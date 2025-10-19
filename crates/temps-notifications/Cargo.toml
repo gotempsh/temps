@@ -1,0 +1,32 @@
+[package]
+name = "temps-notifications"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-entities = { path = "../temps-entities" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sea-orm = { workspace = true }
+async-trait = { workspace = true }
+log = { workspace = true }
+anyhow = { workspace = true }
+lettre = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+utoipa = { workspace = true }
+uuid = { workspace = true }
+axum = { workspace = true }
+axum-macros = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+testcontainers = { workspace = true }
+tower = { version = "0.4", features = ["util"] }

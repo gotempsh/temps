@@ -1,0 +1,49 @@
+[package]
+name = "temps-error-tracking"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-embeddings = { path = "../temps-embeddings" }
+temps-entities = { path = "../temps-entities" }
+temps-projects = { path = "../temps-projects" }
+temps-config = { path = "../temps-config" }
+serde = { workspace = true }
+serde_derive = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+sea-orm = { workspace = true }
+anyhow = { workspace = true }
+utoipa = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+axum = { workspace = true }
+axum-macros = { workspace = true }
+sha2 = { workspace = true }
+http = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+url = { workspace = true }
+log = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+tower-http = { workspace = true }
+regex = { workspace = true }
+
+# Relay dependencies for Sentry SDK compatibility
+relay-event-schema = { git = "https://github.com/getsentry/relay", rev = "ca7e20d" }
+relay-protocol = { git = "https://github.com/getsentry/relay", rev = "ca7e20d" }
+relay-protocol-derive = { git = "https://github.com/getsentry/relay", rev = "ca7e20d" }
+
+# Additional dependencies for Sentry integration
+flate2 = "1.0"  # For gzip decompression
+debugid = { version = "0.8", features = ["serde"] }
+time = { version = "0.3", features = ["parsing", "formatting", "macros", "serde"] }
+
+[dev-dependencies]
+temps-migrations = { path = "../temps-migrations" }
+tokio-test = "0.4"

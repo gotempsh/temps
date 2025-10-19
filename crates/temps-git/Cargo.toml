@@ -1,0 +1,41 @@
+[package]
+name = "temps-git"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
+temps-database = { path = "../temps-database" }
+temps-entities = { path = "../temps-entities" }
+temps-presets = { path = "../temps-presets" }
+temps-queue = { path = "../temps-queue" }
+octocrab = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+log = { workspace = true }
+chrono = { workspace = true }
+sea-orm = { workspace = true }
+axum = { workspace = true }
+urlencoding = { workspace = true }
+async-trait = { workspace = true }
+hex = { workspace = true }
+hmac = "0.12.1"
+thiserror = { workspace = true }
+futures-util = { workspace = true }
+utoipa = { workspace = true }
+futures = { workspace = true }
+sha2 = { workspace = true }
+url = { workspace = true }
+serde_json = { workspace = true }
+serde_derive = { workspace = true }
+jsonwebtoken = "9.3.0"
+uuid = { workspace = true }
+http-body-util = { workspace = true }
+git2 = "0.19.0"
+anyhow = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+

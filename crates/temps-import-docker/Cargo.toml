@@ -1,0 +1,28 @@
+[package]
+name = "temps-import-docker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Workspace dependencies
+temps-import-types = { path = "../temps-import-types" }
+temps-deployer = { path = "../temps-deployer" }
+temps-entities = { path = "../temps-entities" }
+temps-projects = { path = "../temps-projects" }
+temps-presets = { path = "../temps-presets" }
+
+# From workspace
+bollard = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+sea-orm = { workspace = true }
+
+[dev-dependencies]
+temps-database = { path = "../temps-database" }
+temps-git = { path = "../temps-git" }
+temps-deployments = { path = "../temps-deployments" }

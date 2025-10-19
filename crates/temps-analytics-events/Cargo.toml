@@ -1,0 +1,47 @@
+[package]
+name = "temps-analytics-events"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Core dependencies
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-entities = { path = "../temps-entities" }
+temps-auth = { path = "../temps-auth" }
+temps-proxy = { path = "../temps-proxy" }
+temps-geo = { path = "../temps-geo" }
+
+# Web framework
+axum = { workspace = true }
+utoipa = { workspace = true }
+
+# Database
+sea-orm = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+url = "2.5"
+
+# User agent parsing
+woothee = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+testcontainers = { workspace = true }
+temps-migrations = { path = "../temps-migrations" }

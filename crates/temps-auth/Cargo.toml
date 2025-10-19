@@ -1,0 +1,41 @@
+[package]
+name = "temps-auth"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+temps-core = { path = "../temps-core" }
+temps-entities = { path = "../temps-entities" }
+temps-database = { path = "../temps-database" }
+axum = { workspace = true }
+axum-macros = { workspace = true }
+tower = { workspace = true }
+tower-cookies = { workspace = true }
+cookie = { workspace = true }
+argon2 = { workspace = true }
+serde = { workspace = true }
+serde_derive = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+utoipa = { workspace = true }
+chrono = { workspace = true }
+sea-orm = { workspace = true }
+log = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
+totp-rs = { workspace = true }
+base32 = "0.5.1"
+sha2 = { workspace = true }
+qrcode = "0.14.1"
+bcrypt = "0.16.0"
+image = "0.25.6"
+base64 = { workspace = true }
+urlencoding = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+temps-migrations = { path = "../temps-migrations" }
+tokio-test = "0.4"

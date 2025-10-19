@@ -1,0 +1,31 @@
+[package]
+name = "temps-infra"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Use workspace dependencies
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true }
+bollard = { workspace = true }
+reqwest = { workspace = true }
+log = { workspace = true }
+anyhow = { workspace = true }
+
+# Crate-specific dependencies
+get_if_addrs = "0.5"
+parking_lot = "0.12"
+trust-dns-resolver = "0.23"
+
+# Plugin system dependencies
+temps-core = { path = "../temps-core" }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+env_logger = "0.11"
+tower = { workspace = true }
+

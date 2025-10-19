@@ -1,0 +1,25 @@
+# Dependencies
+node_modules
+
+# Build outputs
+dist
+build
+.rsbuild
+
+# Generated files
+src/api/client
+
+# Logs
+*.log
+
+# Package manager
+pnpm-lock.yaml
+package-lock.json
+bun.lockb
+
+# Editor directories
+.vscode
+.idea
+
+# OS files
+.DS_Store

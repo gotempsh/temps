@@ -1,0 +1,33 @@
+[package]
+name = "temps-import"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Workspace dependencies
+temps-import-types = { path = "../temps-import-types" }
+temps-import-docker = { path = "../temps-import-docker" }
+temps-core = { path = "../temps-core" }
+temps-entities = { path = "../temps-entities" }
+temps-deployments = { path = "../temps-deployments" }
+temps-projects = { path = "../temps-projects" }
+temps-auth = { path = "../temps-auth" }
+temps-audit = { path = "../temps-audit" }
+temps-git = { path = "../temps-git" }
+temps-presets = { path = "../temps-presets" }
+
+# From workspace
+sea-orm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+utoipa = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+sea-orm = { workspace = true, features = ["mock"] }

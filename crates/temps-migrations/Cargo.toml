@@ -1,0 +1,15 @@
+[package]
+name = "temps-migrations"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+temps-core = { path = "../temps-core" }
+temps-entities = { path = "../temps-entities" }
+sea-orm-migration = { workspace = true }
+sea-orm = { workspace = true }
+
+[dev-dependencies]
+testcontainers = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }

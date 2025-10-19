@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  timescaledb:
+    image: timescale/timescaledb-ha:pg17
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      # Default environment variables for TimescaleDB HA
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      # TimescaleDB specific settings
+      TIMESCALEDB_TELEMETRY: off
+      # Connection settings
+      POSTGRES_HOST_AUTH_METHOD: md5
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./timescaledb.conf:/etc/postgresql/postgresql.conf:ro
+    networks:
+      - timescale_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  timescaledb_data:
+    driver: local
+
+networks:
+  timescale_network:
+    driver: bridge

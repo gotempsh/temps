@@ -1,0 +1,40 @@
+[package]
+name = "temps-backup"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-config = { path = "../temps-config" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-entities = { path = "../temps-entities" }
+temps-notifications = { path = "../temps-notifications" }
+temps-providers = { path = "../temps-providers" }
+serde = { workspace = true }
+tokio = { workspace = true }
+flate2 = { workspace = true }
+tempfile = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+sea-orm = { workspace = true }
+serde_json = { workspace = true }
+serde_derive = { workspace = true }
+thiserror = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+cron = "0.15.0"
+anyhow = { workspace = true }
+chrono = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = "0.1.17"
+uuid = { workspace = true }
+url = { workspace = true }
+utoipa = { workspace = true }
+axum = { workspace = true }
+bollard = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+sea-orm = { workspace = true, features = ["mock"] }
+testcontainers = { workspace = true }

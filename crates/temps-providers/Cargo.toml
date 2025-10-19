@@ -1,0 +1,39 @@
+[package]
+name = "temps-providers"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-entities = { path = "../temps-entities" }
+serde = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bollard = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+sea-orm = { workspace = true }
+redis = { version = "0.28.2", features = ["tokio-comp", "connection-manager"] }
+aws-sdk-s3 = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+chrono = { workspace = true }
+flate2 = { workspace = true }
+rand = { workspace = true }
+bytes = { workspace = true }
+tar = { workspace = true }
+http = { workspace = true }
+uuid = { workspace = true }
+regex = "1.11.1"
+utoipa = { workspace = true }
+thiserror = { workspace = true }
+axum = { workspace = true }
+axum-macros = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+testcontainers = { workspace = true }

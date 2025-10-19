@@ -1,0 +1,59 @@
+[package]
+name = "temps-deployments"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-config = { path = "../temps-config" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-deployer = { path = "../temps-deployer" }
+temps-entities = { path = "../temps-entities" }
+temps-error-tracking = { path = "../temps-error-tracking" }
+temps-git = { path = "../temps-git" }
+temps-logs = { path = "../temps-logs" }
+temps-queue = { path = "../temps-queue" }
+temps-providers = { path = "../temps-providers" }
+temps-presets = { path = "../temps-presets" }
+temps-screenshots = { path = "../temps-screenshots" }
+serde = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+sea-orm = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+axum-macros = { workspace = true }
+chrono = { workspace = true }
+serde_derive = { workspace = true }
+anyhow = { workspace = true }
+url	= { workspace = true }
+octocrab = { workspace = true }
+utoipa = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+uuid = { workspace = true }
+bollard = { workspace = true }
+tar = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+cron = "0.12"
+rand = { workspace = true }
+
+[dev-dependencies]
+testcontainers = { workspace = true }
+tokio-test = "0.4"
+mockall = "0.12"
+
+[features]
+default = []
+integration-tests = []
+
+[[test]]
+name = "integration_tests"
+path = "tests/integration_tests.rs"
+required-features = ["integration-tests"]

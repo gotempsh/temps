@@ -1,0 +1,38 @@
+[package]
+name = "temps-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core utilities and shared types for the Temps platform"
+keywords = ["platform", "utilities", "deployment"]
+categories = ["development-tools"]
+readme = "README.md"
+
+[dependencies]
+# Core utilities - no dependencies on other crates
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+tower-http = { workspace = true }
+aes-gcm = "0.10"
+base64 = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+futures = { workspace = true }
+log = { workspace = true }
+
+# Internal dependencies - only core dependencies to avoid cycles

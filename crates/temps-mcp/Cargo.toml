@@ -1,0 +1,29 @@
+[package]
+name = "temps-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
+temps-database = { path = "../temps-database" }
+temps-domains = { path = "../temps-domains" }
+temps-entities = { path = "../temps-entities" }
+temps-projects = { path = "../temps-projects" }
+
+serde = { workspace = true }
+tokio = { workspace = true }
+rmcp = { version = "0.6.1", features = [
+    "server",
+    "macros",
+    "transport-sse-server",
+    "transport-io",
+    "transport-streamable-http-server",
+    "auth",
+    "elicitation",
+    "schemars",
+]  }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

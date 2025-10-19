@@ -1,0 +1,68 @@
+[package]
+name = "temps-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "temps"
+path = "src/main.rs"
+
+[dependencies]
+# All library crates
+temps-analytics = { path = "../temps-analytics" }
+temps-analytics-events = { path = "../temps-analytics-events" }
+temps-analytics-funnels = { path = "../temps-analytics-funnels" }
+temps-analytics-performance = { path = "../temps-analytics-performance" }
+temps-analytics-session-replay = { path = "../temps-analytics-session-replay" }
+temps-audit = { path = "../temps-audit" }
+temps-auth = { path = "../temps-auth" }
+temps-backup = { path = "../temps-backup" }
+temps-config = { path = "../temps-config" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-deployer = { path = "../temps-deployer" }
+temps-deployments = { path = "../temps-deployments" }
+temps-domains = { path = "../temps-domains" }
+temps-entities = { path = "../temps-entities" }
+temps-environments = { path = "../temps-environments" }
+temps-error-tracking = { path = "../temps-error-tracking" }
+temps-geo = { path = "../temps-geo" }
+temps-git = { path = "../temps-git" }
+temps-import = { path = "../temps-import" }
+temps-infra = { path = "../temps-infra" }
+temps-logs = { path = "../temps-logs" }
+# temps-mcp = { path = "../temps-mcp" }
+temps-migrations = { path = "../temps-migrations" }
+temps-monitoring = { path = "../temps-monitoring" }
+temps-notifications = { path = "../temps-notifications" }
+temps-projects = { path = "../temps-projects" }
+temps-providers = { path = "../temps-providers" }
+temps-proxy = { path = "../temps-proxy" }
+temps-routes = { path = "../temps-routes" }
+temps-queue = { path = "../temps-queue" }
+temps-screenshots = { path = "../temps-screenshots" }
+temps-status-page = { path = "../temps-status-page" }
+temps-static-files = { path = "../temps-static-files" }
+tokio-util = { workspace = true }
+
+# CLI and runtime dependencies - reference from crates workspace
+clap = "4.4"
+colored = "2.0"
+chrono = { workspace = true }
+argon2 = "0.5"
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+anyhow = { workspace = true }
+dirs = { version = "5.0" }
+rand = { workspace = true }
+hex = { workspace = true }
+bollard = { workspace = true }
+axum = { workspace = true }
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+async-trait = { workspace = true }
+sea-orm = { workspace = true }
+include_dir = "0.7"
+mime_guess = "2.0"
+

@@ -1,0 +1,46 @@
+[package]
+name = "temps-analytics-session-replay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Core dependencies
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-entities = { path = "../temps-entities" }
+temps-auth = { path = "../temps-auth" }
+temps-routes = { path = "../temps-routes" }
+# Web framework
+axum = { workspace = true }
+utoipa = { workspace = true }
+
+# Database
+sea-orm = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+base64 = { workspace = true }
+flate2 = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+woothee = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+axum-test = "18.1.0"

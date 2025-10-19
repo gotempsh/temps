@@ -1,0 +1,21 @@
+[package]
+name = "temps-audit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-entities = { path = "../temps-entities" }
+temps-geo = { path = "../temps-geo" }
+utoipa = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+sea-orm = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+serde_json = { workspace = true }

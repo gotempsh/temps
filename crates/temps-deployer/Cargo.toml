@@ -1,0 +1,38 @@
+[package]
+name = "temps-deployer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bollard = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+http-body-util = "0.1"
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tar = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+sysinfo = { workspace = true }
+num_cpus = "1.16"
+temps-core = { path = "../temps-core" }
+utoipa = { workspace = true }
+flate2 = { workspace = true }
+
+# Nixpacks integration
+nixpacks = "1.40.0"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+env_logger = "0.10"
+tokio-test = "0.4"
+mockall = "0.12"
+serial_test = "3.0"

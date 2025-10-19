@@ -1,0 +1,13 @@
+[package]
+name = "temps-static-files"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+utoipa = { workspace = true }
+
+temps-config = { path = "../temps-config" }
+temps-core = { path = "../temps-core" }

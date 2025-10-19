@@ -1,0 +1,38 @@
+[package]
+name = "temps-analytics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Analytics and metrics collection for the Temps platform"
+keywords = ["analytics", "metrics", "tracking", "web"]
+categories = ["web-programming"]
+readme = "README.md"
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-entities = { path = "../temps-entities" }
+temps-migrations = { path = "../temps-migrations" }
+serde = { workspace = true }
+tokio = { workspace = true }
+async-trait = "0.1"
+sea-orm = { version = "1.0", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+sea-orm-migration = { workspace = true }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+utoipa = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
+axum = { workspace = true }
+axum-macros = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+testcontainers = { workspace = true }

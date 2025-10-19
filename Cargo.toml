@@ -1,0 +1,237 @@
+[workspace]
+resolver = "2"
+members = [
+    # Application crates
+    "crates/temps-cli",
+    # Library crates
+    "crates/temps-core",
+    "crates/temps-entities",
+    "crates/temps-migrations",
+    "crates/temps-database",
+    "crates/temps-queue",
+    "crates/temps-auth",
+    "crates/temps-git",
+    "crates/temps-presets",
+    "crates/temps-logs",
+    "crates/temps-deployer",
+    "crates/temps-projects",
+    "crates/temps-domains",
+    "crates/temps-proxy",
+    "crates/temps-providers",
+    "crates/temps-deployments",
+    "crates/temps-backup",
+    "crates/temps-notifications",
+    "crates/temps-monitoring",
+    "crates/temps-mcp",
+    "crates/temps-analytics",
+    "crates/temps-audit",
+    "crates/temps-config",
+    "crates/temps-geo",
+    "crates/temps-analytics-events",
+    "crates/temps-routes",
+    "crates/temps-analytics-funnels",
+    "crates/temps-analytics-session-replay",
+    "crates/temps-infra",
+    "crates/temps-error-tracking",
+    "crates/temps-analytics-performance",
+    "crates/temps-status-page",
+    "crates/temps-static-files",
+    "crates/temps-import-types",
+    "crates/temps-import",
+    "crates/temps-import-docker",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Temps Contributors"]
+repository = "https://github.com/gotempsh/temps"
+homepage = "https://github.com/gotempsh/temps"
+
+[workspace.dependencies]
+# ============================================================================
+# Async Runtime & Concurrency
+# ============================================================================
+tokio = { version = "1.47.1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3.31"
+futures-util = "0.3.31"
+async-trait = "0.1.68"
+async-stream = "0.3"
+
+# ============================================================================
+# Serialization & Deserialization
+# ============================================================================
+serde = { version = "=1.0.228", features = ["derive", "rc"] }
+serde_derive = "1.0"
+serde_json = "1.0.140"
+serde_yaml = "0.9"
+serde_urlencoded = "0.7.1"
+serde_bytes = "0.11.17"
+serde_path_to_error = "0.1.20"
+serde_test = "1.0.177"
+serde-transcode = "1.1.1"
+serde-vars = "0.2.0"
+
+# ============================================================================
+# Error Handling & Logging
+# ============================================================================
+anyhow = "1.0.86"
+thiserror = "2.0.17"
+log = "0.4"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "std", "fmt", "registry"] }
+
+# ============================================================================
+# Date/Time & UUID
+# ============================================================================
+chrono = { version = "0.4.38", features = ["serde"] }
+uuid = { version = "1.10.0", features = ["v4", "fast-rng", "macro-diagnostics"] }
+
+# ============================================================================
+# Database - ORM & Migrations
+# ============================================================================
+sea-orm = { version = "1.1.14", features = [
+    "sqlx-sqlite",
+    "sqlite-use-returning-for-3_35",
+    "sqlx-postgres",
+    "runtime-tokio-rustls",
+    "macros",
+    "with-chrono",
+    "with-json",
+    "with-uuid",
+    "debug-print"
+] }
+sea-orm-migration = { version = "1.1", features = [
+    "sqlx-sqlite",
+    "sqlite-use-returning-for-3_35",
+    "sqlx-postgres",
+    "runtime-tokio-rustls"
+] }
+sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio"] }
+rusqlite = { version = "0.32.0", features = ["bundled", "trace"] }
+
+# ============================================================================
+# HTTP Framework & Web Server
+# ============================================================================
+axum = { version = "0.8", features = ["multipart", "form", "ws"] }
+axum-macros = "0.5.0-alpha.1"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6.2", features = ["cors", "fs", "catch-panic", "trace"] }
+tower-cookies = "0.11"
+cookie = "0.18"
+http = "1.3.1"
+http-body-util = "0.1"
+
+# ============================================================================
+# HTTP Client
+# ============================================================================
+reqwest = { version = "0.12.15", features = ["json", "stream", "multipart"] }
+
+# ============================================================================
+# API Documentation (OpenAPI/Swagger)
+# ============================================================================
+utoipa = { version = "5.4.0", features = ["axum_extras", "debug"] }
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"], default-features = false }
+
+# ============================================================================
+# Cryptography & Security
+# ============================================================================
+argon2 = "0.5"
+aes-gcm = "0.10.3"
+totp-rs = "5.7.0"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4.3"
+
+# ============================================================================
+# TLS & Certificate Management
+# ============================================================================
+instant-acme = "0.7.2"
+rcgen = { version = "0.13.2", features = ["x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "tls12",
+    "logging"
+] }
+
+# ============================================================================
+# Reverse Proxy (Pingora)
+# ============================================================================
+pingora = { version = "0.6.0" }
+pingora-core = { version = "0.6.0", features = ["openssl"] }
+pingora-proxy = { version = "0.6.0" }
+
+# ============================================================================
+# External Service Integrations
+# ============================================================================
+# Cloud Storage (S3/MinIO)
+aws-sdk-s3 = "1.106.0"
+
+# Caching (Redis)
+redis = { version = "0.28.2", features = ["tokio-comp", "connection-manager"] }
+
+# Email (SMTP)
+lettre = { version = "0.11.11", features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "tokio1-native-tls"] }
+
+# Git Providers (GitHub, GitLab)
+octocrab = "0.39.0"
+
+# ============================================================================
+# Container Management (Docker)
+# ============================================================================
+bollard = { version = "0.19.3", features = ["buildkit", "buildkit_providerless", "chrono", "json_data_content"] }
+
+# ============================================================================
+# Scheduling & Background Jobs
+# ============================================================================
+cron = "0.15.0"
+
+# ============================================================================
+# String & URL Utilities
+# ============================================================================
+url = "2.5.0"
+urlencoding = "2.1"
+slug = "0.1.6"
+regex = "1.11"
+
+# ============================================================================
+# Compression & Archive
+# ============================================================================
+flate2 = "1.0"
+tar = "0.4"
+
+# ============================================================================
+# CLI Framework
+# ============================================================================
+clap = { version = "4.4", features = ["derive", "env"] }
+
+# ============================================================================
+# System & Utilities
+# ============================================================================
+bytes = "1.0"
+rand = "0.8"
+sysinfo = "0.29.0"
+tempfile = "3.12.0"
+once_cell = "1.20"
+notify = "6.1"
+
+# ============================================================================
+# User Agent & Analytics
+# ============================================================================
+woothee = "0.13.0"
+
+# ============================================================================
+# Testing
+# ============================================================================
+testcontainers = { git = "https://github.com/testcontainers/testcontainers-rs", rev = "5ea0d04" }
+
+[profile.dev]
+opt-level = 0
+debug = true      # Skip debug info
+incremental = true
+codegen-units = 256
+
+[profile.dev.package."*"]
+opt-level = 2      # Optimize dependencies

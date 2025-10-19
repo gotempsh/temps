@@ -1,0 +1,23 @@
+[package]
+name = "temps-geo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+axum = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+maxminddb = "0.24"
+rand = { workspace = true }
+sea-orm = { version = "1.0", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = { workspace = true }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-entities = { path = "../temps-entities" }
+utoipa = "5.1"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full"] }

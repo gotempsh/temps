@@ -1,0 +1,13 @@
+[package]
+name = "temps-queue"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+temps-core = { path = "../temps-core" }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+utoipa = "5.1"

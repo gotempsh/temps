@@ -1,0 +1,710 @@
+//! Route table with O(1) lookup and automatic PostgreSQL LISTEN/NOTIFY synchronization
+//!
+//! This module provides a cached routing table that maps hostnames to backend addresses
+//! and project IDs. The cache is automatically kept in sync with the database using
+//! PostgreSQL triggers and LISTEN/NOTIFY.
+
+use parking_lot::RwLock;
+use sea_orm::DatabaseConnection;
+use sqlx::postgres::{PgListener, PgPool};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use temps_entities::{deployments, environments, projects};
+use tracing::{debug, error, info, warn};
+
+/// Route information for a single host with cached models
+#[derive(Clone, Debug)]
+pub struct RouteInfo {
+    /// Backend addresses for load balancing (e.g., ["127.0.0.1:8080", "127.0.0.1:8081"])
+    pub backend_addrs: Vec<String>,
+    /// Round-robin counter for load balancing
+    pub round_robin_counter: Arc<AtomicUsize>,
+    /// Optional redirect URL for project custom domains
+    pub redirect_to: Option<String>,
+    /// Optional status code for redirects
+    pub status_code: Option<i32>,
+    /// Cached project model (None for custom_routes without project)
+    pub project: Option<Arc<projects::Model>>,
+    /// Cached environment model (None for custom_routes)
+    pub environment: Option<Arc<environments::Model>>,
+    /// Cached deployment model (None for custom_routes)
+    pub deployment: Option<Arc<deployments::Model>>,
+}
+
+impl RouteInfo {
+    /// Get the next backend address using round-robin load balancing
+    pub fn get_backend_addr(&self) -> String {
+        if self.backend_addrs.is_empty() {
+            return "127.0.0.1:8080".to_string(); // Fallback
+        }
+
+        if self.backend_addrs.len() == 1 {
+            return self.backend_addrs[0].clone();
+        }
+
+        // Round-robin load balancing
+        let index = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) % self.backend_addrs.len();
+        self.backend_addrs[index].clone()
+    }
+}
+
+/// In-memory routing table with O(1) lookup
+pub struct CachedPeerTable {
+    /// Hostname -> RouteInfo mapping
+    routes: Arc<RwLock<HashMap<String, RouteInfo>>>,
+    /// Database connection for loading routes
+    db: Arc<DatabaseConnection>,
+}
+
+impl CachedPeerTable {
+    pub fn new(db: Arc<DatabaseConnection>) -> Self {
+        Self {
+            routes: Arc::new(RwLock::new(HashMap::new())),
+            db,
+        }
+    }
+
+    /// Load all routes from the database into the cache with full models
+    /// This queries environment_domains, custom_routes, and project_custom_domains
+    pub async fn load_routes(&self) -> Result<(), sea_orm::DbErr> {
+        use sea_orm::{
+            ColumnTrait, EntityTrait, QueryFilter,
+        };
+        use temps_entities::{
+            custom_routes, deployments, environment_domains, environments, project_custom_domains,
+            settings,
+        };
+
+        let mut routes = HashMap::new();
+
+        // Build entity caches as we go - only cache what we actually need for routing
+        let mut projects_cache: HashMap<i32, Arc<projects::Model>> = HashMap::new();
+        let mut environments_cache: HashMap<i32, Arc<environments::Model>> = HashMap::new();
+        let mut deployments_cache: HashMap<i32, Arc<deployments::Model>> = HashMap::new();
+
+        // Fetch preview_domain from settings
+        let preview_domain = settings::Entity::find()
+            .one(self.db.as_ref())
+            .await?
+            .and_then(|s| {
+                s.data
+                    .get("preview_domain")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "localho.st".to_string());
+
+        debug!("Loaded preview_domain from settings: {}", preview_domain);
+
+        debug!("Loading route table from database...");
+
+        // 1. Load environment_domains (e.g., preview-123.temps.dev)
+        let env_domains = environment_domains::Entity::find()
+            .all(self.db.as_ref())
+            .await?;
+
+        debug!(
+            "Section 1: Loading {} environment domains",
+            env_domains.len()
+        );
+
+        for env_domain in env_domains {
+            // Fetch environment if not cached
+            if !environments_cache.contains_key(&env_domain.environment_id) {
+                if let Ok(Some(env)) = environments::Entity::find_by_id(env_domain.environment_id)
+                    .one(self.db.as_ref())
+                    .await
+                {
+                    environments_cache.insert(env.id, Arc::new(env));
+                }
+            }
+
+            if let Some(environment) = environments_cache.get(&env_domain.environment_id) {
+                if let Some(deployment_id) = environment.current_deployment_id {
+                    // Fetch deployment if not cached
+                    if !deployments_cache.contains_key(&deployment_id) {
+                        if let Ok(Some(dep)) = deployments::Entity::find_by_id(deployment_id)
+                            .one(self.db.as_ref())
+                            .await
+                        {
+                            deployments_cache.insert(dep.id, Arc::new(dep));
+                        }
+                    }
+
+                    if let Some(deployment) = deployments_cache.get(&deployment_id) {
+                        // Load all active containers for this deployment
+                        use temps_entities::deployment_containers;
+                        let containers = deployment_containers::Entity::find()
+                            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+                            .filter(deployment_containers::Column::DeletedAt.is_null())
+                            .all(self.db.as_ref())
+                            .await
+                            .unwrap_or_default();
+
+                        if !containers.is_empty() {
+                            // Fetch project if not cached
+                            if !projects_cache.contains_key(&environment.project_id) {
+                                if let Ok(Some(proj)) =
+                                    projects::Entity::find_by_id(environment.project_id)
+                                        .one(self.db.as_ref())
+                                        .await
+                                {
+                                    projects_cache.insert(proj.id, Arc::new(proj));
+                                }
+                            }
+
+                            let project = projects_cache.get(&environment.project_id);
+
+                            // Build backend addresses from all containers
+                            let backend_addrs: Vec<String> = containers
+                                .iter()
+                                .map(|c| format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port)))
+                                .collect();
+
+                            routes.insert(
+                                env_domain.domain.clone(),
+                                RouteInfo {
+                                    backend_addrs: backend_addrs.clone(),
+                                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                                    redirect_to: None,
+                                    status_code: None,
+                                    project: project.cloned(),
+                                    environment: Some(Arc::clone(environment)),
+                                    deployment: Some(Arc::clone(deployment)),
+                                },
+                            );
+                            debug!(
+                                "Loaded environment domain route: {} -> {:?} ({} containers, project={}, env={}, deploy={})",
+                                env_domain.domain, backend_addrs, backend_addrs.len(), environment.project_id, environment.id, deployment_id
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Load custom_routes (custom domain mappings with host:port)
+        let custom_routes_data = custom_routes::Entity::find()
+            .filter(custom_routes::Column::Enabled.eq(true))
+            .all(self.db.as_ref())
+            .await?;
+
+        debug!(
+            "Section 2: Loading {} custom routes",
+            custom_routes_data.len()
+        );
+
+        for custom_route in custom_routes_data {
+            let backend = format!("{}:{}", custom_route.host, custom_route.port);
+            routes.insert(
+                custom_route.domain.clone(),
+                RouteInfo {
+                    backend_addrs: vec![backend.clone()],
+                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                    redirect_to: None,
+                    status_code: None,
+                    project: None, // Custom routes don't have project context
+                    environment: None,
+                    deployment: None,
+                },
+            );
+            debug!(
+                "Loaded custom route: {} -> {}",
+                custom_route.domain, backend
+            );
+        }
+
+        // 3. Load project_custom_domains (custom domains with redirects or environment mapping)
+        // Note: We load ALL custom domains regardless of status to allow immediate routing
+        let custom_domains = project_custom_domains::Entity::find()
+            .all(self.db.as_ref())
+            .await?;
+
+        debug!(
+            "Section 3: Loading {} project custom domains",
+            custom_domains.len()
+        );
+
+        for custom_domain in custom_domains {
+            // Fetch environment if not cached
+            if !environments_cache.contains_key(&custom_domain.environment_id) {
+                if let Ok(Some(env)) =
+                    environments::Entity::find_by_id(custom_domain.environment_id)
+                        .one(self.db.as_ref())
+                        .await
+                {
+                    environments_cache.insert(env.id, Arc::new(env));
+                }
+            }
+
+            if let Some(environment) = environments_cache.get(&custom_domain.environment_id) {
+                if let Some(deployment_id) = environment.current_deployment_id {
+                    // Fetch deployment if not cached
+                    if !deployments_cache.contains_key(&deployment_id) {
+                        if let Ok(Some(dep)) = deployments::Entity::find_by_id(deployment_id)
+                            .one(self.db.as_ref())
+                            .await
+                        {
+                            deployments_cache.insert(dep.id, Arc::new(dep));
+                        }
+                    }
+
+                    if let Some(deployment) = deployments_cache.get(&deployment_id) {
+                        // Load all active containers for this deployment
+                        use temps_entities::deployment_containers;
+                        let containers = deployment_containers::Entity::find()
+                            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+                            .filter(deployment_containers::Column::DeletedAt.is_null())
+                            .all(self.db.as_ref())
+                            .await
+                            .unwrap_or_default();
+
+                        if !containers.is_empty() {
+                            // Fetch project if not cached
+                            if !projects_cache.contains_key(&custom_domain.project_id) {
+                                if let Ok(Some(proj)) =
+                                    projects::Entity::find_by_id(custom_domain.project_id)
+                                        .one(self.db.as_ref())
+                                        .await
+                                {
+                                    projects_cache.insert(proj.id, Arc::new(proj));
+                                }
+                            }
+
+                            let project = projects_cache.get(&custom_domain.project_id);
+
+                            // Build backend addresses from all containers
+                            let backend_addrs: Vec<String> = containers
+                                .iter()
+                                .map(|c| format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port)))
+                                .collect();
+
+                            routes.insert(
+                                custom_domain.domain.clone(),
+                                RouteInfo {
+                                    backend_addrs: backend_addrs.clone(),
+                                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                                    redirect_to: custom_domain.redirect_to.clone(),
+                                    status_code: custom_domain.status_code,
+                                    project: project.cloned(),
+                                    environment: Some(Arc::clone(environment)),
+                                    deployment: Some(Arc::clone(deployment)),
+                                },
+                            );
+                            if let Some(ref redirect) = custom_domain.redirect_to {
+                                debug!(
+                                    "Loaded custom domain with redirect: {} -> {} (status: {:?})",
+                                    custom_domain.domain, redirect, custom_domain.status_code
+                                );
+                            } else {
+                                debug!(
+                                    "Loaded custom domain route: {} -> {:?} ({} containers, project={}, env={}, deploy={})",
+                                    custom_domain.domain, backend_addrs, backend_addrs.len(), custom_domain.project_id, environment.id, deployment_id
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Load all environments with main_url (for preview domain routing)
+        // This handles environments that don't have explicit environment_domains entries
+        // Only fetch environments that have main_url and current_deployment_id
+        let all_envs = environments::Entity::find()
+            .filter(environments::Column::Subdomain.is_not_null())
+            .filter(environments::Column::CurrentDeploymentId.is_not_null())
+            .all(self.db.as_ref())
+            .await?;
+
+        debug!(
+            "Section 4: Loading {} environments with main_url",
+            all_envs.len()
+        );
+
+        for env in all_envs {
+            if let Some(deployment_id) = env.current_deployment_id {
+                let main_url = &env.subdomain;
+                // Cache environment if not already cached
+                if !environments_cache.contains_key(&env.id) {
+                    environments_cache.insert(env.id, Arc::new(env.clone()));
+                }
+
+                // Fetch deployment if not cached
+                if !deployments_cache.contains_key(&deployment_id) {
+                    if let Ok(Some(dep)) = deployments::Entity::find_by_id(deployment_id)
+                        .one(self.db.as_ref())
+                        .await
+                    {
+                        if dep.state == "completed" {
+                            deployments_cache.insert(dep.id, Arc::new(dep));
+                        }
+                    }
+                }
+
+                if let Some(deployment) = deployments_cache.get(&deployment_id) {
+                    // Load all active containers for this deployment
+                    use temps_entities::deployment_containers;
+                    let containers = deployment_containers::Entity::find()
+                        .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+                        .filter(deployment_containers::Column::DeletedAt.is_null())
+                        .all(self.db.as_ref())
+                        .await
+                        .unwrap_or_default();
+
+                    if !containers.is_empty() {
+                        // Fetch project if not cached
+                        if !projects_cache.contains_key(&env.project_id) {
+                            if let Ok(Some(proj)) = projects::Entity::find_by_id(env.project_id)
+                                .one(self.db.as_ref())
+                                .await
+                            {
+                                projects_cache.insert(proj.id, Arc::new(proj));
+                            }
+                        }
+
+                        let project = projects_cache.get(&env.project_id);
+                        let environment = environments_cache.get(&env.id);
+
+                        // Build backend addresses from all containers
+                        let backend_addrs: Vec<String> = containers
+                            .iter()
+                            .map(|c| format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port)))
+                            .collect();
+
+                        // Add route with main_url as-is
+                        if !routes.contains_key(main_url) {
+                            routes.insert(
+                                main_url.clone(),
+                                RouteInfo {
+                                    backend_addrs: backend_addrs.clone(),
+                                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                                    redirect_to: None,
+                                    status_code: None,
+                                    project: project.cloned(),
+                                    environment: environment.cloned(),
+                                    deployment: Some(Arc::clone(deployment)),
+                                },
+                            );
+                            debug!(
+                                "Loaded environment route: {} -> {:?} ({} containers, project={}, env={}, deploy={})",
+                                main_url, backend_addrs, backend_addrs.len(), env.project_id, env.id, deployment_id
+                            );
+                        }
+
+                        // Also add route with preview_domain suffix if configured
+                        let full_domain = format!("{}.{}", main_url, preview_domain);
+                        if !routes.contains_key(&full_domain) {
+                            routes.insert(
+                                full_domain.clone(),
+                                RouteInfo {
+                                    backend_addrs: backend_addrs.clone(),
+                                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                                    redirect_to: None,
+                                    status_code: None,
+                                    project: project.cloned(),
+                                    environment: environment.cloned(),
+                                    deployment: Some(Arc::clone(deployment)),
+                                },
+                            );
+                            debug!(
+                                    "Loaded environment route with preview domain: {} -> {:?} ({} containers, project={}, env={}, deploy={})",
+                                    full_domain, backend_addrs, backend_addrs.len(), env.project_id, env.id, deployment_id
+                                );
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!(
+            "Loaded {} projects, {} environments, {} deployments into cache (on-demand)",
+            projects_cache.len(),
+            environments_cache.len(),
+            deployments_cache.len()
+        );
+
+        // 5. Load all active deployments for all environments
+        // This ensures we have complete coverage of all running deployments
+        debug!("Loading all active deployments for environments...");
+
+        // Get all environments with current_deployment_id
+        let all_active_envs = environments::Entity::find()
+            .filter(environments::Column::CurrentDeploymentId.is_not_null())
+            .all(self.db.as_ref())
+            .await?;
+
+        for env in all_active_envs {
+            // Cache environment if not already cached
+            if !environments_cache.contains_key(&env.id) {
+                environments_cache.insert(env.id, Arc::new(env.clone()));
+            }
+
+            if let Some(deployment_id) = env.current_deployment_id {
+                // Fetch deployment if not cached
+                if !deployments_cache.contains_key(&deployment_id) {
+                    if let Ok(Some(dep)) = deployments::Entity::find_by_id(deployment_id)
+                        .one(self.db.as_ref())
+                        .await
+                    {
+                        if dep.state == "completed" {
+                            deployments_cache.insert(dep.id, Arc::new(dep));
+                        }
+                    }
+                }
+
+                // Fetch project if not cached
+                if !projects_cache.contains_key(&env.project_id) {
+                    if let Ok(Some(proj)) = projects::Entity::find_by_id(env.project_id)
+                        .one(self.db.as_ref())
+                        .await
+                    {
+                        projects_cache.insert(proj.id, Arc::new(proj));
+                    }
+                }
+
+                // Check if we have all required data cached
+                if let (
+                    Some(deployment),
+                    Some(project),
+                    Some(environment),
+                ) = (
+                    deployments_cache.get(&deployment_id),
+                    projects_cache.get(&env.project_id),
+                    environments_cache.get(&env.id),
+                ) {
+                    // Load all active containers for this deployment
+                    use temps_entities::deployment_containers;
+                    let containers = deployment_containers::Entity::find()
+                        .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+                        .filter(deployment_containers::Column::DeletedAt.is_null())
+                        .all(self.db.as_ref())
+                        .await
+                        .unwrap_or_default();
+
+                    if !containers.is_empty() {
+                        // Build backend addresses from all containers
+                        let backend_addrs: Vec<String> = containers
+                            .iter()
+                            .map(|c| format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port)))
+                            .collect();
+
+                        // Generate a fallback route using environment ID if no other routes exist
+                        // This ensures every active deployment is accessible
+                        let fallback_domain = format!("{}.{}", deployment.slug, preview_domain);
+
+                        if !routes.contains_key(&fallback_domain) {
+                            routes.insert(
+                                fallback_domain.clone(),
+                                RouteInfo {
+                                    backend_addrs: backend_addrs.clone(),
+                                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                                    redirect_to: None,
+                                    status_code: None,
+                                    project: Some(Arc::clone(project)),
+                                    environment: Some(Arc::clone(environment)),
+                                    deployment: Some(Arc::clone(deployment)),
+                                },
+                            );
+                            debug!(
+                                "Loaded fallback route for active deployment: {} -> {:?} ({} containers, project={}, env={}, deploy={})",
+                                fallback_domain, backend_addrs, backend_addrs.len(), env.project_id, env.id, deployment_id
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!("Loaded all active deployments. Final cache: {} projects, {} environments, {} deployments",
+            projects_cache.len(), environments_cache.len(), deployments_cache.len());
+
+        // Atomically replace the entire route table
+        let route_count = routes.len();
+        *self.routes.write() = routes;
+
+        debug!("Route table loaded with {} entries", route_count);
+        Ok(())
+    }
+
+    /// Get route information for a host (O(1) lookup)
+    pub fn get_route(&self, host: &str) -> Option<RouteInfo> {
+        self.routes.read().get(host).cloned()
+    }
+
+    /// Get current number of routes in the table
+    pub fn len(&self) -> usize {
+        self.routes.read().len()
+    }
+
+    /// Check if the route table is empty
+    pub fn is_empty(&self) -> bool {
+        self.routes.read().is_empty()
+    }
+}
+
+/// Listens for PostgreSQL notifications and automatically reloads the route table
+pub struct RouteTableListener {
+    peer_table: Arc<CachedPeerTable>,
+    database_url: String,
+}
+
+impl RouteTableListener {
+    pub fn new(peer_table: Arc<CachedPeerTable>, database_url: String) -> Self {
+        Self {
+            peer_table,
+            database_url,
+        }
+    }
+
+    /// Start listening for route table changes
+    /// This performs an initial load and then listens for PostgreSQL notifications
+    pub async fn start_listening(self: Arc<Self>) -> anyhow::Result<()> {
+        // Initial load
+        debug!("Loading initial route table...");
+        self.peer_table.load_routes().await?;
+        debug!(
+            "Initial route table loaded with {} entries",
+            self.peer_table.len()
+        );
+
+        // Create PostgreSQL listener using sqlx
+        let pool = PgPool::connect(&self.database_url).await?;
+        let mut listener = PgListener::connect_with(&pool).await?;
+
+        listener.listen("route_table_changes").await?;
+        debug!(
+            "Started listening for route table changes on PostgreSQL channel 'route_table_changes'"
+        );
+
+        // Spawn background task to handle notifications
+        tokio::spawn(async move {
+            loop {
+                match listener.recv().await {
+                    Ok(notification) => {
+                        debug!(
+                            "Received route table change notification: {}",
+                            notification.payload()
+                        );
+
+                        debug!("🔄 Route table synchronizing...");
+
+                        if let Err(e) = self.peer_table.load_routes().await {
+                            error!("Failed to reload routes: {}", e);
+                        } else {
+                            debug!(
+                                "✅ Route table synchronized ({} entries)",
+                                self.peer_table.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!("Listener error: {}", e);
+
+                        // Attempt to reconnect after error
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+                        match PgListener::connect_with(&pool).await {
+                            Ok(mut new_listener) => {
+                                if let Err(e) = new_listener.listen("route_table_changes").await {
+                                    error!("Failed to re-subscribe to notifications: {}", e);
+                                } else {
+                                    listener = new_listener;
+                                    info!("Reconnected to route table notification listener");
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to reconnect listener: {}", e);
+                                warn!("Route table updates will not be received until reconnection succeeds");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_route_info_creation() {
+        let route = RouteInfo {
+            backend_addrs: vec!["127.0.0.1:8080".to_string()],
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            redirect_to: None,
+            status_code: None,
+            project: None,
+            environment: None,
+            deployment: None,
+        };
+
+        assert_eq!(route.get_backend_addr(), "127.0.0.1:8080");
+        assert!(route.project.is_none());
+        assert!(route.environment.is_none());
+        assert!(route.deployment.is_none());
+        assert!(route.redirect_to.is_none());
+    }
+
+    #[test]
+    fn test_route_info_with_redirect() {
+        let route = RouteInfo {
+            backend_addrs: vec!["127.0.0.1:8080".to_string()],
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            redirect_to: Some("https://example.com".to_string()),
+            status_code: Some(301),
+            project: None,
+            environment: None,
+            deployment: None,
+        };
+
+        assert_eq!(route.redirect_to, Some("https://example.com".to_string()));
+        assert_eq!(route.status_code, Some(301));
+    }
+
+    #[test]
+    fn test_route_info_custom_route() {
+        let route = RouteInfo {
+            backend_addrs: vec!["192.168.1.100:3000".to_string()],
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            redirect_to: None,
+            status_code: None,
+            project: None,
+            environment: None,
+            deployment: None,
+        };
+
+        assert_eq!(route.get_backend_addr(), "192.168.1.100:3000");
+        assert!(route.project.is_none());
+        assert!(route.environment.is_none());
+        assert!(route.deployment.is_none());
+    }
+
+    #[test]
+    fn test_route_info_load_balancing() {
+        let route = RouteInfo {
+            backend_addrs: vec![
+                "127.0.0.1:8080".to_string(),
+                "127.0.0.1:8081".to_string(),
+                "127.0.0.1:8082".to_string(),
+            ],
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            redirect_to: None,
+            status_code: None,
+            project: None,
+            environment: None,
+            deployment: None,
+        };
+
+        // Test round-robin load balancing
+        assert_eq!(route.get_backend_addr(), "127.0.0.1:8080");
+        assert_eq!(route.get_backend_addr(), "127.0.0.1:8081");
+        assert_eq!(route.get_backend_addr(), "127.0.0.1:8082");
+        assert_eq!(route.get_backend_addr(), "127.0.0.1:8080"); // Wraps around
+    }
+}

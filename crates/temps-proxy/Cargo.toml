@@ -1,0 +1,60 @@
+[package]
+name = "temps-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+temps-audit = { path = "../temps-audit" }
+temps-auth = { path = "../temps-auth" }
+temps-config = { path = "../temps-config" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-entities = { path = "../temps-entities" }
+temps-geo = { path = "../temps-geo" }
+temps-routes = { path = "../temps-routes" }
+temps-migrations = { path = "../temps-migrations" }
+serde = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+cookie = { workspace = true }
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+flate2 = { workspace = true }
+tracing = { workspace = true }
+memchr = "2.7"
+pingora = { version = "0.6.0", features = ["lb"] }
+pingora-core = { version = "0.6.0", features = ["openssl"] }
+pingora-http = "0.6.0"
+pingora-load-balancing = "0.6.0"
+pingora-proxy = "0.6.0"
+pingora-openssl = "0.6.0"
+rand = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+mime_guess = "2.0"
+chrono = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+anyhow = { workspace = true }
+utoipa = { workspace = true }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
+parking_lot = "0.12"
+regex = { workspace = true }
+once_cell = { workspace = true }
+woothee = "0.13"
+rustls = "0.23"
+rustls-pemfile = "2.0"
+openssl = "0.10"
+
+[dev-dependencies]
+tokio-test = "0.4"
+testcontainers = { workspace = true }
+temp-dir = "0.1"
+hyper = { version = "1.0", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = { workspace = true }
+tower = "0.4"
+anyhow = "1.0"
+lazy_static = "1.4"

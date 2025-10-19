@@ -1,0 +1,29 @@
+[package]
+name = "temps-config"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-entities = { path = "../temps-entities" }
+temps-database = { path = "../temps-database" }
+temps-core = { path = "../temps-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+config = "0.14"
+dirs = "5.0"
+thiserror = { workspace = true }
+url = { workspace = true }
+sea-orm = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+serde_derive = { workspace = true }
+uuid = { workspace = true }
+utoipa = { workspace = true }
+axum = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }

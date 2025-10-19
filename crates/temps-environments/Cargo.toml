@@ -1,0 +1,28 @@
+[package]
+name = "temps-environments"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-config = { path = "../temps-config" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-entities = { path = "../temps-entities" }
+serde = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+tracing = { workspace = true }
+sea-orm = { workspace = true }
+anyhow = { workspace = true }
+utoipa = { workspace = true }
+futures = { workspace = true }
+serde_derive = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+axum = { workspace = true }
+axum-macros = { workspace = true }
+http = { workspace = true }
+futures-util = { workspace = true }
+slug = { workspace = true }

@@ -1,0 +1,21 @@
+[package]
+name = "temps-logs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-stream = { workspace = true }
+notify = { workspace = true }
+bollard = { workspace = true }
+futures-util = { workspace = true }
+thiserror = { workspace = true }
+# Plugin dependencies
+temps-core = { path = "../temps-core" }
+utoipa = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

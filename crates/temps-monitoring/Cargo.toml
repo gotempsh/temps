@@ -1,0 +1,10 @@
+[package]
+name = "temps-monitoring"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+serde = { workspace = true }
+tokio = { workspace = true }
