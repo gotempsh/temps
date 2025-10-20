@@ -160,6 +160,7 @@ export function UsersManagement({
     },
     onSuccess: () => {
       toast.success('User deleted successfully')
+      setUserToDelete(null)
       reloadUsers()
     },
   })
@@ -187,32 +188,22 @@ export function UsersManagement({
   })
 
   const handleCreateUser = async (data: CreateUserFormData) => {
-    try {
-      await createUser.mutateAsync({
-        body: {
-          username: data.name,
-          email: data.email,
-          roles: [data.role],
-          // password: data.password,
-        },
-      })
-    } catch (error) {
-      // Error is already handled in onError
-    }
+    await createUser.mutateAsync({
+      body: {
+        username: data.name,
+        email: data.email,
+        roles: [data.role],
+        // password: data.password,
+      },
+    })
   }
 
   const handleDeleteUser = async (userId: number) => {
-    try {
-      await deleteUser.mutateAsync({
-        path: {
-          user_id: userId,
-        },
-      })
-    } catch (error) {
-      // Error is already handled in onError
-    } finally {
-      setUserToDelete(null)
-    }
+    await deleteUser.mutateAsync({
+      path: {
+        user_id: userId,
+      },
+    })
   }
 
   const handleRoleChange = async (
@@ -220,39 +211,40 @@ export function UsersManagement({
     roleType: string,
     hasRole: boolean
   ) => {
-    try {
-      if (hasRole) {
-        await removeRole.mutateAsync({
-          path: {
-            user_id: userId,
-            role_type: roleType,
-          },
-        })
-      } else {
-        await assignRole.mutateAsync({
-          path: {
-            user_id: userId,
-          },
-          body: {
-            role_type: roleType,
-            user_id: userId,
-          },
-        })
-      }
+    if (hasRole) {
+      await removeRole.mutateAsync({
+        path: {
+          user_id: userId,
+          role_type: roleType,
+        },
+      })
+    } else {
+      await assignRole.mutateAsync({
+        path: {
+          user_id: userId,
+        },
+        body: {
+          role_type: roleType,
+          user_id: userId,
+        },
+      })
+    }
 
-      if (userToManageRoles) {
-        setUserToManageRoles((prevUser) => {
+    if (userToManageRoles) {
+      setUserToManageRoles(
+        (prevUser: RouteUserWithRoles | null): RouteUserWithRoles | null => {
           if (!prevUser) return null
           return {
             ...prevUser,
             roles: hasRole
-              ? prevUser.roles.filter((r) => r.name !== roleType)
-              : [...prevUser.roles, { id: 0, name: roleType }],
+              ? prevUser.roles
+              : [
+                  ...prevUser.roles,
+                  { id: 0, created_at: 0, updated_at: 0, name: roleType },
+                ],
           }
-        })
-      }
-    } catch (error) {
-      // Error is already handled in onError
+        }
+      )
     }
   }
 

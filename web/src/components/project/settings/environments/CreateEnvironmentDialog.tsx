@@ -49,14 +49,9 @@ export function CreateEnvironmentDialog({
   })
 
   const handleSubmit = async (values: FormValues) => {
-    try {
-      await onSubmit(values)
-      form.reset()
-      onOpenChange(false)
-    } catch (error) {
-      // Error handling will be done by the parent component
-      throw error
-    }
+    await onSubmit(values)
+    form.reset()
+    onOpenChange(false)
   }
 
   return (

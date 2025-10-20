@@ -35,7 +35,7 @@ export const GitHubPATForm: React.FC<GitHubPATFormProps> = ({
   onBack,
   onSuccess,
 }) => {
-  const navigate = useNavigate()
+  const _navigate = useNavigate()
   const queryClient = useQueryClient()
   const [token, setToken] = useState('')
   const [isSuccess, setIsSuccess] = useState(false)
@@ -45,7 +45,7 @@ export const GitHubPATForm: React.FC<GitHubPATFormProps> = ({
     meta: {
       errorTitle: 'Failed to configure GitHub PAT',
     },
-    onSuccess: async (data) => {
+    onSuccess: async (_data) => {
       setIsSuccess(true)
       toast.success('GitHub PAT configured successfully!')
 
@@ -254,8 +254,8 @@ export const GitHubPATForm: React.FC<GitHubPATFormProps> = ({
                   )}
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  Your GitHub personal access token (starts with "ghp_" or
-                  "github_pat_")
+                  Your GitHub personal access token (starts with
+                  &quot;ghp_&quot; or &quot;github_pat_&quot;)
                 </p>
               </div>
 

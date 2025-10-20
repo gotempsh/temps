@@ -117,33 +117,3 @@ export function usePlatformAccess() {
   }
   return context
 }
-
-// Helper hook to get just the access mode
-export function useAccessMode() {
-  const { accessInfo } = usePlatformAccess()
-  return accessInfo?.access_mode
-}
-
-// Helper hook to check if we're running in local mode
-export function useIsLocalMode() {
-  const { isLocal } = usePlatformAccess()
-  return isLocal
-}
-
-// Helper hook to check if we're behind NAT
-export function useIsNatMode() {
-  const { isNat } = usePlatformAccess()
-  return isNat
-}
-
-// Helper hook to check if we're using Cloudflare tunnel
-export function useIsCloudflareMode() {
-  const { isCloudflare } = usePlatformAccess()
-  return isCloudflare
-}
-
-// Helper hook to check if we have direct access
-export function useIsDirectMode() {
-  const { isDirect } = usePlatformAccess()
-  return isDirect
-}

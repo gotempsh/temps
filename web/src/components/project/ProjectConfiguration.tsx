@@ -1,9 +1,3 @@
-import { useState, useEffect, useCallback } from 'react'
-import { useForm, FormProvider } from 'react-hook-form'
-import { zodResolver } from '@hookform/resolvers/zod'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
-import * as z from 'zod'
-import { toast } from 'sonner'
 import { listServicesOptions } from '@/api/client/@tanstack/react-query.gen'
 import { RepositoryResponse, ServiceTypeRoute } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
@@ -15,44 +9,30 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { Form } from '@/components/ui/form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useCallback, useEffect, useState } from 'react'
+import { FormProvider, useForm, useWatch } from 'react-hook-form'
+import { toast } from 'sonner'
+import * as z from 'zod'
 
-import { Badge } from '@/components/ui/badge'
 import { CreateServiceDialog } from '@/components/storage/CreateServiceDialog'
+import { Badge } from '@/components/ui/badge'
 
 import { Progress } from '@/components/ui/progress'
 import {
-  ChevronRight,
-  ChevronLeft,
-  Settings,
-  Loader2,
-  FileText,
-  Server,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
+  FileText,
+  Loader2,
+  Server,
+  Settings,
 } from 'lucide-react'
-import { ProjectDetailsStep } from './wizard/ProjectDetailsStep'
-import { ServicesStep } from './wizard/ServicesStep'
 import { EnvironmentStep } from './wizard/EnvironmentStep'
+import { ProjectDetailsStep } from './wizard/ProjectDetailsStep'
 import { ReviewStep } from './wizard/ReviewStep'
-
-const SERVICE_TYPES = [
-  {
-    id: 'postgres' as ServiceTypeRoute,
-    name: 'PostgreSQL',
-    description: 'Reliable Relational Database',
-  },
-  {
-    id: 'redis' as ServiceTypeRoute,
-    name: 'Redis',
-    description: 'In-Memory Data Store',
-  },
-  { id: 's3' as ServiceTypeRoute, name: 'S3', description: 'Object Storage' },
-  {
-    id: 'libsql' as ServiceTypeRoute,
-    name: 'LibSQL',
-    description: 'SQLite-compatible Database',
-  },
-]
+import { ServicesStep } from './wizard/ServicesStep'
 
 // Wizard step definitions
 const WIZARD_STEPS = [
@@ -125,7 +105,7 @@ interface ProjectConfigurationProps {
 
 export function ProjectConfiguration({
   repository,
-  connectionId,
+  connectionId: _connectionId,
   presetData,
   branches,
   onSubmit,
@@ -133,7 +113,7 @@ export function ProjectConfiguration({
   mode,
   className,
 }: ProjectConfigurationProps) {
-  const queryClient = useQueryClient()
+  const _queryClient = useQueryClient()
   const [currentStep, setCurrentStep] = useState(0)
   const [completedSteps, setCompletedSteps] = useState<Set<number>>(new Set())
   const [isCreateServiceDialogOpen, setIsCreateServiceDialogOpen] =
@@ -194,7 +174,6 @@ export function ProjectConfiguration({
         ? currentServices.filter((id) => id !== serviceId)
         : [...currentServices, serviceId]
 
-      console.log('newValues', newValues)
       form.setValue('storageServices', newValues)
     },
     [form]
@@ -203,7 +182,7 @@ export function ProjectConfiguration({
   // Queries
   const {
     data: existingServices,
-    isLoading: isServicesLoading,
+    isLoading: _isServicesLoading,
     refetch: refetchServices,
   } = useQuery({
     ...listServicesOptions({}),
@@ -232,7 +211,8 @@ export function ProjectConfiguration({
     const currentStepData = WIZARD_STEPS[currentStep]
     if (currentStepData.fields.length === 0) return true // Review step has no validation
 
-    const fieldsToValidate = currentStepData.fields as (keyof FormValues)[]
+    const fieldsToValidate =
+      currentStepData.fields as unknown as (keyof FormValues)[]
     return await form.trigger(fieldsToValidate)
   }
 
@@ -281,7 +261,12 @@ export function ProjectConfiguration({
     }
   }
 
-  const watchedEnvVars = form.watch('environmentVariables') || []
+  const watchedEnvVars =
+    useWatch({
+      control: form.control,
+      name: 'environmentVariables',
+      defaultValue: [],
+    }) || []
   const currentStepData = WIZARD_STEPS[currentStep]
   const progress = ((currentStep + 1) / WIZARD_STEPS.length) * 100
 
@@ -345,114 +330,109 @@ export function ProjectConfiguration({
   return (
     <div className={className}>
       <FormProvider {...form}>
-        <Form {...form}>
-          <form
-            onSubmit={form.handleSubmit(handleSubmit)}
-            className="space-y-6"
-          >
-            {/* Wizard Header */}
-            <Card>
-              <CardHeader>
-                <div className="flex items-center justify-between mb-4">
-                  <div>
-                    <CardTitle className="flex items-center gap-2">
-                      <currentStepData.icon className="h-5 w-5" />
-                      {currentStepData.title}
-                    </CardTitle>
-                    <CardDescription>
-                      {currentStepData.description}
-                    </CardDescription>
-                  </div>
-                  <Badge variant="outline">
-                    Step {currentStep + 1} of {WIZARD_STEPS.length}
-                  </Badge>
+        <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
+          {/* Wizard Header */}
+          <Card>
+            <CardHeader>
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <CardTitle className="flex items-center gap-2">
+                    <currentStepData.icon className="h-5 w-5" />
+                    {currentStepData.title}
+                  </CardTitle>
+                  <CardDescription>
+                    {currentStepData.description}
+                  </CardDescription>
                 </div>
+                <Badge variant="outline">
+                  Step {currentStep + 1} of {WIZARD_STEPS.length}
+                </Badge>
+              </div>
 
-                {/* Progress Bar */}
-                <Progress value={progress} className="h-2" />
+              {/* Progress Bar */}
+              <Progress value={progress} className="h-2" />
 
-                {/* Step Navigation */}
-                <div className="flex items-center justify-between mt-4">
-                  <div className="flex items-center gap-2">
-                    {WIZARD_STEPS.map((step, index) => {
-                      const Icon = step.icon
-                      const isCompleted = completedSteps.has(index)
-                      const isCurrent = index === currentStep
-                      const isAccessible =
-                        index <= currentStep || completedSteps.has(index)
-
-                      return (
-                        <button
-                          key={step.id}
-                          type="button"
-                          onClick={() => isAccessible && goToStep(index)}
-                          disabled={!isAccessible}
-                          className={`flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
-                            isCurrent
-                              ? 'bg-primary text-primary-foreground'
-                              : isCompleted
-                                ? 'bg-muted text-muted-foreground hover:bg-muted/80'
-                                : isAccessible
-                                  ? 'hover:bg-muted text-muted-foreground'
-                                  : 'text-muted-foreground/50 cursor-not-allowed'
-                          }`}
-                        >
-                          <Icon className="h-4 w-4" />
-                          <span className="hidden sm:inline">{step.title}</span>
-                          {isCompleted && <CheckCircle2 className="h-4 w-4" />}
-                        </button>
-                      )
-                    })}
-                  </div>
-                </div>
-              </CardHeader>
-            </Card>
-
-            {/* Step Content */}
-            <Card>
-              <CardContent className="p-6">{renderStepContent()}</CardContent>
-            </Card>
-
-            {/* Navigation Buttons */}
-            <Card>
-              <CardFooter className="flex items-center justify-between">
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={previousStep}
-                  disabled={currentStep === 0}
-                >
-                  <ChevronLeft className="mr-2 h-4 w-4" />
-                  Previous
-                </Button>
-
+              {/* Step Navigation */}
+              <div className="flex items-center justify-between mt-4">
                 <div className="flex items-center gap-2">
-                  {currentStep < WIZARD_STEPS.length - 1 ? (
-                    <Button type="button" onClick={nextStep}>
-                      Next
-                      <ChevronRight className="ml-2 h-4 w-4" />
-                    </Button>
-                  ) : (
-                    <Button type="submit" disabled={isLoading}>
-                      {isLoading ? (
-                        <>
-                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                          {mode === 'onboarding'
-                            ? 'Creating Project...'
-                            : 'Importing Project...'}
-                        </>
-                      ) : mode === 'onboarding' ? (
-                        'Create Project'
-                      ) : (
-                        'Import Project'
-                      )}
-                    </Button>
-                  )}
+                  {WIZARD_STEPS.map((step, index) => {
+                    const Icon = step.icon
+                    const isCompleted = completedSteps.has(index)
+                    const isCurrent = index === currentStep
+                    const isAccessible =
+                      index <= currentStep || completedSteps.has(index)
+
+                    return (
+                      <button
+                        key={step.id}
+                        type="button"
+                        onClick={() => isAccessible && goToStep(index)}
+                        disabled={!isAccessible}
+                        className={`flex items-center gap-2 px-3 py-2 rounded-md text-sm transition-colors ${
+                          isCurrent
+                            ? 'bg-primary text-primary-foreground'
+                            : isCompleted
+                              ? 'bg-muted text-muted-foreground hover:bg-muted/80'
+                              : isAccessible
+                                ? 'hover:bg-muted text-muted-foreground'
+                                : 'text-muted-foreground/50 cursor-not-allowed'
+                        }`}
+                      >
+                        <Icon className="h-4 w-4" />
+                        <span className="hidden sm:inline">{step.title}</span>
+                        {isCompleted && <CheckCircle2 className="h-4 w-4" />}
+                      </button>
+                    )
+                  })}
                 </div>
-              </CardFooter>
-            </Card>
-          </form>
-        </Form>
+              </div>
+            </CardHeader>
+          </Card>
+
+          {/* Step Content */}
+          <Card>
+            <CardContent className="p-6">{renderStepContent()}</CardContent>
+          </Card>
+
+          {/* Navigation Buttons */}
+          <Card>
+            <CardFooter className="flex items-center justify-between">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={previousStep}
+                disabled={currentStep === 0}
+              >
+                <ChevronLeft className="mr-2 h-4 w-4" />
+                Previous
+              </Button>
+
+              <div className="flex items-center gap-2">
+                {currentStep < WIZARD_STEPS.length - 1 ? (
+                  <Button type="button" onClick={nextStep}>
+                    Next
+                    <ChevronRight className="ml-2 h-4 w-4" />
+                  </Button>
+                ) : (
+                  <Button type="submit" disabled={isLoading}>
+                    {isLoading ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        {mode === 'onboarding'
+                          ? 'Creating Project...'
+                          : 'Importing Project...'}
+                      </>
+                    ) : mode === 'onboarding' ? (
+                      'Create Project'
+                    ) : (
+                      'Import Project'
+                    )}
+                  </Button>
+                )}
+              </div>
+            </CardFooter>
+          </Card>
+        </form>
       </FormProvider>
 
       {/* Create Service Dialog */}

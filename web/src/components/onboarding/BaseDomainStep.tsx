@@ -25,7 +25,7 @@ export function BaseDomainStep({
   const { accessInfo } = usePlatformAccess()
 
   // Get public IP
-  const { data: publicIpData, isLoading: ipLoading } = useQuery({
+  const { data: _publicIpData, isLoading: _ipLoading } = useQuery({
     ...getPublicIpOptions(),
     retry: 2,
   })
@@ -104,7 +104,8 @@ export function BaseDomainStep({
           </div>
           {error && <p className="text-sm text-destructive">{error}</p>}
           <p className="text-xs text-muted-foreground">
-            Enter your domain without "www" or subdomains (e.g., example.com)
+            Enter your domain without &quot;www&quot; or subdomains (e.g.,
+            example.com)
           </p>
         </div>
 
@@ -129,8 +130,8 @@ export function BaseDomainStep({
         <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
           <Info className="h-4 w-4 text-blue-600" />
           <AlertDescription className="text-sm">
-            <strong>Next step:</strong> You'll need to configure DNS records to
-            point this domain to your server.
+            <strong>Next step:</strong> You&apos;ll need to configure DNS
+            records to point this domain to your server.
           </AlertDescription>
         </Alert>
       </div>

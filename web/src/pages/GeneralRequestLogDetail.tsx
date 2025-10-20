@@ -23,6 +23,7 @@ import {
 import { format } from 'date-fns'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { HeadersDisplay } from '@/components/http/HeadersDisplay'
 
 export default function GeneralRequestLogDetail() {
   const { logId } = useParams<{ logId: string }>()
@@ -512,47 +513,10 @@ export default function GeneralRequestLogDetail() {
                     </CardHeader>
                     <CardContent>
                       <ScrollArea className="h-[400px] w-full">
-                        {logDetail.request_headers ? (
-                          <div className="space-y-3">
-                            {(() => {
-                              try {
-                                const headers =
-                                  typeof logDetail.request_headers === 'string'
-                                    ? JSON.parse(logDetail.request_headers)
-                                    : logDetail.request_headers
-                                return Object.entries(headers).map(
-                                  ([key, value]) => (
-                                    <div
-                                      key={key}
-                                      className="border-b pb-2 last:border-0"
-                                    >
-                                      <div className="flex flex-col space-y-1">
-                                        <span className="text-sm font-medium">
-                                          {key}
-                                        </span>
-                                        <span className="text-sm text-muted-foreground font-mono break-all">
-                                          {Array.isArray(value)
-                                            ? value.join(', ')
-                                            : String(value)}
-                                        </span>
-                                      </div>
-                                    </div>
-                                  )
-                                )
-                              } catch (e) {
-                                return (
-                                  <p className="text-sm text-muted-foreground">
-                                    Failed to parse request headers
-                                  </p>
-                                )
-                              }
-                            })()}
-                          </div>
-                        ) : (
-                          <p className="text-sm text-muted-foreground">
-                            No request headers available
-                          </p>
-                        )}
+                        <HeadersDisplay
+                          headers={logDetail.request_headers}
+                          emptyMessage="Failed to parse request headers"
+                        />
                       </ScrollArea>
                     </CardContent>
                   </Card>
@@ -567,47 +531,10 @@ export default function GeneralRequestLogDetail() {
                     </CardHeader>
                     <CardContent>
                       <ScrollArea className="h-[400px] w-full">
-                        {logDetail.headers ? (
-                          <div className="space-y-3">
-                            {(() => {
-                              try {
-                                const headers =
-                                  typeof logDetail.headers === 'string'
-                                    ? JSON.parse(logDetail.headers)
-                                    : logDetail.headers
-                                return Object.entries(headers).map(
-                                  ([key, value]) => (
-                                    <div
-                                      key={key}
-                                      className="border-b pb-2 last:border-0"
-                                    >
-                                      <div className="flex flex-col space-y-1">
-                                        <span className="text-sm font-medium">
-                                          {key}
-                                        </span>
-                                        <span className="text-sm text-muted-foreground font-mono break-all">
-                                          {Array.isArray(value)
-                                            ? value.join(', ')
-                                            : String(value)}
-                                        </span>
-                                      </div>
-                                    </div>
-                                  )
-                                )
-                              } catch (e) {
-                                return (
-                                  <p className="text-sm text-muted-foreground">
-                                    Failed to parse response headers
-                                  </p>
-                                )
-                              }
-                            })()}
-                          </div>
-                        ) : (
-                          <p className="text-sm text-muted-foreground">
-                            No response headers available
-                          </p>
-                        )}
+                        <HeadersDisplay
+                          headers={logDetail.headers}
+                          emptyMessage="Failed to parse response headers"
+                        />
                       </ScrollArea>
                     </CardContent>
                   </Card>

@@ -42,6 +42,38 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 
+// Type definitions for event data
+interface IncrementalSnapshotData {
+  source?: number
+  [key: string]: unknown
+}
+
+interface MetaEventData {
+  href?: string
+  [key: string]: unknown
+}
+
+// Type guards
+function isIncrementalSnapshotData(
+  data: unknown
+): data is IncrementalSnapshotData {
+  return (
+    typeof data === 'object' &&
+    data !== null &&
+    ('source' in data
+      ? typeof (data as IncrementalSnapshotData).source === 'number'
+      : true)
+  )
+}
+
+function isMetaEventData(data: unknown): data is MetaEventData {
+  return (
+    typeof data === 'object' &&
+    data !== null &&
+    ('href' in data ? typeof (data as MetaEventData).href === 'string' : true)
+  )
+}
+
 // Event type mapping
 const EVENT_TYPE_INFO = {
   0: { name: 'DOMContentLoaded', icon: FileText, color: 'text-blue-500' },
@@ -78,20 +110,25 @@ const getEventDescription = (event: SessionEventDto): string => {
     EVENT_TYPE_INFO[event.event_type as keyof typeof EVENT_TYPE_INFO]
 
   // For incremental snapshots, get more detail
-  if (event.event_type === 3 && event.data?.source !== undefined) {
-    const incrementalType =
-      INCREMENTAL_TYPES[event.data.source as keyof typeof INCREMENTAL_TYPES] ||
-      'Unknown'
-    return incrementalType
+  if (event.event_type === 3 && isIncrementalSnapshotData(event.data)) {
+    if (event.data.source !== undefined) {
+      const incrementalType =
+        INCREMENTAL_TYPES[
+          event.data.source as keyof typeof INCREMENTAL_TYPES
+        ] || 'Unknown'
+      return incrementalType
+    }
   }
 
   // For meta events, show URL if available
-  if (event.event_type === 4 && event.data?.href) {
-    try {
-      const url = new URL(event.data.href)
-      return url.pathname
-    } catch {
-      return event.data.href
+  if (event.event_type === 4 && isMetaEventData(event.data)) {
+    if (event.data.href) {
+      try {
+        const url = new URL(event.data.href)
+        return url.pathname
+      } catch {
+        return event.data.href
+      }
     }
   }
 
@@ -103,26 +140,31 @@ const getEventIcon = (event: SessionEventDto) => {
     EVENT_TYPE_INFO[event.event_type as keyof typeof EVENT_TYPE_INFO]
 
   // Special icons for incremental snapshot types
-  if (event.event_type === 3 && event.data?.source !== undefined) {
-    const iconMap: Record<number, any> = {
-      0: FileEdit, // Mutation
-      1: Mouse, // Mouse Move
-      2: MousePointerClick, // Mouse Interaction
-      3: ScrollText, // Scroll
-      4: Maximize2, // Viewport Resize
-      5: Keyboard, // Input
-      6: Smartphone, // Touch Move
-      7: Play, // Media Interaction
-      8: Palette, // Style Sheet Rule
-      9: Brush, // Canvas Mutation
-      10: Type, // Font
-      11: Terminal, // Log
-      12: Move, // Drag
-      13: PaintBucket, // Style Declaration
-      14: TextSelect, // Selection
-      15: FileCode, // Adopted Style Sheet
+  if (event.event_type === 3 && isIncrementalSnapshotData(event.data)) {
+    if (event.data.source !== undefined) {
+      const iconMap: Record<
+        number,
+        React.ComponentType<{ className?: string }>
+      > = {
+        0: FileEdit, // Mutation
+        1: Mouse, // Mouse Move
+        2: MousePointerClick, // Mouse Interaction
+        3: ScrollText, // Scroll
+        4: Maximize2, // Viewport Resize
+        5: Keyboard, // Input
+        6: Smartphone, // Touch Move
+        7: Play, // Media Interaction
+        8: Palette, // Style Sheet Rule
+        9: Brush, // Canvas Mutation
+        10: Type, // Font
+        11: Terminal, // Log
+        12: Move, // Drag
+        13: PaintBucket, // Style Declaration
+        14: TextSelect, // Selection
+        15: FileCode, // Adopted Style Sheet
+      }
+      return iconMap[event.data.source] || MousePointer
     }
-    return iconMap[event.data.source] || MousePointer
   }
 
   return eventInfo?.icon || MousePointer
@@ -132,14 +174,6 @@ const getEventColor = (event: SessionEventDto) => {
   const eventInfo =
     EVENT_TYPE_INFO[event.event_type as keyof typeof EVENT_TYPE_INFO]
   return eventInfo?.color || 'text-gray-500'
-}
-
-interface Event {
-  id: string
-  timestamp: number
-  type: string
-  data: any
-  url?: string
 }
 
 export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
@@ -171,7 +205,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
   } = useQuery({
     ...getSessionReplayOptions({
       path: {
-        visitor_id: visitorId as any, // API expects number but system uses UUID string
+        visitor_id: Number(visitorId) || 0,
         session_id: Number(sessionId) || 0,
       },
     }),
@@ -181,12 +215,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
     ...getSessionReplayEventsOptions({
       path: {
         session_id: Number(sessionId) || 0,
-        visitor_id: visitorId as any, // API expects number but system uses UUID string
-      },
-      query: {
-        project_id: project.id.toString(),
-        limit: 1000,
-        offset: 0,
+        visitor_id: Number(visitorId) || 0,
       },
     }),
   })
@@ -208,7 +237,10 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
     let currentGroup: (typeof groups)[0] | null = null
 
     events.forEach((event) => {
-      const subType = event.event_type === 3 ? event.data?.source : undefined
+      const subType =
+        event.event_type === 3 && isIncrementalSnapshotData(event.data)
+          ? event.data.source
+          : undefined
 
       // Check if should group with previous
       const shouldGroup =
@@ -225,7 +257,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
         if (currentGroup) groups.push(currentGroup)
         currentGroup = {
           events: [event],
-          type: event.event_type,
+          type: event.event_type || 0,
           subType,
           startTime: event.timestamp,
           endTime: event.timestamp,
@@ -249,7 +281,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
   }
 
   // Calculate session stats
-  const duration = sessionData?.session?.session?.duration || 0
+  const duration = sessionData?.session?.duration || 0
   const formatDuration = (ms: number) => {
     const seconds = Math.floor(ms / 1000)
     const minutes = Math.floor(seconds / 60)
@@ -296,19 +328,10 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
 
           <Card className="border-0 shadow-none bg-muted/30">
             <CardContent className="flex items-center gap-2 p-3">
-              <div className="text-xs text-muted-foreground">Pages</div>
-              <div className="font-semibold">
-                {sessionData?.session?.session?.page_count || 0}
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card className="border-0 shadow-none bg-muted/30">
-            <CardContent className="flex items-center gap-2 p-3">
               <div className="text-xs text-muted-foreground">Viewport</div>
               <div className="font-semibold">
-                {sessionData?.session?.session?.viewport_width || 0}×
-                {sessionData?.session?.session?.viewport_height || 0}
+                {sessionData?.session?.viewport_width || 0}×
+                {sessionData?.session?.viewport_height || 0}
               </div>
             </CardContent>
           </Card>
@@ -322,15 +345,12 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
             events={events}
             sessionData={{
               id: sessionId || '',
-              created_at: sessionData?.session?.session?.created_at || '',
-              url: sessionData?.session?.session?.url || '',
-              duration: sessionData?.session?.session?.duration || 0,
+              created_at: sessionData?.session?.created_at || '',
+              url: sessionData?.session?.url || '',
+              duration: sessionData?.session?.duration || 0,
               event_count: events.length,
-              page_count: sessionData?.session?.session?.event_count || 0,
-              viewport_width:
-                sessionData?.session?.session?.viewport_width || 0,
-              viewport_height:
-                sessionData?.session?.session?.viewport_height || 0,
+              viewport_width: sessionData?.session?.viewport_width || 0,
+              viewport_height: sessionData?.session?.viewport_height || 0,
             }}
             isLoading={isLoading}
             error={error ? 'Failed to load session replay events' : null}
@@ -378,6 +398,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
                   <div className="divide-y">
                     {groupedEvents.map((group, index) => {
                       const firstEvent = group.events[0]
+                      const firstEventData = firstEvent.data as any
                       const Icon = getEventIcon(firstEvent)
                       const color = getEventColor(firstEvent)
                       const description = getEventDescription(firstEvent)
@@ -407,18 +428,28 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
                                   </span>
                                 )}
                               </div>
-                              {/* Show event data preview */}
-                              {firstEvent.data && (
+                              {firstEventData && (
                                 <div className="text-xs text-muted-foreground mt-1 font-mono truncate">
                                   {(() => {
-                                    const data = firstEvent.data
-                                    if (data.href) return data.href
-                                    if (data.source !== undefined) {
-                                      return INCREMENTAL_TYPES[
-                                        data.source as keyof typeof INCREMENTAL_TYPES
-                                      ]
+                                    // Check for meta event with href
+                                    if (isMetaEventData(firstEventData)) {
+                                      if (firstEventData.href)
+                                        return firstEventData.href
                                     }
-                                    const str = JSON.stringify(data)
+
+                                    // Check for incremental snapshot with source
+                                    if (
+                                      isIncrementalSnapshotData(firstEventData)
+                                    ) {
+                                      if (firstEventData.source !== undefined) {
+                                        return INCREMENTAL_TYPES[
+                                          firstEventData.source as keyof typeof INCREMENTAL_TYPES
+                                        ]
+                                      }
+                                    }
+
+                                    // Fallback to JSON stringify
+                                    const str = JSON.stringify(firstEventData)
                                     return str.length > 50
                                       ? str.slice(0, 50) + '...'
                                       : str
@@ -428,13 +459,17 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
                             </div>
                           </div>
 
-                          {/* Expanded event details */}
-                          {isSelected && firstEvent.data && (
+                          {isSelected && firstEventData && (
                             <div className="mt-3 ml-[60px] p-2 bg-muted/30 rounded-md">
                               <pre className="text-xs overflow-x-auto">
-                                {typeof firstEvent.data === 'object'
-                                  ? JSON.stringify(firstEvent.data, null, 2)
-                                  : String(firstEvent.data)}
+                                {(() => {
+                                  const data = firstEventData
+                                  const formattedData: string =
+                                    typeof data === 'object' && data !== null
+                                      ? JSON.stringify(data, null, 2)
+                                      : String(data)
+                                  return formattedData
+                                })()}
                               </pre>
                             </div>
                           )}

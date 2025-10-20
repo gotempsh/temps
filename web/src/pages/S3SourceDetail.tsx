@@ -26,22 +26,14 @@ export function S3SourceDetail() {
   const { id } = useParams<{ id: string }>()
   const { setBreadcrumbs } = useBreadcrumbs()
 
-  const {
-    data: source,
-    isLoading: isLoadingSource,
-    refetch: refetchSource,
-  } = useQuery({
+  const { data: source, isLoading: isLoadingSource } = useQuery({
     ...getS3SourceOptions({
       path: { id: parseInt(id!) },
     }),
     enabled: !!id,
   })
 
-  const {
-    data: backups,
-    isLoading: isLoadingBackups,
-    refetch: refetchBackups,
-  } = useQuery({
+  const { data: backups, isLoading: isLoadingBackups } = useQuery({
     ...listSourceBackupsOptions({
       path: { id: parseInt(id!) },
     }),

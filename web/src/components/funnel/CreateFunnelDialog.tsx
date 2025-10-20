@@ -42,7 +42,7 @@ export function CreateFunnelDialog({
     meta: {
       errorTitle: 'Failed to create funnel',
     },
-    onSuccess: (data) => {
+    onSuccess: (_data) => {
       queryClient.invalidateQueries({ queryKey: ['listFunnels'] })
       setOpen(false)
       setFormData({

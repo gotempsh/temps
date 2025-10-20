@@ -14,6 +14,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { CopyButton } from '@/components/ui/copy-button'
 import {
   Dialog,
   DialogContent,
@@ -32,7 +33,6 @@ import { format } from 'date-fns'
 import {
   AlertCircle,
   ArrowLeft,
-  Copy,
   Eye,
   EyeOff,
   Loader2,
@@ -41,7 +41,6 @@ import {
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { toast } from 'sonner'
 
 export function ServiceDetail() {
   const { id } = useParams<{ id: string }>()
@@ -93,7 +92,7 @@ export function ServiceDetail() {
         { label: 'Service Details', href: `/storage/${id}` },
       ])
     }
-  }, [setBreadcrumbs, id, service?.service?.name])
+  }, [setBreadcrumbs, id, service])
 
   usePageTitle(service?.service?.name || 'Service Details')
 
@@ -106,21 +105,6 @@ export function ServiceDetail() {
 
   const maskValue = (value: string) => {
     return '*'.repeat(value.length)
-  }
-
-  const handleCopyEnvVars = async () => {
-    if (!envVars) return
-
-    const envString = Object.entries(envVars)
-      .map(([key, value]) => `${key}=${value}`)
-      .join('\n')
-
-    try {
-      await navigator.clipboard.writeText(envString)
-      toast.success('Environment variables copied to clipboard')
-    } catch (err) {
-      toast.error('Failed to copy to clipboard')
-    }
   }
 
   const startService = useMutation({
@@ -366,15 +350,13 @@ export function ServiceDetail() {
                   </CardDescription>
                 </div>
                 {envVars && Object.keys(envVars).length > 0 && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleCopyEnvVars}
-                    className="gap-2"
+                  <CopyButton
+                    value={Object.entries(envVars)
+                      .map(([key, value]) => `${key}=${value}`)
+                      .join('\n')}
                   >
-                    <Copy className="h-4 w-4" />
                     Copy All
-                  </Button>
+                  </CopyButton>
                 )}
               </div>
             </CardHeader>

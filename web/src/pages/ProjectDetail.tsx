@@ -117,8 +117,7 @@ export function ProjectDetail() {
     }
   }, [
     setBreadcrumbs,
-    project?.name,
-    project?.id,
+    project,
     refetchLastDeployment,
     showConfetti,
     searchParams,

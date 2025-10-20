@@ -20,11 +20,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     data: user,
     isLoading: userLoading,
     refetch: refetchUser,
-    error,
   } = useQuery({
     ...getCurrentUserOptions({}),
     retry: (failureCount, error: any) => {
-      console.log('Auth query retry:', { failureCount, error })
       // Don't retry on 401 (unauthorized) or cancelled requests
       if (error?.status === 401 || error?.name === 'AbortError') {
         return false

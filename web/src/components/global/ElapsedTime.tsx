@@ -6,8 +6,6 @@ interface ElapsedTimeProps {
 import { useEffect, useState } from 'react'
 
 export function ElapsedTime({ startedAt, endedAt }: ElapsedTimeProps) {
-  if (!startedAt) return null
-
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
@@ -17,6 +15,8 @@ export function ElapsedTime({ startedAt, endedAt }: ElapsedTimeProps) {
     }, 1000)
     return () => clearInterval(interval)
   }, [endedAt])
+
+  if (!startedAt) return null
 
   const startTime = new Date(startedAt).getTime()
   const endTime = endedAt ? new Date(endedAt).getTime() : now

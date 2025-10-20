@@ -189,7 +189,6 @@ export function VisitorsList({ project }: VisitorsListProps) {
                       key={visitor.visitor_id}
                       className="cursor-pointer hover:bg-muted/50"
                       onClick={() => {
-                        console.log('Navigating to visitor:', visitor.id)
                         navigate(
                           `/projects/${project.slug}/analytics/visitors/${visitor.id}`
                         )

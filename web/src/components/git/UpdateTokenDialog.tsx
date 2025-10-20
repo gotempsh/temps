@@ -12,7 +12,6 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { getErrorMessage } from '@/utils/errorHandling'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { AlertCircle, Key, Loader2 } from 'lucide-react'
 import { useForm } from 'react-hook-form'
@@ -57,7 +56,6 @@ export function UpdateTokenDialog({
       errorTitle: 'Failed to update connection token',
     },
     onSuccess: (data) => {
-      console.log('data', data)
       toast.success(data?.message || 'Token updated successfully')
       queryClient.invalidateQueries({ queryKey: ['listConnections'] })
       reset()

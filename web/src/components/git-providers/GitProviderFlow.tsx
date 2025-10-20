@@ -2,8 +2,8 @@ import {
   createGithubPatProviderMutation,
   createGitlabOauthProviderMutation,
   createGitlabPatProviderMutation,
-  listGitProvidersOptions,
   listDomainsOptions,
+  listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -17,6 +17,7 @@ import {
 } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -39,9 +40,8 @@ import {
   Users,
   Zap,
 } from 'lucide-react'
-import { useState, useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 
 type Step =
   | 'provider'
@@ -68,7 +68,7 @@ export function GitProviderFlow({
   onCancel,
   className,
   initialStep = 'provider',
-  mode = 'settings',
+  mode: _mode = 'settings',
 }: GitProviderFlowProps) {
   const queryClient = useQueryClient()
   const { isLocalMode: isLocal, hasPublicIP } = usePlatformCapabilities()
@@ -84,8 +84,6 @@ export function GitProviderFlow({
   const [providerName, setProviderName] = useState('')
   const [gitlabBaseUrl, setGitlabBaseUrl] = useState('https://gitlab.com')
   const [isCreatingApp, setIsCreatingApp] = useState(false)
-  const [useCustomUrl, setUseCustomUrl] = useState(false)
-  const [customApiUrl, setCustomApiUrl] = useState('')
   const [copiedWebhook, setCopiedWebhook] = useState(false)
   const [copiedCallback, setCopiedCallback] = useState(false)
   const [gitlabClientId, setGitlabClientId] = useState('')
@@ -97,7 +95,7 @@ export function GitProviderFlow({
 
   // Fetch existing git providers to check if there's already a GitHub app
   // Enable refetch interval when polling for installations
-  const { data: gitProviders = [], refetch: refetchProviders } = useQuery({
+  const { data: gitProviders = [], refetch: _refetchProviders } = useQuery({
     ...listGitProvidersOptions(),
     refetchInterval: isPollingInstallations ? 2000 : false, // Poll every 2s when active
   })
@@ -198,12 +196,8 @@ export function GitProviderFlow({
     window.location.hostname === '127.0.0.1' ||
     window.location.hostname.startsWith('192.168.')
 
-  const isHttps =
-    window.location.protocol === 'https:' ||
-    (useCustomUrl && customApiUrl?.startsWith('https://'))
-  const canCreateGitHubApp =
-    isHttps ||
-    (isLocalhost && useCustomUrl && customApiUrl?.startsWith('https://'))
+  const isHttps = window.location.protocol === 'https:'
+  const canCreateGitHubApp = isHttps || isLocalhost
   const httpWarningMessage = !isHttps
     ? 'GitHub Apps require HTTPS. Please use a secure connection or provide an HTTPS URL.'
     : ''
@@ -257,20 +251,14 @@ export function GitProviderFlow({
   })
 
   const handleCopyWebhook = () => {
-    const url =
-      useCustomUrl && customApiUrl
-        ? `${customApiUrl}/webhook/git/github/events`
-        : `${window.location.origin}/api/webhook/git/github/events`
+    const url = `${window.location.origin}/api/webhook/git/github/events`
     navigator.clipboard.writeText(url)
     setCopiedWebhook(true)
     setTimeout(() => setCopiedWebhook(false), 2000)
   }
 
   const handleCopyCallback = () => {
-    const url =
-      useCustomUrl && customApiUrl
-        ? `${customApiUrl}/webhook/git/github/callback`
-        : `${window.location.origin}/api/webhook/git/github/callback`
+    const url = `${window.location.origin}/api/webhook/git/github/callback`
     navigator.clipboard.writeText(url)
     setCopiedCallback(true)
     setTimeout(() => setCopiedCallback(false), 2000)
@@ -286,7 +274,7 @@ export function GitProviderFlow({
         return
       }
 
-      if (isLocalhost && !useCustomUrl) {
+      if (isLocalhost) {
         toast.error(
           'Please use Manual Setup for localhost or provide a public HTTPS URL'
         )
@@ -298,10 +286,7 @@ export function GitProviderFlow({
       const appName = `temps-${Math.random().toString(36).substring(2, 8)}`
       const source = crypto.randomUUID()
 
-      const baseUrl =
-        useCustomUrl && customApiUrl
-          ? customApiUrl
-          : `${window.location.origin}`
+      const baseUrl = `${window.location.origin}`
       const appUrl = `${baseUrl}`
       const apiUrl = `${baseUrl}/api`
 
@@ -482,8 +467,7 @@ export function GitProviderFlow({
       return
     }
 
-    const baseUrl =
-      useCustomUrl && customApiUrl ? customApiUrl : `${window.location.origin}`
+    const baseUrl = `${window.location.origin}`
     const redirectUri = `${baseUrl}/api/webhook/git/gitlab/auth`
 
     await createGitLabOAuth.mutateAsync({
@@ -791,7 +775,8 @@ export function GitProviderFlow({
                             </Badge>
                           </CardTitle>
                           <CardDescription className="mt-1">
-                            Install the existing &quot;{existingGitHubApp.name}&quot; app
+                            Install the existing &quot;{existingGitHubApp.name}
+                            &quot; app
                           </CardDescription>
                         </div>
                       </div>
@@ -962,8 +947,8 @@ export function GitProviderFlow({
                   <Alert className="border-green-200 bg-green-50/50 dark:bg-green-950/20">
                     <Sparkles className="h-4 w-4" />
                     <AlertDescription className="text-sm">
-                      Click below and we&apos;ll automatically configure everything
-                      for you!
+                      Click below and we&apos;ll automatically configure
+                      everything for you!
                     </AlertDescription>
                   </Alert>
                 )}
@@ -1093,107 +1078,102 @@ export function GitProviderFlow({
             </Card>
           </div>
 
-          {isLocalhost &&
-            selectedMethod === 'app' &&
-            !useCustomUrl &&
-            !isLocalMode && (
-              <Card className="border-orange-200 bg-orange-50/50 dark:bg-orange-950/20">
-                <CardContent className="pt-6 space-y-4">
-                  <div className="flex items-center gap-2 text-orange-800 dark:text-orange-200">
-                    <Settings className="h-5 w-5" />
-                    <h3 className="font-medium">
-                      Manual GitHub App Setup Instructions
-                    </h3>
+          {isLocalhost && selectedMethod === 'app' && !isLocalMode && (
+            <Card className="border-orange-200 bg-orange-50/50 dark:bg-orange-950/20">
+              <CardContent className="pt-6 space-y-4">
+                <div className="flex items-center gap-2 text-orange-800 dark:text-orange-200">
+                  <Settings className="h-5 w-5" />
+                  <h3 className="font-medium">
+                    Manual GitHub App Setup Instructions
+                  </h3>
+                </div>
+
+                <div className="space-y-4 text-sm">
+                  <div className="space-y-2">
+                    <p className="font-medium">1. Go to GitHub App settings:</p>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        window.open(
+                          'https://github.com/settings/apps/new',
+                          '_blank'
+                        )
+                      }
+                    >
+                      <ExternalLink className="mr-2 h-3 w-3" />
+                      Open GitHub Settings
+                    </Button>
                   </div>
 
-                  <div className="space-y-4 text-sm">
-                    <div className="space-y-2">
-                      <p className="font-medium">
-                        1. Go to GitHub App settings:
-                      </p>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() =>
-                          window.open(
-                            'https://github.com/settings/apps/new',
-                            '_blank'
-                          )
-                        }
-                      >
-                        <ExternalLink className="mr-2 h-3 w-3" />
-                        Open GitHub Settings
-                      </Button>
-                    </div>
-
-                    <div className="space-y-2">
-                      <p className="font-medium">2. Configure these URLs:</p>
-                      <div className="space-y-2 ml-4">
-                        <div>
-                          <p className="text-muted-foreground">Webhook URL:</p>
-                          <div className="flex items-center gap-2">
-                            <code className="text-xs bg-muted px-2 py-1 rounded flex-1 overflow-x-auto">
-                              {window.location.origin}
-                              /api/webhook/git/github/events
-                            </code>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="shrink-0 h-7 w-7 p-0"
-                              onClick={handleCopyWebhook}
-                            >
-                              {copiedWebhook ? (
-                                <Check className="h-3 w-3" />
-                              ) : (
-                                <Copy className="h-3 w-3" />
-                              )}
-                            </Button>
-                          </div>
+                  <div className="space-y-2">
+                    <p className="font-medium">2. Configure these URLs:</p>
+                    <div className="space-y-2 ml-4">
+                      <div>
+                        <p className="text-muted-foreground">Webhook URL:</p>
+                        <div className="flex items-center gap-2">
+                          <code className="text-xs bg-muted px-2 py-1 rounded flex-1 overflow-x-auto">
+                            {window.location.origin}
+                            /api/webhook/git/github/events
+                          </code>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="shrink-0 h-7 w-7 p-0"
+                            onClick={handleCopyWebhook}
+                          >
+                            {copiedWebhook ? (
+                              <Check className="h-3 w-3" />
+                            ) : (
+                              <Copy className="h-3 w-3" />
+                            )}
+                          </Button>
                         </div>
-                        <div>
-                          <p className="text-muted-foreground">Callback URL:</p>
-                          <div className="flex items-center gap-2">
-                            <code className="text-xs bg-muted px-2 py-1 rounded flex-1 overflow-x-auto">
-                              {window.location.origin}
-                              /api/webhook/git/github/callback
-                            </code>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="shrink-0 h-7 w-7 p-0"
-                              onClick={handleCopyCallback}
-                            >
-                              {copiedCallback ? (
-                                <Check className="h-3 w-3" />
-                              ) : (
-                                <Copy className="h-3 w-3" />
-                              )}
-                            </Button>
-                          </div>
+                      </div>
+                      <div>
+                        <p className="text-muted-foreground">Callback URL:</p>
+                        <div className="flex items-center gap-2">
+                          <code className="text-xs bg-muted px-2 py-1 rounded flex-1 overflow-x-auto">
+                            {window.location.origin}
+                            /api/webhook/git/github/callback
+                          </code>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="shrink-0 h-7 w-7 p-0"
+                            onClick={handleCopyCallback}
+                          >
+                            {copiedCallback ? (
+                              <Check className="h-3 w-3" />
+                            ) : (
+                              <Copy className="h-3 w-3" />
+                            )}
+                          </Button>
                         </div>
                       </div>
                     </div>
-
-                    <div className="space-y-1">
-                      <p className="font-medium">3. Set permissions:</p>
-                      <ul className="ml-4 text-muted-foreground list-disc list-inside space-y-1">
-                        <li>Contents: Write</li>
-                        <li>Metadata: Read</li>
-                        <li>Pull requests: Write</li>
-                        <li>Administration: Write</li>
-                      </ul>
-                    </div>
-
-                    <div className="space-y-1">
-                      <p className="font-medium">4. Subscribe to events:</p>
-                      <ul className="ml-4 text-muted-foreground list-disc list-inside">
-                        <li>Push, Pull request</li>
-                      </ul>
-                    </div>
                   </div>
-                </CardContent>
-              </Card>
-            )}
+
+                  <div className="space-y-1">
+                    <p className="font-medium">3. Set permissions:</p>
+                    <ul className="ml-4 text-muted-foreground list-disc list-inside space-y-1">
+                      <li>Contents: Write</li>
+                      <li>Metadata: Read</li>
+                      <li>Pull requests: Write</li>
+                      <li>Administration: Write</li>
+                    </ul>
+                  </div>
+
+                  <div className="space-y-1">
+                    <p className="font-medium">4. Subscribe to events:</p>
+                    <ul className="ml-4 text-muted-foreground list-disc list-inside">
+                      <li>Push, Pull request</li>
+                    </ul>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          )}
 
           <div className="flex items-center justify-between">
             <Button variant="outline" onClick={handleBack}>
@@ -1282,8 +1262,8 @@ export function GitProviderFlow({
                       <p className="font-medium text-sm">Local mode detected</p>
                       <p className="text-sm">
                         GitLab Applications require a publicly accessible URL to
-                        receive webhook events. Since you&apos;re running in local
-                        mode without external access, this option is not
+                        receive webhook events. Since you&apos;re running in
+                        local mode without external access, this option is not
                         available.
                       </p>
                       {externalUrl && (
@@ -1334,8 +1314,8 @@ export function GitProviderFlow({
                     <AlertDescription className="text-sm">
                       <p className="font-medium mb-2">Manual setup required</p>
                       <p>
-                        GitLab requires manual application creation. We&apos;ll show
-                        you the exact values to enter.
+                        GitLab requires manual application creation. We&apos;ll
+                        show you the exact values to enter.
                       </p>
                     </AlertDescription>
                   </Alert>
@@ -1548,8 +1528,8 @@ export function GitProviderFlow({
               <Alert>
                 <Shield className="h-4 w-4" />
                 <AlertDescription>
-                  Your token will be encrypted and stored securely. We&apos;ll never
-                  display it again after this setup.
+                  Your token will be encrypted and stored securely. We&apos;ll
+                  never display it again after this setup.
                 </AlertDescription>
               </Alert>
             </CardContent>
@@ -1674,8 +1654,8 @@ export function GitProviderFlow({
               <Alert>
                 <Shield className="h-4 w-4" />
                 <AlertDescription>
-                  Your token will be encrypted and stored securely. We&apos;ll never
-                  display it again after this setup.
+                  Your token will be encrypted and stored securely. We&apos;ll
+                  never display it again after this setup.
                 </AlertDescription>
               </Alert>
             </CardContent>
@@ -1770,10 +1750,7 @@ export function GitProviderFlow({
                       variant="ghost"
                       className="h-7 gap-1"
                       onClick={() => {
-                        const baseUrl =
-                          useCustomUrl && customApiUrl
-                            ? customApiUrl
-                            : `${window.location.origin}`
+                        const baseUrl = `${window.location.origin}`
                         const redirectUri = `${baseUrl}/api/webhook/git/gitlab/auth`
                         navigator.clipboard.writeText(redirectUri)
                         toast.success('Copied to clipboard!')
@@ -1784,9 +1761,7 @@ export function GitProviderFlow({
                     </Button>
                   </div>
                   <div className="bg-muted px-3 py-2 rounded-md font-mono text-sm break-all">
-                    {useCustomUrl && customApiUrl
-                      ? customApiUrl
-                      : window.location.origin}
+                    {window.location.origin}
                     /api/webhook/git/gitlab/auth
                   </div>
                   <p className="text-xs text-muted-foreground mt-1">
@@ -1839,9 +1814,9 @@ export function GitProviderFlow({
               <Alert>
                 <Shield className="h-4 w-4" />
                 <AlertDescription>
-                  After creating the application, you&apos;ll receive a Client ID and
-                  Client Secret. Save these credentials as you&apos;ll need them to
-                  complete the integration.
+                  After creating the application, you&apos;ll receive a Client
+                  ID and Client Secret. Save these credentials as you&apos;ll
+                  need them to complete the integration.
                 </AlertDescription>
               </Alert>
             </CardContent>
@@ -1968,8 +1943,8 @@ export function GitProviderFlow({
               <Alert>
                 <Shield className="h-4 w-4" />
                 <AlertDescription>
-                  Your credentials will be encrypted and stored securely. We&apos;ll
-                  never display them again after this setup.
+                  Your credentials will be encrypted and stored securely.
+                  We&apos;ll never display them again after this setup.
                 </AlertDescription>
               </Alert>
             </CardContent>

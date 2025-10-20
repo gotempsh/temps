@@ -168,7 +168,6 @@ export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
 
   const handleNavigate = useCallback(
     (item: NavItem) => {
-      console.log('handleNavigate', item)
       // If item has sub-items, expand it first
       if (item.subItems && item.subItems.length > 0) {
         setExpandedItems((prev) => {

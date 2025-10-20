@@ -682,9 +682,9 @@ export default function ApiKeyDetail() {
           <DialogHeader>
             <DialogTitle>Delete API Key</DialogTitle>
             <DialogDescription>
-              Are you sure you want to delete &quot;{apiKey.name}&quot;? This action
-              cannot be undone and will immediately invalidate all requests
-              using this key.
+              Are you sure you want to delete &quot;{apiKey.name}&quot;? This
+              action cannot be undone and will immediately invalidate all
+              requests using this key.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

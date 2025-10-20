@@ -62,7 +62,7 @@ import {
   RefreshCw,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { z } from 'zod'
@@ -143,7 +143,7 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
       connectionsData?.connections?.find(
         (conn) => conn.id === project?.git_provider_connection_id
       ),
-    [connectionsData, project?.git_provider_connection_id]
+    [connectionsData, project]
   )
   const currentProvider = useMemo(
     () =>
@@ -201,8 +201,8 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
       !!project?.git_provider_connection_id,
   })
 
-  const branches = branchesData?.branches || []
-  const currentBranch = form.watch('branch')
+  const branches = useMemo(() => branchesData?.branches || [], [branchesData])
+  const currentBranch = useWatch({ control: form.control, name: 'branch' })
 
   // Get repository ID for live preset detection
   const { data: repositoryData } = useQuery({
@@ -378,7 +378,7 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
     )
     refetch()
   }
-
+  const directory = useWatch({ control: form.control, name: 'directory' })
   return (
     <div className="space-y-6">
       <h3 className="text-lg font-medium">Git Settings</h3>
@@ -740,8 +740,7 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
                                               <div className="text-sm text-muted-foreground">
                                                 {presets.find(
                                                   (p) => p.value === field.value
-                                                )?.directory ||
-                                                  form.watch('directory')}
+                                                )?.directory || directory}
                                               </div>
                                             </CardContent>
                                           </Card>
@@ -1112,8 +1111,7 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
                   <div
                     key={preset.value}
                     className={`flex items-center gap-3 p-3 cursor-pointer hover:bg-accent ${
-                      !showCustomDirectory &&
-                      form.watch('directory') === preset.directory
+                      !showCustomDirectory && directory === preset.directory
                         ? 'bg-accent'
                         : ''
                     }`}
@@ -1126,8 +1124,7 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
                     <input
                       type="radio"
                       checked={
-                        !showCustomDirectory &&
-                        form.watch('directory') === preset.directory
+                        !showCustomDirectory && directory === preset.directory
                       }
                       onChange={() => {}}
                       className="h-4 w-4"
@@ -1189,7 +1186,8 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
                       </Button>
                     </div>
                     <p className="text-sm text-muted-foreground">
-                      Enter the relative path to your project's root directory
+                      Enter the relative path to your project&apos;s root
+                      directory
                     </p>
                   </div>
                 </div>

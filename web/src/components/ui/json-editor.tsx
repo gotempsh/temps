@@ -16,7 +16,6 @@ export function JsonEditor({
   value,
   onChange,
   onValidationChange,
-  placeholder,
   height = '120px',
   className,
 }: JsonEditorProps) {
@@ -30,7 +29,7 @@ export function JsonEditor({
     if (value && value !== localValue) {
       setLocalValue(value)
     }
-  }, [value])
+  }, [value, localValue])
 
   const handleEditorChange = (newValue: string | undefined) => {
     const valueToUse = newValue || DEFAULT_JSON_VALUE
@@ -62,7 +61,7 @@ export function JsonEditor({
 
         onValidationChange(true)
       } catch (e) {
-        onValidationChange(false, 'Invalid JSON format')
+        onValidationChange(false, `Invalid JSON format: ${e}`)
       }
     }
   }

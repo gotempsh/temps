@@ -32,7 +32,7 @@ export function ExternalUrlStep({
     meta: {
       errorTitle: 'Failed to update settings',
     },
-    onSuccess: (data) => {
+    onSuccess: (_data) => {
       toast.success('External URL and preview domain configured!')
       // Invalidate settings queries to refresh
       queryClient.invalidateQueries({ queryKey: ['getSettings'] })
@@ -97,7 +97,7 @@ export function ExternalUrlStep({
             />
           </div>
           <p className="text-xs text-muted-foreground">
-            The main URL where you'll access the Temps dashboard
+            The main URL where you&apos;ll access the Temps dashboard
           </p>
         </div>
 

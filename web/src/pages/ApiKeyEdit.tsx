@@ -120,7 +120,8 @@ export default function ApiKeyEdit() {
             <AlertCircle className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
             <h3 className="text-lg font-medium">API Key not found</h3>
             <p className="text-muted-foreground mt-2">
-              The API key you're looking for doesn't exist or has been deleted.
+              The API key you&apos;re looking for doesn&apos;t exist or has been
+              deleted.
             </p>
             <Button className="mt-4" onClick={() => navigate('/keys')}>
               Back to API Keys

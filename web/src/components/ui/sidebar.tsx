@@ -61,7 +61,6 @@ const SidebarProvider = React.forwardRef<
   (
     {
       defaultOpen = true,
-      defaultMinimal = false,
       open: openProp,
       onOpenChange: setOpenProp,
       className,
@@ -678,10 +677,10 @@ const SidebarMenuSkeleton = React.forwardRef<
     showIcon?: boolean
   }
 >(({ className, showIcon = false, ...props }, ref) => {
-  // Random width between 50 to 90%.
-  const width = React.useMemo(() => {
-    return `${Math.floor(Math.random() * 40) + 50}%`
-  }, [])
+  // Generate width just once per mount, not during every render.
+  const [width] = React.useState(
+    () => `${Math.floor(Math.random() * 40) + 50}%`
+  )
 
   return (
     <div

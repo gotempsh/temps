@@ -1,3 +1,4 @@
+import { CreateServiceResponse, ServiceTypeRoute } from '@/api/client'
 import {
   Dialog,
   DialogContent,
@@ -5,7 +6,6 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { CreateServiceForm } from './CreateServiceForm'
-import { CreateServiceResponse, ServiceTypeRoute } from '@/api/client'
 
 interface CreateServiceDialogProps {
   open: boolean

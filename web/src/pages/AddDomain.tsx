@@ -19,7 +19,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
 import { CheckCircle, Globe, Info, Shield, ArrowLeft } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { z } from 'zod'
@@ -73,10 +73,6 @@ export function AddDomain() {
     },
   })
 
-  const handleFinish = () => {
-    navigate('/domains')
-  }
-
   const handleNext = () => {
     if (step === 'domain') {
       form.trigger('domain').then((valid) => {
@@ -102,19 +98,15 @@ export function AddDomain() {
   }
 
   const handleSubmit = async (data: DomainWizardFormData) => {
-    try {
-      await createDomain.mutateAsync({
-        body: {
-          domain: data.domain,
-          challenge_type: data.challengeType,
-        },
-      })
-    } catch (error) {
-      // Error handled in onError
-    }
+    await createDomain.mutateAsync({
+      body: {
+        domain: data.domain,
+        challenge_type: data.challengeType,
+      },
+    })
   }
 
-  const watchedValues = form.watch()
+  const watchedValues = useWatch({ control: form.control })
 
   return (
     <div className="flex-1 overflow-auto">
@@ -202,9 +194,9 @@ export function AddDomain() {
                     <Alert>
                       <Info className="h-4 w-4" />
                       <AlertDescription>
-                        You'll need to point your domain's DNS records to your
-                        server after creation. We'll provide detailed
-                        instructions in the next steps.
+                        You&apos;ll need to point your domain&apos;s DNS records
+                        to your server after creation. We&apos;ll provide
+                        detailed instructions in the next steps.
                       </AlertDescription>
                     </Alert>
 
@@ -444,8 +436,8 @@ export function AddDomain() {
                             <p className="font-medium">Next Steps (HTTP-01):</p>
                             <ol className="list-decimal list-inside space-y-1 text-sm">
                               <li>
-                                Point your domain's DNS A record to your server
-                                IP
+                                Point your domain&apos;s DNS A record to your
+                                server IP
                               </li>
                               <li>
                                 Ensure port 80 is accessible on your server
@@ -466,11 +458,12 @@ export function AddDomain() {
                             <p className="font-medium">Next Steps (DNS-01):</p>
                             <ol className="list-decimal list-inside space-y-1 text-sm">
                               <li>
-                                After creation, you'll receive a DNS TXT record
-                                to add
+                                After creation, you&apos;ll receive a DNS TXT
+                                record to add
                               </li>
                               <li>
-                                Add the TXT record to your domain's DNS settings
+                                Add the TXT record to your domain&apos;s DNS
+                                settings
                               </li>
                               <li>Wait for DNS propagation (up to 24 hours)</li>
                               <li>

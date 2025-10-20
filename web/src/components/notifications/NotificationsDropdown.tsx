@@ -103,7 +103,7 @@ export function NotificationsDropdown() {
   })
 
   // Mark multiple notifications
-  const markBulkMutation = useMutation({
+  const _markBulkMutation = useMutation({
     ...markNotificationsBulkMutation(),
     meta: {
       errorTitle: 'Failed to update notifications',

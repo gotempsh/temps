@@ -107,7 +107,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
   } = useQuery({
     ...getVisitorSessions2Options({
       path: {
-        visitor_id: visitorDetails?.id!,
+        visitor_id: visitorDetails?.id as number,
       },
       query: {
         page,

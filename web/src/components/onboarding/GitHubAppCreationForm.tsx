@@ -53,7 +53,6 @@ export function GitHubAppCreationForm({
         hasOpenedGitHub &&
         !isCheckingApp
       ) {
-        console.log('Tab became visible, checking for GitHub app...')
         setIsCheckingApp(true)
         try {
           const result = await onAppCreated()
@@ -64,9 +63,6 @@ export function GitHubAppCreationForm({
             })
             setHasOpenedGitHub(false)
           }
-        } catch (error) {
-          // Silently fail on auto-check - user can manually click if needed
-          console.log('Auto-check failed, user can manually retry')
         } finally {
           setIsCheckingApp(false)
         }
@@ -170,13 +166,6 @@ export function GitHubAppCreationForm({
       }
 
       // Log the manifest for debugging
-      console.log('=== GitHub App Creation Debug ===')
-      console.log('App Name:', appName)
-      console.log('Source ID:', source)
-      console.log('Base URL:', baseUrl)
-      console.log('App URL:', appUrl)
-      console.log('Webhook Base URL:', apiUrl)
-      console.log('Manifest Data:', JSON.stringify(manifestData, null, 2))
 
       // Create a form and submit it to GitHub
       const form = document.createElement('form')
@@ -197,10 +186,6 @@ export function GitHubAppCreationForm({
       input.value = manifestJson
 
       // Log what we're submitting
-      console.log('Form action:', form.action)
-      console.log('State:', source)
-      console.log('Manifest JSON length:', manifestJson.length)
-      console.log('Manifest JSON:', manifestJson)
 
       form.appendChild(input)
       document.body.appendChild(form)
@@ -470,7 +455,10 @@ export function GitHubAppCreationForm({
                 You&apos;ll be redirected to GitHub with all settings pre-filled
               </li>
               <li>Review and confirm the app creation on GitHub</li>
-              <li>Return here and click &quot;I&apos;ve created it&quot; to continue</li>
+              <li>
+                Return here and click &quot;I&apos;ve created it&quot; to
+                continue
+              </li>
             </ol>
           </div>
         </div>

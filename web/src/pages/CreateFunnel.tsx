@@ -69,7 +69,7 @@ export function CreateFunnel({ project }: CreateFunnelProps) {
 
     const validSteps = formData.steps
       .filter((step) => step.event_name.trim())
-      .map(({ showFilters, ...step }) => step)
+      .map(({ showFilters: _, ...step }) => step)
 
     createFunnel.mutate({
       path: {

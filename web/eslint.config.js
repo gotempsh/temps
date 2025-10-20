@@ -70,6 +70,9 @@ export default tseslint.config(
 
       // React Hooks rules
       ...reactHooksPlugin.configs.recommended.rules,
+      'react-hooks/rules-of-hooks': 'error',
+      'react-hooks/exhaustive-deps': 'warn',
+      'no-restricted-syntax': 'off', // Disable cascading setState warnings
 
       // React Refresh
       'react-refresh/only-export-components': [
@@ -87,7 +90,7 @@ export default tseslint.config(
           varsIgnorePattern: '^_',
         },
       ],
-      '@typescript-eslint/no-explicit-any': 'warn',
+      '@typescript-eslint/no-explicit-any': 'off',
       '@typescript-eslint/explicit-module-boundary-types': 'off',
 
       // General rules

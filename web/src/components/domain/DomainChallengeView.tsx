@@ -19,7 +19,7 @@ import {
   Shield,
   XCircle,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { AcmeOrderInfo } from './AcmeOrderInfo'
 import { DnsTxtRecordsDisplay } from './DnsTxtRecordsDisplay'
@@ -36,7 +36,6 @@ interface ChallengeStatus {
   }
   token: string
 }
-
 
 interface DomainChallengeViewProps {
   domain: DomainResponse
@@ -115,91 +114,79 @@ export function DomainChallengeView({
   })
 
   const handleCreateOrder = async () => {
-    try {
-      await createOrder.mutateAsync({
-        path: {
-          domain_id: domain.id,
-        },
-      })
-    } catch (error) {
-      // Error handled in onError
-    }
+    await createOrder.mutateAsync({
+      path: {
+        domain_id: domain.id,
+      },
+    })
   }
 
   const handleCompleteDns = async () => {
-    try {
-      await finalizeOrder.mutateAsync({
-        path: {
-          domain_id: domain.id,
-        },
-      })
-    } catch (error) {
-      // Error handled in onError
-    }
+    await finalizeOrder.mutateAsync({
+      path: {
+        domain_id: domain.id,
+      },
+    })
   }
 
   const handleCancelAndRecreate = async () => {
-    try {
-      // Reset validation status
-      setRecordValidations(new Map())
+    // Reset validation status
+    setRecordValidations(new Map())
 
-      // Cancel existing order
-      await cancelOrder.mutateAsync({
-        path: {
-          domain_id: domain.id,
-        },
-      })
-      // Create new order
-      await createOrder.mutateAsync({
-        path: {
-          domain_id: domain.id,
-        },
-      })
-    } catch (error) {
-      // Errors handled in onError callbacks
-    }
+    // Cancel existing order
+    await cancelOrder.mutateAsync({
+      path: {
+        domain_id: domain.id,
+      },
+    })
+    // Create new order
+    await createOrder.mutateAsync({
+      path: {
+        domain_id: domain.id,
+      },
+    })
   }
 
-  const fetchValidationStatus = async (
-    validationUrl: string,
-    recordIndex: number
-  ) => {
-    setFetchingRecords((prev) => new Set(prev).add(recordIndex))
-    try {
-      const response = await fetch(validationUrl, {
-        method: 'GET',
-        headers: {
-          Accept: 'application/json',
-        },
-      })
-      const data = await response.json()
-      setRecordValidations((prev) => new Map(prev).set(recordIndex, data))
-      return data
-    } catch (error) {
-      console.error('Failed to fetch validation status:', error)
-      return null
-    } finally {
-      setFetchingRecords((prev) => {
-        const newSet = new Set(prev)
-        newSet.delete(recordIndex)
-        return newSet
-      })
-    }
-  }
+  const fetchValidationStatus = useCallback(
+    async (validationUrl: string, recordIndex: number) => {
+      setFetchingRecords((prev) => new Set(prev).add(recordIndex))
+      try {
+        const response = await fetch(validationUrl, {
+          method: 'GET',
+          headers: {
+            Accept: 'application/json',
+          },
+        })
+        const data = await response.json()
+        setRecordValidations((prev) => new Map(prev).set(recordIndex, data))
+        return data
+      } catch (error) {
+        console.error('Failed to fetch validation status:', error)
+        return null
+      } finally {
+        setFetchingRecords((prev) => {
+          const newSet = new Set(prev)
+          newSet.delete(recordIndex)
+          return newSet
+        })
+      }
+    },
+    []
+  )
 
   // Get challenge info from order (DNS-01 specific)
   const challengeData = order?.authorizations as
     | {
-      challenge_type: 'dns-01' | 'http-01'
-      dns_txt_records: Array<{
-        name: string
-        value: string
+        challenge_type: 'dns-01' | 'http-01'
+        dns_txt_records: Array<{
+          name: string
+          value: string
+          validation_url?: string
+        }>
+        key_authorization: string
+        token: string
         validation_url?: string
-      }>
-      key_authorization: string
-      token: string
-      validation_url?: string
-    }
+      }
     | undefined
 
   // Auto-fetch validation status when order is available
@@ -217,7 +204,13 @@ export function DomainChallengeView({
         }
       })
     }
-  }, [order, challengeData])
+  }, [
+    order,
+    challengeData,
+    fetchValidationStatus,
+    fetchingRecords,
+    recordValidations,
+  ])
 
   const dnsTxtRecords = challengeData?.dns_txt_records || []
   const hasDnsValues = dnsTxtRecords.length > 0
@@ -369,7 +362,7 @@ export function DomainChallengeView({
                                 }
                               >
                                 {cancelOrder.isPending ||
-                                  createOrder.isPending ? (
+                                createOrder.isPending ? (
                                   <>
                                     <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                                     Recreating Order...

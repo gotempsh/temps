@@ -117,7 +117,7 @@ export type ProjectFormValues = z.infer<typeof formSchema>
 // Step definitions for different modes
 type WizardStep = 'repo-config' | 'services' | 'env-vars' | 'review'
 
-const STEP_CONFIG = {
+const _STEP_CONFIG = {
   'repo-config': {
     title: 'Repository & Configuration',
     description: 'Configure basic project settings',
@@ -168,10 +168,10 @@ export function ProjectConfigurator({
   connectionId,
   presetData,
   branches,
-  mode = 'wizard',
+  mode: _mode = 'wizard',
   onSubmit,
   onCancel,
-  showSteps = true,
+  showSteps: _showSteps = true,
   defaultValues,
   className,
 }: ProjectConfiguratorProps) {
@@ -179,7 +179,7 @@ export function ProjectConfigurator({
   const queryClient = useQueryClient()
 
   // State management
-  const [currentStep, setCurrentStep] = useState<WizardStep>('repo-config')
+  const [_currentStep, _setCurrentStep] = useState<WizardStep>('repo-config')
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isCreateServiceDialogOpen, setIsCreateServiceDialogOpen] =
     useState(false)
@@ -295,7 +295,6 @@ export function ProjectConfigurator({
     }
 
     const currentPreset = form.getValues('preset')
-    console.log('currentPreset', currentPreset)
     // Only auto-set if preset is empty
     if (currentPreset) {
       return
@@ -895,7 +894,7 @@ export function ProjectConfigurator({
   }
 
   // Render review step
-  const renderReview = () => {
+  const _renderReview = () => {
     const formData = form.getValues()
 
     return (

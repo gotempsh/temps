@@ -11,11 +11,11 @@ import {
   testProviderMutation,
   deleteProvider2Mutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { ProviderForm } from '@/components/monitoring/ProviderForm'
 import {
-  ProviderForm,
   ProviderFormData,
   providerSchema,
-} from '@/components/monitoring/ProviderForm'
+} from '@/components/monitoring/schemas'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -306,8 +306,8 @@ export function EditNotificationProvider() {
           <AlertDialogHeader>
             <AlertDialogTitle>Are you sure?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will permanently delete the "{provider.name}" notification
-              provider. This action cannot be undone.
+              This will permanently delete the &quot;{provider.name}&quot;
+              notification provider. This action cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

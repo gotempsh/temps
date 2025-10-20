@@ -21,7 +21,6 @@ export function ProjectConfigurationWizard({
   presetData,
   branches,
   onSubmit,
-  mode,
 }: ProjectConfigurationWizardProps) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

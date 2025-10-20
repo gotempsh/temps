@@ -22,57 +22,7 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { UseFormReturn } from 'react-hook-form'
 import { toast } from 'sonner'
-import * as z from 'zod'
-
-// Move the schema here since it's specific to the provider form
-export const providerSchema = z.object({
-  name: z.string().min(1, 'Name is required'),
-  provider_type: z.enum(['email', 'slack']),
-  config: z
-    .object({
-      // Slack config
-      webhook_url: z.string().url('Invalid webhook URL').optional(),
-      channel: z.string().optional(),
-      slack_username: z.string().optional(),
-
-      // Email config
-      smtp_host: z.string().optional(),
-      smtp_port: z.number().min(1).max(65535).optional(),
-      use_credentials: z.boolean().optional(),
-      smtp_username: z.string().optional(),
-      password: z.string().optional(),
-      from_name: z.string().optional(),
-      from_address: z.string().email('Invalid from address').optional(),
-      to_addresses: z
-        .array(z.string().email('Invalid email address'))
-        .optional(),
-      tls_mode: z
-        .union([
-          z.enum(['None', 'Starttls', 'Tls']),
-          z.literal(''),
-          z.undefined(),
-          z.null(),
-        ])
-        .transform((val) => (val === '' || val === null ? undefined : val))
-        .optional(),
-      starttls_required: z.boolean().optional(),
-      accept_invalid_certs: z.boolean().optional(),
-    })
-    .refine((data) => {
-      if (data.webhook_url) return true
-      // Username and password are now optional for SMTP
-      if (
-        data.smtp_host &&
-        data.smtp_port &&
-        data.from_address &&
-        data.to_addresses
-      )
-        return true
-      return false
-    }, 'Please fill in all required fields for the selected provider type'),
-})
-
-export type ProviderFormData = z.infer<typeof providerSchema>
+import { ProviderFormData } from './schemas'
 
 interface ProviderFormProps {
   form: UseFormReturn<ProviderFormData>
@@ -95,7 +45,6 @@ export function ProviderForm({
 }: ProviderFormProps) {
   const providerType = form.watch('provider_type')
   const tlsMode = form.watch('config.tls_mode')
-  const useCredentials = form.watch('config.use_credentials')
 
   // Suggest port based on TLS mode
   const getSuggestedPort = () => {
@@ -214,8 +163,10 @@ export function ProviderForm({
                 <FormItem>
                   <FormLabel>TLS Mode</FormLabel>
                   <Select
-                    onValueChange={field.onChange}
-                    value={field.value || undefined}
+                    onValueChange={(value) =>
+                      field.onChange(value || undefined)
+                    }
+                    value={field.value}
                   >
                     <FormControl>
                       <SelectTrigger>

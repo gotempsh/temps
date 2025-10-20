@@ -4,8 +4,6 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { AlertCircle, Database } from 'lucide-react'
-import { useTheme } from 'next-themes'
-import { useMemo } from 'react'
 
 const providers = [
   {
@@ -36,9 +34,6 @@ interface EmptyStateStorageProps {
 export default function EmptyStateStorage({
   onCreateClick,
 }: EmptyStateStorageProps) {
-  const { theme } = useTheme()
-  const isDark = useMemo(() => theme === 'dark', [theme])
-
   return (
     <div className="mx-auto max-w-4xl">
       <div className="flex flex-col items-center text-center mb-8">

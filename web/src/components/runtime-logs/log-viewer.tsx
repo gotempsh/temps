@@ -49,7 +49,6 @@ function estimateLineHeight(content: string, containerWidth: number) {
 }
 
 export default function LogViewer({ project }: { project: ProjectResponse }) {
-  const componentId = useRef(Math.random().toString(36).substr(2, 9))
   const [logs, setLogs] = useState<string[]>([])
   const [connectionStatus, setConnectionStatus] = useState<
     'connecting' | 'connected' | 'error' | 'permanent_error'
@@ -71,6 +70,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   const containerWidth = useRef<number>(0)
   const isConnectingRef = useRef(false)
   const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
     count: logs.length,
     getScrollElement: () => parentRef.current,
@@ -124,7 +124,6 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
 
     // Prevent multiple simultaneous connections
     if (isConnectingRef.current) {
-      console.log('Already connecting, skipping...')
       return
     }
 
@@ -134,7 +133,6 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
 
     const connectSSE = () => {
       if (isConnectingRef.current) {
-        console.log('Connection already in progress, skipping...')
         return
       }
 
@@ -160,24 +158,17 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
       const sseUrl = selectedContainer
         ? `/api/projects/${project.id}/environments/${selectedTarget}/containers/${selectedContainer}/logs?${params.toString()}`
         : `/api/projects/${project.id}/environments/${selectedTarget}/container-logs?${params.toString()}`
-      console.log(
-        `[${componentId.current}] Attempting to connect to SSE:`,
-        sseUrl
-      )
 
       // Close existing connection if any
       if (eventSourceRef.current) {
-        console.log('Existing EventSource found, closing...')
         eventSourceRef.current.close()
       }
 
       try {
-        console.log('Creating EventSource with URL:', sseUrl)
         eventSourceRef.current = new EventSource(sseUrl)
         setConnectionStatus('connecting')
 
         eventSourceRef.current.onopen = () => {
-          console.log('SSE connection established successfully')
           setConnectionStatus('connected')
           setRetryCount(0)
           setErrorMessage('')
@@ -185,14 +176,12 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
 
           // Clear any pending retry timeouts
           if (retryTimeoutRef.current) {
-            console.log('Clearing pending retry timeout')
             clearTimeout(retryTimeoutRef.current)
             retryTimeoutRef.current = null
           }
         }
 
         eventSourceRef.current.onmessage = (event) => {
-          console.log(`[${componentId.current}] Received message:`, event.data)
           try {
             // Try to parse as JSON first
             const parsed = JSON.parse(event.data)
@@ -231,10 +220,8 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
 
           setRetryCount((prev) => {
             const newRetryCount = prev + 1
-            console.log(`Retry attempt ${newRetryCount}/3`)
 
             if (newRetryCount >= 3) {
-              console.log('Max retries reached, giving up')
               setConnectionStatus('permanent_error')
               setErrorMessage('Connection failed after multiple attempts')
               return newRetryCount
@@ -243,7 +230,6 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
             // Temporary error - attempt to reconnect
             setConnectionStatus('error')
             const delay = Math.pow(2, newRetryCount) * 1000
-            console.log(`Scheduling reconnect in ${delay}ms`)
 
             // Clear any existing retry timeout
             if (retryTimeoutRef.current) {
@@ -252,11 +238,8 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
 
             retryTimeoutRef.current = setTimeout(() => {
               if (eventSourceRef.current !== null) {
-                console.log('Executing delayed reconnect')
                 retryTimeoutRef.current = null
                 connectSSE()
-              } else {
-                console.log('Not reconnecting - eventSourceRef.current is null')
               }
             }, delay)
 
@@ -271,16 +254,13 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
       }
     }
 
-    console.log(`[${componentId.current}] Initial SSE connection attempt`)
     connectSSE()
 
     return () => {
-      console.log('Cleaning up SSE connection')
       isConnectingRef.current = false
 
       // Clear any pending retry timeout
       if (retryTimeoutRef.current) {
-        console.log('Clearing retry timeout during cleanup')
         clearTimeout(retryTimeoutRef.current)
         retryTimeoutRef.current = null
       }
@@ -370,8 +350,19 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
         }
       }
 
-      eventSourceRef.current.onerror = (error) => {
-        setErrorMessage('Connection failed')
+      eventSourceRef.current.onerror = (err) => {
+        // Try to extract more details from the error event
+        let errorMessage = 'Connection failed'
+        // Some browsers set err as Event, but some as ErrorEvent or MessageEvent
+        // Try to extract info:
+        if ('message' in err) {
+          errorMessage += `: ${err.message}`
+        } else if ('data' in err) {
+          errorMessage += `: ${err.data}`
+        } else if ('status' in err) {
+          errorMessage += ` (status: ${err.status})`
+        }
+        setErrorMessage(errorMessage)
         eventSourceRef.current?.close()
 
         setRetryCount((prev) => {
@@ -396,19 +387,11 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
           return newRetryCount
         })
       }
-    } catch (error) {
+    } catch {
       setConnectionStatus('permanent_error')
       setErrorMessage('Failed to establish connection')
     }
-  }, [
-    project.id,
-    project.slug,
-    selectedTarget,
-    selectedContainer,
-    startDate,
-    endDate,
-    tail,
-  ])
+  }, [project.slug, selectedTarget, startDate, endDate, tail])
 
   // Update search functionality
   const scrollToMatch = (index: number, matches: number) => {

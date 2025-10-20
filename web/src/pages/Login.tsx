@@ -39,8 +39,6 @@ export const Login = () => {
       await login.mutateAsync({
         body: data,
       })
-    } catch (error) {
-      // Error is handled in onError
     } finally {
       setIsLoading(false)
     }

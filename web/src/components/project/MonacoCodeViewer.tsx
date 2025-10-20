@@ -30,7 +30,7 @@ export function MonacoCodeViewer({
 }: MonacoCodeViewerProps) {
   const [copied, setCopied] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
-  const { theme, resolvedTheme } = useTheme()
+  const { theme: _theme, resolvedTheme } = useTheme()
 
   // Get language from file extension
   const getLanguage = () => {

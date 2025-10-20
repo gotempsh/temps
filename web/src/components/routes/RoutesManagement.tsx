@@ -56,8 +56,8 @@ import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
 import { MoreHorizontal, Pencil, Plus, Router, Trash2 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -127,84 +127,6 @@ export function RoutesManagement({
     },
   })
 
-  const editForm = useForm<CreateRouteFormData>({
-    resolver: zodResolver(createRouteSchema),
-    defaultValues: {
-      domain: '',
-      host: '',
-      port: 80,
-      domainInputType: 'manual',
-      subdomain: '',
-    },
-  })
-
-  const selectedDomain = form.watch('domain')
-  const isWildcardDomain = selectedDomain && selectedDomain.includes('*.')
-
-  const onSubmit = async (data: CreateRouteFormData) => {
-    try {
-      let finalDomain = data.domain
-
-      // If it's a wildcard domain, subdomain is required
-      if (isWildcardDomain) {
-        if (!data.subdomain || data.subdomain.trim() === '') {
-          toast.error('Subdomain is required for wildcard domains')
-          return
-        }
-        finalDomain = data.domain.replace('*.', `${data.subdomain}.`)
-      }
-
-      await createRouteMutation.mutateAsync({
-        domain: finalDomain,
-        host: data.host,
-        port: data.port,
-        domainInputType: data.domainInputType,
-      })
-      // Form reset now handled in mutation success callback
-    } catch (error) {
-      // Error is handled by the mutation, form stays populated
-    }
-  }
-
-  useEffect(() => {
-    if (!isCreateDialogOpen) {
-      form.reset({
-        domain: '',
-        host: '',
-        port: 80,
-        domainInputType:
-          isLocalMode || !hasAvailableDomains ? 'manual' : 'select',
-        subdomain: '',
-      })
-    }
-  }, [isCreateDialogOpen, isLocalMode, hasAvailableDomains])
-
-  useEffect(() => {
-    if (editRoute) {
-      editForm.reset({
-        domain: editRoute.domain,
-        host: editRoute.host,
-        port: editRoute.port,
-        domainInputType: 'manual',
-        subdomain: '',
-      })
-    }
-  }, [editRoute])
-
-  const onEditSubmit = async (data: CreateRouteFormData) => {
-    try {
-      await updateRouteMutation.mutateAsync({
-        domain: data.domain,
-        host: data.host,
-        port: data.port,
-        domainInputType: 'manual',
-      })
-      editForm.reset()
-    } catch (error) {
-      // Error is handled by the mutation
-    }
-  }
-
   // Mutations setup
   const createRouteMutation = useMutation({
     mutationFn: (route: NewRoute) => createRoute({ body: route }),
@@ -265,7 +187,88 @@ export function RoutesManagement({
       setRouteToDelete(null)
     },
   })
+  const editForm = useForm<CreateRouteFormData>({
+    resolver: zodResolver(createRouteSchema),
+    defaultValues: {
+      domain: '',
+      host: '',
+      port: 80,
+      domainInputType: 'manual',
+      subdomain: '',
+    },
+  })
 
+  const selectedDomain = useWatch({
+    control: form.control,
+    name: 'domain',
+  })
+  const isWildcardDomain = useMemo(
+    () => selectedDomain && selectedDomain.includes('*.'),
+    [selectedDomain]
+  )
+
+  const onSubmit = useCallback(
+    async (data: CreateRouteFormData) => {
+      let finalDomain = data.domain
+
+      // If it's a wildcard domain, subdomain is required
+      if (isWildcardDomain) {
+        if (!data.subdomain || data.subdomain.trim() === '') {
+          toast.error('Subdomain is required for wildcard domains')
+          return
+        }
+        finalDomain = data.domain.replace('*.', `${data.subdomain}.`)
+      }
+
+      await createRouteMutation.mutateAsync({
+        domain: finalDomain,
+        host: data.host,
+        port: data.port,
+        domainInputType: data.domainInputType,
+      })
+    },
+    [createRouteMutation, isWildcardDomain]
+  )
+
+  useEffect(() => {
+    if (!isCreateDialogOpen) {
+      form.reset({
+        domain: '',
+        host: '',
+        port: 80,
+        domainInputType:
+          isLocalMode || !hasAvailableDomains ? 'manual' : 'select',
+        subdomain: '',
+      })
+    }
+  }, [isCreateDialogOpen, isLocalMode, hasAvailableDomains, form])
+
+  useEffect(() => {
+    if (editRoute) {
+      editForm.reset({
+        domain: editRoute.domain,
+        host: editRoute.host,
+        port: editRoute.port,
+        domainInputType: 'manual',
+        subdomain: '',
+      })
+    }
+  }, [editRoute, editForm])
+
+  const onEditSubmit = async (data: CreateRouteFormData) => {
+    await updateRouteMutation.mutateAsync({
+      domain: data.domain,
+      host: data.host,
+      port: data.port,
+      domainInputType: 'manual',
+    })
+    editForm.reset()
+  }
+
+  const domainInputType = useWatch({
+    control: form.control,
+    name: 'domainInputType',
+  })
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -329,7 +332,7 @@ export function RoutesManagement({
                     <FormItem>
                       <FormLabel>Domain</FormLabel>
                       <FormControl>
-                        {form.watch('domainInputType') === 'select' &&
+                        {domainInputType === 'select' &&
                         hasAvailableDomains &&
                         !isLocalMode ? (
                           <Select

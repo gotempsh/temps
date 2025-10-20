@@ -17,7 +17,7 @@ import {
 } from '@/utils/errorHandling'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useState, useCallback, useEffect, useRef } from 'react'
-import { Link, useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { PlusIcon } from 'lucide-react'
@@ -30,9 +30,8 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   const [selectedDeployment, setSelectedDeployment] = useState<number | null>(
     null
   )
-  const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
-  const refreshIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const refreshIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const initialDeploymentCountRef = useRef<number | null>(null)
 
   // Handle opening new deployment modal
@@ -47,7 +46,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     refetch,
   } = useQuery({
     ...getProjectDeploymentsOptions({
-      path: { id: project?.id! },
+      path: { id: project.id },
       query: {
         page: 1,
         per_page: ITEMS_PER_PAGE,
@@ -142,7 +141,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       toast.success('Deployment cancelled successfully')
       refetch()
     },
-    onError: (error: unknown) => {
+    onError: (error: any) => {
       // Check if it's an expired token error
       if (isExpiredTokenError(error)) {
         const message = getExpiredTokenMessage(error)

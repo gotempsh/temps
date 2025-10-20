@@ -19,55 +19,36 @@ interface FunnelVisualizationProps {
   stepValue?: number // Value per step completion in dollars
 }
 
-export function FunnelVisualization({
+interface CumulativeDataItem extends StepConversionResponse {
+  dropoff: number
+  dropoffRate: number
+  conversionFromStart: number
+  conversionFromPrevious: number
+  previousCompletions: number
+  value: number
+}
+
+interface ViewProps {
+  totalEntries: number
+  stepConversions: StepConversionResponse[]
+  conversionRate: number
+  averageCompletionTime: number
+  stepValue: number
+  maxValue: number
+  cumulativeData: CumulativeDataItem[]
+}
+
+// Modern Funnel View (Default)
+function FunnelView({
   totalEntries,
   stepConversions,
   conversionRate,
+  stepValue,
+  maxValue,
+  cumulativeData,
   averageCompletionTime,
-  stepValue = 0,
-}: FunnelVisualizationProps) {
-  const [hoveredStep, setHoveredStep] = React.useState<number | null>(null)
-  const [viewMode, setViewMode] = React.useState<'funnel' | 'horizontal'>(
-    'funnel'
-  )
-
-  // Calculate max value for scaling
-  const maxValue = Math.max(
-    totalEntries,
-    ...stepConversions.map((s) => s.completions)
-  )
-
-  // Calculate cumulative metrics
-  const cumulativeData = React.useMemo(() => {
-    let previousCompletions = totalEntries
-    return stepConversions.map((step, index) => {
-      const dropoff = previousCompletions - step.completions
-      const dropoffRate =
-        previousCompletions > 0 ? (dropoff / previousCompletions) * 100 : 0
-      const conversionFromStart =
-        totalEntries > 0 ? (step.completions / totalEntries) * 100 : 0
-      const conversionFromPrevious =
-        previousCompletions > 0
-          ? (step.completions / previousCompletions) * 100
-          : 0
-
-      const result = {
-        ...step,
-        dropoff,
-        dropoffRate,
-        conversionFromStart,
-        conversionFromPrevious,
-        previousCompletions,
-        value: stepValue * step.completions,
-      }
-
-      previousCompletions = step.completions
-      return result
-    })
-  }, [stepConversions, totalEntries, stepValue])
-
-  // Modern Funnel View (Default)
-  const FunnelView = () => (
+}: ViewProps) {
+  return (
     <div className="relative">
       {/* Header Metrics Bar */}
       <div className="grid grid-cols-4 gap-4 mb-8 p-4 bg-muted/30 rounded-lg">
@@ -284,9 +265,11 @@ export function FunnelVisualization({
       </div>
     </div>
   )
+}
 
-  // Horizontal Pipeline View (Alternative)
-  const HorizontalView = () => (
+// Horizontal Pipeline View (Alternative)
+function HorizontalView({ totalEntries, cumulativeData }: ViewProps) {
+  return (
     <div className="overflow-x-auto pb-4">
       <div className="min-w-[800px]">
         <div className="flex items-center gap-2">
@@ -304,7 +287,7 @@ export function FunnelVisualization({
           </div>
 
           {/* Steps */}
-          {cumulativeData.map((step, index) => (
+          {cumulativeData.map((step, _index) => (
             <React.Fragment key={step.step_id}>
               {/* Connector */}
               <div className="flex-shrink-0 flex flex-col items-center">
@@ -347,6 +330,61 @@ export function FunnelVisualization({
       </div>
     </div>
   )
+}
+
+export function FunnelVisualization({
+  totalEntries,
+  stepConversions,
+  conversionRate,
+  averageCompletionTime,
+  stepValue = 0,
+}: FunnelVisualizationProps) {
+  const [viewMode, setViewMode] = React.useState<'funnel' | 'horizontal'>(
+    'funnel'
+  )
+
+  // Calculate max value for scaling
+  const maxValue = Math.max(
+    totalEntries,
+    ...stepConversions.map((s) => s.completions)
+  )
+
+  // Calculate cumulative metrics
+  const cumulativeData = React.useMemo(() => {
+    return stepConversions.map((step, index) => {
+      const previousCompletions =
+        index === 0 ? totalEntries : stepConversions[index - 1].completions
+      const dropoff = previousCompletions - step.completions
+      const dropoffRate =
+        previousCompletions > 0 ? (dropoff / previousCompletions) * 100 : 0
+      const conversionFromStart =
+        totalEntries > 0 ? (step.completions / totalEntries) * 100 : 0
+      const conversionFromPrevious =
+        previousCompletions > 0
+          ? (step.completions / previousCompletions) * 100
+          : 0
+
+      return {
+        ...step,
+        dropoff,
+        dropoffRate,
+        conversionFromStart,
+        conversionFromPrevious,
+        previousCompletions,
+        value: stepValue * step.completions,
+      }
+    })
+  }, [stepConversions, totalEntries, stepValue])
+
+  const viewProps: ViewProps = {
+    totalEntries,
+    stepConversions,
+    conversionRate,
+    averageCompletionTime,
+    stepValue,
+    maxValue,
+    cumulativeData,
+  }
 
   return (
     <div className="space-y-4">
@@ -377,7 +415,11 @@ export function FunnelVisualization({
       </div>
 
       {/* Render selected view */}
-      {viewMode === 'funnel' ? <FunnelView /> : <HorizontalView />}
+      {viewMode === 'funnel' ? (
+        <FunnelView {...viewProps} />
+      ) : (
+        <HorizontalView {...viewProps} />
+      )}
     </div>
   )
 }

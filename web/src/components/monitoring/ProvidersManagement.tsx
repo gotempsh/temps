@@ -31,10 +31,11 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { Bell, EllipsisVertical, Plus } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
-import { useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { useMemo, useState } from 'react'
+import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
-import { ProviderForm, ProviderFormData, providerSchema } from './ProviderForm'
+import { ProviderForm } from './ProviderForm'
+import { ProviderFormData, providerSchema } from './schemas'
 
 interface ExtendedNotificationProvider extends NotificationProviderResponse {
   provider_type: 'email' | 'slack'
@@ -177,7 +178,7 @@ export function ProvidersManagement() {
 
   const handleDelete = async (provider: ExtendedNotificationProvider) => {
     await deleteMutation.mutateAsync({
-      path: { id: provider.id },
+      path: { provider_id: provider.id },
     })
   }
 
@@ -210,8 +211,25 @@ export function ProvidersManagement() {
     })
   }
 
-  const hasProviders = providers && providers.length > 0
-
+  const hasProviders = useMemo(
+    () => providers && providers.length > 0,
+    [providers]
+  )
+  const watchedProviderType = useWatch({
+    control: editForm.control,
+    name: 'provider_type',
+  })
+  const isLoadingProviderType = useMemo(
+    () =>
+      watchedProviderType === 'email'
+        ? updateEmailMutation.isPending
+        : updateSlackMutation.isPending,
+    [
+      watchedProviderType,
+      updateEmailMutation.isPending,
+      updateSlackMutation.isPending,
+    ]
+  )
   return (
     <div className="space-y-4">
       <div className="flex justify-between items-center">
@@ -246,57 +264,64 @@ export function ProvidersManagement() {
         />
       ) : (
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-          {providers?.map((provider: ExtendedNotificationProvider) => (
-            <Card key={provider.id}>
-              <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                <div className="space-y-1">
-                  <CardTitle className="text-base font-medium leading-none">
-                    {provider.name}
-                  </CardTitle>
-                  <p className="text-xs text-muted-foreground capitalize">
-                    {provider.provider_type}
+          {providers?.map((provider) => {
+            const typedProvider = provider as ExtendedNotificationProvider
+            return (
+              <Card key={provider.id}>
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <div className="space-y-1">
+                    <CardTitle className="text-base font-medium leading-none">
+                      {provider.name}
+                    </CardTitle>
+                    <p className="text-xs text-muted-foreground capitalize">
+                      {provider.provider_type}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <Switch
+                      checked={provider.enabled}
+                      onCheckedChange={() => handleToggleEnabled(typedProvider)}
+                      disabled={toggleEnabledMutation.isPending}
+                      className="data-[state=checked]:bg-primary"
+                    />
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="ghost" size="icon" className="h-8 w-8">
+                          <EllipsisVertical className="h-4 w-4" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem
+                          onClick={() => handleEdit(typedProvider)}
+                        >
+                          Edit
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => handleTest(typedProvider)}
+                        >
+                          Test
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          className="text-destructive"
+                          onClick={() => handleDelete(typedProvider)}
+                        >
+                          Delete
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  <p className="text-sm text-muted-foreground truncate">
+                    {provider.provider_type === 'email'
+                      ? typedProvider.config.from_address
+                      : typedProvider.config.webhook_url}
                   </p>
-                </div>
-                <div className="flex items-center gap-1">
-                  <Switch
-                    checked={provider.enabled}
-                    onCheckedChange={() => handleToggleEnabled(provider)}
-                    disabled={toggleEnabledMutation.isPending}
-                    className="data-[state=checked]:bg-primary"
-                  />
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <Button variant="ghost" size="icon" className="h-8 w-8">
-                        <EllipsisVertical className="h-4 w-4" />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem onClick={() => handleEdit(provider)}>
-                        Edit
-                      </DropdownMenuItem>
-                      <DropdownMenuItem onClick={() => handleTest(provider)}>
-                        Test
-                      </DropdownMenuItem>
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem
-                        className="text-destructive"
-                        onClick={() => handleDelete(provider)}
-                      >
-                        Delete
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </div>
-              </CardHeader>
-              <CardContent>
-                <p className="text-sm text-muted-foreground truncate">
-                  {provider.provider_type === 'email'
-                    ? provider.config.from_address
-                    : provider.config.webhook_url}
-                </p>
-              </CardContent>
-            </Card>
-          ))}
+                </CardContent>
+              </Card>
+            )
+          })}
         </div>
       )}
 
@@ -313,11 +338,7 @@ export function ProvidersManagement() {
               form={editForm}
               onSubmit={onEditSubmit}
               isEdit
-              isLoading={
-                editForm.watch('provider_type') === 'email'
-                  ? updateEmailMutation.isPending
-                  : updateSlackMutation.isPending
-              }
+              isLoading={isLoadingProviderType}
             />
           </div>
         </DialogContent>

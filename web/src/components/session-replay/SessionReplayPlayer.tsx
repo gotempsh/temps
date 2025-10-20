@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import rrwebPlayer from 'rrweb-player'
 import 'rrweb-player/dist/style.css'
 import {
@@ -39,6 +39,58 @@ export function SessionReplayPlayer({
 }: SessionReplayPlayerProps) {
   const playerContainerRef = useRef<HTMLDivElement>(null)
   const playerRef = useRef<any>(null)
+  const initPlayer = useCallback(
+    (eventData: SessionEventDto[]) => {
+      if (!playerContainerRef.current) return
+
+      // Destroy existing player if any
+      if (playerRef.current) {
+        playerRef.current.destroy?.()
+      }
+
+      try {
+        // Clear container
+        playerContainerRef.current.innerHTML = ''
+
+        // Get the viewport dimensions from the session data or use defaults
+        const recordedWidth = sessionData?.viewport_width || 1280
+        const recordedHeight = sessionData?.viewport_height || 720
+
+        // Calculate scale to fit within viewport
+        const containerWidth = window.innerWidth - 80 // Account for padding
+        const containerHeight = window.innerHeight - 300 // Account for header and controls
+
+        const scaleX = containerWidth / recordedWidth
+        const scaleY = containerHeight / recordedHeight
+        const scale = Math.min(scaleX, scaleY, 1) // Don't scale up beyond 100%
+
+        const width = Math.floor(recordedWidth * scale)
+        const height = Math.floor(recordedHeight * scale)
+
+        // Create new player instance
+        playerRef.current = new rrwebPlayer({
+          target: playerContainerRef.current,
+          props: {
+            events: eventData.map((event) => event.data),
+            width: width,
+            height: height,
+            autoPlay: false,
+            showController: true,
+            skipInactive: true,
+            speed: 1, // Default speed
+            speedOption: [1, 2, 4, 8], // Available speed options
+            mouseTail: {
+              strokeStyle: '#667eea',
+            },
+            UNSAFE_replayCanvas: false,
+          },
+        })
+      } catch (error) {
+        console.error('Failed to initialize replay player:', error)
+      }
+    },
+    [sessionData]
+  )
 
   useEffect(() => {
     // Initialize player when events are available
@@ -52,57 +104,7 @@ export function SessionReplayPlayer({
         playerRef.current.destroy?.()
       }
     }
-  }, [events])
-
-  const initPlayer = (eventData: SessionEventDto[]) => {
-    if (!playerContainerRef.current) return
-
-    // Destroy existing player if any
-    if (playerRef.current) {
-      playerRef.current.destroy?.()
-    }
-
-    try {
-      // Clear container
-      playerContainerRef.current.innerHTML = ''
-
-      // Get the viewport dimensions from the session data or use defaults
-      const recordedWidth = sessionData?.viewport_width || 1280
-      const recordedHeight = sessionData?.viewport_height || 720
-
-      // Calculate scale to fit within viewport
-      const containerWidth = window.innerWidth - 80 // Account for padding
-      const containerHeight = window.innerHeight - 300 // Account for header and controls
-
-      const scaleX = containerWidth / recordedWidth
-      const scaleY = containerHeight / recordedHeight
-      const scale = Math.min(scaleX, scaleY, 1) // Don't scale up beyond 100%
-
-      const width = Math.floor(recordedWidth * scale)
-      const height = Math.floor(recordedHeight * scale)
-
-      // Create new player instance
-      playerRef.current = new rrwebPlayer({
-        target: playerContainerRef.current,
-        props: {
-          events: eventData.map((event) => event.data),
-          width: width,
-          height: height,
-          autoPlay: false,
-          showController: true,
-          skipInactive: true,
-          speed: 1, // Default speed
-          speedOption: [1, 2, 4, 8], // Available speed options
-          mouseTail: {
-            strokeStyle: '#667eea',
-          },
-          UNSAFE_replayCanvas: false,
-        },
-      })
-    } catch (error) {
-      console.error('Failed to initialize replay player:', error)
-    }
-  }
+  }, [events, initPlayer])
 
   if (isLoading) {
     return (

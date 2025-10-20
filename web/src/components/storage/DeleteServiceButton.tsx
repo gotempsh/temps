@@ -75,9 +75,9 @@ export function DeleteServiceButton({
         <AlertDialogHeader>
           <AlertDialogTitle>Delete storage service?</AlertDialogTitle>
           <AlertDialogDescription>
-            Are you sure you want to delete &quot;{serviceName}&quot;? This action cannot
-            be undone and all data associated with this service will be
-            permanently removed.
+            Are you sure you want to delete &quot;{serviceName}&quot;? This
+            action cannot be undone and all data associated with this service
+            will be permanently removed.
           </AlertDialogDescription>
         </AlertDialogHeader>
         {errorMessage && (

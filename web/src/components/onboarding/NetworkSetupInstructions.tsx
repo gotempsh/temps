@@ -50,7 +50,8 @@ export function NetworkSetupInstructions({
               <Server className="h-4 w-4" />
               <AlertTitle>Direct/VPS Setup</AlertTitle>
               <AlertDescription>
-                Configure your DNS records to point to your server&apos;s public IP
+                Configure your DNS records to point to your server&apos;s public
+                IP
               </AlertDescription>
             </Alert>
 
@@ -144,7 +145,9 @@ export function NetworkSetupInstructions({
                     Make sure your firewall allows incoming traffic on ports:
                   </p>
                   <ul className="text-sm text-muted-foreground space-y-1">
-                    <li>• Port 80 (HTTP) - for Let&apos;s Encrypt validation</li>
+                    <li>
+                      • Port 80 (HTTP) - for Let&apos;s Encrypt validation
+                    </li>
                     <li>• Port 443 (HTTPS) - for secure connections</li>
                   </ul>
                 </div>
@@ -196,8 +199,8 @@ export function NetworkSetupInstructions({
                 </h4>
                 <div className="ml-8 space-y-2">
                   <p className="text-sm text-muted-foreground">
-                    Access your router&apos;s admin panel and add port forwarding
-                    rules:
+                    Access your router&apos;s admin panel and add port
+                    forwarding rules:
                   </p>
                   <div className="bg-muted p-3 rounded-lg text-sm space-y-2">
                     <div className="font-medium">Rule 1: HTTP</div>
@@ -259,8 +262,8 @@ export function NetworkSetupInstructions({
               <AlertTriangle className="h-4 w-4 text-orange-600" />
               <AlertDescription>
                 <strong>Note:</strong> Some ISPs use CGNAT which prevents port
-                forwarding. If this doesn&apos;t work, consider Cloudflare Tunnel
-                instead.
+                forwarding. If this doesn&apos;t work, consider Cloudflare
+                Tunnel instead.
               </AlertDescription>
             </Alert>
           </div>
@@ -439,7 +442,8 @@ ingress:
         <AlertDescription>
           <strong>Important:</strong> Wildcard domains (*.{baseDomain}) require
           DNS configuration. You cannot use direct IP access for wildcard
-          certificates. Make sure you have access to your domain&apos;s DNS settings.
+          certificates. Make sure you have access to your domain&apos;s DNS
+          settings.
         </AlertDescription>
       </Alert>
 

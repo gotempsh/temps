@@ -327,7 +327,6 @@ export function CodeBlock({
 
         for (let i = 0; i < line.length; i++) {
           const char = line[i]
-          const nextChar = line[i + 1]
 
           // Handle strings
           if ((char === '"' || char === "'" || char === '`') && !inString) {

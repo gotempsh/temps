@@ -67,7 +67,6 @@ export const ServicesStep = memo(function ServicesStep({
               <FormItem>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   {existingServices.map((service: any) => {
-                    console.log('service', field.value, service)
                     const isSelected = field.value?.includes(service.id)
                     return (
                       <Card

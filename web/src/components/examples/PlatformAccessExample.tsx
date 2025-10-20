@@ -13,7 +13,7 @@ import {
   useIsNatMode,
   useIsCloudflareMode,
   useIsDirectMode,
-} from '@/contexts/PlatformAccessContext'
+} from '@/hooks/usePlatformAccess'
 import {
   AlertCircle,
   CheckCircle2,

@@ -41,16 +41,47 @@ export const notificationSettingsSchema = z.object({
   minimumSeverity: z.enum(['critical', 'warning', 'info']),
 })
 
+/**
+ * Schema for notification provider configuration
+ * Supports both Slack and Email providers with comprehensive SMTP settings
+ */
 export const providerSchema = z.object({
   name: z.string().min(1, 'Name is required'),
   provider_type: z.enum(['email', 'slack']),
-  enabled: z.boolean().default(true),
   config: z
     .object({
+      // Slack config
       webhook_url: z.string().url('Invalid webhook URL').optional(),
-      email_address: z.string().email('Invalid email address').optional(),
+      channel: z.string().optional(),
+      slack_username: z.string().optional(),
+
+      // Email config
+      smtp_host: z.string().optional(),
+      smtp_port: z.number().min(1).max(65535).optional(),
+      use_credentials: z.boolean().optional(),
+      smtp_username: z.string().optional(),
+      password: z.string().optional(),
+      from_name: z.string().optional(),
+      from_address: z.string().email('Invalid from address').optional(),
+      to_addresses: z
+        .array(z.string().email('Invalid email address'))
+        .optional(),
+      tls_mode: z.enum(['None', 'Starttls', 'Tls']).optional(),
+      starttls_required: z.boolean().optional(),
+      accept_invalid_certs: z.boolean().optional(),
     })
-    .optional(),
+    .refine((data) => {
+      if (data.webhook_url) return true
+      // Username and password are now optional for SMTP
+      if (
+        data.smtp_host &&
+        data.smtp_port &&
+        data.from_address &&
+        data.to_addresses
+      )
+        return true
+      return false
+    }, 'Please fill in all required fields for the selected provider type'),
 })
 
 export type ProjectAlertsFormData = z.infer<typeof projectAlertsSchema>

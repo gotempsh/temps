@@ -23,11 +23,7 @@ export function BackupDetail() {
   const { id, backupId } = useParams<{ id: string; backupId: string }>()
   const { setBreadcrumbs } = useBreadcrumbs()
 
-  const {
-    data: backup,
-    isLoading,
-    refetch,
-  } = useQuery({
+  const { data: backup, isLoading } = useQuery({
     ...getBackupOptions({
       path: { id: backupId! },
     }),

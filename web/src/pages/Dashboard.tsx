@@ -1,9 +1,6 @@
 import {
-  getProjectsOptions,
-  listDomainsOptions,
-  listGitProvidersOptions,
-  listNotificationProvidersOptions,
   getGeneralStatsOptions,
+  getProjectsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ExternalConnectivityAlert } from '@/components/alerts/ExternalConnectivityAlert'
 import { MetricCard } from '@/components/dashboard/MetricCard'
@@ -12,55 +9,18 @@ import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { ImprovedOnboardingDashboard } from '@/components/onboarding/ImprovedOnboardingDashboard'
 import { MetricCardSkeleton } from '@/components/skeletons/MetricCardSkeleton'
 import { ProjectCardSkeleton } from '@/components/skeletons/ProjectCardSkeleton'
-import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
-import {
-  FolderGit2,
-  Minus,
-  Plus,
-  TrendingDown,
-  TrendingUp,
-  Users,
-  DollarSign,
-  Eye,
-} from 'lucide-react'
+import { subDays } from 'date-fns'
+import { DollarSign, Eye, FolderGit2, Plus, Users } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { subDays } from 'date-fns'
 
 const ITEMS_PER_PAGE = 8
-function getChangeDisplay(change: number | undefined, inverse = false) {
-  if (change === undefined)
-    return {
-      icon: <Minus className="h-4 w-4" />,
-      className: 'text-muted-foreground',
-    }
-  if (change === 0)
-    return {
-      icon: <Minus className="h-4 w-4" />,
-      className: 'text-muted-foreground',
-    }
 
-  const isPositive = inverse ? change < 0 : change > 0
-  const showUpArrow = inverse ? change < 0 : change > 0
-
-  return {
-    icon: showUpArrow ? (
-      <TrendingUp className="h-4 w-4" />
-    ) : (
-      <TrendingDown className="h-4 w-4" />
-    ),
-    className: cn(
-      'flex items-center gap-1',
-      isPositive ? 'text-emerald-600 dark:text-emerald-400' : 'text-destructive'
-    ),
-    isPositive,
-  }
-}
 export function Dashboard() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const [page, setPage] = useState(1)
@@ -74,20 +34,6 @@ export function Dashboard() {
     }),
   })
 
-  // Queries for onboarding status
-  const { data: providersData } = useQuery({
-    ...listNotificationProvidersOptions({}),
-    retry: false,
-  })
-  const { data: domainsData } = useQuery({
-    ...listDomainsOptions({}),
-    retry: false,
-  })
-  const { data: gitProvidersData } = useQuery({
-    ...listGitProvidersOptions({}),
-    retry: false,
-  })
-
   useEffect(() => {
     setBreadcrumbs([{ label: 'Dashboard' }])
   }, [setBreadcrumbs])
@@ -96,8 +42,6 @@ export function Dashboard() {
 
   // Determine onboarding status
   const hasProjects = (projectsData?.projects?.length || 0) > 0
-  const hasEmailProvider =
-    (providersData?.filter((p: any) => p.type === 'email')?.length || 0) > 0
   const { startDate, endDate } = useMemo(() => {
     return {
       startDate: subDays(new Date(), 1).toISOString(),

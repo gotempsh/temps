@@ -58,7 +58,7 @@ const isGitHubApp = (provider: ProviderResponse) =>
 export function GitSources() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
-  const { feedback, showSuccess, showError, clearFeedback } = useFeedback()
+  const { feedback, showSuccess, clearFeedback } = useFeedback()
   const queryClient = useQueryClient()
   const [providerToDelete, setProviderToDelete] =
     useState<ProviderResponse | null>(null)
@@ -369,8 +369,8 @@ export function GitSources() {
                                     </AlertDialogTitle>
                                     <AlertDialogDescription>
                                       Are you sure you want to remove &quot;
-                                      {provider.name}&quot;? This action cannot be
-                                      undone and will remove all associated
+                                      {provider.name}&quot;? This action cannot
+                                      be undone and will remove all associated
                                       connections and repositories.
                                     </AlertDialogDescription>
                                   </AlertDialogHeader>

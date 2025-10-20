@@ -1,4 +1,8 @@
-import { ExternalServiceInfo, ProjectResponse, ServiceType } from '@/api/client'
+import {
+  ExternalServiceInfo,
+  ProjectResponse,
+  ServiceTypeRoute,
+} from '@/api/client'
 import {
   getServicePreviewEnvironmentVariablesMaskedOptions,
   linkServiceToProjectMutation,
@@ -6,9 +10,9 @@ import {
   listServicesOptions,
   unlinkServiceFromProjectMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import EmptyStateStorage from '@/components/storage/EmptyStateStorage'
 import { CreateServiceButton } from '@/components/storage/CreateServiceButton'
 import { CreateServiceDialog } from '@/components/storage/CreateServiceDialog'
+import EmptyStateStorage from '@/components/storage/EmptyStateStorage'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -25,20 +29,20 @@ import {
 } from '@/components/ui/collapsible'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { cn } from '@/lib/utils'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   ArrowRight,
   ChevronDown,
   ChevronRight,
-  Copy,
   Eye,
   EyeOff,
   Loader2,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { cn } from '@/lib/utils'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
+import { CopyButton } from '../ui/copy-button'
 
 function ServiceCard({
   service,
@@ -73,28 +77,6 @@ function ServiceCard({
 
   const handleEnvPreviewToggle = () => {
     setShowEnvPreview(!showEnvPreview)
-  }
-
-  const handleCopyEnvVars = async () => {
-    if (!envVars) return
-
-    const envString = Object.entries(envVars)
-      .map(([key, value]) => `${key}=${value}`)
-      .join('\n')
-
-    try {
-      await navigator.clipboard.writeText(envString)
-      toast.success('Environment variables copied to clipboard')
-    } catch (err) {
-      toast.error('Failed to copy to clipboard')
-    }
-  }
-
-  const handleToggleEnvExpand = () => {
-    setIsEnvPreviewOpen(!isEnvPreviewOpen)
-    if (isEnvPreviewOpen) {
-      setShowEnvPreview(false) // Reset when collapsing
-    }
   }
 
   const envVarCount = envVars ? Object.keys(envVars).length : 0
@@ -172,16 +154,11 @@ function ServiceCard({
                   </h4>
                   <div className="flex items-center gap-3">
                     {envVars && showEnvPreview && (
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        onClick={handleCopyEnvVars}
-                        className="h-8 text-xs gap-2 px-3"
-                      >
-                        <Copy className="h-3.5 w-3.5" />
-                        Copy
-                      </Button>
+                      <CopyButton
+                        value={Object.entries(envVars)
+                          .map(([key, value]) => `${key}=${value}`)
+                          .join('\n')}
+                      />
                     )}
                     <Button
                       type="button"
@@ -225,7 +202,7 @@ function ServiceCard({
                 {!showEnvPreview && !envVarsLoading && !envVarsError && (
                   <div className="text-center py-8">
                     <p className="text-sm text-muted-foreground">
-                      Click "Show" to preview environment variables
+                      Click &quot;Show&quot; to preview environment variables
                     </p>
                   </div>
                 )}
@@ -277,10 +254,9 @@ function ServiceCard({
 
 export function ProjectStorage({ project }: { project: ProjectResponse }) {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const navigate = useNavigate()
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [selectedServiceType, setSelectedServiceType] =
-    useState<ServiceType | null>(null)
+    useState<ServiceTypeRoute | null>(null)
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Storage', href: '/storage' }])
@@ -341,7 +317,6 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
       const promise = linkServiceMutation.mutateAsync({
         path: {
           id: serviceId,
-          project_id: project.id,
         },
         body: {
           project_id: project.id,
@@ -397,7 +372,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
           </div>
           <EmptyStateStorage
             onCreateClick={(serviceType) => {
-              setSelectedServiceType(serviceType as ServiceType)
+              setSelectedServiceType(serviceType as ServiceTypeRoute)
               setIsCreateDialogOpen(true)
             }}
           />

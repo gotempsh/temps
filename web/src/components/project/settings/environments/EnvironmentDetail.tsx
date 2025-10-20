@@ -213,7 +213,6 @@ export function EnvironmentDetail({ project }: EnvironmentDetailProps) {
     data: environment,
     isLoading: isLoadingEnvironment,
     error: environmentError,
-    refetch,
   } = useQuery({
     ...getEnvironmentOptions({
       path: {

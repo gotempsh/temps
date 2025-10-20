@@ -27,7 +27,7 @@ import {
 } from '@/hooks/useSettings'
 import { AlertCircle, Globe, Image, Link, Loader2, Save } from 'lucide-react'
 import { useEffect } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 
 type SettingsFormData = Pick<
@@ -43,9 +43,9 @@ export function Settings() {
   const {
     register,
     handleSubmit,
+    control,
     formState: { isDirty, isSubmitting },
     reset,
-    watch,
     setValue,
   } = useForm<SettingsFormData>({
     defaultValues: {
@@ -59,7 +59,7 @@ export function Settings() {
     },
   })
 
-  const screenshots = watch('screenshots')
+  const screenshots = useWatch({ control, name: 'screenshots' })
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Settings' }])

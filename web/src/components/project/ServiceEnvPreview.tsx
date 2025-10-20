@@ -11,16 +11,9 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
-import {
-  ChevronDown,
-  ChevronRight,
-  Copy,
-  Eye,
-  EyeOff,
-  Loader2,
-} from 'lucide-react'
-import { toast } from 'sonner'
+import { ChevronDown, ChevronRight, Eye, EyeOff, Loader2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { CopyButton } from '../ui/copy-button'
 
 interface ServiceEnvPreviewProps {
   serviceId: number
@@ -54,21 +47,6 @@ export function ServiceEnvPreview({
     }
     setShowPreview(!showPreview)
   }, [showPreview, isOpen])
-
-  const handleCopyEnvVars = async () => {
-    if (!envVars) return
-
-    const envString = Object.entries(envVars)
-      .map(([key, value]) => `${key}=${value}`)
-      .join('\n')
-
-    try {
-      await navigator.clipboard.writeText(envString)
-      toast.success('Environment variables copied to clipboard')
-    } catch (err) {
-      toast.error('Failed to copy to clipboard')
-    }
-  }
 
   // Auto-load preview when expanding
   const handleToggleExpand = () => {
@@ -169,16 +147,11 @@ export function ServiceEnvPreview({
                     {envVarCount !== 1 ? 's' : ''} available
                   </p>
                   <div className="flex items-center gap-2">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      onClick={handleCopyEnvVars}
-                      className="h-6 text-xs"
-                    >
-                      <Copy className="h-3 w-3 mr-1" />
-                      Copy
-                    </Button>
+                    <CopyButton
+                      value={Object.entries(envVars)
+                        .map(([key, value]) => `${key}=${value}`)
+                        .join('\n')}
+                    />
                     <Badge variant="secondary" className="text-xs">
                       Masked Preview
                     </Badge>

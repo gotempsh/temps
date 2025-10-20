@@ -46,7 +46,7 @@ export function GitManager({ devProject, className }: GitManagerProps) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [commitMessage, setCommitMessage] = useState('')
-  const [newBranchName, setNewBranchName] = useState('')
+  const [_newBranchName, _setNewBranchName] = useState('')
   const [showCommitDialog, setShowCommitDialog] = useState(false)
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set())
   const [lastClickedFile, setLastClickedFile] = useState<string | null>(null)

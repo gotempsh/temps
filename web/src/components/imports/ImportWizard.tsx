@@ -192,8 +192,11 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
   // Auto-set preset and directory when preset data loads
   useEffect(() => {
     if (defaultPresetValue && !selectedPreset) {
-      setSelectedPreset(defaultPresetValue.value)
-      setRootDirectory(defaultPresetValue.rootDir)
+      const timeoutId = setTimeout(() => {
+        setSelectedPreset(defaultPresetValue.value)
+        setRootDirectory(defaultPresetValue.rootDir)
+      }, 0)
+      return () => clearTimeout(timeoutId)
     }
   }, [defaultPresetValue, selectedPreset])
 
@@ -204,7 +207,10 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
         branchesData.branches.find((b: any) => b.is_default) ||
         branchesData.branches[0]
       if (defaultBranch) {
-        setSelectedBranch(defaultBranch.name)
+        const timeoutId = setTimeout(() => {
+          setSelectedBranch(defaultBranch.name)
+        }, 0)
+        return () => clearTimeout(timeoutId)
       }
     }
   }, [branchesData, selectedBranch])
@@ -351,8 +357,10 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
           } else {
             navigate('/projects')
           }
-        } catch (error) {
-          console.error('Failed to fetch project details:', error)
+        } catch {
+          toast.error('Failed to fetch project details', {
+            description: 'Redirecting to projects list...',
+          })
           // Fallback: navigate to projects list if we can't get the project
           setTimeout(() => {
             navigate('/projects')
@@ -852,27 +860,7 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
                         onValueChange={handlePresetChange}
                       >
                         <SelectTrigger className="mt-2">
-                          <SelectValue placeholder="Select a framework preset">
-                            {(() => {
-                              if (
-                                !selectedPreset ||
-                                selectedPreset === 'custom'
-                              )
-                                return selectedPreset
-                              const [presetName, presetPath] =
-                                selectedPreset.split('::')
-                              return (
-                                <div className="flex items-center gap-2">
-                                  <span>{presetName}</span>
-                                  {presetPath && presetPath !== 'root' && (
-                                    <span className="text-xs text-muted-foreground">
-                                      ({presetPath})
-                                    </span>
-                                  )}
-                                </div>
-                              )
-                            })()}
-                          </SelectValue>
+                          <SelectValue placeholder="Select a framework preset" />
                         </SelectTrigger>
                         <SelectContent>
                           {presetData?.projects?.map(
@@ -1040,9 +1028,9 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
                   </CardContent>
                 </Card>
 
-                {importPlan.plan.project.environment_variables &&
-                  Object.keys(importPlan.plan.project.environment_variables)
-                    .length > 0 && (
+                {importPlan.plan.deployment.env_vars &&
+                  Object.keys(importPlan.plan.deployment.env_vars).length >
+                    0 && (
                     <Card>
                       <CardHeader>
                         <CardTitle>Environment Variables</CardTitle>
@@ -1050,7 +1038,7 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
                       <CardContent>
                         <div className="space-y-1">
                           {Object.entries(
-                            importPlan.plan.project.environment_variables
+                            importPlan.plan.deployment.env_vars
                           ).map(([key, value]) => (
                             <div
                               key={key}

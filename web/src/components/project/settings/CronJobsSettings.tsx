@@ -21,7 +21,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { useState, useEffect } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { EmptyState } from '@/components/ui/empty-state'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -36,45 +36,9 @@ interface CronJobsSettingsProps {
   project: ProjectResponse
 }
 
-export function CronJobsSettings({ project }: CronJobsSettingsProps) {
-  const [selectedEnvironment, setSelectedEnvironment] = useState<string>('')
-  const navigate = useNavigate()
-  const [showInstructions, setShowInstructions] = useState(false)
-
-  // Fetch environments
-  const { data: environments, isLoading: isLoadingEnvironments } = useQuery({
-    ...getEnvironmentsOptions({
-      path: {
-        project_id: project.id,
-      },
-    }),
-  })
-
-  // Set first environment as default when environments are loaded
-  useEffect(() => {
-    if (environments?.length && !selectedEnvironment) {
-      setSelectedEnvironment(environments[0].id.toString())
-    }
-  }, [environments, selectedEnvironment])
-
-  const { data: crons, isLoading: isLoadingCrons } = useQuery({
-    ...getEnvironmentCronsOptions({
-      path: {
-        project_id: project.id,
-        env_id: parseInt(selectedEnvironment) || 0,
-      },
-    }),
-    enabled: !!selectedEnvironment,
-  })
-
-  const handleEnvironmentChange = (value: string) => {
-    setSelectedEnvironment(value)
-  }
-
-  const isLoading = isLoadingEnvironments || isLoadingCrons
-
-  // Create a component for the instructions content to avoid duplication
-  const InstructionsContent = () => (
+// Instructions component for cron job setup - extracted to avoid recreation on every render
+function InstructionsContent() {
+  return (
     <div className="space-y-4">
       <div>
         <p className="mb-2">
@@ -88,10 +52,10 @@ export function CronJobsSettings({ project }: CronJobsSettingsProps) {
           {`cron:
   - path: "/api/ping"
     schedule: "0 */5 * * * *"  # Every 5 minutes
-    
+
   - path: "/api/daily-backup"
     schedule: "0 0 0 * * *"    # Daily at midnight
-    
+
   - path: "/api/weekly-report"
     schedule: "0 0 0 * * 0"    # Weekly on Sunday`}
         </pre>
@@ -144,6 +108,51 @@ export function CronJobsSettings({ project }: CronJobsSettingsProps) {
       </div>
     </div>
   )
+}
+
+export function CronJobsSettings({ project }: CronJobsSettingsProps) {
+  const [selectedEnvironment, setSelectedEnvironment] = useState<string>('')
+  const navigate = useNavigate()
+  const [showInstructions, setShowInstructions] = useState(false)
+
+  // Fetch environments
+  const { data: environments, isLoading: isLoadingEnvironments } = useQuery({
+    ...getEnvironmentsOptions({
+      path: {
+        project_id: project.id,
+      },
+    }),
+  })
+
+  // Derive the actual environment to use - prefer selected, fallback to first
+  const effectiveEnvironment = useMemo(
+    () =>
+      selectedEnvironment ||
+      (environments?.length ? environments[0].id.toString() : ''),
+    [selectedEnvironment, environments]
+  )
+
+  const { data: crons, isLoading: isLoadingCrons } = useQuery({
+    ...getEnvironmentCronsOptions({
+      path: {
+        project_id: project.id,
+        env_id: parseInt(effectiveEnvironment) || 0,
+      },
+    }),
+    enabled: !!effectiveEnvironment,
+  })
+
+  const handleEnvironmentChange = useCallback(
+    (value: string) => {
+      setSelectedEnvironment(value)
+    },
+    [setSelectedEnvironment]
+  )
+
+  const isLoading = useMemo(
+    () => isLoadingEnvironments || isLoadingCrons,
+    [isLoadingEnvironments, isLoadingCrons]
+  )
 
   return (
     <div className="space-y-6">
@@ -156,7 +165,7 @@ export function CronJobsSettings({ project }: CronJobsSettingsProps) {
         </div>
         {crons?.length ? (
           <Button
-            disabled={!selectedEnvironment}
+            disabled={!effectiveEnvironment}
             onClick={() => setShowInstructions(true)}
           >
             <FileCode className="h-4 w-4 mr-2" />
@@ -179,13 +188,13 @@ export function CronJobsSettings({ project }: CronJobsSettingsProps) {
 
       <div className="flex items-center gap-2">
         <Select
-          value={selectedEnvironment}
+          value={effectiveEnvironment}
           onValueChange={handleEnvironmentChange}
         >
           <SelectTrigger className="w-[200px]" disabled={isLoadingEnvironments}>
             <SelectValue placeholder="Select environment">
               {environments?.find(
-                (env) => env.id.toString() === selectedEnvironment
+                (env) => env.id.toString() === effectiveEnvironment
               )?.name || 'Select environment'}
             </SelectValue>
           </SelectTrigger>
@@ -199,7 +208,7 @@ export function CronJobsSettings({ project }: CronJobsSettingsProps) {
         </Select>
       </div>
 
-      {!selectedEnvironment ? (
+      {!effectiveEnvironment ? (
         <EmptyState
           icon={Clock}
           title="Select an Environment"
@@ -237,7 +246,7 @@ export function CronJobsSettings({ project }: CronJobsSettingsProps) {
               className="cursor-pointer hover:bg-muted/50 transition-colors"
               onClick={() =>
                 navigate(
-                  `/projects/${project.slug}/settings/cron-jobs/${selectedEnvironment}/${cron.id}`
+                  `/projects/${project.slug}/settings/cron-jobs/${effectiveEnvironment}/${cron.id}`
                 )
               }
             >

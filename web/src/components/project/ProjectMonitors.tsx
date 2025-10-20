@@ -116,12 +116,7 @@ function MonitorCard({ monitor, projectSlug, onDelete }: MonitorCardProps) {
     refetchInterval: 30000, // Refresh every 30 seconds
   })
 
-  const {
-    data: currentMonitorStatus,
-    isLoading: isLoadingCurrentMonitorStatus,
-    error: currentMonitorStatusError,
-    refetch: refetchCurrentMonitorStatus,
-  } = useQuery({
+  const { data: currentMonitorStatus } = useQuery({
     ...getCurrentMonitorStatusOptions({
       path: {
         monitor_id: monitor.id,
@@ -352,7 +347,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
         <div>
           <h2 className="text-2xl font-bold tracking-tight">Monitors</h2>
           <p className="text-muted-foreground">
-            Monitor your project's uptime and performance
+            Monitor your project&apos;s uptime and performance
           </p>
         </div>
         <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
@@ -366,7 +361,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
             <DialogHeader>
               <DialogTitle>Create Monitor</DialogTitle>
               <DialogDescription>
-                Set up a new monitor to track your project's uptime and
+                Set up a new monitor to track your project&apos;s uptime and
                 performance.
               </DialogDescription>
             </DialogHeader>

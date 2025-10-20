@@ -200,7 +200,9 @@ export function GitLabProviderForm({ onSuccess }: GitLabProviderFormProps) {
                 </div>
                 <div className="text-orange-700 dark:text-orange-300 space-y-1">
                   <div>• Set expiration date (recommended: 1 year)</div>
-                  <div>• Use a descriptive name like "Temps Deployment"</div>
+                  <div>
+                    • Use a descriptive name like &quot;Temps Deployment&quot;
+                  </div>
                   <div>• Keep your token secure and never share it</div>
                 </div>
               </div>

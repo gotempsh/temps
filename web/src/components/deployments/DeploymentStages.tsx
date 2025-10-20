@@ -61,7 +61,7 @@ function useLogSSE(
               return prevLogs + data.log + '\n'
             }
             return prevLogs + event.data + '\n'
-          } catch (_error) {
+          } catch {
             return prevLogs + event.data + '\n'
           }
         })
@@ -82,7 +82,7 @@ function useLogSSE(
         eventSourceRef.current.close()
       }
     }
-  }, [project.id, deployment.id, job.job_id])
+  }, [project.id, deployment.id, job.job_id, project.slug])
 
   return { logs, connectionStatus }
 }
@@ -166,47 +166,54 @@ export function DeploymentStages({
     }),
     refetchInterval:
       deployment.status === 'completed' ||
-        deployment.status === 'failed' ||
-        deployment.status === 'cancelled'
+      deployment.status === 'failed' ||
+      deployment.status === 'cancelled'
         ? false
         : 2500,
   })
 
-  // Change to Set to track multiple expanded stages
-  const [expandedStageIds, setExpandedStageIds] = useState<Set<number>>(
-    new Set()
+  // Track user's manual toggle overrides (true = force expanded, false = force collapsed)
+  const [manualOverrides, setManualOverrides] = useState<Map<number, boolean>>(
+    new Map()
   )
 
-  // Update expanded stages when query data changes
-  useEffect(() => {
-    if (stagesQuery.data) {
-      setExpandedStageIds((prev) => {
-        const newSet = new Set(prev)
-        stagesQuery.data.jobs.forEach((stage) => {
-          // Auto-expand stages that are completed or pending
-          if (
-            stage.status === 'running' ||
-            stage.status === 'pending' ||
-            stage.status === 'failure' ||
-            stage.status === 'cancelled'
-          ) {
-            newSet.add(stage.id)
-          }
-        })
-        return newSet
-      })
-    }
-  }, [stagesQuery.data])
+  // Compute which stages should be expanded based on their status and manual overrides
+  const expandedStageIds = useMemo(() => {
+    if (!stagesQuery.data) return new Set<number>()
+
+    const result = new Set<number>()
+    stagesQuery.data.jobs.forEach((stage) => {
+      // Check if user has manually overridden this stage
+      const manualOverride = manualOverrides.get(stage.id)
+
+      if (manualOverride !== undefined) {
+        // User has manually toggled - respect their choice
+        if (manualOverride) {
+          result.add(stage.id)
+        }
+      } else {
+        // Auto-expand stages that are running, pending, failed, or cancelled
+        if (
+          stage.status === 'running' ||
+          stage.status === 'pending' ||
+          stage.status === 'failure' ||
+          stage.status === 'cancelled'
+        ) {
+          result.add(stage.id)
+        }
+      }
+    })
+
+    return result
+  }, [stagesQuery.data, manualOverrides])
 
   const toggleStage = (stageId: number) => {
-    setExpandedStageIds((prev) => {
-      const newSet = new Set(prev)
-      if (newSet.has(stageId)) {
-        newSet.delete(stageId)
-      } else {
-        newSet.add(stageId)
-      }
-      return newSet
+    setManualOverrides((prev) => {
+      const newMap = new Map(prev)
+      const isCurrentlyExpanded = expandedStageIds.has(stageId)
+      // Toggle: if expanded, collapse; if collapsed, expand
+      newMap.set(stageId, !isCurrentlyExpanded)
+      return newMap
     })
   }
 
@@ -247,11 +254,11 @@ export function DeploymentStages({
               <StatusIndicator
                 status={
                   stage.status as
-                  | 'success'
-                  | 'failure'
-                  | 'running'
-                  | 'pending'
-                  | 'cancelled'
+                    | 'success'
+                    | 'failure'
+                    | 'running'
+                    | 'pending'
+                    | 'cancelled'
                 }
               />
             </div>

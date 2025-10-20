@@ -314,7 +314,10 @@ const AppContent = () => {
 }
 
 // Helper to generate friendly error titles from mutation operations
-const getErrorTitle = (context: any, defaultTitle?: string): string | undefined => {
+const getErrorTitle = (
+  context: any,
+  defaultTitle?: string
+): string | undefined => {
   // Check for custom error title in mutation meta
   if (context?.meta?.errorTitle) {
     return context.meta.errorTitle

@@ -177,7 +177,7 @@ export default function ApiKeyCreate() {
                   API Key Created Successfully
                 </CardTitle>
                 <CardDescription>
-                  Your API key has been created. Copy it now as it won't be
+                  Your API key has been created. Copy it now as it won&apos;t be
                   shown again.
                 </CardDescription>
               </div>
@@ -191,7 +191,7 @@ export default function ApiKeyCreate() {
               <AlertCircle className="h-4 w-4" />
               <AlertDescription>
                 Make sure to copy your API key now. For security reasons, we
-                won't show it again.
+                won&apos;t show it again.
               </AlertDescription>
             </Alert>
 
@@ -628,8 +628,9 @@ export default function ApiKeyCreate() {
             <Alert>
               <AlertCircle className="h-4 w-4" />
               <AlertDescription>
-                After creating this API key, you'll receive a secret token. Make
-                sure to copy and store it securely as it won't be shown again.
+                After creating this API key, you&apos;ll receive a secret token.
+                Make sure to copy and store it securely as it won&apos;t be
+                shown again.
               </AlertDescription>
             </Alert>
 

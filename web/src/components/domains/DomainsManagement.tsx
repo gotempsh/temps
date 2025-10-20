@@ -82,7 +82,7 @@ export function DomainsManagement({
     canManageCertificates,
     canCreateDomains,
     isUsingCloudflare,
-    getAccessModeWarning,
+    getAccessModeWarning: _getAccessModeWarning,
   } = usePlatformCapabilities()
 
   const deleteDomain = useMutation({
@@ -127,21 +127,20 @@ export function DomainsManagement({
     },
   })
 
-  const [isCompletingDns, setIsCompletingDns] = useState<number | null>(null)
+  const handleCompleteDns = (domainId: number) => {
+    finalizeOrder.mutate({
+      path: {
+        domain_id: domainId,
+      },
+    })
+  }
 
-  const handleCompleteDns = async (domainId: number) => {
-    try {
-      setIsCompletingDns(domainId)
-      await finalizeOrder.mutateAsync({
-        path: {
-          domain_id: domainId,
-        },
-      })
-    } catch (error) {
-      // Error handled in onError
-    } finally {
-      setIsCompletingDns(null)
-    }
+  // Helper to check if a specific domain is being finalized
+  const isDomainBeingFinalized = (domainId: number) => {
+    return (
+      finalizeOrder.isPending &&
+      finalizeOrder.variables?.path?.domain_id === domainId
+    )
   }
 
   const handleDeleteDomain = async (domain: string) => {
@@ -151,8 +150,6 @@ export function DomainsManagement({
           domain: domain,
         },
       })
-    } catch (error) {
-      // Error handled in onError
     } finally {
       setDomainToDelete(null)
     }
@@ -469,12 +466,12 @@ export function DomainsManagement({
                                   <Button
                                     onClick={() => handleCompleteDns(domain.id)}
                                     disabled={
-                                      isCompletingDns === domain.id ||
+                                      isDomainBeingFinalized(domain.id) ||
                                       !canManageCertificates
                                     }
                                     className="w-full sm:w-auto"
                                   >
-                                    {isCompletingDns === domain.id ? (
+                                    {isDomainBeingFinalized(domain.id) ? (
                                       <>
                                         <Spinner className="mr-2 h-4 w-4" />
                                         Completing DNS Challenge...

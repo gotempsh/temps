@@ -12,7 +12,7 @@ import { FeedbackAlert } from '@/components/ui/feedback-alert'
 export function AddGitProvider() {
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { feedback, showSuccess, showError, clearFeedback } = useFeedback()
+  const { feedback, showSuccess, clearFeedback } = useFeedback()
 
   useEffect(() => {
     setBreadcrumbs([

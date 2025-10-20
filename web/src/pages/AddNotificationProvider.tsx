@@ -27,11 +27,11 @@ import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
+import { ProviderForm } from '@/components/monitoring/ProviderForm'
 import {
-  ProviderForm,
   ProviderFormData,
   providerSchema,
-} from '@/components/monitoring/ProviderForm'
+} from '@/components/monitoring/schemas'
 import { cn } from '@/lib/utils'
 
 type Step = 'provider-type' | 'configuration' | 'complete'

@@ -119,26 +119,24 @@ export function DomainProvisioning() {
           domain_id: domainId,
         },
       })
-    } catch (error) {
-      // Error handled in onError
     } finally {
       setIsCompletingDns(null)
     }
   }
 
-  const handleCancelOrder = async (domainName: string) => {
+  const handleCancelOrder = async (domain: DomainResponse) => {
     toast.promise(
       cancelOrder.mutateAsync({
         path: {
-          domain: domainName,
+          domain_id: domain.id,
         },
       }),
       {
-        loading: `Cancelling ACME order for ${domainName}...`,
+        loading: `Cancelling ACME order for ${domain.domain}...`,
         success: () => {
-          return `ACME order cancelled for ${domainName}. You can now start fresh.`
+          return `ACME order cancelled for ${domain.domain}. You can now start fresh.`
         },
-        error: `Failed to cancel ACME order for ${domainName}`,
+        error: `Failed to cancel ACME order for ${domain.domain}`,
       }
     )
   }
@@ -209,7 +207,7 @@ export function DomainProvisioning() {
                     domain={domain}
                     onProvision={handleProvisionDomain}
                     onCompleteDns={handleCompleteDns}
-                    onCancelOrder={handleCancelOrder}
+                    onCancelOrder={() => handleCancelOrder(domain)}
                     isCompletingDns={isCompletingDns === domain.id.toString()}
                     canManage={canManageCertificates}
                   />
@@ -239,7 +237,7 @@ export function DomainProvisioning() {
                     key={domain.id}
                     domain={domain}
                     onRetry={handleProvisionDomain}
-                    onCancelOrder={handleCancelOrder}
+                    onCancelOrder={() => handleCancelOrder(domain)}
                     canManage={canManageCertificates}
                   />
                 ))}
@@ -405,8 +403,8 @@ function DomainProvisioningCard({
                     5-15 minutes)
                   </li>
                   <li>
-                    Click "Complete DNS Challenge" below to verify and provision
-                    the certificate
+                    Click &quot;Complete DNS Challenge&quot; below to verify and
+                    provision the certificate
                   </li>
                 </ol>
               </div>

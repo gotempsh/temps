@@ -6,7 +6,6 @@ import {
   getDomainOrderOptions,
   getHttpChallengeDebugOptions,
   getPublicIpOptions,
-  provisionDomainMutation,
   renewDomainMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -45,7 +44,6 @@ export function DomainDetail() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [copiedField, setCopiedField] = useState<string | null>(null)
-  const [isCompletingDns, setIsCompletingDns] = useState(false)
 
   const {
     data: domain,
@@ -154,34 +152,6 @@ export function DomainDetail() {
     },
   })
 
-  const provisionDomain = useMutation({
-    ...provisionDomainMutation(),
-    meta: {
-      errorTitle: 'Failed to provision domain',
-    },
-    onSuccess: async () => {
-      toast.success('SSL certificate provisioning started')
-
-      // Initial refetch
-      await refetchDomain()
-      await refetchOrder()
-
-      // Poll for status updates until domain becomes active
-      const pollInterval = setInterval(async () => {
-        const result = await refetchDomain()
-        if (result.data?.status === 'active') {
-          clearInterval(pollInterval)
-          toast.success('SSL certificate is now active!')
-          await refetchDomain()
-          await refetchOrder()
-        }
-      }, 3000) // Check every 3 seconds
-
-      // Stop polling after 2 minutes
-      setTimeout(() => clearInterval(pollInterval), 120000)
-    },
-  })
-
   const cancelOrder = useMutation({
     ...cancelDomainOrderMutation(),
     meta: {
@@ -223,32 +193,21 @@ export function DomainDetail() {
 
   const handleCreateOrder = async () => {
     if (!domain) return
-    try {
-      await createOrder.mutateAsync({
-        path: {
-          domain_id: domain.id,
-        },
-      })
-    } catch (error) {
-      // Error handled in onError
-    }
+    await createOrder.mutate({
+      path: {
+        domain_id: domain.id,
+      },
+    })
   }
 
   const handleCompleteDns = async () => {
     if (!domain) return
-    try {
-      setIsCompletingDns(true)
-      // Finalize the order after DNS challenge verification
-      await finalizeOrder.mutateAsync({
-        path: {
-          domain_id: domain.id,
-        },
-      })
-    } catch (error) {
-      // Error handled in onError
-    } finally {
-      setIsCompletingDns(false)
-    }
+    // Finalize the order after DNS challenge verification
+    await finalizeOrder.mutate({
+      path: {
+        domain_id: domain.id,
+      },
+    })
   }
 
   const handleCancelOrder = () => {
@@ -420,9 +379,9 @@ export function DomainDetail() {
                   variant="default"
                   size="sm"
                   onClick={handleCompleteDns}
-                  disabled={!canManageCertificates || isCompletingDns}
+                  disabled={!canManageCertificates || finalizeOrder.isPending}
                 >
-                  {isCompletingDns ? (
+                  {finalizeOrder.isPending ? (
                     <>
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                       Verifying...
@@ -773,10 +732,11 @@ export function DomainDetail() {
                                 <Button
                                   onClick={handleCompleteDns}
                                   disabled={
-                                    isCompletingDns || !canManageCertificates
+                                    finalizeOrder.isPending ||
+                                    !canManageCertificates
                                   }
                                 >
-                                  {isCompletingDns ? (
+                                  {finalizeOrder.isPending ? (
                                     <>
                                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                                       Verifying...
@@ -1046,9 +1006,11 @@ export function DomainDetail() {
                       <div className="flex gap-2">
                         <Button
                           onClick={handleCompleteDns}
-                          disabled={isCompletingDns || !canManageCertificates}
+                          disabled={
+                            finalizeOrder.isPending || !canManageCertificates
+                          }
                         >
-                          {isCompletingDns ? (
+                          {finalizeOrder.isPending ? (
                             <>
                               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                               Verifying...
@@ -1223,10 +1185,11 @@ export function DomainDetail() {
                             <Button
                               onClick={handleCompleteDns}
                               disabled={
-                                isCompletingDns || !canManageCertificates
+                                finalizeOrder.isPending ||
+                                !canManageCertificates
                               }
                             >
-                              {isCompletingDns ? (
+                              {finalizeOrder.isPending ? (
                                 <>
                                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                                   Retrying...

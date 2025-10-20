@@ -83,15 +83,15 @@ const SERVICE_TYPES = [
 const formSchema = z.object({
   name: z.string().min(1, 'Project name is required'),
   preset: z.string().min(1, 'Preset is required'),
-  autoDeploy: z.boolean().default(true),
-  rootDirectory: z.string().default('./'),
+  autoDeploy: z.boolean(),
+  rootDirectory: z.string(),
   branch: z.string().min(1, 'Branch is required'),
   environmentVariables: z
     .array(
       z.object({
         key: z.string().min(1, 'Key is required'),
         value: z.string().min(1, 'Value is required'),
-        isSecret: z.boolean().default(false),
+        isSecret: z.boolean(),
       })
     )
     .optional(),
@@ -187,26 +187,7 @@ function RepoConfigStep({
           <FormItem>
             <FormLabel>Framework Preset</FormLabel>
             <Select
-              value={(() => {
-                // Convert stored preset back to select value format
-                if (field.value === 'custom') return 'custom'
-                if (!field.value) return ''
-
-                // Find matching project
-                const matchingProject = presetData?.projects?.find(
-                  (p: any) => p.preset === field.value
-                )
-                if (matchingProject) {
-                  return `${matchingProject.preset}::${matchingProject.path || 'root'}`
-                }
-
-                // Check if it's root preset
-                if (presetData?.root_preset === field.value) {
-                  return `${presetData.root_preset}::root`
-                }
-
-                return field.value
-              })()}
+              value={field.value}
               onValueChange={(value) => {
                 if (value === 'custom') {
                   field.onChange('custom')
@@ -323,16 +304,16 @@ interface ServicesStepProps {
   onCreateService: (type: ServiceTypeRoute) => void
 }
 // Memoized ServiceCard to prevent unnecessary re-renders
-const ServiceCard = React.memo(
-  ({
-    service,
-    isSelected,
-    onToggle,
-  }: {
-    service: any
-    isSelected: boolean
-    onToggle: (id: number) => void
-  }) => (
+const ServiceCard = React.memo(function ServiceCard({
+  service,
+  isSelected,
+  onToggle,
+}: {
+  service: any
+  isSelected: boolean
+  onToggle: (id: number) => void
+}) {
+  return (
     <Card
       className={`cursor-pointer transition-colors hover:bg-muted/50 ${isSelected ? 'ring-2 ring-primary' : ''}`}
       onClick={(e) => {
@@ -356,7 +337,7 @@ const ServiceCard = React.memo(
       </CardHeader>
     </Card>
   )
-)
+})
 
 function ServicesStep({
   form,
@@ -365,23 +346,21 @@ function ServicesStep({
   onCreateService,
 }: ServicesStepProps) {
   // Stable callback for service selection to prevent infinite re-renders
-  const storageCurrentServices = form.watch('storageServices') || []
   const handleServiceToggle = useCallback(
     (serviceId: number) => {
-      const currentServices = storageCurrentServices
+      const currentServices = form.getValues('storageServices') || []
       const isSelected = currentServices.includes(serviceId)
       const newValues = isSelected
         ? currentServices.filter((id: number) => id !== serviceId)
         : [...currentServices, serviceId]
 
-      // form.setValue('storageServices', newValues)
       form.setValue('storageServices', [...newValues], {
         shouldValidate: false,
         shouldDirty: false,
         shouldTouch: false,
       })
     },
-    [form, storageCurrentServices]
+    [form]
   )
 
   return (
@@ -605,7 +584,7 @@ function EnvVarsStep({
             No environment variables configured
           </p>
           <p className="text-sm text-muted-foreground">
-            Click "Add Variable" to get started
+            Click &quot;Add Variable&quot; to get started
           </p>
         </div>
       )}
@@ -794,7 +773,7 @@ const getStepTitle = (step: WizardStep) => {
 // Main Wizard Component
 export function ProjectConfigurationWizardInline({
   repository,
-  connectionId,
+  connectionId: _connectionId,
   presetData,
   branches,
   onSubmit,
@@ -826,7 +805,10 @@ export function ProjectConfigurationWizardInline({
   })
 
   // Step navigation
-  const steps: WizardStep[] = ['repo-config', 'services', 'env-vars', 'review']
+  const steps: WizardStep[] = useMemo(
+    () => ['repo-config', 'services', 'env-vars', 'review'],
+    []
+  )
   const currentStepIndex = useMemo(
     () => steps.indexOf(currentStep),
     [currentStep, steps]
@@ -888,8 +870,10 @@ export function ProjectConfigurationWizardInline({
           ...data,
           storageServices: allServiceIds,
         })
-      } catch (error) {
-        console.error('Project configuration error:', error)
+      } catch {
+        toast.error('Failed to create project', {
+          description: 'Please check your configuration and try again',
+        })
       } finally {
         setIsSubmitting(false)
       }

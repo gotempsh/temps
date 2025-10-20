@@ -2,6 +2,10 @@ import {
   type CustomDomainResponse,
   type DomainEnvironmentResponse,
 } from '@/api/client'
+import {
+  createCustomDomainMutation,
+  updateCustomDomainMutation,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import {
   Form,
@@ -19,16 +23,12 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useForm } from 'react-hook-form'
-import { z } from 'zod'
-import { useState } from 'react'
-import {
-  createCustomDomainMutation,
-  updateCustomDomainMutation,
-} from '@/api/client/@tanstack/react-query.gen'
 import { useMutation } from '@tanstack/react-query'
-import { toast } from 'sonner'
 import { X } from 'lucide-react'
+import { useState } from 'react'
+import { useForm, useWatch } from 'react-hook-form'
+import { toast } from 'sonner'
+import { z } from 'zod'
 
 const domainFormSchema = z.object({
   domain: z.string().min(1, 'Domain is required'),
@@ -170,7 +170,10 @@ export function DomainForm({
       })
     }
   }
-
+  const watchedRedirectTo = useWatch({
+    control: form.control,
+    name: 'redirectTo',
+  })
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
@@ -339,7 +342,7 @@ export function DomainForm({
           )}
         />
 
-        {form.watch('redirectTo') && (
+        {watchedRedirectTo && (
           <FormField
             control={form.control}
             name="statusCode"

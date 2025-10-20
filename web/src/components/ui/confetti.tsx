@@ -12,7 +12,13 @@ export function Confetti({
   particleCount = 50,
 }: ConfettiProps) {
   const [particles, setParticles] = useState<
-    Array<{ id: number; color: string; delay: number; left: number }>
+    Array<{
+      id: number
+      color: string
+      delay: number
+      left: number
+      rotation: number
+    }>
   >([])
   const [isVisible, setIsVisible] = useState(false)
 
@@ -32,6 +38,7 @@ export function Confetti({
         ][Math.floor(Math.random() * 6)],
         delay: Math.random() * 0.5,
         left: Math.random() * 100,
+        rotation: Math.random() * 360,
       }))
       setParticles(newParticles)
 
@@ -57,7 +64,7 @@ export function Confetti({
             left: `${particle.left}%`,
             animationDelay: `${particle.delay}s`,
             backgroundColor: particle.color,
-            transform: `rotate(${Math.random() * 360}deg)`,
+            transform: `rotate(${particle.rotation}deg)`,
           }}
         />
       ))}

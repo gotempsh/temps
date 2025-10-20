@@ -19,7 +19,7 @@ interface GitHubAppConfigurationProps {
 }
 
 export function GitHubAppConfiguration({
-  domain,
+  domain: _domain,
   onBack,
   onContinue,
 }: GitHubAppConfigurationProps) {

@@ -130,7 +130,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                       <Input {...field} className="max-w-[400px]" />
                     </FormControl>
                     <FormDescription className="text-muted-foreground">
-                      This will be used in your project's URL
+                      This will be used in your project&apos;s URL
                     </FormDescription>
                   </FormItem>
                 )}
@@ -164,8 +164,8 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
               <AlertDialogTitle>Are you absolutely sure?</AlertDialogTitle>
               <AlertDialogDescription>
                 This action cannot be undone. This will permanently delete your
-                project "{project?.name}" and remove all associated data from
-                our servers.
+                project &quot;{project?.name}&quot; and remove all associated
+                data from our servers.
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>

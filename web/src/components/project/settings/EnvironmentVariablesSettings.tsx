@@ -104,16 +104,12 @@ function EnvironmentVariableRow({
   })
 
   const handleDelete = async () => {
-    try {
-      await deleteMutation.mutateAsync({
-        path: {
-          project_id: project.id,
-          var_id: variable.id,
-        },
-      })
-    } catch (error) {
-      toast.error('Failed to delete environment variable')
-    }
+    await deleteMutation.mutateAsync({
+      path: {
+        project_id: project.id,
+        var_id: variable.id,
+      },
+    })
   }
 
   const [isEditModalOpen, setIsEditModalOpen] = useState(false)
@@ -599,8 +595,6 @@ function ImportEnvDialog({
         fileInputRef.current.value = ''
       }
       onOpenChange(false)
-    } catch (error) {
-      // Error handling is done in the parent
     } finally {
       setIsImporting(false)
     }
@@ -788,7 +782,9 @@ function ImportEnvDialog({
   )
 }
 
-interface EmptyPlaceholderProps extends React.HTMLAttributes<HTMLDivElement> {}
+interface EmptyPlaceholderProps extends React.HTMLAttributes<HTMLDivElement> {
+  children: React.ReactNode
+}
 
 function EmptyPlaceholder({
   className,
@@ -963,7 +959,7 @@ export function EnvironmentVariablesSettings({
           },
         })
         successCount++
-      } catch (error) {
+      } catch {
         errorCount++
       }
     }
@@ -1010,7 +1006,7 @@ export function EnvironmentVariablesSettings({
               Environment Variables
             </h2>
             <p className="text-sm text-muted-foreground">
-              Manage your project's environment variables across different
+              Manage your project&apos;s environment variables across different
               environments.
             </p>
           </div>

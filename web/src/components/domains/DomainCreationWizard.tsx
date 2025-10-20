@@ -23,8 +23,8 @@ import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
 import { CheckCircle, CopyIcon, Globe, Info, Shield } from 'lucide-react'
-import { useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { useCallback, useState } from 'react'
+import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -123,20 +123,19 @@ export function DomainCreationWizard({
     else if (step === 'confirm') setStep('challenge')
   }
 
-  const handleSubmit = async (data: DomainWizardFormData) => {
-    try {
-      await createDomain.mutateAsync({
+  const handleSubmit = useCallback(
+    (data: DomainWizardFormData) => {
+      createDomain.mutate({
         body: {
           domain: data.domain,
           challenge_type: data.challengeType,
         },
       })
-    } catch (error) {
-      // Error handled in onError
-    }
-  }
+    },
+    [createDomain]
+  )
 
-  const watchedValues = form.watch()
+  const watchedValues = useWatch({ control: form.control })
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

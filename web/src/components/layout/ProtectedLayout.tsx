@@ -16,7 +16,6 @@ export const ProtectedLayout = ({
     )
   }
   if (!user) {
-    console.log('No user detected, showing login')
     return <Login />
   }
 

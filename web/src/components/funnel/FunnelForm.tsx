@@ -1,8 +1,14 @@
 import {
-  ProjectResponse,
+  getUniqueEventsOptions,
+  previewFunnelMetricsMutation,
+} from '@/api/client/@tanstack/react-query.gen'
+import {
   CreateFunnelStep,
+  ProjectResponse,
   SmartFilter,
 } from '@/api/client/types.gen'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -11,26 +17,6 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Textarea } from '@/components/ui/textarea'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
-import { Badge } from '@/components/ui/badge'
-import { Separator } from '@/components/ui/separator'
-import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Skeleton } from '@/components/ui/skeleton'
-import { JsonEditor } from '@/components/ui/json-editor'
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from '@/components/ui/popover'
 import {
   Command,
   CommandEmpty,
@@ -39,25 +25,39 @@ import {
   CommandItem,
   CommandList,
 } from '@/components/ui/command'
+import { Input } from '@/components/ui/input'
+import { JsonEditor } from '@/components/ui/json-editor'
+import { Label } from '@/components/ui/label'
 import {
-  previewFunnelMetricsMutation,
-  getUniqueEventsOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { Separator } from '@/components/ui/separator'
+import { Skeleton } from '@/components/ui/skeleton'
+import { Textarea } from '@/components/ui/textarea'
+import { cn } from '@/lib/utils'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
+  Check,
+  ChevronDown,
+  ChevronsUpDown,
+  ChevronUp,
+  Clock,
+  Filter,
+  Percent,
   Plus,
   Trash2,
-  Filter,
-  ChevronDown,
-  ChevronUp,
   TrendingDown,
   Users,
-  Percent,
-  Clock,
-  Check,
-  ChevronsUpDown,
 } from 'lucide-react'
-import { cn } from '@/lib/utils'
 import * as React from 'react'
 
 type FilterType = SmartFilter['type']
@@ -140,7 +140,7 @@ const validateCustomDataJson = (
     }
 
     return { valid: true }
-  } catch (e) {
+  } catch {
     return { valid: false, error: 'Invalid JSON format' }
   }
 }
@@ -294,26 +294,63 @@ export function FunnelForm({
       }
     }
 
+    // Clear validation error when changing type (separate state update)
+    if (field === 'type') {
+      setFilterValidationErrors((prev) => {
+        const newErrors = { ...prev }
+        if (newErrors[stepIndex]) {
+          delete newErrors[stepIndex][filterIndex]
+          if (Object.keys(newErrors[stepIndex]).length === 0) {
+            delete newErrors[stepIndex]
+          }
+        }
+        return newErrors
+      })
+    }
+
+    // Update form data
     setFormData((prev) => ({
       ...prev,
       steps: prev.steps.map((step, i) => {
         if (i !== stepIndex) return step
         const filters = [...(step.event_filter || [])]
         if (field === 'type') {
-          filters[filterIndex] = { type: value as FilterType, value: '' }
-          // Clear validation error when changing type
-          setFilterValidationErrors((prev) => {
-            const newErrors = { ...prev }
-            if (newErrors[stepIndex]) {
-              delete newErrors[stepIndex][filterIndex]
-              if (Object.keys(newErrors[stepIndex]).length === 0) {
-                delete newErrors[stepIndex]
-              }
+          const newType = value as FilterType
+          // Reset value based on filter type
+          if (newType === 'custom_data') {
+            filters[filterIndex] = {
+              type: newType,
+              value: { path: '', value: '' },
             }
-            return newErrors
-          })
+          } else {
+            filters[filterIndex] = { type: newType, value: '' }
+          }
         } else {
-          filters[filterIndex] = { ...filters[filterIndex], value }
+          // When updating value, preserve the type and create proper discriminated union
+          const currentFilter = filters[filterIndex]
+          if (currentFilter.type === 'custom_data') {
+            // For custom_data, value comes as JSON string from the editor
+            // Parse it to get the object, or use current value if parse fails
+            let parsedValue: { path: string; value: string }
+            try {
+              parsedValue = JSON.parse(value)
+            } catch {
+              // If parsing fails, keep current value or use empty object
+              parsedValue =
+                typeof currentFilter.value === 'object'
+                  ? currentFilter.value
+                  : { path: '', value: '' }
+            }
+            filters[filterIndex] = {
+              type: 'custom_data',
+              value: parsedValue,
+            }
+          } else {
+            filters[filterIndex] = {
+              type: currentFilter.type,
+              value: value,
+            }
+          }
         }
         return { ...step, event_filter: filters }
       }),
@@ -378,24 +415,18 @@ export function FunnelForm({
   React.useEffect(() => {
     // Only fetch preview if we have valid steps (name is not required)
     if (formData.steps.length === 0) {
-      console.log('Preview skipped: no steps')
       return
     }
 
     const validSteps = formData.steps
       .filter((step) => step.event_name.trim())
-      .map(({ showFilters, ...step }) => step)
+      .map(({ showFilters: _showFilters, ...step }) => step)
 
     if (validSteps.length === 0) {
-      console.log('Preview skipped: no valid steps')
       return
     }
 
     const timer = setTimeout(() => {
-      console.log('Fetching preview with:', {
-        name: formData.name.trim() || 'Preview',
-        steps: validSteps,
-      })
       previewMutation.mutate({
         path: {
           project_id: project.id,
@@ -410,12 +441,7 @@ export function FunnelForm({
 
     return () => clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    formData.name,
-    formData.description,
-    JSON.stringify(formData.steps),
-    project.id,
-  ])
+  }, [formData.name, formData.description, formData.steps, project.id])
 
   return (
     <div className="w-full max-w-7xl mx-auto space-y-6 p-6">
@@ -540,7 +566,8 @@ export function FunnelForm({
                                           </p>
                                           <p className="text-xs text-muted-foreground">
                                             Press Enter to use &quot;
-                                            {step.event_name}&quot; as custom event
+                                            {step.event_name}&quot; as custom
+                                            event
                                           </p>
                                         </div>
                                       </CommandEmpty>
@@ -778,7 +805,12 @@ export function FunnelForm({
                                                 </div>
                                               ) : (
                                                 <Input
-                                                  value={filter.value}
+                                                  value={
+                                                    typeof filter.value ===
+                                                    'string'
+                                                      ? filter.value
+                                                      : filter.value.path
+                                                  }
                                                   onChange={(e) =>
                                                     updateFilter(
                                                       index,

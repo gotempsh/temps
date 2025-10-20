@@ -1868,6 +1868,287 @@ const syncMutation = useMutation({
 - Support both inline and dialog/modal modes
 - Make components configurable with props
 
+### React Component Best Practices
+
+#### Avoid IIFEs (Immediately Invoked Function Expressions) in JSX
+
+**NEVER use auto-callable functions (IIFEs) in React components.** Instead, extract logic into separate components, helper functions, or use proper React patterns.
+
+**Why?**
+- Reduces code readability and maintainability
+- Makes components harder to test
+- Hides logic that should be in reusable components or helper functions
+- Creates unnecessary complexity in JSX
+
+**Examples:**
+
+```tsx
+// ❌ BAD - Using IIFE in JSX
+function MyComponent({ headers }) {
+  return (
+    <div>
+      {(() => {
+        try {
+          const parsed = typeof headers === 'string'
+            ? JSON.parse(headers)
+            : headers
+          return Object.entries(parsed).map(([key, value]) => (
+            <div key={key}>
+              <span>{key}</span>
+              <span>{Array.isArray(value) ? value.join(', ') : String(value)}</span>
+            </div>
+          ))
+        } catch (e) {
+          return <p>Failed to parse headers</p>
+        }
+      })()}
+    </div>
+  )
+}
+
+// ✅ GOOD - Extract to separate component
+interface HeadersDisplayProps {
+  headers: string | Record<string, unknown> | null | undefined
+  emptyMessage?: string
+}
+
+function HeadersDisplay({ headers, emptyMessage = 'Failed to parse headers' }: HeadersDisplayProps) {
+  if (!headers) return null
+
+  try {
+    const parsed = typeof headers === 'string' ? JSON.parse(headers) : headers
+    const entries = Object.entries(parsed)
+
+    if (entries.length === 0) {
+      return <p className="text-sm text-muted-foreground">No headers available</p>
+    }
+
+    return (
+      <div className="space-y-3">
+        {entries.map(([key, value]) => (
+          <div key={key} className="border-b pb-2 last:border-0">
+            <div className="flex flex-col space-y-1">
+              <span className="text-sm font-medium">{key}</span>
+              <span className="text-sm text-muted-foreground font-mono break-all">
+                {Array.isArray(value) ? value.join(', ') : String(value)}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+    )
+  } catch (_error) {
+    return <p className="text-sm text-muted-foreground">{emptyMessage}</p>
+  }
+}
+
+// Usage
+function MyComponent({ headers }) {
+  return (
+    <div>
+      <HeadersDisplay headers={headers} />
+    </div>
+  )
+}
+```
+
+```tsx
+// ❌ BAD - Complex logic in IIFE
+function EventList({ events }) {
+  return (
+    <div>
+      {events.map(event => (
+        <div key={event.id}>
+          {(() => {
+            const data = event.data
+            if (isMetaEventData(data)) {
+              if (data.href) return data.href
+            }
+            if (isIncrementalSnapshotData(data)) {
+              if (data.source !== undefined) {
+                return INCREMENTAL_TYPES[data.source]
+              }
+            }
+            return JSON.stringify(data)
+          })()}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ✅ GOOD - Extract to helper function
+function formatEventData(event: Event): string {
+  const data = event.data
+
+  if (isMetaEventData(data) && data.href) {
+    return data.href
+  }
+
+  if (isIncrementalSnapshotData(data) && data.source !== undefined) {
+    return INCREMENTAL_TYPES[data.source]
+  }
+
+  return JSON.stringify(data)
+}
+
+function EventList({ events }) {
+  return (
+    <div>
+      {events.map(event => (
+        <div key={event.id}>
+          {formatEventData(event)}
+        </div>
+      ))}
+    </div>
+  )
+}
+```
+
+**When IIFEs are acceptable:**
+- Simple type casting that TypeScript requires (but prefer helper functions)
+- Very simple transformations that don't warrant a separate function (1-2 lines max)
+
+```tsx
+// Acceptable for simple type casting (but still prefer helper functions)
+<pre>
+  {(() => {
+    const data = event.data
+    const formatted: string = typeof data === 'object' && data !== null
+      ? JSON.stringify(data, null, 2)
+      : String(data)
+    return formatted
+  })()}
+</pre>
+```
+
+#### Use Mutation/Query States Instead of Manual State Variables
+
+**ALWAYS use the built-in state from React Query mutations and queries** (`isPending`, `isLoading`, `isError`, etc.) instead of managing loading states manually with `useState`.
+
+**Why?**
+- Eliminates redundant state management
+- Prevents state sync issues
+- Reduces boilerplate code
+- Automatically tracks the actual operation state
+- More reliable and less error-prone
+
+**Examples:**
+
+```tsx
+// ❌ BAD - Manual loading state management
+function DomainDetail() {
+  const [isCompletingDns, setIsCompletingDns] = useState(false)
+
+  const finalizeOrder = useMutation({
+    ...finalizeOrderMutation(),
+    onSuccess: () => {
+      toast.success('DNS challenge verified!')
+    },
+  })
+
+  const handleCompleteDns = async () => {
+    try {
+      setIsCompletingDns(true)
+      await finalizeOrder.mutateAsync({ path: { domain_id: domain.id } })
+    } catch (error) {
+      // Error handled
+    } finally {
+      setIsCompletingDns(false)
+    }
+  }
+
+  return (
+    <Button
+      onClick={handleCompleteDns}
+      disabled={isCompletingDns}
+    >
+      {isCompletingDns ? (
+        <>
+          <Loader2 className="animate-spin" />
+          Verifying...
+        </>
+      ) : (
+        'Verify DNS'
+      )}
+    </Button>
+  )
+}
+
+// ✅ GOOD - Use mutation's isPending state
+function DomainDetail() {
+  const finalizeOrder = useMutation({
+    ...finalizeOrderMutation(),
+    onSuccess: () => {
+      toast.success('DNS challenge verified!')
+    },
+  })
+
+  const handleCompleteDns = async () => {
+    try {
+      await finalizeOrder.mutateAsync({ path: { domain_id: domain.id } })
+    } catch (error) {
+      // Error handled in onError
+    }
+  }
+
+  return (
+    <Button
+      onClick={handleCompleteDns}
+      disabled={finalizeOrder.isPending}
+    >
+      {finalizeOrder.isPending ? (
+        <>
+          <Loader2 className="animate-spin" />
+          Verifying...
+        </>
+      ) : (
+        'Verify DNS'
+      )}
+    </Button>
+  )
+}
+```
+
+```tsx
+// ❌ BAD - Manual loading state for queries
+function ProjectList() {
+  const [isLoadingProjects, setIsLoadingProjects] = useState(true)
+
+  const { data: projects } = useQuery({
+    ...getProjectsOptions(),
+    onSuccess: () => setIsLoadingProjects(false),
+    onError: () => setIsLoadingProjects(false),
+  })
+
+  if (isLoadingProjects) return <Spinner />
+
+  return <div>{/* render projects */}</div>
+}
+
+// ✅ GOOD - Use query's isLoading state
+function ProjectList() {
+  const { data: projects, isLoading } = useQuery({
+    ...getProjectsOptions(),
+  })
+
+  if (isLoading) return <Spinner />
+
+  return <div>{/* render projects */}</div>
+}
+```
+
+**Available states from React Query:**
+- **Mutations**: `isPending`, `isSuccess`, `isError`, `error`, `data`
+- **Queries**: `isLoading`, `isFetching`, `isError`, `isSuccess`, `error`, `data`
+
+**When to use each:**
+- `isPending` (mutations): Operation is currently running
+- `isLoading` (queries): Initial data load (no cached data exists)
+- `isFetching` (queries): Data is being fetched (may have cached data)
+- `isError`: Operation failed, check `error` for details
+- `isSuccess`: Operation completed successfully
+
 ### UI/UX Guidelines
 - Use shadcn/ui components with proper theme colors for light/dark mode
 - Prefer wider layouts for complex forms (max-w-7xl instead of max-w-5xl)

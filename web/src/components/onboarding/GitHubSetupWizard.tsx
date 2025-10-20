@@ -48,7 +48,7 @@ export function GitHubSetupWizard({
   const [isCheckingInstallation, setIsCheckingInstallation] = useState(false)
 
   // Query GitHub apps configuration
-  const { data: githubApps, isLoading: appsLoading } = useQuery({
+  const { data: githubApps, isLoading: _appsLoading } = useQuery({
     // ...getAllGithubAppsOptions({}),
     queryKey: ['github-apps'],
     queryFn: () => [],
@@ -71,7 +71,7 @@ export function GitHubSetupWizard({
   })
 
   // Sync installation mutation
-  const syncInstallation = useMutation({
+  const _syncInstallation = useMutation({
     // ...syncGithubInstallationMutation(),
     mutationFn: () => Promise.resolve(),
     meta: {
@@ -242,8 +242,8 @@ export function GitHubSetupWizard({
                 <Alert>
                   <AlertCircle className="h-4 w-4" />
                   <AlertDescription>
-                    You&apos;ll be redirected to GitHub to install the app. You can
-                    choose which repositories to grant access to.
+                    You&apos;ll be redirected to GitHub to install the app. You
+                    can choose which repositories to grant access to.
                   </AlertDescription>
                 </Alert>
 
@@ -435,8 +435,8 @@ export function GitHubSetupWizard({
                   </CardHeader>
                   <CardContent>
                     <p className="text-sm text-muted-foreground mb-4">
-                      Your GitHub account is now connected. Here&apos;s what you can
-                      do next:
+                      Your GitHub account is now connected. Here&apos;s what you
+                      can do next:
                     </p>
                     <ul className="space-y-2 text-sm">
                       <li className="flex items-start gap-2">

@@ -88,7 +88,7 @@ export function EditFunnel({ project }: EditFunnelProps) {
 
     const validSteps = formData.steps
       .filter((step) => step.event_name.trim())
-      .map(({ showFilters, ...step }) => step)
+      .map(({ showFilters: _, ...step }) => step)
 
     updateFunnel.mutate({
       path: {

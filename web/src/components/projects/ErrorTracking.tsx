@@ -44,10 +44,8 @@ import {
   Activity,
   AlertTriangle,
   Bug,
-  CheckCircle2,
   ChevronDown,
   ChevronRight,
-  Copy,
   Info,
   Plus,
   RefreshCw,
@@ -60,6 +58,7 @@ import { useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import { TimeAgo } from '../utils/TimeAgo'
+import { CopyButton } from '../ui/copy-button'
 
 interface ErrorTrackingProps {
   project: ProjectResponse
@@ -109,7 +108,6 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
     return { startTime: startTime.toISOString(), endTime }
   }, [selectedTimeRange])
   const [showCreateDialog, setShowCreateDialog] = useState(false)
-  const [copiedDsn, setCopiedDsn] = useState<string | null>(null)
   const [dialogEnvironmentId, setDialogEnvironmentId] = useState<string>('')
 
   // Fetch project environments
@@ -152,7 +150,6 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
     }),
     enabled: hasErrors,
   })
-  errorGroupsResponse?.pagination
 
   // Fetch error dashboard statistics (only if we have errors)
   const { data: dashboardStats, isLoading: isLoadingDashboardStats } = useQuery(
@@ -170,11 +167,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   )
 
   // Fetch DSN for the selected environment (always fetch when environment is selected)
-  const {
-    data: dsnInfo,
-    isLoading: isLoadingDsn,
-    refetch: refetchDsn,
-  } = useQuery({
+  const { data: dsnInfo, refetch: refetchDsn } = useQuery({
     ...listDsnsOptions({
       path: { project_id: project.id },
       // query: { environment_id: parseInt(selectedEnvironmentId) }
@@ -230,24 +223,6 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
         return 'text-gray-600 bg-gray-100 dark:bg-gray-900/20'
     }
   }
-
-  const getTrendIcon = (trend: number) => {
-    if (trend > 0) return <TrendingUp className="h-4 w-4 text-red-500" />
-    if (trend < 0) return <TrendingDown className="h-4 w-4 text-green-500" />
-    return <Activity className="h-4 w-4 text-gray-500" />
-  }
-
-  const handleCopyDsn = async (dsn: string, type: string) => {
-    try {
-      await navigator.clipboard.writeText(dsn)
-      setCopiedDsn(type)
-      toast.success('DSN copied to clipboard')
-      setTimeout(() => setCopiedDsn(null), 2000)
-    } catch (error) {
-      toast.error('Failed to copy DSN')
-    }
-  }
-
   const handleCreateOrRegenerateDsn = () => {
     if (!dialogEnvironmentId) {
       toast.error('Please select an environment')
@@ -259,25 +234,6 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
         environment_id: parseInt(dialogEnvironmentId),
       },
     })
-  }
-
-  const getIntegrationExample = (dsn: string) => {
-    const envName =
-      environments?.find((e) => e.id.toString() === selectedEnvironmentId)
-        ?.name || 'production'
-    return `import * as Sentry from "@sentry/browser";
-
-Sentry.init({
-  dsn: "${dsn}",
-  environment: "${envName}",
-  integrations: [
-    new Sentry.BrowserTracing(),
-    new Sentry.Replay(),
-  ],
-  tracesSampleRate: 1.0,
-  replaysSessionSampleRate: 0.1,
-  replaysOnErrorSampleRate: 1.0,
-});`
   }
 
   const hasDsn = Boolean(dsnInfo?.[0]?.dsn)
@@ -641,7 +597,6 @@ Sentry.init({
                       const env = environments?.find(
                         (e) => e.id === dsn.environment_id
                       )
-                      const dsnId = `dsn-${dsn.environment_id}`
                       return (
                         <div
                           key={dsn.id || dsn.environment_id}
@@ -675,19 +630,7 @@ Sentry.init({
                                 readOnly
                                 className="font-mono text-sm"
                               />
-                              <Button
-                                size="icon"
-                                variant="outline"
-                                onClick={() =>
-                                  handleCopyDsn(dsn.dsn || '', dsnId)
-                                }
-                              >
-                                {copiedDsn === dsnId ? (
-                                  <CheckCircle2 className="h-4 w-4 text-green-600" />
-                                ) : (
-                                  <Copy className="h-4 w-4" />
-                                )}
-                              </Button>
+                              <CopyButton value={dsn.dsn || ''} />
                             </div>
                             <p className="text-xs text-muted-foreground">
                               Use this DSN in your {env?.name?.toLowerCase()}{' '}

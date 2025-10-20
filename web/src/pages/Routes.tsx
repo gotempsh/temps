@@ -6,8 +6,6 @@ import { useQuery } from '@tanstack/react-query'
 import { listDomains, listRoutes } from '@/api/client'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { AlertCircle } from 'lucide-react'
-import { Storage } from '@/pages/Storage'
-import { ServiceDetail } from '@/pages/ServiceDetail'
 
 export function Routes() {
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -66,15 +64,3 @@ export function Routes() {
     </div>
   )
 }
-
-export const routes = [
-  // ... other routes
-  {
-    path: '/storage',
-    element: <Storage />,
-  },
-  {
-    path: '/storage/:id',
-    element: <ServiceDetail />,
-  },
-]

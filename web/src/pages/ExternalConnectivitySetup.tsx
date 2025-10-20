@@ -70,7 +70,7 @@ export function ExternalConnectivitySetup({
   onComplete,
 }: ExternalConnectivitySetupProps) {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { data: settings } = useSettings()
+  const { data: _settings } = useSettings()
   const navigate = useNavigate()
 
   // Use platform access context to detect actual access mode
@@ -132,7 +132,7 @@ export function ExternalConnectivitySetup({
   const [networkSolution, setNetworkSolution] =
     useState<NetworkSolution | null>(null)
   const [domainName, setDomainName] = useState('*.example.com')
-  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [_showAdvanced, _setShowAdvanced] = useState(false)
   const [setupInstructionsOpen, setSetupInstructionsOpen] = useState(true)
   const [confirmedPublicAccess, setConfirmedPublicAccess] = useState(false)
 
@@ -143,8 +143,8 @@ export function ExternalConnectivitySetup({
   const tunnelName = `${slugifyDomain(baseDomain)}-temps`
 
   // Port forwarding setup
-  const [forwardedPorts, setForwardedPorts] = useState(['80', '443'])
-  const [routerConfigured, setRouterConfigured] = useState(false)
+  const [_forwardedPorts, _setForwardedPorts] = useState(['80', '443'])
+  const [_routerConfigured, _setRouterConfigured] = useState(false)
 
   // Public IP detection - prefer platform access info if available
   const {
@@ -241,14 +241,12 @@ export function ExternalConnectivitySetup({
       errorTitle: 'Failed to configure domain',
     },
     onSuccess: (data) => {
-      console.log('Domain created successfully:', data)
       toast.success(
         'Domain configured successfully! Redirecting to DNS challenge setup...'
       )
 
       // Always redirect to domain detail page after creating domain
       if (data && data.id) {
-        console.log('Navigating to domain:', data.id)
         navigate(`/domains/${data.id}`)
       } else {
         console.error('Domain created but no ID returned:', data)
@@ -317,7 +315,7 @@ export function ExternalConnectivitySetup({
             External Connectivity
           </h1>
           <p className="text-muted-foreground mt-2">
-            Your platform's external connectivity status and configuration
+            Your platform&apos;s external connectivity status and configuration
           </p>
         </div>
 
@@ -394,7 +392,7 @@ export function ExternalConnectivitySetup({
                     Router Port Forwarding Configuration
                   </CardTitle>
                   <CardDescription>
-                    You're accessing from a private IP. Ensure these port
+                    You&apos;re accessing from a private IP. Ensure these port
                     mappings are configured in your router.
                   </CardDescription>
                 </CardHeader>
@@ -478,7 +476,7 @@ export function ExternalConnectivitySetup({
                       <strong>Router Configuration Required:</strong>
                       <ol className="mt-2 space-y-1 text-sm list-decimal list-inside">
                         <li>
-                          Access your router's admin panel (usually at
+                          Access your router&apos;s admin panel (usually at
                           192.168.1.1 or 192.168.0.1)
                         </li>
                         <li>
@@ -494,7 +492,7 @@ export function ExternalConnectivitySetup({
                     <Alert className="border-yellow-200">
                       <Info className="h-4 w-4 text-yellow-600" />
                       <AlertDescription>
-                        You're currently accessing on port{' '}
+                        You&apos;re currently accessing on port{' '}
                         <strong>{getCurrentPort()}</strong>. For production use,
                         configure standard ports 80 and 443 for better
                         compatibility.
@@ -971,7 +969,7 @@ export function ExternalConnectivitySetup({
                               </div>
                             </div>
                             <div className="text-xs text-muted-foreground mt-2">
-                              Your server's private IP:{' '}
+                              Your server&apos;s private IP:{' '}
                               <code className="font-mono font-semibold">
                                 {window.location.hostname}
                               </code>
@@ -1061,8 +1059,8 @@ cloudflared tunnel route dns ${tunnelName} "${baseDomain || 'example.com'}"`}
                                 />
                                 <div className="p-2 bg-blue-50 dark:bg-blue-950/30 rounded text-xs">
                                   <p className="text-blue-900 dark:text-blue-100">
-                                    💡 Save the Tunnel ID - you'll need it for
-                                    the config file
+                                    💡 Save the Tunnel ID - you&apos;ll need it
+                                    for the config file
                                   </p>
                                 </div>
                               </div>
@@ -1321,8 +1319,8 @@ echo "Run 'cloudflared tunnel run $TUNNEL_NAME' to start the tunnel"`}
                     </>
                   )}
                   <li>
-                    SSL certificates will be automatically provisioned via Let's
-                    Encrypt
+                    SSL certificates will be automatically provisioned via
+                    Let&apos;s Encrypt
                   </li>
                 </ul>
               </AlertDescription>
