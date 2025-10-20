@@ -2025,10 +2025,9 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("container-123".to_string()),
             container_name: Set("test-container-1".to_string()),
-            image_name: Set("nginx:latest".to_string()),
-            status: Set("running".to_string()),
+            image_name: Set(Some("nginx:latest".to_string())),
+            status: Set(Some("running".to_string())),
             created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
             ..Default::default()
         };
         container1.insert(db.as_ref()).await?;
@@ -2037,10 +2036,9 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("container-456".to_string()),
             container_name: Set("test-container-2".to_string()),
-            image_name: Set("postgres:15".to_string()),
-            status: Set("running".to_string()),
+            image_name: Set(Some("postgres:15".to_string())),
+            status: Set(Some("running".to_string())),
             created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
             ..Default::default()
         };
         container2.insert(db.as_ref()).await?;
@@ -2064,13 +2062,13 @@ mod tests {
         let db = test_db.connection_arc();
 
         // Setup test data without current deployment
-        let (_project, environment, _deployment) = setup_test_data(&db).await?;
+        let (project, environment, _deployment) = setup_test_data(&db).await?;
 
         let deployment_service = create_deployment_service_for_test(db.clone());
 
         // Test list containers - should return empty for no active deployment
         let containers = deployment_service
-            .list_environment_containers(deployment.project_id, environment.id)
+            .list_environment_containers(project.id, environment.id)
             .await?;
 
         assert_eq!(containers.len(), 0, "Should return no containers when no active deployment");
@@ -2098,10 +2096,9 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("valid-container-id".to_string()),
             container_name: Set("test-container".to_string()),
-            image_name: Set("nginx:latest".to_string()),
-            status: Set("running".to_string()),
+            image_name: Set(Some("nginx:latest".to_string())),
+            status: Set(Some("running".to_string())),
             created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
             ..Default::default()
         };
         container.insert(db.as_ref()).await?;

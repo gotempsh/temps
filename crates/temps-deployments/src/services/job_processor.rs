@@ -499,6 +499,7 @@ mod tests {
     use temps_core::QueueError;
     use temps_database::test_utils::TestDatabase;
     use temps_entities::types::{PipelineStatus, ProjectType};
+    use temps_logs::LogService;
 
     fn create_test_config_service(db: Arc<DbConnection>) -> Arc<temps_config::ConfigService> {
         let server_config = Arc::new(
@@ -731,9 +732,28 @@ mod tests {
         let db = test_db.connection_arc();
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
+
+        // Create ExternalServiceManager with minimal setup
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .expect("Failed to create encryption service"),
+        );
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .expect("Docker required for tests")
+        );
+        let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
+            db.clone(),
+            encryption_service,
+            docker,
+        ));
+
         let workflow_planner = Arc::new(WorkflowPlanner::new(
             db.clone(),
             Arc::new(LogService::new(std::env::temp_dir())),
+            external_service_manager,
             config_service,
             dsn_service,
         ));
@@ -777,9 +797,28 @@ mod tests {
         let db = test_db.connection_arc();
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
+
+        // Create ExternalServiceManager with minimal setup
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .expect("Failed to create encryption service"),
+        );
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .expect("Docker required for tests")
+        );
+        let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
+            db.clone(),
+            encryption_service,
+            docker,
+        ));
+
         let workflow_planner = Arc::new(WorkflowPlanner::new(
             db.clone(),
             Arc::new(LogService::new(std::env::temp_dir())),
+            external_service_manager,
             config_service,
             dsn_service,
         ));
@@ -852,9 +891,28 @@ mod tests {
         let db = test_db.connection_arc();
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
+
+        // Create ExternalServiceManager with minimal setup
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .expect("Failed to create encryption service"),
+        );
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .expect("Docker required for tests")
+        );
+        let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
+            db.clone(),
+            encryption_service,
+            docker,
+        ));
+
         let workflow_planner = Arc::new(WorkflowPlanner::new(
             db.clone(),
             Arc::new(LogService::new(std::env::temp_dir())),
+            external_service_manager,
             config_service,
             dsn_service,
         ));

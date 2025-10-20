@@ -74,9 +74,9 @@ impl TestDBMockOperations {
             environment_id: Set(environment.id),
             slug: Set("http://localhost:8080".to_string()),
             state: Set("running".to_string()),
-            status: Set(temps_entities::types::PipelineStatus::Completed),
-            container_port: Set(Some(8080)), // Required for route table
-            metadata: Set(sea_orm::JsonValue::Null), // Required field
+            metadata: Set(sea_orm::JsonValue::Object(serde_json::Map::from_iter(vec![
+                ("container_port".to_string(), serde_json::Value::Number(8080.into())),
+            ]))),
             ..Default::default()
         };
         let deployment = deployment.insert(self.db.as_ref()).await?;

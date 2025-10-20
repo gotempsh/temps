@@ -802,7 +802,6 @@ mod integration_tests {
         let job = temps_core::Job::ProjectCreated(temps_core::ProjectCreatedJob {
             project_id: project.id,
             project_name: project.name.clone(),
-            owner_id: 1,
         });
         queue.send(job).await.unwrap();
 

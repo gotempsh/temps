@@ -762,10 +762,11 @@ mod tests {
         let test_db = temps_database::test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
+        let encryption_service = Arc::new(EncryptionService::new("0000000000000000000000000000000000000000000000000000000000000000").unwrap());
         let repository = Arc::new(crate::tls::repository::DefaultCertificateRepository::new(
             test_db.db.clone(),
+            encryption_service.clone(),
         ));
-        let encryption_service = Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let service = DomainService::new(
             test_db.db.clone(),
             Arc::new(MockProvider),

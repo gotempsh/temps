@@ -971,9 +971,18 @@ mod tests {
             // Wait for Mailpit to be ready
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
+            // Create encryption service
+            let encryption_service = Arc::new(
+                temps_core::EncryptionService::new("0000000000000000000000000000000000000000000000000000000000000000")
+                    .expect("Failed to create encryption service")
+            );
+
             // Create notification service
             let notification_service = Arc::new(
-                crate::services::NotificationService::new(test_db.connection_arc())
+                crate::services::NotificationService::new(
+                    test_db.connection_arc(),
+                    encryption_service.clone()
+                )
             );
 
             // Create notification preferences service

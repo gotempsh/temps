@@ -159,14 +159,15 @@ mod tests {
         let lb_service = Arc::new(LbService::new(test_db.db.clone()));
         let request_log_service = Arc::new(RequestLogService::new(test_db.db.clone()));
 
-        // Create a mock IP service for proxy_log_service
-        let ip_service = Arc::new(temps_geo::IpAddressService::new(test_db.db.clone()));
+        // Create a mock GeoIP service and IP service for proxy_log_service
+        let geo_ip_service = Arc::new(temps_geo::GeoIpService::new().unwrap());
+        let ip_service = Arc::new(temps_geo::IpAddressService::new(test_db.db.clone(), geo_ip_service));
         let proxy_log_service = Arc::new(ProxyLogService::new(test_db.db.clone(), ip_service));
 
         // Register services in the service registry
-        service_registry.register_service(lb_service);
-        service_registry.register_service(request_log_service);
-        service_registry.register_service(proxy_log_service);
+        service_registry.register(lb_service);
+        service_registry.register(request_log_service);
+        service_registry.register(proxy_log_service);
 
         let plugin_context = PluginContext::new(service_registry, state_registry);
         let plugin = ProxyPlugin::new();

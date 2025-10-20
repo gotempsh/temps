@@ -1296,9 +1296,104 @@ impl ProjectService {
 mod tests {
     use super::*;
     use temps_database::test_utils::TestDatabase;
-    use temps_queue::MockJobQueue;
     use std::sync::Arc;
     use sea_orm::{ActiveModelTrait, Set};
+    use temps_core::{JobQueue, QueueError};
+    use temps_core::async_trait::async_trait;
+    use std::sync::Mutex;
+
+    // Mock JobQueue for testing
+    struct MockJobQueue {
+        jobs: Arc<Mutex<Vec<Job>>>,
+    }
+
+    impl MockJobQueue {
+        fn new() -> Self {
+            Self {
+                jobs: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        async fn get_jobs(&self) -> Vec<Job> {
+            self.jobs.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl JobQueue for MockJobQueue {
+        async fn send(&self, job: Job) -> Result<(), QueueError> {
+            self.jobs.lock().unwrap().push(job);
+            Ok(())
+        }
+
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            unimplemented!("Not needed for these tests")
+        }
+    }
+
+    // Helper function to create test services
+    async fn create_test_services(
+        db: Arc<temps_database::DbConnection>,
+        mock_queue: Arc<MockJobQueue>,
+    ) -> ProjectService {
+        // Create ConfigService
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgresql://test".to_string(),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            server_config,
+            db.clone(),
+        ));
+
+        // Create ExternalServiceManager
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .expect("Failed to create encryption service"),
+        );
+
+        // Create Docker client for ExternalServiceManager
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .expect("Docker connection required for tests")
+        );
+
+        let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
+            db.clone(),
+            encryption_service.clone(),
+            docker,
+        ));
+
+        // Create GitProviderManager
+        let git_provider_manager = Arc::new(temps_git::GitProviderManager::new(
+            db.clone(),
+            encryption_service.clone(),
+            mock_queue.clone() as Arc<dyn temps_core::JobQueue>,
+            config_service.clone(),
+        ));
+
+        // Create EnvironmentService
+        let environment_service = Arc::new(temps_environments::EnvironmentService::new(
+            db.clone(),
+            config_service.clone(),
+        ));
+
+        ProjectService::new(
+            db,
+            mock_queue,
+            config_service,
+            external_service_manager,
+            git_provider_manager,
+            environment_service,
+        )
+    }
 
     #[tokio::test]
     async fn test_update_project_emits_event() {
@@ -1310,30 +1405,47 @@ mod tests {
         let mock_queue = Arc::new(MockJobQueue::new());
 
         // Create project service
-        let project_service = ProjectService::new(db.clone(), mock_queue.clone());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
 
         // Insert a test project
         let project = temps_entities::projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            repository_id: Set(None),
             git_provider_connection_id: Set(None),
             main_branch: Set("main".to_string()),
             preset: Set(Some("docker".to_string())),
-            cpu_request: Set("100m".to_string()),
-            cpu_limit: Set("500m".to_string()),
-            memory_request: Set("128Mi".to_string()),
-            memory_limit: Set("512Mi".to_string()),
+            cpu_request: Set(Some(100)),
+            cpu_limit: Set(Some(500)),
+            memory_request: Set(Some(128)),
+            memory_limit: Set(Some(512)),
             ..Default::default()
         };
 
         let inserted_project = project.insert(db.as_ref()).await.unwrap();
 
         // Update the project
-        let update_request = UpdateProjectRequest {
+        let update_request = CreateProjectRequest {
             name: "Updated Test Project".to_string(),
+            repo_name: None,
+            repo_owner: None,
+            directory: "/".to_string(),
             main_branch: "develop".to_string(),
             preset: "nodejs".to_string(),
+            output_dir: None,
+            build_command: None,
+            install_command: None,
+            environment_variables: None,
+            automatic_deploy: false,
+            project_type: None,
+            is_web_app: false,
+            performance_metrics_enabled: false,
+            storage_service_ids: vec![],
+            use_default_wildcard: None,
+            custom_domain: None,
+            is_public_repo: None,
+            git_url: None,
+            git_provider_connection_id: None,
+            is_on_demand: None,
         };
 
         let result = project_service
@@ -1365,35 +1477,36 @@ mod tests {
         let mock_queue = Arc::new(MockJobQueue::new());
 
         // Create project service
-        let project_service = ProjectService::new(db.clone(), mock_queue.clone());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
 
         // Insert a test project
         let project = temps_entities::projects::ActiveModel {
             name: Set("Settings Test Project".to_string()),
             slug: Set("settings-test-project".to_string()),
-            repository_id: Set(None),
             git_provider_connection_id: Set(None),
             main_branch: Set("main".to_string()),
             preset: Set(Some("docker".to_string())),
-            cpu_request: Set("100m".to_string()),
-            cpu_limit: Set("500m".to_string()),
-            memory_request: Set("128Mi".to_string()),
-            memory_limit: Set("512Mi".to_string()),
+            cpu_request: Set(Some(100)),
+            cpu_limit: Set(Some(500)),
+            memory_request: Set(Some(128)),
+            memory_limit: Set(Some(512)),
             ..Default::default()
         };
 
         let inserted_project = project.insert(db.as_ref()).await.unwrap();
 
         // Update project settings
-        let settings = ProjectSettings {
-            cpu_request: "200m".to_string(),
-            cpu_limit: "1000m".to_string(),
-            memory_request: "256Mi".to_string(),
-            memory_limit: "1Gi".to_string(),
-        };
-
         let result = project_service
-            .update_project_settings(&inserted_project.slug, settings)
+            .update_project_settings(
+                inserted_project.id,
+                Some("new-slug".to_string()),
+                None,
+                Some("develop".to_string()),
+                None,
+                None,
+                Some("nodejs".to_string()),
+                None,
+            )
             .await;
 
         assert!(result.is_ok(), "update_project_settings should succeed");
@@ -1421,20 +1534,19 @@ mod tests {
         let mock_queue = Arc::new(MockJobQueue::new());
 
         // Create project service
-        let project_service = ProjectService::new(db.clone(), mock_queue.clone());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
 
         // Insert a test project with specific name
         let project = temps_entities::projects::ActiveModel {
             name: Set("Event Data Test".to_string()),
             slug: Set("event-data-test".to_string()),
-            repository_id: Set(None),
             git_provider_connection_id: Set(None),
             main_branch: Set("main".to_string()),
             preset: Set(Some("docker".to_string())),
-            cpu_request: Set("100m".to_string()),
-            cpu_limit: Set("500m".to_string()),
-            memory_request: Set("128Mi".to_string()),
-            memory_limit: Set("512Mi".to_string()),
+            cpu_request: Set(Some(100)),
+            cpu_limit: Set(Some(500)),
+            memory_request: Set(Some(128)),
+            memory_limit: Set(Some(512)),
             ..Default::default()
         };
 
@@ -1442,10 +1554,28 @@ mod tests {
         let project_id = inserted_project.id;
 
         // Update the project name
-        let update_request = UpdateProjectRequest {
+        let update_request = CreateProjectRequest {
             name: "Event Data Test Updated".to_string(),
+            repo_name: None,
+            repo_owner: None,
+            directory: "/".to_string(),
             main_branch: "main".to_string(),
             preset: "docker".to_string(),
+            output_dir: None,
+            build_command: None,
+            install_command: None,
+            environment_variables: None,
+            automatic_deploy: false,
+            project_type: None,
+            is_web_app: false,
+            performance_metrics_enabled: false,
+            storage_service_ids: vec![],
+            use_default_wildcard: None,
+            custom_domain: None,
+            is_public_repo: None,
+            git_url: None,
+            git_provider_connection_id: None,
+            is_on_demand: None,
         };
 
         project_service
