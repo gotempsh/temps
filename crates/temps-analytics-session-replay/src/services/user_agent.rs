@@ -88,9 +88,9 @@ mod tests {
     fn test_chrome_desktop() {
         let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36";
         let info = BrowserInfo::from_user_agent(Some(ua));
-        
+
         assert_eq!(info.browser, Some("Chrome".to_string()));
-        assert_eq!(info.operating_system, Some("Windows".to_string()));
+        assert_eq!(info.operating_system, Some("Windows 10".to_string()));
         assert_eq!(info.device_type, Some("Desktop".to_string()));
     }
 

@@ -3413,9 +3413,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_installation_deactivates_provider() {
+        use temps_entities::users;
+        use chrono::Utc;
+
         // Create real test database
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
+
+        // Create a test user first (required for foreign key)
+        let now = Utc::now();
+        let user = users::ActiveModel {
+            email: Set("test@example.com".to_string()),
+            password_hash: Set(Some("hash".to_string())),
+            name: Set("Test User".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        user.insert(db.as_ref()).await.unwrap();
 
         // Create a git provider
         let provider = git_providers::ActiveModel {

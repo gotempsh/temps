@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::path::Path;
-use temps_core::{WorkflowBuilder, WorkflowTask};
+use temps_core::{WorkflowBuilder, WorkflowTask, LogWriter, WorkflowError};
 use temps_git::{GitProviderManagerTrait, GitProviderManagerError, RepositoryInfo};
 use async_trait::async_trait;
 
@@ -151,6 +151,20 @@ impl GitProviderManagerTrait for MockGitProviderManager {
         _archive_path: &Path,
     ) -> Result<(), GitProviderManagerError> {
         Err(GitProviderManagerError::Other("Mock: not implemented".to_string()))
+    }
+}
+
+/// Mock LogWriter for pipeline validation
+struct MockLogWriter;
+
+#[async_trait]
+impl LogWriter for MockLogWriter {
+    async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
+        Ok(())
+    }
+
+    fn stage_id(&self) -> i32 {
+        1
     }
 }
 
@@ -357,9 +371,11 @@ fn validate_workflow_builder_integration() -> Result<(), String> {
     );
 
     // Create workflow with all jobs
+    let log_writer = Arc::new(MockLogWriter);
     let workflow_config = WorkflowBuilder::new()
         .with_workflow_run_id("validation-test-123".to_string())
         .with_deployment_context(1, 1, 1)
+        .with_log_writer(log_writer)
         .with_var("pipeline_type", "full_deployment")
         .map_err(|e| format!("Failed to set pipeline_type var: {}", e))?
         .with_var("environment", "test")

@@ -199,19 +199,29 @@ async fn list_notification_providers(
     info!("Listing notification providers");
     match app_state.notification_service.list_providers().await {
         Ok(providers) => {
-            let response: Vec<NotificationProviderResponse> = providers
-                .into_iter()
-                .map(|p| NotificationProviderResponse {
+            let mut response_vec = Vec::new();
+            for p in providers {
+                let config = app_state
+                    .notification_service
+                    .decrypt_provider_config(&p.config)
+                    .map_err(|e| {
+                        error!("Failed to decrypt provider config: {}", e);
+                        ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                            .title("Failed to decrypt provider configurations")
+                            .detail(&format!("Error: {}", e))
+                            .build()
+                    })?;
+                response_vec.push(NotificationProviderResponse {
                     id: p.id,
                     name: p.name,
                     provider_type: p.provider_type,
-                    config: serde_json::from_str(&p.config).unwrap_or_default(),
+                    config,
                     enabled: p.enabled,
                     created_at: p.created_at.timestamp_millis(),
                     updated_at: p.updated_at.timestamp_millis(),
-                })
-                .collect();
-            Ok((StatusCode::OK, Json(response)))
+                });
+            }
+            Ok((StatusCode::OK, Json(response_vec)))
         }
         Err(e) => {
             error!("Failed to list notification providers: {}", e);
@@ -249,11 +259,21 @@ async fn get_notification_provider(
     info!("Getting notification provider {}", id);
     match app_state.notification_service.get_provider(id).await {
         Ok(Some(provider)) => {
+            let config = app_state
+                .notification_service
+                .decrypt_provider_config(&provider.config)
+                .map_err(|e| {
+                    error!("Failed to decrypt provider config: {}", e);
+                    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("Failed to decrypt provider configuration")
+                        .detail(&format!("Error: {}", e))
+                        .build()
+                })?;
             let response = NotificationProviderResponse {
                 id: provider.id,
                 name: provider.name,
                 provider_type: provider.provider_type,
-                config: serde_json::from_str(&provider.config).unwrap_or_default(),
+                config,
                 enabled: provider.enabled,
                 created_at: provider.created_at.timestamp_millis(),
                 updated_at: provider.updated_at.timestamp_millis(),
@@ -302,11 +322,21 @@ async fn create_notification_provider(
         .await
     {
         Ok(provider) => {
+            let config = app_state
+                .notification_service
+                .decrypt_provider_config(&provider.config)
+                .map_err(|e| {
+                    error!("Failed to decrypt provider config: {}", e);
+                    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("Failed to decrypt provider configuration")
+                        .detail(&format!("Error: {}", e))
+                        .build()
+                })?;
             let response = NotificationProviderResponse {
                 id: provider.id,
                 name: provider.name,
                 provider_type: provider.provider_type,
-                config: serde_json::from_str(&provider.config).unwrap_or_default(),
+                config,
                 enabled: provider.enabled,
                 created_at: provider.created_at.timestamp_millis(),
                 updated_at: provider.updated_at.timestamp_millis(),
@@ -364,11 +394,21 @@ async fn update_provider(
         .await
     {
         Ok(Some(provider)) => {
+            let config = app_state
+                .notification_service
+                .decrypt_provider_config(&provider.config)
+                .map_err(|e| {
+                    error!("Failed to decrypt provider config: {}", e);
+                    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("Failed to decrypt provider configuration")
+                        .detail(&format!("Error: {}", e))
+                        .build()
+                })?;
             let response = NotificationProviderResponse {
                 id: provider.id,
                 name: provider.name,
                 provider_type: provider.provider_type,
-                config: serde_json::from_str(&provider.config).unwrap_or_default(),
+                config,
                 enabled: provider.enabled,
                 created_at: provider.created_at.timestamp_millis(),
                 updated_at: provider.updated_at.timestamp_millis(),
@@ -514,11 +554,21 @@ async fn create_slack_provider(
         .await
     {
         Ok(provider) => {
+            let config = app_state
+                .notification_service
+                .decrypt_provider_config(&provider.config)
+                .map_err(|e| {
+                    error!("Failed to decrypt provider config: {}", e);
+                    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("Failed to decrypt provider configuration")
+                        .detail(&format!("Error: {}", e))
+                        .build()
+                })?;
             let response = NotificationProviderResponse {
                 id: provider.id,
                 name: provider.name,
                 provider_type: provider.provider_type,
-                config: serde_json::from_str(&provider.config).unwrap_or_default(),
+                config,
                 enabled: provider.enabled,
                 created_at: provider.created_at.timestamp_millis(),
                 updated_at: provider.updated_at.timestamp_millis(),
@@ -564,11 +614,21 @@ async fn create_email_provider(
         .await
     {
         Ok(provider) => {
+            let config = app_state
+                .notification_service
+                .decrypt_provider_config(&provider.config)
+                .map_err(|e| {
+                    error!("Failed to decrypt provider config: {}", e);
+                    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("Failed to decrypt provider configuration")
+                        .detail(&format!("Error: {}", e))
+                        .build()
+                })?;
             let response = NotificationProviderResponse {
                 id: provider.id,
                 name: provider.name,
                 provider_type: provider.provider_type,
-                config: serde_json::from_str(&provider.config).unwrap_or_default(),
+                config,
                 enabled: provider.enabled,
                 created_at: provider.created_at.timestamp_millis(),
                 updated_at: provider.updated_at.timestamp_millis(),
@@ -623,11 +683,21 @@ async fn update_slack_provider(
         .await
     {
         Ok(Some(provider)) => {
+            let config = app_state
+                .notification_service
+                .decrypt_provider_config(&provider.config)
+                .map_err(|e| {
+                    error!("Failed to decrypt provider config: {}", e);
+                    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("Failed to decrypt provider configuration")
+                        .detail(&format!("Error: {}", e))
+                        .build()
+                })?;
             let response = NotificationProviderResponse {
                 id: provider.id,
                 name: provider.name,
                 provider_type: provider.provider_type,
-                config: serde_json::from_str(&provider.config).unwrap_or_default(),
+                config,
                 enabled: provider.enabled,
                 created_at: provider.created_at.timestamp_millis(),
                 updated_at: provider.updated_at.timestamp_millis(),
@@ -686,11 +756,21 @@ async fn update_email_provider(
         .await
     {
         Ok(Some(provider)) => {
+            let config = app_state
+                .notification_service
+                .decrypt_provider_config(&provider.config)
+                .map_err(|e| {
+                    error!("Failed to decrypt provider config: {}", e);
+                    ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                        .title("Failed to decrypt provider configuration")
+                        .detail(&format!("Error: {}", e))
+                        .build()
+                })?;
             let response = NotificationProviderResponse {
                 id: provider.id,
                 name: provider.name,
                 provider_type: provider.provider_type,
-                config: serde_json::from_str(&provider.config).unwrap_or_default(),
+                config,
                 enabled: provider.enabled,
                 created_at: provider.created_at.timestamp_millis(),
                 updated_at: provider.updated_at.timestamp_millis(),

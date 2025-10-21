@@ -118,7 +118,12 @@ mod tests {
         let context = ServiceRegistrationContext::new();
 
         // Register database connection
-        context.register_service(test_db.db.clone());
+        context.register_service(test_db.connection_arc().clone());
+
+        // Register required IP service
+        let geo_ip_service = Arc::new(temps_geo::GeoIpService::Mock(temps_geo::MockGeoIpService::new()));
+        let ip_service = Arc::new(temps_geo::IpAddressService::new(test_db.connection_arc().clone(), geo_ip_service));
+        context.register_service(ip_service);
 
         let plugin = ProxyPlugin::new();
         // Call register_services method correctly
@@ -156,13 +161,13 @@ mod tests {
 
         // Create mock services and register them in the service registry
         let test_db = TestDatabase::new().await.unwrap();
-        let lb_service = Arc::new(LbService::new(test_db.db.clone()));
-        let request_log_service = Arc::new(RequestLogService::new(test_db.db.clone()));
+        let lb_service = Arc::new(LbService::new(test_db.connection_arc().clone()));
+        let request_log_service = Arc::new(RequestLogService::new(test_db.connection_arc().clone()));
 
         // Create a mock GeoIP service and IP service for proxy_log_service
-        let geo_ip_service = Arc::new(temps_geo::GeoIpService::new().unwrap());
-        let ip_service = Arc::new(temps_geo::IpAddressService::new(test_db.db.clone(), geo_ip_service));
-        let proxy_log_service = Arc::new(ProxyLogService::new(test_db.db.clone(), ip_service));
+        let geo_ip_service = Arc::new(temps_geo::GeoIpService::Mock(temps_geo::MockGeoIpService::new()));
+        let ip_service = Arc::new(temps_geo::IpAddressService::new(test_db.connection_arc().clone(), geo_ip_service));
+        let proxy_log_service = Arc::new(ProxyLogService::new(test_db.connection_arc().clone(), ip_service));
 
         // Register services in the service registry
         service_registry.register(lb_service);

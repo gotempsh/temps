@@ -1781,12 +1781,12 @@ mod tests {
     async fn test_get_top_pages() -> anyhow::Result<()> {
         let (service, db, _container) = create_test_analytics_service!("test_get_top_pages");
 
-        let start_date = DateTime::parse_from_str("2024-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+        let start_date = chrono::NaiveDateTime::parse_from_str("2024-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
             .unwrap()
-            .into();
-        let end_date = DateTime::parse_from_str("2024-01-31 23:59:59", "%Y-%m-%d %H:%M:%S")
+            .and_utc();
+        let end_date = chrono::NaiveDateTime::parse_from_str("2024-01-31 23:59:59", "%Y-%m-%d %H:%M:%S")
             .unwrap()
-            .into();
+            .and_utc();
 
         let pages = service
             .get_top_pages(1, 10, Some(start_date), Some(end_date))
@@ -1811,12 +1811,12 @@ mod tests {
         let (service, db, _container) =
             create_test_analytics_service!("test_empty_results_for_invalid_project");
 
-        let start_date = DateTime::parse_from_str("2024-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+        let start_date = chrono::NaiveDateTime::parse_from_str("2024-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
             .unwrap()
-            .into();
-        let end_date = DateTime::parse_from_str("2024-01-31 23:59:59", "%Y-%m-%d %H:%M:%S")
+            .and_utc();
+        let end_date = chrono::NaiveDateTime::parse_from_str("2024-01-31 23:59:59", "%Y-%m-%d %H:%M:%S")
             .unwrap()
-            .into();
+            .and_utc();
 
         // Use a non-existent project ID
         let invalid_project_id = 9999;

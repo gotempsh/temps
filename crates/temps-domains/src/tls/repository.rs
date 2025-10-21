@@ -952,8 +952,9 @@ pub mod test_utils {
         #[tokio::test]
         async fn test_list_all_orders_with_database() {
             use temps_database::test_utils::TestDatabase;
-            use temps_entities::acme_orders;
+            use temps_entities::{acme_orders, domains};
             use sea_orm::{ActiveModelTrait, Set};
+            use chrono::Utc;
 
             // Setup test database
             let test_db = TestDatabase::with_migrations().await.unwrap();
@@ -964,6 +965,30 @@ pub mod test_utils {
             let encryption_service = Arc::new(temps_core::EncryptionService::new(encryption_key).unwrap());
 
             let repo = DefaultCertificateRepository::new(db.clone(), encryption_service);
+
+            // Create test domains first (required for foreign key)
+            let now = Utc::now();
+            let domain1 = domains::ActiveModel {
+                domain: Set("test1.example.com".to_string()),
+                status: Set("pending".to_string()),
+                is_wildcard: Set(false),
+                verification_method: Set("http-01".to_string()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            };
+            domain1.insert(db.as_ref()).await.unwrap();
+
+            let domain2 = domains::ActiveModel {
+                domain: Set("test2.example.com".to_string()),
+                status: Set("valid".to_string()),
+                is_wildcard: Set(false),
+                verification_method: Set("http-01".to_string()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            };
+            domain2.insert(db.as_ref()).await.unwrap();
 
             // Insert test ACME orders
             let order1 = acme_orders::ActiveModel {

@@ -267,7 +267,7 @@ fn prompt_for_admin_email() -> anyhow::Result<Option<String>> {
     );
     println!(
         "{}",
-        "           🚀 Welcome to Temps Engine!"
+        "           🚀 Welcome to Temps!"
             .bright_white()
             .bold()
     );

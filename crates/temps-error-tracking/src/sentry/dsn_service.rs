@@ -424,9 +424,22 @@ mod tests {
     }
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
+        use temps_entities::types::ProjectType;
+        use uuid::Uuid;
+
+        let unique_slug = format!("test-project-{}", Uuid::new_v4());
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
-            slug: Set("test-project".to_string()),
+            directory: Set("/test".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set(unique_slug),
+            project_type: Set(ProjectType::Server),
+            automatic_deploy: Set(true),
+            is_web_app: Set(false),
+            performance_metrics_enabled: Set(false),
+            use_default_wildcard: Set(true),
+            is_public_repo: Set(false),
+            is_on_demand: Set(false),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -440,6 +453,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_generate_project_dsn() {
         let test_db = setup_test_db().await;
         let db = test_db.connection_arc();
@@ -481,6 +495,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_validate_dsn_auth() {
         let test_db = setup_test_db().await;
         let db = test_db.connection_arc();
@@ -509,6 +524,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_revoke_dsn() {
         let test_db = setup_test_db().await;
         let db = test_db.connection_arc();

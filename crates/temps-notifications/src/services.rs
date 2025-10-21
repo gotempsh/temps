@@ -585,6 +585,19 @@ impl NotificationService {
         Ok(providers)
     }
 
+    /// Decrypt the provider config for safe return to API
+    pub fn decrypt_provider_config(&self, encrypted_config: &str) -> Result<serde_json::Value> {
+        let decrypted_config = self
+            .encryption_service
+            .decrypt_string(encrypted_config)
+            .map_err(|e| anyhow::anyhow!("Failed to decrypt config: {}", e))?;
+
+        let config_value: serde_json::Value = serde_json::from_str(&decrypted_config)
+            .map_err(|e| anyhow::anyhow!("Failed to parse decrypted config: {}", e))?;
+
+        Ok(config_value)
+    }
+
     async fn load_provider(
         &self,
         record: &notification_providers::Model,

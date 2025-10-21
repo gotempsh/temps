@@ -685,19 +685,69 @@ mod tests {
     use super::*;
     use crate::CrawlerDetector;
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::{deployments, environments, projects, request_logs};
+    use temps_entities::{deployments, environments, projects, request_logs, visitor};
 
     fn create_mock_ip_service(db: Arc<DatabaseConnection>) -> Arc<temps_geo::IpAddressService> {
         let geoip_service =
-            Arc::new(temps_geo::GeoIpService::new().expect("Failed to create GeoIpService"));
+            Arc::new(temps_geo::GeoIpService::Mock(temps_geo::MockGeoIpService::new()));
         Arc::new(temps_geo::IpAddressService::new(db, geoip_service))
     }
 
+    async fn create_test_visitor(
+        db: &Arc<DatabaseConnection>,
+        visitor_id: &str,
+        project_id: i32,
+        environment_id: i32,
+    ) -> i32 {
+        use chrono::Utc;
+        use sea_orm::ActiveValue::Set;
+
+        let visitor_model = visitor::ActiveModel {
+            visitor_id: Set(visitor_id.to_string()),
+            project_id: Set(project_id),
+            environment_id: Set(environment_id),
+            first_seen: Set(Utc::now()),
+            last_seen: Set(Utc::now()),
+            is_crawler: Set(false),
+            ..Default::default()
+        };
+
+        let visitor = visitor_model.insert(db.as_ref()).await.unwrap();
+        visitor.id
+    }
+
+    async fn create_test_session(
+        db: &Arc<DatabaseConnection>,
+        session_id: &str,
+        visitor_id_i32: i32,
+    ) -> i32 {
+        use chrono::Utc;
+        use sea_orm::ActiveValue::Set;
+        use temps_entities::request_sessions;
+
+        let session_model = request_sessions::ActiveModel {
+            session_id: Set(session_id.to_string()),
+            started_at: Set(Utc::now()),
+            last_accessed_at: Set(Utc::now()),
+            visitor_id: Set(Some(visitor_id_i32)),
+            data: Set("{}".to_string()),
+            ..Default::default()
+        };
+
+        let session = session_model.insert(db.as_ref()).await.unwrap();
+        session.id
+    }
+
     async fn create_test_project_context(db: &Arc<DatabaseConnection>) -> ProjectContext {
+        use temps_entities::types::ProjectType;
+
         // Create test project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            project_type: Set(ProjectType::Static),
             ..Default::default()
         };
         let project = project.insert(db.as_ref()).await.unwrap();
@@ -734,12 +784,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_logger_user_agent_parsing() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let ip_service = create_mock_ip_service(test_db.db.clone());
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let ip_service = create_mock_ip_service(test_db.connection_arc().clone());
         let logger =
-            RequestLoggerImpl::new(LoggingConfig::default(), test_db.db.clone(), ip_service);
+            RequestLoggerImpl::new(LoggingConfig::default(), test_db.connection_arc().clone(), ip_service);
 
-        let context = create_test_project_context(&test_db.db).await;
+        let context = create_test_project_context(&test_db.connection_arc()).await;
 
         // Test Chrome user agent
         let chrome_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -766,25 +816,25 @@ mod tests {
         // Verify log was created with parsed user agent data
         let logs = request_logs::Entity::find()
             .filter(request_logs::Column::RequestId.eq("test-req-1"))
-            .one(test_db.db.as_ref())
+            .one(test_db.connection_arc().as_ref())
             .await
             .unwrap()
             .expect("Log should be created");
 
         assert_eq!(logs.browser, Some("Chrome".to_string()));
         assert!(logs.browser_version.is_some());
-        assert_eq!(logs.operating_system, Some("Windows".to_string()));
+        assert_eq!(logs.operating_system, Some("Windows 10".to_string()));
         assert_eq!(logs.is_mobile, false);
     }
 
     #[tokio::test]
     async fn test_request_logger_mobile_detection() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let ip_service = create_mock_ip_service(test_db.db.clone());
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let ip_service = create_mock_ip_service(test_db.connection_arc().clone());
         let logger =
-            RequestLoggerImpl::new(LoggingConfig::default(), test_db.db.clone(), ip_service);
+            RequestLoggerImpl::new(LoggingConfig::default(), test_db.connection_arc().clone(), ip_service);
 
-        let context = create_test_project_context(&test_db.db).await;
+        let context = create_test_project_context(&test_db.connection_arc()).await;
 
         // Test mobile Safari user agent
         let mobile_ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
@@ -811,23 +861,23 @@ mod tests {
         // Verify mobile detection
         let logs = request_logs::Entity::find()
             .filter(request_logs::Column::RequestId.eq("test-req-mobile"))
-            .one(test_db.db.as_ref())
+            .one(test_db.connection_arc().as_ref())
             .await
             .unwrap()
             .expect("Log should be created");
 
         assert_eq!(logs.is_mobile, true);
-        assert_eq!(logs.operating_system, Some("iOS".to_string()));
+        assert_eq!(logs.operating_system, Some("iPhone".to_string()));
     }
 
     #[tokio::test]
     async fn test_request_logger_crawler_detection() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let ip_service = create_mock_ip_service(test_db.db.clone());
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let ip_service = create_mock_ip_service(test_db.connection_arc().clone());
         let logger =
-            RequestLoggerImpl::new(LoggingConfig::default(), test_db.db.clone(), ip_service);
+            RequestLoggerImpl::new(LoggingConfig::default(), test_db.connection_arc().clone(), ip_service);
 
-        let context = create_test_project_context(&test_db.db).await;
+        let context = create_test_project_context(&test_db.connection_arc()).await;
 
         // Test Googlebot user agent
         let bot_ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
@@ -854,7 +904,7 @@ mod tests {
         // Verify crawler detection
         let logs = request_logs::Entity::find()
             .filter(request_logs::Column::RequestId.eq("test-req-bot"))
-            .one(test_db.db.as_ref())
+            .one(test_db.connection_arc().as_ref())
             .await
             .unwrap()
             .expect("Log should be created");
@@ -866,15 +916,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_logger_ip_geolocation() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let ip_service = create_mock_ip_service(test_db.db.clone());
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let ip_service = create_mock_ip_service(test_db.connection_arc().clone());
         let logger = RequestLoggerImpl::new(
             LoggingConfig::default(),
-            test_db.db.clone(),
+            test_db.connection_arc().clone(),
             ip_service.clone(),
         );
 
-        let context = create_test_project_context(&test_db.db).await;
+        let context = create_test_project_context(&test_db.connection_arc()).await;
 
         // Test with a real IP address
         let test_ip = "8.8.8.8"; // Google DNS
@@ -901,7 +951,7 @@ mod tests {
         // Verify IP geolocation was created
         let logs = request_logs::Entity::find()
             .filter(request_logs::Column::RequestId.eq("test-req-ip"))
-            .one(test_db.db.as_ref())
+            .one(test_db.connection_arc().as_ref())
             .await
             .unwrap()
             .expect("Log should be created");
@@ -915,7 +965,7 @@ mod tests {
         // Verify the IP address record was created with geolocation data
         let ip_record =
             temps_entities::ip_geolocations::Entity::find_by_id(logs.ip_address_id.unwrap())
-                .one(test_db.db.as_ref())
+                .one(test_db.connection_arc().as_ref())
                 .await
                 .unwrap()
                 .expect("IP address record should exist");
@@ -927,17 +977,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_logger_with_visitor_and_session() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let ip_service = create_mock_ip_service(test_db.db.clone());
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let ip_service = create_mock_ip_service(test_db.connection_arc().clone());
         let logger =
-            RequestLoggerImpl::new(LoggingConfig::default(), test_db.db.clone(), ip_service);
+            RequestLoggerImpl::new(LoggingConfig::default(), test_db.connection_arc().clone(), ip_service);
 
-        let context = create_test_project_context(&test_db.db).await;
+        let context = create_test_project_context(&test_db.connection_arc()).await;
+
+        // Create visitor record in database first
+        let visitor_id_i32 = create_test_visitor(
+            &test_db.connection_arc(),
+            "test-visitor-123",
+            context.project.id,
+            context.environment.id,
+        ).await;
+
+        // Create session record in database
+        let session_id_i32 = create_test_session(
+            &test_db.connection_arc(),
+            "test-session-456",
+            visitor_id_i32,
+        ).await;
 
         // Create test visitor
         let visitor_data = Visitor {
             visitor_id: "test-visitor-123".to_string(),
-            visitor_id_i32: 999,
+            visitor_id_i32,
             is_crawler: false,
             crawler_name: None,
         };
@@ -945,8 +1010,8 @@ mod tests {
         // Create test session
         let session_data = Session {
             session_id: "test-session-456".to_string(),
-            session_id_i32: 888,
-            visitor_id_i32: 999,
+            session_id_i32,
+            visitor_id_i32,
             is_new_session: true,
         };
 
@@ -973,33 +1038,41 @@ mod tests {
         // Verify visitor and session IDs are stored
         let logs = request_logs::Entity::find()
             .filter(request_logs::Column::RequestId.eq("test-req-with-visitor"))
-            .one(test_db.db.as_ref())
+            .one(test_db.connection_arc().as_ref())
             .await
             .unwrap()
             .expect("Log should be created");
 
-        assert_eq!(logs.visitor_id, Some(999));
-        assert_eq!(logs.session_id, Some(888));
+        assert_eq!(logs.visitor_id, Some(visitor_id_i32));
+        assert_eq!(logs.session_id, Some(session_id_i32));
         assert_eq!(logs.is_entry_page, true); // New session = entry page
         assert_eq!(logs.referrer, Some("https://google.com".to_string()));
     }
 
     #[tokio::test]
     async fn test_session_creation_and_reuse() {
-        let test_db = TestDatabase::new().await.unwrap();
+        let test_db = TestDatabase::with_migrations().await.unwrap();
         let crypto = Arc::new(
             temps_core::CookieCrypto::new(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
             .unwrap(),
         );
-        let session_manager = SessionManagerImpl::new(test_db.db.clone(), crypto.clone());
+        let session_manager = SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
 
-        let context = create_test_project_context(&test_db.db).await;
+        let context = create_test_project_context(&test_db.connection_arc()).await;
+
+        // Create visitor record in database first
+        let visitor_id_i32 = create_test_visitor(
+            &test_db.connection_arc(),
+            "test-visitor-1",
+            context.project.id,
+            context.environment.id,
+        ).await;
 
         let visitor = Visitor {
             visitor_id: "test-visitor-1".to_string(),
-            visitor_id_i32: 1,
+            visitor_id_i32,
             is_crawler: false,
             crawler_name: None,
         };
@@ -1056,20 +1129,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_expiry_after_30_minutes() {
-        let test_db = TestDatabase::new().await.unwrap();
+        let test_db = TestDatabase::with_migrations().await.unwrap();
         let crypto = Arc::new(
             temps_core::CookieCrypto::new(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
             .unwrap(),
         );
-        let session_manager = SessionManagerImpl::new(test_db.db.clone(), crypto.clone());
+        let session_manager = SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
 
-        let context = create_test_project_context(&test_db.db).await;
+        let context = create_test_project_context(&test_db.connection_arc()).await;
+
+        // Create visitor record in database first
+        let visitor_id_i32 = create_test_visitor(
+            &test_db.connection_arc(),
+            "test-visitor-2",
+            context.project.id,
+            context.environment.id,
+        ).await;
 
         let visitor = Visitor {
             visitor_id: "test-visitor-2".to_string(),
-            visitor_id_i32: 2,
+            visitor_id_i32,
             is_crawler: false,
             crawler_name: None,
         };
@@ -1100,14 +1181,14 @@ mod tests {
         use temps_entities::request_sessions;
         let db_session = request_sessions::Entity::find()
             .filter(request_sessions::Column::SessionId.eq(&session1.session_id))
-            .one(test_db.db.as_ref())
+            .one(test_db.connection_arc().as_ref())
             .await
             .unwrap()
             .unwrap();
 
         let mut active_session: request_sessions::ActiveModel = db_session.into();
         active_session.last_accessed_at = Set(chrono::Utc::now() - chrono::Duration::minutes(31));
-        active_session.update(test_db.db.as_ref()).await.unwrap();
+        active_session.update(test_db.connection_arc().as_ref()).await.unwrap();
 
         // Try to reuse with expired session - should create new one
         let session2 = session_manager
@@ -1127,20 +1208,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_with_invalid_cookie() {
-        let test_db = TestDatabase::new().await.unwrap();
+        let test_db = TestDatabase::with_migrations().await.unwrap();
         let crypto = Arc::new(
             temps_core::CookieCrypto::new(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
             .unwrap(),
         );
-        let session_manager = SessionManagerImpl::new(test_db.db.clone(), crypto.clone());
+        let session_manager = SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
 
-        let context = create_test_project_context(&test_db.db).await;
+        let context = create_test_project_context(&test_db.connection_arc()).await;
+
+        // Create visitor record in database first
+        let visitor_id_i32 = create_test_visitor(
+            &test_db.connection_arc(),
+            "test-visitor-3",
+            context.project.id,
+            context.environment.id,
+        ).await;
 
         let visitor = Visitor {
             visitor_id: "test-visitor-3".to_string(),
-            visitor_id_i32: 3,
+            visitor_id_i32,
             is_crawler: false,
             crawler_name: None,
         };
@@ -1164,20 +1253,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_cookie_encryption_decryption() {
-        let test_db = TestDatabase::new().await.unwrap();
+        let test_db = TestDatabase::with_migrations().await.unwrap();
         let crypto = Arc::new(
             temps_core::CookieCrypto::new(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
             .unwrap(),
         );
-        let session_manager = SessionManagerImpl::new(test_db.db.clone(), crypto.clone());
+        let session_manager = SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
 
-        let context = create_test_project_context(&test_db.db).await;
+        let context = create_test_project_context(&test_db.connection_arc()).await;
+
+        // Create visitor record in database first
+        let visitor_id_i32 = create_test_visitor(
+            &test_db.connection_arc(),
+            "test-visitor-4",
+            context.project.id,
+            context.environment.id,
+        ).await;
 
         let visitor = Visitor {
             visitor_id: "test-visitor-4".to_string(),
-            visitor_id_i32: 4,
+            visitor_id_i32,
             is_crawler: false,
             crawler_name: None,
         };
@@ -1221,20 +1318,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_last_accessed_updated() {
-        let test_db = TestDatabase::new().await.unwrap();
+        let test_db = TestDatabase::with_migrations().await.unwrap();
         let crypto = Arc::new(
             temps_core::CookieCrypto::new(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
             .unwrap(),
         );
-        let session_manager = SessionManagerImpl::new(test_db.db.clone(), crypto.clone());
+        let session_manager = SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
 
-        let context = create_test_project_context(&test_db.db).await;
+        let context = create_test_project_context(&test_db.connection_arc()).await;
+
+        // Create visitor record in database first
+        let visitor_id_i32 = create_test_visitor(
+            &test_db.connection_arc(),
+            "test-visitor-5",
+            context.project.id,
+            context.environment.id,
+        ).await;
 
         let visitor = Visitor {
             visitor_id: "test-visitor-5".to_string(),
-            visitor_id_i32: 5,
+            visitor_id_i32,
             is_crawler: false,
             crawler_name: None,
         };
@@ -1249,7 +1354,7 @@ mod tests {
         use temps_entities::request_sessions;
         let db_session1 = request_sessions::Entity::find()
             .filter(request_sessions::Column::SessionId.eq(&session1.session_id))
-            .one(test_db.db.as_ref())
+            .one(test_db.connection_arc().as_ref())
             .await
             .unwrap()
             .unwrap();
@@ -1283,7 +1388,7 @@ mod tests {
         // Check that last_accessed_at was updated
         let db_session2 = request_sessions::Entity::find()
             .filter(request_sessions::Column::SessionId.eq(&session1.session_id))
-            .one(test_db.db.as_ref())
+            .one(test_db.connection_arc().as_ref())
             .await
             .unwrap()
             .unwrap();

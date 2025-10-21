@@ -51,3 +51,5 @@ time = { version = "0.3", features = ["parsing", "formatting", "macros", "serde"
 [dev-dependencies]
 temps-migrations = { path = "../temps-migrations" }
 tokio-test = "0.4"
+axum-test = "18.1.0"
+serial_test = "3.2"

@@ -587,6 +587,38 @@ mod tests {
         }
     }
 
+    // Helper function to create test project and environment
+    async fn create_test_project_and_environment(
+        db: &DatabaseConnection,
+    ) -> Result<(temps_entities::projects::Model, temps_entities::environments::Model), Box<dyn std::error::Error>> {
+        use temps_entities::{projects, environments, types::ProjectType};
+
+        // Create project
+        let project = projects::ActiveModel {
+            name: Set("test-project".to_string()),
+            slug: Set("test-project".to_string()),
+            directory: Set("test-directory".to_string()),
+            main_branch: Set("main".to_string()),
+            project_type: Set(ProjectType::Server),
+            ..Default::default()
+        };
+        let project = project.insert(db).await?;
+
+        // Create environment
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("test-env".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set("test-env".to_string()),
+            host: Set("test-env.local".to_string()),
+            upstreams: Set(serde_json::json!([])),
+            ..Default::default()
+        };
+        let environment = environment.insert(db).await?;
+
+        Ok((project, environment))
+    }
+
     #[test]
     fn test_validate_cron_schedule_valid() {
         // Valid schedules
@@ -621,6 +653,9 @@ mod tests {
         let db = test_db.connection_arc();
         let queue = Arc::new(MockQueue);
 
+        // Create test project and environment
+        let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
+
         let service = DatabaseCronConfigService::new(db.clone(), queue);
 
         let configs = vec![CronConfig {
@@ -628,12 +663,14 @@ mod tests {
             schedule: "0 0 * * * *".to_string(),
         }];
 
-        service.configure_crons(1, 1, configs).await?;
+        service
+            .configure_crons(project.id, environment.id, configs)
+            .await?;
 
         // Verify cron was created
         let crons_list = crons::Entity::find()
-            .filter(crons::Column::ProjectId.eq(1))
-            .filter(crons::Column::EnvironmentId.eq(1))
+            .filter(crons::Column::ProjectId.eq(project.id))
+            .filter(crons::Column::EnvironmentId.eq(environment.id))
             .all(db.as_ref())
             .await?;
 
@@ -651,6 +688,9 @@ mod tests {
         let db = test_db.connection_arc();
         let queue = Arc::new(MockQueue);
 
+        // Create test project and environment
+        let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
+
         let service = DatabaseCronConfigService::new(db.clone(), queue);
 
         // Create initial cron
@@ -658,19 +698,23 @@ mod tests {
             path: "/api/cron/task".to_string(),
             schedule: "0 0 * * * *".to_string(),
         }];
-        service.configure_crons(1, 1, configs).await?;
+        service
+            .configure_crons(project.id, environment.id, configs)
+            .await?;
 
         // Update with different schedule
         let updated_configs = vec![CronConfig {
             path: "/api/cron/task".to_string(),
             schedule: "0 */5 * * * *".to_string(),
         }];
-        service.configure_crons(1, 1, updated_configs).await?;
+        service
+            .configure_crons(project.id, environment.id, updated_configs)
+            .await?;
 
         // Verify cron was updated
         let crons_list = crons::Entity::find()
-            .filter(crons::Column::ProjectId.eq(1))
-            .filter(crons::Column::EnvironmentId.eq(1))
+            .filter(crons::Column::ProjectId.eq(project.id))
+            .filter(crons::Column::EnvironmentId.eq(environment.id))
             .filter(crons::Column::DeletedAt.is_null())
             .all(db.as_ref())
             .await?;
@@ -687,6 +731,9 @@ mod tests {
         let db = test_db.connection_arc();
         let queue = Arc::new(MockQueue);
 
+        // Create test project and environment
+        let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
+
         let service = DatabaseCronConfigService::new(db.clone(), queue);
 
         // Create two crons
@@ -700,19 +747,23 @@ mod tests {
                 schedule: "0 0 * * * *".to_string(),
             },
         ];
-        service.configure_crons(1, 1, configs).await?;
+        service
+            .configure_crons(project.id, environment.id, configs)
+            .await?;
 
         // Update with only one cron (task2 removed)
         let updated_configs = vec![CronConfig {
             path: "/api/cron/task1".to_string(),
             schedule: "0 0 * * * *".to_string(),
         }];
-        service.configure_crons(1, 1, updated_configs).await?;
+        service
+            .configure_crons(project.id, environment.id, updated_configs)
+            .await?;
 
         // Verify only one active cron remains
         let active_crons = crons::Entity::find()
-            .filter(crons::Column::ProjectId.eq(1))
-            .filter(crons::Column::EnvironmentId.eq(1))
+            .filter(crons::Column::ProjectId.eq(project.id))
+            .filter(crons::Column::EnvironmentId.eq(environment.id))
             .filter(crons::Column::DeletedAt.is_null())
             .all(db.as_ref())
             .await?;
@@ -722,8 +773,8 @@ mod tests {
 
         // Verify task2 is marked as deleted
         let all_crons = crons::Entity::find()
-            .filter(crons::Column::ProjectId.eq(1))
-            .filter(crons::Column::EnvironmentId.eq(1))
+            .filter(crons::Column::ProjectId.eq(project.id))
+            .filter(crons::Column::EnvironmentId.eq(environment.id))
             .all(db.as_ref())
             .await?;
 

@@ -1386,7 +1386,7 @@ mod tests {
         let port = node.get_host_port_ipv4(5432).await.expect("Failed to get port");
 
         let database_url = format!(
-            "postgresql://postgres:postgres@localhost:{}/postgres",
+            "postgresql://postgres:postgres@localhost:{}/postgres?sslmode=disable",
             port
         );
 
@@ -1783,7 +1783,7 @@ mod tests {
         let port = node.get_host_port_ipv4(5432).await.expect("Failed to get port");
 
         let database_url = format!(
-            "postgresql://postgres:postgres@localhost:{}/postgres",
+            "postgresql://postgres:postgres@localhost:{}/postgres?sslmode=disable",
             port
         );
 

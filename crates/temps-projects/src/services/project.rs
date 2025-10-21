@@ -792,10 +792,49 @@ impl ProjectService {
             }
 
             let updated_project = active_project.update(self.db.as_ref()).await?;
-            return Ok(Self::map_db_project_to_project(updated_project));
+            let project_found = Self::map_db_project_to_project(updated_project);
+
+            // Emit ProjectUpdated job
+            let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
+                project_id: project_found.id,
+                project_name: project_found.name.clone(),
+            });
+
+            if let Err(e) = self.queue_service.send(project_updated_job).await {
+                warn!(
+                    "Failed to emit ProjectUpdated job for project {}: {}",
+                    project_found.id, e
+                );
+            }
+
+            return Ok(project_found);
         }
 
-        Ok(Self::map_db_project_to_project(project))
+        // Always reload the final project state before returning
+        let final_project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ProjectError::NotFound(format!(
+                "Project {} not found",
+                project_id
+            )))?;
+
+        let project_found = Self::map_db_project_to_project(final_project);
+
+        // Emit ProjectUpdated job
+        let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
+            project_id: project_found.id,
+            project_name: project_found.name.clone(),
+        });
+
+        if let Err(e) = self.queue_service.send(project_updated_job).await {
+            warn!(
+                "Failed to emit ProjectUpdated job for project {}: {}",
+                project_found.id, e
+            );
+        }
+
+        Ok(project_found)
     }
 
     pub async fn update_automatic_deploy(
@@ -1411,8 +1450,10 @@ mod tests {
         let project = temps_entities::projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
+            directory: Set("test-project".to_string()),
             git_provider_connection_id: Set(None),
             main_branch: Set("main".to_string()),
+            project_type: Set(temps_entities::types::ProjectType::Server),
             preset: Set(Some("docker".to_string())),
             cpu_request: Set(Some(100)),
             cpu_limit: Set(Some(500)),
@@ -1483,8 +1524,10 @@ mod tests {
         let project = temps_entities::projects::ActiveModel {
             name: Set("Settings Test Project".to_string()),
             slug: Set("settings-test-project".to_string()),
+            directory: Set("settings-test-project".to_string()),
             git_provider_connection_id: Set(None),
             main_branch: Set("main".to_string()),
+            project_type: Set(temps_entities::types::ProjectType::Server),
             preset: Set(Some("docker".to_string())),
             cpu_request: Set(Some(100)),
             cpu_limit: Set(Some(500)),
@@ -1540,8 +1583,10 @@ mod tests {
         let project = temps_entities::projects::ActiveModel {
             name: Set("Event Data Test".to_string()),
             slug: Set("event-data-test".to_string()),
+            directory: Set("event-data-test".to_string()),
             git_provider_connection_id: Set(None),
             main_branch: Set("main".to_string()),
+            project_type: Set(temps_entities::types::ProjectType::Server),
             preset: Set(Some("docker".to_string())),
             cpu_request: Set(Some(100)),
             cpu_limit: Set(Some(500)),

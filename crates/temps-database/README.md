@@ -1,6 +1,6 @@
 # temps-database
 
-Database connection utilities and test helpers for the Temps engine.
+Database connection utilities and test helpers for the Temps.
 
 ## Features
 

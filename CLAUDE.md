@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-# Temps Engine API - Architecture & Development Guidelines
+# Temps - Architecture & Development Guidelines
 
 ## Critical Rules
 

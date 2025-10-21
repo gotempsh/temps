@@ -203,7 +203,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_monitor_service_create_and_get() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db.db.clone();
+        let db = test_db.connection_arc();
 
         // Create a project first
         let project = projects::ActiveModel {
@@ -263,7 +263,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_monitor_service_ensure_monitor_for_environment() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db.db.clone();
+        let db = test_db.connection_arc();
 
         // Create a project
         let project = projects::ActiveModel {
@@ -317,7 +317,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_monitor_service_list_monitors() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db.db.clone();
+        let db = test_db.connection_arc();
 
         // Create a project
         let project = projects::ActiveModel {
@@ -332,6 +332,20 @@ mod integration_tests {
         };
         let project = project.insert(db.as_ref()).await.unwrap();
 
+        // Create an environment
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("test-env".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set("test-env".to_string()),
+            host: Set("test-env.local".to_string()),
+            upstreams: Set(serde_json::json!([])),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let environment = environment.insert(db.as_ref()).await.unwrap();
+
         let config_service = create_test_config_service(&db);
         let monitor_service = MonitorService::new(db.clone(), config_service);
 
@@ -340,7 +354,7 @@ mod integration_tests {
             let request = CreateMonitorRequest {
                 name: format!("Monitor {}", i),
                 monitor_type: "web".to_string(),
-                environment_id: 1,
+                environment_id: environment.id,
                 check_interval_seconds: Some(60),
             };
             monitor_service.create_monitor(project.id, request).await.unwrap();
@@ -358,7 +372,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_monitor_service_record_check() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db.db.clone();
+        let db = test_db.connection_arc();
 
         // Create a project
         let project = projects::ActiveModel {
@@ -373,6 +387,20 @@ mod integration_tests {
         };
         let project = project.insert(db.as_ref()).await.unwrap();
 
+        // Create an environment
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("test-env".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set("test-env".to_string()),
+            host: Set("test-env.local".to_string()),
+            upstreams: Set(serde_json::json!([])),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let environment = environment.insert(db.as_ref()).await.unwrap();
+
         let config_service = create_test_config_service(&db);
         let monitor_service = MonitorService::new(db.clone(), config_service);
 
@@ -380,7 +408,7 @@ mod integration_tests {
         let request = CreateMonitorRequest {
             name: "Test Monitor".to_string(),
             monitor_type: "web".to_string(),
-            environment_id: 1,
+            environment_id: environment.id,
             check_interval_seconds: Some(60),
         };
         let monitor = monitor_service.create_monitor(project.id, request).await.unwrap();
@@ -413,7 +441,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_incident_service_create_and_get() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db.db.clone();
+        let db = test_db.connection_arc();
 
         // Create a project
         let project = projects::ActiveModel {
@@ -428,13 +456,27 @@ mod integration_tests {
         };
         let project = project.insert(db.as_ref()).await.unwrap();
 
+        // Create an environment
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("test-env".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set("test-env".to_string()),
+            host: Set("test-env.local".to_string()),
+            upstreams: Set(serde_json::json!([])),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let environment = environment.insert(db.as_ref()).await.unwrap();
+
         let incident_service = IncidentService::new(db.clone());
 
         let request = CreateIncidentRequest {
             title: "Database Connection Issue".to_string(),
             description: Some("Unable to connect to primary database".to_string()),
             severity: "major".to_string(),
-            environment_id: Some(1),
+            environment_id: Some(environment.id),
             monitor_id: None,
         };
 
@@ -456,7 +498,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_incident_service_update_status() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db.db.clone();
+        let db = test_db.connection_arc();
 
         // Create a project
         let project = projects::ActiveModel {
@@ -471,6 +513,20 @@ mod integration_tests {
         };
         let project = project.insert(db.as_ref()).await.unwrap();
 
+        // Create an environment
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("test-env".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set("test-env".to_string()),
+            host: Set("test-env.local".to_string()),
+            upstreams: Set(serde_json::json!([])),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let environment = environment.insert(db.as_ref()).await.unwrap();
+
         let incident_service = IncidentService::new(db.clone());
 
         // Create an incident
@@ -478,7 +534,7 @@ mod integration_tests {
             title: "API Latency".to_string(),
             description: None,
             severity: "minor".to_string(),
-            environment_id: Some(1),
+            environment_id: Some(environment.id),
             monitor_id: None,
         };
 
@@ -513,7 +569,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_incident_service_validation() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db.db.clone();
+        let db = test_db.connection_arc();
 
         // Create a project
         let project = projects::ActiveModel {
@@ -553,7 +609,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_status_page_service_overview() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db.db.clone();
+        let db = test_db.connection_arc();
 
         // Create a project
         let project = projects::ActiveModel {
@@ -606,7 +662,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_environment_created_job_creates_monitor() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db.db.clone();
+        let db = test_db.connection_arc();
 
         // Create a project
         let project = projects::ActiveModel {
@@ -687,7 +743,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_environment_deleted_job_deletes_monitors() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db.db.clone();
+        let db = test_db.connection_arc();
 
         // Create a project
         let project = projects::ActiveModel {
@@ -779,7 +835,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_project_created_and_deleted_jobs() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db.db.clone();
+        let db = test_db.connection_arc();
 
         // Create a project
         let project = projects::ActiveModel {
@@ -841,7 +897,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_multiple_environments_lifecycle() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db.db.clone();
+        let db = test_db.connection_arc();
 
         // Create a project
         let project = projects::ActiveModel {
@@ -956,7 +1012,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_health_check_service_initialize_monitors() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db.db.clone();
+        let db = test_db.connection_arc();
 
         // Create a project
         let project = projects::ActiveModel {
@@ -971,7 +1027,8 @@ mod integration_tests {
         };
         let project = project.insert(db.as_ref()).await.unwrap();
 
-        // Create multiple environments
+        // Create multiple environments and save the first one's ID
+        let mut first_env_id = None;
         for i in 1..=3 {
             let environment = environments::ActiveModel {
                 project_id: Set(project.id),
@@ -985,13 +1042,16 @@ mod integration_tests {
                 updated_at: Set(Utc::now()),
                 ..Default::default()
             };
-            environment.insert(db.as_ref()).await.unwrap();
+            let env = environment.insert(db.as_ref()).await.unwrap();
+            if i == 1 {
+                first_env_id = Some(env.id);
+            }
         }
 
         // Create a deployment for one environment
         let deployment = deployments::ActiveModel {
             project_id: Set(project.id),
-            environment_id: Set(1),
+            environment_id: Set(first_env_id.unwrap()),
             commit_sha: Set(Some("abc123".to_string())),
             commit_message: Set(Some("Test deployment".to_string())),
             branch_ref: Set(Some("main".to_string())),

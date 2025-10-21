@@ -266,8 +266,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_logs_pagination() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let service = RequestLogService::new(test_db.db.clone());
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let service = RequestLogService::new(test_db.connection_arc().clone());
 
         // Test with default pagination
         let result = service.get_logs(Some(1), None, None, None, None, None, None, 20, 0).await;
@@ -280,8 +280,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_logs_with_filters() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let service = RequestLogService::new(test_db.db.clone());
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let service = RequestLogService::new(test_db.connection_arc().clone());
 
         // Test with environment filter
         let result = service.get_logs(Some(1), Some(1), None, None, None, None, None, 20, 0).await;

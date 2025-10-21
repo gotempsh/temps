@@ -20,3 +20,6 @@ testcontainers = { workspace = true }
 once_cell = "1.19"
 
 anyhow = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }

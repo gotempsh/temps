@@ -11,11 +11,22 @@ async fn setup_test_db() -> TestDatabase {
 }
 
 async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
+    use temps_entities::types::ProjectType;
+    use uuid::Uuid;
+
+    let unique_slug = format!("test-project-{}", Uuid::new_v4());
     let project = projects::ActiveModel {
         name: Set("Test Project".to_string()),
-        slug: Set("test-project".to_string()),
         directory: Set("/test".to_string()),
         main_branch: Set("main".to_string()),
+        slug: Set(unique_slug),
+        project_type: Set(ProjectType::Server),
+        automatic_deploy: Set(true),
+        is_web_app: Set(false),
+        performance_metrics_enabled: Set(false),
+        use_default_wildcard: Set(true),
+        is_public_repo: Set(false),
+        is_on_demand: Set(false),
         created_at: Set(chrono::Utc::now()),
         updated_at: Set(chrono::Utc::now()),
         ..Default::default()
@@ -30,6 +41,7 @@ async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
 
 fn create_test_error_data(project_id: i32) -> CreateErrorEventData {
     CreateErrorEventData {
+        source: Some("test".to_string()),
         exception_type: Some("TypeError".to_string()),
         exception_value: Some("Cannot read property 'foo' of undefined".to_string()),
         stack_trace: Some(serde_json::json!([
@@ -45,6 +57,7 @@ fn create_test_error_data(project_id: i32) -> CreateErrorEventData {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_process_error_event_creates_new_group() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();
@@ -71,6 +84,7 @@ async fn test_process_error_event_creates_new_group() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_process_error_event_groups_similar_errors() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();
@@ -106,6 +120,7 @@ async fn test_process_error_event_groups_similar_errors() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_generate_fingerprint_is_consistent() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();
@@ -127,6 +142,7 @@ async fn test_generate_fingerprint_is_consistent() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_generate_fingerprint_differs_for_different_errors() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();
@@ -155,6 +171,7 @@ async fn test_generate_fingerprint_differs_for_different_errors() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_normalize_error_message() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();
@@ -170,6 +187,7 @@ async fn test_normalize_error_message() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_process_error_event_creates_event() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();
@@ -195,6 +213,7 @@ async fn test_process_error_event_creates_event() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_extract_stack_signature() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();
@@ -213,6 +232,7 @@ async fn test_extract_stack_signature() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_normalize_error_message_replaces_uuids() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();
@@ -226,6 +246,7 @@ async fn test_normalize_error_message_replaces_uuids() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_normalize_error_message_replaces_hex_ids() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();
@@ -239,6 +260,7 @@ async fn test_normalize_error_message_replaces_hex_ids() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_normalize_error_message_replaces_numbers() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();
@@ -252,6 +274,7 @@ async fn test_normalize_error_message_replaces_numbers() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_normalize_error_message_replaces_paths() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();
@@ -267,6 +290,7 @@ async fn test_normalize_error_message_replaces_paths() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_normalize_error_message_replaces_urls() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();
@@ -280,6 +304,7 @@ async fn test_normalize_error_message_replaces_urls() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_normalize_error_message_replaces_emails() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();
@@ -293,6 +318,7 @@ async fn test_normalize_error_message_replaces_emails() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_normalize_error_message_replaces_ips() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();
@@ -306,6 +332,7 @@ async fn test_normalize_error_message_replaces_ips() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_normalize_error_message_replaces_table_refs() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();
@@ -319,6 +346,7 @@ async fn test_normalize_error_message_replaces_table_refs() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn test_normalize_error_message_groups_similar_errors() {
     let test_db = setup_test_db().await;
     let db = test_db.connection_arc();

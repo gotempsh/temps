@@ -123,27 +123,38 @@ impl ErrorAnalyticsService {
     /// Normalize bucket interval to PostgreSQL interval format
     /// Accepts: "1h", "15m", "1d", "1 hour", "30 minutes", etc.
     fn normalize_bucket_interval(bucket: &str) -> String {
+        // Trim whitespace first
+        let bucket = bucket.trim();
+
         // Already in PostgreSQL interval format (e.g., "1 hour", "30 minutes")
         if bucket.contains(" ") {
             return bucket.to_string();
         }
 
         // Parse shorthand notation (e.g., "1h", "15m", "1d")
-        let bucket = bucket.trim().to_lowercase();
+        let bucket = bucket.to_lowercase();
 
-        // Common patterns
+        // Common patterns - validate format before parsing
         if bucket.ends_with('h') {
             let hours = bucket.trim_end_matches('h');
-            return format!("{} hour", hours);
+            if hours.parse::<u32>().is_ok() {
+                return format!("{} hour", hours);
+            }
         } else if bucket.ends_with('m') {
             let minutes = bucket.trim_end_matches('m');
-            return format!("{} minute", minutes);
+            if minutes.parse::<u32>().is_ok() {
+                return format!("{} minute", minutes);
+            }
         } else if bucket.ends_with('d') {
             let days = bucket.trim_end_matches('d');
-            return format!("{} day", days);
+            if days.parse::<u32>().is_ok() {
+                return format!("{} day", days);
+            }
         } else if bucket.ends_with('w') {
             let weeks = bucket.trim_end_matches('w');
-            return format!("{} week", weeks);
+            if weeks.parse::<u32>().is_ok() {
+                return format!("{} week", weeks);
+            }
         }
 
         // Default to 1 hour if format is unrecognized

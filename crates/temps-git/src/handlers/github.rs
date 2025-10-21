@@ -88,7 +88,7 @@ async fn handle_manifest_conversion_with_source(
     let response = match client
         .post(&conversions_url)
         .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "Temps Engine")
+        .header("User-Agent", "Temps")
         .send()
         .await
     {

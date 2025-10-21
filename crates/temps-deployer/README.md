@@ -264,9 +264,9 @@ This example demonstrates:
 - ✅ A/B testing build approaches
 - ✅ Supporting diverse team preferences
 
-## Integration with Temps Engine
+## Integration with Temps
 
-This library is designed to integrate seamlessly with the larger Temps Engine ecosystem:
+This library is designed to integrate seamlessly with the larger Temps ecosystem:
 
 ```rust
 // In your pipeline service
@@ -308,4 +308,4 @@ impl BuildStrategy {
 
 ## License
 
-This project is part of the Temps Engine ecosystem and follows the same licensing terms.
+This project is part of the Temps ecosystem and follows the same licensing terms.

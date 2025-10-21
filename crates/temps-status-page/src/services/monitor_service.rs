@@ -845,9 +845,13 @@ mod tests {
     use sea_orm::{ActiveModelTrait, Set};
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> projects::Model {
+        let slug = format!("test-project-{}", chrono::Utc::now().timestamp());
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
-            slug: Set(format!("test-project-{}", chrono::Utc::now().timestamp())),
+            slug: Set(slug.clone()),
+            directory: Set(slug),
+            main_branch: Set("main".to_string()),
+            project_type: Set(temps_entities::types::ProjectType::Server),
             ..Default::default()
         };
         project.insert(db.as_ref()).await.unwrap()
@@ -857,10 +861,14 @@ mod tests {
         db: &Arc<DatabaseConnection>,
         project_id: i32,
     ) -> environments::Model {
+        let subdomain = format!("test-env-{}", chrono::Utc::now().timestamp());
         let env = environments::ActiveModel {
             project_id: Set(project_id),
             name: Set("test-env".to_string()),
-            subdomain: Set(format!("test-env-{}", chrono::Utc::now().timestamp())),
+            slug: Set("test-env".to_string()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.local", subdomain)),
+            upstreams: Set(serde_json::json!([])),
             ..Default::default()
         };
         env.insert(db.as_ref()).await.unwrap()
@@ -880,8 +888,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_monitor() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let db = test_db.db;
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
         let config_service = create_mock_config_service(&db);
         let service = MonitorService::new(db.clone(), config_service);
 
@@ -908,8 +916,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_monitor() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let db = test_db.db;
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
         let config_service = create_mock_config_service(&db);
         let service = MonitorService::new(db.clone(), config_service);
 
@@ -932,8 +940,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_monitor_not_found() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let db = test_db.db;
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
         let config_service = create_mock_config_service(&db);
         let service = MonitorService::new(db.clone(), config_service);
 
@@ -947,8 +955,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_monitors() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let db = test_db.db;
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
         let config_service = create_mock_config_service(&db);
         let service = MonitorService::new(db.clone(), config_service);
 
@@ -985,8 +993,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_monitor_status() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let db = test_db.db;
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
         let config_service = create_mock_config_service(&db);
         let service = MonitorService::new(db.clone(), config_service);
 
@@ -1014,8 +1022,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_monitor() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let db = test_db.db;
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
         let config_service = create_mock_config_service(&db);
         let service = MonitorService::new(db.clone(), config_service);
 
@@ -1042,8 +1050,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_ensure_monitor_for_environment() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let db = test_db.db;
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
         let config_service = create_mock_config_service(&db);
         let service = MonitorService::new(db.clone(), config_service);
 
@@ -1070,8 +1078,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_current_status() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let db = test_db.db;
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
         let config_service = create_mock_config_service(&db);
         let service = MonitorService::new(db.clone(), config_service);
 
@@ -1096,8 +1104,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_monitor_url_populated() {
-        let test_db = TestDatabase::new().await.unwrap();
-        let db = test_db.db;
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
         let config_service = create_mock_config_service(&db);
         let service = MonitorService::new(db.clone(), config_service);
 

@@ -4202,7 +4202,7 @@ impl MigrationTrait for Migration {
                 GROUP BY bucket, project_id, environment_id, error_group_id
                 WITH NO DATA;
 
-                CREATE INDEX idx_error_events_hourly_project_bucket
+                CREATE INDEX IF NOT EXISTS idx_error_events_hourly_project_bucket
                     ON error_events_hourly (project_id, bucket DESC);
 
                 SELECT add_continuous_aggregate_policy('error_events_hourly',
@@ -4231,7 +4231,7 @@ impl MigrationTrait for Migration {
                 GROUP BY bucket, project_id, environment_id
                 WITH NO DATA;
 
-                CREATE INDEX idx_error_events_daily_project_bucket
+                CREATE INDEX IF NOT EXISTS idx_error_events_daily_project_bucket
                     ON error_events_daily (project_id, bucket DESC);
 
                 SELECT add_continuous_aggregate_policy('error_events_daily',

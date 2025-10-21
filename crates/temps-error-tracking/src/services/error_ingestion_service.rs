@@ -131,44 +131,44 @@ impl ErrorIngestionService {
 
         let mut normalized = message.to_lowercase();
 
-        // Replace UUIDs (e.g., 550e8400-e29b-41d4-a716-446655440000)
+        // Replace UUIDs (e.g., 550e8400-e29b-41d4-a716-446655440000) - FIRST
         let uuid_regex = Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap();
-        normalized = uuid_regex.replace_all(&normalized, "<UUID>").to_string();
+        normalized = uuid_regex.replace_all(&normalized, "<uuid>").to_string();
 
-        // Replace hex IDs (e.g., 0x1a2b3c4d, deadbeef)
+        // Replace hex IDs (e.g., 0x1a2b3c4d, deadbeef) - SECOND
         let hex_regex = Regex::new(r"\b(0x)?[0-9a-f]{8,}\b").unwrap();
-        normalized = hex_regex.replace_all(&normalized, "<HEX_ID>").to_string();
+        normalized = hex_regex.replace_all(&normalized, "<hex_id>").to_string();
 
-        // Replace numeric IDs and timestamps (standalone numbers of 4+ digits)
-        let number_regex = Regex::new(r"\b\d{4,}\b").unwrap();
-        normalized = number_regex.replace_all(&normalized, "<NUM>").to_string();
+        // Replace URLs (http/https) - BEFORE paths (paths might match URL components)
+        let url_regex = Regex::new(r"https?://[\w./\-?=&%]+").unwrap();
+        normalized = url_regex.replace_all(&normalized, "<url>").to_string();
 
-        // Replace file paths (Unix and Windows style)
+        // Replace email addresses - BEFORE paths
+        let email_regex = Regex::new(r"\b[\w._%+-]+@[\w.-]+\.[a-z]{2,}\b").unwrap();
+        normalized = email_regex.replace_all(&normalized, "<email>").to_string();
+
+        // Replace file paths (Unix and Windows style) - AFTER URLs/emails
         let unix_path_regex = Regex::new(r"/[\w/.]+\.[\w]+").unwrap();
-        normalized = unix_path_regex.replace_all(&normalized, "<PATH>").to_string();
+        normalized = unix_path_regex.replace_all(&normalized, "<path>").to_string();
 
         let windows_path_regex = Regex::new(r"[a-z]:\\[\w\\]+\.[\w]+").unwrap();
-        normalized = windows_path_regex.replace_all(&normalized, "<PATH>").to_string();
+        normalized = windows_path_regex.replace_all(&normalized, "<path>").to_string();
 
-        // Replace URLs (http/https)
-        let url_regex = Regex::new(r"https?://[\w./\-?=&%]+").unwrap();
-        normalized = url_regex.replace_all(&normalized, "<URL>").to_string();
-
-        // Replace email addresses
-        let email_regex = Regex::new(r"\b[\w._%+-]+@[\w.-]+\.[a-z]{2,}\b").unwrap();
-        normalized = email_regex.replace_all(&normalized, "<EMAIL>").to_string();
-
-        // Replace IP addresses (v4)
+        // Replace IP addresses (v4) - BEFORE table refs and numbers
         let ip_regex = Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").unwrap();
-        normalized = ip_regex.replace_all(&normalized, "<IP>").to_string();
+        normalized = ip_regex.replace_all(&normalized, "<ip>").to_string();
 
-        // Replace quoted strings (often dynamic user input)
-        let quoted_string_regex = Regex::new(r#"["']([^"']{10,})["']"#).unwrap();
-        normalized = quoted_string_regex.replace_all(&normalized, r#""<STRING>""#).to_string();
-
-        // Replace database table references (table_123, users_456)
+        // Replace database table references (table_123, users_456) - BEFORE general numbers
         let table_ref_regex = Regex::new(r"\b(\w+)_\d+\b").unwrap();
-        normalized = table_ref_regex.replace_all(&normalized, "$1_<ID>").to_string();
+        normalized = table_ref_regex.replace_all(&normalized, "${1}_<id>").to_string();
+
+        // Replace numeric IDs and timestamps (standalone numbers of 4+ digits) - LAST number operation
+        let number_regex = Regex::new(r"\b\d{4,}\b").unwrap();
+        normalized = number_regex.replace_all(&normalized, "<num>").to_string();
+
+        // Replace quoted strings (often dynamic user input) - FINAL
+        let quoted_string_regex = Regex::new(r#"["']([^"']{10,})["']"#).unwrap();
+        normalized = quoted_string_regex.replace_all(&normalized, r#""<string>""#).to_string();
 
         // Truncate to 200 characters
         normalized.chars().take(200).collect::<String>()

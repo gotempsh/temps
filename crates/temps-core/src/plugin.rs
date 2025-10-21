@@ -661,7 +661,7 @@ impl PluginManager {
         let mut combined_openapi = OpenApiBuilder::new()
             .info(
                 InfoBuilder::new()
-                    .title("Temps Engine API")
+                    .title("Temps")
                     .description(Some("A comprehensive API for managing projects, deployments, and infrastructure resources"))
                     .version("1.0.0")
                     .contact(Some(

@@ -2151,6 +2151,11 @@ mod tests {
         let config_service = create_mock_config_service();
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+
+        // Encrypt the credentials for the test
+        let encrypted_access_key = encryption_service.encrypt_string("test-key").unwrap();
+        let encrypted_secret_key = encryption_service.encrypt_string("test-secret").unwrap();
+
         let backup_service = BackupService::new(
             db,
             external_service_manager,
@@ -2164,8 +2169,8 @@ mod tests {
             name: "test-source".to_string(),
             bucket_name: "test-bucket".to_string(),
             bucket_path: "/backups".to_string(),
-            access_key_id: "test-key".to_string(),
-            secret_key: "test-secret".to_string(),
+            access_key_id: encrypted_access_key,
+            secret_key: encrypted_secret_key,
             region: "us-east-1".to_string(),
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
@@ -2464,6 +2469,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires Docker (MinIO and PostgreSQL containers)
     async fn test_backup_to_minio_integration() {
         use temps_database::test_utils::TestDatabase;
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
@@ -2671,6 +2677,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires Docker (PostgreSQL container)
     async fn test_restore_postgres_from_url() {
         use temps_database::test_utils::TestDatabase;
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};

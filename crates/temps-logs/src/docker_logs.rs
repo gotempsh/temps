@@ -47,6 +47,9 @@ impl DockerLogService {
         container_id: &str,
         options: ContainerLogOptions,
     ) -> Result<impl futures::Stream<Item = Result<String, DockerLogError>>, DockerLogError> {
+        // Validate container exists first by attempting to inspect it
+        self.docker.inspect_container(container_id, None::<bollard::query_parameters::InspectContainerOptions>).await?;
+
         let tail = options.tail.unwrap_or_else(|| "all".to_string());
         let log_options = Some(LogsOptions {
             follow: true,

@@ -721,6 +721,14 @@ impl ExternalService for PostgresService {
     fn get_parameter_definitions(&self) -> Vec<ServiceParameter> {
         vec![
             ServiceParameter {
+                name: "host".to_string(),
+                required: true,
+                encrypted: false,
+                description: "Database host".to_string(),
+                default_value: Some("localhost".to_string()),
+                validation_pattern: None,
+            },
+            ServiceParameter {
                 name: "port".to_string(),
                 required: true,
                 encrypted: false,
@@ -734,6 +742,22 @@ impl ExternalService for PostgresService {
                 encrypted: false,
                 description: "Database name".to_string(),
                 default_value: Some("postgres".to_string()),
+                validation_pattern: None,
+            },
+            ServiceParameter {
+                name: "username".to_string(),
+                required: true,
+                encrypted: false,
+                description: "Database username".to_string(),
+                default_value: Some("postgres".to_string()),
+                validation_pattern: None,
+            },
+            ServiceParameter {
+                name: "password".to_string(),
+                required: true,
+                encrypted: true,
+                description: "Database password".to_string(),
+                default_value: None,
                 validation_pattern: None,
             },
         ]

@@ -457,6 +457,7 @@ mod tests {
     use super::*;
     use crate::workflow::WorkflowBuilder;
     use crate::workflow::WorkflowTask;
+    use crate::LogWriter;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug)]
@@ -525,6 +526,20 @@ mod tests {
         }
     }
 
+    // Mock LogWriter for testing
+    struct MockLogWriter;
+
+    #[async_trait::async_trait]
+    impl LogWriter for MockLogWriter {
+        async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
+            Ok(())
+        }
+
+        fn stage_id(&self) -> i32 {
+            1
+        }
+    }
+
     #[tokio::test]
     async fn test_workflow_execution_order() {
         let global_counter = Arc::new(AtomicUsize::new(0));
@@ -538,9 +553,11 @@ mod tests {
         let job2 = Arc::new(TestJob::new("job2", "Second Job", vec!["job1".to_string()], job2_order.clone(), global_counter.clone()));
         let job3 = Arc::new(TestJob::new("job3", "Third Job", vec!["job2".to_string()], job3_order.clone(), global_counter.clone()));
 
+        let log_writer = Arc::new(MockLogWriter);
         let config = WorkflowBuilder::new()
             .with_workflow_run_id("test-workflow".to_string())
             .with_deployment_context(1, 1, 1)
+            .with_log_writer(log_writer)
             .with_jobs(vec![job3.clone(), job1.clone(), job2.clone()]) // Intentionally out of order
             .build()
             .unwrap();
@@ -574,9 +591,11 @@ mod tests {
         let job2 = Arc::new(TestJob::new("job2", "Second Job", vec!["job1".to_string()], Arc::new(AtomicUsize::new(0)), global_counter.clone()));
         let job3 = Arc::new(TestJob::new("job3", "Third Job", vec!["job2".to_string()], Arc::new(AtomicUsize::new(0)), global_counter.clone()));
 
+        let log_writer = Arc::new(MockLogWriter);
         let config = WorkflowBuilder::new()
             .with_workflow_run_id("test-workflow".to_string())
             .with_deployment_context(1, 1, 1)
+            .with_log_writer(log_writer)
             .with_jobs(vec![job1, job2, job3])
             .build()
             .unwrap();

@@ -2021,13 +2021,16 @@ mod tests {
         environment = active_environment.update(db.as_ref()).await?;
 
         // Create deployment_containers entries
+        let now = Utc::now();
         let container1 = deployment_containers::ActiveModel {
             deployment_id: Set(deployment.id),
             container_id: Set("container-123".to_string()),
             container_name: Set("test-container-1".to_string()),
+            container_port: Set(8080),
             image_name: Set(Some("nginx:latest".to_string())),
             status: Set(Some("running".to_string())),
-            created_at: Set(Utc::now()),
+            created_at: Set(now),
+            deployed_at: Set(now),
             ..Default::default()
         };
         container1.insert(db.as_ref()).await?;
@@ -2036,9 +2039,11 @@ mod tests {
             deployment_id: Set(deployment.id),
             container_id: Set("container-456".to_string()),
             container_name: Set("test-container-2".to_string()),
+            container_port: Set(5432),
             image_name: Set(Some("postgres:15".to_string())),
             status: Set(Some("running".to_string())),
-            created_at: Set(Utc::now()),
+            created_at: Set(now),
+            deployed_at: Set(now),
             ..Default::default()
         };
         container2.insert(db.as_ref()).await?;
@@ -2092,13 +2097,16 @@ mod tests {
         environment = active_environment.update(db.as_ref()).await?;
 
         // Create a container for the deployment
+        let now = Utc::now();
         let container = deployment_containers::ActiveModel {
             deployment_id: Set(deployment.id),
             container_id: Set("valid-container-id".to_string()),
             container_name: Set("test-container".to_string()),
+            container_port: Set(8080),
             image_name: Set(Some("nginx:latest".to_string())),
             status: Set(Some("running".to_string())),
-            created_at: Set(Utc::now()),
+            created_at: Set(now),
+            deployed_at: Set(now),
             ..Default::default()
         };
         container.insert(db.as_ref()).await?;

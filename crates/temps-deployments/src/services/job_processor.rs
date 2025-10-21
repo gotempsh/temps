@@ -779,8 +779,16 @@ mod tests {
             .create_deployment_jobs(deployment.id)
             .await?;
 
-        // Verify jobs were created (nextjs project should create 4 jobs)
-        assert_eq!(jobs.len(), 4);
+        // Verify jobs were created (nextjs project should create 5 jobs including configure_crons)
+        let job_ids: Vec<String> = jobs.iter().map(|j| j.job_id.clone()).collect();
+        assert_eq!(jobs.len(), 5, "Expected 5 jobs but got {}: {:?}", jobs.len(), job_ids);
+
+        // Verify all expected jobs are present
+        assert!(job_ids.contains(&"download_repo".to_string()));
+        assert!(job_ids.contains(&"build_image".to_string()));
+        assert!(job_ids.contains(&"deploy_container".to_string()));
+        assert!(job_ids.contains(&"mark_deployment_complete".to_string()));
+        assert!(job_ids.contains(&"configure_crons".to_string()));
 
         // Verify all jobs are in pending state
         for job in &jobs {
@@ -874,13 +882,14 @@ mod tests {
             .create_deployment_jobs(deployment.id)
             .await?;
 
-        // Should create 2 jobs (no download_repo): build_image, deploy_container
-        assert_eq!(jobs.len(), 2);
-
+        // Should create 3 jobs (no download_repo): build_image, deploy_container, mark_deployment_complete
         let job_ids: Vec<String> = jobs.iter().map(|j| j.job_id.clone()).collect();
+        assert_eq!(jobs.len(), 3, "Expected 3 jobs but got {}: {:?}", jobs.len(), job_ids);
+
         assert!(!job_ids.contains(&"download_repo".to_string()));
         assert!(job_ids.contains(&"build_image".to_string()));
         assert!(job_ids.contains(&"deploy_container".to_string()));
+        assert!(job_ids.contains(&"mark_deployment_complete".to_string()));
 
         Ok(())
     }

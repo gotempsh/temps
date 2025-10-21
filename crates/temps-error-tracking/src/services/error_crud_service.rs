@@ -334,11 +334,22 @@ mod tests {
     }
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
+        use temps_entities::types::ProjectType;
+        use uuid::Uuid;
+
+        let unique_slug = format!("test-project-{}", Uuid::new_v4());
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
-            slug: Set("test-project".to_string()),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
+            slug: Set(unique_slug),
+            project_type: Set(ProjectType::Server),
+            automatic_deploy: Set(true),
+            is_web_app: Set(false),
+            performance_metrics_enabled: Set(false),
+            use_default_wildcard: Set(true),
+            is_public_repo: Set(false),
+            is_on_demand: Set(false),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
             ..Default::default()
@@ -415,6 +426,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_update_error_group_status_to_resolved() {
         let test_db = setup_test_db().await;
         let db = test_db.connection_arc();
@@ -441,6 +453,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_update_error_group_with_assignment() {
         let test_db = setup_test_db().await;
         let db = test_db.connection_arc();
@@ -473,6 +486,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_update_error_group_to_ignored() {
         let test_db = setup_test_db().await;
         let db = test_db.connection_arc();
@@ -499,6 +513,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_update_error_group_not_found() {
         let test_db = setup_test_db().await;
         let db = test_db.connection_arc();
@@ -514,6 +529,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_update_error_group_wrong_project() {
         let test_db = setup_test_db().await;
         let db = test_db.connection_arc();
@@ -532,6 +548,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_list_error_groups_with_pagination() {
         let test_db = setup_test_db().await;
         let db = test_db.connection_arc();
@@ -555,6 +572,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_list_error_groups_with_status_filter() {
         let test_db = setup_test_db().await;
         let db = test_db.connection_arc();
@@ -587,6 +605,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_get_error_group_by_id() {
         let test_db = setup_test_db().await;
         let db = test_db.connection_arc();
@@ -605,6 +624,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_has_error_groups() {
         let test_db = setup_test_db().await;
         let db = test_db.connection_arc();

@@ -73,7 +73,23 @@ export function EditNotificationProvider() {
     defaultValues: {
       name: '',
       provider_type: 'email',
-      config: {},
+      config: {
+        // Slack config
+        webhook_url: '',
+        channel: '',
+        // Email config
+        smtp_host: '',
+        smtp_port: 587,
+        use_credentials: false,
+        smtp_username: '',
+        password: '',
+        from_name: '',
+        from_address: '',
+        to_addresses: [], // Array of email addresses
+        tls_mode: 'Starttls', // Default TLS mode
+        starttls_required: false,
+        accept_invalid_certs: false,
+      },
     },
   })
 

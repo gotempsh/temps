@@ -629,9 +629,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_workflow_builder() {
+        let log_writer = Arc::new(MockLogWriter);
         let workflow = WorkflowBuilder::new()
             .with_workflow_run_id("test-run-123".to_string())
             .with_deployment_context(1, 1, 1)
+            .with_log_writer(log_writer)
             .with_var("test_var", "test_value").unwrap()
             .with_job(Arc::new(TestJob::new("job1", "First Job")))
             .with_job(Arc::new(TestJob::new("job2", "Second Job")))

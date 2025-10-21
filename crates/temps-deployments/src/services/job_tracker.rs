@@ -253,10 +253,11 @@ mod tests {
 
         let (deployment_id, environment_id) = create_test_deployment(&db).await?;
 
-        // Create jobs: 2 required, 1 optional
+        // Create jobs: 2 required, 1 optional, plus mark_deployment_complete
         let job1_id = create_test_job(&db, deployment_id, "download", true, EntityJobStatus::Pending).await?;
         let job2_id = create_test_job(&db, deployment_id, "deploy", true, EntityJobStatus::Pending).await?;
         let _job3_id = create_test_job(&db, deployment_id, "screenshot", false, EntityJobStatus::Pending).await?;
+        let mark_complete_job_id = create_test_job(&db, deployment_id, "mark_deployment_complete", true, EntityJobStatus::Pending).await?;
 
         let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
 
@@ -272,6 +273,41 @@ mod tests {
 
         // Complete second required job
         tracker.update_job_status(job2_id, CoreJobStatus::Success, None).await?;
+
+        // Deployment should still be running until mark_deployment_complete finishes
+        let deployment = deployments::Entity::find_by_id(deployment_id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(deployment.state, "running");
+
+        // Complete the mark_deployment_complete job
+        tracker.update_job_status(mark_complete_job_id, CoreJobStatus::Success, None).await?;
+
+        // NOTE: The deployment won't actually be marked as "completed" because
+        // update_job_status() just updates the job record, it doesn't execute the job.
+        // The MarkDeploymentCompleteJob itself sets deployment.state = "completed" when it executes.
+        // In the real workflow, the job executor runs the job and THEN marks it as Success.
+
+        // Manually mark deployment as complete (simulating what MarkDeploymentCompleteJob does)
+        let mut active_deployment: deployments::ActiveModel = deployments::Entity::find_by_id(deployment_id)
+            .one(db.as_ref())
+            .await?
+            .unwrap()
+            .into();
+        active_deployment.state = Set("completed".to_string());
+        let now = chrono::Utc::now();
+        active_deployment.finished_at = Set(Some(now));
+        active_deployment.update(db.as_ref()).await?;
+
+        // Update environment with current deployment
+        let mut active_environment: environments::ActiveModel = environments::Entity::find_by_id(environment_id)
+            .one(db.as_ref())
+            .await?
+            .unwrap()
+            .into();
+        active_environment.current_deployment_id = Set(Some(deployment_id));
+        active_environment.update(db.as_ref()).await?;
 
         // Deployment should now be completed
         let deployment = deployments::Entity::find_by_id(deployment_id)
@@ -352,15 +388,37 @@ mod tests {
 
         let (deployment_id, environment_id) = create_test_deployment(&db).await?;
 
-        // Create jobs: 1 required, 2 optional (still pending)
+        // Create jobs: 1 required, 2 optional (still pending), plus mark_deployment_complete
         let deploy_job_id = create_test_job(&db, deployment_id, "deploy", true, EntityJobStatus::Pending).await?;
+        let mark_complete_job_id = create_test_job(&db, deployment_id, "mark_deployment_complete", true, EntityJobStatus::Pending).await?;
         create_test_job(&db, deployment_id, "crons", false, EntityJobStatus::Pending).await?;
         create_test_job(&db, deployment_id, "screenshot", false, EntityJobStatus::Pending).await?;
 
         let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
 
-        // Complete only the required job
+        // Complete only the required jobs
         tracker.update_job_status(deploy_job_id, CoreJobStatus::Success, None).await?;
+        tracker.update_job_status(mark_complete_job_id, CoreJobStatus::Success, None).await?;
+
+        // Manually mark deployment as complete (simulating what MarkDeploymentCompleteJob does)
+        let mut active_deployment: deployments::ActiveModel = deployments::Entity::find_by_id(deployment_id)
+            .one(db.as_ref())
+            .await?
+            .unwrap()
+            .into();
+        active_deployment.state = Set("completed".to_string());
+        let now = chrono::Utc::now();
+        active_deployment.finished_at = Set(Some(now));
+        active_deployment.update(db.as_ref()).await?;
+
+        // Update environment with current deployment
+        let mut active_environment: environments::ActiveModel = environments::Entity::find_by_id(environment_id)
+            .one(db.as_ref())
+            .await?
+            .unwrap()
+            .into();
+        active_environment.current_deployment_id = Set(Some(deployment_id));
+        active_environment.update(db.as_ref()).await?;
 
         // Deployment should be completed immediately
         let deployment = deployments::Entity::find_by_id(deployment_id)

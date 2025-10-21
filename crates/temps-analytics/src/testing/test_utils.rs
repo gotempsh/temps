@@ -3,7 +3,7 @@ use sea_orm::{Database, DatabaseConnection};
 use std::sync::Arc;
 use temps_core::EncryptionService;
 use temps_migrations::{Migrator, MigratorTrait};
-use testcontainers::{runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
+use testcontainers::{core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 use uuid::Uuid;
 
 /// Test database setup with unique container per test
@@ -25,6 +25,7 @@ impl TestDatabase {
         );
 
         let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg17")
+            .with_exposed_port(ContainerPort::Tcp(5432))
             .with_env_var("POSTGRES_DB", "test_db")
             .with_env_var("POSTGRES_USER", "test_user")
             .with_env_var("POSTGRES_PASSWORD", "test_password")
