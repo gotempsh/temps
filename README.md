@@ -21,17 +21,21 @@
 **Deploy your first app in 60 seconds:**
 
 ```bash
-# 1. Download and install Temps
+# 1. Start PostgreSQL with TimescaleDB (one-time setup, runs on port 15432 to avoid conflicts)
+docker run -d \
+  --name temps-postgres \
+  -e POSTGRES_PASSWORD=temps \
+  -e POSTGRES_DB=temps \
+  -p 15432:5432 \
+  timescale/timescaledb-ha:pg16
+
+# 2. Download and install Temps
 curl -LO https://github.com/gotempsh/temps/releases/latest/download/temps-linux-amd64
 chmod +x temps-linux-amd64
 sudo mv temps-linux-amd64 /usr/local/bin/temps
 
-# 2. Setup database (one-time)
-createdb temps
-psql temps -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
-
 # 3. Start Temps
-temps serve --database-url postgresql://localhost/temps
+temps serve --database-url postgresql://postgres:temps@localhost:15432/temps
 
 # 4. Open http://localhost:8080 in your browser
 
@@ -46,6 +50,8 @@ temps serve --database-url postgresql://localhost/temps
 ```
 
 **That's it!** No configuration files, no Docker Compose, no Kubernetes manifests. Just point Temps at your Git repo and deploy.
+
+**Note:** TimescaleDB extension is required. If you have native PostgreSQL, you must install TimescaleDB separately (see [Installation](#installation) section below).
 
 ---
 
@@ -211,9 +217,8 @@ Temps is your **self-hosted deployment platform** that makes it effortless to de
 
 ### Prerequisites
 
-- **PostgreSQL 15+** with TimescaleDB extension
+- **Docker** (recommended for easiest setup) OR **PostgreSQL 15+** with TimescaleDB extension
 - **Linux AMD64** or **macOS** (ARM64 support coming soon)
-- **Docker** (optional, for container deployments)
 
 ### Installation
 
@@ -268,32 +273,83 @@ temps --version
 
 ### Database Setup
 
+**Option 1: Docker (Recommended - Easiest)**
+
 ```bash
-# Install PostgreSQL 15+ and TimescaleDB
+# Start PostgreSQL with TimescaleDB on port 15432 (avoids conflicts)
+docker run -d \
+  --name temps-postgres \
+  -e POSTGRES_PASSWORD=temps \
+  -e POSTGRES_DB=temps \
+  -p 15432:5432 \
+  timescale/timescaledb-ha:pg16
+
+# Verify it's running
+docker ps | grep temps-postgres
+```
+
+**Option 2: Native Installation (Requires TimescaleDB)**
+
+⚠️ **Important:** You cannot just install regular PostgreSQL. TimescaleDB must be installed separately.
+
+```bash
 # Ubuntu/Debian:
-sudo apt-get install postgresql-15 timescaledb-postgresql-15
+# 1. Add PostgreSQL repository
+sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+
+# 2. Add TimescaleDB repository
+sudo sh -c "echo 'deb https://packagecloud.io/timescale/timescaledb/ubuntu/ $(lsb_release -c -s) main' > /etc/apt/sources.list.d/timescaledb.list"
+wget --quiet -O - https://packagecloud.io/timescale/timescaledb/gpgkey | sudo apt-key add -
+
+# 3. Install both PostgreSQL and TimescaleDB
+sudo apt-get update
+sudo apt-get install -y postgresql-15 timescaledb-postgresql-15
+
+# 4. Configure TimescaleDB
+sudo timescaledb-tune --quiet --yes
+
+# 5. Restart PostgreSQL
+sudo systemctl restart postgresql
+
+# 6. Create database and enable extension
+sudo -u postgres createdb temps
+sudo -u postgres psql temps -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
 
 # macOS with Homebrew:
-brew install postgresql@15 timescaledb
+# 1. Install PostgreSQL and TimescaleDB
+brew install postgresql@15
+brew install timescaledb
 
-# Create database
+# 2. Follow the post-install instructions to configure TimescaleDB
+timescaledb-tune --quiet --yes
+
+# 3. Restart PostgreSQL
+brew services restart postgresql@15
+
+# 4. Create database and enable extension
 createdb temps
-
-# Enable TimescaleDB extension
 psql temps -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
 ```
+
+**Not seeing TimescaleDB?** It won't appear as a simple PostgreSQL extension. You must install the TimescaleDB package for your PostgreSQL version. See [TimescaleDB installation docs](https://docs.timescale.com/self-hosted/latest/install/) for detailed instructions.
 
 ### Running Temps
 
 ```bash
-# Start the server
+# If using Docker database (port 15432):
+temps serve \
+  --address 0.0.0.0:8080 \
+  --database-url postgresql://postgres:temps@localhost:15432/temps
+
+# If using native PostgreSQL (port 5432):
 temps serve \
   --address 0.0.0.0:8080 \
   --database-url postgresql://postgres:password@localhost:5432/temps
 
-# Or use environment variables
+# Or use environment variables:
 export TEMPS_ADDRESS=0.0.0.0:8080
-export TEMPS_DATABASE_URL=postgresql://postgres:password@localhost:5432/temps
+export TEMPS_DATABASE_URL=postgresql://postgres:temps@localhost:15432/temps
 temps serve
 ```
 
@@ -952,14 +1008,46 @@ Detailed development guidelines are in [CLAUDE.md](CLAUDE.md), including:
 
 **Database Connection Error**
 ```bash
-# Ensure PostgreSQL is running
+# If using Docker:
+docker ps | grep temps-postgres  # Ensure container is running
+docker logs temps-postgres       # Check for errors
+
+# If using native PostgreSQL:
 sudo systemctl status postgresql
+psql postgresql://postgres:temps@localhost:15432/temps  # Test connection
+```
 
-# Test connection
-psql postgresql://user:pass@localhost:5432/temps
+**TimescaleDB Extension Not Found**
+```bash
+# This error means TimescaleDB is not installed!
+# Error: "extension "timescaledb" is not available"
 
-# Check TimescaleDB extension
+# Solution: Use Docker (easiest)
+docker run -d --name temps-postgres \
+  -e POSTGRES_PASSWORD=temps -e POSTGRES_DB=temps \
+  -p 15432:5432 timescale/timescaledb-ha:pg16
+
+# OR install TimescaleDB package for your PostgreSQL version
+# See: https://docs.timescale.com/self-hosted/latest/install/
+
+# Verify TimescaleDB is installed:
 psql temps -c "SELECT * FROM pg_extension WHERE extname = 'timescaledb';"
+# Should return one row if installed correctly
+```
+
+**Docker PostgreSQL Won't Start**
+```bash
+# Check if port 15432 is already in use
+lsof -i :15432
+
+# Check container logs
+docker logs temps-postgres
+
+# Remove and recreate container
+docker rm -f temps-postgres
+docker run -d --name temps-postgres \
+  -e POSTGRES_PASSWORD=temps -e POSTGRES_DB=temps \
+  -p 15432:5432 timescale/timescaledb-ha:pg16
 ```
 
 **Web UI Not Loading**
