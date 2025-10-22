@@ -22,6 +22,18 @@ Temps is your **self-hosted deployment platform** that makes it effortless to de
 
 **Deploy once, monitor forever** - with built-in analytics, error tracking, session replay, uptime monitoring, and performance insights that would normally require 5+ separate SaaS subscriptions.
 
+### What Can You Deploy?
+
+| Application Type | Examples | Temps Support |
+|-----------------|----------|---------------|
+| **Frontend Apps** | React, Next.js, Vue, Svelte, Angular | ✅ Zero-config |
+| **Backend APIs** | Node.js, Python, Go, Rust, Ruby, PHP | ✅ Auto-detected |
+| **Static Sites** | Hugo, Jekyll, Gatsby, plain HTML | ✅ Served with nginx |
+| **Full-Stack** | Next.js, Nuxt, SvelteKit, Remix | ✅ SSR supported |
+| **Databases** | PostgreSQL, Redis | ✅ Managed services |
+| **CMS** | WordPress, Strapi, Ghost | ✅ One-click deploy |
+| **Custom Apps** | Anything with a Dockerfile | ✅ Full Docker support |
+
 ### Why Temps?
 
 - **🚀 Deploy Anything**: React, Next.js, Vue, Python, Node.js, Go, Rust, static sites - if it runs in Docker, Temps can deploy it
@@ -30,6 +42,46 @@ Temps is your **self-hosted deployment platform** that makes it effortless to de
 - **📊 All-in-One Observability**: Analytics, error tracking (Sentry-compatible), session replay, uptime monitoring, and performance metrics built-in
 - **🔐 Production-Grade**: Automatic TLS/ACME certificates, managed databases (PostgreSQL, Redis), S3 storage, and enterprise security
 - **💰 Zero SaaS Costs**: Replace Vercel + Sentry + Datadog + Logtail and save thousands per month
+
+### Temps vs. Others
+
+| Feature | Temps | Vercel/Netlify | Heroku | AWS/GCP | Self-Hosted Docker |
+|---------|-------|----------------|--------|---------|-------------------|
+| **Deploy Any App** | ✅ All languages | ⚠️ JS-focused | ✅ Yes | ✅ Yes | ✅ Yes |
+| **Zero Config** | ✅ Auto-detect | ✅ Yes | ⚠️ Limited | ❌ Manual | ❌ Manual |
+| **Built-in Analytics** | ✅ Included | ❌ Extra cost | ❌ No | ❌ Extra cost | ❌ No |
+| **Error Tracking** | ✅ Sentry-compatible | ❌ Extra cost | ❌ No | ❌ Extra cost | ❌ No |
+| **Session Replay** | ✅ Included | ❌ Extra cost | ❌ No | ❌ Extra cost | ❌ No |
+| **Self-Hosted** | ✅ Your servers | ❌ SaaS only | ❌ SaaS only | ⚠️ Complex | ✅ Yes |
+| **Cost** | 💰 Server only | 💰💰💰 Per-user/usage | 💰💰 Per-dyno | 💰💰💰 Complex | 💰 Server + time |
+| **Data Privacy** | ✅ Full control | ❌ Third-party | ❌ Third-party | ⚠️ Your cloud | ✅ Full control |
+| **Custom Domains** | ✅ Unlimited | 💰 Paid plans | ✅ Yes | ✅ Yes | ✅ Yes |
+| **Managed Databases** | ✅ Included | ❌ Extra cost | ✅ Add-ons | ✅ Yes | ❌ DIY |
+
+**Cost Example:** Running 5 apps with analytics, error tracking, and monitoring:
+- **Temps**: ~$50/month (VPS + storage)
+- **Vercel + Sentry + Analytics**: ~$500+/month
+- **AWS + third-party tools**: ~$800+/month
+
+### Deploy Your First App in 60 Seconds
+
+```bash
+# 1. Start Temps (one-time setup)
+temps serve --database-url postgresql://localhost/temps
+
+# 2. Open http://localhost:8080
+
+# 3. Connect GitHub/GitLab
+
+# 4. Select repository → Click "Deploy"
+
+# 5. Done! Your app is live with:
+#    ✅ HTTPS (automatic TLS)
+#    ✅ Analytics
+#    ✅ Error tracking
+#    ✅ Monitoring
+#    ✅ Live logs
+```
 
 ---
 
@@ -56,6 +108,24 @@ Temps is your **self-hosted deployment platform** that makes it effortless to de
 - ✅ .NET (ASP.NET Core)
 
 #### **How Deployment Works**
+
+```
+┌─────────────┐      ┌──────────────┐      ┌─────────────┐      ┌──────────────┐
+│  Git Push   │─────▶│ Auto-Detect  │─────▶│ Build       │─────▶│ Deploy       │
+│  (GitHub/   │      │ Framework    │      │ Container   │      │ with TLS     │
+│   GitLab)   │      │              │      │             │      │              │
+└─────────────┘      └──────────────┘      └─────────────┘      └──────────────┘
+                             │                                            │
+                             ▼                                            ▼
+                     ┌──────────────┐                            ┌──────────────┐
+                     │   Next.js    │                            │  Analytics   │
+                     │   Vite       │                            │  Monitoring  │
+                     │   Python     │                            │  Logs        │
+                     │   Custom     │                            │  Errors      │
+                     └──────────────┘                            └──────────────┘
+```
+
+**Deployment is a 5-step process:**
 1. **Connect Git Repository**: Link your GitHub or GitLab repo
 2. **Auto-Detection**: Temps detects your stack and builds automatically
 3. **Containerization**: Creates optimized Docker containers

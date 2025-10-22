@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   timescaledb:
-    image: timescale/timescaledb-ha:pg17
+    image: timescale/timescaledb:latest-pg17
     restart: always
     ports:
       - "5432:5432"

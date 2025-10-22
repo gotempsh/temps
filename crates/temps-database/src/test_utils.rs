@@ -39,7 +39,7 @@ impl SharedContainer {
         let password = "test_password";
 
         // Start TimescaleDB container
-        let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg17")
+        let postgres_container = GenericImage::new("timescale/timescaledb", "latest-pg17")
             .with_env_var("POSTGRES_DB", db_name)
             .with_env_var("POSTGRES_USER", username)
             .with_env_var("POSTGRES_PASSWORD", password)
@@ -229,7 +229,7 @@ impl TestDatabase {
         password: &str,
     ) -> anyhow::Result<Self> {
         // Start TimescaleDB container
-        let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg17")
+        let postgres_container = GenericImage::new("timescale/timescaledb", "latest-pg17")
             .with_env_var("POSTGRES_DB", db_name)
             .with_env_var("POSTGRES_USER", username)
             .with_env_var("POSTGRES_PASSWORD", password)

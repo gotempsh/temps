@@ -1362,7 +1362,7 @@ mod tests {
         };
 
         // Use TimescaleDB with pgvector support
-        let postgres_image = GenericImage::new("timescale/timescaledb-ha", "pg16")
+        let postgres_image = GenericImage::new("timescale/timescaledb", "latest-pg17")
             .with_exposed_port(ContainerPort::Tcp(5432))
             .with_wait_for(WaitFor::message_on_stderr(
                 "database system is ready to accept connections",
@@ -1752,7 +1752,7 @@ mod tests {
         };
 
         // Setup PostgreSQL test container with TimescaleDB
-        let postgres_image = GenericImage::new("timescale/timescaledb-ha", "pg16")
+        let postgres_image = GenericImage::new("timescale/timescaledb", "latest-pg17")
             .with_exposed_port(ContainerPort::Tcp(5432))
             .with_wait_for(WaitFor::message_on_stderr(
                 "database system is ready to accept connections",

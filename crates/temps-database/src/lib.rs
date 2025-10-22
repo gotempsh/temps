@@ -17,7 +17,7 @@ mod tests {
     #[tokio::test]
     async fn test_establish_connection() -> anyhow::Result<()> {
         // Start TimescaleDB container
-        let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg17")
+        let postgres_container = GenericImage::new("timescale/timescaledb", "latest-pg17")
             .with_env_var("POSTGRES_DB", "postgres")
             .with_env_var("POSTGRES_USER", "postgres")
             .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -64,7 +64,7 @@ mod tests {
     #[tokio::test]
     async fn test_establish_connection_with_migrations() -> anyhow::Result<()> {
         // Start TimescaleDB container
-        let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg17")
+        let postgres_container = GenericImage::new("timescale/timescaledb", "latest-pg17")
             .with_env_var("POSTGRES_DB", "postgres")
             .with_env_var("POSTGRES_USER", "postgres")
             .with_env_var("POSTGRES_PASSWORD", "postgres")
