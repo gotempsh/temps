@@ -1,7 +1,7 @@
 use super::types::AppState;
 use crate::services::service::{
     GroupBy, GroupedPageMetric, GroupedPageMetricsResponse, MetricsOverTimeResponse,
-    PerformanceMetricsResponse,
+    PerformanceMetricsResponse, RecordPerformanceMetricsConfig, UpdatePerformanceMetricsConfig,
 };
 use axum::http::header::HeaderMap;
 use axum::Extension;
@@ -387,29 +387,29 @@ pub async fn record_speed_metrics(
 
     match state
         .performance_service
-        .record_performance_metrics(
+        .record_performance_metrics(RecordPerformanceMetricsConfig {
             project_id,
             environment_id,
             deployment_id,
-            metadata.session_id_cookie,
-            metadata.visitor_id_cookie,
+            session_id: metadata.session_id_cookie,
+            visitor_id: metadata.visitor_id_cookie,
             ip_address_id,
-            payload.ttfb,
-            payload.lcp,
-            payload.fid,
-            payload.fcp,
-            payload.cls,
-            payload.inp,
-            payload.pathname,
-            payload.query,
-            Some(host),
+            ttfb: payload.ttfb,
+            lcp: payload.lcp,
+            fid: payload.fid,
+            fcp: payload.fcp,
+            cls: payload.cls,
+            inp: payload.inp,
+            pathname: payload.pathname,
+            query: payload.query,
+            host: Some(host),
             user_agent,
-            payload.screen_width,
-            payload.screen_height,
-            payload.viewport_width,
-            payload.viewport_height,
-            payload.language,
-        )
+            screen_width: payload.screen_width,
+            screen_height: payload.screen_height,
+            viewport_width: payload.viewport_width,
+            viewport_height: payload.viewport_height,
+            language: payload.language,
+        })
         .await
     {
         Ok(_) => StatusCode::OK.into_response(),
@@ -503,15 +503,15 @@ pub async fn update_speed_metrics(
 
     match state
         .performance_service
-        .update_performance_metrics(
+        .update_performance_metrics(UpdatePerformanceMetricsConfig {
             project_id,
             environment_id,
             deployment_id,
-            metadata.session_id_cookie,
-            metadata.visitor_id_cookie,
-            payload.cls,
-            payload.inp,
-        )
+            session_id: metadata.session_id_cookie,
+            visitor_id: metadata.visitor_id_cookie,
+            cls: payload.cls,
+            inp: payload.inp,
+        })
         .await
     {
         Ok(_) => StatusCode::OK.into_response(),

@@ -45,14 +45,14 @@ pub enum GitProviderType {
     Generic,
 }
 
-impl ToString for GitProviderType {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for GitProviderType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GitProviderType::GitHub => "github".to_string(),
-            GitProviderType::GitLab => "gitlab".to_string(),
-            GitProviderType::Bitbucket => "bitbucket".to_string(),
-            GitProviderType::Gitea => "gitea".to_string(),
-            GitProviderType::Generic => "generic".to_string(),
+            GitProviderType::GitHub => write!(f, "github"),
+            GitProviderType::GitLab => write!(f, "gitlab"),
+            GitProviderType::Bitbucket => write!(f, "bitbucket"),
+            GitProviderType::Gitea => write!(f, "gitea"),
+            GitProviderType::Generic => write!(f, "generic"),
         }
     }
 }

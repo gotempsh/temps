@@ -251,8 +251,9 @@ pub fn setup_proxy_server(
         info!("TLS server will listen on {}", tls_addr);
     }
 
-    let mut run_args = RunArgs::default();
-    run_args.shutdown_signal = Box::new(ShutdownSignalBridge::new(shutdown_signal));
+    let run_args = RunArgs {
+        shutdown_signal: Box::new(ShutdownSignalBridge::new(shutdown_signal)),
+    };
     server.run(run_args);
 
     Ok(())

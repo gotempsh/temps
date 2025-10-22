@@ -21,16 +21,7 @@ impl Preset for DockerCustomPreset {
         "/images/presets/docker.svg".to_string()
     }
 
-    fn dockerfile(
-        &self,
-        _root_local_path: &Path,
-        _local_path: &Path,
-        install_command: Option<&str>,
-        build_command: Option<&str>,
-        output_dir: Option<&str>,
-        build_vars: Option<&Vec<String>>,
-        project_slug: &str,
-    ) -> String {
+    fn dockerfile(&self, config: super::DockerfileConfig) -> String {
         let base_image = "alpine:latest";
 
         // Create the initial part of the Dockerfile
@@ -45,7 +36,7 @@ COPY . .
 "#, base_image);
 
         // Add build variables if present
-        if let Some(vars) = build_vars {
+        if let Some(vars) = config.build_vars {
             let build_vars_section = vars
                 .iter()
                 .map(|var| format!("ARG {}", var))
@@ -58,7 +49,7 @@ COPY . .
         }
 
         // Add the project slug as an ARG
-        dockerfile = format!("{}ARG PROJECT_SLUG={}\n", dockerfile, project_slug);
+        dockerfile = format!("{}ARG PROJECT_SLUG={}\n", dockerfile, config.project_slug);
 
         // Determine if we need to install any dependencies based on what files are present
         dockerfile = format!("{}
@@ -67,21 +58,21 @@ RUN apk add --no-cache nodejs npm git curl
 ", dockerfile);
 
         // Add the install command if provided
-        if let Some(cmd) = install_command {
+        if let Some(cmd) = config.install_command {
             dockerfile = format!("{}
 # Install dependencies
 RUN {}\n", dockerfile, cmd);
         }
 
         // Add the build command if provided
-        if let Some(cmd) = build_command {
+        if let Some(cmd) = config.build_command {
             dockerfile = format!("{}
 # Build the application
 RUN {}\n", dockerfile, cmd);
         }
 
         // Output directory handling
-        let app_dir = if let Some(dir) = output_dir {
+        let app_dir = if let Some(dir) = config.output_dir {
             format!("/app/{}", dir)
         } else {
             "/app".to_string()
@@ -117,15 +108,15 @@ CMD [\"nginx\", \"-g\", \"daemon off;\"]",
     fn dockerfile_with_build_dir(&self, local_path: &Path) -> String {
         // This method should return a Dockerfile that can be used with a build context directory
         // In this case, we'll use the same Dockerfile as the regular one
-        self.dockerfile(
-            Path::new(""),
+        self.dockerfile(super::DockerfileConfig {
+            root_local_path: Path::new(""),
             local_path,
-            None,
-            None,
-            None,
-            None,
-            "app",
-        )
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "app",
+        })
     }
 
     fn install_command(&self, _local_path: &Path) -> String {

@@ -256,6 +256,7 @@ impl TlsService {
     /// Check and automatically renew expiring certificates
     /// - HTTP-01 certificates: Auto-renew
     /// - DNS-01 certificates: Send notification for manual renewal
+    ///
     /// Threshold: 30 days before expiration
     pub async fn check_and_renew_certificates(
         &self,
@@ -749,8 +750,8 @@ mod tests {
     use super::*;
     use crate::tls::errors::ProviderError;
     use crate::tls::models::{
-        Certificate, CertificateFilter, CertificateStatus, ChallengeData,
-        ChallengeType, DnsChallengeData, ProvisioningResult, ValidationResult,
+        Certificate, CertificateFilter, CertificateStatus, ChallengeData, ChallengeType,
+        DnsChallengeData, ProvisioningResult, ValidationResult,
     };
     use crate::tls::providers::CertificateProvider;
     use crate::tls::repository::test_utils::MockCertificateRepository;
@@ -761,7 +762,6 @@ mod tests {
     #[tokio::test]
     async fn test_builder_pattern() {
         // Create mock components
-        let repo = Arc::new(MockCertificateRepository::new());
         let provider = Arc::new(MockCertificateProvider::new());
 
         // For now, we'll just test that the builder requires all components
@@ -776,8 +776,10 @@ mod tests {
     }
 
     // Mock implementations for testing
+    #[allow(dead_code)]
     struct MockJobQueue;
 
+    #[allow(dead_code)]
     impl MockJobQueue {
         fn new() -> Self {
             Self

@@ -21,23 +21,14 @@ impl Preset for DockerfilePreset {
         "https://example.com/docker-icon.png".to_string()
     }
 
-    fn dockerfile(
-        &self,
-        _root_local_path: &Path,
-        local_path: &Path,
-        _install_command: Option<&str>,
-        _build_command: Option<&str>,
-        _output_dir: Option<&str>,
-        build_vars: Option<&Vec<String>>,
-        _project_slug: &str,
-    ) -> String {
+    fn dockerfile(&self, config: super::DockerfileConfig) -> String {
         // Read the existing Dockerfile content
-        let dockerfile_path = local_path.join("Dockerfile");
+        let dockerfile_path = config.local_path.join("Dockerfile");
         let mut dockerfile = std::fs::read_to_string(&dockerfile_path)
             .unwrap_or_else(|_| "# No Dockerfile found".to_string());
 
         // Add build variables if present
-        if let Some(vars) = build_vars {
+        if let Some(vars) = config.build_vars {
             let build_vars_section = vars
                 .iter()
                 .map(|var| format!("ARG {}", var))

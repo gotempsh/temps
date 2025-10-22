@@ -10,7 +10,7 @@ use chrono::Utc;
 use futures::Stream;
 use std::path::PathBuf;
 use tokio::fs::{create_dir_all, File};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader, SeekFrom};
 use tokio::time::Duration;
 use tracing::{debug, trace};
 
@@ -59,14 +59,16 @@ impl LogService {
         log_path: &str,
         log_entry: &str,
     ) -> Result<(), std::io::Error> {
+        use tokio::io::AsyncWriteExt;
+
         let log_path = self.get_log_path(log_path);
-        tokio::fs::OpenOptions::new()
+        let mut file = tokio::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .open(log_path)
-            .await?
-            .write(log_entry.as_bytes())
             .await?;
+
+        file.write_all(log_entry.as_bytes()).await?;
         Ok(())
     }
 

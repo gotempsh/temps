@@ -25,11 +25,11 @@ pub enum ProjectType {
     Static,
 }
 
-impl ToString for ProjectType {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for ProjectType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProjectType::Server => "server".to_string(),
-            ProjectType::Static => "static".to_string(),
+            ProjectType::Server => write!(f, "server"),
+            ProjectType::Static => write!(f, "static"),
         }
     }
 }
@@ -84,20 +84,22 @@ impl PackageManager {
     }
 }
 
+/// Configuration parameters for generating a Dockerfile
+pub struct DockerfileConfig<'a> {
+    pub root_local_path: &'a Path,
+    pub local_path: &'a Path,
+    pub install_command: Option<&'a str>,
+    pub build_command: Option<&'a str>,
+    pub output_dir: Option<&'a str>,
+    pub build_vars: Option<&'a Vec<String>>,
+    pub project_slug: &'a str,
+}
+
 pub trait Preset: fmt::Display + Send + Sync {
     fn project_type(&self) -> ProjectType;
     fn label(&self) -> String;
     fn icon_url(&self) -> String;
-    fn dockerfile(
-        &self,
-        root_local_path: &Path,
-        local_path: &Path,
-        install_command: Option<&str>,
-        build_command: Option<&str>,
-        output_dir: Option<&str>,
-        build_vars: Option<&Vec<String>>,
-        project_slug: &str,
-    ) -> String;
+    fn dockerfile(&self, config: DockerfileConfig) -> String;
     fn dockerfile_with_build_dir(&self, local_path: &Path) -> String;
     fn install_command(&self, local_path: &Path) -> String {
         let build_system = BuildSystem::detect(local_path);
@@ -129,27 +131,30 @@ pub fn get_preset_by_slug(slug: &str) -> Option<Box<dyn Preset>> {
         .find(|preset| preset.slug() == slug)
 }
 
-// Add a function to create a custom preset
-pub fn create_custom_preset(
-    label: String,
-    icon_url: String,
-    project_type: ProjectType,
-    dockerfile: String,
-    slug: String,
-    install_command: String,
-    build_command: String,
-    dockerfile_with_build_dir: String,
-) -> Box<dyn Preset> {
-    Box::new(CustomPreset::new(
-        label,
-        icon_url,
-        project_type,
-        dockerfile,
-        dockerfile_with_build_dir,
-        slug,
-        install_command,
-        build_command,
-    ))
+/// Configuration for creating a custom preset
+pub struct CreateCustomPresetConfig {
+    pub label: String,
+    pub icon_url: String,
+    pub project_type: ProjectType,
+    pub dockerfile: String,
+    pub slug: String,
+    pub install_command: String,
+    pub build_command: String,
+    pub dockerfile_with_build_dir: String,
+}
+
+/// Create a custom preset with the given configuration
+pub fn create_custom_preset(config: CreateCustomPresetConfig) -> Box<dyn Preset> {
+    Box::new(CustomPreset::new(custom::CustomPresetConfig {
+        label: config.label,
+        icon_url: config.icon_url,
+        project_type: config.project_type,
+        dockerfile: config.dockerfile,
+        dockerfile_with_build_dir: config.dockerfile_with_build_dir,
+        slug: config.slug,
+        install_command: config.install_command,
+        build_command: config.build_command,
+    }))
 }
 
 pub fn detect_preset_from_files(files: &[String]) -> Option<Box<dyn Preset>> {
@@ -192,25 +197,28 @@ pub fn detect_preset_from_files(files: &[String]) -> Option<Box<dyn Preset>> {
         return Some(Box::new(Rsbuild));
     }
 
-    Some(create_custom_preset(
-        "Custom".to_string(),
-        "".to_string(),
-        ProjectType::Server,
-        "".to_string(),
-        "custom".to_string(),
-        "".to_string(),
-        "".to_string(),
-        "".to_string(),
-    ))
+    Some(create_custom_preset(CreateCustomPresetConfig {
+        label: "Custom".to_string(),
+        icon_url: "".to_string(),
+        project_type: ProjectType::Server,
+        dockerfile: "".to_string(),
+        slug: "custom".to_string(),
+        install_command: "".to_string(),
+        build_command: "".to_string(),
+        dockerfile_with_build_dir: "".to_string(),
+    }))
 }
 
 // Add this function to register the new docker_custom preset
 pub fn register_docker_custom_preset() -> custom::CustomPreset {
-    custom::CustomPreset::new(
-        "Docker Custom".to_string(),
-        "/images/presets/docker.svg".to_string(), // Adjust icon path as needed
-        ProjectType::Server,
-        r#"FROM alpine:latest
+    custom::CustomPreset::new(custom::CustomPresetConfig {
+        label: "Docker Custom".to_string(),
+        icon_url: "/images/presets/docker.svg".to_string(), // Adjust icon path as needed
+        project_type: ProjectType::Server,
+        slug: "docker_custom".to_string(),
+        install_command: "{{INSTALL_COMMAND}}".to_string(),
+        build_command: "{{BUILD_COMMAND}}".to_string(),
+        dockerfile: r#"FROM alpine:latest
 
 ARG PROJECT_SLUG
 ARG INSTALL_COMMAND
@@ -238,7 +246,7 @@ COPY nginx.conf /etc/nginx/nginx.conf
 EXPOSE 80
 
 CMD ["nginx", "-g", "daemon off;"]"#.to_string(),
-        r#"FROM alpine:latest
+        dockerfile_with_build_dir: r#"FROM alpine:latest
 
 ARG PROJECT_SLUG
 ARG INSTALL_COMMAND
@@ -266,8 +274,5 @@ COPY nginx.conf /etc/nginx/nginx.conf
 EXPOSE 80
 
 CMD ["nginx", "-g", "daemon off;"]"#.to_string(),
-        "docker_custom".to_string(),
-        "{{INSTALL_COMMAND}}".to_string(),
-        "{{BUILD_COMMAND}}".to_string()
-    )
+    })
 }

@@ -21,17 +21,8 @@ impl Preset for Docusaurus {
         "https://example.com/docusaurus-icon.png".to_string()
     }
 
-    fn dockerfile(
-        &self,
-        _root_local_path: &Path,
-        local_path: &Path,
-        install_command: Option<&str>,
-        build_command: Option<&str>,
-        _output_dir: Option<&str>,
-        build_vars: Option<&Vec<String>>,
-        _project_slug: &str,
-    ) -> String {
-        let pkg_manager = PackageManager::detect(local_path);
+    fn dockerfile(&self, config: super::DockerfileConfig) -> String {
+        let pkg_manager = PackageManager::detect(config.local_path);
 
         let lockfile = match pkg_manager {
             PackageManager::Bun => "COPY package.json bun.lock* ./",
@@ -55,11 +46,11 @@ RUN {}
 "#,
             pkg_manager.base_image(),
             lockfile,
-            install_command.unwrap_or(pkg_manager.install_command())
+            config.install_command.unwrap_or(pkg_manager.install_command())
         );
 
         // Add build variables if present
-        if let Some(vars) = build_vars {
+        if let Some(vars) = config.build_vars {
             for var in vars {
                 dockerfile.push_str(&format!("ARG {}\n", var));
             }
@@ -90,7 +81,7 @@ EXPOSE 3000
 
 CMD ["serve", "-s", "build", "-l", "3000"]
 "#,
-            build_command.unwrap_or(pkg_manager.build_command()),
+            config.build_command.unwrap_or(pkg_manager.build_command()),
             pkg_manager.base_image(),
             match pkg_manager {
                 PackageManager::Bun => "bun install -g serve",

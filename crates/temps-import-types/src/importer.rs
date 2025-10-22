@@ -53,9 +53,18 @@ impl ImportSource {
             ImportSource::Custom => "custom",
         }
     }
+}
 
-    /// Parse ImportSource from string
-    pub fn from_str(s: &str) -> Result<Self, crate::ImportError> {
+impl std::fmt::Display for ImportSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::str::FromStr for ImportSource {
+    type Err = crate::ImportError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "docker" => Ok(ImportSource::Docker),
             "coolify" => Ok(ImportSource::Coolify),
@@ -71,12 +80,6 @@ impl ImportSource {
                 s
             ))),
         }
-    }
-}
-
-impl std::fmt::Display for ImportSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
     }
 }
 

@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Integration test for WorkflowExecutionService
 //!
 //! This test demonstrates the complete workflow execution pipeline:
@@ -253,9 +254,17 @@ async fn test_workflow_execution_service_with_real_jobs() {
     // Create DSN service
     let dsn_service = Arc::new(temps_error_tracking::DSNService::new(db.clone()));
 
+    // Create encryption service for ExternalServiceManager
+    let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+        "test_password",
+    ));
+
     // Create ExternalServiceManager
-    let external_service_manager =
-        Arc::new(temps_providers::ExternalServiceManager::new(db.clone()));
+    let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
+        db.clone(),
+        encryption_service,
+        Arc::new(docker.clone()),
+    ));
 
     // Create jobs using WorkflowPlanner
     let workflow_planner = WorkflowPlanner::new(

@@ -1,6 +1,7 @@
 use sea_orm::{DeriveActiveEnum, EnumIter};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
+use std::str::FromStr;
 
 /// PipelineStatus enum for pipeline state tracking.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeriveActiveEnum, EnumIter)]
@@ -37,16 +38,20 @@ impl PipelineStatus {
             PipelineStatus::Built => "built",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for PipelineStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "running" => Some(PipelineStatus::Running),
-            "completed" => Some(PipelineStatus::Completed),
-            "failed" => Some(PipelineStatus::Failed),
-            "cancelled" => Some(PipelineStatus::Cancelled),
-            "pending" => Some(PipelineStatus::Pending),
-            "built" => Some(PipelineStatus::Built),
-            _ => None,
+            "running" => Ok(PipelineStatus::Running),
+            "completed" => Ok(PipelineStatus::Completed),
+            "failed" => Ok(PipelineStatus::Failed),
+            "cancelled" => Ok(PipelineStatus::Cancelled),
+            "pending" => Ok(PipelineStatus::Pending),
+            "built" => Ok(PipelineStatus::Built),
+            _ => Err(format!("Invalid PipelineStatus: {}", s)),
         }
     }
 }
@@ -75,12 +80,16 @@ impl ProjectType {
             ProjectType::Server => "server",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for ProjectType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "static" => Some(ProjectType::Static),
-            "server" => Some(ProjectType::Server),
-            _ => None,
+            "static" => Ok(ProjectType::Static),
+            "server" => Ok(ProjectType::Server),
+            _ => Err(format!("Invalid ProjectType: {}", s)),
         }
     }
 }
@@ -124,17 +133,21 @@ impl Framework {
             Framework::Unknown => "unknown",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for Framework {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "nextjs" => Some(Framework::NextJs),
-            "vite" => Some(Framework::Vite),
-            "rsbuild" => Some(Framework::Rsbuild),
-            "create-react-app" => Some(Framework::CreateReactApp),
-            "docusaurus" => Some(Framework::Docusaurus),
-            "dockerfile" => Some(Framework::Dockerfile),
-            "unknown" => Some(Framework::Unknown),
-            _ => None,
+            "nextjs" => Ok(Framework::NextJs),
+            "vite" => Ok(Framework::Vite),
+            "rsbuild" => Ok(Framework::Rsbuild),
+            "create-react-app" => Ok(Framework::CreateReactApp),
+            "docusaurus" => Ok(Framework::Docusaurus),
+            "dockerfile" => Ok(Framework::Dockerfile),
+            "unknown" => Ok(Framework::Unknown),
+            _ => Err(format!("Invalid Framework: {}", s)),
         }
     }
 }
@@ -177,17 +190,21 @@ impl JobStatus {
             JobStatus::Skipped => "skipped",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for JobStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "pending" => Some(JobStatus::Pending),
-            "waiting" => Some(JobStatus::Waiting),
-            "running" => Some(JobStatus::Running),
-            "success" => Some(JobStatus::Success),
-            "failure" => Some(JobStatus::Failure),
-            "cancelled" => Some(JobStatus::Cancelled),
-            "skipped" => Some(JobStatus::Skipped),
-            _ => None,
+            "pending" => Ok(JobStatus::Pending),
+            "waiting" => Ok(JobStatus::Waiting),
+            "running" => Ok(JobStatus::Running),
+            "success" => Ok(JobStatus::Success),
+            "failure" => Ok(JobStatus::Failure),
+            "cancelled" => Ok(JobStatus::Cancelled),
+            "skipped" => Ok(JobStatus::Skipped),
+            _ => Err(format!("Invalid JobStatus: {}", s)),
         }
     }
 }
@@ -216,12 +233,16 @@ impl RoleType {
             RoleType::User => "user",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for RoleType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "admin" => Some(RoleType::Admin),
-            "user" => Some(RoleType::User),
-            _ => None,
+            "admin" => Ok(RoleType::Admin),
+            "user" => Ok(RoleType::User),
+            _ => Err(format!("Invalid RoleType: {}", s)),
         }
     }
 }

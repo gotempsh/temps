@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Integration test for Node.js deployment through all three stages
 //!
 //! This test demonstrates the complete deployment pipeline with a real Node.js application:

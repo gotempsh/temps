@@ -21,17 +21,8 @@ impl Preset for CreateReactApp {
         "https://example.com/react-icon.png".to_string()
     }
 
-    fn dockerfile(
-        &self,
-        _root_local_path: &Path,
-        local_path: &Path,
-        install_command: Option<&str>,
-        build_command: Option<&str>,
-        _output_dir: Option<&str>,
-        build_vars: Option<&Vec<String>>,
-        project_slug: &str,
-    ) -> String {
-        let pkg_manager = self.package_manager(local_path);
+    fn dockerfile(&self, config: super::DockerfileConfig) -> String {
+        let pkg_manager = self.package_manager(config.local_path);
 
         let lockfile = match pkg_manager {
             PackageManager::Bun => "COPY package.json bun.lock* ./",
@@ -55,12 +46,12 @@ RUN --mount=type=cache,target=/app/node_modules,id=node_modules_{} {}
 "#,
             pkg_manager.base_image(),
             lockfile,
-            project_slug,
-            install_command.unwrap_or(&self.install_command(local_path))
+            config.project_slug,
+            config.install_command.unwrap_or(&self.install_command(config.local_path))
         );
 
         // Add build variables if present
-        if let Some(vars) = build_vars {
+        if let Some(vars) = config.build_vars {
             for var in vars {
                 dockerfile.push_str(&format!("ARG {}\n", var));
             }
@@ -90,7 +81,7 @@ EXPOSE 3000
 
 CMD ["serve", "-s", "build", "-l", "3000"]
 "#,
-            build_command.unwrap_or(&self.build_command(local_path)),
+            config.build_command.unwrap_or(&self.build_command(config.local_path)),
             pkg_manager.base_image(),
             match pkg_manager {
                 PackageManager::Bun => "bun install -g serve",

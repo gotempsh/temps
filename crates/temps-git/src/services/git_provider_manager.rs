@@ -547,6 +547,7 @@ impl GitProviderManager {
     }
 
     /// Create a new git provider configuration
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_provider(
         &self,
         name: String,
@@ -634,6 +635,7 @@ impl GitProviderManager {
     }
 
     /// Create a connection to a git provider for a user
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_connection(
         &self,
         provider_id: i32,
@@ -2671,15 +2673,13 @@ impl GitProviderManager {
         // Check each provider's auth config for matching app_id
         for provider in providers {
             if let Ok(auth_config) = self.decrypt_sensitive_data(&provider.auth_config).await {
-                if let Ok(auth_method) = serde_json::from_value::<AuthMethod>(auth_config) {
-                    if let AuthMethod::GitHubApp {
-                        app_id: provider_app_id,
-                        ..
-                    } = auth_method
-                    {
-                        if provider_app_id == app_id {
-                            return Ok(provider);
-                        }
+                if let Ok(AuthMethod::GitHubApp {
+                    app_id: provider_app_id,
+                    ..
+                }) = serde_json::from_value::<AuthMethod>(auth_config)
+                {
+                    if provider_app_id == app_id {
+                        return Ok(provider);
                     }
                 }
             }

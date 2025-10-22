@@ -664,11 +664,7 @@ impl DomainService {
         }
 
         // Allow wildcard domains
-        let domain_to_check = if domain.starts_with("*.") {
-            &domain[2..]
-        } else {
-            domain
-        };
+        let domain_to_check = domain.strip_prefix("*.").unwrap_or(domain);
 
         // Basic checks
         if domain_to_check.starts_with('.') || domain_to_check.ends_with('.') {

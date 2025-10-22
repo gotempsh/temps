@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use sea_orm::EntityTrait;
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use temps_core::{JobResult, TempsConfig, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
@@ -135,7 +135,7 @@ impl ConfigureCronsJob {
     /// Load and parse .temps.yaml configuration
     async fn load_temps_config(
         &self,
-        repo_dir: &PathBuf,
+        repo_dir: &Path,
         project: &projects::Model,
     ) -> Result<Option<TempsConfig>, WorkflowError> {
         let project_dir = repo_dir.join(&project.directory);
@@ -379,7 +379,6 @@ impl Default for ConfigureCronsJobBuilder {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    
 
     // Mock CronConfigService for testing
     struct MockCronConfigService {

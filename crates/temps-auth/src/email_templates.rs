@@ -163,7 +163,7 @@ mod tests {
 
         async fn send_notification(
             &self,
-            notification: temps_core::notifications::NotificationData,
+            _notification: temps_core::notifications::NotificationData,
         ) -> Result<(), NotificationError> {
             Ok(())
         }

@@ -250,6 +250,7 @@ impl ErrorIngestionService {
         #[derive(Debug, FromQueryResult)]
         struct SimilarGroup {
             id: i32,
+            #[allow(dead_code)]
             distance: f32,
         }
 

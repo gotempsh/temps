@@ -2,6 +2,19 @@ use super::{Preset, ProjectType};
 use std::fmt;
 use std::path::Path;
 
+/// Configuration for creating a custom preset
+#[derive(Clone)]
+pub struct CustomPresetConfig {
+    pub label: String,
+    pub icon_url: String,
+    pub project_type: ProjectType,
+    pub dockerfile: String,
+    pub dockerfile_with_build_dir: String,
+    pub slug: String,
+    pub install_command: String,
+    pub build_command: String,
+}
+
 #[derive(Clone)]
 pub struct CustomPreset {
     label: String,
@@ -17,25 +30,16 @@ pub struct CustomPreset {
 }
 
 impl CustomPreset {
-    pub fn new(
-        label: String,
-        icon_url: String,
-        project_type: ProjectType,
-        dockerfile: String,
-        dockerfile_with_build_dir: String,
-        slug: String,
-        install_command: String,
-        build_command: String,
-    ) -> Self {
+    pub fn new(config: CustomPresetConfig) -> Self {
         Self {
-            label,
-            icon_url,
-            project_type,
-            dockerfile,
-            dockerfile_with_build_dir,
-            slug,
-            install_command,
-            build_command,
+            label: config.label,
+            icon_url: config.icon_url,
+            project_type: config.project_type,
+            dockerfile: config.dockerfile,
+            dockerfile_with_build_dir: config.dockerfile_with_build_dir,
+            slug: config.slug,
+            install_command: config.install_command,
+            build_command: config.build_command,
             output_dir: None,
             dirs_to_upload: vec![".".to_string()],
         }
@@ -69,20 +73,11 @@ impl Preset for CustomPreset {
         self.icon_url.clone()
     }
 
-    fn dockerfile(
-        &self,
-        _root_local_path: &Path,
-        _local_path: &Path,
-        install_command: Option<&str>,
-        build_command: Option<&str>,
-        output_dir: Option<&str>,
-        build_vars: Option<&Vec<String>>,
-        _project_slug: &str,
-    ) -> String {
+    fn dockerfile(&self, config: super::DockerfileConfig) -> String {
         let mut dockerfile = self.dockerfile.clone();
 
         // Add build variables if present
-        if let Some(vars) = build_vars {
+        if let Some(vars) = config.build_vars {
             let build_vars_section = vars
                 .iter()
                 .map(|var| format!("ARG {}", var))
@@ -92,13 +87,13 @@ impl Preset for CustomPreset {
         }
 
         // Replace placeholders if they exist
-        if let Some(cmd) = install_command {
+        if let Some(cmd) = config.install_command {
             dockerfile = dockerfile.replace("{{INSTALL_COMMAND}}", cmd);
         }
-        if let Some(cmd) = build_command {
+        if let Some(cmd) = config.build_command {
             dockerfile = dockerfile.replace("{{BUILD_COMMAND}}", cmd);
         }
-        if let Some(dir) = output_dir {
+        if let Some(dir) = config.output_dir {
             dockerfile = dockerfile.replace("{{OUTPUT_DIR}}", dir);
         }
 

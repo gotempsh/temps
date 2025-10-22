@@ -194,18 +194,18 @@ mod tests {
     #[test]
     fn test_dockerfile_generation() {
         let temp_dir = create_test_dir_with_files(&["package.json"]);
-        let path = temp_dir.path().to_path_buf();
+        let path = temp_dir.path();
 
         if let Some(preset) = get_preset_by_slug("nextjs") {
-            let dockerfile = preset.dockerfile(
-                &path,
-                &path,
-                Some("npm install"),
-                Some("npm run build"),
-                Some("dist"),
-                None,
-                "test-project",
-            );
+            let dockerfile = preset.dockerfile(DockerfileConfig {
+                root_local_path: path,
+                local_path: path,
+                install_command: Some("npm install"),
+                build_command: Some("npm run build"),
+                output_dir: Some("dist"),
+                build_vars: None,
+                project_slug: "test-project",
+            });
 
             // Basic checks that dockerfile contains expected content
             assert!(dockerfile.contains("FROM"));
@@ -218,16 +218,16 @@ mod tests {
 
     #[test]
     fn test_create_custom_preset() {
-        let custom_preset = create_custom_preset(
-            "My Custom".to_string(),
-            "https://example.com/icon.png".to_string(),
-            ProjectType::Server,
-            "FROM alpine\nRUN echo 'hello'".to_string(),
-            "custom-test".to_string(),
-            "make install".to_string(),
-            "make build".to_string(),
-            "FROM alpine\nWORKDIR /app".to_string(),
-        );
+        let custom_preset = create_custom_preset(CreateCustomPresetConfig {
+            label: "My Custom".to_string(),
+            icon_url: "https://example.com/icon.png".to_string(),
+            project_type: ProjectType::Server,
+            dockerfile: "FROM alpine\nRUN echo 'hello'".to_string(),
+            slug: "custom-test".to_string(),
+            install_command: "make install".to_string(),
+            build_command: "make build".to_string(),
+            dockerfile_with_build_dir: "FROM alpine\nWORKDIR /app".to_string(),
+        });
 
         assert_eq!(custom_preset.slug(), "custom-test");
         assert_eq!(custom_preset.label(), "My Custom");

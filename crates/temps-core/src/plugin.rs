@@ -108,6 +108,17 @@ impl MiddlewareCondition {
     }
 }
 
+/// Type alias for middleware handler function
+pub type MiddlewareHandler = Arc<
+    dyn Fn(
+            Request,
+            Next,
+        )
+            -> Pin<Box<dyn Future<Output = Result<Response, axum::http::StatusCode>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Plugin middleware definition
 pub struct PluginMiddleware {
     /// Unique name for this middleware
@@ -119,15 +130,7 @@ pub struct PluginMiddleware {
     /// Condition for when to execute
     pub condition: MiddlewareCondition,
     /// The actual middleware function
-    pub handler: Arc<
-        dyn Fn(
-                Request,
-                Next,
-            )
-                -> Pin<Box<dyn Future<Output = Result<Response, axum::http::StatusCode>> + Send>>
-            + Send
-            + Sync,
-    >,
+    pub handler: MiddlewareHandler,
 }
 
 impl std::fmt::Debug for PluginMiddleware {

@@ -410,9 +410,8 @@ impl GitService {
             revwalk.set_sorting(git2::Sort::TIME)?;
 
             let mut commits = Vec::new();
-            let mut count = 0;
 
-            for oid_result in revwalk {
+            for (count, oid_result) in revwalk.enumerate() {
                 if count >= limit {
                     break;
                 }
@@ -439,8 +438,6 @@ impl GitService {
                     author_email,
                     date,
                 });
-
-                count += 1;
             }
 
             Ok(commits)

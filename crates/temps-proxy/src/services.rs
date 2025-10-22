@@ -683,7 +683,7 @@ impl SessionManager for SessionManagerImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{deployments, environments, projects, request_logs, visitor};
 

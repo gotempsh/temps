@@ -94,18 +94,21 @@ impl CtrlCShutdownSignal {
     async fn cleanup_database(&self) {
         debug!("Cleaning up database connections...");
 
-        // Clone the Arc to get ownership for closing
-        // Note: This will only close this reference; other references may still exist
-        let db = Arc::try_unwrap(Arc::clone(&self.db)).unwrap_or_else(|arc| {
-            debug!("Database still has other references, cannot close directly");
-            (*arc).clone() // Get a clone if we can't unwrap
-        });
-
-        // Close the database connection gracefully
-        if let Err(e) = db.close().await {
-            warn!("Error closing database connection: {}", e);
-        } else {
-            debug!("Database connection closed successfully");
+        // Try to unwrap the Arc to get ownership for closing
+        // Note: If there are other references, we can't close it directly
+        match Arc::try_unwrap(Arc::clone(&self.db)) {
+            Ok(db) => {
+                // We got exclusive ownership, close the connection
+                if let Err(e) = db.close().await {
+                    warn!("Error closing database connection: {}", e);
+                } else {
+                    debug!("Database connection closed successfully");
+                }
+            }
+            Err(_arc) => {
+                // Other references still exist, cannot close
+                debug!("Database still has other references, skipping close");
+            }
         }
 
         debug!("Database cleanup completed");

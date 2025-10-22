@@ -527,6 +527,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     async fn setup_test_data(db: &DbConnection) -> Result<(i32, i32), Box<dyn std::error::Error>> {
         // Create test project
         let project = temps_entities::projects::ActiveModel {

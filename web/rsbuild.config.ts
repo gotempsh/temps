@@ -21,6 +21,12 @@ export default defineConfig({
 		},
 	},
 	output: {
+		// Allow custom output path from environment variable (used by Rust build.rs)
+		...(process.env.RSBUILD_OUTPUT_PATH && {
+			distPath: {
+				root: process.env.RSBUILD_OUTPUT_PATH,
+			},
+		}),
 		// Add contenthash to filenames for cache busting
 		filename: {
 			js: '[name].[contenthash:8].js',

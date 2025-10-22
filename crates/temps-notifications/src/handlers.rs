@@ -1047,13 +1047,15 @@ mod tests {
     use std::sync::Arc;
     use temps_database::test_utils::TestDatabase;
     use testcontainers::{core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage};
-    
+
     use tower::ServiceExt;
 
     struct TestSetup {
         pub test_db: TestDatabase,
+        #[allow(dead_code)]
         pub mailpit_container: ContainerAsync<GenericImage>,
         pub mailpit_smtp_port: u16,
+        #[allow(dead_code)]
         pub mailpit_web_port: u16,
         pub notification_state: Arc<NotificationState>,
     }

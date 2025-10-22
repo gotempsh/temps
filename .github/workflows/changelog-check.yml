@@ -1,0 +1,112 @@
+name: Changelog Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    branches:
+      - main
+
+jobs:
+  check-changelog:
+    name: Check Changelog Updated
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history to check diff
+
+      - name: Check if changelog was updated
+        id: changelog_check
+        run: |
+          # Skip check if PR has 'skip-changelog' label
+          if echo '${{ toJson(github.event.pull_request.labels.*.name) }}' | grep -q 'skip-changelog'; then
+            echo "Skipping changelog check (skip-changelog label present)"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Check if CHANGELOG.md was modified
+          git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -q "^CHANGELOG.md$"
+          if [ $? -eq 0 ]; then
+            echo "✅ CHANGELOG.md was updated"
+            echo "updated=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ CHANGELOG.md was not updated"
+            echo "updated=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Verify Unreleased section exists
+        if: steps.changelog_check.outputs.updated == 'true' && steps.changelog_check.outputs.skip != 'true'
+        run: |
+          if ! grep -q "## \[Unreleased\]" CHANGELOG.md; then
+            echo "❌ CHANGELOG.md is missing [Unreleased] section"
+            echo ""
+            echo "Please ensure CHANGELOG.md has an [Unreleased] section with your changes."
+            exit 1
+          fi
+          echo "✅ [Unreleased] section found"
+
+      - name: Verify changelog format
+        if: steps.changelog_check.outputs.updated == 'true' && steps.changelog_check.outputs.skip != 'true'
+        run: |
+          # Check for at least one category under Unreleased
+          if ! grep -A 20 "## \[Unreleased\]" CHANGELOG.md | grep -q "^### \(Added\|Changed\|Deprecated\|Removed\|Fixed\|Security\)"; then
+            echo "❌ CHANGELOG.md [Unreleased] section has no entries"
+            echo ""
+            echo "Please add your changes under one of these categories:"
+            echo "  ### Added - for new features"
+            echo "  ### Changed - for changes in existing functionality"
+            echo "  ### Deprecated - for soon-to-be removed features"
+            echo "  ### Removed - for now removed features"
+            echo "  ### Fixed - for any bug fixes"
+            echo "  ### Security - for security fixes"
+            exit 1
+          fi
+          echo "✅ Changelog format is valid"
+
+      - name: Post comment on PR
+        if: steps.changelog_check.outputs.updated == 'false' && steps.changelog_check.outputs.skip != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## ⚠️ Changelog Not Updated
+
+              This PR doesn't include updates to \`CHANGELOG.md\`.
+
+              ### What to do:
+
+              1. **Add your changes to CHANGELOG.md**:
+                 \`\`\`markdown
+                 ## [Unreleased]
+
+                 ### Added
+                 - Your new feature or addition
+
+                 ### Changed
+                 - Your modifications to existing functionality
+
+                 ### Fixed
+                 - Your bug fixes
+                 \`\`\`
+
+              2. **Or skip this check** by adding the \`skip-changelog\` label if:
+                 - This is a documentation-only change
+                 - This is a CI/build configuration change
+                 - This is a dependency update with no user-facing changes
+
+              See [Keep a Changelog](https://keepachangelog.com/) for format guidelines.`
+            })
+
+      - name: Fail if changelog not updated
+        if: steps.changelog_check.outputs.updated == 'false' && steps.changelog_check.outputs.skip != 'true'
+        run: |
+          echo "❌ CHANGELOG.md must be updated for this PR"
+          echo ""
+          echo "Add your changes to CHANGELOG.md under the [Unreleased] section, or"
+          echo "add the 'skip-changelog' label if this PR doesn't need changelog entry."
+          exit 1

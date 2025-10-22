@@ -802,8 +802,6 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 mod tests {
     use super::*;
     use crate::services::service::VisitorInfo;
-    
-    
 
     #[tokio::test]
     async fn test_session_replay_dto_conversion() {

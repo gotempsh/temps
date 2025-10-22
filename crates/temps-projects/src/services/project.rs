@@ -653,6 +653,7 @@ impl ProjectService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_project_settings(
         &self,
         project_id: i32,
@@ -859,6 +860,7 @@ impl ProjectService {
         Ok(Self::map_db_project_to_project(updated_project))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_git_settings(
         &self,
         project_id: i32,

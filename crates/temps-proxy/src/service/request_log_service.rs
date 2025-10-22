@@ -104,6 +104,7 @@ impl RequestLogService {
     }
 
     /// Get request logs with optional filters
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_logs(
         &self,
         project_id: Option<i32>,

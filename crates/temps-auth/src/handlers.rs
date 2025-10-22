@@ -21,6 +21,7 @@ use cookie::Cookie;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 pub use temps_core::AuditContext;
 use temps_core::RequestMetadata;
@@ -1074,8 +1075,8 @@ async fn assign_role(
 
     // Verify role type is valid
     let role_type = match RoleType::from_str(&assign_req.role_type) {
-        Some(rt) => rt,
-        None => {
+        Ok(rt) => rt,
+        Err(_) => {
             error!("Invalid role type: {}", assign_req.role_type);
             return Err(temps_core::error_builder::bad_request()
                 .detail(format!("Invalid role type: {}", assign_req.role_type))
@@ -1151,7 +1152,7 @@ async fn create_user(
     let roles: Vec<RoleType> = create_req
         .roles
         .iter()
-        .filter_map(|r| RoleType::from_str(r))
+        .filter_map(|r| RoleType::from_str(r).ok())
         .collect();
 
     let user = app_state
@@ -1317,8 +1318,8 @@ async fn remove_role(
 
     // Verify role type is valid
     let role_type = match RoleType::from_str(&role_type) {
-        Some(rt) => rt,
-        None => {
+        Ok(rt) => rt,
+        Err(_) => {
             error!("Invalid role type: {}", role_type);
             return Err(temps_core::error_builder::bad_request()
                 .detail(format!("Invalid role type: {}", role_type))

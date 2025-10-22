@@ -58,13 +58,13 @@ impl MonorepoTool {
     }
 }
 
-impl ToString for MonorepoTool {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for MonorepoTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MonorepoTool::Lerna => "lerna".to_string(),
-            MonorepoTool::Turbo => "turbo".to_string(),
-            MonorepoTool::Nx => "nx".to_string(),
-            MonorepoTool::None => "none".to_string(),
+            MonorepoTool::Lerna => write!(f, "lerna"),
+            MonorepoTool::Turbo => write!(f, "turbo"),
+            MonorepoTool::Nx => write!(f, "nx"),
+            MonorepoTool::None => write!(f, "none"),
         }
     }
 }

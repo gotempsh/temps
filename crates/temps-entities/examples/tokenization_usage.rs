@@ -43,7 +43,6 @@ fn main() {
 
 fn create_sample_error() -> ErrorGroup {
     use chrono::Utc;
-    
 
     ErrorGroup {
         id: 1,

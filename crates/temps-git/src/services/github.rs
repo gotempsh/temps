@@ -81,13 +81,13 @@ pub enum PackageManager {
     Unknown,
 }
 
-impl ToString for PackageManager {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for PackageManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PackageManager::Bun => "bun".to_string(),
-            PackageManager::Npm => "npm".to_string(),
-            PackageManager::Yarn => "yarn".to_string(),
-            PackageManager::Unknown => "Unknown".to_string(),
+            PackageManager::Bun => write!(f, "bun"),
+            PackageManager::Npm => write!(f, "npm"),
+            PackageManager::Yarn => write!(f, "yarn"),
+            PackageManager::Unknown => write!(f, "Unknown"),
         }
     }
 }
@@ -116,16 +116,16 @@ pub enum Framework {
     Unknown,
 }
 
-impl ToString for Framework {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for Framework {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Framework::NextJs => "Next.js".to_string(),
-            Framework::Vite => "Vite".to_string(),
-            Framework::CreateReactApp => "Create React App".to_string(),
-            Framework::Unknown => "Unknown".to_string(),
-            Framework::Rsbuild => "Rsbuild".to_string(),
-            Framework::Docusaurus => "Docusaurus".to_string(), // Add Docusaurus string conversion
-            Framework::Dockerfile => "Dockerfile".to_string(), // Add Dockerfile string conversion
+            Framework::NextJs => write!(f, "Next.js"),
+            Framework::Vite => write!(f, "Vite"),
+            Framework::CreateReactApp => write!(f, "Create React App"),
+            Framework::Unknown => write!(f, "Unknown"),
+            Framework::Rsbuild => write!(f, "Rsbuild"),
+            Framework::Docusaurus => write!(f, "Docusaurus"), // Add Docusaurus string conversion
+            Framework::Dockerfile => write!(f, "Dockerfile"), // Add Dockerfile string conversion
         }
     }
 }
@@ -1324,6 +1324,7 @@ pub struct CommitInfo {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TokenResponse {
     access_token: String,
     expires_in: i64,

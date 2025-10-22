@@ -171,6 +171,7 @@ impl ProxyCommand {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_proxy_server(
         &self,
         db: Arc<DbConnection>,

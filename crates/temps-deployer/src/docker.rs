@@ -467,18 +467,15 @@ impl ImageBuilder for DockerRuntime {
 
                         return Err(BuilderError::BuildFailed(error));
                     }
-                    if let Some(aux) = info.aux {
-                        if let bollard::models::BuildInfoAux::BuildKit(res) = aux {
-                            for log in res.logs {
-                                // Write to file
-                                let _ = log_file.write_all(&log.msg[..]).await;
-                                debug!("BuildKit: {}", String::from_utf8_lossy(&log.msg));
+                    if let Some(bollard::models::BuildInfoAux::BuildKit(res)) = info.aux {
+                        for log in res.logs {
+                            // Write to file
+                            let _ = log_file.write_all(&log.msg[..]).await;
+                            debug!("BuildKit: {}", String::from_utf8_lossy(&log.msg));
 
-                                // Call log callback if provided
-                                if let Some(ref callback) = log_callback {
-                                    callback(String::from_utf8_lossy(&log.msg[..]).to_string())
-                                        .await;
-                                }
+                            // Call log callback if provided
+                            if let Some(ref callback) = log_callback {
+                                callback(String::from_utf8_lossy(&log.msg[..]).to_string()).await;
                             }
                         }
                     }
@@ -1386,10 +1383,12 @@ CMD ["cat", "/hello.txt"]
 
     #[tokio::test]
     async fn test_restart_policy_enum() {
-        let policies = [RestartPolicy::Never,
+        let policies = [
+            RestartPolicy::Never,
             RestartPolicy::Always,
             RestartPolicy::OnFailure,
-            RestartPolicy::UnlessStopped];
+            RestartPolicy::UnlessStopped,
+        ];
 
         // Just test that all enum variants exist and can be created
         assert_eq!(policies.len(), 4);

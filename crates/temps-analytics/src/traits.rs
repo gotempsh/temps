@@ -10,6 +10,7 @@ use crate::types::{AnalyticsError, Page};
 
 /// Trait defining analytics operations for tracking and analyzing user behavior
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait Analytics: Send + Sync {
     /// Get top pages by view count
     async fn get_top_pages(

@@ -33,6 +33,7 @@ pub struct WorkflowExecutionService {
 }
 
 impl WorkflowExecutionService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<DbConnection>,
         git_provider: Arc<dyn GitProviderManagerTrait>,
@@ -999,7 +1000,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use sea_orm::{ActiveModelTrait, Set};
-    
+
     use temps_database::test_utils::TestDatabase;
     use temps_entities::types::{JobStatus, ProjectType};
 
@@ -1286,7 +1287,7 @@ mod tests {
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = None;
-        let service = WorkflowExecutionService::new(
+        let _service = WorkflowExecutionService::new(
             db.clone(),
             git_provider,
             image_builder,
@@ -1297,8 +1298,7 @@ mod tests {
             screenshot_service,
         );
 
-        // Service should be created successfully
-        assert!(true);
+        // Service should be created successfully - compilation itself is the test
 
         Ok(())
     }
@@ -1308,7 +1308,7 @@ mod tests {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
-        let (project, environment, deployment) = create_test_data(&db).await?;
+        let (_project, _environment, deployment) = create_test_data(&db).await?;
 
         let git_provider = Arc::new(MockGitProvider);
         let image_builder = Arc::new(MockImageBuilder { should_fail: false });
@@ -1349,7 +1349,7 @@ mod tests {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
-        let (project, environment, deployment) = create_test_data(&db).await?;
+        let (_project, _environment, deployment) = create_test_data(&db).await?;
 
         // Create jobs for the deployment
         let download_job = deployment_jobs::ActiveModel {

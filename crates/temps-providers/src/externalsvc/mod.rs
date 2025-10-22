@@ -34,6 +34,7 @@ impl std::fmt::Display for ServiceType {
 }
 
 impl ServiceType {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
             "postgres" => Ok(ServiceType::Postgres),
@@ -82,6 +83,7 @@ pub struct RuntimeEnvVar {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait ExternalService: Send + Sync {
     /// Initialize the service with given configuration
     /// Returns a HashMap of inferred parameters that should be stored

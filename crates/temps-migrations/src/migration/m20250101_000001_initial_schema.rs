@@ -3787,27 +3787,27 @@ impl MigrationTrait for Migration {
             // Configure TimescaleDB for deployment_metrics and events
             let sql = r#"
                 -- Configure TimescaleDB for events table
-                SELECT create_hypertable('events', 'timestamp', 
+                SELECT create_hypertable('events', 'timestamp',
                     chunk_time_interval => INTERVAL '1 day',
                     if_not_exists => TRUE);
-                
+
                 -- Create indexes for events
-                CREATE INDEX IF NOT EXISTS idx_events_project_timestamp 
+                CREATE INDEX IF NOT EXISTS idx_events_project_timestamp
                     ON events (project_id, timestamp DESC);
-                CREATE INDEX IF NOT EXISTS idx_events_session_timestamp 
+                CREATE INDEX IF NOT EXISTS idx_events_session_timestamp
                     ON events (session_id, timestamp DESC);
-                CREATE INDEX IF NOT EXISTS idx_events_page_timestamp 
+                CREATE INDEX IF NOT EXISTS idx_events_page_timestamp
                     ON events (page_path, timestamp DESC);
-                
+
                 -- Enable compression for events after 7 days
                 ALTER TABLE events SET (
                     timescaledb.compress,
                     timescaledb.compress_segmentby = 'project_id,event_type',
                     timescaledb.compress_orderby = 'timestamp DESC'
                 );
-                
+
                 SELECT add_compression_policy('events', INTERVAL '7 days', if_not_exists => TRUE);
-                
+
                 -- Data retention for events (keep for 90 days)
                 SELECT add_retention_policy('events', INTERVAL '90 days', if_not_exists => TRUE);
             "#;

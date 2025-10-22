@@ -1310,11 +1310,11 @@ impl DeploymentService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use chrono::Utc;
     use mockall::mock;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
-    
+
     use std::sync::Arc;
     use temps_core::EncryptionService;
     use temps_database::test_utils::TestDatabase;
@@ -1496,6 +1496,7 @@ mod tests {
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn setup_test_external_services(
         db: &Arc<temps_database::DbConnection>,
         project_id: i32,
@@ -1960,7 +1961,6 @@ mod tests {
     #[tokio::test]
     async fn test_deployment_jobs_with_log_ids() -> Result<(), Box<dyn std::error::Error>> {
         use crate::services::workflow_planner::WorkflowPlanner;
-        
 
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();

@@ -10,8 +10,22 @@ repos:
     hooks:
       - id: typos
 
+  # Conventional Commits linter
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.6.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+
   - repo: local
     hooks:
+      - id: changelog-format
+        name: validate changelog format
+        entry: python3 scripts/hooks/validate-changelog.py
+        language: system
+        files: ^CHANGELOG\.md$
+        pass_filenames: false
+
       - id: cargo-fmt
         name: cargo fmt
         entry: cargo fmt --

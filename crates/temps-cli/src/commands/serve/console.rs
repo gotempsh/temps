@@ -600,7 +600,6 @@ pub async fn start_console_api(
                     mfa_recovery_codes: Set(None),
                     created_at: Set(now),
                     updated_at: Set(now),
-                    ..Default::default()
                 };
 
                 system_user

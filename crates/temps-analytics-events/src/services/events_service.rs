@@ -31,6 +31,7 @@ impl AnalyticsEventsService {
     }
 
     /// Get custom event counts with filtering and aggregation level
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_events_count(
         &self,
         start_date: UtcDateTime,
@@ -354,6 +355,7 @@ impl AnalyticsEventsService {
     }
 
     /// Get events over time (timeline)
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_events_timeline(
         &self,
         start_date: UtcDateTime,
@@ -461,6 +463,7 @@ impl AnalyticsEventsService {
 
     /// Get property breakdown by grouping events by a specific column
     /// Example: Get channel distribution, device_type breakdown, browser stats, etc.
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_property_breakdown(
         &self,
         start_date: UtcDateTime,
@@ -595,6 +598,7 @@ impl AnalyticsEventsService {
 
     /// Get property timeline: group by column over time using TimescaleDB time_bucket
     /// Example: Channel distribution by hour, device types by day, etc.
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_property_timeline(
         &self,
         start_date: UtcDateTime,
@@ -921,6 +925,7 @@ WHERE project_id = $1
 
     /// Get aggregated metrics by time bucket using TimescaleDB time_bucket_gapfill
     /// Returns counts for visitors/sessions/events grouped by customizable time buckets
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_aggregated_buckets(
         &self,
         start_date: UtcDateTime,
@@ -1018,6 +1023,7 @@ WHERE project_id = $1
     }
 
     /// Record an analytics event with enriched data
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_event(
         &self,
         project_id: i32,
@@ -1180,6 +1186,7 @@ mod tests {
         Database::connect("sqlite::memory:").await
     }
 
+    #[allow(dead_code)]
     async fn create_test_events(_db: &DatabaseConnection) {
         // This test would require the events table schema
         // For now, this is a template for future tests
@@ -1205,7 +1212,7 @@ mod tests {
         let end = Utc.with_ymd_and_hms(2024, 12, 31, 23, 59, 59).unwrap();
 
         // Test Events aggregation
-        let events_result = service
+        let _events_result = service
             .get_events_count(
                 start,
                 end,
@@ -1218,7 +1225,7 @@ mod tests {
             .await;
 
         // Test Sessions aggregation
-        let sessions_result = service
+        let _sessions_result = service
             .get_events_count(
                 start,
                 end,
@@ -1231,7 +1238,7 @@ mod tests {
             .await;
 
         // Test Visitors aggregation
-        let visitors_result = service
+        let _visitors_result = service
             .get_events_count(
                 start,
                 end,
@@ -1262,15 +1269,15 @@ mod tests {
         let end = Utc.with_ymd_and_hms(2024, 12, 31, 23, 59, 59).unwrap();
 
         // Test with different aggregation levels
-        let events_breakdown = service
+        let _events_breakdown = service
             .get_event_type_breakdown(start, end, 1, None, AggregationLevel::Events)
             .await;
 
-        let sessions_breakdown = service
+        let _sessions_breakdown = service
             .get_event_type_breakdown(start, end, 1, None, AggregationLevel::Sessions)
             .await;
 
-        let visitors_breakdown = service
+        let _visitors_breakdown = service
             .get_event_type_breakdown(start, end, 1, None, AggregationLevel::Visitors)
             .await;
 
@@ -1297,7 +1304,7 @@ mod tests {
         let end = Utc.with_ymd_and_hms(2024, 1, 2, 23, 59, 59).unwrap();
 
         // Test Events aggregation - should show raw event counts per day
-        let events_timeline = service
+        let _events_timeline = service
             .get_events_timeline(
                 start,
                 end,
@@ -1310,7 +1317,7 @@ mod tests {
             .await;
 
         // Test Sessions aggregation - should show unique sessions per day
-        let sessions_timeline = service
+        let _sessions_timeline = service
             .get_events_timeline(
                 start,
                 end,
@@ -1323,7 +1330,7 @@ mod tests {
             .await;
 
         // Test Visitors aggregation - should show unique visitors per day
-        let visitors_timeline = service
+        let _visitors_timeline = service
             .get_events_timeline(
                 start,
                 end,
@@ -1736,7 +1743,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hourly_visits_gap_filling() {
-        use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
         use temps_entities::{deployments, environments, events, projects, visitor};
         use testcontainers::{
             core::{ContainerPort, WaitFor},

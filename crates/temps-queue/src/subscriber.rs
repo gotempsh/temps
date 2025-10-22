@@ -88,14 +88,12 @@ mod tests {
         // Consumer module only caring about git push jobs would do this:
         let mut git_push_jobs = Vec::new();
         for _ in 0..3 {
-            if let Ok(job) = timeout(Duration::from_millis(100), receiver.recv()).await {
-                if let Ok(job) = job {
-                    if let Job::GitPushEvent(data) = job {
-                        git_push_jobs.push(data);
-                    }
-                    // Ignore other job types
-                }
+            if let Ok(Ok(Job::GitPushEvent(data))) =
+                timeout(Duration::from_millis(100), receiver.recv()).await
+            {
+                git_push_jobs.push(data);
             }
+            // Ignore other job types and errors
         }
 
         assert_eq!(git_push_jobs.len(), 1);

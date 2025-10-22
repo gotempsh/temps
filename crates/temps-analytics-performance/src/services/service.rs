@@ -24,6 +24,44 @@ impl From<sea_orm::DbErr> for PerformanceError {
     }
 }
 
+/// Configuration for recording performance metrics
+#[derive(Debug, Clone)]
+pub struct RecordPerformanceMetricsConfig {
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub deployment_id: i32,
+    pub session_id: Option<String>,
+    pub visitor_id: Option<String>,
+    pub ip_address_id: Option<i32>,
+    pub ttfb: Option<f32>,
+    pub lcp: Option<f32>,
+    pub fid: Option<f32>,
+    pub fcp: Option<f32>,
+    pub cls: Option<f32>,
+    pub inp: Option<f32>,
+    pub pathname: Option<String>,
+    pub query: Option<String>,
+    pub host: Option<String>,
+    pub user_agent: Option<String>,
+    pub screen_width: Option<i16>,
+    pub screen_height: Option<i16>,
+    pub viewport_width: Option<i16>,
+    pub viewport_height: Option<i16>,
+    pub language: Option<String>,
+}
+
+/// Configuration for updating performance metrics
+#[derive(Debug, Clone)]
+pub struct UpdatePerformanceMetricsConfig {
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub deployment_id: i32,
+    pub session_id: Option<String>,
+    pub visitor_id: Option<String>,
+    pub cls: Option<f32>,
+    pub inp: Option<f32>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PerformanceMetricsResponse {
     // Base metrics
@@ -495,37 +533,17 @@ impl PerformanceService {
     /// Record performance metrics from client
     pub async fn record_performance_metrics(
         &self,
-        project_id: i32,
-        environment_id: i32,
-        deployment_id: i32,
-        session_id: Option<String>,
-        visitor_id: Option<String>,
-        ip_address_id: Option<i32>,
-        ttfb: Option<f32>,
-        lcp: Option<f32>,
-        fid: Option<f32>,
-        fcp: Option<f32>,
-        cls: Option<f32>,
-        inp: Option<f32>,
-        pathname: Option<String>,
-        query: Option<String>,
-        host: Option<String>,
-        user_agent: Option<String>,
-        screen_width: Option<i16>,
-        screen_height: Option<i16>,
-        viewport_width: Option<i16>,
-        viewport_height: Option<i16>,
-        language: Option<String>,
+        config: RecordPerformanceMetricsConfig,
     ) -> Result<(), PerformanceError> {
         info!(
             "Recording performance metrics for project: {}, session: {:?}, visitor: {:?}",
-            project_id, session_id, visitor_id
+            config.project_id, config.session_id, config.visitor_id
         );
 
         // Parse User-Agent header using woothee
         let parser = Parser::new();
         let (browser, browser_version, operating_system, operating_system_version, device_type) =
-            if let Some(ua_str) = user_agent.as_deref() {
+            if let Some(ua_str) = config.user_agent.as_deref() {
                 if let Some(result) = parser.parse(ua_str) {
                     let browser = if result.name != "UNKNOWN" {
                         Some(result.name.to_string())
@@ -568,7 +586,7 @@ impl PerformanceService {
             };
 
         // Look up session_id in request_sessions table
-        let session_id_i32 = if let Some(sess_id) = session_id {
+        let session_id_i32 = if let Some(sess_id) = config.session_id {
             request_sessions::Entity::find()
                 .filter(request_sessions::Column::SessionId.eq(&sess_id))
                 .one(self.db.as_ref())
@@ -579,7 +597,7 @@ impl PerformanceService {
         };
 
         // Look up visitor_id in visitor table
-        let visitor_id_i32 = if let Some(vis_id) = visitor_id {
+        let visitor_id_i32 = if let Some(vis_id) = config.visitor_id {
             visitor::Entity::find()
                 .filter(visitor::Column::VisitorId.eq(&vis_id))
                 .one(self.db.as_ref())
@@ -591,33 +609,33 @@ impl PerformanceService {
 
         let metric = performance_metrics::ActiveModel {
             id: sea_orm::NotSet,
-            project_id: Set(project_id),
-            environment_id: Set(environment_id),
-            deployment_id: Set(deployment_id),
+            project_id: Set(config.project_id),
+            environment_id: Set(config.environment_id),
+            deployment_id: Set(config.deployment_id),
             session_id: Set(session_id_i32),
             visitor_id: Set(visitor_id_i32),
-            ip_address_id: Set(ip_address_id),
-            ttfb: Set(ttfb),
-            lcp: Set(lcp),
-            fid: Set(fid),
-            fcp: Set(fcp),
-            cls: Set(cls),
-            inp: Set(inp),
+            ip_address_id: Set(config.ip_address_id),
+            ttfb: Set(config.ttfb),
+            lcp: Set(config.lcp),
+            fid: Set(config.fid),
+            fcp: Set(config.fcp),
+            cls: Set(config.cls),
+            inp: Set(config.inp),
             recorded_at: Set(chrono::Utc::now()),
             is_crawler: Set(false),
-            pathname: Set(pathname),
-            query: Set(query),
-            host: Set(host),
+            pathname: Set(config.pathname),
+            query: Set(config.query),
+            host: Set(config.host),
             browser: Set(browser),
             browser_version: Set(browser_version),
             operating_system: Set(operating_system),
             operating_system_version: Set(operating_system_version),
             device_type: Set(device_type),
-            screen_width: Set(screen_width),
-            screen_height: Set(screen_height),
-            viewport_width: Set(viewport_width),
-            viewport_height: Set(viewport_height),
-            language: Set(language),
+            screen_width: Set(config.screen_width),
+            screen_height: Set(config.screen_height),
+            viewport_width: Set(config.viewport_width),
+            viewport_height: Set(config.viewport_height),
+            language: Set(config.language),
         };
 
         metric.insert(self.db.as_ref()).await?;
@@ -628,21 +646,15 @@ impl PerformanceService {
     /// Update performance metrics (for late-loading metrics like CLS, INP)
     pub async fn update_performance_metrics(
         &self,
-        project_id: i32,
-        environment_id: i32,
-        deployment_id: i32,
-        session_id: Option<String>,
-        visitor_id: Option<String>,
-        cls: Option<f32>,
-        inp: Option<f32>,
+        config: UpdatePerformanceMetricsConfig,
     ) -> Result<(), PerformanceError> {
         info!(
             "Updating late metrics for project: {}, session: {:?}, visitor: {:?}",
-            project_id, session_id, visitor_id
+            config.project_id, config.session_id, config.visitor_id
         );
 
         // Look up session_id in request_sessions table
-        let session_id_i32 = if let Some(sess_id) = session_id {
+        let session_id_i32 = if let Some(sess_id) = config.session_id {
             request_sessions::Entity::find()
                 .filter(request_sessions::Column::SessionId.eq(&sess_id))
                 .one(self.db.as_ref())
@@ -653,7 +665,7 @@ impl PerformanceService {
         };
 
         // Look up visitor_id in visitor table
-        let visitor_id_i32 = if let Some(vis_id) = visitor_id {
+        let visitor_id_i32 = if let Some(vis_id) = config.visitor_id {
             visitor::Entity::find()
                 .filter(visitor::Column::VisitorId.eq(&vis_id))
                 .one(self.db.as_ref())
@@ -665,9 +677,9 @@ impl PerformanceService {
 
         // Find the most recent metric for this session/visitor
         let mut query = performance_metrics::Entity::find()
-            .filter(performance_metrics::Column::ProjectId.eq(project_id))
-            .filter(performance_metrics::Column::EnvironmentId.eq(environment_id))
-            .filter(performance_metrics::Column::DeploymentId.eq(deployment_id))
+            .filter(performance_metrics::Column::ProjectId.eq(config.project_id))
+            .filter(performance_metrics::Column::EnvironmentId.eq(config.environment_id))
+            .filter(performance_metrics::Column::DeploymentId.eq(config.deployment_id))
             .order_by_desc(performance_metrics::Column::RecordedAt);
 
         if let Some(sess_id) = session_id_i32 {
@@ -687,11 +699,11 @@ impl PerformanceService {
 
         let mut metric: performance_metrics::ActiveModel = metric.into();
 
-        if let Some(cls_value) = cls {
+        if let Some(cls_value) = config.cls {
             metric.cls = Set(Some(cls_value));
         }
 
-        if let Some(inp_value) = inp {
+        if let Some(inp_value) = config.inp {
             metric.inp = Set(Some(inp_value));
         }
 

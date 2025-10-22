@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 use super::shutdown::CtrlCShutdownSignal;
 
 /// Initialize and start the proxy server
+#[allow(clippy::too_many_arguments)]
 pub fn start_proxy_server(
     db: Arc<DbConnection>,
     address: String,

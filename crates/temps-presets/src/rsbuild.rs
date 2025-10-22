@@ -21,16 +21,8 @@ impl Preset for Rsbuild {
         "https://example.com/vite-icon.png".to_string()
     }
 
-    fn dockerfile(
-        &self,
-        _root_local_path: &Path, local_path: &Path,
-        install_command: Option<&str>,
-        build_command: Option<&str>,
-        _output_dir: Option<&str>,
-        build_vars: Option<&Vec<String>>,
-        project_slug: &str,
-    ) -> String {
-        let pkg_manager = PackageManager::detect(local_path);
+    fn dockerfile(&self, config: super::DockerfileConfig) -> String {
+        let pkg_manager = PackageManager::detect(config.local_path);
 
         let lockfile = match pkg_manager {
             PackageManager::Bun => "COPY package.json bun.lock* ./",
@@ -54,12 +46,12 @@ RUN --mount=type=cache,target=/app/node_modules,id=node_modules_{} \
 "#,
             pkg_manager.base_image(),
             lockfile,
-            project_slug,
-            install_command.unwrap_or(pkg_manager.install_command())
+            config.project_slug,
+            config.install_command.unwrap_or(pkg_manager.install_command())
         );
 
         // Add build variables if present
-        if let Some(vars) = build_vars {
+        if let Some(vars) = config.build_vars {
             for var in vars {
                 dockerfile.push_str(&format!("ARG {}\n", var));
             }
@@ -90,8 +82,8 @@ EXPOSE 3000
 
 CMD ["serve", "-s", "dist", "-l", "3000"]
 "#,
-            project_slug,
-            build_command.unwrap_or(pkg_manager.build_command()),
+            config.project_slug,
+            config.build_command.unwrap_or(pkg_manager.build_command()),
             pkg_manager.base_image(),
             match pkg_manager {
                 PackageManager::Bun => "bun install -g serve",

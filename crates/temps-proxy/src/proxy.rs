@@ -79,6 +79,7 @@ pub struct LoadBalancer {
 }
 
 impl LoadBalancer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         upstream_resolver: Arc<dyn UpstreamResolver>,
         request_logger: Arc<dyn RequestLogger>,
@@ -610,6 +611,7 @@ impl LoadBalancer {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn is_page_visit(&self, upstream_response: &ResponseHeader, ctx: &ProxyContext) -> bool {
         let mut is_page_visit = upstream_response
             .headers

@@ -99,7 +99,6 @@ pub struct AppState {
         ProjectQuery,
         PageSessionStatsQuery,
         PagePathsQuery,
-        ActiveVisitorsQuery,
         PageHourlySessionsQuery,
         VisitorWithGeolocation,
         EventBreakdown,

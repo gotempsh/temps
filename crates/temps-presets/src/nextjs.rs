@@ -22,25 +22,16 @@ impl Preset for NextJs {
         "https://example.com/nextjs-icon.png".to_string()
     }
 
-    fn dockerfile(
-        &self,
-        root_local_path: &Path,
-        local_path: &Path,
-        install_command: Option<&str>,
-        build_command: Option<&str>,
-        _output_dir: Option<&str>,
-        build_vars: Option<&Vec<String>>,
-        project_slug: &str,
-    ) -> String {
-        let project_slug = project_slug.replace("-", "_").to_lowercase();
-        debug!("Local path is {:?}", local_path.display());
-        let build_system = BuildSystem::detect(root_local_path);
+    fn dockerfile(&self, config: super::DockerfileConfig) -> String {
+        let project_slug = config.project_slug.replace("-", "_").to_lowercase();
+        debug!("Local path is {:?}", config.local_path.display());
+        let build_system = BuildSystem::detect(config.root_local_path);
         let package_manager = build_system.package_manager;
 
         // Calculate relative path from root to project directory for monorepos
-        let relative_path = if local_path != root_local_path {
-            local_path
-                .strip_prefix(root_local_path)
+        let relative_path = if config.local_path != config.root_local_path {
+            config.local_path
+                .strip_prefix(config.root_local_path)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default()
         } else {
@@ -51,9 +42,9 @@ impl Preset for NextJs {
 
         // Use provided commands or fall back to build system commands
         let build_system_install_cmd = &build_system.get_install_command();
-        let mut install_cmd = install_command.unwrap_or(build_system_install_cmd).to_string();
+        let mut install_cmd = config.install_command.unwrap_or(build_system_install_cmd).to_string();
         let build_system_build_cmd = &build_system.get_build_command(Some(&project_slug));
-        let mut build_cmd = build_command.unwrap_or(build_system_build_cmd).to_string();
+        let mut build_cmd = config.build_command.unwrap_or(build_system_build_cmd).to_string();
 
         // For Bun, ensure we use the full path in cache mount contexts
         if matches!(package_manager, PackageManager::Bun) {
@@ -150,7 +141,7 @@ RUN --mount=type=cache,target=/{project_slug}/cache/node_modules,id=node_modules
         }
 
         // Add build variables if present
-        if let Some(vars) = build_vars {
+        if let Some(vars) = config.build_vars {
             for var in vars {
                 dockerfile.push_str(&format!("ARG {}\n", var));
             }
@@ -289,6 +280,7 @@ impl std::fmt::Display for NextJs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DockerfileConfig;
 
     #[test]
     fn test_bun_dockerfile_uses_full_path() {
@@ -298,15 +290,15 @@ mod tests {
         std::fs::write(temp_dir.join("bun.lock"), "").unwrap();
 
         let preset = NextJs;
-        let dockerfile = preset.dockerfile(
-            &temp_dir,
-            &temp_dir,
-            None,
-            None,
-            None,
-            None,
-            "test-project",
-        );
+        let dockerfile = preset.dockerfile(DockerfileConfig {
+            root_local_path: &temp_dir,
+            local_path: &temp_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        });
 
         // Verify Bun is installed
         assert!(dockerfile.contains("curl -fsSL https://bun.sh/install | bash"));
@@ -328,15 +320,15 @@ mod tests {
         std::fs::write(temp_dir.join("package-lock.json"), "").unwrap();
 
         let preset = NextJs;
-        let dockerfile = preset.dockerfile(
-            &temp_dir,
-            &temp_dir,
-            None,
-            None,
-            None,
-            None,
-            "test-project",
-        );
+        let dockerfile = preset.dockerfile(DockerfileConfig {
+            root_local_path: &temp_dir,
+            local_path: &temp_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        });
 
         // Verify Bun is NOT installed
         assert!(!dockerfile.contains("curl -fsSL https://bun.sh/install | bash"));
@@ -360,15 +352,15 @@ mod tests {
         std::fs::write(subproject_dir.join("package.json"), "{}").unwrap();
 
         let preset = NextJs;
-        let dockerfile = preset.dockerfile(
-            &temp_dir,
-            &subproject_dir,
-            None,
-            None,
-            None,
-            None,
-            "test-project",
-        );
+        let dockerfile = preset.dockerfile(DockerfileConfig {
+            root_local_path: &temp_dir,
+            local_path: &subproject_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        });
 
         // Verify the entire repository is copied for monorepos
         assert!(dockerfile.contains("# Copy entire repository for monorepo build"));
@@ -393,15 +385,15 @@ mod tests {
         std::fs::write(temp_dir.join("package.json"), "{}").unwrap();
 
         let preset = NextJs;
-        let dockerfile = preset.dockerfile(
-            &temp_dir,
-            &temp_dir,
-            None,
-            None,
-            None,
-            None,
-            "test-project",
-        );
+        let dockerfile = preset.dockerfile(DockerfileConfig {
+            root_local_path: &temp_dir,
+            local_path: &temp_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        });
 
         // Verify only one WORKDIR is set (the initial one) - no subdirectory WORKDIR
         let workdir_count = dockerfile.matches("WORKDIR /test_project").count();
@@ -421,15 +413,15 @@ mod tests {
         std::fs::write(temp_dir.join("bun.lock"), "").unwrap();
 
         let preset = NextJs;
-        let dockerfile = preset.dockerfile(
-            &temp_dir,
-            &temp_dir,
-            Some("bun install --frozen-lockfile"),
-            Some("bun run build:prod"),
-            None,
-            None,
-            "test-project",
-        );
+        let dockerfile = preset.dockerfile(DockerfileConfig {
+            root_local_path: &temp_dir,
+            local_path: &temp_dir,
+            install_command: Some("bun install --frozen-lockfile"),
+            build_command: Some("bun run build:prod"),
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        });
 
         // Verify custom commands are used with full bun path
         assert!(dockerfile.contains("/root/.bun/bin/bun install --frozen-lockfile"));

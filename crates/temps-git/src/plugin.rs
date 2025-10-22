@@ -150,14 +150,17 @@ impl TempsPlugin for GitPlugin {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    
+
     use temps_core::QueueError;
     use temps_core::{Job, JobReceiver};
 
     // Mock implementations for testing
+    #[allow(dead_code)]
     struct MockConfigService;
+    #[allow(dead_code)]
     struct MockAuditService;
 
+    #[allow(dead_code)]
     struct MockJobQueue;
 
     #[async_trait]

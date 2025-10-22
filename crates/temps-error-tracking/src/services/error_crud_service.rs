@@ -212,6 +212,7 @@ impl ErrorCRUDService {
     }
 
     /// List error groups with filtering and pagination
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_error_groups(
         &self,
         project_id: i32,
@@ -409,7 +410,6 @@ mod tests {
     /// 3. Ignore errors with "ignored" status
     /// 4. Proper error handling for non-existent groups
     /// 5. Project isolation - can't update groups from other projects
-
     async fn setup_test_db() -> TestDatabase {
         TestDatabase::with_migrations()
             .await
@@ -650,7 +650,7 @@ mod tests {
         let project_id = create_test_project(&db).await;
 
         // Create multiple error groups
-        for i in 0..5 {
+        for _i in 0..5 {
             create_test_error_group(&db, project_id, "unresolved").await;
         }
 

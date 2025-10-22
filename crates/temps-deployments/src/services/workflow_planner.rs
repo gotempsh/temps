@@ -479,7 +479,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use sea_orm::Set;
-    
+
     use temps_config::{ConfigService, ServerConfig};
     use temps_core::EncryptionService;
     use temps_database::test_utils::TestDatabase;
@@ -588,7 +588,7 @@ mod tests {
             dsn_service,
         );
 
-        let (project, environment, deployment) =
+        let (_project, _environment, deployment) =
             create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
                 .await?;
 
@@ -716,7 +716,7 @@ mod tests {
             dsn_service,
         );
 
-        let (project, environment, deployment) =
+        let (_project, _environment, deployment) =
             create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
                 .await?;
 
@@ -763,7 +763,7 @@ mod tests {
             dsn_service,
         );
 
-        let (project, environment, deployment) =
+        let (_project, _environment, deployment) =
             create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
                 .await?;
 
@@ -806,7 +806,7 @@ mod tests {
             dsn_service,
         );
 
-        let (project, environment, deployment) =
+        let (_project, _environment, deployment) =
             create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
                 .await?;
 

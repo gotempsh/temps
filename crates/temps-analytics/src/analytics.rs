@@ -1195,10 +1195,9 @@ impl Analytics for AnalyticsService {
         }
 
         // Use provided dates or default to last 24 hours
-        let (start, end) = if start_date.is_some() && end_date.is_some() {
-            (start_date.unwrap(), end_date.unwrap())
-        } else if start_date.is_some() {
-            let start = start_date.unwrap();
+        let (start, end) = if let (Some(start), Some(end)) = (start_date, end_date) {
+            (start, end)
+        } else if let Some(start) = start_date {
             (start, start + chrono::Duration::days(1))
         } else {
             // Default to last 24 hours
@@ -1748,7 +1747,7 @@ mod tests {
     use super::*;
     use crate::testing::test_utils::AnalyticsTestUtils;
     use crate::{cleanup_test_analytics, create_test_analytics_service};
-    
+
     use UtcDateTime;
 
     #[tokio::test]
@@ -1870,6 +1869,6 @@ mod tests {
         );
 
         // If this test compiles, it proves our parameterized query pattern is correct
-        assert!(true, "Parameterized queries compile correctly");
+        // No assertion needed - compilation itself is the test
     }
 }

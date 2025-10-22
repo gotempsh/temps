@@ -40,6 +40,7 @@ impl ErrorTrackingService {
     }
 
     /// List error groups (delegates to CRUD service)
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_error_groups(
         &self,
         project_id: i32,

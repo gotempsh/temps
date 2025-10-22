@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - 'v*.*.*-*'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-linux-amd64:
+    name: Build Linux AMD64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y cmake pkg-config libssl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install web dependencies
+        run: |
+          cd web
+          bun install
+
+      - name: Build release binary
+        run: cargo build --release --bin temps
+        env:
+          FORCE_WEB_BUILD: 1
+
+      - name: Strip binary
+        run: strip target/release/temps
+
+      - name: Rename binary
+        run: cp target/release/temps temps-linux-amd64
+
+      - name: Generate checksums
+        run: |
+          sha256sum temps-linux-amd64 > temps-linux-amd64.sha256
+          cat temps-linux-amd64.sha256
+
+      - name: Get binary info
+        run: |
+          ls -lh temps-linux-amd64
+          file temps-linux-amd64
+          ./temps-linux-amd64 --version || echo "Note: Binary may require runtime dependencies"
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            temps-linux-amd64
+            temps-linux-amd64.sha256
+          draft: false
+          prerelease: ${{ contains(github.ref, '-') }}
+          body: |
+            ## Changes
+
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref }}/CHANGELOG.md) for details.
+
+            ## Installation
+
+            ### Linux AMD64
+            ```bash
+            # Download
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-linux-amd64
+
+            # Make executable
+            chmod +x temps-linux-amd64
+
+            # Move to PATH
+            sudo mv temps-linux-amd64 /usr/local/bin/temps
+
+            # Verify
+            temps --version
+            ```
+
+            ### Checksums
+            ```bash
+            # Verify checksum (Linux/macOS)
+            sha256sum -c temps-linux-amd64.sha256
+            ```

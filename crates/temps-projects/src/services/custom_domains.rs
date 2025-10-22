@@ -124,6 +124,7 @@ impl CustomDomainService {
     }
 
     /// Update custom domain
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_custom_domain(
         &self,
         id: i32,

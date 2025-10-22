@@ -66,7 +66,6 @@ impl DockerLogService {
                 .end_date
                 .map(|dt| dt.timestamp() as i32)
                 .unwrap_or(0),
-            ..Default::default()
         });
 
         let logs = self.docker.logs(container_id, log_options);

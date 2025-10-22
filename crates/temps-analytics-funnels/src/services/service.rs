@@ -767,10 +767,7 @@ impl FunnelService {
 mod tests {
     use super::*;
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::{
-        deployments, environments, events, projects,
-        types::ProjectType,
-    };
+    use temps_entities::{deployments, environments, events, projects, types::ProjectType};
 
     async fn create_test_project(db: Arc<DatabaseConnection>) -> (i32, i32, i32) {
         // Create project
@@ -1426,6 +1423,7 @@ mod tests {
     }
 
     // Helper function to create events
+    #[allow(clippy::too_many_arguments)]
     async fn create_event(
         db: &DatabaseConnection,
         project_id: i32,
@@ -1455,6 +1453,7 @@ mod tests {
     }
 
     // Helper function to create events with custom event_data
+    #[allow(clippy::too_many_arguments)]
     async fn create_event_with_data(
         db: &DatabaseConnection,
         project_id: i32,

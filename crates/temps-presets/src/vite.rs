@@ -20,20 +20,11 @@ impl Preset for Vite {
         "https://example.com/vite-icon.png".to_string()
     }
 
-    fn dockerfile(
-        &self,
-        _root_local_path: &Path,
-        local_path: &Path,
-        install_command: Option<&str>,
-        build_command: Option<&str>,
-        output_dir: Option<&str>,
-        build_vars: Option<&Vec<String>>,
-        project_slug: &str,
-    ) -> String {
-        let package_manager = PackageManager::detect(local_path);
-        let install_cmd = install_command.unwrap_or(package_manager.install_command());
-        let build_cmd = build_command.unwrap_or(package_manager.build_command());
-        let output = output_dir.unwrap_or("dist");
+    fn dockerfile(&self, config: super::DockerfileConfig) -> String {
+        let package_manager = PackageManager::detect(config.local_path);
+        let install_cmd = config.install_command.unwrap_or(package_manager.install_command());
+        let build_cmd = config.build_command.unwrap_or(package_manager.build_command());
+        let output = config.output_dir.unwrap_or("dist");
 
         let mut dockerfile = format!(
             r#"FROM {} as builder
@@ -42,12 +33,12 @@ COPY . .
 RUN --mount=type=cache,target=/app/node_modules,id=node_modules_{} {}
 "#,
             package_manager.base_image(),
-            project_slug,
+            config.project_slug,
             install_cmd
         );
 
         // Add build variables if present
-        if let Some(vars) = build_vars {
+        if let Some(vars) = config.build_vars {
             for var in vars {
                 dockerfile.push_str(&format!("ARG {}\n", var));
             }

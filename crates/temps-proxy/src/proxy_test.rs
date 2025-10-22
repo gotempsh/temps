@@ -10,7 +10,7 @@ mod proxy_tests {
     use pingora::upstreams::peer::Peer;
     use std::sync::atomic::{AtomicU16, Ordering};
     use std::sync::Arc;
-    
+
     use temps_database::test_utils::TestDatabase;
     use temps_routes::CachedPeerTable;
     use tokio::io::AsyncWriteExt;
@@ -18,10 +18,9 @@ mod proxy_tests {
 
     use anyhow::Result;
     use http_body_util::Full;
-    
+
     use std::collections::HashMap;
     use std::convert::Infallible;
-    
 
     // Helper to convert std errors to anyhow
     fn convert_error<T>(result: Result<T, Box<dyn std::error::Error>>) -> Result<T> {
@@ -51,13 +50,9 @@ mod proxy_tests {
 
         // Start a simple server that accepts and closes connections
         tokio::spawn(async move {
-            loop {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    // Just close the connection immediately
-                    let _ = stream.shutdown().await;
-                } else {
-                    break;
-                }
+            while let Ok((mut stream, _)) = listener.accept().await {
+                // Just close the connection immediately
+                let _ = stream.shutdown().await;
             }
         });
 
@@ -67,6 +62,7 @@ mod proxy_tests {
         server_addr
     }
 
+    #[allow(dead_code)]
     async fn mock_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
         let path = req.uri().path();
         let method = req.method();
@@ -212,7 +208,7 @@ mod proxy_tests {
             convert_error(test_db.create_test_project_with_domain(&test_domain).await)?;
 
         // Create proxy service with mock upstream resolver
-        let server_config = ProxyConfig::default();
+        let _server_config = ProxyConfig::default();
         let crypto = create_crypto_cookie_crypto();
 
         let upstream_resolver = Arc::new(MockUpstreamResolver::new(
@@ -312,7 +308,7 @@ mod proxy_tests {
     #[tokio::test]
     async fn test_proxy_route_resolution() -> Result<()> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
+        let _test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
             .await
             .unwrap();
 
@@ -357,7 +353,7 @@ mod proxy_tests {
             .await
             .unwrap();
 
-        let server_config = ProxyConfig::default();
+        let _server_config = ProxyConfig::default();
         let crypto = create_crypto_cookie_crypto();
 
         let ip_service = create_mock_ip_service(test_db.db.clone());
@@ -406,7 +402,7 @@ mod proxy_tests {
     #[tokio::test]
     #[ignore] // TODO: Fix foreign key constraint - needs visitor record creation before session
     async fn test_proxy_session_management() -> Result<()> {
-        let server_config = ProxyConfig::default();
+        let _server_config = ProxyConfig::default();
         let crypto = create_crypto_cookie_crypto();
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
         let session_manager =
@@ -456,7 +452,7 @@ mod proxy_tests {
             .await
             .unwrap();
 
-        let server_config = ProxyConfig::default();
+        let _server_config = ProxyConfig::default();
         let crypto = create_crypto_cookie_crypto();
 
         let ip_service = create_mock_ip_service(test_db.db.clone());
@@ -504,7 +500,7 @@ mod proxy_tests {
         use crate::test_utils::MockProjectContextResolver;
 
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let db = test_db_mock.connection_arc().clone();
+        let _db = test_db_mock.connection_arc().clone();
 
         // Create a mock context resolver that returns redirect info for test.redirect.com
         let project_context_resolver = Arc::new(MockProjectContextResolver::new_with_redirect(

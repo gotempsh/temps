@@ -212,15 +212,15 @@ impl BuildImageJob {
             .collect();
 
         // Generate Dockerfile content with build args
-        let dockerfile_content = preset.dockerfile(
-            repo_dir,          // root_local_path
-            repo_dir,          // local_path
-            None,              // install_command (auto-detect)
-            None,              // build_command (auto-detect)
-            None,              // output_dir (auto-detect)
-            Some(&build_vars), // build_vars - ARG directives for env vars
-            "deployment",      // project_slug
-        );
+        let dockerfile_content = preset.dockerfile(temps_presets::DockerfileConfig {
+            root_local_path: repo_dir,
+            local_path: repo_dir,
+            install_command: None,         // auto-detect
+            build_command: None,           // auto-detect
+            output_dir: None,              // auto-detect
+            build_vars: Some(&build_vars), // ARG directives for env vars
+            project_slug: "deployment",
+        });
 
         // Write the Dockerfile
         fs::write(dockerfile_path, dockerfile_content).map_err(WorkflowError::IoError)?;
@@ -542,7 +542,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::path::Path;
-    
+
     use temps_deployer::{
         BuildRequest, BuildRequestWithCallback, BuildResult, BuilderError, ImageBuilder,
     };

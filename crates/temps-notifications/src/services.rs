@@ -1271,11 +1271,13 @@ mod tests {
         let service = NotificationPreferencesService::new(test_db.connection_arc());
 
         // Create custom preferences
-        let mut custom_prefs = NotificationPreferences::default();
-        custom_prefs.email_enabled = false;
-        custom_prefs.slack_enabled = true;
-        custom_prefs.minimum_severity = "critical".to_string();
-        custom_prefs.error_threshold = 500;
+        let custom_prefs = NotificationPreferences {
+            email_enabled: false,
+            slack_enabled: true,
+            minimum_severity: "critical".to_string(),
+            error_threshold: 500,
+            ..Default::default()
+        };
 
         // Update preferences
         let updated = service
@@ -1319,17 +1321,21 @@ mod tests {
         let service = NotificationPreferencesService::new(test_db.connection_arc());
 
         // Create initial preferences
-        let mut initial_prefs = NotificationPreferences::default();
-        initial_prefs.email_enabled = false;
+        let initial_prefs = NotificationPreferences {
+            email_enabled: false,
+            ..Default::default()
+        };
         service
             .update_preferences(initial_prefs)
             .await
             .expect("Failed to create initial preferences");
 
         // Update with different values
-        let mut updated_prefs = NotificationPreferences::default();
-        updated_prefs.email_enabled = true;
-        updated_prefs.slack_enabled = true;
+        let updated_prefs = NotificationPreferences {
+            email_enabled: true,
+            slack_enabled: true,
+            ..Default::default()
+        };
 
         let result = service
             .update_preferences(updated_prefs)
@@ -1441,24 +1447,30 @@ mod tests {
         let service = NotificationPreferencesService::new(test_db.connection_arc());
 
         // First update
-        let mut prefs1 = NotificationPreferences::default();
-        prefs1.error_threshold = 100;
+        let prefs1 = NotificationPreferences {
+            error_threshold: 100,
+            ..Default::default()
+        };
         service
             .update_preferences(prefs1)
             .await
             .expect("Failed to update preferences");
 
         // Second update
-        let mut prefs2 = NotificationPreferences::default();
-        prefs2.error_threshold = 200;
+        let prefs2 = NotificationPreferences {
+            error_threshold: 200,
+            ..Default::default()
+        };
         service
             .update_preferences(prefs2)
             .await
             .expect("Failed to update preferences");
 
         // Third update
-        let mut prefs3 = NotificationPreferences::default();
-        prefs3.error_threshold = 300;
+        let prefs3 = NotificationPreferences {
+            error_threshold: 300,
+            ..Default::default()
+        };
         service
             .update_preferences(prefs3)
             .await

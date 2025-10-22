@@ -239,11 +239,7 @@ impl LetsEncryptProvider {
         }
 
         // Extract base domain for DNS record name
-        let dns_record_domain = if domain.starts_with("*.") {
-            &domain[2..] // Remove "*." prefix for DNS record
-        } else {
-            domain
-        };
+        let dns_record_domain = domain.strip_prefix("*.").unwrap_or(domain);
 
         // For wildcard domains with base domain, we'll have multiple authorizations
         // Collect ALL DNS TXT records that need to be added

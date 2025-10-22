@@ -1,5 +1,4 @@
 use super::*;
-use sea_orm::*;
 use std::sync::Arc;
 use temps_database::test_utils::TestDatabase;
 use temps_entities::{error_events, error_groups, projects};

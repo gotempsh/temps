@@ -13,11 +13,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Create N+1 queries - ALWAYS use JOINs for related data
 - Leave the project in non-compilable state
 - Use `#[tokio::main]` when integrating with pingora
+- **Create markdown documentation files (*.md) unless explicitly requested** - No README files, no documentation files unless the user asks
 
 ### ✅ ALWAYS
 - Run `cargo check --lib` after every modification
 - **New functionality must compile without warnings** - Fix all warnings before considering work complete
 - **Write tests for all new functionality AND verify they run successfully** - Tests that don't run are worthless
+- **Use Conventional Commits** - Format: `type(scope): description` (e.g., `feat: add user authentication`, `fix(api): handle null responses`)
+  - Types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`, `perf`, `ci`, `build`, `revert`
+  - CHANGELOG is auto-generated from commits using `git-cliff`
 - Use services for all business logic
 - Implement pagination (default: 20, max: 100) and sorting (default: created_at DESC)
 - Use typed error handling with proper propagation
@@ -25,6 +29,112 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Keep tests for a class/service in the same file, not in separate test files
 - Return dates in ISO 8601 format with `Z` suffix for UTC times
 - Use `permission_check!` macro for authorization in handlers
+
+## Commit Message Format
+
+Follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<type>[optional scope]: <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+**Types:**
+- `feat:` - New feature (→ Added in CHANGELOG)
+- `fix:` - Bug fix (→ Fixed in CHANGELOG)
+- `docs:` - Documentation only
+- `style:` - Code style (formatting, no logic change)
+- `refactor:` - Code refactoring
+- `perf:` - Performance improvement
+- `test:` - Adding tests
+- `build:` - Build system changes
+- `ci:` - CI configuration
+- `chore:` - Other changes (dependencies, tooling)
+- `revert:` - Revert previous commit
+
+**Examples:**
+```bash
+feat(auth): add JWT token refresh
+fix(api): handle null response from external service
+docs: update installation instructions
+chore(deps): update rust dependencies
+```
+
+**Generate CHANGELOG:**
+```bash
+# Install git-cliff
+cargo install git-cliff
+
+# Generate changelog for unreleased changes
+git cliff --unreleased --prepend CHANGELOG.md
+
+# Generate changelog for specific version
+git cliff --tag v1.0.0 --prepend CHANGELOG.md
+```
+
+## Development Setup
+
+### Initial Setup
+
+**One-time setup for git hooks:**
+```bash
+./scripts/setup-hooks.sh
+```
+
+This script will:
+- Detect or prompt you to choose between `prek` (Rust-based) or `pre-commit` (Python-based)
+- Install the chosen framework if not already installed
+- Configure git hooks that run automatically on commit
+
+The hooks include:
+- Conventional Commits validator
+- Changelog format validator
+- Code formatting (cargo fmt)
+- Linting (cargo clippy)
+- YAML validation
+- Trailing whitespace fixes
+
+**Add to your shell profile (~/.zshrc or ~/.bashrc):**
+```bash
+# If using pre-commit (Python-based)
+export PATH="$HOME/Library/Python/3.9/bin:$PATH"  # macOS
+export PATH="$HOME/.local/bin:$PATH"              # Linux
+
+# If using prek (Rust-based)
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+**Run hooks manually:**
+```bash
+# If using prek
+prek run --all-files
+
+# If using pre-commit
+pre-commit run --all-files
+```
+
+### Pre-commit Hooks
+
+Hooks run **automatically** on `git commit`:
+- ✅ Validates commit message format (Conventional Commits)
+- ✅ Runs `cargo fmt`
+- ✅ Runs `cargo clippy`
+- ✅ Validates CHANGELOG.md format
+- ✅ Checks YAML files
+- ✅ Fixes trailing whitespace
+
+**Manual run:**
+```bash
+pre-commit run --all-files
+```
+
+**Skip hooks (not recommended):**
+```bash
+git commit --no-verify
+```
 
 ## Build & Test Commands
 
@@ -42,6 +152,44 @@ cargo build --bin temps
 # Build with optimizations
 cargo build --release --bin temps
 ```
+
+### Web Build Integration
+
+The web UI is automatically built during `cargo build` via `temps-cli/build.rs` and placed in `temps-cli/dist/`.
+
+**Development (Debug) Mode - Web build SKIPPED by default:**
+```bash
+# Fast Rust development (skips web build)
+cargo build
+
+# Force web build in debug mode
+FORCE_WEB_BUILD=1 cargo build
+```
+
+**Release Mode - Web build INCLUDED automatically:**
+```bash
+# Build with web UI (automatic)
+cargo build --release
+
+# Skip web build even in release
+SKIP_WEB_BUILD=1 cargo build --release
+```
+
+**Manual web build:**
+```bash
+cd web
+bun install
+bun run build
+
+# Output to temps-cli/dist
+RSBUILD_OUTPUT_PATH=../crates/temps-cli/dist bun run build
+```
+
+**Important Notes:**
+- In debug mode, a **placeholder** `dist/` directory is created with a development HTML page
+- This prevents build failures since `include_dir!("dist")` requires the directory to exist
+- Tests and debug builds work without building the full web UI
+- The placeholder shows instructions for building the full UI when accessed
 
 ### Test Commands
 ```bash
@@ -1870,9 +2018,9 @@ const syncMutation = useMutation({
 
 ### React Component Best Practices
 
-#### Avoid IIFEs (Immediately Invoked Function Expressions) in JSX
+#### Avoid IFEs (Immediately Invoked Function Expressions) in JSX
 
-**NEVER use auto-callable functions (IIFEs) in React components.** Instead, extract logic into separate components, helper functions, or use proper React patterns.
+**NEVER use auto-callable functions (IFEs) in React components.** Instead, extract logic into separate components, helper functions, or use proper React patterns.
 
 **Why?**
 - Reduces code readability and maintainability
@@ -2005,7 +2153,7 @@ function EventList({ events }) {
 }
 ```
 
-**When IIFEs are acceptable:**
+**When IFEs are acceptable:**
 - Simple type casting that TypeScript requires (but prefer helper functions)
 - Very simple transformations that don't warrant a separate function (1-2 lines max)
 

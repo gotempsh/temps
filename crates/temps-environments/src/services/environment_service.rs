@@ -115,6 +115,7 @@ impl EnvironmentService {
         format!("{}://{}.{}", protocol, environment_slug, base_domain)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_environment(
         &self,
         project_id: i32,

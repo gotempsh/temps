@@ -21,6 +21,7 @@ impl TestDBMockOperations {
     }
 
     /// Create test project with environment and deployment
+    #[allow(dead_code)]
     pub async fn create_test_project(
         &self,
     ) -> Result<

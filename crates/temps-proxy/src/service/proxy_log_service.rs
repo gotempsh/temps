@@ -387,6 +387,7 @@ impl ProxyLogService {
     }
 
     /// Legacy method - kept for backward compatibility
+    #[allow(clippy::too_many_arguments)]
     pub async fn list(
         &self,
         project_id: Option<i32>,
@@ -469,7 +470,6 @@ impl ProxyLogService {
 
 #[cfg(test)]
 mod tests {
-    
 
     // Tests would go here - similar to request_log_service tests
 }

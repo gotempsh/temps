@@ -283,11 +283,11 @@ macro_rules! create_test_analytics_service {
         let test_db = $crate::testing::test_utils::TestDatabase::new($test_name)
             .await
             .unwrap();
-        crate::testing::test_utils::AnalyticsTestUtils::insert_test_data(&test_db.db)
+        $crate::testing::test_utils::AnalyticsTestUtils::insert_test_data(&test_db.db)
             .await
             .unwrap();
         let encryption_service = Arc::new(EncryptionService::new_from_password("test_password"));
-        let service = crate::AnalyticsService::new(test_db.db.clone(), encryption_service);
+        let service = $crate::AnalyticsService::new(test_db.db.clone(), encryption_service);
         (service, test_db.db.clone(), test_db) // Return the TestDatabase to keep container alive
     }};
 }

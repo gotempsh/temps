@@ -202,16 +202,14 @@ pub fn extract_visitor_id_cookie(req: &Request, crypto: &CookieCrypto) -> Option
 
     for cookie_header in headers.get_all("Cookie") {
         if let Ok(cookie_header_str) = cookie_header.to_str() {
-            for cookie_result in Cookie::split_parse(cookie_header_str) {
-                if let Ok(cookie) = cookie_result {
-                    if cookie.name() == VISITOR_ID_COOKIE_NAME {
-                        // Decrypt the cookie value
-                        match crypto.decrypt(cookie.value()) {
-                            Ok(decrypted) => return Some(decrypted),
-                            Err(_) => {
-                                // If decryption fails, no valid visitor ID
-                                return None;
-                            }
+            for cookie in Cookie::split_parse(cookie_header_str).flatten() {
+                if cookie.name() == VISITOR_ID_COOKIE_NAME {
+                    // Decrypt the cookie value
+                    match crypto.decrypt(cookie.value()) {
+                        Ok(decrypted) => return Some(decrypted),
+                        Err(_) => {
+                            // If decryption fails, no valid visitor ID
+                            return None;
                         }
                     }
                 }
@@ -226,16 +224,14 @@ pub fn extract_session_id_cookie(req: &Request, crypto: &CookieCrypto) -> Option
 
     for cookie_header in headers.get_all("Cookie") {
         if let Ok(cookie_header_str) = cookie_header.to_str() {
-            for cookie_result in Cookie::split_parse(cookie_header_str) {
-                if let Ok(cookie) = cookie_result {
-                    if cookie.name() == SESSION_ID_COOKIE_NAME {
-                        // Decrypt the cookie value
-                        match crypto.decrypt(cookie.value()) {
-                            Ok(decrypted) => return Some(decrypted),
-                            Err(_) => {
-                                // If decryption fails, no valid session ID
-                                return None;
-                            }
+            for cookie in Cookie::split_parse(cookie_header_str).flatten() {
+                if cookie.name() == SESSION_ID_COOKIE_NAME {
+                    // Decrypt the cookie value
+                    match crypto.decrypt(cookie.value()) {
+                        Ok(decrypted) => return Some(decrypted),
+                        Err(_) => {
+                            // If decryption fails, no valid session ID
+                            return None;
                         }
                     }
                 }

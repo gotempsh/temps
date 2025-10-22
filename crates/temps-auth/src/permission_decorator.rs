@@ -15,7 +15,6 @@
 ///     // Permission is automatically checked
 /// }
 /// ```
-
 /// Macro that generates a handler with automatic permission checking
 #[macro_export]
 macro_rules! permission_required {

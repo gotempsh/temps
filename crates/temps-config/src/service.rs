@@ -414,7 +414,6 @@ impl ConfigService {
                 data: Set(settings.to_json()),
                 created_at: Set(now),
                 updated_at: Set(now),
-                ..Default::default()
             };
             new_settings.insert(self.db.as_ref()).await?;
         }

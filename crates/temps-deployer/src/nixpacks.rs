@@ -850,13 +850,12 @@ mod tests {
         println!("Concurrent build 1: {:?}", result1.is_ok());
         println!("Concurrent build 2: {:?}", result2.is_ok());
 
-        // At minimum, they shouldn't panic or deadlock
-        assert!(true); // Test completion is success
+        // At minimum, they shouldn't panic or deadlock - test completion is success
     }
 
     // Helper functions for creating test projects
 
-    async fn create_nodejs_test_project(path: &PathBuf) {
+    async fn create_nodejs_test_project(path: &Path) {
         let package_json = r#"{
   "name": "test-nodejs-app",
   "version": "1.0.0",
@@ -900,7 +899,7 @@ app.listen(port, () => {
         fs::write(path.join("index.js"), index_js).await.unwrap();
     }
 
-    async fn create_python_test_project(path: &PathBuf) {
+    async fn create_python_test_project(path: &Path) {
         let requirements = r#"fastapi==0.104.1
 uvicorn==0.24.0
 pytest==7.4.3
@@ -954,7 +953,7 @@ def test_health():
             .unwrap();
     }
 
-    async fn create_rust_test_project(path: &PathBuf) {
+    async fn create_rust_test_project(path: &Path) {
         let cargo_toml = r#"[package]
 name = "nixpacks-rust-test"
 version = "0.1.0"
@@ -1052,8 +1051,7 @@ mod tests {
                 println!("Nixpacks list_images: {:?}", nixpacks_images.is_ok());
                 println!("Docker list_images: {:?}", docker_images.is_ok());
 
-                // Test that both handle the same interface
-                assert!(true); // If we get here, both implement ImageBuilder correctly
+                // Test that both handle the same interface - if we get here, both implement ImageBuilder correctly
             }
             Err(e) => {
                 println!("Docker not available for integration test: {}", e);
@@ -1141,8 +1139,7 @@ mod tests {
         println!("Concurrent nixpacks operation 1: {:?}", result1.is_ok());
         println!("Concurrent nixpacks operation 2: {:?}", result2.is_ok());
 
-        // Test completion without deadlock is success
-        assert!(true);
+        // Test completion without deadlock is success - if we get here, test passes
     }
 
     #[tokio::test]

@@ -26,15 +26,21 @@ struct HookResponse {
 #[derive(Deserialize)]
 struct GitLabCommitResponse {
     id: String,
+    #[allow(dead_code)]
     short_id: String,
+    #[allow(dead_code)]
     title: String,
     message: String,
     author_name: String,
     author_email: String,
+    #[allow(dead_code)]
     authored_date: String,
+    #[allow(dead_code)]
     committer_name: String,
+    #[allow(dead_code)]
     committer_email: String,
     committed_date: String,
+    #[allow(dead_code)]
     web_url: String,
 }
 

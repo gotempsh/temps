@@ -270,6 +270,7 @@ impl fmt::Display for Permission {
 }
 
 impl Permission {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "projects:read" => Some(Permission::ProjectsRead),
@@ -499,6 +500,7 @@ impl fmt::Display for Role {
 }
 
 impl Role {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "admin" => Some(Role::Admin),

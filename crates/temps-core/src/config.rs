@@ -33,7 +33,7 @@ impl Default for PaginationParams {
 impl PaginationParams {
     pub fn normalize(self) -> (u64, u64) {
         let page = self.page.unwrap_or(1).max(1);
-        let page_size = self.page_size.unwrap_or(20).min(100).max(1);
+        let page_size = self.page_size.unwrap_or(20).clamp(1, 100);
         (page, page_size)
     }
 }

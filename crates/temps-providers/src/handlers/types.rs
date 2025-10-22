@@ -57,6 +57,7 @@ pub enum ServiceTypeRoute {
 }
 
 impl ServiceTypeRoute {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> anyhow::Result<Self> {
         match s.to_lowercase().as_str() {
             "postgres" => Ok(ServiceTypeRoute::Postgres),
@@ -83,12 +84,12 @@ impl ServiceTypeRoute {
             .collect()
     }
 }
-impl ToString for ServiceTypeRoute {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for ServiceTypeRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ServiceTypeRoute::Postgres => "postgres".to_string(),
-            ServiceTypeRoute::Redis => "redis".to_string(),
-            ServiceTypeRoute::S3 => "s3".to_string(),
+            ServiceTypeRoute::Postgres => write!(f, "postgres"),
+            ServiceTypeRoute::Redis => write!(f, "redis"),
+            ServiceTypeRoute::S3 => write!(f, "s3"),
         }
     }
 }

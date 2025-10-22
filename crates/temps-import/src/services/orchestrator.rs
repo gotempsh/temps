@@ -4,6 +4,7 @@
 
 use sea_orm::{DatabaseConnection, EntityTrait};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use temps_import_types::{
     ImportPlan, ImportSelector, ImportSource, ValidationReport, WorkloadDescriptor, WorkloadId,
@@ -21,10 +22,12 @@ use crate::handlers::types::{
 /// Stored import session
 #[derive(Debug, Clone)]
 struct ImportSession {
+    #[allow(dead_code)]
     session_id: String,
     user_id: i32,
     plan: ImportPlan,
     validation: ValidationReport,
+    #[allow(dead_code)]
     repository_id: Option<i32>,
     git_provider_connection_id: Option<i32>,
     repo_owner: Option<String>,
@@ -287,6 +290,7 @@ impl ImportOrchestrator {
     }
 
     /// Execute an import
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_import(
         &self,
         user_id: i32,
@@ -428,6 +432,7 @@ mod tests {
         WorkloadImporter, WorkloadSnapshot,
     };
 
+    #[allow(dead_code)]
     fn create_test_db() -> Arc<DatabaseConnection> {
         // For unit tests, we create a mock database
         use sea_orm::{DatabaseBackend, MockDatabase};
@@ -813,31 +818,39 @@ mod tests {
     // Mock implementations for testing (kept for potential future integration tests)
 
     /// Mock Git Provider Manager
+    #[allow(dead_code)]
     struct MockGitProviderManager;
 
+    #[allow(dead_code)]
     fn create_mock_git_provider_manager() -> MockGitProviderManager {
         MockGitProviderManager
     }
 
     /// Mock Project Service for orchestrator tests
+    #[allow(dead_code)]
     struct MockProjectServiceForOrchestrator;
 
+    #[allow(dead_code)]
     fn create_mock_project_service_for_orchestrator() -> MockProjectServiceForOrchestrator {
         MockProjectServiceForOrchestrator
     }
 
     /// Mock Deployment Service
+    #[allow(dead_code)]
     struct MockDeploymentService;
 
+    #[allow(dead_code)]
     fn create_mock_deployment_service() -> MockDeploymentService {
         MockDeploymentService
     }
 
     /// Mock Workload Importer for testing
+    #[allow(dead_code)]
     struct MockWorkloadImporter {
         source: ImportSource,
     }
 
+    #[allow(dead_code)]
     impl MockWorkloadImporter {
         fn new() -> Self {
             Self {

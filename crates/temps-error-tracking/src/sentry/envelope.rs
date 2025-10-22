@@ -94,7 +94,7 @@ pub enum ItemType {
     RawSecurity,
     /// NEL report as sent by the browser.
     Nel,
-    /// Raw compressed UE4 crash report.
+    /// Raw compressed Unreal Engine 4 crash report.
     UnrealReport,
     /// User feedback encoded as JSON.
     UserReport,
@@ -189,6 +189,7 @@ pub struct ItemHeader {
 
 /// Represents an item in a Sentry envelope
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum EnvelopeItem {
     /// Error event
     Event(Annotated<Event>),
@@ -428,7 +429,7 @@ mod tests {
         let event_json = include_str!("../../resources/stacktrace_event.json");
         let event_value: serde_json::Value = serde_json::from_str(event_json).unwrap();
         let event_value = Event::from_value(event_value.into());
-        let event = event_value
+        let _event = event_value
             .value()
             .unwrap_or_else(|| panic!("Should parse event"));
         println!("{}", event_value.to_json_pretty().unwrap());

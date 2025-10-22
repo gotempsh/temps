@@ -178,10 +178,7 @@ mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::{
-        deployments, environments, projects,
-        types::ProjectType,
-    };
+    use temps_entities::{deployments, environments, projects, types::ProjectType};
 
     async fn create_test_deployment(
         db: &Arc<DbConnection>,
