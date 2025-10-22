@@ -94,7 +94,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_geo_plugin_default() {
-        let geo_plugin = GeoPlugin::default();
+        let geo_plugin = GeoPlugin;
         assert_eq!(geo_plugin.name(), "geo");
     }
 }

@@ -1144,7 +1144,7 @@ mod tests {
         // Verify metadata
         assert_eq!(plan.metadata.generator_version, "1.0.0");
         assert!(
-            plan.metadata.warnings.len() > 0,
+            !plan.metadata.warnings.is_empty(),
             "Should have warnings for bind mount"
         );
     }

@@ -150,7 +150,7 @@ impl TempsPlugin for GitPlugin {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use temps_core::plugin::PluginStateRegistry;
+    
     use temps_core::QueueError;
     use temps_core::{Job, JobReceiver};
 

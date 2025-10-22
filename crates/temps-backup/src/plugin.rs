@@ -99,7 +99,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_backup_plugin_default() {
-        let backup_plugin = BackupPlugin::default();
+        let backup_plugin = BackupPlugin;
         assert_eq!(backup_plugin.name(), "backup");
     }
 }

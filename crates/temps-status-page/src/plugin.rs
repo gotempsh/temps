@@ -218,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_page_plugin_default() {
-        let plugin = StatusPagePlugin::default();
+        let plugin = StatusPagePlugin;
         assert_eq!(plugin.name(), "status-page");
     }
 }

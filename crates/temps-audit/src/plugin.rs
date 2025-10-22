@@ -79,7 +79,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_audit_plugin_default() {
-        let audit_plugin = AuditPlugin::default();
+        let audit_plugin = AuditPlugin;
         assert_eq!(audit_plugin.name(), "audit");
     }
 }

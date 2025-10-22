@@ -96,7 +96,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_projects_plugin_default() {
-        let projects_plugin = ProjectsPlugin::default();
+        let projects_plugin = ProjectsPlugin;
         assert_eq!(projects_plugin.name(), "projects");
     }
 }

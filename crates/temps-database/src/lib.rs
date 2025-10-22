@@ -13,7 +13,7 @@ mod tests {
     use super::*;
     use sea_orm::{ConnectionTrait, Database};
     use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
-    use tokio;
+    
 
     #[tokio::test]
     async fn test_establish_connection() -> anyhow::Result<()> {

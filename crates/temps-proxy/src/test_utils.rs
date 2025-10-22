@@ -1,5 +1,4 @@
 use sea_orm::*;
-use sea_orm_migration::MigratorTrait;
 #[cfg(test)]
 use std::sync::Arc;
 use temps_database::DbConnection;
@@ -7,8 +6,6 @@ use temps_entities::{
     custom_routes, deployments, environments, project_custom_domains, projects, request_logs,
     visitor,
 };
-use temps_migrations::Migrator;
-use testcontainers::{runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 
 /// Test database setup with TimescaleDB container
 pub struct TestDBMockOperations {
@@ -210,6 +207,12 @@ pub struct MockProjectContextResolver {
 }
 
 #[cfg(test)]
+impl Default for MockProjectContextResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockProjectContextResolver {
     pub fn new() -> Self {
         Self {

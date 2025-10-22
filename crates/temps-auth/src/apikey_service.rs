@@ -549,7 +549,7 @@ mod tests {
             role_type: Set(role_type.to_string()),
             permissions: Set(None),
             is_active: Set(true),
-            expires_at: Set(Some((Utc::now() + Duration::days(365)))),
+            expires_at: Set(Some(Utc::now() + Duration::days(365))),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()

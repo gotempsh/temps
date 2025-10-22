@@ -713,8 +713,7 @@ CMD ["echo", "Hello from container"]
 
     #[test]
     fn test_multiple_port_mappings() {
-        let port_mappings = vec![
-            PortMapping {
+        let port_mappings = [PortMapping {
                 host_port: 8080,
                 container_port: 80,
                 protocol: Protocol::Tcp,
@@ -728,8 +727,7 @@ CMD ["echo", "Hello from container"]
                 host_port: 9090,
                 container_port: 9090,
                 protocol: Protocol::Udp,
-            },
-        ];
+            }];
 
         assert_eq!(port_mappings.len(), 3);
         assert_eq!(port_mappings[0].host_port, 8080);

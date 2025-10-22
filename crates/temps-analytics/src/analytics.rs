@@ -1746,9 +1746,9 @@ WHERE project_id = $1
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{test_helpers::AnalyticsTestHelper, test_utils::AnalyticsTestUtils};
+    use crate::testing::test_utils::AnalyticsTestUtils;
     use crate::{cleanup_test_analytics, create_test_analytics_service};
-    use chrono::DateTime;
+    
     use UtcDateTime;
 
     #[tokio::test]

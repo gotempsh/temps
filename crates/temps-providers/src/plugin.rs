@@ -91,7 +91,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_providers_plugin_default() {
-        let providers_plugin = ProvidersPlugin::default();
+        let providers_plugin = ProvidersPlugin;
         assert_eq!(providers_plugin.name(), "providers");
     }
 }

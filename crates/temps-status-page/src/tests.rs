@@ -1,14 +1,13 @@
 use crate::services::*;
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
-use serde_json;
 use std::sync::Arc;
 use temps_config::{ConfigService, ServerConfig};
 use temps_core::{Job, JobQueue, JobReceiver, QueueError};
 use temps_database::test_utils::TestDatabase;
 use temps_entities::{
     deployments, environments, projects, status_monitors,
-    types::{PipelineStatus, ProjectType},
+    types::ProjectType,
 };
 
 fn create_test_config_service(db: &Arc<DatabaseConnection>) -> Arc<ConfigService> {

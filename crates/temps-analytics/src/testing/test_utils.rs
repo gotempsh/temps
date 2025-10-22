@@ -1,7 +1,6 @@
 use sea_orm::{Database, DatabaseConnection};
 #[cfg(test)]
 use std::sync::Arc;
-use temps_core::EncryptionService;
 use temps_migrations::{Migrator, MigratorTrait};
 use testcontainers::{
     core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
@@ -281,7 +280,7 @@ impl AnalyticsTestUtils {
 #[macro_export]
 macro_rules! create_test_analytics_service {
     ($test_name:expr) => {{
-        let test_db = crate::testing::test_utils::TestDatabase::new($test_name)
+        let test_db = $crate::testing::test_utils::TestDatabase::new($test_name)
             .await
             .unwrap();
         crate::testing::test_utils::AnalyticsTestUtils::insert_test_data(&test_db.db)
@@ -297,7 +296,7 @@ macro_rules! create_test_analytics_service {
 #[macro_export]
 macro_rules! cleanup_test_analytics {
     ($db:expr) => {{
-        crate::testing::test_utils::AnalyticsTestUtils::cleanup_test_data(&$db)
+        $crate::testing::test_utils::AnalyticsTestUtils::cleanup_test_data(&$db)
             .await
             .unwrap();
     }};

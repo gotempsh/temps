@@ -114,7 +114,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_apikey_plugin_default() {
-        let apikey_plugin = ApiKeyPlugin::default();
+        let apikey_plugin = ApiKeyPlugin;
         assert_eq!(apikey_plugin.name(), "apikey");
     }
 }

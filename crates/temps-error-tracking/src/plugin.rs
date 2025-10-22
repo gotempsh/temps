@@ -138,7 +138,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_error_tracking_plugin_default() {
-        let plugin = ErrorTrackingPlugin::default();
+        let plugin = ErrorTrackingPlugin;
         assert_eq!(plugin.name(), "error-tracking");
     }
 }

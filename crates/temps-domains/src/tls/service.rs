@@ -749,7 +749,7 @@ mod tests {
     use super::*;
     use crate::tls::errors::ProviderError;
     use crate::tls::models::{
-        Certificate, CertificateFilter, CertificateStatus, ChallengeData, ChallengeStrategy,
+        Certificate, CertificateFilter, CertificateStatus, ChallengeData,
         ChallengeType, DnsChallengeData, ProvisioningResult, ValidationResult,
     };
     use crate::tls::providers::CertificateProvider;

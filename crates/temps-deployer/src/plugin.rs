@@ -162,7 +162,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deployer_plugin_default() {
-        let deployer_plugin = DeployerPlugin::default();
+        let deployer_plugin = DeployerPlugin;
         assert_eq!(deployer_plugin.name(), "deployer");
     }
 }

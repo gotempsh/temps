@@ -159,7 +159,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_domains_plugin_default() {
-        let domains_plugin = DomainsPlugin::default();
+        let domains_plugin = DomainsPlugin;
         assert_eq!(domains_plugin.name(), "domains");
     }
 }

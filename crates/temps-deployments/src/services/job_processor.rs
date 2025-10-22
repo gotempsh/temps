@@ -498,7 +498,7 @@ mod tests {
     use sea_orm::{ActiveModelTrait, Set};
     use temps_core::QueueError;
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::types::{PipelineStatus, ProjectType};
+    use temps_entities::types::ProjectType;
     use temps_logs::LogService;
 
     fn create_test_config_service(db: Arc<DbConnection>) -> Arc<temps_config::ConfigService> {

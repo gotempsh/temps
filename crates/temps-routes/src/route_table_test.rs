@@ -93,7 +93,7 @@ mod route_table_tests {
         route_table.load_routes().await?;
 
         // Verify route was loaded
-        assert!(route_table.len() >= 1);
+        assert!(!route_table.is_empty());
         let route_info = route_table.get_route("preview-123.example.com");
         assert!(route_info.is_some());
 
@@ -143,7 +143,7 @@ mod route_table_tests {
         route_table.load_routes().await?;
 
         // Verify route was loaded
-        assert!(route_table.len() >= 1);
+        assert!(!route_table.is_empty());
         let route_info = route_table.get_route("mycustomdomain.com");
         assert!(route_info.is_some());
 

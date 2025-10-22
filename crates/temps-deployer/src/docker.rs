@@ -1386,12 +1386,10 @@ CMD ["cat", "/hello.txt"]
 
     #[tokio::test]
     async fn test_restart_policy_enum() {
-        let policies = vec![
-            RestartPolicy::Never,
+        let policies = [RestartPolicy::Never,
             RestartPolicy::Always,
             RestartPolicy::OnFailure,
-            RestartPolicy::UnlessStopped,
-        ];
+            RestartPolicy::UnlessStopped];
 
         // Just test that all enum variants exist and can be created
         assert_eq!(policies.len(), 4);

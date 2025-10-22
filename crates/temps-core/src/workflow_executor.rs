@@ -283,7 +283,7 @@ impl WorkflowExecutor {
 
         for job_id in job_states.keys() {
             if !visited.contains(job_id)
-                && self.has_cycle(job_id, job_states, &mut visited, &mut rec_stack)?
+                && Self::has_cycle(job_id, job_states, &mut visited, &mut rec_stack)?
             {
                 return Err(WorkflowError::DependencyCycleDetected(format!(
                     "Dependency cycle detected involving job '{}'",
@@ -297,7 +297,6 @@ impl WorkflowExecutor {
 
     /// Check for cycles using DFS
     fn has_cycle(
-        &self,
         job_id: &str,
         job_states: &HashMap<String, JobExecutionState>,
         visited: &mut HashSet<String>,
@@ -309,7 +308,7 @@ impl WorkflowExecutor {
         if let Some(job_state) = job_states.get(job_id) {
             for dep_id in &job_state.dependencies {
                 if !visited.contains(dep_id) {
-                    if self.has_cycle(dep_id, job_states, visited, rec_stack)? {
+                    if Self::has_cycle(dep_id, job_states, visited, rec_stack)? {
                         return Ok(true);
                     }
                 } else if rec_stack.contains(dep_id) {

@@ -43,7 +43,7 @@ fn main() {
 
 fn create_sample_error() -> ErrorGroup {
     use chrono::Utc;
-    use temps_entities::error_groups::PgVector;
+    
 
     ErrorGroup {
         id: 1,

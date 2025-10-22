@@ -141,7 +141,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_infra_plugin_default() {
-        let infra_plugin = InfraPlugin::default();
+        let infra_plugin = InfraPlugin;
         assert_eq!(infra_plugin.name(), "infra");
     }
 }

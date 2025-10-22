@@ -84,7 +84,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_environments_plugin_default() {
-        let environments_plugin = EnvironmentsPlugin::default();
+        let environments_plugin = EnvironmentsPlugin;
         assert_eq!(environments_plugin.name(), "environments");
     }
 }

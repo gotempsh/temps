@@ -190,7 +190,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deployments_plugin_default() {
-        let deployments_plugin = DeploymentsPlugin::default();
+        let deployments_plugin = DeploymentsPlugin;
         assert_eq!(deployments_plugin.name(), "deployments");
     }
 

@@ -180,7 +180,7 @@ mod tests {
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{
         deployments, environments, projects,
-        types::{PipelineStatus, ProjectType},
+        types::ProjectType,
     };
 
     async fn create_test_deployment(

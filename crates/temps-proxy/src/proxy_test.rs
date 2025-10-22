@@ -10,7 +10,7 @@ mod proxy_tests {
     use pingora::upstreams::peer::Peer;
     use std::sync::atomic::{AtomicU16, Ordering};
     use std::sync::Arc;
-    use temps_core::CookieCrypto;
+    
     use temps_database::test_utils::TestDatabase;
     use temps_routes::CachedPeerTable;
     use tokio::io::AsyncWriteExt;
@@ -18,10 +18,10 @@ mod proxy_tests {
 
     use anyhow::Result;
     use http_body_util::Full;
-    use lazy_static::lazy_static;
+    
     use std::collections::HashMap;
     use std::convert::Infallible;
-    use std::sync::{Arc as StdArc, Mutex};
+    
 
     // Helper to convert std errors to anyhow
     fn convert_error<T>(result: Result<T, Box<dyn std::error::Error>>) -> Result<T> {

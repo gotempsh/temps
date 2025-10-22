@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn test_analytics_plugin_default() {
-        let analytics_plugin = AnalyticsPlugin::default();
+        let analytics_plugin = AnalyticsPlugin;
         assert_eq!(analytics_plugin.name(), "analytics");
     }
 }

@@ -398,7 +398,7 @@ impl ErrorCRUDService {
 mod tests {
     use super::*;
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::{error_events, error_groups, projects};
+    use temps_entities::{error_groups, projects};
 
     /// Test: Manual error resolution workflow
     ///

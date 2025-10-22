@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use temps_screenshots::{
     LocalScreenshotProvider, RemoteScreenshotProvider, ScreenshotError, ScreenshotProvider,
-    ScreenshotService,
 };
 
 /// Test that the local provider can be created with default settings

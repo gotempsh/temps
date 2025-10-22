@@ -194,7 +194,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_plugin_default() {
-        let auth_plugin = AuthPlugin::default();
+        let auth_plugin = AuthPlugin;
         assert_eq!(auth_plugin.name(), "auth");
     }
 }

@@ -999,7 +999,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use sea_orm::{ActiveModelTrait, Set};
-    use std::sync::Mutex;
+    
     use temps_database::test_utils::TestDatabase;
     use temps_entities::types::{JobStatus, ProjectType};
 

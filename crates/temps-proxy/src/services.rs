@@ -683,7 +683,7 @@ impl SessionManager for SessionManagerImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CrawlerDetector;
+    
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{deployments, environments, projects, request_logs, visitor};
 
@@ -828,7 +828,7 @@ mod tests {
         assert_eq!(logs.browser, Some("Chrome".to_string()));
         assert!(logs.browser_version.is_some());
         assert_eq!(logs.operating_system, Some("Windows 10".to_string()));
-        assert_eq!(logs.is_mobile, false);
+        assert!(!logs.is_mobile);
     }
 
     #[tokio::test]
@@ -873,7 +873,7 @@ mod tests {
             .unwrap()
             .expect("Log should be created");
 
-        assert_eq!(logs.is_mobile, true);
+        assert!(logs.is_mobile);
         assert_eq!(logs.operating_system, Some("iPhone".to_string()));
     }
 
@@ -919,7 +919,7 @@ mod tests {
             .unwrap()
             .expect("Log should be created");
 
-        assert_eq!(logs.is_crawler, true);
+        assert!(logs.is_crawler);
         assert!(logs.crawler_name.is_some());
         assert!(logs.crawler_name.unwrap().contains("Google"));
     }
@@ -1060,7 +1060,7 @@ mod tests {
 
         assert_eq!(logs.visitor_id, Some(visitor_id_i32));
         assert_eq!(logs.session_id, Some(session_id_i32));
-        assert_eq!(logs.is_entry_page, true); // New session = entry page
+        assert!(logs.is_entry_page); // New session = entry page
         assert_eq!(logs.referrer, Some("https://google.com".to_string()));
     }
 

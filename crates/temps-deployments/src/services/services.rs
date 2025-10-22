@@ -1310,14 +1310,14 @@ impl DeploymentService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
+    
     use chrono::Utc;
     use mockall::mock;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
-    use std::collections::HashMap;
+    
     use std::sync::Arc;
     use temps_core::EncryptionService;
-    use temps_database::{test_utils::TestDatabase, DbConnection};
+    use temps_database::test_utils::TestDatabase;
     use temps_entities::{
         deployments, env_vars, environments, external_service_params, external_services,
         project_services, projects,
@@ -1960,7 +1960,7 @@ mod tests {
     #[tokio::test]
     async fn test_deployment_jobs_with_log_ids() -> Result<(), Box<dyn std::error::Error>> {
         use crate::services::workflow_planner::WorkflowPlanner;
-        use temps_entities::deployment_jobs;
+        
 
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();

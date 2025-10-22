@@ -827,6 +827,12 @@ pub mod test_utils {
         accounts: Arc<RwLock<HashMap<String, AcmeAccount>>>,
     }
 
+    impl Default for MockCertificateRepository {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MockCertificateRepository {
         pub fn new() -> Self {
             Self {

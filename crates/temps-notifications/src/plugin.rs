@@ -108,7 +108,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notifications_plugin_default() {
-        let notifications_plugin = NotificationsPlugin::default();
+        let notifications_plugin = NotificationsPlugin;
         assert_eq!(notifications_plugin.name(), "notifications");
     }
 }

@@ -113,27 +113,27 @@ mod tests {
     fn test_package_manager_detection() {
         // Test pnpm detection
         let temp_dir = create_test_dir_with_files(&["pnpm-lock.yaml"]);
-        let package_manager = PackageManager::detect(&temp_dir.path().to_path_buf());
+        let package_manager = PackageManager::detect(temp_dir.path());
         assert!(matches!(package_manager, PackageManager::Pnpm));
 
         // Test npm detection
         let temp_dir = create_test_dir_with_files(&["package-lock.json"]);
-        let package_manager = PackageManager::detect(&temp_dir.path().to_path_buf());
+        let package_manager = PackageManager::detect(temp_dir.path());
         assert!(matches!(package_manager, PackageManager::Npm));
 
         // Test yarn detection
         let temp_dir = create_test_dir_with_files(&["yarn.lock"]);
-        let package_manager = PackageManager::detect(&temp_dir.path().to_path_buf());
+        let package_manager = PackageManager::detect(temp_dir.path());
         assert!(matches!(package_manager, PackageManager::Yarn));
 
         // Test bun detection
         let temp_dir = create_test_dir_with_files(&["bun.lockb"]);
-        let package_manager = PackageManager::detect(&temp_dir.path().to_path_buf());
+        let package_manager = PackageManager::detect(temp_dir.path());
         assert!(matches!(package_manager, PackageManager::Bun));
 
         // Test default (npm) when no lock files
         let temp_dir = create_test_dir_with_files(&["package.json"]);
-        let package_manager = PackageManager::detect(&temp_dir.path().to_path_buf());
+        let package_manager = PackageManager::detect(temp_dir.path());
         assert!(matches!(package_manager, PackageManager::Npm));
     }
 

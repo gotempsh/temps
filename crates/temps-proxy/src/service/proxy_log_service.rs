@@ -469,7 +469,7 @@ impl ProxyLogService {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     // Tests would go here - similar to request_log_service tests
 }
