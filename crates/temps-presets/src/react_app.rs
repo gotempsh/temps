@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::{PackageManager, Preset, ProjectType};
 
@@ -23,8 +23,8 @@ impl Preset for CreateReactApp {
 
     fn dockerfile(
         &self,
-        _root_local_path: &PathBuf,
-        local_path: &PathBuf,
+        _root_local_path: &Path,
+        local_path: &Path,
         install_command: Option<&str>,
         build_command: Option<&str>,
         _output_dir: Option<&str>,
@@ -104,7 +104,7 @@ CMD ["serve", "-s", "build", "-l", "3000"]
         dockerfile
     }
 
-    fn dockerfile_with_build_dir(&self, local_path: &PathBuf) -> String {
+    fn dockerfile_with_build_dir(&self, local_path: &Path) -> String {
         let pkg_manager = self.package_manager(local_path);
 
         format!(

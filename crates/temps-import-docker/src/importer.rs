@@ -937,16 +937,14 @@ impl DockerImporter {
             .as_ref()
             .and_then(|hc| hc.restart_policy.as_ref())
             .and_then(|rp| rp.name.as_ref())
-            .and_then(|name| match name {
+            .map(|name| match name {
                 RestartPolicyNameEnum::NO | RestartPolicyNameEnum::EMPTY => {
-                    Some(temps_import_types::RestartPolicy::No)
+                    temps_import_types::RestartPolicy::No
                 }
-                RestartPolicyNameEnum::ALWAYS => Some(temps_import_types::RestartPolicy::Always),
-                RestartPolicyNameEnum::ON_FAILURE => {
-                    Some(temps_import_types::RestartPolicy::OnFailure)
-                }
+                RestartPolicyNameEnum::ALWAYS => temps_import_types::RestartPolicy::Always,
+                RestartPolicyNameEnum::ON_FAILURE => temps_import_types::RestartPolicy::OnFailure,
                 RestartPolicyNameEnum::UNLESS_STOPPED => {
-                    Some(temps_import_types::RestartPolicy::UnlessStopped)
+                    temps_import_types::RestartPolicy::UnlessStopped
                 }
             });
 

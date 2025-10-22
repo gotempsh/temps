@@ -254,7 +254,8 @@ async fn test_workflow_execution_service_with_real_jobs() {
     let dsn_service = Arc::new(temps_error_tracking::DSNService::new(db.clone()));
 
     // Create ExternalServiceManager
-    let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(db.clone()));
+    let external_service_manager =
+        Arc::new(temps_providers::ExternalServiceManager::new(db.clone()));
 
     // Create jobs using WorkflowPlanner
     let workflow_planner = WorkflowPlanner::new(

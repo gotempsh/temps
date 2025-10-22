@@ -1,4 +1,4 @@
-use std::{fmt, path::PathBuf};
+use std::{fmt, path::Path};
 
 mod custom;
 mod docker;
@@ -90,8 +90,8 @@ pub trait Preset: fmt::Display + Send + Sync {
     fn icon_url(&self) -> String;
     fn dockerfile(
         &self,
-        root_local_path: &PathBuf,
-        local_path: &PathBuf,
+        root_local_path: &Path,
+        local_path: &Path,
         install_command: Option<&str>,
         build_command: Option<&str>,
         output_dir: Option<&str>,

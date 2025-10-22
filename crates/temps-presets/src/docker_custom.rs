@@ -1,6 +1,6 @@
 use super::{Preset, ProjectType};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::Path;
 
 pub struct DockerCustomPreset;
 
@@ -23,8 +23,8 @@ impl Preset for DockerCustomPreset {
 
     fn dockerfile(
         &self,
-        _root_local_path: &PathBuf,
-        _local_path: &PathBuf,
+        _root_local_path: &Path,
+        _local_path: &Path,
         install_command: Option<&str>,
         build_command: Option<&str>,
         output_dir: Option<&str>,
@@ -32,7 +32,7 @@ impl Preset for DockerCustomPreset {
         project_slug: &str,
     ) -> String {
         let base_image = "alpine:latest";
-        
+
         // Create the initial part of the Dockerfile
         let mut dockerfile = format!(r#"FROM {}
 
@@ -51,7 +51,7 @@ COPY . .
                 .map(|var| format!("ARG {}", var))
                 .collect::<Vec<_>>()
                 .join("\n");
-            
+
             if !build_vars_section.is_empty() {
                 dockerfile = format!("{}# Build arguments\n{}\n\n", dockerfile, build_vars_section);
             }
@@ -106,19 +106,19 @@ RUN echo 'server {{ \\
 EXPOSE 80
 
 # Start the web server
-CMD [\"nginx\", \"-g\", \"daemon off;\"]", 
-            dockerfile, 
+CMD [\"nginx\", \"-g\", \"daemon off;\"]",
+            dockerfile,
             app_dir
         );
 
         dockerfile
     }
 
-    fn dockerfile_with_build_dir(&self, local_path: &PathBuf) -> String {
+    fn dockerfile_with_build_dir(&self, local_path: &Path) -> String {
         // This method should return a Dockerfile that can be used with a build context directory
         // In this case, we'll use the same Dockerfile as the regular one
         self.dockerfile(
-            &PathBuf::new(),
+            Path::new(""),
             local_path,
             None,
             None,
@@ -128,12 +128,12 @@ CMD [\"nginx\", \"-g\", \"daemon off;\"]",
         )
     }
 
-    fn install_command(&self, _local_path: &PathBuf) -> String {
+    fn install_command(&self, _local_path: &Path) -> String {
         // This will be overridden by the actual project's install command
         "".to_string()
     }
 
-    fn build_command(&self, _local_path: &PathBuf) -> String {
+    fn build_command(&self, _local_path: &Path) -> String {
         // This will be overridden by the actual project's build command
         "".to_string()
     }
@@ -147,4 +147,4 @@ impl fmt::Display for DockerCustomPreset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Docker Custom Preset")
     }
-} 
+}

@@ -1,6 +1,6 @@
 use super::{PackageManager, Preset, ProjectType};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::Path;
 
 pub struct DockerfilePreset;
 
@@ -23,8 +23,8 @@ impl Preset for DockerfilePreset {
 
     fn dockerfile(
         &self,
-        _root_local_path: &PathBuf,
-        local_path: &PathBuf,
+        _root_local_path: &Path,
+        local_path: &Path,
         _install_command: Option<&str>,
         _build_command: Option<&str>,
         _output_dir: Option<&str>,
@@ -43,7 +43,7 @@ impl Preset for DockerfilePreset {
                 .map(|var| format!("ARG {}", var))
                 .collect::<Vec<_>>()
                 .join("\n");
-            
+
             // Insert ARG statements after the first FROM
             if let Some(from_pos) = dockerfile.find("FROM") {
                 if let Some(newline_pos) = dockerfile[from_pos..].find('\n') {
@@ -56,21 +56,21 @@ impl Preset for DockerfilePreset {
         dockerfile
     }
 
-    fn dockerfile_with_build_dir(&self, local_path: &PathBuf) -> String {
+    fn dockerfile_with_build_dir(&self, local_path: &Path) -> String {
         // For projects with their own Dockerfile, we'll use it directly
         let dockerfile_path = local_path.join("Dockerfile");
         std::fs::read_to_string(&dockerfile_path)
             .unwrap_or_else(|_| "# No Dockerfile found".to_string())
     }
 
-    fn install_command(&self, local_path: &PathBuf) -> String {
+    fn install_command(&self, local_path: &Path) -> String {
         // Try to detect the package manager and return appropriate command
         PackageManager::detect(local_path)
             .install_command()
             .to_string()
     }
 
-    fn build_command(&self, local_path: &PathBuf) -> String {
+    fn build_command(&self, local_path: &Path) -> String {
         // Try to detect the package manager and return appropriate command
         PackageManager::detect(local_path)
             .build_command()
@@ -87,4 +87,4 @@ impl fmt::Display for DockerfilePreset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.label())
     }
-} 
+}

@@ -27,10 +27,8 @@ impl ActiveModelBehavior for ActiveModel {
     {
         let now = chrono::Utc::now();
 
-        if insert {
-            if self.created_at.is_not_set() {
-                self.created_at = Set(now);
-            }
+        if insert && self.created_at.is_not_set() {
+            self.created_at = Set(now);
         }
 
         Ok(self)

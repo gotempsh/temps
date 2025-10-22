@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use super::{PackageManager, Preset, ProjectType};
 
@@ -23,7 +23,7 @@ impl Preset for Rsbuild {
 
     fn dockerfile(
         &self,
-        _root_local_path: &PathBuf, local_path: &PathBuf,
+        _root_local_path: &Path, local_path: &Path,
         install_command: Option<&str>,
         build_command: Option<&str>,
         _output_dir: Option<&str>,
@@ -104,7 +104,7 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
         dockerfile
     }
 
-    fn dockerfile_with_build_dir(&self, _local_path: &PathBuf) -> String {
+    fn dockerfile_with_build_dir(&self, _local_path: &Path) -> String {
         r#"
 # Use a lightweight base image
 FROM oven/bun:1.2-alpine
@@ -126,13 +126,13 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
 "#.to_string()
     }
 
-    fn install_command(&self, local_path: &PathBuf) -> String {
+    fn install_command(&self, local_path: &Path) -> String {
         PackageManager::detect(local_path)
             .install_command()
             .to_string()
     }
 
-    fn build_command(&self, local_path: &PathBuf) -> String {
+    fn build_command(&self, local_path: &Path) -> String {
         PackageManager::detect(local_path)
             .build_command()
             .to_string()

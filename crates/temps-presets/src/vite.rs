@@ -1,5 +1,5 @@
 use super::{PackageManager, Preset, ProjectType};
-use std::path::PathBuf;
+use std::path::Path;
 
 pub struct Vite;
 
@@ -22,8 +22,8 @@ impl Preset for Vite {
 
     fn dockerfile(
         &self,
-        _root_local_path: &PathBuf,
-        local_path: &PathBuf,
+        _root_local_path: &Path,
+        local_path: &Path,
         install_command: Option<&str>,
         build_command: Option<&str>,
         output_dir: Option<&str>,
@@ -66,7 +66,7 @@ COPY --from=builder /app/{} /usr/share/nginx/html
         dockerfile
     }
 
-    fn dockerfile_with_build_dir(&self, local_path: &PathBuf) -> String {
+    fn dockerfile_with_build_dir(&self, local_path: &Path) -> String {
         let pkg_manager = PackageManager::detect(local_path);
 
         format!(
@@ -96,13 +96,13 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
         )
     }
 
-    fn install_command(&self, local_path: &PathBuf) -> String {
+    fn install_command(&self, local_path: &Path) -> String {
         PackageManager::detect(local_path)
             .install_command()
             .to_string()
     }
 
-    fn build_command(&self, local_path: &PathBuf) -> String {
+    fn build_command(&self, local_path: &Path) -> String {
         PackageManager::detect(local_path)
             .build_command()
             .to_string()

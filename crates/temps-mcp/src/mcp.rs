@@ -147,8 +147,7 @@ impl McpService {
                     result.push_str(&format!("Updated: {}\n", project.updated_at));
 
                     result.push_str(
-                        &"\nNote: Deployment information is not available in this service.\n"
-                            .to_string(),
+                        "\nNote: Deployment information is not available in this service.\n",
                     );
 
                     Ok(CallToolResult::success(vec![Content::text(result)]))

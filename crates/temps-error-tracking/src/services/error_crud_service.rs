@@ -26,7 +26,7 @@ impl ErrorCRUDService {
         let data = event
             .data
             .as_ref()
-            .and_then(|v| ErrorEventData::from_json_value(v));
+            .and_then(ErrorEventData::from_json_value);
 
         ErrorEventDomain {
             id: event.id,

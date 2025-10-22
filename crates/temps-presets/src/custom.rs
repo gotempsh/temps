@@ -1,6 +1,6 @@
 use super::{Preset, ProjectType};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::Path;
 
 #[derive(Clone)]
 pub struct CustomPreset {
@@ -71,8 +71,8 @@ impl Preset for CustomPreset {
 
     fn dockerfile(
         &self,
-        _root_local_path: &PathBuf,
-        _local_path: &PathBuf,
+        _root_local_path: &Path,
+        _local_path: &Path,
         install_command: Option<&str>,
         build_command: Option<&str>,
         output_dir: Option<&str>,
@@ -105,15 +105,15 @@ impl Preset for CustomPreset {
         dockerfile
     }
 
-    fn dockerfile_with_build_dir(&self, _local_path: &PathBuf) -> String {
+    fn dockerfile_with_build_dir(&self, _local_path: &Path) -> String {
         self.dockerfile_with_build_dir.clone()
     }
 
-    fn install_command(&self, _local_path: &PathBuf) -> String {
+    fn install_command(&self, _local_path: &Path) -> String {
         self.install_command.clone()
     }
 
-    fn build_command(&self, _local_path: &PathBuf) -> String {
+    fn build_command(&self, _local_path: &Path) -> String {
         self.build_command.clone()
     }
 

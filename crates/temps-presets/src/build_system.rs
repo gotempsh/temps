@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use super::PackageManager;
 #[derive(Debug, Clone)]
 pub enum MonorepoTool {
@@ -62,7 +62,7 @@ impl ToString for MonorepoTool {
     fn to_string(&self) -> String {
         match self {
             MonorepoTool::Lerna => "lerna".to_string(),
-            MonorepoTool::Turbo => "turbo".to_string(), 
+            MonorepoTool::Turbo => "turbo".to_string(),
             MonorepoTool::Nx => "nx".to_string(),
             MonorepoTool::None => "none".to_string(),
         }
@@ -90,17 +90,17 @@ impl BuildSystem {
             (PackageManager::Yarn, MonorepoTool::Lerna) => "yarn lerna bootstrap".to_string(),
             (PackageManager::Pnpm, MonorepoTool::Lerna) => "pnpm lerna bootstrap".to_string(),
             (PackageManager::Bun, MonorepoTool::Lerna) => "bun lerna bootstrap".to_string(),
-            
+
             (PackageManager::Npm, MonorepoTool::Turbo) => "npm install".to_string(),
             (PackageManager::Yarn, MonorepoTool::Turbo) => "yarn install".to_string(),
             (PackageManager::Pnpm, MonorepoTool::Turbo) => "pnpm install".to_string(),
             (PackageManager::Bun, MonorepoTool::Turbo) => "bun install".to_string(),
-            
+
             (PackageManager::Npm, MonorepoTool::Nx) => "npx nx exec -- npm install".to_string(),
             (PackageManager::Yarn, MonorepoTool::Nx) => "npx nx exec -- yarn install".to_string(),
             (PackageManager::Pnpm, MonorepoTool::Nx) => "npx nx exec -- pnpm install".to_string(),
             (PackageManager::Bun, MonorepoTool::Nx) => "npx nx exec -- bun install".to_string(),
-            
+
             (_, MonorepoTool::None) => self.package_manager.install_command().to_string(),
         }
     }
@@ -116,7 +116,7 @@ impl BuildSystem {
             }
             (PackageManager::Yarn, MonorepoTool::Lerna) => {
                 if let Some(pkg) = package_name {
-                    format!("yarn lerna run build --scope={}", pkg) 
+                    format!("yarn lerna run build --scope={}", pkg)
                 } else {
                     "yarn lerna run build".to_string()
                 }
@@ -135,7 +135,7 @@ impl BuildSystem {
                     "bun lerna run build".to_string()
                 }
             }
-            
+
             (PackageManager::Npm, MonorepoTool::Turbo) => {
                 if let Some(_pkg) = package_name {
                     "npx turbo build".to_string()
@@ -164,7 +164,7 @@ impl BuildSystem {
                     "bun turbo run build".to_string()
                 }
             }
-            
+
             (PackageManager::Npm, MonorepoTool::Nx) => {
                 if let Some(pkg) = package_name {
                     format!("npx nx build {}", pkg)
@@ -193,8 +193,8 @@ impl BuildSystem {
                     "bun nx run-many --target=build --all".to_string()
                 }
             }
-            
+
             (_, MonorepoTool::None) => self.package_manager.build_command().to_string(),
         }
     }
-} 
+}

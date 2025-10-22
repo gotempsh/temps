@@ -1,7 +1,7 @@
 use super::build_system::{BuildSystem, MonorepoTool};
 use super::{PackageManager, Preset, ProjectType};
 use tracing::debug;
-use std::path::PathBuf;
+use std::path::Path;
 
 pub struct NextJs;
 
@@ -24,8 +24,8 @@ impl Preset for NextJs {
 
     fn dockerfile(
         &self,
-        root_local_path: &PathBuf,
-        local_path: &PathBuf,
+        root_local_path: &Path,
+        local_path: &Path,
         install_command: Option<&str>,
         build_command: Option<&str>,
         _output_dir: Option<&str>,
@@ -231,7 +231,7 @@ EXPOSE 3000
         dockerfile
     }
 
-    fn dockerfile_with_build_dir(&self, _local_path: &PathBuf) -> String {
+    fn dockerfile_with_build_dir(&self, _local_path: &Path) -> String {
         r#"
 # Use a lightweight Node.js image as the base
 FROM node:22-alpine AS runner
@@ -258,13 +258,13 @@ CMD ["node", "server.js"]
 "#.to_string()
     }
 
-    fn install_command(&self, local_path: &PathBuf) -> String {
+    fn install_command(&self, local_path: &Path) -> String {
         PackageManager::detect(local_path)
             .install_command()
             .to_string()
     }
 
-    fn build_command(&self, local_path: &PathBuf) -> String {
+    fn build_command(&self, local_path: &Path) -> String {
         PackageManager::detect(local_path)
             .build_command()
             .to_string()
