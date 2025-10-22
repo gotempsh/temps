@@ -17,13 +17,25 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Free up disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          echo "Disk space after cleanup:"
+          df -h
+
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install build dependencies
         run: |
-          apt-get update
-          apt-get install -y cmake pkg-config libssl-dev
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libssl-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -32,11 +44,21 @@ jobs:
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-amd64-release
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
 
       - name: Install web dependencies
         run: |
@@ -47,6 +69,7 @@ jobs:
         run: cargo build --release --bin temps
         env:
           FORCE_WEB_BUILD: 1
+          CARGO_INCREMENTAL: 0
 
       - name: Strip binary
         run: strip target/release/temps
@@ -54,7 +77,7 @@ jobs:
       - name: Rename binary
         run: cp target/release/temps temps-linux-amd64
 
-      - name: Generate checksums
+      - name: Generate checksum
         run: |
           sha256sum temps-linux-amd64 > temps-linux-amd64.sha256
           cat temps-linux-amd64.sha256
@@ -65,14 +88,196 @@ jobs:
           file temps-linux-amd64
           ./temps-linux-amd64 --version || echo "Note: Binary may require runtime dependencies"
 
-      - name: Create Release and Upload Assets
-        uses: softprops/action-gh-release@v2
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: temps-linux-amd64
+          path: |
             temps-linux-amd64
             temps-linux-amd64.sha256
+
+  build-darwin-amd64:
+    name: Build macOS AMD64
+    runs-on: macos-13
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: darwin-amd64-release
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install web dependencies
+        run: |
+          cd web
+          bun install
+
+      - name: Build release binary
+        run: cargo build --release --bin temps --target x86_64-apple-darwin
+        env:
+          FORCE_WEB_BUILD: 1
+          CARGO_INCREMENTAL: 0
+
+      - name: Strip binary
+        run: strip target/x86_64-apple-darwin/release/temps
+
+      - name: Rename binary
+        run: cp target/x86_64-apple-darwin/release/temps temps-darwin-amd64
+
+      - name: Generate checksum
+        run: |
+          shasum -a 256 temps-darwin-amd64 > temps-darwin-amd64.sha256
+          cat temps-darwin-amd64.sha256
+
+      - name: Get binary info
+        run: |
+          ls -lh temps-darwin-amd64
+          file temps-darwin-amd64
+          ./temps-darwin-amd64 --version || echo "Note: Binary may require runtime dependencies"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: temps-darwin-amd64
+          path: |
+            temps-darwin-amd64
+            temps-darwin-amd64.sha256
+
+  build-darwin-arm64:
+    name: Build macOS ARM64
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: darwin-arm64-release
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install web dependencies
+        run: |
+          cd web
+          bun install
+
+      - name: Build release binary
+        run: cargo build --release --bin temps --target aarch64-apple-darwin
+        env:
+          FORCE_WEB_BUILD: 1
+          CARGO_INCREMENTAL: 0
+
+      - name: Strip binary
+        run: strip target/aarch64-apple-darwin/release/temps
+
+      - name: Rename binary
+        run: cp target/aarch64-apple-darwin/release/temps temps-darwin-arm64
+
+      - name: Generate checksum
+        run: |
+          shasum -a 256 temps-darwin-arm64 > temps-darwin-arm64.sha256
+          cat temps-darwin-arm64.sha256
+
+      - name: Get binary info
+        run: |
+          ls -lh temps-darwin-arm64
+          file temps-darwin-arm64
+          ./temps-darwin-arm64 --version || echo "Note: Binary may require runtime dependencies"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: temps-darwin-arm64
+          path: |
+            temps-darwin-arm64
+            temps-darwin-arm64.sha256
+
+  create-release:
+    name: Create Release
+    needs: [build-linux-amd64, build-darwin-amd64, build-darwin-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Organize artifacts
+        run: |
+          mkdir -p release
+          cp artifacts/temps-linux-amd64/* release/
+          cp artifacts/temps-darwin-amd64/* release/
+          cp artifacts/temps-darwin-arm64/* release/
+          ls -lh release/
+
+      - name: Create combined checksums file
+        run: |
+          cd release
+          cat temps-linux-amd64.sha256 > checksums.txt
+          cat temps-darwin-amd64.sha256 >> checksums.txt
+          cat temps-darwin-arm64.sha256 >> checksums.txt
+          echo "Combined checksums:"
+          cat checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
           draft: false
           prerelease: ${{ contains(github.ref, '-') }}
+          generate_release_notes: false
+          files: |
+            release/temps-linux-amd64
+            release/temps-linux-amd64.sha256
+            release/temps-darwin-amd64
+            release/temps-darwin-amd64.sha256
+            release/temps-darwin-arm64
+            release/temps-darwin-arm64.sha256
+            release/checksums.txt
           body: |
             ## Changes
 
@@ -95,8 +300,41 @@ jobs:
             temps --version
             ```
 
+            ### macOS AMD64 (Intel)
+            ```bash
+            # Download
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-darwin-amd64
+
+            # Make executable
+            chmod +x temps-darwin-amd64
+
+            # Move to PATH
+            sudo mv temps-darwin-amd64 /usr/local/bin/temps
+
+            # Verify
+            temps --version
+            ```
+
+            ### macOS ARM64 (Apple Silicon)
+            ```bash
+            # Download
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-darwin-arm64
+
+            # Make executable
+            chmod +x temps-darwin-arm64
+
+            # Move to PATH
+            sudo mv temps-darwin-arm64 /usr/local/bin/temps
+
+            # Verify
+            temps --version
+            ```
+
             ### Checksums
             ```bash
+            # Download checksums
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/checksums.txt
+
             # Verify checksum (Linux/macOS)
-            sha256sum -c temps-linux-amd64.sha256
+            sha256sum -c checksums.txt --ignore-missing
             ```
