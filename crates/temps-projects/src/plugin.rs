@@ -42,9 +42,9 @@ impl TempsPlugin for ProjectsPlugin {
             let config_service = context.require_service::<temps_config::ConfigService>();
             let external_service_manager =
                 context.require_service::<temps_providers::ExternalServiceManager>();
-            let git_provider_manager =
-                context.require_service::<temps_git::GitProviderManager>();
-            let environment_service = context.require_service::<temps_environments::EnvironmentService>();
+            let git_provider_manager = context.require_service::<temps_git::GitProviderManager>();
+            let environment_service =
+                context.require_service::<temps_environments::EnvironmentService>();
 
             // Create ProjectService
             let project_service = Arc::new(ProjectService::new(
@@ -76,9 +76,7 @@ impl TempsPlugin for ProjectsPlugin {
             audit_service,
         });
         let routes = crate::handlers::configure_routes().with_state(app_state);
-        Some(PluginRoutes {
-            router: routes,
-        })
+        Some(PluginRoutes { router: routes })
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

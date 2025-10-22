@@ -9,33 +9,32 @@
 //! - Request/response filtering
 
 pub mod config;
-pub mod traits;
-pub mod proxy;
-pub mod services;
-pub mod server;
-pub mod handler;
-pub mod service;
-pub mod plugin;
 pub mod crawler_detector;
+pub mod handler;
+pub mod plugin;
+pub mod proxy;
+pub mod server;
+pub mod service;
+pub mod services;
 pub mod tls_cert_loader;
-pub use temps_routes::{RouteInfo, CachedPeerTable, RouteTableListener};
-pub use handler::*;
+pub mod traits;
 pub use crawler_detector::CrawlerDetector;
+pub use handler::*;
+pub use temps_routes::{CachedPeerTable, RouteInfo, RouteTableListener};
 
-#[cfg(test)]
-pub mod test_utils;
-#[cfg(test)]
-pub mod tests;
 #[cfg(test)]
 pub mod integration_test;
 #[cfg(test)]
 pub mod proxy_test;
-
+#[cfg(test)]
+pub mod test_utils;
+#[cfg(test)]
+pub mod tests;
 
 // Re-export main types and functions
 pub use config::*;
-pub use traits::*;
-pub use proxy::*;
-pub use services::*;
-pub use server::*;
 pub use plugin::*;
+pub use proxy::*;
+pub use server::*;
+pub use services::*;
+pub use traits::*;

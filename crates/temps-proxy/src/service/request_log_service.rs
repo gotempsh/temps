@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use chrono::DateTime;
-use thiserror::Error;
 use sea_orm::*;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use temps_entities::request_logs;
-use serde::{Serialize, Deserialize};
+use thiserror::Error;
 use utoipa::ToSchema;
 
 #[derive(Error, Debug)]
@@ -270,7 +270,9 @@ mod tests {
         let service = RequestLogService::new(test_db.connection_arc().clone());
 
         // Test with default pagination
-        let result = service.get_logs(Some(1), None, None, None, None, None, None, 20, 0).await;
+        let result = service
+            .get_logs(Some(1), None, None, None, None, None, None, 20, 0)
+            .await;
         assert!(result.is_ok());
 
         let (logs, total) = result.unwrap();
@@ -284,21 +286,49 @@ mod tests {
         let service = RequestLogService::new(test_db.connection_arc().clone());
 
         // Test with environment filter
-        let result = service.get_logs(Some(1), Some(1), None, None, None, None, None, 20, 0).await;
+        let result = service
+            .get_logs(Some(1), Some(1), None, None, None, None, None, 20, 0)
+            .await;
         assert!(result.is_ok());
 
         // Test with deployment filter
-        let result = service.get_logs(Some(1), None, Some(1), None, None, None, None, 20, 0).await;
+        let result = service
+            .get_logs(Some(1), None, Some(1), None, None, None, None, 20, 0)
+            .await;
         assert!(result.is_ok());
 
         // Test with status code and method filters
-        let result = service.get_logs(Some(1), None, None, Some(200), Some("GET"), None, None, 20, 0).await;
+        let result = service
+            .get_logs(
+                Some(1),
+                None,
+                None,
+                Some(200),
+                Some("GET"),
+                None,
+                None,
+                20,
+                0,
+            )
+            .await;
         assert!(result.is_ok());
 
         // Test with date range filters
         let start = chrono::Utc::now().timestamp_millis() - 86400000; // 24 hours ago
         let end = chrono::Utc::now().timestamp_millis();
-        let result = service.get_logs(Some(1), None, None, None, None, Some(start), Some(end), 20, 0).await;
+        let result = service
+            .get_logs(
+                Some(1),
+                None,
+                None,
+                None,
+                None,
+                Some(start),
+                Some(end),
+                20,
+                0,
+            )
+            .await;
         assert!(result.is_ok());
     }
 }

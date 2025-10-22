@@ -1,7 +1,5 @@
+use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::sync::Arc;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
-};
 use temps_entities::project_custom_domains;
 use thiserror::Error;
 use tracing::{debug, error, info};
@@ -39,7 +37,10 @@ impl CustomDomainService {
         status_code: Option<i32>,
         branch: Option<String>,
     ) -> Result<project_custom_domains::Model, CustomDomainError> {
-        info!("Creating custom domain: {} for project: {}", domain, project_id);
+        info!(
+            "Creating custom domain: {} for project: {}",
+            domain, project_id
+        );
 
         // Check if domain already exists
         if let Some(_existing) = project_custom_domains::Entity::find()
@@ -47,9 +48,10 @@ impl CustomDomainService {
             .one(self.db.as_ref())
             .await?
         {
-            return Err(CustomDomainError::DuplicateDomain(
-                format!("Domain {} already exists", domain)
-            ));
+            return Err(CustomDomainError::DuplicateDomain(format!(
+                "Domain {} already exists",
+                domain
+            )));
         }
 
         let new_custom_domain = project_custom_domains::ActiveModel {
@@ -67,12 +69,18 @@ impl CustomDomainService {
 
         let custom_domain = new_custom_domain.insert(self.db.as_ref()).await?;
 
-        debug!("Custom domain created successfully: {} with ID: {}", domain, custom_domain.id);
+        debug!(
+            "Custom domain created successfully: {} with ID: {}",
+            domain, custom_domain.id
+        );
         Ok(custom_domain)
     }
 
     /// Get custom domain by ID
-    pub async fn get_custom_domain(&self, id: i32) -> Result<Option<project_custom_domains::Model>, CustomDomainError> {
+    pub async fn get_custom_domain(
+        &self,
+        id: i32,
+    ) -> Result<Option<project_custom_domains::Model>, CustomDomainError> {
         let custom_domain = project_custom_domains::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?;
@@ -80,7 +88,10 @@ impl CustomDomainService {
     }
 
     /// Get custom domain by domain name
-    pub async fn get_custom_domain_by_domain(&self, domain: &str) -> Result<Option<project_custom_domains::Model>, CustomDomainError> {
+    pub async fn get_custom_domain_by_domain(
+        &self,
+        domain: &str,
+    ) -> Result<Option<project_custom_domains::Model>, CustomDomainError> {
         let custom_domain = project_custom_domains::Entity::find()
             .filter(project_custom_domains::Column::Domain.eq(domain))
             .one(self.db.as_ref())
@@ -89,7 +100,10 @@ impl CustomDomainService {
     }
 
     /// List all custom domains for a project
-    pub async fn list_custom_domains_for_project(&self, project_id: i32) -> Result<Vec<project_custom_domains::Model>, CustomDomainError> {
+    pub async fn list_custom_domains_for_project(
+        &self,
+        project_id: i32,
+    ) -> Result<Vec<project_custom_domains::Model>, CustomDomainError> {
         let custom_domains = project_custom_domains::Entity::find()
             .filter(project_custom_domains::Column::ProjectId.eq(project_id))
             .all(self.db.as_ref())
@@ -98,7 +112,10 @@ impl CustomDomainService {
     }
 
     /// List all custom domains for an environment
-    pub async fn list_custom_domains_for_environment(&self, environment_id: i32) -> Result<Vec<project_custom_domains::Model>, CustomDomainError> {
+    pub async fn list_custom_domains_for_environment(
+        &self,
+        environment_id: i32,
+    ) -> Result<Vec<project_custom_domains::Model>, CustomDomainError> {
         let custom_domains = project_custom_domains::Entity::find()
             .filter(project_custom_domains::Column::EnvironmentId.eq(environment_id))
             .all(self.db.as_ref())
@@ -124,7 +141,9 @@ impl CustomDomainService {
         let custom_domain = project_custom_domains::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| CustomDomainError::NotFound(format!("Custom domain with ID {} not found", id)))?;
+            .ok_or_else(|| {
+                CustomDomainError::NotFound(format!("Custom domain with ID {} not found", id))
+            })?;
 
         let mut active_model: project_custom_domains::ActiveModel = custom_domain.into();
 
@@ -136,9 +155,10 @@ impl CustomDomainService {
                 .await?
             {
                 if existing.id != id {
-                    return Err(CustomDomainError::DuplicateDomain(
-                        format!("Domain {} already exists", new_domain)
-                    ));
+                    return Err(CustomDomainError::DuplicateDomain(format!(
+                        "Domain {} already exists",
+                        new_domain
+                    )));
                 }
             }
             active_model.domain = Set(new_domain);
@@ -198,7 +218,9 @@ impl CustomDomainService {
         let custom_domain = project_custom_domains::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| CustomDomainError::NotFound(format!("Custom domain with ID {} not found", id)))?;
+            .ok_or_else(|| {
+                CustomDomainError::NotFound(format!("Custom domain with ID {} not found", id))
+            })?;
 
         let mut active_model: project_custom_domains::ActiveModel = custom_domain.into();
         active_model.status = Set(status);
@@ -216,12 +238,17 @@ impl CustomDomainService {
         id: i32,
         certificate_id: i32,
     ) -> Result<project_custom_domains::Model, CustomDomainError> {
-        info!("Linking custom domain ID: {} to certificate ID: {}", id, certificate_id);
+        info!(
+            "Linking custom domain ID: {} to certificate ID: {}",
+            id, certificate_id
+        );
 
         let custom_domain = project_custom_domains::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| CustomDomainError::NotFound(format!("Custom domain with ID {} not found", id)))?;
+            .ok_or_else(|| {
+                CustomDomainError::NotFound(format!("Custom domain with ID {} not found", id))
+            })?;
 
         let mut active_model: project_custom_domains::ActiveModel = custom_domain.into();
         active_model.certificate_id = Set(Some(certificate_id));
@@ -229,7 +256,10 @@ impl CustomDomainService {
 
         let updated_domain = active_model.update(self.db.as_ref()).await?;
 
-        debug!("Custom domain linked to certificate successfully: ID {}", id);
+        debug!(
+            "Custom domain linked to certificate successfully: ID {}",
+            id
+        );
         Ok(updated_domain)
     }
 
@@ -242,7 +272,10 @@ impl CustomDomainService {
             .await?;
 
         if result.rows_affected == 0 {
-            return Err(CustomDomainError::NotFound(format!("Custom domain with ID {} not found", id)));
+            return Err(CustomDomainError::NotFound(format!(
+                "Custom domain with ID {} not found",
+                id
+            )));
         }
 
         debug!("Custom domain deleted successfully: ID {}", id);
@@ -521,7 +554,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(updated.domain, "updated-domain.com");
-        assert_eq!(updated.redirect_to, Some("https://redirect.com".to_string()));
+        assert_eq!(
+            updated.redirect_to,
+            Some("https://redirect.com".to_string())
+        );
         assert_eq!(updated.status_code, Some(301));
         assert_eq!(updated.branch, Some("main".to_string()));
     }
@@ -611,10 +647,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(updated.status, "active");
-        assert_eq!(
-            updated.message,
-            Some("Successfully configured".to_string())
-        );
+        assert_eq!(updated.message, Some("Successfully configured".to_string()));
     }
 
     #[tokio::test]

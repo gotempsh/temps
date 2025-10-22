@@ -7,8 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use temps_core::{WorkflowTask, JobResult, WorkflowContext, WorkflowError};
-use temps_deployer::{ContainerDeployer, DeployRequest, PortMapping, Protocol, ResourceLimits, RestartPolicy, ContainerStatus as DeployerContainerStatus};
+use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_deployer::{
+    ContainerDeployer, ContainerStatus as DeployerContainerStatus, DeployRequest, PortMapping,
+    Protocol, ResourceLimits, RestartPolicy,
+};
 use temps_logs::LogService;
 
 /// Typed output from BuildImageJob
@@ -23,17 +26,36 @@ pub struct BuildImageOutput {
 
 impl BuildImageOutput {
     /// Extract ImageOutput from WorkflowContext
-    pub fn from_context(context: &WorkflowContext, build_job_id: &str) -> Result<Self, WorkflowError> {
-        let image_tag: String = context.get_output(build_job_id, "image_tag")?
-            .ok_or_else(|| WorkflowError::JobValidationFailed("image_tag output not found".to_string()))?;
-        let image_id: String = context.get_output(build_job_id, "image_id")?
-            .ok_or_else(|| WorkflowError::JobValidationFailed("image_id output not found".to_string()))?;
-        let size_bytes: u64 = context.get_output(build_job_id, "size_bytes")?
-            .ok_or_else(|| WorkflowError::JobValidationFailed("size_bytes output not found".to_string()))?;
-        let build_context_str: String = context.get_output(build_job_id, "build_context")?
-            .ok_or_else(|| WorkflowError::JobValidationFailed("build_context output not found".to_string()))?;
-        let dockerfile_path_str: String = context.get_output(build_job_id, "dockerfile_path")?
-            .ok_or_else(|| WorkflowError::JobValidationFailed("dockerfile_path output not found".to_string()))?;
+    pub fn from_context(
+        context: &WorkflowContext,
+        build_job_id: &str,
+    ) -> Result<Self, WorkflowError> {
+        let image_tag: String =
+            context
+                .get_output(build_job_id, "image_tag")?
+                .ok_or_else(|| {
+                    WorkflowError::JobValidationFailed("image_tag output not found".to_string())
+                })?;
+        let image_id: String = context
+            .get_output(build_job_id, "image_id")?
+            .ok_or_else(|| {
+                WorkflowError::JobValidationFailed("image_id output not found".to_string())
+            })?;
+        let size_bytes: u64 = context
+            .get_output(build_job_id, "size_bytes")?
+            .ok_or_else(|| {
+                WorkflowError::JobValidationFailed("size_bytes output not found".to_string())
+            })?;
+        let build_context_str: String = context
+            .get_output(build_job_id, "build_context")?
+            .ok_or_else(|| {
+                WorkflowError::JobValidationFailed("build_context output not found".to_string())
+            })?;
+        let dockerfile_path_str: String = context
+            .get_output(build_job_id, "dockerfile_path")?
+            .ok_or_else(|| {
+                WorkflowError::JobValidationFailed("dockerfile_path output not found".to_string())
+            })?;
 
         Ok(Self {
             image_tag,
@@ -134,7 +156,6 @@ pub enum DeploymentTarget {
     },
 }
 
-
 /// Job for deploying container images to target environments
 pub struct DeployImageJob {
     job_id: String,
@@ -230,7 +251,8 @@ impl DeployImageJob {
         let listener = TcpListener::bind("127.0.0.1:0")
             .map_err(|e| WorkflowError::Other(format!("Failed to find available port: {}", e)))?;
 
-        let port = listener.local_addr()
+        let port = listener
+            .local_addr()
             .map_err(|e| WorkflowError::Other(format!("Failed to get port: {}", e)))?
             .port();
 
@@ -248,23 +270,41 @@ impl DeployImageJob {
     }
 
     /// Deploy the container image with real-time logging
-    async fn deploy_image(&self, image_output: &BuildImageOutput, context: &WorkflowContext) -> Result<DeploymentOutput, WorkflowError> {
-        self.log(format!("🚀 Starting deployment of image: {}", image_output.image_tag)).await?;
+    async fn deploy_image(
+        &self,
+        image_output: &BuildImageOutput,
+        context: &WorkflowContext,
+    ) -> Result<DeploymentOutput, WorkflowError> {
+        self.log(format!(
+            "🚀 Starting deployment of image: {}",
+            image_output.image_tag
+        ))
+        .await?;
         self.log(format!("🎯 Target: {:?}", self.target)).await?;
-        self.log(format!("⚙️  Service: {} in namespace: {}", self.config.service_name, self.config.namespace)).await?;
+        self.log(format!(
+            "⚙️  Service: {} in namespace: {}",
+            self.config.service_name, self.config.namespace
+        ))
+        .await?;
 
         // Pre-deployment validation
-        self.log("🔍 Validating deployment configuration...".to_string()).await?;
+        self.log("🔍 Validating deployment configuration...".to_string())
+            .await?;
         self.validate_deployment_config(context).await?;
 
         // Prepare deployment request using temps-deployer types
-        self.log("📦 Deploying container image...".to_string()).await?;
+        self.log("📦 Deploying container image...".to_string())
+            .await?;
 
         let log_path = std::env::temp_dir().join(format!("deploy_{}.log", self.job_id));
 
         // Allocate a random available port on the host
         let host_port = Self::find_available_port()?;
-        self.log(format!("🔌 Allocated host port: {} → container port: {}", host_port, self.config.port)).await?;
+        self.log(format!(
+            "🔌 Allocated host port: {} → container port: {}",
+            host_port, self.config.port
+        ))
+        .await?;
 
         let port_mappings = vec![PortMapping {
             host_port,
@@ -273,10 +313,18 @@ impl DeployImageJob {
         }];
 
         let resource_limits = ResourceLimits {
-            cpu_limit: self.config.resources.cpu_limit.as_ref().and_then(|s| s.parse::<f64>().ok()),
-            memory_limit_mb: self.config.resources.memory_limit.as_ref().and_then(|s| {
-                s.trim_end_matches("Mi").parse::<u64>().ok()
-            }),
+            cpu_limit: self
+                .config
+                .resources
+                .cpu_limit
+                .as_ref()
+                .and_then(|s| s.parse::<f64>().ok()),
+            memory_limit_mb: self
+                .config
+                .resources
+                .memory_limit
+                .as_ref()
+                .and_then(|s| s.trim_end_matches("Mi").parse::<u64>().ok()),
             disk_limit_mb: None,
         };
 
@@ -292,20 +340,38 @@ impl DeployImageJob {
             command: None,
         };
 
-        let deploy_result = self.container_deployer.deploy_container(deploy_request).await
-            .map_err(|e| WorkflowError::JobExecutionFailed(format!("Failed to deploy container: {}", e)))?;
+        let deploy_result = self
+            .container_deployer
+            .deploy_container(deploy_request)
+            .await
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!("Failed to deploy container: {}", e))
+            })?;
 
-        self.log(format!("✅ Deployment created: {}", deploy_result.container_id)).await?;
+        self.log(format!(
+            "✅ Deployment created: {}",
+            deploy_result.container_id
+        ))
+        .await?;
 
         // Wait for deployment to be ready (with timeout)
-        self.log("⏳ Waiting for container to start...".to_string()).await?;
+        self.log("⏳ Waiting for container to start...".to_string())
+            .await?;
         let max_wait_time = std::time::Duration::from_secs(300); // 5 minutes
         let start_time = std::time::Instant::now();
 
         // Phase 1: Wait for container to be running
         loop {
-            let container_info = self.container_deployer.get_container_info(&deploy_result.container_id).await
-                .map_err(|e| WorkflowError::JobExecutionFailed(format!("Failed to check deployment status: {}", e)))?;
+            let container_info = self
+                .container_deployer
+                .get_container_info(&deploy_result.container_id)
+                .await
+                .map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to check deployment status: {}",
+                        e
+                    ))
+                })?;
 
             match container_info.status {
                 DeployerContainerStatus::Running => {
@@ -314,69 +380,104 @@ impl DeployImageJob {
                 }
                 DeployerContainerStatus::Exited | DeployerContainerStatus::Dead => {
                     self.log("❌ Container failed to start".to_string()).await?;
-                    return Err(WorkflowError::JobExecutionFailed("Container failed to start".to_string()));
+                    return Err(WorkflowError::JobExecutionFailed(
+                        "Container failed to start".to_string(),
+                    ));
                 }
                 DeployerContainerStatus::Created => {
                     if start_time.elapsed() > max_wait_time {
                         self.log("❌ Container start timeout".to_string()).await?;
-                        return Err(WorkflowError::JobExecutionFailed("Container timeout - took too long to start".to_string()));
+                        return Err(WorkflowError::JobExecutionFailed(
+                            "Container timeout - took too long to start".to_string(),
+                        ));
                     }
-                    self.log(format!("⏳ Container status: {:?}, waiting...", container_info.status)).await?;
+                    self.log(format!(
+                        "⏳ Container status: {:?}, waiting...",
+                        container_info.status
+                    ))
+                    .await?;
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
                 _ => {
-                    self.log(format!("⏳ Container status: {:?}, waiting...", container_info.status)).await?;
+                    self.log(format!(
+                        "⏳ Container status: {:?}, waiting...",
+                        container_info.status
+                    ))
+                    .await?;
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
         }
 
         // Phase 2: Wait for application to be ready (connectivity check)
-        self.log("⏳ Waiting for application to be ready...".to_string()).await?;
-        let health_check_url = format!("http://localhost:{}{}",
+        self.log("⏳ Waiting for application to be ready...".to_string())
+            .await?;
+        let health_check_url = format!(
+            "http://localhost:{}{}",
             host_port,
             self.config.health_check_path.as_deref().unwrap_or("/")
         );
-        self.log(format!("🔍 Health check URL: {}", health_check_url)).await?;
+        self.log(format!("🔍 Health check URL: {}", health_check_url))
+            .await?;
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
-            .map_err(|e| WorkflowError::JobExecutionFailed(format!("Failed to create HTTP client: {}", e)))?;
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!("Failed to create HTTP client: {}", e))
+            })?;
 
         let mut consecutive_successes = 0;
         let required_successes = 2; // Require 2 consecutive successful connections
 
         loop {
             if start_time.elapsed() > max_wait_time {
-                self.log("❌ Application readiness timeout".to_string()).await?;
-                return Err(WorkflowError::JobExecutionFailed("Application timeout - connectivity checks did not pass in time".to_string()));
+                self.log("❌ Application readiness timeout".to_string())
+                    .await?;
+                return Err(WorkflowError::JobExecutionFailed(
+                    "Application timeout - connectivity checks did not pass in time".to_string(),
+                ));
             }
 
             match client.get(&health_check_url).send().await {
                 Ok(response) => {
                     // Any response (including 404, 500, etc.) means the server is responding
                     consecutive_successes += 1;
-                    self.log(format!("✅ Connectivity check passed - server responding with status {} ({}/{})",
-                        response.status(), consecutive_successes, required_successes)).await?;
+                    self.log(format!(
+                        "✅ Connectivity check passed - server responding with status {} ({}/{})",
+                        response.status(),
+                        consecutive_successes,
+                        required_successes
+                    ))
+                    .await?;
 
                     if consecutive_successes >= required_successes {
-                        self.log("🎉 Application is ready and responding!".to_string()).await?;
+                        self.log("🎉 Application is ready and responding!".to_string())
+                            .await?;
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
                 Err(e) => {
                     consecutive_successes = 0; // Reset counter on connection error
-                    self.log(format!("⏳ Connectivity check failed ({}), retrying...", e)).await?;
+                    self.log(format!("⏳ Connectivity check failed ({}), retrying...", e))
+                        .await?;
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
         }
 
         let endpoint_url = Some(format!("http://localhost:{}", deploy_result.host_port));
-        self.log(format!("🌐 Service endpoint: {}", endpoint_url.as_ref().unwrap())).await?;
-        self.log(format!("📊 Replicas: {}, Resources: {:?}", self.config.replicas, self.config.resources)).await?;
+        self.log(format!(
+            "🌐 Service endpoint: {}",
+            endpoint_url.as_ref().unwrap()
+        ))
+        .await?;
+        self.log(format!(
+            "📊 Replicas: {}, Resources: {:?}",
+            self.config.replicas, self.config.resources
+        ))
+        .await?;
 
         // Convert deployer status to deployment status
         let status = match deploy_result.status {
@@ -398,20 +499,30 @@ impl DeployImageJob {
         })
     }
 
-    async fn validate_deployment_config(&self, _context: &WorkflowContext) -> Result<(), WorkflowError> {
+    async fn validate_deployment_config(
+        &self,
+        _context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
         if self.config.service_name.is_empty() {
-            return Err(WorkflowError::JobValidationFailed("service_name cannot be empty".to_string()));
+            return Err(WorkflowError::JobValidationFailed(
+                "service_name cannot be empty".to_string(),
+            ));
         }
 
         if self.config.namespace.is_empty() {
-            return Err(WorkflowError::JobValidationFailed("namespace cannot be empty".to_string()));
+            return Err(WorkflowError::JobValidationFailed(
+                "namespace cannot be empty".to_string(),
+            ));
         }
 
         if self.config.replicas == 0 {
-            return Err(WorkflowError::JobValidationFailed("replicas must be greater than 0".to_string()));
+            return Err(WorkflowError::JobValidationFailed(
+                "replicas must be greater than 0".to_string(),
+            ));
         }
 
-        self.log("✅ Deployment configuration is valid".to_string()).await?;
+        self.log("✅ Deployment configuration is valid".to_string())
+            .await?;
         Ok(())
     }
 }
@@ -442,8 +553,16 @@ impl WorkflowTask for DeployImageJob {
         let deployment_output = self.deploy_image(&image_output, &context).await?;
 
         // Set typed job outputs
-        context.set_output(&self.job_id, "deployment_id", &deployment_output.deployment_id)?;
-        context.set_output(&self.job_id, "service_name", &deployment_output.service_name)?;
+        context.set_output(
+            &self.job_id,
+            "deployment_id",
+            &deployment_output.deployment_id,
+        )?;
+        context.set_output(
+            &self.job_id,
+            "service_name",
+            &deployment_output.service_name,
+        )?;
         context.set_output(&self.job_id, "namespace", &deployment_output.namespace)?;
         context.set_output(&self.job_id, "status", &deployment_output.status)?;
         context.set_output(&self.job_id, "replicas", deployment_output.replicas)?;
@@ -452,13 +571,29 @@ impl WorkflowTask for DeployImageJob {
         }
 
         // Store container info for database update (deployment_id is container_id, service_name is container_name)
-        context.set_output(&self.job_id, "container_id", &deployment_output.deployment_id)?;
-        context.set_output(&self.job_id, "container_name", &deployment_output.service_name)?;
-        context.set_output(&self.job_id, "container_port", deployment_output.host_port as i32)?; // Store host port (external port)
+        context.set_output(
+            &self.job_id,
+            "container_id",
+            &deployment_output.deployment_id,
+        )?;
+        context.set_output(
+            &self.job_id,
+            "container_name",
+            &deployment_output.service_name,
+        )?;
+        context.set_output(
+            &self.job_id,
+            "container_port",
+            deployment_output.host_port as i32,
+        )?; // Store host port (external port)
         context.set_output(&self.job_id, "host_port", deployment_output.host_port)?; // Also set as host_port for other jobs
 
         // Set artifacts
-        context.set_artifact(&self.job_id, "deployment", PathBuf::from(&deployment_output.deployment_id));
+        context.set_artifact(
+            &self.job_id,
+            "deployment",
+            PathBuf::from(&deployment_output.deployment_id),
+        );
 
         Ok(JobResult::success(context))
     }
@@ -469,7 +604,9 @@ impl WorkflowTask for DeployImageJob {
 
         // Basic validation
         if self.build_job_id.is_empty() {
-            return Err(WorkflowError::JobValidationFailed("build_job_id cannot be empty".to_string()));
+            return Err(WorkflowError::JobValidationFailed(
+                "build_job_id cannot be empty".to_string(),
+            ));
         }
 
         // Note: validate_deployment_config requires context for logging,
@@ -480,12 +617,20 @@ impl WorkflowTask for DeployImageJob {
 
     async fn cleanup(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
         // Get deployment ID from outputs if available
-        if let Ok(Some(deployment_id)) = context.get_output::<String>(&self.job_id, "deployment_id") {
+        if let Ok(Some(deployment_id)) = context.get_output::<String>(&self.job_id, "deployment_id")
+        {
             // Note: In a real implementation, you might want to conditionally clean up
             // based on deployment lifecycle configuration (e.g., cleanup on failure only)
-            if let Err(e) = self.container_deployer.remove_container(&deployment_id).await {
+            if let Err(e) = self
+                .container_deployer
+                .remove_container(&deployment_id)
+                .await
+            {
                 // Log but don't fail cleanup
-                eprintln!("Warning: Failed to cleanup deployment {}: {}", deployment_id, e);
+                eprintln!(
+                    "Warning: Failed to cleanup deployment {}: {}",
+                    deployment_id, e
+                );
             }
         }
         Ok(())
@@ -575,19 +720,20 @@ impl DeployImageJobBuilder {
         self
     }
 
-    pub fn build(self, container_deployer: Arc<dyn ContainerDeployer>) -> Result<DeployImageJob, WorkflowError> {
+    pub fn build(
+        self,
+        container_deployer: Arc<dyn ContainerDeployer>,
+    ) -> Result<DeployImageJob, WorkflowError> {
         let job_id = self.job_id.unwrap_or_else(|| "deploy_image".to_string());
-        let build_job_id = self.build_job_id
-            .ok_or_else(|| WorkflowError::JobValidationFailed("build_job_id is required".to_string()))?;
-        let target = self.target
-            .ok_or_else(|| WorkflowError::JobValidationFailed("deployment target is required".to_string()))?;
+        let build_job_id = self.build_job_id.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("build_job_id is required".to_string())
+        })?;
+        let target = self.target.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("deployment target is required".to_string())
+        })?;
 
-        let mut job = DeployImageJob::new(
-            job_id,
-            build_job_id,
-            target,
-            container_deployer,
-        ).with_config(self.config);
+        let mut job = DeployImageJob::new(job_id, build_job_id, target, container_deployer)
+            .with_config(self.config);
 
         if let Some(log_id) = self.log_id {
             job = job.with_log_id(log_id);
@@ -609,16 +755,22 @@ impl Default for DeployImageJobBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::WorkflowContext;
-    use temps_deployer::{ContainerDeployer, DeployRequest, DeployResult, DeployerError, ContainerInfo, ContainerStatus as DeployerContainerStatus};
     use async_trait::async_trait;
+    use temps_core::WorkflowContext;
+    use temps_deployer::{
+        ContainerDeployer, ContainerInfo, ContainerStatus as DeployerContainerStatus,
+        DeployRequest, DeployResult, DeployerError,
+    };
 
     // Mock ContainerDeployer for testing
     struct MockContainerDeployer;
 
     #[async_trait]
     impl ContainerDeployer for MockContainerDeployer {
-        async fn deploy_container(&self, request: DeployRequest) -> Result<DeployResult, DeployerError> {
+        async fn deploy_container(
+            &self,
+            request: DeployRequest,
+        ) -> Result<DeployResult, DeployerError> {
             Ok(DeployResult {
                 container_id: "test_container_123".to_string(),
                 container_name: request.container_name,
@@ -648,7 +800,10 @@ mod tests {
             Ok(())
         }
 
-        async fn get_container_info(&self, _container_id: &str) -> Result<ContainerInfo, DeployerError> {
+        async fn get_container_info(
+            &self,
+            _container_id: &str,
+        ) -> Result<ContainerInfo, DeployerError> {
             Ok(ContainerInfo {
                 container_id: "test_container_123".to_string(),
                 container_name: "test_container".to_string(),
@@ -668,7 +823,10 @@ mod tests {
             Ok("test logs".to_string())
         }
 
-        async fn stream_container_logs(&self, _container_id: &str) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, DeployerError> {
+        async fn stream_container_logs(
+            &self,
+            _container_id: &str,
+        ) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, DeployerError> {
             Err(DeployerError::Other("Not implemented".to_string()))
         }
     }
@@ -708,18 +866,31 @@ mod tests {
         let mut context = crate::test_utils::create_test_context("test".to_string(), 1, 1, 1);
 
         // Set up outputs as the build job would
-        context.set_output("build_image", "image_tag", "myapp:latest").unwrap();
-        context.set_output("build_image", "image_id", "sha256:abc123").unwrap();
-        context.set_output("build_image", "size_bytes", 104857600u64).unwrap(); // 100MB
-        context.set_output("build_image", "build_context", "/tmp/repo").unwrap();
-        context.set_output("build_image", "dockerfile_path", "/tmp/repo/Dockerfile").unwrap();
+        context
+            .set_output("build_image", "image_tag", "myapp:latest")
+            .unwrap();
+        context
+            .set_output("build_image", "image_id", "sha256:abc123")
+            .unwrap();
+        context
+            .set_output("build_image", "size_bytes", 104857600u64)
+            .unwrap(); // 100MB
+        context
+            .set_output("build_image", "build_context", "/tmp/repo")
+            .unwrap();
+        context
+            .set_output("build_image", "dockerfile_path", "/tmp/repo/Dockerfile")
+            .unwrap();
 
         let image_output = BuildImageOutput::from_context(&context, "build_image").unwrap();
         assert_eq!(image_output.image_tag, "myapp:latest");
         assert_eq!(image_output.image_id, "sha256:abc123");
         assert_eq!(image_output.size_bytes, 104857600);
         assert_eq!(image_output.build_context, PathBuf::from("/tmp/repo"));
-        assert_eq!(image_output.dockerfile_path, PathBuf::from("/tmp/repo/Dockerfile"));
+        assert_eq!(
+            image_output.dockerfile_path,
+            PathBuf::from("/tmp/repo/Dockerfile")
+        );
     }
 
     #[tokio::test]

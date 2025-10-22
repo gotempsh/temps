@@ -4,7 +4,6 @@ use aes_gcm::{
 };
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use hex;
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -26,10 +25,11 @@ impl EncryptionService {
             master_key.as_bytes().to_vec()
         } else if master_key.len() == 64 {
             // Hex-encoded 64-character key
-            hex::decode(master_key)
-                .map_err(|e| anyhow!("Invalid hex key: {}", e))?
+            hex::decode(master_key).map_err(|e| anyhow!("Invalid hex key: {}", e))?
         } else {
-            return Err(anyhow!("Master key must be exactly 32 bytes or 64 hex characters"));
+            return Err(anyhow!(
+                "Master key must be exactly 32 bytes or 64 hex characters"
+            ));
         };
 
         if key_bytes.len() != 32 {
@@ -102,7 +102,7 @@ impl EncryptionService {
     /// Decrypts base64 encoded data and returns it as a UTF-8 string
     pub fn decrypt_string(&self, encoded_data: &str) -> Result<String> {
         let decrypted = self.decrypt(encoded_data)?;
-        Ok(String::from_utf8(decrypted).map_err(|e| anyhow!("UTF-8 decode failed: {}", e))?)
+        String::from_utf8(decrypted).map_err(|e| anyhow!("UTF-8 decode failed: {}", e))
     }
 
     /// Generates a random encryption key as base64 string
@@ -141,7 +141,10 @@ mod tests {
         let short_key = "short";
         let result = EncryptionService::new(short_key);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Master key must be exactly 32 bytes"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Master key must be exactly 32 bytes"));
     }
 
     #[test]
@@ -203,7 +206,10 @@ mod tests {
 
         let result = service.decrypt_string("invalid-base64");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Base64 decode error"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Base64 decode error"));
     }
 
     #[test]
@@ -215,7 +221,10 @@ mod tests {
         let short_data = BASE64.encode(b"short");
         let result = service.decrypt_string(&short_data);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid encrypted data"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid encrypted data"));
     }
 
     #[test]
@@ -357,6 +366,9 @@ mod tests {
         // But decrypt_string() should fail
         let result = service.decrypt_string(&encrypted);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("UTF-8 decode failed"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("UTF-8 decode failed"));
     }
 }

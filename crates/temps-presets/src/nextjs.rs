@@ -232,8 +232,7 @@ EXPOSE 3000
     }
 
     fn dockerfile_with_build_dir(&self, _local_path: &PathBuf) -> String {
-        format!(
-            r#"
+        r#"
 # Use a lightweight Node.js image as the base
 FROM node:22-alpine AS runner
 
@@ -256,8 +255,7 @@ EXPOSE 3000
 
 # Start the Next.js application
 CMD ["node", "server.js"]
-"#
-        )
+"#.to_string()
     }
 
     fn install_command(&self, local_path: &PathBuf) -> String {

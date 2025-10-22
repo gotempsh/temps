@@ -133,8 +133,7 @@ impl LetsEncryptProvider {
     ) -> Result<Certificate, ProviderError> {
         // Generate CSR
         // For wildcard domains, include both wildcard and base domain
-        let names = if domain.starts_with("*.") {
-            let base_domain = &domain[2..];
+        let names = if let Some(base_domain) = domain.strip_prefix("*.") {
             vec![domain.to_string(), base_domain.to_string()]
         } else {
             vec![domain.to_string()]
@@ -268,7 +267,7 @@ impl LetsEncryptProvider {
             let mut hasher = Sha256::new();
             hasher.update(key_auth.as_str().as_bytes());
             let hash = hasher.finalize();
-            let txt_value = URL_SAFE_NO_PAD.encode(&hash);
+            let txt_value = URL_SAFE_NO_PAD.encode(hash);
 
             // Add DNS TXT record with its validation URL
             dns_txt_records.push(DnsTxtRecord {
@@ -367,8 +366,8 @@ impl CertificateProvider for LetsEncryptProvider {
 
         // For wildcard domains, also request the base domain in the same certificate
         // e.g., if domain is "*.example.com", request both "*.example.com" and "example.com"
-        let identifiers = if domain.starts_with("*.") {
-            let base_domain = &domain[2..]; // Remove "*." prefix
+        let identifiers = if let Some(base_domain) = domain.strip_prefix("*.") {
+            // Remove "*." prefix
             info!(
                 "Requesting wildcard certificate for {} - including base domain {}",
                 domain, base_domain

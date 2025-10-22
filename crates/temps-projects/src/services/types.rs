@@ -24,7 +24,6 @@ pub struct EnvVarWithEnvironments {
     pub environments: Vec<EnvVarEnvironment>,
 }
 
-
 #[derive(Deserialize)]
 pub struct UpdateDeploymentSettingsRequest {
     pub cpu_request: Option<i32>,
@@ -86,7 +85,6 @@ pub struct CreateProjectRequest {
     pub is_on_demand: Option<bool>,
 }
 
-
 #[derive(Deserialize)]
 pub struct CreateProjectFromTemplateRequest {
     pub project_name: String,
@@ -106,8 +104,6 @@ pub struct CreateGithubRepoRequest {
     #[serde(rename = "auto_init")]
     pub auto_init: bool,
 }
-
-
 
 // Types are defined directly in this file for simplicity
 

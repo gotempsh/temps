@@ -217,20 +217,18 @@ impl HealthCheckService {
                 }
                 Ok(Err(e)) => {
                     // Network errors - retry for connection and timeout errors
-                    if e.is_connect() || e.is_timeout() {
-                        if attempt < MAX_RETRIES {
-                            last_error = Some(format!(
-                                "{}: {} (attempt {})",
-                                if e.is_connect() {
-                                    "Connection failed"
-                                } else {
-                                    "Request timeout"
-                                },
-                                e,
-                                attempt + 1
-                            ));
-                            continue;
-                        }
+                    if (e.is_connect() || e.is_timeout()) && attempt < MAX_RETRIES {
+                        last_error = Some(format!(
+                            "{}: {} (attempt {})",
+                            if e.is_connect() {
+                                "Connection failed"
+                            } else {
+                                "Request timeout"
+                            },
+                            e,
+                            attempt + 1
+                        ));
+                        continue;
                     }
 
                     // Non-retryable error or final attempt

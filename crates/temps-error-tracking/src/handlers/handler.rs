@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use super::types::AppState;
+use crate::services::{ErrorEventDomain, ErrorGroupDomain, ErrorTrackingError};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -7,13 +8,9 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use temps_core::DateTime;
-use utoipa::{ToSchema, IntoParams, OpenApi};
-use super::types::AppState;
-use crate::services::{
-    ErrorTrackingError,
-    ErrorGroupDomain, ErrorEventDomain,
-};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -50,17 +47,37 @@ use crate::services::{
 )]
 pub struct ErrorTrackingApiDoc;
 
-
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/projects/{project_id}/error-groups", get(list_error_groups))
-        .route("/projects/{project_id}/error-groups/{group_id}", get(get_error_group).put(update_error_group))
-        .route("/projects/{project_id}/error-groups/{group_id}/events", get(list_error_events))
-        .route("/projects/{project_id}/error-groups/{group_id}/events/{event_id}", get(get_error_event))
+        .route(
+            "/projects/{project_id}/error-groups",
+            get(list_error_groups),
+        )
+        .route(
+            "/projects/{project_id}/error-groups/{group_id}",
+            get(get_error_group).put(update_error_group),
+        )
+        .route(
+            "/projects/{project_id}/error-groups/{group_id}/events",
+            get(list_error_events),
+        )
+        .route(
+            "/projects/{project_id}/error-groups/{group_id}/events/{event_id}",
+            get(get_error_event),
+        )
         .route("/projects/{project_id}/error-stats", get(get_error_stats))
-        .route("/projects/{project_id}/error-dashboard-stats", get(get_error_dashboard_stats))
-        .route("/projects/{project_id}/error-time-series", get(get_error_time_series))
-        .route("/projects/{project_id}/has-error-groups", get(has_error_groups))
+        .route(
+            "/projects/{project_id}/error-dashboard-stats",
+            get(get_error_dashboard_stats),
+        )
+        .route(
+            "/projects/{project_id}/error-time-series",
+            get(get_error_time_series),
+        )
+        .route(
+            "/projects/{project_id}/has-error-groups",
+            get(has_error_groups),
+        )
 }
 
 // ===== Request/Response Types =====
@@ -195,10 +212,18 @@ pub struct PaginatedErrorEventsResponse {
     pub pagination: PaginationMeta,
 }
 
-fn default_page() -> u64 { 1 }
-fn default_page_size() -> u64 { 20 }
-fn default_sort_order() -> String { "desc".to_string() }
-fn default_interval() -> String { "1h".to_string() }
+fn default_page() -> u64 {
+    1
+}
+fn default_page_size() -> u64 {
+    20
+}
+fn default_sort_order() -> String {
+    "desc".to_string()
+}
+fn default_interval() -> String {
+    "1h".to_string()
+}
 
 // ===== Conversions =====
 
@@ -248,16 +273,40 @@ pub struct ErrorResponse {
 impl axum::response::IntoResponse for ErrorTrackingError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
-            ErrorTrackingError::Database(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)),
-            ErrorTrackingError::GroupNotFound => (StatusCode::NOT_FOUND, "Error group not found".to_string()),
-            ErrorTrackingError::EventNotFound => (StatusCode::NOT_FOUND, "Error event not found".to_string()),
-            ErrorTrackingError::InvalidFingerprint => (StatusCode::BAD_REQUEST, "Invalid fingerprint".to_string()),
-            ErrorTrackingError::EmbeddingService(msg) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Embedding service error: {}", msg)),
-            ErrorTrackingError::Validation(msg) => (StatusCode::BAD_REQUEST, format!("Validation error: {}", msg)),
-            ErrorTrackingError::ProjectNotFound => (StatusCode::NOT_FOUND, "Project not found".to_string()),
+            ErrorTrackingError::Database(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            ),
+            ErrorTrackingError::GroupNotFound => {
+                (StatusCode::NOT_FOUND, "Error group not found".to_string())
+            }
+            ErrorTrackingError::EventNotFound => {
+                (StatusCode::NOT_FOUND, "Error event not found".to_string())
+            }
+            ErrorTrackingError::InvalidFingerprint => {
+                (StatusCode::BAD_REQUEST, "Invalid fingerprint".to_string())
+            }
+            ErrorTrackingError::EmbeddingService(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Embedding service error: {}", msg),
+            ),
+            ErrorTrackingError::Validation(msg) => (
+                StatusCode::BAD_REQUEST,
+                format!("Validation error: {}", msg),
+            ),
+            ErrorTrackingError::ProjectNotFound => {
+                (StatusCode::NOT_FOUND, "Project not found".to_string())
+            }
         };
 
-        (status, Json(ErrorResponse { error: message, details: None })).into_response()
+        (
+            status,
+            Json(ErrorResponse {
+                error: message,
+                details: None,
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -494,7 +543,6 @@ pub async fn get_error_dashboard_stats(
     Path(project_id): Path<i32>,
     Query(query): Query<ErrorDashboardStatsQuery>,
 ) -> Result<Json<ErrorDashboardStatsResponse>, ErrorTrackingError> {
-    
     let stats = state
         .error_tracking_service
         .get_dashboard_stats(
@@ -540,7 +588,12 @@ pub async fn get_error_time_series(
 ) -> Result<Json<Vec<ErrorTimeSeriesDataResponse>>, ErrorTrackingError> {
     let data = state
         .error_tracking_service
-        .get_error_time_series(project_id, query.start_time.into(), query.end_time.into(), &query.bucket)
+        .get_error_time_series(
+            project_id,
+            query.start_time.into(),
+            query.end_time.into(),
+            &query.bucket,
+        )
         .await?;
 
     let response: Vec<ErrorTimeSeriesDataResponse> = data

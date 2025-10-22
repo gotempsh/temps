@@ -9,7 +9,7 @@ pub struct Model {
     pub visitor_id: String,
     pub project_id: i32,
     pub environment_id: i32,
-    pub first_seen: DBDateTime,  
+    pub first_seen: DBDateTime,
     pub last_seen: DBDateTime,
     pub user_agent: Option<String>,
     pub ip_address_id: Option<i32>,

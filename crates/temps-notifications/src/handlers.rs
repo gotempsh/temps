@@ -1,4 +1,6 @@
-use crate::services::{NotificationService, NotificationPreferencesService, NotificationPreferences, TlsMode};
+use crate::services::{
+    NotificationPreferences, NotificationPreferencesService, NotificationService, TlsMode,
+};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -6,13 +8,13 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use tracing::{error, info};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
+use tracing::{error, info};
 use utoipa::OpenApi;
 
 pub struct NotificationState {
@@ -208,7 +210,7 @@ async fn list_notification_providers(
                         error!("Failed to decrypt provider config: {}", e);
                         ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                             .title("Failed to decrypt provider configurations")
-                            .detail(&format!("Error: {}", e))
+                            .detail(format!("Error: {}", e))
                             .build()
                     })?;
                 response_vec.push(NotificationProviderResponse {
@@ -227,7 +229,7 @@ async fn list_notification_providers(
             error!("Failed to list notification providers: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to list notification providers")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -266,7 +268,7 @@ async fn get_notification_provider(
                     error!("Failed to decrypt provider config: {}", e);
                     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                         .title("Failed to decrypt provider configuration")
-                        .detail(&format!("Error: {}", e))
+                        .detail(format!("Error: {}", e))
                         .build()
                 })?;
             let response = NotificationProviderResponse {
@@ -288,7 +290,7 @@ async fn get_notification_provider(
             error!("Failed to get notification provider {}: {}", id, e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -329,7 +331,7 @@ async fn create_notification_provider(
                     error!("Failed to decrypt provider config: {}", e);
                     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                         .title("Failed to decrypt provider configuration")
-                        .detail(&format!("Error: {}", e))
+                        .detail(format!("Error: {}", e))
                         .build()
                 })?;
             let response = NotificationProviderResponse {
@@ -347,7 +349,7 @@ async fn create_notification_provider(
             error!("Failed to create notification provider: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to create notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -401,7 +403,7 @@ async fn update_provider(
                     error!("Failed to decrypt provider config: {}", e);
                     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                         .title("Failed to decrypt provider configuration")
-                        .detail(&format!("Error: {}", e))
+                        .detail(format!("Error: {}", e))
                         .build()
                 })?;
             let response = NotificationProviderResponse {
@@ -423,7 +425,7 @@ async fn update_provider(
             error!("Failed to update notification provider {}: {}", id, e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to update notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -463,7 +465,7 @@ async fn delete_provider(
             error!("Failed to delete notification provider {}: {}", id, e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to delete notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -518,7 +520,7 @@ async fn test_provider(
                 },
                 Json(TestProviderResponse {
                     success: false,
-                    message: Some(format!("Test failed: {}", e.to_string())),
+                    message: Some(format!("Test failed: {}", e)),
                 }),
             ))
         }
@@ -561,7 +563,7 @@ async fn create_slack_provider(
                     error!("Failed to decrypt provider config: {}", e);
                     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                         .title("Failed to decrypt provider configuration")
-                        .detail(&format!("Error: {}", e))
+                        .detail(format!("Error: {}", e))
                         .build()
                 })?;
             let response = NotificationProviderResponse {
@@ -579,7 +581,7 @@ async fn create_slack_provider(
             error!("Failed to create Slack notification provider: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to create Slack notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -621,7 +623,7 @@ async fn create_email_provider(
                     error!("Failed to decrypt provider config: {}", e);
                     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                         .title("Failed to decrypt provider configuration")
-                        .detail(&format!("Error: {}", e))
+                        .detail(format!("Error: {}", e))
                         .build()
                 })?;
             let response = NotificationProviderResponse {
@@ -639,7 +641,7 @@ async fn create_email_provider(
             error!("Failed to create Email notification provider: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to create Email notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -690,7 +692,7 @@ async fn update_slack_provider(
                     error!("Failed to decrypt provider config: {}", e);
                     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                         .title("Failed to decrypt provider configuration")
-                        .detail(&format!("Error: {}", e))
+                        .detail(format!("Error: {}", e))
                         .build()
                 })?;
             let response = NotificationProviderResponse {
@@ -712,7 +714,7 @@ async fn update_slack_provider(
             error!("Failed to update Slack notification provider {}: {}", id, e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to update Slack notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -763,7 +765,7 @@ async fn update_email_provider(
                     error!("Failed to decrypt provider config: {}", e);
                     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                         .title("Failed to decrypt provider configuration")
-                        .detail(&format!("Error: {}", e))
+                        .detail(format!("Error: {}", e))
                         .build()
                 })?;
             let response = NotificationProviderResponse {
@@ -785,7 +787,7 @@ async fn update_email_provider(
             error!("Failed to update Email notification provider {}: {}", id, e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to update Email notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -876,16 +878,24 @@ async fn get_preferences(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationPreferencesRead);
 
-    info!("Getting notification preferences for user {}", auth.user_id());
-    match app_state.notification_preferences_service.get_preferences().await {
-        Ok(preferences) => {
-            Ok((StatusCode::OK, Json(NotificationPreferencesResponse::from(preferences))))
-        }
+    info!(
+        "Getting notification preferences for user {}",
+        auth.user_id()
+    );
+    match app_state
+        .notification_preferences_service
+        .get_preferences()
+        .await
+    {
+        Ok(preferences) => Ok((
+            StatusCode::OK,
+            Json(NotificationPreferencesResponse::from(preferences)),
+        )),
         Err(e) => {
             error!("Failed to get notification preferences: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get notification preferences")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -913,7 +923,10 @@ async fn update_preferences(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationPreferencesWrite);
 
-    info!("Updating notification preferences for user {}", auth.user_id());
+    info!(
+        "Updating notification preferences for user {}",
+        auth.user_id()
+    );
     let db_preferences = NotificationPreferences {
         email_enabled: request.preferences.email_enabled,
         slack_enabled: request.preferences.slack_enabled,
@@ -931,20 +944,27 @@ async fn update_preferences(
         backup_failures_enabled: request.preferences.backup_failures_enabled,
         backup_successes_enabled: request.preferences.backup_successes_enabled,
         s3_connection_issues_enabled: request.preferences.s3_connection_issues_enabled,
-        retention_policy_violations_enabled: request.preferences.retention_policy_violations_enabled,
+        retention_policy_violations_enabled: request
+            .preferences
+            .retention_policy_violations_enabled,
         route_downtime_enabled: request.preferences.route_downtime_enabled,
         load_balancer_issues_enabled: request.preferences.load_balancer_issues_enabled,
     };
 
-    match app_state.notification_preferences_service.update_preferences(db_preferences).await {
-        Ok(preferences) => {
-            Ok((StatusCode::OK, Json(NotificationPreferencesResponse::from(preferences))))
-        }
+    match app_state
+        .notification_preferences_service
+        .update_preferences(db_preferences)
+        .await
+    {
+        Ok(preferences) => Ok((
+            StatusCode::OK,
+            Json(NotificationPreferencesResponse::from(preferences)),
+        )),
         Err(e) => {
             error!("Failed to update notification preferences: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to update notification preferences")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -970,16 +990,21 @@ async fn delete_preferences(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationPreferencesWrite);
 
-    info!("Deleting notification preferences for user {}", auth.user_id());
-    match app_state.notification_preferences_service.delete_preferences().await {
-        Ok(_) => {
-            Ok(StatusCode::NO_CONTENT)
-        }
+    info!(
+        "Deleting notification preferences for user {}",
+        auth.user_id()
+    );
+    match app_state
+        .notification_preferences_service
+        .delete_preferences()
+        .await
+    {
+        Ok(_) => Ok(StatusCode::NO_CONTENT),
         Err(e) => {
             error!("Failed to delete notification preferences: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to delete notification preferences")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -1017,11 +1042,11 @@ pub fn configure_routes() -> Router<Arc<NotificationState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::{Request, StatusCode};
     use axum::body::Body;
+    use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use temps_database::test_utils::TestDatabase;
-    use testcontainers::{runners::AsyncRunner, ContainerAsync, GenericImage, core::ContainerPort};
+    use testcontainers::{core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage};
     use tokio;
     use tower::ServiceExt;
 
@@ -1053,21 +1078,21 @@ mod tests {
 
             // Create encryption service
             let encryption_service = Arc::new(
-                temps_core::EncryptionService::new("0000000000000000000000000000000000000000000000000000000000000000")
-                    .expect("Failed to create encryption service")
+                temps_core::EncryptionService::new(
+                    "0000000000000000000000000000000000000000000000000000000000000000",
+                )
+                .expect("Failed to create encryption service"),
             );
 
             // Create notification service
-            let notification_service = Arc::new(
-                crate::services::NotificationService::new(
-                    test_db.connection_arc(),
-                    encryption_service.clone()
-                )
-            );
+            let notification_service = Arc::new(crate::services::NotificationService::new(
+                test_db.connection_arc(),
+                encryption_service.clone(),
+            ));
 
             // Create notification preferences service
             let notification_preferences_service = Arc::new(
-                crate::services::NotificationPreferencesService::new(test_db.connection_arc())
+                crate::services::NotificationPreferencesService::new(test_db.connection_arc()),
             );
 
             let notification_state = Arc::new(NotificationState::new(

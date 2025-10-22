@@ -88,7 +88,10 @@ impl ImportOrchestrator {
     }
 
     /// Get an importer for a source
-    fn get_importer(&self, source: ImportSource) -> ImportServiceResult<&Arc<dyn WorkloadImporter>> {
+    fn get_importer(
+        &self,
+        source: ImportSource,
+    ) -> ImportServiceResult<&Arc<dyn WorkloadImporter>> {
         self.importers
             .get(&source)
             .ok_or_else(|| ImportServiceError::SourceNotAvailable(source.to_string()))
@@ -157,7 +160,9 @@ impl ImportOrchestrator {
         let mut plan = importer.generate_plan(snapshot.clone())?;
 
         // Fetch repository information if repository ID is provided
-        let (git_provider_connection_id, repo_owner, repo_name) = if let Some(repo_id) = repository_id {
+        let (git_provider_connection_id, repo_owner, repo_name) = if let Some(repo_id) =
+            repository_id
+        {
             debug!("Fetching repository {} information", repo_id);
 
             // Fetch repository to get git_provider_connection_id, owner, and name
@@ -165,8 +170,12 @@ impl ImportOrchestrator {
             let repository = repositories::Entity::find_by_id(repo_id)
                 .one(self.db.as_ref())
                 .await
-                .map_err(|e| ImportServiceError::Internal(format!("Failed to fetch repository: {}", e)))?
-                .ok_or_else(|| ImportServiceError::Validation(format!("Repository {} not found", repo_id)))?;
+                .map_err(|e| {
+                    ImportServiceError::Internal(format!("Failed to fetch repository: {}", e))
+                })?
+                .ok_or_else(|| {
+                    ImportServiceError::Validation(format!("Repository {} not found", repo_id))
+                })?;
 
             let git_provider_conn_id = repository.git_provider_connection_id
                 .ok_or_else(|| ImportServiceError::Validation(
@@ -176,14 +185,23 @@ impl ImportOrchestrator {
             let owner = repository.owner.clone();
             let name = repository.name.clone();
 
-            debug!("Repository {} has git_provider_connection_id: {}, owner: {}, name: {}",
-                repo_id, git_provider_conn_id, owner, name);
+            debug!(
+                "Repository {} has git_provider_connection_id: {}, owner: {}, name: {}",
+                repo_id, git_provider_conn_id, owner, name
+            );
 
             // Detect preset from repository
-            match self.git_provider_manager.calculate_repository_preset_live(repo_id, None).await {
+            match self
+                .git_provider_manager
+                .calculate_repository_preset_live(repo_id, None)
+                .await
+            {
                 Ok(preset_info) => {
                     if let Some(root_preset) = preset_info.root_preset {
-                        info!("Detected preset '{}' for repository {}", root_preset, repo_id);
+                        info!(
+                            "Detected preset '{}' for repository {}",
+                            root_preset, repo_id
+                        );
 
                         // Update plan with preset information
                         // Note: We'll add a preset field to BuildConfiguration
@@ -199,7 +217,9 @@ impl ImportOrchestrator {
 
                         // Add preset as metadata in build args
                         if let Some(ref mut build) = plan.deployment.build {
-                            build.args.insert("DETECTED_PRESET".to_string(), root_preset.clone());
+                            build
+                                .args
+                                .insert("DETECTED_PRESET".to_string(), root_preset.clone());
                         }
 
                         // Add warning if Docker image will be replaced by build
@@ -329,7 +349,12 @@ impl ImportOrchestrator {
         };
 
         // Delegate execution to the importer
-        let outcome = importer.execute(context, session.plan.clone(), self as &dyn temps_import_types::ImportServiceProvider)
+        let outcome = importer
+            .execute(
+                context,
+                session.plan.clone(),
+                self as &dyn temps_import_types::ImportServiceProvider,
+            )
             .await
             .map_err(|e| ImportServiceError::ExecutionFailed(e.to_string()))?;
 
@@ -398,7 +423,10 @@ mod tests {
     use super::*;
     use temps_import_types::plan::*;
     use temps_import_types::validation::*;
-    use temps_import_types::{WorkloadImporter, ImportSelector, WorkloadDescriptor, WorkloadId, WorkloadSnapshot, ImportValidationRule, ImportSource};
+    use temps_import_types::{
+        ImportSelector, ImportSource, ImportValidationRule, WorkloadDescriptor, WorkloadId,
+        WorkloadImporter, WorkloadSnapshot,
+    };
 
     fn create_test_db() -> Arc<DatabaseConnection> {
         // For unit tests, we create a mock database
@@ -836,15 +864,26 @@ mod tests {
             Ok(true)
         }
 
-        async fn discover(&self, _selector: ImportSelector) -> temps_import_types::ImportResult<Vec<WorkloadDescriptor>> {
+        async fn discover(
+            &self,
+            _selector: ImportSelector,
+        ) -> temps_import_types::ImportResult<Vec<WorkloadDescriptor>> {
             Ok(vec![])
         }
 
-        async fn describe(&self, _workload_id: &WorkloadId) -> temps_import_types::ImportResult<WorkloadSnapshot> {
-            Err(temps_import_types::ImportError::Internal("Mock importer".to_string()))
+        async fn describe(
+            &self,
+            _workload_id: &WorkloadId,
+        ) -> temps_import_types::ImportResult<WorkloadSnapshot> {
+            Err(temps_import_types::ImportError::Internal(
+                "Mock importer".to_string(),
+            ))
         }
 
-        fn generate_plan(&self, _snapshot: WorkloadSnapshot) -> temps_import_types::ImportResult<ImportPlan> {
+        fn generate_plan(
+            &self,
+            _snapshot: WorkloadSnapshot,
+        ) -> temps_import_types::ImportResult<ImportPlan> {
             Ok(create_test_plan())
         }
 

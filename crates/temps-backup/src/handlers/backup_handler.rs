@@ -389,7 +389,7 @@ async fn list_source_backups(
         .backup_service
         .list_source_backups(id)
         .await
-        .map_err(|e| Problem::from(e))?;
+        .map_err(Problem::from)?;
 
     let s3_index: S3BackupIndex = serde_json::from_value(index).map_err(|e| {
         error!("Failed to parse backup index: {}", e);
@@ -476,7 +476,7 @@ async fn list_s3_sources(
         .backup_service
         .list_s3_sources()
         .await
-        .map_err(|e| Problem::from(e))?;
+        .map_err(Problem::from)?;
 
     let responses: Vec<S3SourceResponse> = sources.into_iter().map(Into::into).collect();
     Ok(Json(responses))
@@ -509,7 +509,7 @@ async fn create_s3_source(
         .backup_service
         .create_s3_source(request.clone())
         .await
-        .map_err(|e| Problem::from(e))?;
+        .map_err(Problem::from)?;
 
     // Create audit log
     let audit = S3SourceCreatedAudit {
@@ -523,11 +523,7 @@ async fn create_s3_source(
         bucket_name: source.bucket_name.clone(),
     };
 
-    if let Err(e) = app_state
-        .audit_service
-        .create_audit_log(&audit)
-        .await
-    {
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log: {}", e);
     }
 
@@ -621,11 +617,7 @@ async fn update_s3_source(
         updated_fields,
     };
 
-    if let Err(e) = app_state
-        .audit_service
-        .create_audit_log(&audit)
-        .await
-    {
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log: {}", e);
     }
 
@@ -656,10 +648,7 @@ async fn delete_s3_source(
     // Get source details before deletion for audit log
     let source = app_state.backup_service.get_s3_source(id).await?;
 
-    app_state
-        .backup_service
-        .delete_s3_source(id)
-        .await?;
+    app_state.backup_service.delete_s3_source(id).await?;
 
     let audit = S3SourceDeletedAudit {
         context: AuditContext {
@@ -672,11 +661,7 @@ async fn delete_s3_source(
         bucket_name: source.bucket_name,
     };
 
-    if let Err(e) = app_state
-        .audit_service
-        .create_audit_log(&audit)
-        .await
-    {
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log: {}", e);
     }
 
@@ -702,10 +687,7 @@ async fn list_backup_schedules(
     State(app_state): State<Arc<BackupAppState>>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
-    let schedules = app_state
-        .backup_service
-        .list_backup_schedules()
-        .await?;
+    let schedules = app_state.backup_service.list_backup_schedules().await?;
 
     let responses: Vec<BackupScheduleResponse> = schedules.into_iter().map(Into::into).collect();
     Ok(Json(responses))
@@ -769,10 +751,7 @@ async fn get_backup_schedule(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
-    let schedule = app_state
-        .backup_service
-        .get_backup_schedule(id)
-        .await?;
+    let schedule = app_state.backup_service.get_backup_schedule(id).await?;
     Ok(Json(BackupScheduleResponse::from(schedule)))
 }
 
@@ -796,10 +775,7 @@ async fn delete_backup_schedule(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
     permission_guard!(auth, BackupsDelete);
-    let result = app_state
-        .backup_service
-        .delete_backup_schedule(id)
-        .await?;
+    let result = app_state.backup_service.delete_backup_schedule(id).await?;
     if result {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -866,7 +842,7 @@ async fn run_backup_for_source(
         .backup_service
         .run_backup_for_source(id, &request.backup_type, auth.user.id)
         .await
-        .map_err(|e| Problem::from(e))?;
+        .map_err(Problem::from)?;
 
     let audit = BackupRunAudit {
         context: AuditContext {
@@ -880,11 +856,7 @@ async fn run_backup_for_source(
         backup_type: request.backup_type,
     };
 
-    if let Err(e) = app_state
-        .audit_service
-        .create_audit_log(&audit)
-        .await
-    {
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log: {}", e);
     }
 
@@ -944,10 +916,7 @@ async fn disable_backup_schedule(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsWrite);
-    let schedule = app_state
-        .backup_service
-        .disable_backup_schedule(id)
-        .await?;
+    let schedule = app_state.backup_service.disable_backup_schedule(id).await?;
 
     let audit = BackupScheduleStatusChangedAudit {
         context: AuditContext {
@@ -960,11 +929,7 @@ async fn disable_backup_schedule(
         new_status: "disabled".to_string(),
     };
 
-    if let Err(e) = app_state
-        .audit_service
-        .create_audit_log(&audit)
-        .await
-    {
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log: {}", e);
     }
 
@@ -992,10 +957,7 @@ async fn enable_backup_schedule(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsWrite);
-    let schedule = app_state
-        .backup_service
-        .enable_backup_schedule(id)
-        .await?;
+    let schedule = app_state.backup_service.enable_backup_schedule(id).await?;
     let audit = BackupScheduleStatusChangedAudit {
         context: AuditContext {
             user_id: auth.user_id(),
@@ -1007,11 +969,7 @@ async fn enable_backup_schedule(
         new_status: "enabled".to_string(),
     };
 
-    if let Err(e) = app_state
-        .audit_service
-        .create_audit_log(&audit)
-        .await
-    {
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log: {}", e);
     }
 

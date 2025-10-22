@@ -13,8 +13,8 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_core::DateTime;
 use std::sync::Arc;
+use temps_core::DateTime;
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
 
@@ -116,14 +116,8 @@ pub struct PerformanceApiDoc;
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/performance/metrics", get(get_performance_metrics))
-        .route(
-            "/performance/metrics-over-time",
-            get(get_metrics_over_time),
-        )
-        .route(
-            "/performance/page-metrics",
-            get(get_grouped_page_metrics),
-        )
+        .route("/performance/metrics-over-time", get(get_metrics_over_time))
+        .route("/performance/page-metrics", get(get_grouped_page_metrics))
         .route("/_temps/speed", post(record_speed_metrics))
         .route("/_temps/speed/update", post(update_speed_metrics))
 }
@@ -150,8 +144,6 @@ async fn get_performance_metrics(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PerformanceMetricsQuery>,
 ) -> Result<Json<PerformanceMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
-
-
     match state
         .performance_service
         .get_metrics(
@@ -199,7 +191,6 @@ async fn get_metrics_over_time(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PerformanceMetricsQuery>,
 ) -> Result<Json<MetricsOverTimeResponse>, (StatusCode, Json<ErrorResponse>)> {
-   
     match state
         .performance_service
         .get_metrics_over_time(
@@ -248,8 +239,6 @@ async fn get_grouped_page_metrics(
     State(state): State<Arc<AppState>>,
     Query(query): Query<GroupedPageMetricsQuery>,
 ) -> Result<Json<GroupedPageMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
-
-
     let group_by = match query.group_by.as_str() {
         "path" => GroupBy::Path,
         "country" => GroupBy::Country,
@@ -372,10 +361,17 @@ pub async fn record_speed_metrics(
 
     // Lookup IP geolocation
     let ip_address_id = if !metadata.ip_address.is_empty() {
-        match state.ip_address_service.get_or_create_ip(&metadata.ip_address).await {
+        match state
+            .ip_address_service
+            .get_or_create_ip(&metadata.ip_address)
+            .await
+        {
             Ok(ip_info) => Some(ip_info.id),
             Err(e) => {
-                error!("Failed to lookup IP geolocation for {}: {}", metadata.ip_address, e);
+                error!(
+                    "Failed to lookup IP geolocation for {}: {}",
+                    metadata.ip_address, e
+                );
                 None
             }
         }

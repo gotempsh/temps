@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{PackageManager, Preset, ProjectType};
 
@@ -134,7 +134,7 @@ CMD ["serve", "-s", "build", "-l", "3000"]
         )
     }
 
-    fn install_command(&self, local_path: &PathBuf) -> String {
+    fn install_command(&self, local_path: &Path) -> String {
         match self.package_manager(local_path) {
             PackageManager::Bun => "bun install --frozen-lockfile".to_string(),
             PackageManager::Yarn => "yarn install".to_string(),
@@ -143,7 +143,7 @@ CMD ["serve", "-s", "build", "-l", "3000"]
         }
     }
 
-    fn build_command(&self, local_path: &PathBuf) -> String {
+    fn build_command(&self, local_path: &Path) -> String {
         match self.package_manager(local_path) {
             PackageManager::Bun => "bun run build".to_string(),
             PackageManager::Yarn => "yarn run build".to_string(),
@@ -158,7 +158,7 @@ CMD ["serve", "-s", "build", "-l", "3000"]
 }
 
 impl CreateReactApp {
-    fn package_manager(&self, local_path: &PathBuf) -> PackageManager {
+    fn package_manager(&self, local_path: &Path) -> PackageManager {
         if local_path.join("package-lock.json").exists() {
             PackageManager::Npm
         } else if local_path.join("bun.lockb").exists() ||  local_path.join("bun.lock").exists() {

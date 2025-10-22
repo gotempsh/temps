@@ -15,13 +15,13 @@ use axum::Router;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
+use tracing::debug;
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
-use tracing::debug;
 
 use crate::{
+    apikey_handler::{self, ApiKeyApiDoc, ApiKeyState},
     apikey_service::ApiKeyService,
-    apikey_handler::{self, ApiKeyState, ApiKeyApiDoc},
 };
 
 /// API Key Plugin for managing API key operations
@@ -78,9 +78,18 @@ impl TempsPlugin for ApiKeyPlugin {
             .route("/api-keys/{id}", get(apikey_handler::get_api_key))
             .route("/api-keys/{id}", patch(apikey_handler::update_api_key))
             .route("/api-keys/{id}", delete(apikey_handler::delete_api_key))
-            .route("/api-keys/{id}/activate", post(apikey_handler::activate_api_key))
-            .route("/api-keys/{id}/deactivate", post(apikey_handler::deactivate_api_key))
-            .route("/api-keys/permissions", get(apikey_handler::get_api_key_permissions))
+            .route(
+                "/api-keys/{id}/activate",
+                post(apikey_handler::activate_api_key),
+            )
+            .route(
+                "/api-keys/{id}/deactivate",
+                post(apikey_handler::deactivate_api_key),
+            )
+            .route(
+                "/api-keys/permissions",
+                get(apikey_handler::get_api_key_permissions),
+            )
             .with_state(apikey_state);
 
         Some(PluginRoutes {

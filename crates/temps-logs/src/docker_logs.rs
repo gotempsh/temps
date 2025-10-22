@@ -8,11 +8,7 @@
 
 use std::sync::Arc;
 
-use bollard::{
-    container::LogOutput,
-    query_parameters::LogsOptions,
-    Docker,
-};
+use bollard::{container::LogOutput, query_parameters::LogsOptions, Docker};
 use futures::{StreamExt, TryStreamExt};
 use temps_core::UtcDateTime;
 
@@ -48,7 +44,12 @@ impl DockerLogService {
         options: ContainerLogOptions,
     ) -> Result<impl futures::Stream<Item = Result<String, DockerLogError>>, DockerLogError> {
         // Validate container exists first by attempting to inspect it
-        self.docker.inspect_container(container_id, None::<bollard::query_parameters::InspectContainerOptions>).await?;
+        self.docker
+            .inspect_container(
+                container_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await?;
 
         let tail = options.tail.unwrap_or_else(|| "all".to_string());
         let log_options = Some(LogsOptions {
@@ -57,12 +58,18 @@ impl DockerLogService {
             stderr: true,
             timestamps: true,
             tail,
-            since: options.start_date.map(|dt| dt.timestamp() as i32).unwrap_or(0),
-            until: options.end_date.map(|dt| dt.timestamp() as i32).unwrap_or(0),
+            since: options
+                .start_date
+                .map(|dt| dt.timestamp() as i32)
+                .unwrap_or(0),
+            until: options
+                .end_date
+                .map(|dt| dt.timestamp() as i32)
+                .unwrap_or(0),
             ..Default::default()
         });
 
-        let logs = self.docker.logs(&container_id, log_options);
+        let logs = self.docker.logs(container_id, log_options);
 
         let stream = logs.map(|result| match result {
             Ok(log_output) => match log_output {

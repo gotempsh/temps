@@ -1,6 +1,6 @@
+use anyhow::Result;
 use serde::Serialize;
 use temps_core::{AuditContext, AuditOperation};
-use anyhow::Result;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EnvironmentSettingsUpdatedFields {

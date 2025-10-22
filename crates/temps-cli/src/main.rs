@@ -6,8 +6,8 @@
 mod commands;
 
 use clap::{Parser, Subcommand};
+use commands::{ProxyCommand, ResetPasswordCommand, ServeCommand};
 use tracing_subscriber::{layer::SubscriberExt, Layer};
-use commands::{ServeCommand, ProxyCommand, ResetPasswordCommand};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -17,7 +17,12 @@ struct Cli {
     log_level: String,
 
     /// Log format: compact, full
-    #[arg(long, default_value = "compact", env = "TEMPS_LOG_FORMAT", global = true)]
+    #[arg(
+        long,
+        default_value = "compact",
+        env = "TEMPS_LOG_FORMAT",
+        global = true
+    )]
     log_format: String,
 
     #[command(subcommand)]
@@ -49,7 +54,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         // Use our default filter with all temps crates at the specified level
         // and noisy dependencies at warn level
-        tracing_subscriber::EnvFilter::new(&format!(
+        tracing_subscriber::EnvFilter::new(format!(
             "temps_cli={level},\
              temps_deployments={level},\
              temps_deployer={level},\
@@ -112,9 +117,7 @@ fn main() -> anyhow::Result<()> {
             .boxed(),
     };
 
-    let subscriber = tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt_layer);
+    let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
     tracing::subscriber::set_global_default(subscriber)
         .expect("Failed to set global default subscriber");
 
@@ -125,4 +128,3 @@ fn main() -> anyhow::Result<()> {
         Commands::ResetAdminPassword(reset_cmd) => reset_cmd.execute(),
     }
 }
-

@@ -15,7 +15,7 @@ pub fn check_permission_or_error(
             .title("Insufficient Permissions")
             .detail(format!(
                 "This operation requires the {} permission",
-                permission.to_string()
+                permission
             ))
             .value("required_permission", permission.to_string())
             .value("user_role", auth.effective_role.to_string())

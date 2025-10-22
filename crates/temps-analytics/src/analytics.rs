@@ -117,11 +117,8 @@ impl Analytics for AnalyticsService {
             "e.timestamp <= $3".to_string(),
             "e.event_name IS NOT NULL".to_string(),
         ];
-        let mut values: Vec<sea_orm::Value> = vec![
-            project_id.into(),
-            start_date.into(),
-            end_date.into(),
-        ];
+        let mut values: Vec<sea_orm::Value> =
+            vec![project_id.into(), start_date.into(), end_date.into()];
         let mut param_index = 4;
 
         // Default to true - only return custom events by default
@@ -191,10 +188,7 @@ impl Analytics for AnalyticsService {
             ORDER BY ec.count DESC
             LIMIT ${}
             "#,
-            select_field,
-            where_clause,
-            group_by_field,
-            param_index
+            select_field, where_clause, group_by_field, param_index
         );
         values.push((limit_val as i64).into());
 
@@ -240,11 +234,8 @@ impl Analytics for AnalyticsService {
             "e.timestamp >= $2".to_string(),
             "e.timestamp <= $3".to_string(),
         ];
-        let mut values: Vec<sea_orm::Value> = vec![
-            project_id.into(),
-            start_date.into(),
-            end_date.into(),
-        ];
+        let mut values: Vec<sea_orm::Value> =
+            vec![project_id.into(), start_date.into(), end_date.into()];
         let mut param_index = 4;
 
         if let Some(env_id) = environment_id {
@@ -349,7 +340,7 @@ impl Analytics for AnalyticsService {
 
         Ok(VisitorsResponse {
             visitors,
-            total_count: total_count,
+            total_count,
             filtered_count: total_count, // For now, same as total
         })
     }
@@ -890,14 +881,10 @@ impl Analytics for AnalyticsService {
             })?;
 
         // Build WHERE conditions with parameterized queries
-        let mut where_conditions = vec![
-            "session_id = $1".to_string(),
-            "project_id = $2".to_string(),
-        ];
-        let mut values: Vec<sea_orm::Value> = vec![
-            request_session.session_id.into(),
-            project_id.into(),
-        ];
+        let mut where_conditions =
+            vec!["session_id = $1".to_string(), "project_id = $2".to_string()];
+        let mut values: Vec<sea_orm::Value> =
+            vec![request_session.session_id.into(), project_id.into()];
         let mut param_index = 3;
 
         if let Some(env_id) = environment_id {
@@ -1275,8 +1262,7 @@ impl Analytics for AnalyticsService {
             ORDER BY page_view_count DESC
             LIMIT ${}
             "#,
-            where_clause,
-            param_index
+            where_clause, param_index
         );
 
         // Add LIMIT as parameter
@@ -1370,7 +1356,7 @@ WHERE project_id = $1
         let query = if let Some(limit) = limit {
             format!(
                 r#"
-                SELECT 
+                SELECT
                     e.session_id,
                     e.visitor_id,
                     MIN(e.timestamp) as session_start,
@@ -1393,7 +1379,7 @@ WHERE project_id = $1
         } else {
             format!(
                 r#"
-                SELECT 
+                SELECT
                     e.session_id,
                     e.visitor_id,
                     MIN(e.timestamp) as session_start,
@@ -1781,12 +1767,14 @@ mod tests {
     async fn test_get_top_pages() -> anyhow::Result<()> {
         let (service, db, _container) = create_test_analytics_service!("test_get_top_pages");
 
-        let start_date = chrono::NaiveDateTime::parse_from_str("2024-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
-            .unwrap()
-            .and_utc();
-        let end_date = chrono::NaiveDateTime::parse_from_str("2024-01-31 23:59:59", "%Y-%m-%d %H:%M:%S")
-            .unwrap()
-            .and_utc();
+        let start_date =
+            chrono::NaiveDateTime::parse_from_str("2024-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+                .unwrap()
+                .and_utc();
+        let end_date =
+            chrono::NaiveDateTime::parse_from_str("2024-01-31 23:59:59", "%Y-%m-%d %H:%M:%S")
+                .unwrap()
+                .and_utc();
 
         let pages = service
             .get_top_pages(1, 10, Some(start_date), Some(end_date))
@@ -1811,12 +1799,14 @@ mod tests {
         let (service, db, _container) =
             create_test_analytics_service!("test_empty_results_for_invalid_project");
 
-        let start_date = chrono::NaiveDateTime::parse_from_str("2024-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
-            .unwrap()
-            .and_utc();
-        let end_date = chrono::NaiveDateTime::parse_from_str("2024-01-31 23:59:59", "%Y-%m-%d %H:%M:%S")
-            .unwrap()
-            .and_utc();
+        let start_date =
+            chrono::NaiveDateTime::parse_from_str("2024-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+                .unwrap()
+                .and_utc();
+        let end_date =
+            chrono::NaiveDateTime::parse_from_str("2024-01-31 23:59:59", "%Y-%m-%d %H:%M:%S")
+                .unwrap()
+                .and_utc();
 
         // Use a non-existent project ID
         let invalid_project_id = 9999;
@@ -1882,6 +1872,4 @@ mod tests {
         // If this test compiles, it proves our parameterized query pattern is correct
         assert!(true, "Parameterized queries compile correctly");
     }
-
-
 }

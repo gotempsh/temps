@@ -1,5 +1,5 @@
-use sea_orm::entity::prelude::*;
 use async_trait::async_trait;
+use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
@@ -32,8 +32,8 @@ pub struct Model {
     pub package_manager: Option<String>,
     pub installation_id: Option<i32>,
     pub clone_url: Option<String>, // Added for non-API based cloning
-    pub ssh_url: Option<String>, // Added for SSH cloning
-    pub preset: Option<String>, // Stores the calculated project preset/type
+    pub ssh_url: Option<String>,   // Added for SSH cloning
+    pub preset: Option<String>,    // Stores the calculated project preset/type
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -52,7 +52,6 @@ impl Related<super::git_provider_connections::Entity> for Entity {
     }
 }
 
-
 #[async_trait]
 impl ActiveModelBehavior for ActiveModel {
     async fn before_save<C>(mut self, _db: &C, insert: bool) -> Result<Self, DbErr>
@@ -60,7 +59,7 @@ impl ActiveModelBehavior for ActiveModel {
         C: ConnectionTrait,
     {
         let now = chrono::Utc::now();
-        
+
         if insert {
             if self.created_at.is_not_set() {
                 self.created_at = Set(now);
@@ -71,7 +70,7 @@ impl ActiveModelBehavior for ActiveModel {
         } else {
             self.updated_at = Set(now);
         }
-        
+
         Ok(self)
     }
 }

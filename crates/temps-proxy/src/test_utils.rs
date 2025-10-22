@@ -3,7 +3,10 @@ use sea_orm_migration::MigratorTrait;
 #[cfg(test)]
 use std::sync::Arc;
 use temps_database::DbConnection;
-use temps_entities::{custom_routes, deployments, environments, projects, project_custom_domains, request_logs, visitor};
+use temps_entities::{
+    custom_routes, deployments, environments, project_custom_domains, projects, request_logs,
+    visitor,
+};
 use temps_migrations::Migrator;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 
@@ -15,9 +18,7 @@ pub struct TestDBMockOperations {
 impl TestDBMockOperations {
     /// Create a new test database with TimescaleDB
     pub async fn new(db: Arc<DbConnection>) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(TestDBMockOperations {
-            db,
-        })
+        Ok(TestDBMockOperations { db })
     }
 
     /// Create test project with environment and deployment
@@ -74,9 +75,12 @@ impl TestDBMockOperations {
             environment_id: Set(environment.id),
             slug: Set("http://localhost:8080".to_string()),
             state: Set("running".to_string()),
-            metadata: Set(sea_orm::JsonValue::Object(serde_json::Map::from_iter(vec![
-                ("container_port".to_string(), serde_json::Value::Number(8080.into())),
-            ]))),
+            metadata: Set(sea_orm::JsonValue::Object(serde_json::Map::from_iter(
+                vec![(
+                    "container_port".to_string(),
+                    serde_json::Value::Number(8080.into()),
+                )],
+            ))),
             ..Default::default()
         };
         let deployment = deployment.insert(self.db.as_ref()).await?;

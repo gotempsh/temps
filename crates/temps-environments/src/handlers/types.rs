@@ -3,8 +3,8 @@ use std::sync::Arc;
 use temps_core::AuditLogger;
 use utoipa::ToSchema;
 
-use crate::services::environment_service::EnvironmentService;
 use crate::services::env_var_service::EnvVarService;
+use crate::services::environment_service::EnvironmentService;
 pub struct AppState {
     pub environment_service: Arc<EnvironmentService>,
     pub env_var_service: Arc<EnvVarService>,
@@ -110,7 +110,6 @@ pub struct AddEnvironmentDomainRequest {
 pub struct EnvironmentVariableValueResponse {
     pub value: String,
 }
-
 
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
 pub struct UpdateEnvironmentSettingsRequest {

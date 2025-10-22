@@ -1,8 +1,8 @@
-// Note: This will be a procedural macro crate, but for now we'll create 
+// Note: This will be a procedural macro crate, but for now we'll create
 // a simpler function-based approach that can be used similarly
 
-use crate::permissions::Permission;
 use crate::context::AuthContext;
+use crate::permissions::Permission;
 use axum::{
     extract::FromRequestParts,
     http::{request::Parts, StatusCode},
@@ -13,7 +13,8 @@ use temps_core::problemdetails::{self, Problem};
 pub async fn extract_auth_context(parts: &Parts) -> Result<AuthContext, Problem> {
     // This will be implemented with the middleware
     // For now, return an error to indicate auth is required
-    parts.extensions
+    parts
+        .extensions
         .get::<AuthContext>()
         .cloned()
         .ok_or_else(|| {
@@ -26,20 +27,17 @@ pub async fn extract_auth_context(parts: &Parts) -> Result<AuthContext, Problem>
 // Wrapper function to check single permission
 pub fn check_permission(
     auth_context: &AuthContext,
-    permission: &Permission
+    permission: &Permission,
 ) -> Result<(), Problem> {
     if !auth_context.has_permission(permission) {
-        return Err(
-            problemdetails::new(StatusCode::FORBIDDEN)
-                .with_title("Insufficient Permissions")
-                .with_detail(format!(
-                    "Required permission: {}. Your role: {}",
-                    permission.to_string(),
-                    auth_context.effective_role.to_string()
-                ))
-                .with_value("required_permission", permission.to_string())
-                .with_value("user_role", auth_context.effective_role.to_string())
-        );
+        return Err(problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("Insufficient Permissions")
+            .with_detail(format!(
+                "Required permission: {}. Your role: {}",
+                permission, auth_context.effective_role
+            ))
+            .with_value("required_permission", permission.to_string())
+            .with_value("user_role", auth_context.effective_role.to_string()));
     }
     Ok(())
 }
@@ -47,21 +45,18 @@ pub fn check_permission(
 // Wrapper function to check multiple permissions (AND logic)
 pub fn check_permissions(
     auth_context: &AuthContext,
-    permissions: &[Permission]
+    permissions: &[Permission],
 ) -> Result<(), Problem> {
     for permission in permissions {
         if !auth_context.has_permission(permission) {
-            return Err(
-                problemdetails::new(StatusCode::FORBIDDEN)
-                    .with_title("Insufficient Permissions")
-                    .with_detail(format!(
-                        "Required permission: {}. Your role: {}",
-                        permission.to_string(),
-                        auth_context.effective_role.to_string()
-                    ))
-                    .with_value("required_permission", permission.to_string())
-                    .with_value("user_role", auth_context.effective_role.to_string())
-            );
+            return Err(problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Insufficient Permissions")
+                .with_detail(format!(
+                    "Required permission: {}. Your role: {}",
+                    permission, auth_context.effective_role
+                ))
+                .with_value("required_permission", permission.to_string())
+                .with_value("user_role", auth_context.effective_role.to_string()));
         }
     }
     Ok(())
@@ -78,7 +73,8 @@ where
     type Rejection = Problem;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let auth_context = parts.extensions
+        let auth_context = parts
+            .extensions
             .get::<AuthContext>()
             .cloned()
             .ok_or_else(|| {

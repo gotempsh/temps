@@ -175,9 +175,7 @@ impl From<crate::user_service::ServiceUser> for RouteUser {
             email: service_user.email,
             image: service_user.image,
             mfa_enabled: service_user.mfa_enabled,
-            deleted_at: service_user
-                .deleted_at
-                .map(|d| d.timestamp_millis()),
+            deleted_at: service_user.deleted_at.map(|d| d.timestamp_millis()),
         }
     }
 }

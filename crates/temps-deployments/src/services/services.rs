@@ -126,19 +126,13 @@ impl DeploymentService {
             query = query.filter(deployment_containers::Column::ContainerName.eq(name));
         }
 
-        let container = query
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| {
-                if let Some(name) = container_name {
-                    DeploymentError::NotFound(format!(
-                        "Container '{}' not found for deployment",
-                        name
-                    ))
-                } else {
-                    DeploymentError::NotFound("No containers found for deployment".to_string())
-                }
-            })?;
+        let container = query.one(self.db.as_ref()).await?.ok_or_else(|| {
+            if let Some(name) = container_name {
+                DeploymentError::NotFound(format!("Container '{}' not found for deployment", name))
+            } else {
+                DeploymentError::NotFound("No containers found for deployment".to_string())
+            }
+        })?;
 
         let container_id = container.container_id;
         let stream_result = self
@@ -147,12 +141,10 @@ impl DeploymentService {
                 &container_id,
                 temps_logs::docker_logs::ContainerLogOptions {
                     start_date: start_date.map(|ts| {
-                        chrono::DateTime::from_timestamp(ts, 0)
-                            .unwrap_or_else(|| chrono::Utc::now())
+                        chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
                     }),
                     end_date: end_date.map(|ts| {
-                        chrono::DateTime::from_timestamp(ts, 0)
-                            .unwrap_or_else(|| chrono::Utc::now())
+                        chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
                     }),
                     tail,
                 },
@@ -162,9 +154,7 @@ impl DeploymentService {
 
         // Map ContainerError to std::io::Error to maintain API compatibility
         let mapped_stream = futures_util::stream::StreamExt::map(stream_result, |item| {
-            item.map_err(|container_err| {
-                std::io::Error::new(std::io::ErrorKind::Other, container_err.to_string())
-            })
+            item.map_err(|container_err| std::io::Error::other(container_err.to_string()))
         });
 
         Ok(mapped_stream)
@@ -230,12 +220,10 @@ impl DeploymentService {
                 &container_id,
                 temps_logs::docker_logs::ContainerLogOptions {
                     start_date: start_date.map(|ts| {
-                        chrono::DateTime::from_timestamp(ts, 0)
-                            .unwrap_or_else(|| chrono::Utc::now())
+                        chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
                     }),
                     end_date: end_date.map(|ts| {
-                        chrono::DateTime::from_timestamp(ts, 0)
-                            .unwrap_or_else(|| chrono::Utc::now())
+                        chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
                     }),
                     tail,
                 },
@@ -245,9 +233,7 @@ impl DeploymentService {
 
         // Map ContainerError to std::io::Error to maintain API compatibility
         let mapped_stream = futures_util::stream::StreamExt::map(stream_result, |item| {
-            item.map_err(|container_err| {
-                std::io::Error::new(std::io::ErrorKind::Other, container_err.to_string())
-            })
+            item.map_err(|container_err| std::io::Error::other(container_err.to_string()))
         });
 
         Ok(mapped_stream)
@@ -300,7 +286,11 @@ impl DeploymentService {
         // Get container info from the deployer for each container
         let mut container_infos = Vec::new();
         for db_container in db_containers {
-            match self.deployer.get_container_info(&db_container.container_id).await {
+            match self
+                .deployer
+                .get_container_info(&db_container.container_id)
+                .await
+            {
                 Ok(info) => container_infos.push(info),
                 Err(e) => {
                     warn!(
@@ -576,7 +566,7 @@ impl DeploymentService {
             branch: branch.clone(),
             tag: tag.clone(),
             commit: commit.clone().unwrap_or_default(),
-            project_id: project_id,
+            project_id,
         };
 
         tracing::debug!(
@@ -884,7 +874,7 @@ impl DeploymentService {
         for domain in custom_domains {
             domains_by_env
                 .entry(domain.environment_id)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(domain.domain);
         }
 
@@ -1018,7 +1008,7 @@ impl DeploymentService {
             status: db_deployment.state,
             url: deployment_url,
             commit_hash: commit_sha,
-            commit_message: commit_message,
+            commit_message,
             branch: branch_ref,
             tag: tag_ref,
             created_at: db_deployment.created_at,
@@ -1239,7 +1229,6 @@ impl DeploymentService {
         project_id: i32,
         deployment_id: i32,
     ) -> Result<(), DeploymentError> {
-        
         use temps_entities::{deployment_jobs, types::JobStatus};
 
         info!(
@@ -1325,9 +1314,9 @@ mod tests {
     use chrono::Utc;
     use mockall::mock;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
-    use temps_core::EncryptionService;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use temps_core::EncryptionService;
     use temps_database::{test_utils::TestDatabase, DbConnection};
     use temps_entities::{
         deployments, env_vars, environments, external_service_params, external_services,
@@ -1380,10 +1369,17 @@ mod tests {
             async fn stream_container_logs(&self, container_id: &str) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, temps_deployer::DeployerError>;
         }
     }
-    fn create_test_external_service_manager(db: Arc<temps_database::DbConnection>) -> Arc<temps_providers::ExternalServiceManager> {
-        let encryption_service = Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+    fn create_test_external_service_manager(
+        db: Arc<temps_database::DbConnection>,
+    ) -> Arc<temps_providers::ExternalServiceManager> {
+        let encryption_service =
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().ok().unwrap());
-        Arc::new(temps_providers::ExternalServiceManager::new(db, encryption_service, docker))
+        Arc::new(temps_providers::ExternalServiceManager::new(
+            db,
+            encryption_service,
+            docker,
+        ))
     }
 
     async fn setup_test_data(
@@ -1895,8 +1891,13 @@ mod tests {
         // Create workflow planner
         let dsn_service = Arc::new(temps_error_tracking::DSNService::new(db.clone()));
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let workflow_planner =
-            WorkflowPlanner::new(db.clone(), log_service.clone(), external_service_manager.clone(), config_service, dsn_service);
+        let workflow_planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service.clone(),
+            external_service_manager.clone(),
+            config_service,
+            dsn_service,
+        );
 
         // Create deployment jobs using workflow planner
         let created_jobs = workflow_planner
@@ -1982,8 +1983,13 @@ mod tests {
         // Create workflow planner
         let dsn_service = Arc::new(temps_error_tracking::DSNService::new(db.clone()));
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let workflow_planner =
-            WorkflowPlanner::new(db.clone(), log_service.clone(), external_service_manager.clone(), config_service, dsn_service);
+        let workflow_planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service.clone(),
+            external_service_manager.clone(),
+            config_service,
+            dsn_service,
+        );
 
         // Create deployment jobs
         let created_jobs = workflow_planner
@@ -2062,7 +2068,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_environment_containers_no_deployment() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_list_environment_containers_no_deployment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
@@ -2076,7 +2083,11 @@ mod tests {
             .list_environment_containers(project.id, environment.id)
             .await?;
 
-        assert_eq!(containers.len(), 0, "Should return no containers when no active deployment");
+        assert_eq!(
+            containers.len(),
+            0,
+            "Should return no containers when no active deployment"
+        );
 
         Ok(())
     }
@@ -2128,7 +2139,10 @@ mod tests {
         assert!(result.is_err(), "Should fail with invalid container ID");
         match result {
             Err(DeploymentError::NotFound(msg)) => {
-                assert!(msg.contains("Container"), "Error should mention container not found");
+                assert!(
+                    msg.contains("Container"),
+                    "Error should mention container not found"
+                );
             }
             _ => panic!("Expected NotFound error"),
         }
@@ -2178,7 +2192,10 @@ mod tests {
         assert!(result.is_err(), "Should fail for non-server projects");
         match result {
             Err(DeploymentError::Other(msg)) => {
-                assert!(msg.contains("server-type"), "Error should mention server-type projects");
+                assert!(
+                    msg.contains("server-type"),
+                    "Error should mention server-type projects"
+                );
             }
             _ => panic!("Expected Other error"),
         }

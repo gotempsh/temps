@@ -4,14 +4,14 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::collections::HashMap;
-use temps_core::{WorkflowTask, JobResult, WorkflowContext, WorkflowError};
-use temps_deployer::{ImageBuilder, BuildRequest};
+use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_deployer::{BuildRequest, ImageBuilder};
 use temps_logs::LogService;
 use temps_presets;
-use std::fs;
 
 /// Typed output from DownloadRepoJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,15 +24,30 @@ pub struct RepositoryOutput {
 
 impl RepositoryOutput {
     /// Extract RepositoryOutput from WorkflowContext
-    pub fn from_context(context: &WorkflowContext, download_job_id: &str) -> Result<Self, WorkflowError> {
-        let repo_dir_str: String = context.get_output(download_job_id, "repo_dir")?
-            .ok_or_else(|| WorkflowError::JobValidationFailed("repo_dir output not found".to_string()))?;
-        let checkout_ref: String = context.get_output(download_job_id, "checkout_ref")?
-            .ok_or_else(|| WorkflowError::JobValidationFailed("checkout_ref output not found".to_string()))?;
-        let repo_owner: String = context.get_output(download_job_id, "repo_owner")?
-            .ok_or_else(|| WorkflowError::JobValidationFailed("repo_owner output not found".to_string()))?;
-        let repo_name: String = context.get_output(download_job_id, "repo_name")?
-            .ok_or_else(|| WorkflowError::JobValidationFailed("repo_name output not found".to_string()))?;
+    pub fn from_context(
+        context: &WorkflowContext,
+        download_job_id: &str,
+    ) -> Result<Self, WorkflowError> {
+        let repo_dir_str: String = context
+            .get_output(download_job_id, "repo_dir")?
+            .ok_or_else(|| {
+                WorkflowError::JobValidationFailed("repo_dir output not found".to_string())
+            })?;
+        let checkout_ref: String = context
+            .get_output(download_job_id, "checkout_ref")?
+            .ok_or_else(|| {
+                WorkflowError::JobValidationFailed("checkout_ref output not found".to_string())
+            })?;
+        let repo_owner: String = context
+            .get_output(download_job_id, "repo_owner")?
+            .ok_or_else(|| {
+                WorkflowError::JobValidationFailed("repo_owner output not found".to_string())
+            })?;
+        let repo_name: String = context
+            .get_output(download_job_id, "repo_name")?
+            .ok_or_else(|| {
+                WorkflowError::JobValidationFailed("repo_name output not found".to_string())
+            })?;
 
         Ok(Self {
             repo_dir: PathBuf::from(repo_dir_str),
@@ -74,7 +89,6 @@ impl Default for BuildConfig {
         }
     }
 }
-
 
 /// Job for building container images from source code
 pub struct BuildImageJob {
@@ -161,58 +175,74 @@ impl BuildImageJob {
     }
 
     /// Generate Dockerfile from preset if it doesn't exist
-    async fn ensure_dockerfile(&self, repo_dir: &PathBuf, dockerfile_path: &PathBuf) -> Result<(), WorkflowError> {
+    async fn ensure_dockerfile(
+        &self,
+        repo_dir: &PathBuf,
+        dockerfile_path: &PathBuf,
+    ) -> Result<(), WorkflowError> {
         // If Dockerfile exists, we're done
         if dockerfile_path.exists() {
             return Ok(());
         }
 
         // If no preset is configured, we can't generate a Dockerfile
-        let preset_slug = self.preset.as_ref()
-            .ok_or_else(|| WorkflowError::JobExecutionFailed(
-                "Dockerfile not found and no preset configured to generate one".to_string()
-            ))?;
+        let preset_slug = self.preset.as_ref().ok_or_else(|| {
+            WorkflowError::JobExecutionFailed(
+                "Dockerfile not found and no preset configured to generate one".to_string(),
+            )
+        })?;
 
-        self.log(format!("📝 Dockerfile not found, generating from preset: {}", preset_slug)).await?;
+        self.log(format!(
+            "📝 Dockerfile not found, generating from preset: {}",
+            preset_slug
+        ))
+        .await?;
 
         // Get the preset
-        let preset = temps_presets::get_preset_by_slug(preset_slug)
-            .ok_or_else(|| WorkflowError::JobExecutionFailed(
-                format!("Unknown preset: {}", preset_slug)
-            ))?;
+        let preset = temps_presets::get_preset_by_slug(preset_slug).ok_or_else(|| {
+            WorkflowError::JobExecutionFailed(format!("Unknown preset: {}", preset_slug))
+        })?;
 
         // Convert build args to build_vars format (Vec<String> of "KEY" for ARG directives)
-        let build_vars: Vec<String> = self.build_config.build_args
+        let build_vars: Vec<String> = self
+            .build_config
+            .build_args
             .iter()
             .map(|(key, _)| key.clone())
             .collect();
 
         // Generate Dockerfile content with build args
         let dockerfile_content = preset.dockerfile(
-            repo_dir,                          // root_local_path
-            repo_dir,                          // local_path
-            None,                              // install_command (auto-detect)
-            None,                              // build_command (auto-detect)
-            None,                              // output_dir (auto-detect)
-            Some(&build_vars),                 // build_vars - ARG directives for env vars
-            "deployment",                      // project_slug
+            repo_dir,          // root_local_path
+            repo_dir,          // local_path
+            None,              // install_command (auto-detect)
+            None,              // build_command (auto-detect)
+            None,              // output_dir (auto-detect)
+            Some(&build_vars), // build_vars - ARG directives for env vars
+            "deployment",      // project_slug
         );
 
         // Write the Dockerfile
-        fs::write(dockerfile_path, dockerfile_content)
-            .map_err(|e| WorkflowError::IoError(e))?;
+        fs::write(dockerfile_path, dockerfile_content).map_err(WorkflowError::IoError)?;
 
-        self.log(format!("✅ Generated Dockerfile at: {} with {} build args",
+        self.log(format!(
+            "✅ Generated Dockerfile at: {} with {} build args",
             dockerfile_path.display(),
             build_vars.len()
-        )).await?;
+        ))
+        .await?;
 
         Ok(())
     }
 
     /// Build the container image with real-time logging
-    async fn build_image(&self, repo_output: &RepositoryOutput, _context: &WorkflowContext) -> Result<ImageOutput, WorkflowError> {
-        self.log(format!("🐳 Starting image build for {}", self.image_tag)).await?;
+    async fn build_image(
+        &self,
+        repo_output: &RepositoryOutput,
+        _context: &WorkflowContext,
+    ) -> Result<ImageOutput, WorkflowError> {
+        self.log(format!("🐳 Starting image build for {}", self.image_tag))
+            .await?;
 
         // Determine dockerfile path
         let dockerfile_path = if let Some(ref dockerfile) = self.build_config.dockerfile_path {
@@ -221,10 +251,15 @@ impl BuildImageJob {
             repo_output.repo_dir.join("Dockerfile")
         };
 
-        self.log(format!("📄 Using Dockerfile: {}", dockerfile_path.display())).await?;
+        self.log(format!(
+            "📄 Using Dockerfile: {}",
+            dockerfile_path.display()
+        ))
+        .await?;
 
         // Ensure Dockerfile exists (generate from preset if needed)
-        self.ensure_dockerfile(&repo_output.repo_dir, &dockerfile_path).await?;
+        self.ensure_dockerfile(&repo_output.repo_dir, &dockerfile_path)
+            .await?;
 
         // Determine build context
         let build_context = if let Some(ref context_path) = self.build_config.build_context {
@@ -233,13 +268,15 @@ impl BuildImageJob {
             repo_output.repo_dir.clone()
         };
 
-        self.log(format!("📁 Build context: {}", build_context.display())).await?;
+        self.log(format!("📁 Build context: {}", build_context.display()))
+            .await?;
 
         // Create a temporary log file for the build
         let log_path = std::env::temp_dir().join(format!("build_{}.log", self.job_id));
 
         // Build the image using ImageBuilder trait
-        self.log("🔨 Building container image...".to_string()).await?;
+        self.log("🔨 Building container image...".to_string())
+            .await?;
 
         let mut build_args = HashMap::new();
         for (key, value) in &self.build_config.build_args {
@@ -258,29 +295,47 @@ impl BuildImageJob {
         // Create log callback to stream Docker build output to job logs
         let log_service = self.log_service.clone();
         let log_id = self.log_id.clone();
-        let log_callback: Option<temps_deployer::LogCallback> = if let (Some(log_svc), Some(log_id_str)) = (log_service, log_id) {
-            Some(std::sync::Arc::new(move |line: String| {
-                let log_svc_clone = log_svc.clone();
-                let log_id_clone = log_id_str.clone();
-                Box::pin(async move {
-                    let _ = log_svc_clone.append_to_log(&log_id_clone, &line).await;
-                })
-            }))
-        } else {
-            None
-        };
+        let log_callback: Option<temps_deployer::LogCallback> =
+            if let (Some(log_svc), Some(log_id_str)) = (log_service, log_id) {
+                Some(std::sync::Arc::new(move |line: String| {
+                    let log_svc_clone = log_svc.clone();
+                    let log_id_clone = log_id_str.clone();
+                    Box::pin(async move {
+                        let _ = log_svc_clone.append_to_log(&log_id_clone, &line).await;
+                    })
+                }))
+            } else {
+                None
+            };
 
         let build_request_with_callback = temps_deployer::BuildRequestWithCallback {
             request: build_request,
             log_callback,
         };
 
-        let build_result = self.image_builder.build_image_with_callback(build_request_with_callback).await
-            .map_err(|e| WorkflowError::JobExecutionFailed(format!("Failed to build image: {}", e)))?;
+        let build_result = self
+            .image_builder
+            .build_image_with_callback(build_request_with_callback)
+            .await
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!("Failed to build image: {}", e))
+            })?;
 
-        self.log(format!("✅ Image built successfully: {} ({})", build_result.image_name, build_result.image_id)).await?;
-        self.log(format!("📊 Image size: {} MB", build_result.size_bytes / (1024 * 1024))).await?;
-        self.log(format!("⏱️  Build time: {} ms", build_result.build_duration_ms)).await?;
+        self.log(format!(
+            "✅ Image built successfully: {} ({})",
+            build_result.image_name, build_result.image_id
+        ))
+        .await?;
+        self.log(format!(
+            "📊 Image size: {} MB",
+            build_result.size_bytes / (1024 * 1024)
+        ))
+        .await?;
+        self.log(format!(
+            "⏱️  Build time: {} ms",
+            build_result.build_duration_ms
+        ))
+        .await?;
 
         Ok(ImageOutput {
             image_tag: build_result.image_name,
@@ -321,11 +376,23 @@ impl WorkflowTask for BuildImageJob {
         context.set_output(&self.job_id, "image_tag", &image_output.image_tag)?;
         context.set_output(&self.job_id, "image_id", &image_output.image_id)?;
         context.set_output(&self.job_id, "size_bytes", image_output.size_bytes)?;
-        context.set_output(&self.job_id, "build_context", image_output.build_context.to_string_lossy().to_string())?;
-        context.set_output(&self.job_id, "dockerfile_path", image_output.dockerfile_path.to_string_lossy().to_string())?;
+        context.set_output(
+            &self.job_id,
+            "build_context",
+            image_output.build_context.to_string_lossy().to_string(),
+        )?;
+        context.set_output(
+            &self.job_id,
+            "dockerfile_path",
+            image_output.dockerfile_path.to_string_lossy().to_string(),
+        )?;
 
         // Set artifacts
-        context.set_artifact(&self.job_id, "container_image", PathBuf::from(&image_output.image_tag));
+        context.set_artifact(
+            &self.job_id,
+            "container_image",
+            PathBuf::from(&image_output.image_tag),
+        );
 
         Ok(JobResult::success(context))
     }
@@ -336,10 +403,14 @@ impl WorkflowTask for BuildImageJob {
 
         // Basic validation
         if self.image_tag.is_empty() {
-            return Err(WorkflowError::JobValidationFailed("image_tag cannot be empty".to_string()));
+            return Err(WorkflowError::JobValidationFailed(
+                "image_tag cannot be empty".to_string(),
+            ));
         }
         if self.download_job_id.is_empty() {
-            return Err(WorkflowError::JobValidationFailed("download_job_id cannot be empty".to_string()));
+            return Err(WorkflowError::JobValidationFailed(
+                "download_job_id cannot be empty".to_string(),
+            ));
         }
 
         Ok(())
@@ -431,19 +502,20 @@ impl BuildImageJobBuilder {
         self
     }
 
-    pub fn build(self, image_builder: Arc<dyn ImageBuilder>) -> Result<BuildImageJob, WorkflowError> {
+    pub fn build(
+        self,
+        image_builder: Arc<dyn ImageBuilder>,
+    ) -> Result<BuildImageJob, WorkflowError> {
         let job_id = self.job_id.unwrap_or_else(|| "build_image".to_string());
-        let download_job_id = self.download_job_id
-            .ok_or_else(|| WorkflowError::JobValidationFailed("download_job_id is required".to_string()))?;
-        let image_tag = self.image_tag
-            .ok_or_else(|| WorkflowError::JobValidationFailed("image_tag is required".to_string()))?;
+        let download_job_id = self.download_job_id.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("download_job_id is required".to_string())
+        })?;
+        let image_tag = self.image_tag.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("image_tag is required".to_string())
+        })?;
 
-        let mut job = BuildImageJob::new(
-            job_id,
-            download_job_id,
-            image_tag,
-            image_builder,
-        ).with_build_config(self.build_config);
+        let mut job = BuildImageJob::new(job_id, download_job_id, image_tag, image_builder)
+            .with_build_config(self.build_config);
 
         if let Some(log_id) = self.log_id {
             job = job.with_log_id(log_id);
@@ -468,10 +540,12 @@ impl Default for BuildImageJobBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::WorkflowContext;
-    use temps_deployer::{BuildRequest, BuildRequestWithCallback, BuildResult, BuilderError, ImageBuilder};
     use async_trait::async_trait;
     use std::path::Path;
+    use temps_core::WorkflowContext;
+    use temps_deployer::{
+        BuildRequest, BuildRequestWithCallback, BuildResult, BuilderError, ImageBuilder,
+    };
 
     // Mock ImageBuilder for testing
     struct MockImageBuilder;
@@ -487,11 +561,20 @@ mod tests {
             })
         }
 
-        async fn import_image(&self, _image_path: PathBuf, _tag: &str) -> Result<String, BuilderError> {
+        async fn import_image(
+            &self,
+            _image_path: PathBuf,
+            _tag: &str,
+        ) -> Result<String, BuilderError> {
             Ok("sha256:imported".to_string())
         }
 
-        async fn extract_from_image(&self, _image_name: &str, _source_path: &str, _destination_path: &Path) -> Result<(), BuilderError> {
+        async fn extract_from_image(
+            &self,
+            _image_name: &str,
+            _source_path: &str,
+            _destination_path: &Path,
+        ) -> Result<(), BuilderError> {
             Ok(())
         }
 
@@ -503,7 +586,10 @@ mod tests {
             Ok(())
         }
 
-        async fn build_image_with_callback(&self, request: BuildRequestWithCallback) -> Result<BuildResult, BuilderError> {
+        async fn build_image_with_callback(
+            &self,
+            request: BuildRequestWithCallback,
+        ) -> Result<BuildResult, BuilderError> {
             // Delegate to regular build_image since we don't need callback in tests
             self.build_image(request.request).await
         }
@@ -533,10 +619,18 @@ mod tests {
         let mut context = crate::test_utils::create_test_context("test".to_string(), 1, 1, 1);
 
         // Set up outputs as the download job would
-        context.set_output("download_repo", "repo_dir", "/tmp/repo").unwrap();
-        context.set_output("download_repo", "checkout_ref", "main").unwrap();
-        context.set_output("download_repo", "repo_owner", "user").unwrap();
-        context.set_output("download_repo", "repo_name", "project").unwrap();
+        context
+            .set_output("download_repo", "repo_dir", "/tmp/repo")
+            .unwrap();
+        context
+            .set_output("download_repo", "checkout_ref", "main")
+            .unwrap();
+        context
+            .set_output("download_repo", "repo_owner", "user")
+            .unwrap();
+        context
+            .set_output("download_repo", "repo_name", "project")
+            .unwrap();
 
         let repo_output = RepositoryOutput::from_context(&context, "download_repo").unwrap();
         assert_eq!(repo_output.repo_dir, PathBuf::from("/tmp/repo"));

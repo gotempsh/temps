@@ -428,7 +428,9 @@ mod tests {
         let event_json = include_str!("../../resources/stacktrace_event.json");
         let event_value: serde_json::Value = serde_json::from_str(event_json).unwrap();
         let event_value = Event::from_value(event_value.into());
-        let event = event_value.value().unwrap_or_else(|| panic!("Should parse event"));
+        let event = event_value
+            .value()
+            .unwrap_or_else(|| panic!("Should parse event"));
         println!("{}", event_value.to_json_pretty().unwrap());
         // let stacktrace = event.stacktrace.value();
         // assert!(stacktrace.is_some(), "Should parse stacktrace");

@@ -46,8 +46,9 @@ impl TempsPlugin for DomainsPlugin {
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
             // Create repository for TLS service
-            let repository: Arc<dyn crate::tls::repository::CertificateRepository> =
-                Arc::new(DefaultCertificateRepository::new(db.clone(), encryption_service.clone()));
+            let repository: Arc<dyn crate::tls::repository::CertificateRepository> = Arc::new(
+                DefaultCertificateRepository::new(db.clone(), encryption_service.clone()),
+            );
             context.register_service(repository.clone());
 
             // Create certificate provider
@@ -58,7 +59,8 @@ impl TempsPlugin for DomainsPlugin {
             ));
 
             // Try to get notification service (optional)
-            let notification_service = context.get_service::<dyn temps_core::notifications::NotificationService>();
+            let notification_service =
+                context.get_service::<dyn temps_core::notifications::NotificationService>();
 
             // Create TLS service
             let mut tls_service = TlsServiceBuilder::new()
@@ -75,7 +77,9 @@ impl TempsPlugin for DomainsPlugin {
                 tls_service = tls_service.with_notification_service(notif_service);
                 tracing::debug!("Notification service integrated with TLS service");
             } else {
-                tracing::debug!("No notification service available - renewal notifications will be skipped");
+                tracing::debug!(
+                    "No notification service available - renewal notifications will be skipped"
+                );
             }
 
             let tls_service = Arc::new(tls_service);
@@ -110,7 +114,12 @@ impl TempsPlugin for DomainsPlugin {
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
             // Create domain service
-            let domain_service = Arc::new(crate::DomainService::new(db.clone(), cert_provider, repository.clone(), encryption_service.clone()));
+            let domain_service = Arc::new(crate::DomainService::new(
+                db.clone(),
+                cert_provider,
+                repository.clone(),
+                encryption_service.clone(),
+            ));
 
             // Create DomainAppState for handlers
             let domain_app_state = create_domain_app_state(tls_service, repository, domain_service);

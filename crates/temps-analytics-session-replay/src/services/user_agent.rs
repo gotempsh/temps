@@ -1,25 +1,13 @@
 use serde::{Deserialize, Serialize};
 use woothee::parser::{Parser, WootheeResult};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BrowserInfo {
     pub browser: Option<String>,
     pub browser_version: Option<String>,
     pub operating_system: Option<String>,
     pub operating_system_version: Option<String>,
     pub device_type: Option<String>,
-}
-
-impl Default for BrowserInfo {
-    fn default() -> Self {
-        Self {
-            browser: None,
-            browser_version: None,
-            operating_system: None,
-            operating_system_version: None,
-            device_type: None,
-        }
-    }
 }
 
 impl BrowserInfo {
@@ -42,11 +30,11 @@ impl BrowserInfo {
 
     fn from_woothee_result(result: &WootheeResult) -> Self {
         Self {
-            browser: Self::clean_name(&result.name),
-            browser_version: Self::clean_version(&result.version),
-            operating_system: Self::clean_name(&result.os),
+            browser: Self::clean_name(result.name),
+            browser_version: Self::clean_version(result.version),
+            operating_system: Self::clean_name(result.os),
             operating_system_version: Self::clean_version(&result.os_version),
-            device_type: Self::determine_device_type(&result.category),
+            device_type: Self::determine_device_type(result.category),
         }
     }
 
@@ -98,7 +86,7 @@ mod tests {
     fn test_safari_mobile() {
         let ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1";
         let info = BrowserInfo::from_user_agent(Some(ua));
-        
+
         assert_eq!(info.browser, Some("Safari".to_string()));
         assert_eq!(info.operating_system, Some("iPhone".to_string()));
         assert_eq!(info.device_type, Some("Mobile".to_string()));
@@ -116,7 +104,7 @@ mod tests {
     fn test_bot_user_agent() {
         let ua = "Googlebot/2.1 (+http://www.google.com/bot.html)";
         let info = BrowserInfo::from_user_agent(Some(ua));
-        
+
         assert_eq!(info.device_type, Some("Bot".to_string()));
     }
 }

@@ -1,12 +1,11 @@
-use crate::services::{AuditService, AuditLogWithDetails};
+use crate::services::{AuditLogWithDetails, AuditService};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use serde::{Serialize, Deserialize};
-use utoipa::ToSchema;
 use temps_core::DateTime;
+use utoipa::ToSchema;
 pub struct AppState {
     pub audit_service: Arc<AuditService>,
 }
-
 
 /// Response type for audit log entries
 #[derive(Serialize, ToSchema)]

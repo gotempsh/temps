@@ -9,8 +9,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
-use temps_core::{problemdetails::Problem, AppSettings, LetsEncryptSettings, ScreenshotSettings};
 use temps_core::error_builder::ErrorBuilder;
+use temps_core::{problemdetails::Problem, AppSettings, LetsEncryptSettings, ScreenshotSettings};
 use utoipa::{OpenApi, ToSchema};
 
 pub struct SettingsState {
@@ -118,13 +118,11 @@ async fn get_settings(
         }
         Err(e) => {
             tracing::error!("Failed to get settings: {}", e);
-            Err(
-                ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .type_("https://temps.sh/probs/settings-error")
-                    .title("Settings Error")
-                    .detail(format!("Failed to get settings: {}", e))
-                    .build(),
-            )
+            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .type_("https://temps.sh/probs/settings-error")
+                .title("Settings Error")
+                .detail(format!("Failed to get settings: {}", e))
+                .build())
         }
     }
 }
@@ -180,15 +178,11 @@ async fn update_settings(
         )),
         Err(e) => {
             tracing::error!("Failed to update settings: {}", e);
-            Err(
-                ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .type_("https://temps.sh/probs/settings-error")
-                    .title("Settings Error")
-                    .detail(format!("Failed to update settings: {}", e))
-                    .build(),
-            )
+            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .type_("https://temps.sh/probs/settings-error")
+                .title("Settings Error")
+                .detail(format!("Failed to update settings: {}", e))
+                .build())
         }
     }
 }
-
-

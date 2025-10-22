@@ -127,7 +127,7 @@ impl NixpacksBuilder {
         if nixpacks_dockerfile.exists() {
             fs::rename(&nixpacks_dockerfile, &target_dockerfile)
                 .await
-                .map_err(|e| BuilderError::IoError(e))?;
+                .map_err(BuilderError::IoError)?;
             info!("Dockerfile generated at: {}", target_dockerfile.display());
             Ok(target_dockerfile)
         } else {
@@ -205,7 +205,7 @@ impl ImageBuilder for NixpacksBuilder {
 
         fs::write(&request.log_path, &logs)
             .await
-            .map_err(|e| BuilderError::IoError(e))?;
+            .map_err(BuilderError::IoError)?;
 
         if !output.status.success() {
             error!("Docker build failed: {}", logs);
@@ -248,7 +248,7 @@ impl ImageBuilder for NixpacksBuilder {
         // Read the tar file into memory
         let tar_data = tokio::fs::read(&image_path)
             .await
-            .map_err(|e| BuilderError::IoError(e))?;
+            .map_err(BuilderError::IoError)?;
 
         // Import the image
         let import_options = ImportImageOptions {
@@ -381,7 +381,7 @@ impl ImageBuilder for NixpacksBuilder {
         let mut archive = tar::Archive::new(cursor);
         archive
             .unpack(destination_path)
-            .map_err(|e| BuilderError::IoError(e))?;
+            .map_err(BuilderError::IoError)?;
 
         // Cleanup container
         let _ = self

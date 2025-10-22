@@ -1,4 +1,3 @@
-
 use serde::{Deserialize, Serialize};
 use temps_core::UtcDateTime;
 // Deployment-related types
@@ -75,7 +74,6 @@ pub struct DeploymentStage {
     pub finished_at: Option<UtcDateTime>,
 }
 
-
 #[derive(Deserialize)]
 pub struct UpdateDeploymentSettingsRequest {
     pub cpu_request: Option<i32>,
@@ -83,7 +81,6 @@ pub struct UpdateDeploymentSettingsRequest {
     pub memory_request: Option<i32>,
     pub memory_limit: Option<i32>,
 }
-
 
 #[derive(Debug, Serialize)]
 pub struct Pipeline {

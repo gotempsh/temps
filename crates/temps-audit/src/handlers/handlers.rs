@@ -6,28 +6,18 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use tracing::error;
 use std::sync::Arc;
 use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
+use tracing::error;
 use utoipa::OpenApi;
 
-use super::types::{
-    AuditLogResponse,
-    ListAuditLogsQuery,
-    AuditLogUserInfo,
-    AuditLogIpInfo
-};
+use super::types::{AuditLogIpInfo, AuditLogResponse, AuditLogUserInfo, ListAuditLogsQuery};
 
 #[derive(OpenApi)]
 #[openapi(
     paths(list_audit_logs, get_audit_log),
-    components(schemas(
-        AuditLogResponse,
-        ListAuditLogsQuery,
-        AuditLogUserInfo,
-        AuditLogIpInfo
-    )),
+    components(schemas(AuditLogResponse, ListAuditLogsQuery, AuditLogUserInfo, AuditLogIpInfo)),
     info(
         title = "Audit API",
         description = "API endpoints for managing and retrieving audit logs. \

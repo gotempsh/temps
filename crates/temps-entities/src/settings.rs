@@ -2,8 +2,8 @@
 
 use sea_orm::entity::prelude::*;
 use sea_orm::ConnectionTrait;
-use temps_core::DBDateTime;
 use serde::{Deserialize, Serialize};
+use temps_core::DBDateTime;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "settings")]
@@ -22,7 +22,7 @@ pub enum Relation {}
 #[async_trait::async_trait]
 impl ActiveModelBehavior for ActiveModel {
     fn new() -> Self {
-        use sea_orm::ActiveValue::{Set, NotSet};
+        use sea_orm::ActiveValue::{NotSet, Set};
         let now = chrono::Utc::now();
         Self {
             id: Set(1),

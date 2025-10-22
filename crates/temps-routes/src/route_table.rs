@@ -8,8 +8,8 @@ use parking_lot::RwLock;
 use sea_orm::DatabaseConnection;
 use sqlx::postgres::{PgListener, PgPool};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use temps_entities::{deployments, environments, projects};
 use tracing::{debug, error, info, warn};
 
@@ -44,7 +44,8 @@ impl RouteInfo {
         }
 
         // Round-robin load balancing
-        let index = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) % self.backend_addrs.len();
+        let index =
+            self.round_robin_counter.fetch_add(1, Ordering::Relaxed) % self.backend_addrs.len();
         self.backend_addrs[index].clone()
     }
 }
@@ -68,9 +69,7 @@ impl CachedPeerTable {
     /// Load all routes from the database into the cache with full models
     /// This queries environment_domains, custom_routes, and project_custom_domains
     pub async fn load_routes(&self) -> Result<(), sea_orm::DbErr> {
-        use sea_orm::{
-            ColumnTrait, EntityTrait, QueryFilter,
-        };
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
         use temps_entities::{
             custom_routes, deployments, environment_domains, environments, project_custom_domains,
             settings,
@@ -159,7 +158,9 @@ impl CachedPeerTable {
                             // Build backend addresses from all containers
                             let backend_addrs: Vec<String> = containers
                                 .iter()
-                                .map(|c| format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port)))
+                                .map(|c| {
+                                    format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port))
+                                })
                                 .collect();
 
                             routes.insert(
@@ -277,7 +278,9 @@ impl CachedPeerTable {
                             // Build backend addresses from all containers
                             let backend_addrs: Vec<String> = containers
                                 .iter()
-                                .map(|c| format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port)))
+                                .map(|c| {
+                                    format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port))
+                                })
                                 .collect();
 
                             routes.insert(
@@ -327,9 +330,9 @@ impl CachedPeerTable {
             if let Some(deployment_id) = env.current_deployment_id {
                 let main_url = &env.subdomain;
                 // Cache environment if not already cached
-                if !environments_cache.contains_key(&env.id) {
-                    environments_cache.insert(env.id, Arc::new(env.clone()));
-                }
+                environments_cache
+                    .entry(env.id)
+                    .or_insert_with(|| Arc::new(env.clone()));
 
                 // Fetch deployment if not cached
                 if !deployments_cache.contains_key(&deployment_id) {
@@ -370,7 +373,9 @@ impl CachedPeerTable {
                         // Build backend addresses from all containers
                         let backend_addrs: Vec<String> = containers
                             .iter()
-                            .map(|c| format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port)))
+                            .map(|c| {
+                                format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port))
+                            })
                             .collect();
 
                         // Add route with main_url as-is
@@ -437,9 +442,9 @@ impl CachedPeerTable {
 
         for env in all_active_envs {
             // Cache environment if not already cached
-            if !environments_cache.contains_key(&env.id) {
-                environments_cache.insert(env.id, Arc::new(env.clone()));
-            }
+            environments_cache
+                .entry(env.id)
+                .or_insert_with(|| Arc::new(env.clone()));
 
             if let Some(deployment_id) = env.current_deployment_id {
                 // Fetch deployment if not cached
@@ -465,11 +470,7 @@ impl CachedPeerTable {
                 }
 
                 // Check if we have all required data cached
-                if let (
-                    Some(deployment),
-                    Some(project),
-                    Some(environment),
-                ) = (
+                if let (Some(deployment), Some(project), Some(environment)) = (
                     deployments_cache.get(&deployment_id),
                     projects_cache.get(&env.project_id),
                     environments_cache.get(&env.id),
@@ -487,7 +488,9 @@ impl CachedPeerTable {
                         // Build backend addresses from all containers
                         let backend_addrs: Vec<String> = containers
                             .iter()
-                            .map(|c| format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port)))
+                            .map(|c| {
+                                format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port))
+                            })
                             .collect();
 
                         // Generate a fallback route using environment ID if no other routes exist

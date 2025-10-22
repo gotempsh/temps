@@ -1,15 +1,13 @@
-
-use chrono::Utc;
-use tracing::warn;
-use sea_orm::{prelude::*, Set, EntityTrait, QueryFilter, QueryOrder, QuerySelect, ColumnTrait};
-use serde::Serialize;
-use temps_database::DbConnection;
-use temps_entities::{audit_logs, users, ip_geolocations};
-use temps_geo::IpAddressService;
-use std::sync::Arc;
 use anyhow::Context;
+use chrono::Utc;
+use sea_orm::{prelude::*, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
+use serde::Serialize;
+use std::sync::Arc;
 use temps_core::{AuditLogger, AuditOperation, UtcDateTime};
-
+use temps_database::DbConnection;
+use temps_entities::{audit_logs, ip_geolocations, users};
+use temps_geo::IpAddressService;
+use tracing::warn;
 
 /// Audit log with enriched user and IP geolocation data
 #[derive(Debug, Clone, Serialize)]
@@ -54,8 +52,8 @@ impl AuditService {
             operation_type: Set(operation.operation_type()),
             user_agent: Set(operation.user_agent().to_string()),
             ip_address_id: Set(ip_address_id_val),
-            audit_date: Set(now.into()),
-            created_at: Set(now.into()),
+            audit_date: Set(now),
+            created_at: Set(now),
             data: Set(data_json),
             ..Default::default()
         };
@@ -85,7 +83,10 @@ impl AuditService {
         Ok(results)
     }
 
-    pub async fn get_recent_audit_logs(&self, limit: u64) -> anyhow::Result<Vec<temps_entities::audit_logs::Model>> {
+    pub async fn get_recent_audit_logs(
+        &self,
+        limit: u64,
+    ) -> anyhow::Result<Vec<temps_entities::audit_logs::Model>> {
         let results = temps_entities::audit_logs::Entity::find()
             .order_by_desc(temps_entities::audit_logs::Column::AuditDate)
             .limit(limit)
@@ -107,7 +108,8 @@ impl AuditService {
 
         // Apply filters
         if let Some(action_filter) = action {
-            query = query.filter(temps_entities::audit_logs::Column::OperationType.contains(action_filter));
+            query = query
+                .filter(temps_entities::audit_logs::Column::OperationType.contains(action_filter));
         }
         if let Some(uid) = user_id_p {
             query = query.filter(temps_entities::audit_logs::Column::UserId.eq(uid));
@@ -135,7 +137,7 @@ impl AuditService {
             let user = temps_entities::users::Entity::find_by_id(log.user_id)
                 .one(self.db.as_ref())
                 .await?;
-                
+
             // Fetch related IP geolocation if present
             let ip_address = if let Some(ip_address_id) = log.ip_address_id {
                 temps_entities::ip_geolocations::Entity::find_by_id(ip_address_id)
@@ -144,7 +146,7 @@ impl AuditService {
             } else {
                 None
             };
-            
+
             audit_details.push(AuditLogWithDetails {
                 log,
                 user,
@@ -166,8 +168,8 @@ impl AuditService {
             let user = temps_entities::users::Entity::find_by_id(log.user_id)
                 .one(self.db.as_ref())
                 .await?;
-                
-            // Fetch related IP geolocation if present  
+
+            // Fetch related IP geolocation if present
             let ip_address = if let Some(ip_address_id) = log.ip_address_id {
                 temps_entities::ip_geolocations::Entity::find_by_id(ip_address_id)
                     .one(self.db.as_ref())

@@ -46,7 +46,7 @@ pub enum ErrorTrackingError {
 }
 
 /// Input data for creating a new error event
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CreateErrorEventData {
     // Source of the error event (e.g., "sentry", "custom", "bugsnag")
     pub source: Option<String>,
@@ -146,77 +146,6 @@ pub struct CreateErrorEventData {
     pub deployment_id: Option<i32>,
     pub visitor_id: Option<i32>,
     pub ip_geolocation_id: Option<i32>,
-}
-
-impl Default for CreateErrorEventData {
-    fn default() -> Self {
-        Self {
-            source: None,
-            raw_sentry_event: None,
-            exceptions: Vec::new(),
-            exception_type: None,
-            exception_value: None,
-            stack_trace: None,
-            url: None,
-            user_agent: None,
-            referrer: None,
-            method: None,
-            headers: None,
-            user_id: None,
-            user_email: None,
-            user_username: None,
-            user_ip_address: None,
-            user_segment: None,
-            session_id: None,
-            user_context: None,
-            browser: None,
-            browser_version: None,
-            operating_system: None,
-            operating_system_version: None,
-            device_type: None,
-            screen_width: None,
-            screen_height: None,
-            viewport_width: None,
-            viewport_height: None,
-            request_context: None,
-            extra_context: None,
-            release_version: None,
-            build_number: None,
-            server_name: None,
-            environment: None,
-            sdk_name: None,
-            sdk_version: None,
-            sdk_integrations: None,
-            platform: None,
-            transaction_name: None,
-            breadcrumbs: None,
-            request_cookies: None,
-            request_query_string: None,
-            request_data: None,
-            contexts: None,
-            os_name: None,
-            os_version: None,
-            os_build: None,
-            os_kernel_version: None,
-            device_arch: None,
-            device_processor_count: None,
-            device_processor_frequency: None,
-            device_memory_size: None,
-            device_free_memory: None,
-            device_boot_time: None,
-            runtime_name: None,
-            runtime_version: None,
-            app_start_time: None,
-            app_memory: None,
-            locale: None,
-            timezone: None,
-            project_id: 0,
-            environment_id: None,
-            deployment_id: None,
-            visitor_id: None,
-            ip_geolocation_id: None,
-        }
-    }
 }
 
 /// Domain model for error groups

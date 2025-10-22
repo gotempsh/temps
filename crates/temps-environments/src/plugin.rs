@@ -44,7 +44,7 @@ impl TempsPlugin for EnvironmentsPlugin {
             // Create EnvironmentService with queue service
             let environment_service = Arc::new(
                 EnvironmentService::new(db.clone(), config_service)
-                    .with_queue_service(queue_service)
+                    .with_queue_service(queue_service),
             );
             context.register_service(environment_service);
             let env_var_service = Arc::new(EnvVarService::new(db.clone()));
@@ -64,9 +64,7 @@ impl TempsPlugin for EnvironmentsPlugin {
             audit_service,
         });
         let routes = crate::handlers::configure_routes().with_state(app_state);
-        Some(PluginRoutes {
-            router: routes,
-        })
+        Some(PluginRoutes { router: routes })
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

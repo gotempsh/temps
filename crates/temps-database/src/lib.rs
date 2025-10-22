@@ -11,8 +11,8 @@ pub mod test_utils;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use testcontainers::{GenericImage, ImageExt, runners::AsyncRunner};
     use sea_orm::{ConnectionTrait, Database};
+    use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
     use tokio;
 
     #[tokio::test]
@@ -27,10 +27,7 @@ mod tests {
             .await?;
 
         let port = postgres_container.get_host_port_ipv4(5432).await?;
-        let database_url = format!(
-            "postgresql://postgres:postgres@localhost:{}/postgres",
-            port
-        );
+        let database_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
 
         // Wait a bit for the database to be ready, then connect with retries
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
@@ -43,7 +40,10 @@ mod tests {
                     retries -= 1;
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                     if retries == 0 {
-                        return Err(anyhow::anyhow!("Failed to connect to database after retries: {}", e));
+                        return Err(anyhow::anyhow!(
+                            "Failed to connect to database after retries: {}",
+                            e
+                        ));
                     }
                 }
                 Err(e) => return Err(anyhow::anyhow!("Failed to connect to database: {}", e)),
@@ -53,7 +53,7 @@ mod tests {
         // Test basic connectivity
         let result = sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT 1".to_owned()
+            "SELECT 1".to_owned(),
         );
 
         let query_result = db.query_one(result).await?;
@@ -74,10 +74,7 @@ mod tests {
             .await?;
 
         let port = postgres_container.get_host_port_ipv4(5432).await?;
-        let database_url = format!(
-            "postgresql://postgres:postgres@localhost:{}/postgres",
-            port
-        );
+        let database_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
 
         // Wait a bit for the database to be ready
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
@@ -91,7 +88,10 @@ mod tests {
                     retries -= 1;
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                     if retries == 0 {
-                        return Err(anyhow::anyhow!("Failed to establish connection after retries: {}", e));
+                        return Err(anyhow::anyhow!(
+                            "Failed to establish connection after retries: {}",
+                            e
+                        ));
                     }
                 }
                 Err(e) => return Err(anyhow::anyhow!("Failed to establish connection: {}", e)),

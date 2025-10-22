@@ -1,5 +1,5 @@
 // Re-export audit traits from core for convenience
-pub use temps_core::{AuditEvent, AuditOperation, AuditContext};
+pub use temps_core::{AuditContext, AuditEvent, AuditOperation};
 
 pub mod handlers;
 pub mod services;

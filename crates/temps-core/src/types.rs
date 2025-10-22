@@ -118,7 +118,6 @@ impl From<DateTime> for ChronoDateTime<Utc> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

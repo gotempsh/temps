@@ -3,7 +3,9 @@ use sea_orm::{Database, DatabaseConnection};
 use std::sync::Arc;
 use temps_core::EncryptionService;
 use temps_migrations::{Migrator, MigratorTrait};
-use testcontainers::{core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
+use testcontainers::{
+    core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
+};
 use uuid::Uuid;
 
 /// Test database setup with unique container per test

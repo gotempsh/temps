@@ -25,9 +25,7 @@ pub fn convert_sentry_event_to_error_data(
     environment_id: Option<i32>,
     deployment_id: Option<i32>,
 ) -> Result<CreateErrorEventData, SentryMappingError> {
-    let event = event
-        .value()
-        .ok_or_else(|| SentryMappingError::NoValue)?;
+    let event = event.value().ok_or(SentryMappingError::NoValue)?;
 
     // Extract message - for now, just use a default
     let message: String = event
@@ -43,7 +41,8 @@ pub fn convert_sentry_event_to_error_data(
         if let Some(values_vec) = exceptions.values.value() {
             for annotated_exception in values_vec.iter() {
                 if let Some(exc) = annotated_exception.value() {
-                    let exception_type = exc.ty
+                    let exception_type = exc
+                        .ty
                         .as_str()
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "Error".to_string());
@@ -51,23 +50,27 @@ pub fn convert_sentry_event_to_error_data(
                     let exception_value = exc.value.as_str().map(|s| s.to_string());
 
                     // Extract stack trace for this exception
-                    let stack_trace = exc.stacktrace
-                        .value()
-                        .and_then(convert_stacktrace_to_json);
+                    let stack_trace = exc.stacktrace.value().and_then(convert_stacktrace_to_json);
 
                     // Extract mechanism if available
-                    let mechanism = exc.mechanism.value().and_then(|mech| {
+                    let mechanism = exc.mechanism.value().map(|mech| {
                         let mut obj = serde_json::Map::new();
                         if let Some(ty) = mech.ty.as_str() {
-                            obj.insert("type".to_string(), serde_json::Value::String(ty.to_string()));
+                            obj.insert(
+                                "type".to_string(),
+                                serde_json::Value::String(ty.to_string()),
+                            );
                         }
                         if let Some(handled) = mech.handled.value() {
                             obj.insert("handled".to_string(), serde_json::Value::Bool(*handled));
                         }
                         if let Some(synthetic) = mech.synthetic.value() {
-                            obj.insert("synthetic".to_string(), serde_json::Value::Bool(*synthetic));
+                            obj.insert(
+                                "synthetic".to_string(),
+                                serde_json::Value::Bool(*synthetic),
+                            );
                         }
-                        Some(serde_json::Value::Object(obj))
+                        serde_json::Value::Object(obj)
                     });
 
                     let module = exc.module.as_str().map(|s| s.to_string());
@@ -88,7 +91,8 @@ pub fn convert_sentry_event_to_error_data(
 
     // If no exceptions found but event has a stacktrace at the top level, create a generic exception
     if exceptions_list.is_empty() {
-        let stack_trace = event.stacktrace
+        let stack_trace = event
+            .stacktrace
             .value()
             .and_then(convert_stacktrace_to_json);
 
@@ -103,15 +107,16 @@ pub fn convert_sentry_event_to_error_data(
     }
 
     // For backward compatibility, extract first exception data
-    let (exception_type, exception_value, stack_trace) = if let Some(first) = exceptions_list.first() {
-        (
-            Some(first.exception_type.clone()),
-            first.exception_value.clone(),
-            first.stack_trace.clone(),
-        )
-    } else {
-        (Some(message.clone()), None, None)
-    };
+    let (exception_type, exception_value, stack_trace) =
+        if let Some(first) = exceptions_list.first() {
+            (
+                Some(first.exception_type.clone()),
+                first.exception_value.clone(),
+                first.stack_trace.clone(),
+            )
+        } else {
+            (Some(message.clone()), None, None)
+        };
 
     // Extract breadcrumbs
     let mut json_breadcrumbs: Option<serde_json::Value> = None;
@@ -120,20 +125,32 @@ pub fn convert_sentry_event_to_error_data(
             let items: Vec<serde_json::Value> = values
                 .iter()
                 .filter_map(|annotated_breadcrumb| {
-                    annotated_breadcrumb.value().and_then(|breadcrumb| {
+                    annotated_breadcrumb.value().map(|breadcrumb| {
                         let mut obj = serde_json::Map::new();
 
                         if let Some(ty) = breadcrumb.ty.as_str() {
-                            obj.insert("type".to_string(), serde_json::Value::String(ty.to_string()));
+                            obj.insert(
+                                "type".to_string(),
+                                serde_json::Value::String(ty.to_string()),
+                            );
                         }
                         if let Some(category) = breadcrumb.category.as_str() {
-                            obj.insert("category".to_string(), serde_json::Value::String(category.to_string()));
+                            obj.insert(
+                                "category".to_string(),
+                                serde_json::Value::String(category.to_string()),
+                            );
                         }
                         if let Some(message) = breadcrumb.message.as_str() {
-                            obj.insert("message".to_string(), serde_json::Value::String(message.to_string()));
+                            obj.insert(
+                                "message".to_string(),
+                                serde_json::Value::String(message.to_string()),
+                            );
                         }
                         if let Some(level) = breadcrumb.level.value() {
-                            obj.insert("level".to_string(), serde_json::Value::String(level.to_string()));
+                            obj.insert(
+                                "level".to_string(),
+                                serde_json::Value::String(level.to_string()),
+                            );
                         }
                         if let Some(timestamp) = breadcrumb.timestamp.value() {
                             let dt = timestamp.into_inner();
@@ -147,14 +164,15 @@ pub fn convert_sentry_event_to_error_data(
                                 .iter()
                                 .filter_map(|(k, v)| {
                                     v.value().and_then(|value| {
-                                        relay_value_to_json(value).map(|json_val| (k.clone(), json_val))
+                                        relay_value_to_json(value)
+                                            .map(|json_val| (k.clone(), json_val))
                                     })
                                 })
                                 .collect();
                             obj.insert("data".to_string(), serde_json::Value::Object(map));
                         }
 
-                        Some(serde_json::Value::Object(obj))
+                        serde_json::Value::Object(obj)
                     })
                 })
                 .collect();
@@ -274,19 +292,34 @@ pub fn convert_stacktrace_to_json(
                     // Filename is NativeImagePath, convert using Debug format as fallback
                     if let Some(filename) = frame.filename.value() {
                         let filename_str = format!("{:?}", filename);
-                        obj.insert("filename".to_string(), serde_json::Value::String(filename_str));
+                        obj.insert(
+                            "filename".to_string(),
+                            serde_json::Value::String(filename_str),
+                        );
                     }
                     if let Some(function) = frame.function.as_str() {
-                        obj.insert("function".to_string(), serde_json::Value::String(function.to_string()));
+                        obj.insert(
+                            "function".to_string(),
+                            serde_json::Value::String(function.to_string()),
+                        );
                     }
                     if let Some(module) = frame.module.as_str() {
-                        obj.insert("module".to_string(), serde_json::Value::String(module.to_string()));
+                        obj.insert(
+                            "module".to_string(),
+                            serde_json::Value::String(module.to_string()),
+                        );
                     }
                     if let Some(lineno) = frame.lineno.value() {
-                        obj.insert("lineno".to_string(), serde_json::Value::Number((*lineno).into()));
+                        obj.insert(
+                            "lineno".to_string(),
+                            serde_json::Value::Number((*lineno).into()),
+                        );
                     }
                     if let Some(colno) = frame.colno.value() {
-                        obj.insert("colno".to_string(), serde_json::Value::Number((*colno).into()));
+                        obj.insert(
+                            "colno".to_string(),
+                            serde_json::Value::Number((*colno).into()),
+                        );
                     }
                     if let Some(in_app) = frame.in_app.value() {
                         obj.insert("in_app".to_string(), serde_json::Value::Bool(*in_app));
@@ -294,19 +327,32 @@ pub fn convert_stacktrace_to_json(
                     if let Some(pre_context) = frame.pre_context.value() {
                         let pre_array: Vec<serde_json::Value> = pre_context
                             .iter()
-                            .filter_map(|s| s.as_str().map(|v| serde_json::Value::String(v.to_string())))
+                            .filter_map(|s| {
+                                s.as_str().map(|v| serde_json::Value::String(v.to_string()))
+                            })
                             .collect();
-                        obj.insert("pre_context".to_string(), serde_json::Value::Array(pre_array));
+                        obj.insert(
+                            "pre_context".to_string(),
+                            serde_json::Value::Array(pre_array),
+                        );
                     }
                     if let Some(context_line) = frame.context_line.as_str() {
-                        obj.insert("context_line".to_string(), serde_json::Value::String(context_line.to_string()));
+                        obj.insert(
+                            "context_line".to_string(),
+                            serde_json::Value::String(context_line.to_string()),
+                        );
                     }
                     if let Some(post_context) = frame.post_context.value() {
                         let post_array: Vec<serde_json::Value> = post_context
                             .iter()
-                            .filter_map(|s| s.as_str().map(|v| serde_json::Value::String(v.to_string())))
+                            .filter_map(|s| {
+                                s.as_str().map(|v| serde_json::Value::String(v.to_string()))
+                            })
                             .collect();
-                        obj.insert("post_context".to_string(), serde_json::Value::Array(post_array));
+                        obj.insert(
+                            "post_context".to_string(),
+                            serde_json::Value::Array(post_array),
+                        );
                     }
 
                     serde_json::Value::Object(obj)
@@ -331,9 +377,7 @@ pub fn relay_value_to_json(value: &relay_protocol::Value) -> Option<serde_json::
         relay_protocol::Value::Array(arr) => {
             let items: Vec<serde_json::Value> = arr
                 .iter()
-                .filter_map(|annotated| {
-                    annotated.value().and_then(relay_value_to_json)
-                })
+                .filter_map(|annotated| annotated.value().and_then(relay_value_to_json))
                 .collect();
             Some(serde_json::Value::Array(items))
         }

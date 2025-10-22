@@ -34,19 +34,19 @@
 //! Validate on ingestion (service.rs)
 //! ```
 
+pub mod dsn_handlers;
+pub mod dsn_service;
 pub mod envelope;
+pub mod handlers;
 pub mod mapper;
 pub mod service;
-pub mod handlers;
-pub mod dsn_service;
-pub mod dsn_handlers;
 pub mod types;
 
 // Re-exports for convenience
-pub use envelope::{Envelope, EnvelopeItem, EnvelopeError};
-pub use service::SentryIngestionService;
 pub use dsn_service::DSNService;
+pub use envelope::{Envelope, EnvelopeError, EnvelopeItem};
+pub use service::SentryIngestionService;
 pub use types::{
-    SentryEventRequest, SentryEventResponse, DSNResponse, CreateDSNRequest,
-    SentryIngesterError, ProjectDSN, ParsedDSN,
+    CreateDSNRequest, DSNResponse, ParsedDSN, ProjectDSN, SentryEventRequest, SentryEventResponse,
+    SentryIngesterError,
 };

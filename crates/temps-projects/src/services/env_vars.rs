@@ -88,7 +88,7 @@ impl EnvVarService {
             if let Some(env) = env_option {
                 env_map
                     .entry(env_var_env.env_var_id)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(EnvVarEnvironment {
                         id: env.id,
                         name: env.name,
@@ -285,8 +285,7 @@ impl EnvVarService {
         project_id: i32,
         var_id: i32,
     ) -> Result<(), EnvVarError> {
-        let _result = self
-            .db
+        self.db
             .transaction::<_, (), EnvVarError>(|txn| {
                 Box::pin(async move {
                     // First delete the environment relationships

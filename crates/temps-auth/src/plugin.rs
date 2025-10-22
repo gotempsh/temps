@@ -14,7 +14,6 @@ use temps_core::plugin::{
     PluginContext, PluginError, PluginMiddlewareCollection, PluginRoutes,
     ServiceRegistrationContext, TempsPlugin,
 };
-use tracing;
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 

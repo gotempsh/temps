@@ -1,16 +1,19 @@
-use std::sync::Arc;
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use temps_core::plugin::{
-    PluginError, ServiceRegistrationContext, TempsPlugin, PluginContext, PluginRoutes
+    PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
+use temps_database::DbConnection;
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
-use temps_database::DbConnection;
 
 use crate::{
     handler::{handler::LbApiDoc, request_logs::RequestLogsApiDoc},
-    service::{lb_service::LbService, request_log_service::RequestLogService, proxy_log_service::ProxyLogService},
+    service::{
+        lb_service::LbService, proxy_log_service::ProxyLogService,
+        request_log_service::RequestLogService,
+    },
 };
 
 pub struct ProxyPlugin;
@@ -26,13 +29,15 @@ impl TempsPlugin for ProxyPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             // Get database connection
-            let db = context.get_service::<DbConnection>()
-                .ok_or_else(|| PluginError::ServiceNotFound {
+            let db = context.get_service::<DbConnection>().ok_or_else(|| {
+                PluginError::ServiceNotFound {
                     service_type: "DbConnection".to_string(),
-                })?;
+                }
+            })?;
 
             // Get IP service
-            let ip_service = context.get_service::<temps_geo::IpAddressService>()
+            let ip_service = context
+                .get_service::<temps_geo::IpAddressService>()
                 .ok_or_else(|| PluginError::ServiceNotFound {
                     service_type: "IpAddressService".to_string(),
                 })?;
@@ -87,7 +92,7 @@ impl TempsPlugin for ProxyPlugin {
 
         let merged = temps_core::openapi::merge_openapi_schemas(
             lb_spec,
-            vec![request_logs_spec, proxy_logs_spec]
+            vec![request_logs_spec, proxy_logs_spec],
         );
 
         Some(merged)
@@ -109,8 +114,8 @@ impl Default for ProxyPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_database::test_utils::TestDatabase;
     use temps_core::plugin::{PluginStateRegistry, ServiceRegistry};
+    use temps_database::test_utils::TestDatabase;
 
     #[tokio::test]
     async fn test_plugin_registration() {
@@ -121,8 +126,13 @@ mod tests {
         context.register_service(test_db.connection_arc().clone());
 
         // Register required IP service
-        let geo_ip_service = Arc::new(temps_geo::GeoIpService::Mock(temps_geo::MockGeoIpService::new()));
-        let ip_service = Arc::new(temps_geo::IpAddressService::new(test_db.connection_arc().clone(), geo_ip_service));
+        let geo_ip_service = Arc::new(temps_geo::GeoIpService::Mock(
+            temps_geo::MockGeoIpService::new(),
+        ));
+        let ip_service = Arc::new(temps_geo::IpAddressService::new(
+            test_db.connection_arc().clone(),
+            geo_ip_service,
+        ));
         context.register_service(ip_service);
 
         let plugin = ProxyPlugin::new();
@@ -162,12 +172,21 @@ mod tests {
         // Create mock services and register them in the service registry
         let test_db = TestDatabase::new().await.unwrap();
         let lb_service = Arc::new(LbService::new(test_db.connection_arc().clone()));
-        let request_log_service = Arc::new(RequestLogService::new(test_db.connection_arc().clone()));
+        let request_log_service =
+            Arc::new(RequestLogService::new(test_db.connection_arc().clone()));
 
         // Create a mock GeoIP service and IP service for proxy_log_service
-        let geo_ip_service = Arc::new(temps_geo::GeoIpService::Mock(temps_geo::MockGeoIpService::new()));
-        let ip_service = Arc::new(temps_geo::IpAddressService::new(test_db.connection_arc().clone(), geo_ip_service));
-        let proxy_log_service = Arc::new(ProxyLogService::new(test_db.connection_arc().clone(), ip_service));
+        let geo_ip_service = Arc::new(temps_geo::GeoIpService::Mock(
+            temps_geo::MockGeoIpService::new(),
+        ));
+        let ip_service = Arc::new(temps_geo::IpAddressService::new(
+            test_db.connection_arc().clone(),
+            geo_ip_service,
+        ));
+        let proxy_log_service = Arc::new(ProxyLogService::new(
+            test_db.connection_arc().clone(),
+            ip_service,
+        ));
 
         // Register services in the service registry
         service_registry.register(lb_service);

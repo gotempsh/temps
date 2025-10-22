@@ -257,7 +257,13 @@ async fn get_cron_executions(
 
     let executions = app_state
         .cron_service
-        .get_cron_executions(project_id, env_id, cron_id, pagination.page, pagination.per_page)
+        .get_cron_executions(
+            project_id,
+            env_id,
+            cron_id,
+            pagination.page,
+            pagination.per_page,
+        )
         .await?;
 
     let execution_infos: Vec<CronExecutionInfo> = executions

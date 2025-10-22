@@ -4,7 +4,9 @@
 //! This is generic for all workload types: containers, serverless functions, static sites, etc.
 
 use crate::{
-    error::ImportResult, plan::ImportPlan, snapshot::{WorkloadDescriptor, WorkloadId, WorkloadSnapshot},
+    error::ImportResult,
+    plan::ImportPlan,
+    snapshot::{WorkloadDescriptor, WorkloadId, WorkloadSnapshot},
     validation::{ImportValidationRule, ValidationReport},
 };
 use async_trait::async_trait;
@@ -64,7 +66,10 @@ impl ImportSource {
             "render" => Ok(ImportSource::Render),
             "fly" => Ok(ImportSource::Fly),
             "custom" => Ok(ImportSource::Custom),
-            _ => Err(crate::ImportError::SourceNotAccessible(format!("Unknown import source: {}", s))),
+            _ => Err(crate::ImportError::SourceNotAccessible(format!(
+                "Unknown import source: {}",
+                s
+            ))),
         }
     }
 }

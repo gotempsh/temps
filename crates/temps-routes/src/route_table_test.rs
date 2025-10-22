@@ -2,12 +2,12 @@
 
 #[cfg(test)]
 mod route_table_tests {
+    use crate::route_table::CachedPeerTable;
+    use crate::test_utils::TestDBMockOperations;
+    use sea_orm::{ActiveModelTrait, Set};
     use std::sync::Arc;
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{custom_routes, environment_domains, project_custom_domains};
-    use sea_orm::{ActiveModelTrait, Set};
-    use crate::route_table::CachedPeerTable;
-    use crate::test_utils::TestDBMockOperations;
 
     #[tokio::test]
     async fn test_route_table_basic_operations() -> Result<(), Box<dyn std::error::Error>> {
@@ -65,15 +65,20 @@ mod route_table_tests {
     }
 
     #[tokio::test]
-    async fn test_route_table_loads_environment_domains() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_route_table_loads_environment_domains() -> Result<(), Box<dyn std::error::Error>>
+    {
         let test_db_mock = TestDatabase::with_migrations().await?;
         let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
 
         // Create project, environment, and deployment
-        let (project, environment, deployment) = test_db.create_test_project_with_domain("test.example.com").await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("test.example.com")
+            .await?;
 
         // Create deployment container with port 9000
-        test_db.create_deployment_container(deployment.id, 9000, None).await?;
+        test_db
+            .create_deployment_container(deployment.id, 9000, None)
+            .await?;
 
         // Create environment domain
         let env_domain = environment_domains::ActiveModel {
@@ -106,15 +111,20 @@ mod route_table_tests {
     }
 
     #[tokio::test]
-    async fn test_route_table_loads_project_custom_domains() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_route_table_loads_project_custom_domains(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await?;
         let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
 
         // Create project, environment, and deployment
-        let (project, environment, deployment) = test_db.create_test_project_with_domain("test.example.com").await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("test.example.com")
+            .await?;
 
         // Create deployment container with port 9001
-        test_db.create_deployment_container(deployment.id, 9001, None).await?;
+        test_db
+            .create_deployment_container(deployment.id, 9001, None)
+            .await?;
 
         // Create project custom domain
         let custom_domain = project_custom_domains::ActiveModel {
@@ -154,10 +164,14 @@ mod route_table_tests {
         let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
 
         // Create project, environment, and deployment
-        let (project, environment, deployment) = test_db.create_test_project_with_domain("test.example.com").await?;
+        let (project, environment, deployment) = test_db
+            .create_test_project_with_domain("test.example.com")
+            .await?;
 
         // Create deployment container with port 9002
-        test_db.create_deployment_container(deployment.id, 9002, None).await?;
+        test_db
+            .create_deployment_container(deployment.id, 9002, None)
+            .await?;
 
         // Create project custom domain with redirect
         let custom_domain = project_custom_domains::ActiveModel {
@@ -180,7 +194,10 @@ mod route_table_tests {
         assert!(route_info.is_some());
 
         let route_info = route_info.unwrap();
-        assert_eq!(route_info.redirect_to, Some("https://new-domain.com".to_string()));
+        assert_eq!(
+            route_info.redirect_to,
+            Some("https://new-domain.com".to_string())
+        );
         assert_eq!(route_info.status_code, Some(301));
 
         test_db.cleanup().await?;
@@ -246,7 +263,10 @@ mod route_table_tests {
             let route_info = route_table.get_route(&format!("route-{}.com", i));
             assert!(route_info.is_some());
             let route_info = route_info.unwrap();
-            assert_eq!(route_info.get_backend_addr(), format!("localhost:{}", 8000 + i));
+            assert_eq!(
+                route_info.get_backend_addr(),
+                format!("localhost:{}", 8000 + i)
+            );
         }
 
         test_db.cleanup().await?;
@@ -254,7 +274,8 @@ mod route_table_tests {
     }
 
     #[tokio::test]
-    async fn test_route_table_disabled_custom_routes_not_loaded() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_route_table_disabled_custom_routes_not_loaded(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await?;
         let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
 
@@ -282,12 +303,15 @@ mod route_table_tests {
     }
 
     #[tokio::test]
-    async fn test_route_table_inactive_custom_domains_not_loaded() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_route_table_inactive_custom_domains_not_loaded(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await?;
         let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
 
         // Create project, environment, and deployment
-        let (project, environment, _deployment) = test_db.create_test_project_with_domain("test.example.com").await?;
+        let (project, environment, _deployment) = test_db
+            .create_test_project_with_domain("test.example.com")
+            .await?;
 
         // Create inactive project custom domain
         let custom_domain = project_custom_domains::ActiveModel {
@@ -319,10 +343,14 @@ mod route_table_tests {
         let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
 
         // Create project, environment, and deployment
-        let (_project, environment, deployment) = test_db.create_test_project_with_domain("test.example.com").await?;
+        let (_project, environment, deployment) = test_db
+            .create_test_project_with_domain("test.example.com")
+            .await?;
 
         // Create deployment container with port 9000
-        let container = test_db.create_deployment_container(deployment.id, 9000, None).await?;
+        let container = test_db
+            .create_deployment_container(deployment.id, 9000, None)
+            .await?;
 
         // Create environment domain
         let env_domain = environment_domains::ActiveModel {
@@ -357,15 +385,20 @@ mod route_table_tests {
     }
 
     #[tokio::test]
-    async fn test_route_table_environment_current_deployment_changes() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_route_table_environment_current_deployment_changes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await?;
         let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
 
         // Create project, environment, and deployment
-        let (project, environment, deployment1) = test_db.create_test_project_with_domain("test.example.com").await?;
+        let (project, environment, deployment1) = test_db
+            .create_test_project_with_domain("test.example.com")
+            .await?;
 
         // Create deployment container with port 9000
-        test_db.create_deployment_container(deployment1.id, 9000, None).await?;
+        test_db
+            .create_deployment_container(deployment1.id, 9000, None)
+            .await?;
 
         // Create environment domain
         let env_domain = environment_domains::ActiveModel {
@@ -394,7 +427,9 @@ mod route_table_tests {
         let deployment2 = deployment2.insert(test_db.db.as_ref()).await?;
 
         // Create deployment container for second deployment with port 9001
-        test_db.create_deployment_container(deployment2.id, 9001, None).await?;
+        test_db
+            .create_deployment_container(deployment2.id, 9001, None)
+            .await?;
 
         // Update environment to point to new deployment
         let mut environment: temps_entities::environments::ActiveModel = environment.into();

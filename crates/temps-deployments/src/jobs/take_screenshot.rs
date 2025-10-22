@@ -6,11 +6,11 @@ use async_trait::async_trait;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use temps_config::ConfigService;
 use temps_core::{JobResult, UtcDateTime, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
 use temps_entities::{deployments, prelude::*};
 use temps_logs::LogService;
-use temps_config::ConfigService;
 use temps_screenshots::ScreenshotServiceTrait;
 
 /// Output from TakeScreenshotJob
@@ -86,20 +86,26 @@ impl TakeScreenshotJob {
         deployment_url: &str,
         filename: &str,
     ) -> Result<ScreenshotOutput, WorkflowError> {
-        self.log(format!("📸 Capturing screenshot of: {}", deployment_url)).await?;
+        self.log(format!("📸 Capturing screenshot of: {}", deployment_url))
+            .await?;
 
         // Generate screenshot path with timestamp structure
         let now = chrono::Utc::now();
 
-        self.log(format!("🔄 Using screenshot service: {}", self.screenshot_service.provider_name())).await?;
+        self.log(format!(
+            "🔄 Using screenshot service: {}",
+            self.screenshot_service.provider_name()
+        ))
+        .await?;
 
         // Capture and save screenshot using the screenshot service
-        let screenshot_path = self.screenshot_service
+        let screenshot_path = self
+            .screenshot_service
             .capture_and_save(deployment_url, filename)
             .await
-            .map_err(|e| WorkflowError::JobExecutionFailed(
-                format!("Failed to capture screenshot: {}", e)
-            ))?;
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!("Failed to capture screenshot: {}", e))
+            })?;
 
         // Log relative path for cleaner output
         let static_dir = self.config_service.static_dir();
@@ -108,11 +114,10 @@ impl TakeScreenshotJob {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| screenshot_path.display().to_string());
 
-        self.log(format!("💾 Screenshot saved to: {}", relative_display)).await?;
+        self.log(format!("💾 Screenshot saved to: {}", relative_display))
+            .await?;
 
-        Ok(ScreenshotOutput {
-            captured_at: now,
-        })
+        Ok(ScreenshotOutput { captured_at: now })
     }
 }
 
@@ -138,17 +143,23 @@ impl WorkflowTask for TakeScreenshotJob {
     async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
         // it takes a bit of time for the route table to be ready
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        self.log(format!("📸 Taking screenshot for deployment ID: {}", self.deployment_id)).await?;
+        self.log(format!(
+            "📸 Taking screenshot for deployment ID: {}",
+            self.deployment_id
+        ))
+        .await?;
 
         // Get deployment URL from config service using deployment_id
-        let deployment_url = self.config_service
+        let deployment_url = self
+            .config_service
             .get_deployment_url(self.deployment_id)
             .await
-            .map_err(|e| WorkflowError::JobExecutionFailed(
-                format!("Failed to get deployment URL: {}", e)
-            ))?;
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!("Failed to get deployment URL: {}", e))
+            })?;
 
-        self.log(format!("🌐 Deployment URL: {}", deployment_url)).await?;
+        self.log(format!("🌐 Deployment URL: {}", deployment_url))
+            .await?;
 
         // Generate screenshot filename with timestamp
         let now = chrono::Utc::now();
@@ -161,14 +172,17 @@ impl WorkflowTask for TakeScreenshotJob {
         // Capture screenshot
         let screenshot_output = self.capture_screenshot(&deployment_url, &filename).await?;
 
-        self.log(format!("✅ Screenshot captured: {}", filename)).await?;
+        self.log(format!("✅ Screenshot captured: {}", filename))
+            .await?;
 
         // Update deployment with screenshot location (relative path)
         let deployment = Deployments::find_by_id(self.deployment_id)
             .one(self.db.as_ref())
             .await
             .map_err(|e| WorkflowError::Other(format!("Failed to find deployment: {}", e)))?
-            .ok_or_else(|| WorkflowError::Other(format!("Deployment {} not found", self.deployment_id)))?;
+            .ok_or_else(|| {
+                WorkflowError::Other(format!("Deployment {} not found", self.deployment_id))
+            })?;
 
         let mut active_deployment: deployments::ActiveModel = deployment.into();
         active_deployment.screenshot_location = Set(Some(filename.clone()));
@@ -177,31 +191,51 @@ impl WorkflowTask for TakeScreenshotJob {
         active_deployment
             .update(self.db.as_ref())
             .await
-            .map_err(|e| WorkflowError::Other(format!("Failed to update deployment screenshot_location: {}", e)))?;
+            .map_err(|e| {
+                WorkflowError::Other(format!(
+                    "Failed to update deployment screenshot_location: {}",
+                    e
+                ))
+            })?;
 
-        self.log(format!("✅ Updated deployment screenshot_location: {}", filename)).await?;
+        self.log(format!(
+            "✅ Updated deployment screenshot_location: {}",
+            filename
+        ))
+        .await?;
 
         // Set job outputs
-        context.set_output(&self.job_id, "captured_at", screenshot_output.captured_at.timestamp())?;
+        context.set_output(
+            &self.job_id,
+            "captured_at",
+            screenshot_output.captured_at.timestamp(),
+        )?;
         context.set_output(&self.job_id, "deployment_id", self.deployment_id)?;
         context.set_output(&self.job_id, "screenshot_location", filename)?;
 
         Ok(JobResult::success(context))
     }
 
-    async fn validate_prerequisites(&self, _context: &WorkflowContext) -> Result<(), WorkflowError> {
+    async fn validate_prerequisites(
+        &self,
+        _context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
         // Basic validation
         if self.job_id.is_empty() {
-            return Err(WorkflowError::JobValidationFailed("job_id cannot be empty".to_string()));
+            return Err(WorkflowError::JobValidationFailed(
+                "job_id cannot be empty".to_string(),
+            ));
         }
         if self.deployment_id <= 0 {
-            return Err(WorkflowError::JobValidationFailed("deployment_id must be positive".to_string()));
+            return Err(WorkflowError::JobValidationFailed(
+                "deployment_id must be positive".to_string(),
+            ));
         }
 
         // Check if screenshot service is available
         if !self.screenshot_service.is_provider_available().await {
             return Err(WorkflowError::JobValidationFailed(
-                "Screenshot provider is not available".to_string()
+                "Screenshot provider is not available".to_string(),
             ));
         }
 
@@ -248,7 +282,10 @@ impl TakeScreenshotJobBuilder {
         self
     }
 
-    pub fn screenshot_service(mut self, screenshot_service: Arc<dyn ScreenshotServiceTrait>) -> Self {
+    pub fn screenshot_service(
+        mut self,
+        screenshot_service: Arc<dyn ScreenshotServiceTrait>,
+    ) -> Self {
         self.screenshot_service = Some(screenshot_service);
         self
     }
@@ -275,16 +312,26 @@ impl TakeScreenshotJobBuilder {
 
     pub fn build(self) -> Result<TakeScreenshotJob, WorkflowError> {
         let job_id = self.job_id.unwrap_or_else(|| "take_screenshot".to_string());
-        let deployment_id = self.deployment_id
-            .ok_or_else(|| WorkflowError::JobValidationFailed("deployment_id is required".to_string()))?;
-        let screenshot_service = self.screenshot_service
-            .ok_or_else(|| WorkflowError::JobValidationFailed("screenshot_service is required".to_string()))?;
-        let config_service = self.config_service
-            .ok_or_else(|| WorkflowError::JobValidationFailed("config_service is required".to_string()))?;
-        let db = self.db
+        let deployment_id = self.deployment_id.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("deployment_id is required".to_string())
+        })?;
+        let screenshot_service = self.screenshot_service.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("screenshot_service is required".to_string())
+        })?;
+        let config_service = self.config_service.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("config_service is required".to_string())
+        })?;
+        let db = self
+            .db
             .ok_or_else(|| WorkflowError::JobValidationFailed("db is required".to_string()))?;
 
-        let mut job = TakeScreenshotJob::new(job_id, deployment_id, screenshot_service, config_service, db);
+        let mut job = TakeScreenshotJob::new(
+            job_id,
+            deployment_id,
+            screenshot_service,
+            config_service,
+            db,
+        );
 
         if let Some(log_id) = self.log_id {
             job = job.with_log_id(log_id);

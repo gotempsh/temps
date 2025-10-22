@@ -5,7 +5,10 @@ use axum::http::header;
 use bytes::Bytes;
 use cookie::Cookie;
 use pingora::Error;
-use pingora_core::{upstreams::peer::{HttpPeer, Peer}, Result};
+use pingora_core::{
+    upstreams::peer::{HttpPeer, Peer},
+    Result,
+};
 use pingora_http::ResponseHeader;
 use pingora_proxy::{FailToProxy, ProxyHttp, Session as PingoraSession};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -127,23 +130,20 @@ impl LoadBalancer {
 
         // Common static file extensions to skip
         let static_extensions = [
-            ".js", ".mjs", ".cjs",
-            ".css", ".scss", ".sass", ".less",
-            ".map",
-            ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".avif",
-            ".woff", ".woff2", ".ttf", ".eot", ".otf",
-            ".mp4", ".webm", ".ogg", ".mp3", ".wav",
-            ".pdf", ".zip", ".tar", ".gz",
+            ".js", ".mjs", ".cjs", ".css", ".scss", ".sass", ".less", ".map", ".png", ".jpg",
+            ".jpeg", ".gif", ".svg", ".ico", ".webp", ".avif", ".woff", ".woff2", ".ttf", ".eot",
+            ".otf", ".mp4", ".webm", ".ogg", ".mp3", ".wav", ".pdf", ".zip", ".tar", ".gz",
         ];
 
         let path_lower = path.to_lowercase();
-        !static_extensions.iter().any(|ext| path_lower.ends_with(ext))
+        !static_extensions
+            .iter()
+            .any(|ext| path_lower.ends_with(ext))
     }
 
     fn get_host_header(&self, session: &PingoraSession) -> Result<String> {
         let host_with_port = if let Some(host) = session.req_header().headers.get("host") {
-            host
-                .to_str()
+            host.to_str()
                 .map_err(|_| Error::new_str("Invalid host header encoding"))?
                 .to_string()
         } else if let Some(host) = session.req_header().uri.host() {
@@ -265,13 +265,13 @@ impl LoadBalancer {
         upstream_response.insert_header("X-Request-ID", &ctx.request_id)?;
 
         if let Some(project) = &ctx.project {
-            upstream_response.insert_header("X-Project-ID", &project.id.to_string())?;
+            upstream_response.insert_header("X-Project-ID", project.id.to_string())?;
         }
         if let Some(environment) = &ctx.environment {
-            upstream_response.insert_header("X-Environment-ID", &environment.id.to_string())?;
+            upstream_response.insert_header("X-Environment-ID", environment.id.to_string())?;
         }
         if let Some(deployment) = &ctx.deployment {
-            upstream_response.insert_header("X-Deployment-ID", &deployment.id.to_string())?;
+            upstream_response.insert_header("X-Deployment-ID", deployment.id.to_string())?;
         }
 
         upstream_response.insert_header("Referrer-Policy", "strict-origin-when-cross-origin")?;
@@ -453,7 +453,7 @@ impl LoadBalancer {
         } else {
             ctx.request_headers
                 .as_ref()
-                .map(|h| serde_json::to_value(h))
+                .map(serde_json::to_value)
                 .transpose()
                 .map_err(|_| Error::new_str("Failed to serialize request headers."))?
         };
@@ -537,17 +537,23 @@ impl LoadBalancer {
         // Asynchronously log to proxy_logs table (skip static assets)
         if Self::should_log_request(&ctx.path) {
             // Extract request size from Content-Length header
-            let request_size = ctx.request_headers.as_ref()
+            let request_size = ctx
+                .request_headers
+                .as_ref()
                 .and_then(|h| h.get("content-length"))
                 .and_then(|v| v.parse::<i64>().ok());
 
             // Extract response size from Content-Length header
-            let response_size = ctx.response_headers.as_ref()
+            let response_size = ctx
+                .response_headers
+                .as_ref()
                 .and_then(|h| h.get("content-length"))
                 .and_then(|v| v.parse::<i64>().ok());
 
             // Extract cache status from response headers
-            let cache_status = ctx.response_headers.as_ref()
+            let cache_status = ctx
+                .response_headers
+                .as_ref()
                 .and_then(|h| h.get("x-cache").or_else(|| h.get("cf-cache-status")))
                 .cloned();
 
@@ -583,8 +589,14 @@ impl LoadBalancer {
                 request_size_bytes: request_size,
                 response_size_bytes: response_size,
                 cache_status,
-                request_headers: ctx.request_headers.as_ref().and_then(|h| serde_json::to_value(h).ok()),
-                response_headers: ctx.response_headers.as_ref().and_then(|h| serde_json::to_value(h).ok()),
+                request_headers: ctx
+                    .request_headers
+                    .as_ref()
+                    .and_then(|h| serde_json::to_value(h).ok()),
+                response_headers: ctx
+                    .response_headers
+                    .as_ref()
+                    .and_then(|h| serde_json::to_value(h).ok()),
             };
 
             // Spawn async task to avoid blocking the response
@@ -902,7 +914,7 @@ impl ProxyHttp for LoadBalancer {
             resp.insert_header("Content-Type", "text/plain")?;
             resp.insert_header("Cache-Control", "no-cache")?;
             resp.insert_header("X-Request-ID", &ctx.request_id)?;
-            resp.insert_header("Content-Length", &content_length.to_string())?;
+            resp.insert_header("Content-Length", content_length.to_string())?;
             resp.insert_header("Connection", "close")?;
 
             session.write_response_header(Box::new(resp), false).await?;
@@ -1236,7 +1248,9 @@ impl ProxyHttp for LoadBalancer {
         // Asynchronously log failed proxy request (skip static assets)
         if Self::should_log_request(&ctx.path) {
             // Extract request size from Content-Length header
-            let request_size = ctx.request_headers.as_ref()
+            let request_size = ctx
+                .request_headers
+                .as_ref()
                 .and_then(|h| h.get("content-length"))
                 .and_then(|v| v.parse::<i64>().ok());
 
@@ -1245,38 +1259,44 @@ impl ProxyHttp for LoadBalancer {
 
             let proxy_log_service = self.proxy_log_service.clone();
             let proxy_log_request = CreateProxyLogRequest {
-            method: ctx.method.clone(),
-            path: ctx.path.clone(),
-            query_string: None,
-            host: ctx.host.clone(),
-            status_code: error_code as i16,
-            response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
-            request_source: "proxy".to_string(),
-            is_system_request: ctx.path.starts_with(ROUTE_PREFIX_TEMPS),
-            routing_status: ctx.routing_status.clone(),
-            project_id: ctx.project.as_ref().map(|p| p.id),
-            environment_id: ctx.environment.as_ref().map(|e| e.id),
-            deployment_id: ctx.deployment.as_ref().map(|d| d.id),
-            container_id: None,
-            upstream_host: None,
-            error_message: ctx.error_message.clone(),
-            client_ip: ctx.ip_address.clone(),
-            user_agent: Some(ctx.user_agent.clone()),
-            referrer: ctx.referrer.clone(),
-            request_id: ctx.request_id.clone(),
-            ip_geolocation_id: None,
-            browser: None,
-            browser_version: None,
-            operating_system: None,
-            device_type: None,
-            is_bot: None,
-            bot_name: None,
-            request_size_bytes: request_size,
-            response_size_bytes: response_size,
-            cache_status: None,
-            request_headers: ctx.request_headers.as_ref().and_then(|h| serde_json::to_value(h).ok()),
-            response_headers: ctx.response_headers.as_ref().and_then(|h| serde_json::to_value(h).ok()),
-        };
+                method: ctx.method.clone(),
+                path: ctx.path.clone(),
+                query_string: None,
+                host: ctx.host.clone(),
+                status_code: error_code as i16,
+                response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
+                request_source: "proxy".to_string(),
+                is_system_request: ctx.path.starts_with(ROUTE_PREFIX_TEMPS),
+                routing_status: ctx.routing_status.clone(),
+                project_id: ctx.project.as_ref().map(|p| p.id),
+                environment_id: ctx.environment.as_ref().map(|e| e.id),
+                deployment_id: ctx.deployment.as_ref().map(|d| d.id),
+                container_id: None,
+                upstream_host: None,
+                error_message: ctx.error_message.clone(),
+                client_ip: ctx.ip_address.clone(),
+                user_agent: Some(ctx.user_agent.clone()),
+                referrer: ctx.referrer.clone(),
+                request_id: ctx.request_id.clone(),
+                ip_geolocation_id: None,
+                browser: None,
+                browser_version: None,
+                operating_system: None,
+                device_type: None,
+                is_bot: None,
+                bot_name: None,
+                request_size_bytes: request_size,
+                response_size_bytes: response_size,
+                cache_status: None,
+                request_headers: ctx
+                    .request_headers
+                    .as_ref()
+                    .and_then(|h| serde_json::to_value(h).ok()),
+                response_headers: ctx
+                    .response_headers
+                    .as_ref()
+                    .and_then(|h| serde_json::to_value(h).ok()),
+            };
 
             // Spawn async task to avoid blocking
             tokio::spawn(async move {

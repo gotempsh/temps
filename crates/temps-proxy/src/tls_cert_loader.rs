@@ -1,9 +1,9 @@
 use anyhow::Result;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-use temps_database::DbConnection;
 use std::io::BufReader;
 use std::sync::Arc;
+use temps_database::DbConnection;
 use temps_entities::domains;
 use tracing::{debug, warn};
 
@@ -14,8 +14,14 @@ pub struct CertificateLoader {
 }
 
 impl CertificateLoader {
-    pub fn new(db: Arc<DbConnection>, encryption_service: Arc<temps_core::EncryptionService>) -> Self {
-        Self { db, encryption_service }
+    pub fn new(
+        db: Arc<DbConnection>,
+        encryption_service: Arc<temps_core::EncryptionService>,
+    ) -> Self {
+        Self {
+            db,
+            encryption_service,
+        }
     }
 
     /// Load certificate for a given SNI hostname
@@ -56,13 +62,22 @@ impl CertificateLoader {
 
         if let Some(domain) = domain_entity {
             // Check if we have both certificate and private key
-            if let (Some(cert_pem), Some(encrypted_key_pem)) = (domain.certificate, domain.private_key) {
+            if let (Some(cert_pem), Some(encrypted_key_pem)) =
+                (domain.certificate, domain.private_key)
+            {
                 debug!("Found certificate for domain: {}", domain.domain);
 
                 // Decrypt the private key
-                let key_pem = self.encryption_service
+                let key_pem = self
+                    .encryption_service
                     .decrypt_string(&encrypted_key_pem)
-                    .map_err(|e| anyhow::anyhow!("Failed to decrypt private key for domain {}: {}", domain.domain, e))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to decrypt private key for domain {}: {}",
+                            domain.domain,
+                            e
+                        )
+                    })?;
 
                 // Parse certificates
                 let certs = self.parse_certificates(cert_pem.as_bytes())?;
@@ -70,7 +85,10 @@ impl CertificateLoader {
 
                 return Ok(Some((certs, key)));
             } else {
-                warn!("Domain {} found but missing certificate or key", domain.domain);
+                warn!(
+                    "Domain {} found but missing certificate or key",
+                    domain.domain
+                );
             }
         }
 
@@ -131,13 +149,12 @@ mod tests {
     fn test_wildcard_domain_extraction() {
         // Create a dummy encryption service for testing
         let encryption_service = Arc::new(
-            temps_core::EncryptionService::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-                .expect("Failed to create encryption service")
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("Failed to create encryption service"),
         );
-        let loader = CertificateLoader::new(
-            Arc::new(DbConnection::default()),
-            encryption_service,
-        );
+        let loader = CertificateLoader::new(Arc::new(DbConnection::default()), encryption_service);
 
         assert_eq!(
             loader.get_wildcard_domain("api.example.com"),

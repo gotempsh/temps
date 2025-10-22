@@ -5,19 +5,19 @@
 
 use std::path::PathBuf;
 
-pub mod provider;
+pub mod error;
 pub mod local_provider;
+pub mod plugin;
+pub mod provider;
 pub mod remote_provider;
 pub mod service;
-pub mod plugin;
-pub mod error;
 
-pub use provider::ScreenshotProvider;
+pub use error::{ScreenshotError, ScreenshotResult};
 pub use local_provider::LocalScreenshotProvider;
+pub use plugin::ScreenshotsPlugin;
+pub use provider::ScreenshotProvider;
 pub use remote_provider::RemoteScreenshotProvider;
 pub use service::ScreenshotService;
-pub use plugin::ScreenshotsPlugin;
-pub use error::{ScreenshotError, ScreenshotResult};
 
 /// Trait for screenshot service operations (used for dependency injection and testing)
 #[async_trait::async_trait]

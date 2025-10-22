@@ -13,13 +13,13 @@ use std::sync::Arc;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
+use tracing::debug;
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
-use tracing::debug;
 
 use crate::{
-    services::{NotificationService, NotificationPreferencesService},
-    handlers::{NotificationState, NotificationProvidersApiDoc, configure_routes},
+    handlers::{configure_routes, NotificationProvidersApiDoc, NotificationState},
+    services::{NotificationPreferencesService, NotificationService},
 };
 
 /// Notifications Plugin for managing notification providers and services
@@ -52,7 +52,10 @@ impl TempsPlugin for NotificationsPlugin {
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
             // Create NotificationService
-            let notification_service = Arc::new(NotificationService::new(db.clone(), encryption_service.clone()));
+            let notification_service = Arc::new(NotificationService::new(
+                db.clone(),
+                encryption_service.clone(),
+            ));
             context.register_service(notification_service.clone());
 
             // Register the notification service as the trait object directly
@@ -62,7 +65,8 @@ impl TempsPlugin for NotificationsPlugin {
             context.register_service(dyn_notification_service);
 
             // Create NotificationPreferencesService
-            let notification_preferences_service = Arc::new(NotificationPreferencesService::new(db.clone()));
+            let notification_preferences_service =
+                Arc::new(NotificationPreferencesService::new(db.clone()));
             context.register_service(notification_preferences_service.clone());
 
             // Create NotificationState for handlers
@@ -84,9 +88,7 @@ impl TempsPlugin for NotificationsPlugin {
         // Build notification routes using the existing configure_routes function
         let routes = configure_routes().with_state(notification_state);
 
-        Some(PluginRoutes {
-            router: routes,
-        })
+        Some(PluginRoutes { router: routes })
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

@@ -1,7 +1,7 @@
 use crate::{apikey_service::ApiKeyService, auth_service::AuthService, user_service::UserService};
-use temps_core::notifications::DynNotificationService;
 use sea_orm::DatabaseConnection;
 use std::sync::Arc;
+use temps_core::notifications::DynNotificationService;
 use temps_core::{CookieCrypto, EncryptionService};
 
 /// Application state containing all authentication services for Axum
@@ -32,10 +32,7 @@ impl AuthState {
         cookie_crypto: Arc<CookieCrypto>,
         notification_service: DynNotificationService,
     ) -> Self {
-        let auth_service = Arc::new(AuthService::new(
-            db.clone(),
-            notification_service,
-        ));
+        let auth_service = Arc::new(AuthService::new(db.clone(), notification_service));
         let api_key_service = Arc::new(ApiKeyService::new(db.clone()));
         let user_service = Arc::new(UserService::new(db.clone()));
         Self {

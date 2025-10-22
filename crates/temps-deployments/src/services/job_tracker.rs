@@ -4,9 +4,7 @@ use std::sync::Arc;
 use temps_core::{JobStatus as CoreJobStatus, JobTracker, WorkflowError};
 use temps_database::DbConnection;
 use temps_entities::{
-    deployment_jobs,
-    prelude::DeploymentJobs,
-    types::JobStatus as EntityJobStatus
+    deployment_jobs, prelude::DeploymentJobs, types::JobStatus as EntityJobStatus,
 };
 use tracing::debug;
 
@@ -50,7 +48,9 @@ impl JobTracker for DeploymentJobTracker {
             .one(self.db.as_ref())
             .await
             .map_err(|e| WorkflowError::Other(format!("Failed to find job {}: {}", job_id, e)))?
-            .ok_or_else(|| WorkflowError::Other(format!("Job {} not found in deployment_jobs", job_id)))?;
+            .ok_or_else(|| {
+                WorkflowError::Other(format!("Job {} not found in deployment_jobs", job_id))
+            })?;
 
         // Update status and timestamps
         let mut active_job: deployment_jobs::ActiveModel = job.clone().into();
@@ -63,7 +63,9 @@ impl JobTracker for DeploymentJobTracker {
             debug!("Job {} (id={}) started at {}", job_id, job.id, now);
         }
 
-        active_job.update(self.db.as_ref()).await
+        active_job
+            .update(self.db.as_ref())
+            .await
             .map_err(|e| WorkflowError::Other(format!("Failed to update job status: {}", e)))?;
 
         Ok(job.id)
@@ -176,9 +178,14 @@ mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::{deployments, environments, projects, types::{PipelineStatus, ProjectType}};
+    use temps_entities::{
+        deployments, environments, projects,
+        types::{PipelineStatus, ProjectType},
+    };
 
-    async fn create_test_deployment(db: &Arc<DbConnection>) -> Result<(i32, i32), Box<dyn std::error::Error>> {
+    async fn create_test_deployment(
+        db: &Arc<DbConnection>,
+    ) -> Result<(i32, i32), Box<dyn std::error::Error>> {
         // Create project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
@@ -247,22 +254,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_all_required_jobs_complete_marks_deployment_done() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_all_required_jobs_complete_marks_deployment_done(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
         let (deployment_id, environment_id) = create_test_deployment(&db).await?;
 
         // Create jobs: 2 required, 1 optional, plus mark_deployment_complete
-        let job1_id = create_test_job(&db, deployment_id, "download", true, EntityJobStatus::Pending).await?;
-        let job2_id = create_test_job(&db, deployment_id, "deploy", true, EntityJobStatus::Pending).await?;
-        let _job3_id = create_test_job(&db, deployment_id, "screenshot", false, EntityJobStatus::Pending).await?;
-        let mark_complete_job_id = create_test_job(&db, deployment_id, "mark_deployment_complete", true, EntityJobStatus::Pending).await?;
+        let job1_id = create_test_job(
+            &db,
+            deployment_id,
+            "download",
+            true,
+            EntityJobStatus::Pending,
+        )
+        .await?;
+        let job2_id =
+            create_test_job(&db, deployment_id, "deploy", true, EntityJobStatus::Pending).await?;
+        let _job3_id = create_test_job(
+            &db,
+            deployment_id,
+            "screenshot",
+            false,
+            EntityJobStatus::Pending,
+        )
+        .await?;
+        let mark_complete_job_id = create_test_job(
+            &db,
+            deployment_id,
+            "mark_deployment_complete",
+            true,
+            EntityJobStatus::Pending,
+        )
+        .await?;
 
         let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
 
         // Complete first required job
-        tracker.update_job_status(job1_id, CoreJobStatus::Success, None).await?;
+        tracker
+            .update_job_status(job1_id, CoreJobStatus::Success, None)
+            .await?;
 
         // Deployment should still be running
         let deployment = deployments::Entity::find_by_id(deployment_id)
@@ -272,7 +304,9 @@ mod tests {
         assert_eq!(deployment.state, "running");
 
         // Complete second required job
-        tracker.update_job_status(job2_id, CoreJobStatus::Success, None).await?;
+        tracker
+            .update_job_status(job2_id, CoreJobStatus::Success, None)
+            .await?;
 
         // Deployment should still be running until mark_deployment_complete finishes
         let deployment = deployments::Entity::find_by_id(deployment_id)
@@ -282,7 +316,9 @@ mod tests {
         assert_eq!(deployment.state, "running");
 
         // Complete the mark_deployment_complete job
-        tracker.update_job_status(mark_complete_job_id, CoreJobStatus::Success, None).await?;
+        tracker
+            .update_job_status(mark_complete_job_id, CoreJobStatus::Success, None)
+            .await?;
 
         // NOTE: The deployment won't actually be marked as "completed" because
         // update_job_status() just updates the job record, it doesn't execute the job.
@@ -290,22 +326,24 @@ mod tests {
         // In the real workflow, the job executor runs the job and THEN marks it as Success.
 
         // Manually mark deployment as complete (simulating what MarkDeploymentCompleteJob does)
-        let mut active_deployment: deployments::ActiveModel = deployments::Entity::find_by_id(deployment_id)
-            .one(db.as_ref())
-            .await?
-            .unwrap()
-            .into();
+        let mut active_deployment: deployments::ActiveModel =
+            deployments::Entity::find_by_id(deployment_id)
+                .one(db.as_ref())
+                .await?
+                .unwrap()
+                .into();
         active_deployment.state = Set("completed".to_string());
         let now = chrono::Utc::now();
         active_deployment.finished_at = Set(Some(now));
         active_deployment.update(db.as_ref()).await?;
 
         // Update environment with current deployment
-        let mut active_environment: environments::ActiveModel = environments::Entity::find_by_id(environment_id)
-            .one(db.as_ref())
-            .await?
-            .unwrap()
-            .into();
+        let mut active_environment: environments::ActiveModel =
+            environments::Entity::find_by_id(environment_id)
+                .one(db.as_ref())
+                .await?
+                .unwrap()
+                .into();
         active_environment.current_deployment_id = Set(Some(deployment_id));
         active_environment.update(db.as_ref()).await?;
 
@@ -328,23 +366,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_required_job_failure_prevents_completion() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_required_job_failure_prevents_completion(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
         let (deployment_id, _environment_id) = create_test_deployment(&db).await?;
 
         // Create jobs: 2 required
-        let job1_id = create_test_job(&db, deployment_id, "build", true, EntityJobStatus::Pending).await?;
-        let job2_id = create_test_job(&db, deployment_id, "deploy", true, EntityJobStatus::Pending).await?;
+        let job1_id =
+            create_test_job(&db, deployment_id, "build", true, EntityJobStatus::Pending).await?;
+        let job2_id =
+            create_test_job(&db, deployment_id, "deploy", true, EntityJobStatus::Pending).await?;
 
         let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
 
         // Complete first job
-        tracker.update_job_status(job1_id, CoreJobStatus::Success, None).await?;
+        tracker
+            .update_job_status(job1_id, CoreJobStatus::Success, None)
+            .await?;
 
         // Fail second required job
-        tracker.update_job_status(job2_id, CoreJobStatus::Failure, Some("Deploy failed".to_string())).await?;
+        tracker
+            .update_job_status(
+                job2_id,
+                CoreJobStatus::Failure,
+                Some("Deploy failed".to_string()),
+            )
+            .await?;
 
         // Deployment should still be running (not completed)
         let deployment = deployments::Entity::find_by_id(deployment_id)
@@ -357,19 +406,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deployment_completion_with_only_optional_jobs() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_deployment_completion_with_only_optional_jobs(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
         let (deployment_id, _environment_id) = create_test_deployment(&db).await?;
 
         // Create only optional jobs
-        let job1_id = create_test_job(&db, deployment_id, "screenshot", false, EntityJobStatus::Pending).await?;
+        let job1_id = create_test_job(
+            &db,
+            deployment_id,
+            "screenshot",
+            false,
+            EntityJobStatus::Pending,
+        )
+        .await?;
 
         let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
 
         // Complete optional job
-        tracker.update_job_status(job1_id, CoreJobStatus::Success, None).await?;
+        tracker
+            .update_job_status(job1_id, CoreJobStatus::Success, None)
+            .await?;
 
         // Deployment should NOT be completed (no required jobs)
         let deployment = deployments::Entity::find_by_id(deployment_id)
@@ -382,41 +441,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deployment_completes_before_optional_jobs_run() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_deployment_completes_before_optional_jobs_run(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
         let (deployment_id, environment_id) = create_test_deployment(&db).await?;
 
         // Create jobs: 1 required, 2 optional (still pending), plus mark_deployment_complete
-        let deploy_job_id = create_test_job(&db, deployment_id, "deploy", true, EntityJobStatus::Pending).await?;
-        let mark_complete_job_id = create_test_job(&db, deployment_id, "mark_deployment_complete", true, EntityJobStatus::Pending).await?;
+        let deploy_job_id =
+            create_test_job(&db, deployment_id, "deploy", true, EntityJobStatus::Pending).await?;
+        let mark_complete_job_id = create_test_job(
+            &db,
+            deployment_id,
+            "mark_deployment_complete",
+            true,
+            EntityJobStatus::Pending,
+        )
+        .await?;
         create_test_job(&db, deployment_id, "crons", false, EntityJobStatus::Pending).await?;
-        create_test_job(&db, deployment_id, "screenshot", false, EntityJobStatus::Pending).await?;
+        create_test_job(
+            &db,
+            deployment_id,
+            "screenshot",
+            false,
+            EntityJobStatus::Pending,
+        )
+        .await?;
 
         let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
 
         // Complete only the required jobs
-        tracker.update_job_status(deploy_job_id, CoreJobStatus::Success, None).await?;
-        tracker.update_job_status(mark_complete_job_id, CoreJobStatus::Success, None).await?;
+        tracker
+            .update_job_status(deploy_job_id, CoreJobStatus::Success, None)
+            .await?;
+        tracker
+            .update_job_status(mark_complete_job_id, CoreJobStatus::Success, None)
+            .await?;
 
         // Manually mark deployment as complete (simulating what MarkDeploymentCompleteJob does)
-        let mut active_deployment: deployments::ActiveModel = deployments::Entity::find_by_id(deployment_id)
-            .one(db.as_ref())
-            .await?
-            .unwrap()
-            .into();
+        let mut active_deployment: deployments::ActiveModel =
+            deployments::Entity::find_by_id(deployment_id)
+                .one(db.as_ref())
+                .await?
+                .unwrap()
+                .into();
         active_deployment.state = Set("completed".to_string());
         let now = chrono::Utc::now();
         active_deployment.finished_at = Set(Some(now));
         active_deployment.update(db.as_ref()).await?;
 
         // Update environment with current deployment
-        let mut active_environment: environments::ActiveModel = environments::Entity::find_by_id(environment_id)
-            .one(db.as_ref())
-            .await?
-            .unwrap()
-            .into();
+        let mut active_environment: environments::ActiveModel =
+            environments::Entity::find_by_id(environment_id)
+                .one(db.as_ref())
+                .await?
+                .unwrap()
+                .into();
         active_environment.current_deployment_id = Set(Some(deployment_id));
         active_environment.update(db.as_ref()).await?;
 

@@ -22,6 +22,6 @@ pub fn mask_sensitive(data: &str) -> String {
     if data.len() <= 8 {
         "***".to_string()
     } else {
-        format!("{}***{}", &data[..4], &data[data.len()-4..])
+        format!("{}***{}", &data[..4], &data[data.len() - 4..])
     }
 }

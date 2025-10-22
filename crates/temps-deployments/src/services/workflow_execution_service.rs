@@ -5,9 +5,7 @@
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_core::{
-    WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor,
-};
+use temps_core::{WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor};
 use temps_database::DbConnection;
 use temps_deployer::{ContainerDeployer, ImageBuilder};
 use temps_entities::{deployment_jobs, deployments, environments, projects};
@@ -133,11 +131,13 @@ impl WorkflowExecutionService {
 
             // Parse dependencies from database record
             let dependencies: Vec<String> = if let Some(ref deps_json) = db_job.dependencies {
-                serde_json::from_value(deps_json.clone())
-                    .unwrap_or_else(|e| {
-                        warn!("Failed to parse dependencies for job {}: {}", db_job.job_id, e);
-                        vec![]
-                    })
+                serde_json::from_value(deps_json.clone()).unwrap_or_else(|e| {
+                    warn!(
+                        "Failed to parse dependencies for job {}: {}",
+                        db_job.job_id, e
+                    );
+                    vec![]
+                })
             } else {
                 vec![]
             };
@@ -208,7 +208,8 @@ impl WorkflowExecutionService {
             Err(e) => {
                 // Check if this is a cancellation error
                 let error_message = format!("{}", e);
-                let is_cancellation = error_message.contains("cancelled") || error_message.contains("Cancelled");
+                let is_cancellation =
+                    error_message.contains("cancelled") || error_message.contains("Cancelled");
 
                 if is_cancellation {
                     info!(
@@ -567,7 +568,7 @@ impl WorkflowExecutionService {
                 // Check if screenshot service is available
                 let screenshot_service = self.screenshot_service.as_ref().ok_or_else(|| {
                     WorkflowExecutionError::JobCreationFailed(
-                        "Screenshot service is not available".to_string()
+                        "Screenshot service is not available".to_string(),
                     )
                 })?;
 

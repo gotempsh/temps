@@ -1,5 +1,5 @@
+pub mod audit;
 pub mod handlers;
 pub mod types;
-pub mod audit;
-pub use handlers::*;
 pub use audit::*;
+pub use handlers::*;

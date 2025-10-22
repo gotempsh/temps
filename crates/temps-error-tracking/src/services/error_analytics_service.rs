@@ -200,8 +200,7 @@ impl ErrorAnalyticsService {
         }
 
         let groups_sql = if let Some(_env_id) = environment_id {
-            format!(
-                r#"
+            r#"
                 SELECT COUNT(DISTINCT error_group_id) as count
                 FROM error_events
                 WHERE project_id = $1
@@ -209,17 +208,16 @@ impl ErrorAnalyticsService {
                     AND timestamp <= $3
                     AND environment_id = $4
                 "#
-            )
+            .to_string()
         } else {
-            format!(
-                r#"
+            r#"
                 SELECT COUNT(DISTINCT error_group_id) as count
                 FROM error_events
                 WHERE project_id = $1
                     AND timestamp >= $2
                     AND timestamp <= $3
                 "#
-            )
+            .to_string()
         };
 
         let group_count_result = if let Some(env_id) = environment_id {
@@ -262,9 +260,8 @@ impl ErrorAnalyticsService {
                 let prev_total = prev_query.count(self.db.as_ref()).await? as i64;
 
                 // Get previous period error groups count
-                let prev_groups_sql = if let Some(_) = environment_id {
-                    format!(
-                        r#"
+                let prev_groups_sql = if environment_id.is_some() {
+                    r#"
                         SELECT COUNT(DISTINCT error_group_id) as count
                         FROM error_events
                         WHERE project_id = $1
@@ -272,17 +269,16 @@ impl ErrorAnalyticsService {
                             AND timestamp <= $3
                             AND environment_id = $4
                         "#
-                    )
+                    .to_string()
                 } else {
-                    format!(
-                        r#"
+                    r#"
                         SELECT COUNT(DISTINCT error_group_id) as count
                         FROM error_events
                         WHERE project_id = $1
                             AND timestamp >= $2
                             AND timestamp <= $3
                         "#
-                    )
+                    .to_string()
                 };
 
                 let prev_group_count_result = if let Some(env_id) = environment_id {

@@ -27,10 +27,7 @@ impl IncidentService {
     }
 
     /// Execute a database operation with retry logic
-    async fn with_retry<F, T>(
-        operation_name: &str,
-        mut operation: F,
-    ) -> Result<T, StatusPageError>
+    async fn with_retry<F, T>(operation_name: &str, mut operation: F) -> Result<T, StatusPageError>
     where
         F: FnMut() -> BoxFuture<'static, Result<T, sea_orm::DbErr>>,
     {
@@ -52,28 +49,33 @@ impl IncidentService {
             match operation().await {
                 Ok(result) => {
                     if attempt > 0 {
-                        debug!("{} succeeded after {} attempts", operation_name, attempt + 1);
+                        debug!(
+                            "{} succeeded after {} attempts",
+                            operation_name,
+                            attempt + 1
+                        );
                     }
                     return Ok(result);
                 }
                 Err(e) => {
                     // Check if it's a transient error that we should retry
                     let should_retry = match &e {
-                        sea_orm::DbErr::ConnectionAcquire(_) |
-                        sea_orm::DbErr::Conn(_) => true,
+                        sea_orm::DbErr::ConnectionAcquire(_) | sea_orm::DbErr::Conn(_) => true,
                         sea_orm::DbErr::Query(runtime_err) => {
                             let err_str = runtime_err.to_string();
                             err_str.contains("deadlock")
                                 || err_str.contains("timeout")
                                 || err_str.contains("connection")
-                        },
+                        }
                         _ => false,
                     };
 
                     if should_retry && attempt < MAX_RETRIES {
                         warn!(
                             "{} failed (attempt {}), will retry: {:?}",
-                            operation_name, attempt + 1, e
+                            operation_name,
+                            attempt + 1,
+                            e
                         );
                         last_error = Some(e);
                         continue;
@@ -82,7 +84,9 @@ impl IncidentService {
                     // Non-retryable error or final attempt
                     error!(
                         "{} failed after {} attempts: {:?}",
-                        operation_name, attempt + 1, e
+                        operation_name,
+                        attempt + 1,
+                        e
                     );
                     return Err(StatusPageError::Database(e));
                 }
@@ -90,9 +94,12 @@ impl IncidentService {
         }
 
         // Should not reach here
-        Err(StatusPageError::Database(last_error.unwrap_or_else(||
-            sea_orm::DbErr::Custom(format!("{} failed after all retry attempts", operation_name))
-        )))
+        Err(StatusPageError::Database(last_error.unwrap_or_else(|| {
+            sea_orm::DbErr::Custom(format!(
+                "{} failed after all retry attempts",
+                operation_name
+            ))
+        })))
     }
 
     /// Create a new incident with retry logic
@@ -130,11 +137,10 @@ impl IncidentService {
             || {
                 let incident = incident.clone();
                 let db = db.clone();
-                Box::pin(async move {
-                    incident.insert(db.as_ref()).await
-                })
+                Box::pin(async move { incident.insert(db.as_ref()).await })
             },
-        ).await?;
+        )
+        .await?;
 
         let incident_id = result.id;
 
@@ -151,11 +157,10 @@ impl IncidentService {
             || {
                 let update = initial_update.clone();
                 let db = db.clone();
-                Box::pin(async move {
-                    update.insert(db.as_ref()).await
-                })
+                Box::pin(async move { update.insert(db.as_ref()).await })
             },
-        ).await?;
+        )
+        .await?;
 
         Ok(result.into())
     }
@@ -352,9 +357,11 @@ impl IncidentService {
             "5min" => "5 minutes",
             "hourly" => "1 hour",
             "daily" => "1 day",
-            _ => return Err(StatusPageError::Validation(
-                "Invalid interval. Must be '5min', 'hourly', or 'daily'".to_string()
-            )),
+            _ => {
+                return Err(StatusPageError::Validation(
+                    "Invalid interval. Must be '5min', 'hourly', or 'daily'".to_string(),
+                ))
+            }
         };
 
         let env_filter = if let Some(env_id) = environment_id {
@@ -434,4 +441,3 @@ impl IncidentService {
         })
     }
 }
-

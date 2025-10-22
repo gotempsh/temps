@@ -219,6 +219,12 @@ pub struct PluginMiddlewareCollection {
     pub middleware: Vec<PluginMiddleware>,
 }
 
+impl Default for PluginMiddlewareCollection {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PluginMiddlewareCollection {
     pub fn new() -> Self {
         Self {
@@ -402,6 +408,12 @@ pub struct ServiceRegistry {
     services: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
 }
 
+impl Default for ServiceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServiceRegistry {
     /// Create a new service registry
     pub fn new() -> Self {
@@ -444,6 +456,12 @@ impl ServiceRegistry {
 /// Registry for plugin-specific state (used for routing)
 pub struct PluginStateRegistry {
     states: Mutex<HashMap<String, Box<dyn Any + Send + Sync>>>,
+}
+
+impl Default for PluginStateRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PluginStateRegistry {
@@ -535,6 +553,12 @@ pub struct ServiceRegistrationContext {
     state_registry: Arc<PluginStateRegistry>,
 }
 
+impl Default for ServiceRegistrationContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServiceRegistrationContext {
     pub fn new() -> Self {
         Self {
@@ -577,6 +601,12 @@ impl ServiceRegistrationContext {
 pub struct PluginManager {
     plugins: Vec<Box<dyn TempsPlugin>>,
     context: ServiceRegistrationContext,
+}
+
+impl Default for PluginManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PluginManager {

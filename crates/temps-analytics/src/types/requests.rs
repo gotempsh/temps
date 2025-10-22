@@ -1,4 +1,4 @@
-use serde::{Deserialize};
+use serde::Deserialize;
 use serde_json::Value;
 use temps_core::DateTime;
 use utoipa::ToSchema;
@@ -121,7 +121,6 @@ pub struct VisitorsListQuery {
     pub limit: Option<i32>,
     pub offset: Option<i32>,
 }
-
 
 #[derive(Deserialize, Clone, ToSchema)]
 pub struct VisitorSessionsQuery {

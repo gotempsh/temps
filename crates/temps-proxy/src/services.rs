@@ -688,8 +688,9 @@ mod tests {
     use temps_entities::{deployments, environments, projects, request_logs, visitor};
 
     fn create_mock_ip_service(db: Arc<DatabaseConnection>) -> Arc<temps_geo::IpAddressService> {
-        let geoip_service =
-            Arc::new(temps_geo::GeoIpService::Mock(temps_geo::MockGeoIpService::new()));
+        let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
+            temps_geo::MockGeoIpService::new(),
+        ));
         Arc::new(temps_geo::IpAddressService::new(db, geoip_service))
     }
 
@@ -786,8 +787,11 @@ mod tests {
     async fn test_request_logger_user_agent_parsing() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let ip_service = create_mock_ip_service(test_db.connection_arc().clone());
-        let logger =
-            RequestLoggerImpl::new(LoggingConfig::default(), test_db.connection_arc().clone(), ip_service);
+        let logger = RequestLoggerImpl::new(
+            LoggingConfig::default(),
+            test_db.connection_arc().clone(),
+            ip_service,
+        );
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -831,8 +835,11 @@ mod tests {
     async fn test_request_logger_mobile_detection() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let ip_service = create_mock_ip_service(test_db.connection_arc().clone());
-        let logger =
-            RequestLoggerImpl::new(LoggingConfig::default(), test_db.connection_arc().clone(), ip_service);
+        let logger = RequestLoggerImpl::new(
+            LoggingConfig::default(),
+            test_db.connection_arc().clone(),
+            ip_service,
+        );
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -874,8 +881,11 @@ mod tests {
     async fn test_request_logger_crawler_detection() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let ip_service = create_mock_ip_service(test_db.connection_arc().clone());
-        let logger =
-            RequestLoggerImpl::new(LoggingConfig::default(), test_db.connection_arc().clone(), ip_service);
+        let logger = RequestLoggerImpl::new(
+            LoggingConfig::default(),
+            test_db.connection_arc().clone(),
+            ip_service,
+        );
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -979,8 +989,11 @@ mod tests {
     async fn test_request_logger_with_visitor_and_session() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let ip_service = create_mock_ip_service(test_db.connection_arc().clone());
-        let logger =
-            RequestLoggerImpl::new(LoggingConfig::default(), test_db.connection_arc().clone(), ip_service);
+        let logger = RequestLoggerImpl::new(
+            LoggingConfig::default(),
+            test_db.connection_arc().clone(),
+            ip_service,
+        );
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -990,14 +1003,16 @@ mod tests {
             "test-visitor-123",
             context.project.id,
             context.environment.id,
-        ).await;
+        )
+        .await;
 
         // Create session record in database
         let session_id_i32 = create_test_session(
             &test_db.connection_arc(),
             "test-session-456",
             visitor_id_i32,
-        ).await;
+        )
+        .await;
 
         // Create test visitor
         let visitor_data = Visitor {
@@ -1058,7 +1073,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let session_manager = SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
+        let session_manager =
+            SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -1068,7 +1084,8 @@ mod tests {
             "test-visitor-1",
             context.project.id,
             context.environment.id,
-        ).await;
+        )
+        .await;
 
         let visitor = Visitor {
             visitor_id: "test-visitor-1".to_string(),
@@ -1136,7 +1153,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let session_manager = SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
+        let session_manager =
+            SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -1146,7 +1164,8 @@ mod tests {
             "test-visitor-2",
             context.project.id,
             context.environment.id,
-        ).await;
+        )
+        .await;
 
         let visitor = Visitor {
             visitor_id: "test-visitor-2".to_string(),
@@ -1188,7 +1207,10 @@ mod tests {
 
         let mut active_session: request_sessions::ActiveModel = db_session.into();
         active_session.last_accessed_at = Set(chrono::Utc::now() - chrono::Duration::minutes(31));
-        active_session.update(test_db.connection_arc().as_ref()).await.unwrap();
+        active_session
+            .update(test_db.connection_arc().as_ref())
+            .await
+            .unwrap();
 
         // Try to reuse with expired session - should create new one
         let session2 = session_manager
@@ -1215,7 +1237,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let session_manager = SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
+        let session_manager =
+            SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -1225,7 +1248,8 @@ mod tests {
             "test-visitor-3",
             context.project.id,
             context.environment.id,
-        ).await;
+        )
+        .await;
 
         let visitor = Visitor {
             visitor_id: "test-visitor-3".to_string(),
@@ -1260,7 +1284,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let session_manager = SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
+        let session_manager =
+            SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -1270,7 +1295,8 @@ mod tests {
             "test-visitor-4",
             context.project.id,
             context.environment.id,
-        ).await;
+        )
+        .await;
 
         let visitor = Visitor {
             visitor_id: "test-visitor-4".to_string(),
@@ -1325,7 +1351,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let session_manager = SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
+        let session_manager =
+            SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -1335,7 +1362,8 @@ mod tests {
             "test-visitor-5",
             context.project.id,
             context.environment.id,
-        ).await;
+        )
+        .await;
 
         let visitor = Visitor {
             visitor_id: "test-visitor-5".to_string(),

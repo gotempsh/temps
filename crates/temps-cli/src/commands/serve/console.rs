@@ -267,9 +267,7 @@ fn prompt_for_admin_email() -> anyhow::Result<Option<String>> {
     );
     println!(
         "{}",
-        "           🚀 Welcome to Temps!"
-            .bright_white()
-            .bold()
+        "           🚀 Welcome to Temps!".bright_white().bold()
     );
     println!(
         "{}",
@@ -435,22 +433,22 @@ pub async fn start_console_api(
 
     // 3.1. EventsPlugin - provides custom events tracking (depends on database)
     debug!("Registering EventsPlugin");
-    let events_plugin = Box::new(EventsPlugin::default());
+    let events_plugin = Box::new(EventsPlugin);
     plugin_manager.register_plugin(events_plugin);
 
     // 3.2. FunnelsPlugin - provides funnel analytics (depends on database)
     debug!("Registering FunnelsPlugin");
-    let funnels_plugin = Box::new(FunnelsPlugin::default());
+    let funnels_plugin = Box::new(FunnelsPlugin);
     plugin_manager.register_plugin(funnels_plugin);
 
     // 3.3. SessionReplayPlugin - provides session replay (depends on database)
     debug!("Registering SessionReplayPlugin");
-    let session_replay_plugin = Box::new(SessionReplayPlugin::default());
+    let session_replay_plugin = Box::new(SessionReplayPlugin);
     plugin_manager.register_plugin(session_replay_plugin);
 
     // 3.4. PerformancePlugin - provides performance metrics (depends on database)
     debug!("Registering PerformancePlugin");
-    let performance_plugin = Box::new(PerformancePlugin::default());
+    let performance_plugin = Box::new(PerformancePlugin);
     plugin_manager.register_plugin(performance_plugin);
 
     // 4. GeoPlugin - provides geolocation services (depends on database)

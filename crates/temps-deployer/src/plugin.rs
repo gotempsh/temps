@@ -29,12 +29,14 @@ impl DeployerPlugin {
                             tracing::debug!("Docker version: {}", version_str);
 
                             // Parse version and check if >= 18.09
-                            if let Some(major_minor) = version_str.split('.').take(2).collect::<Vec<_>>().get(0..2) {
-                                if let (Ok(major), Ok(minor)) = (
-                                    major_minor[0].parse::<u32>(),
-                                    major_minor[1].parse::<u32>()
-                                ) {
-                                    let supports_buildkit = major > 18 || (major == 18 && minor >= 9);
+                            if let Some(major_minor) =
+                                version_str.split('.').take(2).collect::<Vec<_>>().get(0..2)
+                            {
+                                if let (Ok(major), Ok(minor)) =
+                                    (major_minor[0].parse::<u32>(), major_minor[1].parse::<u32>())
+                                {
+                                    let supports_buildkit =
+                                        major > 18 || (major == 18 && minor >= 9);
 
                                     if !supports_buildkit {
                                         tracing::warn!(
@@ -53,7 +55,11 @@ impl DeployerPlugin {
                         match docker.info().await {
                             Ok(info) => {
                                 // Log out all info for debug
-                                tracing::debug!("Docker info arch: {:?} os: {:?}", info.architecture, info.os_type);
+                                tracing::debug!(
+                                    "Docker info arch: {:?} os: {:?}",
+                                    info.architecture,
+                                    info.os_type
+                                );
                                 // Check if BuildKit is explicitly disabled
                                 // Note: BuildKit is enabled by default in newer Docker versions
                                 tracing::debug!("Docker info retrieved successfully");
@@ -63,7 +69,10 @@ impl DeployerPlugin {
                                 true
                             }
                             Err(e) => {
-                                tracing::debug!("Failed to get Docker info: {}, assuming BuildKit available", e);
+                                tracing::debug!(
+                                    "Failed to get Docker info: {}, assuming BuildKit available",
+                                    e
+                                );
                                 true // Assume available if we can't check
                             }
                         }
@@ -99,7 +108,7 @@ impl TempsPlugin for DeployerPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             // Create Docker client
-           let docker = context.require_service::<bollard::Docker>();
+            let docker = context.require_service::<bollard::Docker>();
 
             // Check if buildkit is available
             let use_buildkit = Self::detect_buildkit().await;

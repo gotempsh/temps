@@ -2,10 +2,12 @@
 //!
 //! These tests can be run independently from the main test suite
 
-use temps_core::TempsConfig;
-use temps_deployments::jobs::configure_crons::{CronConfig, CronConfigError, CronConfigService, NoOpCronConfigService};
 use async_trait::async_trait;
 use std::sync::Arc;
+use temps_core::TempsConfig;
+use temps_deployments::jobs::configure_crons::{
+    CronConfig, CronConfigError, CronConfigService, NoOpCronConfigService,
+};
 
 // Mock CronConfigService for testing
 struct MockCronConfigService {
@@ -173,12 +175,10 @@ cron:
 #[test]
 fn test_noop_cron_service() {
     let service = NoOpCronConfigService;
-    let configs = vec![
-        CronConfig {
-            path: "/test".to_string(),
-            schedule: "* * * * *".to_string(),
-        },
-    ];
+    let configs = vec![CronConfig {
+        path: "/test".to_string(),
+        schedule: "* * * * *".to_string(),
+    }];
 
     // Should succeed without doing anything
     let result = tokio_test::block_on(service.configure_crons(1, 1, configs));
@@ -211,12 +211,10 @@ async fn test_mock_cron_service_success() {
 #[tokio::test]
 async fn test_mock_cron_service_failure() {
     let service = MockCronConfigService::with_failure();
-    let configs = vec![
-        CronConfig {
-            path: "/api/cron/task".to_string(),
-            schedule: "0 0 * * *".to_string(),
-        },
-    ];
+    let configs = vec![CronConfig {
+        path: "/api/cron/task".to_string(),
+        schedule: "0 0 * * *".to_string(),
+    }];
 
     let result = service.configure_crons(1, 1, configs).await;
     assert!(result.is_err());

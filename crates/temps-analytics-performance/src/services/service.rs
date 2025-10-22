@@ -1,11 +1,14 @@
-use std::sync::Arc;
 use anyhow::Result;
-use sea_orm::{prelude::*, QueryFilter, QueryOrder, Statement, DatabaseBackend, FromQueryResult, ActiveModelTrait, Set};
-use temps_core::UtcDateTime;
-use tracing::info;
+use sea_orm::{
+    prelude::*, ActiveModelTrait, DatabaseBackend, FromQueryResult, QueryFilter, QueryOrder, Set,
+    Statement,
+};
 use serde::Serialize;
-use utoipa::ToSchema;
+use std::sync::Arc;
+use temps_core::UtcDateTime;
 use temps_entities::{performance_metrics, request_sessions, visitor};
+use tracing::info;
+use utoipa::ToSchema;
 use woothee::parser::Parser;
 
 #[derive(Debug)]
@@ -159,7 +162,6 @@ impl PerformanceService {
         environment_id: Option<i32>,
         deployment_id: Option<i32>,
     ) -> Result<PerformanceMetricsResponse, PerformanceError> {
-
         // Get all metrics for the project and date range
         let mut query = performance_metrics::Entity::find()
             .filter(performance_metrics::Column::ProjectId.eq(project_id))
@@ -236,18 +238,19 @@ impl PerformanceService {
         environment_id: Option<i32>,
         deployment_id: Option<i32>,
     ) -> Result<MetricsOverTimeResponse, PerformanceError> {
-
         // Get all metrics for percentile calculations
         let mut percentile_query = performance_metrics::Entity::find()
             .filter(performance_metrics::Column::ProjectId.eq(project_id))
             .filter(performance_metrics::Column::RecordedAt.between(start_date, end_date));
 
         if let Some(env_id) = environment_id {
-            percentile_query = percentile_query.filter(performance_metrics::Column::EnvironmentId.eq(env_id));
+            percentile_query =
+                percentile_query.filter(performance_metrics::Column::EnvironmentId.eq(env_id));
         }
 
         if let Some(dep_id) = deployment_id {
-            percentile_query = percentile_query.filter(performance_metrics::Column::DeploymentId.eq(dep_id));
+            percentile_query =
+                percentile_query.filter(performance_metrics::Column::DeploymentId.eq(dep_id));
         }
 
         let all_metrics = percentile_query.all(self.db.as_ref()).await?;
@@ -319,9 +322,7 @@ impl PerformanceService {
         };
 
         for metric in metrics {
-            result
-                .timestamps
-                .push(metric.recorded_at.to_rfc3339());
+            result.timestamps.push(metric.recorded_at.to_rfc3339());
             result.ttfb.push(metric.ttfb);
             result.lcp.push(metric.lcp);
             result.fid.push(metric.fid);
@@ -342,17 +343,19 @@ impl PerformanceService {
         deployment_id: Option<i32>,
         group_by: GroupBy,
     ) -> Result<GroupedPageMetricsResponse, PerformanceError> {
-
         // Determine the grouping field and column
         let (group_field, group_by_name) = match group_by {
             GroupBy::Path => ("rl.request_path", "path"),
             GroupBy::Country => ("COALESCE(ig.country, 'Unknown')", "country"),
             GroupBy::DeviceType => (
                 "CASE WHEN rl.is_mobile = true THEN 'Mobile' ELSE 'Desktop' END",
-                "device_type"
+                "device_type",
             ),
             GroupBy::Browser => ("COALESCE(rl.browser, 'Unknown')", "browser"),
-            GroupBy::OperatingSystem => ("COALESCE(rl.operating_system, 'Unknown')", "operating_system"),
+            GroupBy::OperatingSystem => (
+                "COALESCE(rl.operating_system, 'Unknown')",
+                "operating_system",
+            ),
         };
 
         // Build the base query with proper grouping
@@ -362,11 +365,8 @@ impl PerformanceService {
             format!("pm.recorded_at <= ${}", 3),
             "pm.is_crawler = false".to_string(),
         ];
-        let mut params: Vec<sea_orm::Value> = vec![
-            project_id.into(),
-            start_date.into(),
-            end_date.into(),
-        ];
+        let mut params: Vec<sea_orm::Value> =
+            vec![project_id.into(), start_date.into(), end_date.into()];
         let mut param_count = 3;
 
         // Add optional filters
@@ -430,12 +430,19 @@ impl PerformanceService {
             events: i64,
         }
 
-        let results = GroupedMetricResult::find_by_statement(
-            Statement::from_sql_and_values(DatabaseBackend::Postgres, &query, params)
-        )
+        let results = GroupedMetricResult::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &query,
+            params,
+        ))
         .all(self.db.as_ref())
         .await
-        .map_err(|e| PerformanceError::DatabaseError(format!("Failed to execute grouped page metrics query: {}", e)))?;
+        .map_err(|e| {
+            PerformanceError::DatabaseError(format!(
+                "Failed to execute grouped page metrics query: {}",
+                e
+            ))
+        })?;
 
         let groups: Vec<GroupedPageMetric> = results
             .into_iter()
@@ -525,7 +532,7 @@ impl PerformanceService {
                     } else {
                         None
                     };
-                    let browser_version = if result.version != "" {
+                    let browser_version = if !result.version.is_empty() {
                         Some(result.version.to_string())
                     } else {
                         None
@@ -535,17 +542,24 @@ impl PerformanceService {
                     } else {
                         None
                     };
-                    let operating_system_version = if !result.os_version.is_empty() && result.os_version != "UNKNOWN" {
-                        Some(result.os_version.to_string())
-                    } else {
-                        None
-                    };
+                    let operating_system_version =
+                        if !result.os_version.is_empty() && result.os_version != "UNKNOWN" {
+                            Some(result.os_version.to_string())
+                        } else {
+                            None
+                        };
                     let device_type = if result.category != "UNKNOWN" {
                         Some(result.category.to_string())
                     } else {
                         None
                     };
-                    (browser, browser_version, operating_system, operating_system_version, device_type)
+                    (
+                        browser,
+                        browser_version,
+                        operating_system,
+                        operating_system_version,
+                        device_type,
+                    )
                 } else {
                     (None, None, None, None, None)
                 }
@@ -667,7 +681,9 @@ impl PerformanceService {
         let metric = query
             .one(self.db.as_ref())
             .await?
-            .ok_or(PerformanceError::Other("Metric not found for update".to_string()))?;
+            .ok_or(PerformanceError::Other(
+                "Metric not found for update".to_string(),
+            ))?;
 
         let mut metric: performance_metrics::ActiveModel = metric.into();
 

@@ -2,9 +2,7 @@ use super::audit::{EnvironmentSettingsUpdatedAudit, EnvironmentSettingsUpdatedFi
 use super::types::AppState;
 use axum::Router;
 use axum::{
-    extract::{
-        Extension, Path, Query, State,
-    },
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post, put},
@@ -29,15 +27,25 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
     fn from(err: crate::services::env_var_service::EnvVarError) -> Self {
         use crate::services::env_var_service::EnvVarError;
         match err {
-            EnvVarError::NotFound(msg) => temps_core::error_builder::not_found().detail(msg).build(),
-            EnvVarError::InvalidInput(msg) => temps_core::error_builder::bad_request().detail(msg).build(),
+            EnvVarError::NotFound(msg) => {
+                temps_core::error_builder::not_found().detail(msg).build()
+            }
+            EnvVarError::InvalidInput(msg) => {
+                temps_core::error_builder::bad_request().detail(msg).build()
+            }
             EnvVarError::DatabaseConnectionError(msg) => {
-                temps_core::error_builder::internal_server_error().detail(msg).build()
+                temps_core::error_builder::internal_server_error()
+                    .detail(msg)
+                    .build()
             }
             EnvVarError::DatabaseError { reason } => {
-                temps_core::error_builder::internal_server_error().detail(reason).build()
+                temps_core::error_builder::internal_server_error()
+                    .detail(reason)
+                    .build()
             }
-            EnvVarError::Other(msg) => temps_core::error_builder::internal_server_error().detail(msg).build(),
+            EnvVarError::Other(msg) => temps_core::error_builder::internal_server_error()
+                .detail(msg)
+                .build(),
         }
     }
 }

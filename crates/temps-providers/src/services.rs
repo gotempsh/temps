@@ -6,7 +6,6 @@ use crate::types::EnvironmentVariableInfo;
 use anyhow::Result;
 use bollard::Docker;
 use chrono::Utc;
-use tracing::{error, info};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
     TransactionTrait,
@@ -19,6 +18,7 @@ use temps_entities::{
     projects,
 };
 use thiserror::Error;
+use tracing::{error, info};
 // use crate::routes::types::external_services::EnvironmentVariableInfo;
 use temps_core::EncryptionService;
 // Add these constants at the top of the file proper key management
@@ -602,12 +602,8 @@ impl ExternalServiceManager {
             version: service.version,
             status: service.status,
             connection_info: None,
-            created_at: service
-                .created_at
-                .to_rfc3339(),
-            updated_at: service
-                .updated_at
-                .to_rfc3339(),
+            created_at: service.created_at.to_rfc3339(),
+            updated_at: service.updated_at.to_rfc3339(),
         })
     }
 
@@ -819,7 +815,8 @@ impl ExternalServiceManager {
             for param in params {
                 // Since is_encrypted is removed, we assume all old params might be unencrypted
                 // Try to decrypt first, if that fails, assume it's unencrypted and encrypt it
-                let needs_encryption = self.encryption_service
+                let needs_encryption = self
+                    .encryption_service
                     .decrypt_string(&param.value)
                     .is_err();
 
@@ -829,7 +826,8 @@ impl ExternalServiceManager {
                         param.key, service.id
                     );
 
-                    let encrypted_value = self.encryption_service
+                    let encrypted_value = self
+                        .encryption_service
                         .encrypt_string(&param.value)
                         .map_err(|e| ExternalServiceError::EncryptionFailed {
                             service_id: service.id,
@@ -1409,7 +1407,11 @@ mod tests {
         };
 
         let result = manager.create_service(request).await;
-        assert!(result.is_ok(), "Failed to create service: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to create service: {:?}",
+            result.err()
+        );
 
         let service = result.unwrap();
         assert_eq!(service.name, "test-postgres");

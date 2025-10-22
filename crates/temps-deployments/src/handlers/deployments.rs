@@ -335,7 +335,7 @@ pub async fn pause_deployment(
     permission_guard!(auth, DeploymentsDelete);
     info!("Pausing deployment: {:?}", deployment_id);
 
-    let _deployment = state
+    state
         .deployment_service
         .pause_deployment(project_id, deployment_id)
         .await?;
@@ -371,7 +371,7 @@ pub async fn resume_deployment(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsCreate);
 
-    let _deployment = state
+    state
         .deployment_service
         .resume_deployment(project_id, deployment_id)
         .await?;
@@ -545,10 +545,8 @@ pub async fn list_containers(
         .list_environment_containers(project_id, environment_id)
         .await?;
 
-    let container_responses: Vec<ContainerInfoResponse> = containers
-        .into_iter()
-        .map(Into::into)
-        .collect();
+    let container_responses: Vec<ContainerInfoResponse> =
+        containers.into_iter().map(Into::into).collect();
 
     let total = container_responses.len();
     let response = ContainerListResponse {
@@ -600,7 +598,14 @@ pub async fn get_container_logs_by_id(
 
     // Get the log stream from the deployment service
     let log_stream = deployment_service
-        .get_container_logs_by_id(project_id, environment_id, container_id, start_date, end_date, tail)
+        .get_container_logs_by_id(
+            project_id,
+            environment_id,
+            container_id,
+            start_date,
+            end_date,
+            tail,
+        )
         .await
         .map_err(|e| {
             error!("Failed to get container logs: {}", e);
@@ -610,13 +615,11 @@ pub async fn get_container_logs_by_id(
         })?;
 
     // Convert the log stream to SSE events
-    let event_stream = log_stream.map(|log_result| {
-        match log_result {
-            Ok(line) => Ok::<_, axum::BoxError>(Event::default().data(line)),
-            Err(e) => {
-                error!("Error reading log line: {}", e);
-                Ok(Event::default().data(format!("Error: {}", e)))
-            }
+    let event_stream = log_stream.map(|log_result| match log_result {
+        Ok(line) => Ok::<_, axum::BoxError>(Event::default().data(line)),
+        Err(e) => {
+            error!("Error reading log line: {}", e);
+            Ok(Event::default().data(format!("Error: {}", e)))
         }
     });
 
@@ -665,7 +668,14 @@ pub async fn get_container_logs(
 
     // Get the log stream from the deployment service
     let log_stream = deployment_service
-        .get_filtered_container_logs(project_id, environment_id, start_date, end_date, tail, container_name)
+        .get_filtered_container_logs(
+            project_id,
+            environment_id,
+            start_date,
+            end_date,
+            tail,
+            container_name,
+        )
         .await
         .map_err(|e| {
             error!("Failed to get container logs: {}", e);
@@ -675,13 +685,11 @@ pub async fn get_container_logs(
         })?;
 
     // Convert the log stream to SSE events
-    let event_stream = log_stream.map(|log_result| {
-        match log_result {
-            Ok(line) => Ok::<_, axum::BoxError>(Event::default().data(line)),
-            Err(e) => {
-                error!("Error reading log line: {}", e);
-                Ok(Event::default().data(format!("Error: {}", e)))
-            }
+    let event_stream = log_stream.map(|log_result| match log_result {
+        Ok(line) => Ok::<_, axum::BoxError>(Event::default().data(line)),
+        Err(e) => {
+            error!("Error reading log line: {}", e);
+            Ok(Event::default().data(format!("Error: {}", e)))
         }
     });
 
@@ -842,9 +850,9 @@ pub async fn tail_deployment_job_logs(
                     .json_data(serde_json::json!({
                         "log": cleaned_data
                     }))
-                    .expect("Failed to serialize log data")
+                    .expect("Failed to serialize log data"),
             )
-        },
+        }
         Err(e) => {
             error!("Error reading log line: {:?}", e);
             Ok::<Event, std::io::Error>(Event::default().data("Error reading log line"))

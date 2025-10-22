@@ -29,19 +29,24 @@ impl ScreenshotService {
             .map_err(|e| ScreenshotError::ConfigError(format!("Failed to get settings: {}", e)))?;
 
         // Determine which provider to use based on configuration
-        let provider: Arc<dyn ScreenshotProvider> = if !settings.screenshots.url.is_empty() && settings.screenshots.provider == "remote" {
-            info!("Using remote screenshot provider at {}", settings.screenshots.url);
-            Arc::new(
-                RemoteScreenshotProvider::new(settings.screenshots.url.clone(), None)
-                    .map_err(|e| {
-                        error!("Failed to create remote screenshot provider: {}", e);
-                        e
-                    })?,
-            )
-        } else {
-            info!("Using local headless Chrome screenshot provider");
-            Arc::new(LocalScreenshotProvider::new())
-        };
+        let provider: Arc<dyn ScreenshotProvider> =
+            if !settings.screenshots.url.is_empty() && settings.screenshots.provider == "remote" {
+                info!(
+                    "Using remote screenshot provider at {}",
+                    settings.screenshots.url
+                );
+                Arc::new(
+                    RemoteScreenshotProvider::new(settings.screenshots.url.clone(), None).map_err(
+                        |e| {
+                            error!("Failed to create remote screenshot provider: {}", e);
+                            e
+                        },
+                    )?,
+                )
+            } else {
+                info!("Using local headless Chrome screenshot provider");
+                Arc::new(LocalScreenshotProvider::new())
+            };
 
         // Check if provider is available
         if !provider.is_available().await {
@@ -69,11 +74,7 @@ impl ScreenshotService {
     }
 
     /// Capture a screenshot and save it to the static files directory
-    pub async fn capture_and_save(
-        &self,
-        url: &str,
-        filename: &str,
-    ) -> ScreenshotResult<PathBuf> {
+    pub async fn capture_and_save(&self, url: &str, filename: &str) -> ScreenshotResult<PathBuf> {
         debug!("Capturing screenshot of {} and saving as {}", url, filename);
 
         // Capture screenshot
@@ -101,7 +102,11 @@ impl ScreenshotService {
 
         // Save the file
         fs::write(&file_path, &image_data).await.map_err(|e| {
-            error!("Failed to write screenshot to {}: {}", file_path.display(), e);
+            error!(
+                "Failed to write screenshot to {}: {}",
+                file_path.display(),
+                e
+            );
             ScreenshotError::Io(e)
         })?;
 

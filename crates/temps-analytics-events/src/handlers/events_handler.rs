@@ -10,7 +10,7 @@ use crate::types::{
 use axum::Extension;
 use axum::{
     extract::{Path, Query, State},
-    http::{StatusCode, header::HeaderMap},
+    http::{header::HeaderMap, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
@@ -569,8 +569,7 @@ pub async fn record_event_metrics(
 
     info!(
         "Recording event metrics: {} path: {}",
-        payload.event_name,
-        payload.request_path
+        payload.event_name, payload.request_path
     );
 
     // Extract domain from Host header
@@ -610,11 +609,13 @@ pub async fn record_event_metrics(
     };
 
     // Extract user agent and referrer from headers
-    let user_agent = headers.get("user-agent")
+    let user_agent = headers
+        .get("user-agent")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
-    let referrer_header = headers.get("referer")
+    let referrer_header = headers
+        .get("referer")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
@@ -623,21 +624,32 @@ pub async fn record_event_metrics(
 
     // Extract language from event_data if not provided in payload
     let language = payload.language.or_else(|| {
-        payload.event_data.get("language")
+        payload
+            .event_data
+            .get("language")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
 
     // Lookup IP geolocation
     let ip_geolocation_id = if !metadata.ip_address.is_empty() {
-        match state.ip_address_service.get_or_create_ip(&metadata.ip_address).await {
+        match state
+            .ip_address_service
+            .get_or_create_ip(&metadata.ip_address)
+            .await
+        {
             Ok(ip_info) => {
-                info!("Resolved IP {} to geolocation: country={:?}, city={:?}",
-                      metadata.ip_address, ip_info.country, ip_info.city);
+                info!(
+                    "Resolved IP {} to geolocation: country={:?}, city={:?}",
+                    metadata.ip_address, ip_info.country, ip_info.city
+                );
                 Some(ip_info.id)
             }
             Err(e) => {
-                error!("Failed to lookup IP geolocation for {}: {}", metadata.ip_address, e);
+                error!(
+                    "Failed to lookup IP geolocation for {}: {}",
+                    metadata.ip_address, e
+                );
                 None
             }
         }
@@ -754,19 +766,43 @@ pub async fn get_aggregated_buckets(
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/projects/{project_id}/events", get(get_events_count))
-        .route("/projects/{project_id}/events/breakdown", get(get_event_type_breakdown))
-        .route("/projects/{project_id}/events/timeline", get(get_events_timeline))
-        .route("/projects/{project_id}/events/properties/breakdown", get(get_property_breakdown))
-        .route("/projects/{project_id}/events/properties/timeline", get(get_property_timeline))
-        .route("/projects/{project_id}/aggregated-buckets", get(get_aggregated_buckets))
-        .route("/projects/{project_id}/unique-counts", get(get_unique_counts))
-        .route("/projects/{project_id}/active-visitors", get(get_active_visitors))
-        .route("/projects/{project_id}/hourly-visits", get(get_hourly_visits))
-        .route("/projects/{project_id}/has-events", get(has_analytics_events))
         .route(
-            "/sessions/{session_id}/events",
-            get(get_session_events),
+            "/projects/{project_id}/events/breakdown",
+            get(get_event_type_breakdown),
         )
+        .route(
+            "/projects/{project_id}/events/timeline",
+            get(get_events_timeline),
+        )
+        .route(
+            "/projects/{project_id}/events/properties/breakdown",
+            get(get_property_breakdown),
+        )
+        .route(
+            "/projects/{project_id}/events/properties/timeline",
+            get(get_property_timeline),
+        )
+        .route(
+            "/projects/{project_id}/aggregated-buckets",
+            get(get_aggregated_buckets),
+        )
+        .route(
+            "/projects/{project_id}/unique-counts",
+            get(get_unique_counts),
+        )
+        .route(
+            "/projects/{project_id}/active-visitors",
+            get(get_active_visitors),
+        )
+        .route(
+            "/projects/{project_id}/hourly-visits",
+            get(get_hourly_visits),
+        )
+        .route(
+            "/projects/{project_id}/has-events",
+            get(has_analytics_events),
+        )
+        .route("/sessions/{session_id}/events", get(get_session_events))
         .route("/_temps/event", post(record_event_metrics))
 }
 

@@ -27,7 +27,7 @@ pub async fn auth_middleware(
             // Extract user from auth context if available
             user = Some(ctx.user.clone());
             Some(ctx)
-        },
+        }
         Err(_) => {
             // For routes that don't require auth, continue without context
             // The RequireAuth extractor will handle the error later
@@ -40,16 +40,20 @@ pub async fn auth_middleware(
     let session_id_cookie = extract_session_id_cookie(&req, &app_state.cookie_crypto);
 
     // Create base URL from request headers
-    let host = req.headers()
+    let host = req
+        .headers()
         .get("host")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("localhost")
         .to_string();
 
     // Determine scheme (simplified - you may want to add more sophisticated logic)
-    let scheme = if req.headers().get("x-forwarded-proto")
+    let scheme = if req
+        .headers()
+        .get("x-forwarded-proto")
         .and_then(|h| h.to_str().ok())
-        .map_or(false, |s| s == "https") {
+        == Some("https")
+    {
         "https"
     } else {
         "http"
@@ -193,10 +197,7 @@ fn extract_session_from_cookies(
     Ok(None)
 }
 
-pub fn extract_visitor_id_cookie(
-    req: &Request,
-    crypto: &CookieCrypto,
-) -> Option<String> {
+pub fn extract_visitor_id_cookie(req: &Request, crypto: &CookieCrypto) -> Option<String> {
     let headers = req.headers();
 
     for cookie_header in headers.get_all("Cookie") {
@@ -220,10 +221,7 @@ pub fn extract_visitor_id_cookie(
     None
 }
 
-pub fn extract_session_id_cookie(
-    req: &Request,
-    crypto: &CookieCrypto,
-) -> Option<String> {
+pub fn extract_session_id_cookie(req: &Request, crypto: &CookieCrypto) -> Option<String> {
     let headers = req.headers();
 
     for cookie_header in headers.get_all("Cookie") {

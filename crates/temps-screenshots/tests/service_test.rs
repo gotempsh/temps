@@ -1,9 +1,7 @@
 //! Service-level integration tests
 
 use std::sync::Arc;
-use temps_screenshots::{
-    LocalScreenshotProvider, ScreenshotError, ScreenshotProvider,
-};
+use temps_screenshots::{LocalScreenshotProvider, ScreenshotError, ScreenshotProvider};
 
 /// Mock provider for testing without actual browser/network calls
 struct MockScreenshotProvider {
@@ -31,9 +29,7 @@ impl ScreenshotProvider for MockScreenshotProvider {
         self.captured_urls.lock().await.push(url.to_string());
 
         if self.should_fail {
-            return Err(ScreenshotError::CaptureFailed(
-                "Mock failure".to_string(),
-            ));
+            return Err(ScreenshotError::CaptureFailed("Mock failure".to_string()));
         }
 
         // Return a minimal PNG header
@@ -54,7 +50,9 @@ impl ScreenshotProvider for MockScreenshotProvider {
 async fn test_mock_provider_capture() {
     let mock_provider = MockScreenshotProvider::new(false);
 
-    let result = mock_provider.capture_screenshot("https://example.com").await;
+    let result = mock_provider
+        .capture_screenshot("https://example.com")
+        .await;
     assert!(result.is_ok());
 
     let image_bytes = result.unwrap();
@@ -70,7 +68,9 @@ async fn test_mock_provider_capture() {
 async fn test_mock_provider_failure() {
     let mock_provider = MockScreenshotProvider::new(true); // Will fail
 
-    let result = mock_provider.capture_screenshot("https://example.com").await;
+    let result = mock_provider
+        .capture_screenshot("https://example.com")
+        .await;
     assert!(result.is_err());
 
     match result.unwrap_err() {
@@ -127,9 +127,7 @@ async fn test_mock_provider_concurrent_captures() {
     for i in 0..5 {
         let provider_clone = mock_provider.clone();
         let url = format!("https://example-{}.com", i);
-        let handle = tokio::spawn(async move {
-            provider_clone.capture_screenshot(&url).await
-        });
+        let handle = tokio::spawn(async move { provider_clone.capture_screenshot(&url).await });
         handles.push(handle);
     }
 
@@ -149,12 +147,7 @@ async fn test_local_provider_invalid_urls() {
     let provider = LocalScreenshotProvider::new();
 
     // Test various invalid URLs
-    let invalid_urls = vec![
-        "",
-        "not-a-url",
-        "ftp://invalid",
-        "javascript:alert(1)",
-    ];
+    let invalid_urls = vec!["", "not-a-url", "ftp://invalid", "javascript:alert(1)"];
 
     for url in invalid_urls {
         let result = provider.capture_screenshot(url).await;

@@ -1,37 +1,37 @@
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use temps_core::UtcDateTime;
-use std::sync::Arc;
-use thiserror::Error;
 use sea_orm::DatabaseConnection;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use temps_core::UtcDateTime;
+use thiserror::Error;
 use utoipa::ToSchema;
 
 #[derive(Error, Debug)]
 pub enum GitProviderError {
     #[error("Database error: {0}")]
     DatabaseError(#[from] sea_orm::DbErr),
-    
+
     #[error("Provider not found: {0}")]
     ProviderNotFound(String),
-    
+
     #[error("Connection not found: {0}")]
     ConnectionNotFound(String),
-    
+
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
-    
+
     #[error("API error: {0}")]
     ApiError(String),
-    
+
     #[error("Not implemented for this provider")]
     NotImplemented,
-    
+
     #[error("Invalid configuration: {0}")]
     InvalidConfiguration(String),
-    
+
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
-    
+
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -59,7 +59,7 @@ impl ToString for GitProviderType {
 
 impl TryFrom<&str> for GitProviderType {
     type Error = GitProviderError;
-    
+
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value.to_lowercase().as_str() {
             "github" => Ok(GitProviderType::GitHub),
@@ -67,7 +67,10 @@ impl TryFrom<&str> for GitProviderType {
             "bitbucket" => Ok(GitProviderType::Bitbucket),
             "gitea" => Ok(GitProviderType::Gitea),
             "generic" => Ok(GitProviderType::Generic),
-            _ => Err(GitProviderError::InvalidConfiguration(format!("Unknown provider type: {}", value))),
+            _ => Err(GitProviderError::InvalidConfiguration(format!(
+                "Unknown provider type: {}",
+                value
+            ))),
         }
     }
 }
@@ -113,16 +116,16 @@ impl<'de> Deserialize<'de> for AuthMethod {
     {
         use serde::de::{self, MapAccess, Visitor};
         use serde_json::Value;
-        
+
         struct AuthMethodVisitor;
-        
+
         impl<'de> Visitor<'de> for AuthMethodVisitor {
             type Value = AuthMethod;
-            
+
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
                 formatter.write_str("AuthMethod in either tagged or untagged format")
             }
-            
+
             fn visit_map<V>(self, mut map: V) -> Result<AuthMethod, V::Error>
             where
                 V: MapAccess<'de>,
@@ -133,13 +136,15 @@ impl<'de> Deserialize<'de> for AuthMethod {
                     json_map.insert(key, value);
                 }
                 let json_value = Value::Object(json_map);
-                
+
                 // Check if it's in tagged format (has a single key that's the variant name)
                 if let Value::Object(ref obj) = json_value {
                     // Check for tagged format - single key that matches a variant name
                     if obj.len() == 1 || (obj.len() == 2 && obj.contains_key("ping_received_at")) {
                         if let Some(inner) = obj.get("GitHubApp") {
-                            if let Ok(github_app) = serde_json::from_value::<GitHubAppFields>(inner.clone()) {
+                            if let Ok(github_app) =
+                                serde_json::from_value::<GitHubAppFields>(inner.clone())
+                            {
                                 return Ok(AuthMethod::GitHubApp {
                                     app_id: github_app.app_id,
                                     client_id: github_app.client_id,
@@ -150,7 +155,9 @@ impl<'de> Deserialize<'de> for AuthMethod {
                             }
                         }
                         if let Some(inner) = obj.get("GitLabApp") {
-                            if let Ok(gitlab_app) = serde_json::from_value::<GitLabAppFields>(inner.clone()) {
+                            if let Ok(gitlab_app) =
+                                serde_json::from_value::<GitLabAppFields>(inner.clone())
+                            {
                                 return Ok(AuthMethod::GitLabApp {
                                     app_id: gitlab_app.app_id,
                                     app_secret: gitlab_app.app_secret,
@@ -159,7 +166,8 @@ impl<'de> Deserialize<'de> for AuthMethod {
                             }
                         }
                         if let Some(inner) = obj.get("OAuth") {
-                            if let Ok(oauth) = serde_json::from_value::<OAuthFields>(inner.clone()) {
+                            if let Ok(oauth) = serde_json::from_value::<OAuthFields>(inner.clone())
+                            {
                                 return Ok(AuthMethod::OAuth {
                                     client_id: oauth.client_id,
                                     client_secret: oauth.client_secret,
@@ -168,14 +176,16 @@ impl<'de> Deserialize<'de> for AuthMethod {
                             }
                         }
                         if let Some(inner) = obj.get("PersonalAccessToken") {
-                            if let Ok(pat) = serde_json::from_value::<PersonalAccessTokenFields>(inner.clone()) {
-                                return Ok(AuthMethod::PersonalAccessToken {
-                                    token: pat.token,
-                                });
+                            if let Ok(pat) =
+                                serde_json::from_value::<PersonalAccessTokenFields>(inner.clone())
+                            {
+                                return Ok(AuthMethod::PersonalAccessToken { token: pat.token });
                             }
                         }
                         if let Some(inner) = obj.get("BasicAuth") {
-                            if let Ok(basic) = serde_json::from_value::<BasicAuthFields>(inner.clone()) {
+                            if let Ok(basic) =
+                                serde_json::from_value::<BasicAuthFields>(inner.clone())
+                            {
                                 return Ok(AuthMethod::BasicAuth {
                                     username: basic.username,
                                     password: basic.password,
@@ -191,10 +201,12 @@ impl<'de> Deserialize<'de> for AuthMethod {
                             }
                         }
                     }
-                    
+
                     // Try untagged format - fields directly in the object
                     // Try each variant in order
-                    if let Ok(github_app) = serde_json::from_value::<GitHubAppFields>(json_value.clone()) {
+                    if let Ok(github_app) =
+                        serde_json::from_value::<GitHubAppFields>(json_value.clone())
+                    {
                         return Ok(AuthMethod::GitHubApp {
                             app_id: github_app.app_id,
                             client_id: github_app.client_id,
@@ -203,7 +215,9 @@ impl<'de> Deserialize<'de> for AuthMethod {
                             webhook_secret: github_app.webhook_secret,
                         });
                     }
-                    if let Ok(gitlab_app) = serde_json::from_value::<GitLabAppFields>(json_value.clone()) {
+                    if let Ok(gitlab_app) =
+                        serde_json::from_value::<GitLabAppFields>(json_value.clone())
+                    {
                         return Ok(AuthMethod::GitLabApp {
                             app_id: gitlab_app.app_id,
                             app_secret: gitlab_app.app_secret,
@@ -217,12 +231,13 @@ impl<'de> Deserialize<'de> for AuthMethod {
                             redirect_uri: oauth.redirect_uri,
                         });
                     }
-                    if let Ok(pat) = serde_json::from_value::<PersonalAccessTokenFields>(json_value.clone()) {
-                        return Ok(AuthMethod::PersonalAccessToken {
-                            token: pat.token,
-                        });
+                    if let Ok(pat) =
+                        serde_json::from_value::<PersonalAccessTokenFields>(json_value.clone())
+                    {
+                        return Ok(AuthMethod::PersonalAccessToken { token: pat.token });
                     }
-                    if let Ok(basic) = serde_json::from_value::<BasicAuthFields>(json_value.clone()) {
+                    if let Ok(basic) = serde_json::from_value::<BasicAuthFields>(json_value.clone())
+                    {
                         return Ok(AuthMethod::BasicAuth {
                             username: basic.username,
                             password: basic.password,
@@ -235,11 +250,13 @@ impl<'de> Deserialize<'de> for AuthMethod {
                         });
                     }
                 }
-                
-                Err(de::Error::custom("data did not match any variant of AuthMethod"))
+
+                Err(de::Error::custom(
+                    "data did not match any variant of AuthMethod",
+                ))
             }
         }
-        
+
         deserializer.deserialize_map(AuthMethodVisitor)
     }
 }
@@ -379,7 +396,7 @@ pub trait GitProviderService: Send + Sync {
         access_token: &str,
         organization: Option<&str>,
     ) -> Result<Vec<Repository>, GitProviderError>;
-    
+
     /// Get a specific repository
     async fn get_repository(
         &self,
@@ -387,7 +404,7 @@ pub trait GitProviderService: Send + Sync {
         owner: &str,
         repo: &str,
     ) -> Result<Repository, GitProviderError>;
-    
+
     /// List branches for a repository
     async fn list_branches(
         &self,
@@ -395,7 +412,7 @@ pub trait GitProviderService: Send + Sync {
         owner: &str,
         repo: &str,
     ) -> Result<Vec<Branch>, GitProviderError>;
-    
+
     /// List tags for a repository
     async fn list_tags(
         &self,
@@ -403,7 +420,7 @@ pub trait GitProviderService: Send + Sync {
         owner: &str,
         repo: &str,
     ) -> Result<Vec<GitProviderTag>, GitProviderError>;
-    
+
     /// Get file content from repository
     async fn get_file_content(
         &self,
@@ -413,7 +430,7 @@ pub trait GitProviderService: Send + Sync {
         path: &str,
         branch: Option<&str>,
     ) -> Result<FileContent, GitProviderError>;
-    
+
     /// Get latest commit for a branch
     async fn get_latest_commit(
         &self,
@@ -422,7 +439,7 @@ pub trait GitProviderService: Send + Sync {
         repo: &str,
         branch: &str,
     ) -> Result<Commit, GitProviderError>;
-    
+
     /// Get a specific commit by SHA or reference (branch/tag)
     async fn get_commit(
         &self,
@@ -431,7 +448,7 @@ pub trait GitProviderService: Send + Sync {
         repo: &str,
         reference: &str, // Can be commit SHA, branch name, or tag name
     ) -> Result<Commit, GitProviderError>;
-    
+
     /// Check if a commit exists in the repository
     async fn check_commit_exists(
         &self,
@@ -440,7 +457,7 @@ pub trait GitProviderService: Send + Sync {
         repo: &str,
         commit_sha: &str,
     ) -> Result<bool, GitProviderError>;
-    
+
     /// Create a webhook for repository
     async fn create_webhook(
         &self,
@@ -449,7 +466,7 @@ pub trait GitProviderService: Send + Sync {
         repo: &str,
         config: WebhookConfig,
     ) -> Result<String, GitProviderError>;
-    
+
     /// Delete a webhook
     async fn delete_webhook(
         &self,
@@ -458,7 +475,7 @@ pub trait GitProviderService: Send + Sync {
         repo: &str,
         webhook_id: &str,
     ) -> Result<(), GitProviderError>;
-    
+
     /// Verify webhook signature
     async fn verify_webhook_signature(
         &self,
@@ -466,20 +483,17 @@ pub trait GitProviderService: Send + Sync {
         signature: &str,
         secret: &str,
     ) -> Result<bool, GitProviderError>;
-    
+
     /// Get authenticated user information
-    async fn get_user(
-        &self,
-        access_token: &str,
-    ) -> Result<User, GitProviderError>;
-    
+    async fn get_user(&self, access_token: &str) -> Result<User, GitProviderError>;
+
     /// Check if a repository is accessible (for public repos without auth)
     async fn check_repository_accessible(
         &self,
         owner: &str,
         repo: &str,
     ) -> Result<bool, GitProviderError>;
-    
+
     /// Clone repository using git command (for non-API access)
     async fn clone_repository(
         &self,
@@ -487,7 +501,7 @@ pub trait GitProviderService: Send + Sync {
         target_dir: &str,
         access_token: Option<&str>,
     ) -> Result<(), GitProviderError>;
-    
+
     /// Download repository archive (tarball/zip) for a specific ref (branch, tag, or commit)
     async fn download_archive(
         &self,
@@ -623,21 +637,21 @@ pub trait GitProviderRepositoryService: Send + Sync {
         access_token: &str,
         params: RepositoryListParams,
     ) -> Result<Vec<GitProviderRepository>, GitProviderError>;
-    
+
     async fn get_repository(
         &self,
         access_token: &str,
         owner: &str,
         repo: &str,
     ) -> Result<GitProviderRepository, GitProviderError>;
-    
+
     async fn list_branches(
         &self,
         access_token: &str,
         owner: &str,
         repo: &str,
     ) -> Result<Vec<GitProviderBranch>, GitProviderError>;
-    
+
     async fn list_tags(
         &self,
         access_token: &str,

@@ -1,13 +1,16 @@
 #[cfg(test)]
-use std::sync::Arc;
-#[cfg(test)]
-use sea_orm::{DatabaseConnection, Set, ActiveModelTrait, EntityTrait, QueryFilter, ColumnTrait, PaginatorTrait};
-#[cfg(test)]
-use temps_entities::{events, visitor, ip_geolocations};
-#[cfg(test)]
-use crate::{AnalyticsService, Analytics};
+use crate::{Analytics, AnalyticsService};
 #[cfg(test)]
 use rand;
+#[cfg(test)]
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    Set,
+};
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use temps_entities::{events, ip_geolocations, visitor};
 
 /// Test helper for comprehensive analytics event testing
 #[cfg(test)]
@@ -30,7 +33,9 @@ impl AnalyticsTestHelper {
     pub async fn new_with_name(_test_name: &str) -> anyhow::Result<Self> {
         let test_database = temps_database::test_utils::TestDatabase::with_migrations().await?;
         let db = test_database.db.clone();
-        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password("test_password"));
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "test_password",
+        ));
         let service = AnalyticsService::new(db.clone(), encryption_service);
 
         Ok(Self {
@@ -46,7 +51,7 @@ impl AnalyticsTestHelper {
         self.cleanup().await?;
 
         // Create required parent records first
-        use temps_entities::{projects, environments, deployments};
+        use temps_entities::{deployments, environments, projects};
 
         // Insert test project
         let test_project = projects::ActiveModel {
@@ -76,14 +81,26 @@ impl AnalyticsTestHelper {
         let _ = test_deployment.insert(self.db.as_ref()).await; // Ignore if exists
 
         // Create test visitors
-        let visitor1 = self.create_visitor("visitor_1", 1, "2024-01-01 10:00:00").await?;
-        let visitor2 = self.create_visitor("visitor_2", 1, "2024-01-01 11:00:00").await?;
-        let visitor3 = self.create_visitor("visitor_3", 1, "2024-01-01 12:00:00").await?;
+        let visitor1 = self
+            .create_visitor("visitor_1", 1, "2024-01-01 10:00:00")
+            .await?;
+        let visitor2 = self
+            .create_visitor("visitor_2", 1, "2024-01-01 11:00:00")
+            .await?;
+        let visitor3 = self
+            .create_visitor("visitor_3", 1, "2024-01-01 12:00:00")
+            .await?;
 
         // Create test geolocations
-        let geo_us = self.create_geolocation("US", "California", "San Francisco", 37.7749, -122.4194).await?;
-        let geo_uk = self.create_geolocation("GB", "England", "London", 51.5074, -0.1278).await?;
-        let geo_ca = self.create_geolocation("CA", "Ontario", "Toronto", 43.6532, -79.3832).await?;
+        let geo_us = self
+            .create_geolocation("US", "California", "San Francisco", 37.7749, -122.4194)
+            .await?;
+        let geo_uk = self
+            .create_geolocation("GB", "England", "London", 51.5074, -0.1278)
+            .await?;
+        let geo_ca = self
+            .create_geolocation("CA", "Ontario", "Toronto", 43.6532, -79.3832)
+            .await?;
 
         // Create comprehensive event dataset
         let events = vec![
@@ -199,7 +216,8 @@ impl AnalyticsTestHelper {
 
     /// Store a single analytics event
     async fn store_event(&self, event: TestEvent) -> anyhow::Result<events::Model> {
-        let timestamp = chrono::DateTime::parse_from_rfc3339(event.timestamp)?.with_timezone(&chrono::Utc);
+        let timestamp =
+            chrono::DateTime::parse_from_rfc3339(event.timestamp)?.with_timezone(&chrono::Utc);
 
         let new_event = events::ActiveModel {
             visitor_id: Set(Some(event.visitor_id)),
@@ -215,9 +233,9 @@ impl AnalyticsTestHelper {
             time_on_page: Set(event.time_on_page),
             is_crawler: Set(event.is_crawler),
             environment_id: Set(Some(1)),
-            deployment_id: Set(Some(1)), // Add deployment_id
+            deployment_id: Set(Some(1)),              // Add deployment_id
             hostname: Set("example.com".to_string()), // Add hostname
-            pathname: Set(event.page_path.clone()), // Add pathname (same as page_path)
+            pathname: Set(event.page_path.clone()),   // Add pathname (same as page_path)
             href: Set(format!("https://example.com{}", event.page_path)), // Add href
             ..Default::default()
         };
@@ -226,8 +244,14 @@ impl AnalyticsTestHelper {
     }
 
     /// Create a test visitor
-    async fn create_visitor(&self, visitor_id: &str, project_id: i32, first_seen: &str) -> anyhow::Result<visitor::Model> {
-        let first_seen_dt = chrono::DateTime::parse_from_rfc3339(first_seen)?.with_timezone(&chrono::Utc);
+    async fn create_visitor(
+        &self,
+        visitor_id: &str,
+        project_id: i32,
+        first_seen: &str,
+    ) -> anyhow::Result<visitor::Model> {
+        let first_seen_dt =
+            chrono::DateTime::parse_from_rfc3339(first_seen)?.with_timezone(&chrono::Utc);
         // Set last_seen to first_seen + 1 hour as a reasonable default
         let last_seen_dt = first_seen_dt + chrono::Duration::hours(1);
 
@@ -245,7 +269,14 @@ impl AnalyticsTestHelper {
     }
 
     /// Create a test geolocation
-    async fn create_geolocation(&self, country: &str, region: &str, city: &str, lat: f64, lon: f64) -> anyhow::Result<ip_geolocations::Model> {
+    async fn create_geolocation(
+        &self,
+        country: &str,
+        region: &str,
+        city: &str,
+        lat: f64,
+        lon: f64,
+    ) -> anyhow::Result<ip_geolocations::Model> {
         let new_geo = ip_geolocations::ActiveModel {
             ip_address: Set(format!("192.168.1.{}", rand::random::<u8>())), // Generate unique IP for testing
             country: Set(country.to_string()),
@@ -261,7 +292,10 @@ impl AnalyticsTestHelper {
     }
 
     /// Verify analytics data by running various queries and checking results
-    pub async fn verify_analytics_data(&self, dataset: &TestDataSet) -> anyhow::Result<VerificationResults> {
+    pub async fn verify_analytics_data(
+        &self,
+        dataset: &TestDataSet,
+    ) -> anyhow::Result<VerificationResults> {
         let mut results = VerificationResults::default();
 
         // Test top pages (only currently implemented analytics query in test helpers)
@@ -280,7 +314,10 @@ impl AnalyticsTestHelper {
     }
 
     /// Verify data integrity by checking counts and relationships
-    async fn verify_data_integrity(&self, dataset: &TestDataSet) -> anyhow::Result<DataIntegrityChecks> {
+    async fn verify_data_integrity(
+        &self,
+        dataset: &TestDataSet,
+    ) -> anyhow::Result<DataIntegrityChecks> {
         let mut checks = DataIntegrityChecks::default();
 
         // Check event count
@@ -296,7 +333,9 @@ impl AnalyticsTestHelper {
         checks.visitor_count_matches = total_visitors as usize == dataset.visitors.len();
 
         // Check geolocation count
-        let total_geos = ip_geolocations::Entity::find().count(self.db.as_ref()).await?;
+        let total_geos = ip_geolocations::Entity::find()
+            .count(self.db.as_ref())
+            .await?;
         checks.total_geolocations = total_geos as usize;
         checks.expected_geolocations = dataset.geolocations.len();
         checks.geolocation_count_matches = total_geos as usize == dataset.geolocations.len();
@@ -304,12 +343,14 @@ impl AnalyticsTestHelper {
         // Check for crawlers vs real users
         let crawler_events = events::Entity::find()
             .filter(events::Column::IsCrawler.eq(true))
-            .count(self.db.as_ref()).await?;
+            .count(self.db.as_ref())
+            .await?;
         checks.crawler_events = crawler_events as usize;
 
         let user_events = events::Entity::find()
             .filter(events::Column::IsCrawler.eq(false))
-            .count(self.db.as_ref()).await?;
+            .count(self.db.as_ref())
+            .await?;
         checks.user_events = user_events as usize;
 
         Ok(checks)
@@ -405,17 +446,37 @@ impl VerificationResults {
 
 🎯 Overall Status: {}
             "#,
-            self.has_top_pages, self.top_pages_count,
+            self.has_top_pages,
+            self.top_pages_count,
             self.has_analytics_events,
-            self.data_integrity_checks.total_events, self.data_integrity_checks.expected_events,
-            if self.data_integrity_checks.event_count_matches { "✅" } else { "❌" },
-            self.data_integrity_checks.total_visitors, self.data_integrity_checks.expected_visitors,
-            if self.data_integrity_checks.visitor_count_matches { "✅" } else { "❌" },
-            self.data_integrity_checks.total_geolocations, self.data_integrity_checks.expected_geolocations,
-            if self.data_integrity_checks.geolocation_count_matches { "✅" } else { "❌" },
+            self.data_integrity_checks.total_events,
+            self.data_integrity_checks.expected_events,
+            if self.data_integrity_checks.event_count_matches {
+                "✅"
+            } else {
+                "❌"
+            },
+            self.data_integrity_checks.total_visitors,
+            self.data_integrity_checks.expected_visitors,
+            if self.data_integrity_checks.visitor_count_matches {
+                "✅"
+            } else {
+                "❌"
+            },
+            self.data_integrity_checks.total_geolocations,
+            self.data_integrity_checks.expected_geolocations,
+            if self.data_integrity_checks.geolocation_count_matches {
+                "✅"
+            } else {
+                "❌"
+            },
             self.data_integrity_checks.crawler_events,
             self.data_integrity_checks.user_events,
-            if self.all_passed() { "🎉 ALL TESTS PASSED" } else { "⚠️ SOME TESTS FAILED" }
+            if self.all_passed() {
+                "🎉 ALL TESTS PASSED"
+            } else {
+                "⚠️ SOME TESTS FAILED"
+            }
         )
     }
 }

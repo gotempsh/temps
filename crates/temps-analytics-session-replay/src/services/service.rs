@@ -1,20 +1,20 @@
+use super::user_agent::BrowserInfo;
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Utc};
 use flate2::read::ZlibDecoder;
-use temps_core::UtcDateTime;
-use tracing::{debug, error, info};
-use sea_orm::{
-    ActiveModelTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
-    ColumnTrait, QuerySelect, FromQueryResult,
-};
 use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::Read;
 use std::sync::Arc;
+use temps_core::UtcDateTime;
 use thiserror::Error;
-use super::user_agent::BrowserInfo;
+use tracing::{debug, error, info};
 
 use temps_entities::{session_replay_events, session_replay_sessions, visitor};
 
@@ -22,25 +22,25 @@ use temps_entities::{session_replay_events, session_replay_sessions, visitor};
 pub enum SessionReplayError {
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
-    
+
     #[error("Visitor not found: {0}")]
     VisitorNotFound(String),
-    
+
     #[error("Session not found: {0}")]
     SessionNotFound(String),
-    
+
     #[error("Invalid packed data: {0}")]
     InvalidPackedData(String),
-    
+
     #[error("Decompression error: {0}")]
     DecompressionError(String),
-    
+
     #[error("JSON parsing error: {0}")]
     JsonError(#[from] serde_json::Error),
-    
+
     #[error("Base64 decode error: {0}")]
     Base64Error(#[from] base64::DecodeError),
-    
+
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 }
@@ -244,46 +244,51 @@ impl SessionReplayService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self { db }
     }
-    
+
     /// Initialize a new session replay with metadata only
     /// This creates the session record without any events
     pub async fn initialize_session(
         &self,
         session_id: &str,
         metadata: SessionMetadata,
-		project_id: i32,
-		environment_id: Option<i32>,
+        project_id: i32,
+        environment_id: Option<i32>,
         deployment_id: Option<i32>,
     ) -> Result<String, SessionReplayError> {
         info!("Initializing session: {} with metadata", session_id);
-        
+
         // Look up visitor by visitor_id GUID
         let visitor = visitor::Entity::find()
             .filter(visitor::Column::VisitorId.eq(&metadata.visitor_id))
             .one(self.db.as_ref())
             .await?;
-            
+
         let visitor = match visitor {
             Some(v) => v,
             None => {
-                return Err(SessionReplayError::VisitorNotFound(metadata.visitor_id.clone()));
+                return Err(SessionReplayError::VisitorNotFound(
+                    metadata.visitor_id.clone(),
+                ));
             }
         };
-        
+
         let visitor_id_int = visitor.id;
         // Parse timestamp
         let created_at = DateTime::parse_from_rfc3339(&metadata.timestamp)
             .map(|dt| dt.with_timezone(&Utc))
             .ok();
-        
+
         // Check if session already exists by session_replay_id
         let existing = session_replay_sessions::Entity::find()
             .filter(session_replay_sessions::Column::SessionReplayId.eq(session_id))
             .one(self.db.as_ref())
             .await?;
-            
+
         if existing.is_some() {
-            info!("Session {} already exists, skipping initialization", session_id);
+            info!(
+                "Session {} already exists, skipping initialization",
+                session_id
+            );
             return Ok(session_id.to_string());
         }
 
@@ -298,7 +303,7 @@ impl SessionReplayService {
             project_id: Set(project_id),
             environment_id: Set(environment_id.unwrap_or(0)),
             deployment_id: Set(deployment_id.unwrap_or(0)),
-            created_at: Set(created_at.map(|dt| dt)),
+            created_at: Set(created_at),
             user_agent: Set(Some(metadata.user_agent)),
             browser: Set(browser_info.browser),
             browser_version: Set(browser_info.browser_version),
@@ -318,10 +323,10 @@ impl SessionReplayService {
 
         session_model.insert(self.db.as_ref()).await?;
         info!("Session {} initialized successfully", session_id);
-        
+
         Ok(session_id.to_string())
     }
-    
+
     /// Add events to an existing session (events are already base64 encoded and compressed)
     pub async fn add_session_events(
         &self,
@@ -329,7 +334,7 @@ impl SessionReplayService {
         events_base64: &str,
     ) -> Result<usize, SessionReplayError> {
         info!("Adding events to session: {}", session_id);
-        
+
         // Verify session exists by session_replay_id
         let session = session_replay_sessions::Entity::find()
             .filter(session_replay_sessions::Column::SessionReplayId.eq(session_id))
@@ -337,37 +342,32 @@ impl SessionReplayService {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| SessionReplayError::SessionNotFound(session_id.to_string()))?;
-            
+
         // Decode and decompress events
         let compressed = STANDARD.decode(events_base64)?;
         let mut decoder = ZlibDecoder::new(&compressed[..]);
         let mut decompressed = String::new();
-        decoder.read_to_string(&mut decompressed)
-            .map_err(|e| SessionReplayError::DecompressionError(
-                format!("Failed to decompress events: {}", e)
-            ))?;
+        decoder.read_to_string(&mut decompressed).map_err(|e| {
+            SessionReplayError::DecompressionError(format!("Failed to decompress events: {}", e))
+        })?;
 
         let events: Value = serde_json::from_str(&decompressed)?;
-        
+
         let mut event_count = 0;
         let mut min_timestamp: Option<i64> = None;
         let mut max_timestamp: Option<i64> = None;
-        
+
         // Extract events handling both formats
         let events_to_store = self.extract_events_from_json(&events)?;
-        
+
         for event in &events_to_store {
-            let timestamp = event.get("timestamp")
-                .and_then(|t| t.as_i64())
-                .unwrap_or(0);
-                
+            let timestamp = event.get("timestamp").and_then(|t| t.as_i64()).unwrap_or(0);
+
             // Track min/max timestamps for duration calculation
             min_timestamp = Some(min_timestamp.map_or(timestamp, |min| min.min(timestamp)));
             max_timestamp = Some(max_timestamp.map_or(timestamp, |max| max.max(timestamp)));
-            
-            let event_type = event.get("type")
-                .and_then(|t| t.as_i64())
-                .map(|t| t as i32);
+
+            let event_type = event.get("type").and_then(|t| t.as_i64()).map(|t| t as i32);
 
             let event_model = session_replay_events::ActiveModel {
                 id: sea_orm::NotSet,
@@ -381,20 +381,21 @@ impl SessionReplayService {
             event_model.insert(self.db.as_ref()).await?;
             event_count += 1;
         }
-        
+
         // Update session duration if we have timestamps
         if let (Some(min), Some(max)) = (min_timestamp, max_timestamp) {
             let duration_ms = (max - min) as i32;
-            
+
             // Get current duration if exists
             let current_duration = session.duration.unwrap_or(0);
             let new_duration = current_duration.max(duration_ms);
-            
+
             if new_duration > current_duration {
-                self.update_session_duration(session_id, new_duration).await?;
+                self.update_session_duration(session_id, new_duration)
+                    .await?;
             }
         }
-        
+
         info!("Added {} events to session {}", event_count, session_id);
         Ok(event_count)
     }
@@ -405,28 +406,33 @@ impl SessionReplayService {
         packed_data: PackedEvents,
         deployment_id: i32,
     ) -> Result<String, SessionReplayError> {
-        info!("Storing packed session replay for session: {}", packed_data.session_id);
+        info!(
+            "Storing packed session replay for session: {}",
+            packed_data.session_id
+        );
 
         // Look up visitor by visitor_id GUID
         let visitor = visitor::Entity::find()
             .filter(visitor::Column::VisitorId.eq(&packed_data.metadata.visitor_id))
             .one(self.db.as_ref())
             .await?;
-            
+
         let visitor = match visitor {
             Some(v) => v,
             None => {
-                return Err(SessionReplayError::VisitorNotFound(packed_data.metadata.visitor_id.clone()));
+                return Err(SessionReplayError::VisitorNotFound(
+                    packed_data.metadata.visitor_id.clone(),
+                ));
             }
         };
-        
+
         let visitor_id_int = visitor.id;
         let project_id = visitor.project_id;
         let environment_id = visitor.environment_id;
 
         // Unpack the events
         let unpacked = self.unpack_events(&packed_data)?;
-        
+
         // Parse timestamp
         let created_at = DateTime::parse_from_rfc3339(&packed_data.metadata.timestamp)
             .map(|dt| dt.with_timezone(&Utc))
@@ -443,7 +449,7 @@ impl SessionReplayService {
             project_id: Set(project_id),
             environment_id: Set(environment_id),
             deployment_id: Set(deployment_id),
-            created_at: Set(created_at.map(|dt| dt)),
+            created_at: Set(created_at),
             user_agent: Set(Some(packed_data.metadata.user_agent)),
             browser: Set(browser_info.browser),
             browser_version: Set(browser_info.browser_version),
@@ -466,24 +472,22 @@ impl SessionReplayService {
         // Store events - handle both array and object formats
         let events_to_store = self.extract_events_from_json(&unpacked.events)?;
         let event_count = events_to_store.len();
-        
+
         for event in events_to_store {
-            let timestamp = event.get("timestamp")
-                .and_then(|t| t.as_i64())
-                .unwrap_or(0);
-            
-            let event_type = event.get("type")
-                .and_then(|t| t.as_i64())
-                .map(|t| t as i32);
+            let timestamp = event.get("timestamp").and_then(|t| t.as_i64()).unwrap_or(0);
+
+            let event_type = event.get("type").and_then(|t| t.as_i64()).map(|t| t as i32);
 
             // Need to get the session's integer ID first
             let session_int_id = session_replay_sessions::Entity::find()
-                .filter(session_replay_sessions::Column::SessionReplayId.eq(&packed_data.session_id))
+                .filter(
+                    session_replay_sessions::Column::SessionReplayId.eq(&packed_data.session_id),
+                )
                 .one(self.db.as_ref())
                 .await?
                 .map(|s| s.id)
                 .unwrap_or(0); // This should exist since we just created it
-            
+
             let event_model = session_replay_events::ActiveModel {
                 id: sea_orm::NotSet,
                 session_id: Set(session_int_id),
@@ -496,7 +500,10 @@ impl SessionReplayService {
             event_model.insert(self.db.as_ref()).await?;
         }
 
-        info!("Stored {} events for session {}", event_count, packed_data.session_id);
+        info!(
+            "Stored {} events for session {}",
+            event_count, packed_data.session_id
+        );
 
         Ok(packed_data.session_id)
     }
@@ -510,7 +517,10 @@ impl SessionReplayService {
         metadata: Option<SessionMetadata>,
         deployment_id: i32,
     ) -> Result<String, SessionReplayError> {
-        info!("Store or update session replay for session: {}, visitor: {}", session_id, visitor_id);
+        info!(
+            "Store or update session replay for session: {}, visitor: {}",
+            session_id, visitor_id
+        );
 
         // Check if session exists by session_replay_id
         let existing_session = session_replay_sessions::Entity::find()
@@ -525,10 +535,10 @@ impl SessionReplayService {
                 .one(self.db.as_ref())
                 .await?
                 .ok_or_else(|| SessionReplayError::VisitorNotFound(visitor_id.to_string()))?;
-            
+
             let project_id = visitor.project_id;
             let environment_id = visitor.environment_id;
-            
+
             // Parse user agent if available
             let browser_info = if let Some(meta) = metadata.as_ref() {
                 BrowserInfo::from_user_agent(Some(&meta.user_agent))
@@ -552,10 +562,10 @@ impl SessionReplayService {
                 operating_system: Set(browser_info.operating_system),
                 operating_system_version: Set(browser_info.operating_system_version),
                 device_type: Set(browser_info.device_type),
-                viewport_width: Set(metadata.as_ref().and_then(|m| Some(m.viewport.width as i32))),
-                viewport_height: Set(metadata.as_ref().and_then(|m| Some(m.viewport.height as i32))),
-                screen_width: Set(metadata.as_ref().and_then(|m| Some(m.screen.width as i32))),
-                screen_height: Set(metadata.as_ref().and_then(|m| Some(m.screen.height as i32))),
+                viewport_width: Set(metadata.as_ref().map(|m| m.viewport.width as i32)),
+                viewport_height: Set(metadata.as_ref().map(|m| m.viewport.height as i32)),
+                screen_width: Set(metadata.as_ref().map(|m| m.screen.width as i32)),
+                screen_height: Set(metadata.as_ref().map(|m| m.screen.height as i32)),
                 language: Set(metadata.as_ref().map(|m| m.language.clone())),
                 timezone: Set(metadata.as_ref().map(|m| m.timezone.clone())),
                 url: Set(metadata.as_ref().map(|m| m.url.clone())),
@@ -592,28 +602,24 @@ impl SessionReplayService {
                 }
             }),
         };
-        
+
         let unpacked = self.unpack_events(&packed_events)?;
-        
+
         // Extract events handling both formats
         let events_to_store = self.extract_events_from_json(&unpacked.events)?;
-        
+
         if !events_to_store.is_empty() {
             let mut min_timestamp: Option<i64> = None;
             let mut max_timestamp: Option<i64> = None;
 
             for event in &events_to_store {
-                let timestamp = event.get("timestamp")
-                    .and_then(|t| t.as_i64())
-                    .unwrap_or(0);
+                let timestamp = event.get("timestamp").and_then(|t| t.as_i64()).unwrap_or(0);
 
                 // Track min/max timestamps for duration calculation
                 min_timestamp = Some(min_timestamp.map_or(timestamp, |min| min.min(timestamp)));
                 max_timestamp = Some(max_timestamp.map_or(timestamp, |max| max.max(timestamp)));
 
-                let event_type = event.get("type")
-                    .and_then(|t| t.as_i64())
-                    .map(|t| t as i32);
+                let event_type = event.get("type").and_then(|t| t.as_i64()).map(|t| t as i32);
 
                 // Get the session's integer ID
                 let session_int_id = session_replay_sessions::Entity::find()
@@ -622,7 +628,7 @@ impl SessionReplayService {
                     .await?
                     .map(|s| s.id)
                     .unwrap_or(0); // This should exist
-                
+
                 let event_model = session_replay_events::ActiveModel {
                     id: sea_orm::NotSet,
                     session_id: Set(session_int_id),
@@ -638,10 +644,15 @@ impl SessionReplayService {
             // Update session duration if we have timestamps
             if let (Some(min), Some(max)) = (min_timestamp, max_timestamp) {
                 let duration_ms = (max - min) as i32;
-                self.update_session_duration(session_id, duration_ms).await?;
+                self.update_session_duration(session_id, duration_ms)
+                    .await?;
             }
 
-            info!("Stored {} events for session {}", events_to_store.len(), session_id);
+            info!(
+                "Stored {} events for session {}",
+                events_to_store.len(),
+                session_id
+            );
         }
         Ok(session_id.to_string())
     }
@@ -654,50 +665,53 @@ impl SessionReplayService {
         } else if let Some(events_obj) = events.as_object() {
             // Object with numeric keys - convert to sorted array
             let mut events_vec = Vec::new();
-            
+
             // Collect numeric keys and sort them
-            let mut numeric_keys: Vec<usize> = events_obj.keys()
+            let mut numeric_keys: Vec<usize> = events_obj
+                .keys()
                 .filter_map(|k| k.parse::<usize>().ok())
                 .collect();
             numeric_keys.sort();
-            
+
             // Extract events in order
             for key in numeric_keys {
                 if let Some(event) = events_obj.get(&key.to_string()) {
                     events_vec.push(event.clone());
                 }
             }
-            
+
             // Also check for special keys like "v" for metadata
             debug!("Extracted {} events from object format", events_vec.len());
-            
+
             return Ok(events_vec);
         }
-        
+
         // Not an array or object with events
         Ok(Vec::new())
     }
 
     /// Unpack compressed rrweb events
-    fn unpack_events(&self, packed_data: &PackedEvents) -> Result<UnpackedEvents, SessionReplayError> {
+    fn unpack_events(
+        &self,
+        packed_data: &PackedEvents,
+    ) -> Result<UnpackedEvents, SessionReplayError> {
         debug!("Decoding base64 for session: {}", packed_data.session_id);
-        
+
         // Decode base64
         let compressed = STANDARD.decode(&packed_data.events)?;
 
         debug!("Decompressing with zlib...");
-        
+
         // Decompress with zlib
         let mut decoder = ZlibDecoder::new(&compressed[..]);
         let mut decompressed = String::new();
-        decoder.read_to_string(&mut decompressed)
-            .map_err(|e| SessionReplayError::DecompressionError(
-                format!("Failed to decompress events: {}", e)
-            ))?;
+        decoder.read_to_string(&mut decompressed).map_err(|e| {
+            SessionReplayError::DecompressionError(format!("Failed to decompress events: {}", e))
+        })?;
 
         // Parse the decompressed JSON
         let events: Value = serde_json::from_str(&decompressed)?;
-        
+
         // Log what format we received
         if events.is_array() {
             if let Some(arr) = events.as_array() {
@@ -705,7 +719,10 @@ impl SessionReplayService {
             }
         } else if events.is_object() {
             let event_count = self.extract_events_from_json(&events)?.len();
-            debug!("Successfully unpacked {} events (object format)", event_count);
+            debug!(
+                "Successfully unpacked {} events (object format)",
+                event_count
+            );
         }
 
         Ok(UnpackedEvents {
@@ -724,13 +741,17 @@ impl SessionReplayService {
         page: u64,
         per_page: u64,
     ) -> Result<(Vec<SessionReplayWithVisitor>, u64), SessionReplayError> {
-        info!("Getting session replays for project: {}, environment: {:?}", project_id, environment_id);
+        info!(
+            "Getting session replays for project: {}, environment: {:?}",
+            project_id, environment_id
+        );
 
         // Build filtered base for total count
         let mut count_select = session_replay_sessions::Entity::find()
             .filter(session_replay_sessions::Column::ProjectId.eq(project_id));
         if let Some(env_id) = environment_id {
-            count_select = count_select.filter(session_replay_sessions::Column::EnvironmentId.eq(env_id));
+            count_select =
+                count_select.filter(session_replay_sessions::Column::EnvironmentId.eq(env_id));
         }
         let total_count: u64 = count_select.count(self.db.as_ref()).await?;
 
@@ -759,16 +780,46 @@ impl SessionReplayService {
                 session_replay_sessions::Column::Url,
                 session_replay_sessions::Column::Duration,
             ])
-            .expr_as(Expr::col((visitor::Entity, visitor::Column::Id)), "visitor_internal_id")
-            .expr_as(Expr::col((visitor::Entity, visitor::Column::VisitorId)), "visitor_uuid")
-            .expr_as(Expr::col((visitor::Entity, visitor::Column::ProjectId)), "visitor_project_id")
-            .expr_as(Expr::col((visitor::Entity, visitor::Column::EnvironmentId)), "visitor_environment_id")
-            .expr_as(Expr::col((visitor::Entity, visitor::Column::FirstSeen)), "visitor_first_seen")
-            .expr_as(Expr::col((visitor::Entity, visitor::Column::LastSeen)), "visitor_last_seen")
-            .expr_as(Expr::col((visitor::Entity, visitor::Column::UserAgent)), "visitor_user_agent")
-            .expr_as(Expr::col((visitor::Entity, visitor::Column::IsCrawler)), "visitor_is_crawler")
-            .expr_as(Expr::col((visitor::Entity, visitor::Column::CrawlerName)), "visitor_crawler_name")
-            .expr_as(Expr::col((visitor::Entity, visitor::Column::CustomData)), "visitor_custom_data")
+            .expr_as(
+                Expr::col((visitor::Entity, visitor::Column::Id)),
+                "visitor_internal_id",
+            )
+            .expr_as(
+                Expr::col((visitor::Entity, visitor::Column::VisitorId)),
+                "visitor_uuid",
+            )
+            .expr_as(
+                Expr::col((visitor::Entity, visitor::Column::ProjectId)),
+                "visitor_project_id",
+            )
+            .expr_as(
+                Expr::col((visitor::Entity, visitor::Column::EnvironmentId)),
+                "visitor_environment_id",
+            )
+            .expr_as(
+                Expr::col((visitor::Entity, visitor::Column::FirstSeen)),
+                "visitor_first_seen",
+            )
+            .expr_as(
+                Expr::col((visitor::Entity, visitor::Column::LastSeen)),
+                "visitor_last_seen",
+            )
+            .expr_as(
+                Expr::col((visitor::Entity, visitor::Column::UserAgent)),
+                "visitor_user_agent",
+            )
+            .expr_as(
+                Expr::col((visitor::Entity, visitor::Column::IsCrawler)),
+                "visitor_is_crawler",
+            )
+            .expr_as(
+                Expr::col((visitor::Entity, visitor::Column::CrawlerName)),
+                "visitor_crawler_name",
+            )
+            .expr_as(
+                Expr::col((visitor::Entity, visitor::Column::CustomData)),
+                "visitor_custom_data",
+            )
             .order_by_desc(session_replay_sessions::Column::CreatedAt);
 
         if let Some(env_id) = environment_id {
@@ -835,7 +886,7 @@ impl SessionReplayService {
         let offset = (page.saturating_sub(1)) * per_page;
         let query = format!(
             r#"
-            SELECT 
+            SELECT
                 s.id,
                 s.session_replay_id,
                 s.visitor_id,
@@ -872,13 +923,13 @@ impl SessionReplayService {
             "#,
             per_page, offset
         );
-        
+
         let statement = sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             &query,
-            vec![visitor_id.into()]
+            vec![visitor_id.into()],
         );
-        
+
         #[derive(Debug, FromQueryResult)]
         struct SessionReplayWithVisitorQueryRow {
             pub id: i32,
@@ -910,7 +961,7 @@ impl SessionReplayService {
             pub visitor_crawler_name: Option<String>,
             pub visitor_custom_data: Option<String>,
         }
-        
+
         let query_results = SessionReplayWithVisitorQueryRow::find_by_statement(statement)
             .all(self.db.as_ref())
             .await?;
@@ -965,7 +1016,7 @@ impl SessionReplayService {
 
         // Get session with visitor data using join
         let query = r#"
-            SELECT 
+            SELECT
                 s.id,
                 s.session_replay_id,
                 s.visitor_id,
@@ -998,18 +1049,18 @@ impl SessionReplayService {
             INNER JOIN visitor v ON s.visitor_id = v.id
             WHERE s.id = $1
         "#;
-        
+
         let statement = sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             query,
-            vec![session_id.into()]
+            vec![session_id.into()],
         );
-        
+
         let row = SessionReplayQueryResult::find_by_statement(statement)
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| SessionReplayError::SessionNotFound(session_id.to_string()))?;
-        
+
         // Get events using the integer session ID
         let events = session_replay_events::Entity::find()
             .filter(session_replay_events::Column::SessionId.eq(row.id))
@@ -1078,7 +1129,7 @@ impl SessionReplayService {
 
         // Get session with visitor data using join and count events
         let query = r#"
-            SELECT 
+            SELECT
                 s.id,
                 s.session_replay_id,
                 s.visitor_id,
@@ -1111,13 +1162,13 @@ impl SessionReplayService {
             INNER JOIN visitor v ON s.visitor_id = v.id
             WHERE s.id = $1
         "#;
-        
+
         let statement = sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             query,
-            vec![session_id.into()]
+            vec![session_id.into()],
         );
-        
+
         #[derive(Debug, FromQueryResult)]
         struct SessionReplayWithVisitorRow {
             pub id: i32,
@@ -1149,12 +1200,12 @@ impl SessionReplayService {
             pub visitor_crawler_name: Option<String>,
             pub visitor_custom_data: Option<String>,
         }
-        
+
         let row = SessionReplayWithVisitorRow::find_by_statement(statement)
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| SessionReplayError::SessionNotFound(session_id.to_string()))?;
-        
+
         Ok(SessionReplayWithVisitor {
             id: row.id,
             session_replay_id: row.session_replay_id,
@@ -1190,17 +1241,23 @@ impl SessionReplayService {
     }
 
     /// Unpack events without storing them (useful for debugging or inspection)
-    pub fn unpack_events_only(&self, packed_data: &PackedEvents) -> Result<UnpackedEvents, SessionReplayError> {
+    pub fn unpack_events_only(
+        &self,
+        packed_data: &PackedEvents,
+    ) -> Result<UnpackedEvents, SessionReplayError> {
         self.unpack_events(packed_data)
     }
-    
+
     /// Update session duration
     pub async fn update_session_duration(
         &self,
         session_id: &str,
         duration: i32,
     ) -> Result<(), SessionReplayError> {
-        info!("Updating duration for session: {} to {} ms", session_id, duration);
+        info!(
+            "Updating duration for session: {} to {} ms",
+            session_id, duration
+        );
 
         let session = session_replay_sessions::Entity::find()
             .filter(session_replay_sessions::Column::SessionReplayId.eq(session_id))
@@ -1217,10 +1274,7 @@ impl SessionReplayService {
     }
 
     /// Delete a session replay (soft delete)
-    pub async fn delete_session_replay(
-        &self,
-        session_id: &str,
-    ) -> Result<(), SessionReplayError> {
+    pub async fn delete_session_replay(&self, session_id: &str) -> Result<(), SessionReplayError> {
         info!("Deleting session replay: {}", session_id);
 
         let session = session_replay_sessions::Entity::find()
@@ -1232,7 +1286,7 @@ impl SessionReplayService {
 
         // Store the session ID before converting to ActiveModel
         let session_int_id = session.id;
-        
+
         // Soft delete session
         let mut session: session_replay_sessions::ActiveModel = session.into();
         session.is_active = Set(false);
@@ -1260,7 +1314,7 @@ impl SessionReplayService {
 // mod tests {
 //     use super::*;
 //     use serde_json::json;
-// 
+//
 //     #[test]
 //     fn test_unpack_events_not_packed() {
 //         // Test implementation would go here

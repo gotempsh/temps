@@ -1,8 +1,8 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use temps_core::UtcDateTime;
 use thiserror::Error;
 use utoipa::ToSchema;
-use temps_core::UtcDateTime;
 
 #[derive(Error, Debug)]
 pub enum StatusPageError {

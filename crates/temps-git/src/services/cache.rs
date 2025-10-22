@@ -62,7 +62,8 @@ where
 
     /// Set a value in the cache with the default TTL
     pub async fn set(&self, key: K, value: V) {
-        self.set_with_ttl(key, value, self.default_ttl_minutes).await;
+        self.set_with_ttl(key, value, self.default_ttl_minutes)
+            .await;
     }
 
     /// Set a value in the cache with a custom TTL
@@ -210,7 +211,10 @@ mod tests {
 
         // Test set and get
         cache.set("key1".to_string(), "value1".to_string()).await;
-        assert_eq!(cache.get(&"key1".to_string()).await, Some("value1".to_string()));
+        assert_eq!(
+            cache.get(&"key1".to_string()).await,
+            Some("value1".to_string())
+        );
 
         // Test non-existent key
         assert_eq!(cache.get(&"nonexistent".to_string()).await, None);
@@ -225,7 +229,9 @@ mod tests {
         let cache: GitProviderCache<String, String> = GitProviderCache::new(1);
 
         // Set with very short TTL (negative means already expired)
-        cache.set_with_ttl("key1".to_string(), "value1".to_string(), -1).await;
+        cache
+            .set_with_ttl("key1".to_string(), "value1".to_string(), -1)
+            .await;
 
         // Should return None because it's expired
         assert_eq!(cache.get(&"key1".to_string()).await, None);
@@ -236,7 +242,9 @@ mod tests {
         let cache: GitProviderCache<String, String> = GitProviderCache::new(1);
 
         // Add expired and valid entries
-        cache.set_with_ttl("expired".to_string(), "value".to_string(), -1).await;
+        cache
+            .set_with_ttl("expired".to_string(), "value".to_string(), -1)
+            .await;
         cache.set("valid".to_string(), "value".to_string()).await;
 
         assert_eq!(cache.len().await, 2);
@@ -244,7 +252,10 @@ mod tests {
         // Cleanup should remove expired entries
         cache.cleanup_expired().await;
         assert_eq!(cache.len().await, 1);
-        assert_eq!(cache.get(&"valid".to_string()).await, Some("value".to_string()));
+        assert_eq!(
+            cache.get(&"valid".to_string()).await,
+            Some("value".to_string())
+        );
     }
 
     #[tokio::test]

@@ -66,6 +66,12 @@ impl DnsProviderService for DummyDnsProvider {
 
 pub struct ManualDnsProvider {}
 
+impl Default for ManualDnsProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ManualDnsProvider {
     pub fn new() -> Self {
         Self {}
@@ -335,13 +341,12 @@ impl CloudflareDnsProvider {
             .request(&endpoint)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list zones: {:?}", e))?;
-        return response
+        response
             .result
             .first()
             .ok_or_else(|| anyhow::anyhow!("Zone not found"))
-            .map(|zone| zone.id.to_string());
+            .map(|zone| zone.id.to_string())
     }
-
 }
 
 impl CloudflareDnsProvider {
@@ -386,7 +391,7 @@ impl CloudflareDnsProvider {
             .ok_or_else(|| {
                 anyhow::anyhow!("Record not found for zone_id {} and name {}", zone_id, name)
             })
-            .map(|cf_record| Self::map_cloudflare_record_to_custom(cf_record))
+            .map(Self::map_cloudflare_record_to_custom)
     }
     async fn get_records(&self, zone_id: &str, name: &str) -> Result<Vec<CFDnsRecord>> {
         let endpoint = dns::ListDnsRecords {

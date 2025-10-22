@@ -96,7 +96,9 @@ impl ServeCommand {
                 encryption_service_clone,
                 route_table_clone,
                 Some(ready_tx),
-            ).await {
+            )
+            .await
+            {
                 tracing::error!("Failed to start console API server: {}", e);
                 tracing::error!("Console API server will not be available");
             }

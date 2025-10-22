@@ -1390,7 +1390,11 @@ async fn update_self(
 
     let updated_user = app_state
         .user_service
-        .update_user(auth.user_id(), update_req.email.clone(), update_req.name.clone())
+        .update_user(
+            auth.user_id(),
+            update_req.email.clone(),
+            update_req.name.clone(),
+        )
         .await?;
 
     // Create audit log

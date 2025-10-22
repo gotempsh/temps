@@ -86,8 +86,7 @@ pub async fn create_custom_domain(
         .await?;
 
     // Fetch additional info for response
-    let domain_with_info =
-        get_domain_with_info(&state, custom_domain).await?;
+    let domain_with_info = get_domain_with_info(&state, custom_domain).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -228,7 +227,10 @@ pub async fn update_custom_domain(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
 
-    info!("Updating custom domain: {} for project: {}", domain_id, project_id);
+    info!(
+        "Updating custom domain: {} for project: {}",
+        domain_id, project_id
+    );
 
     // Verify domain belongs to project
     let existing_domain = state
@@ -277,7 +279,7 @@ pub async fn update_custom_domain(
                 None,
                 None,
                 Some("".to_string()), // Empty string to clear
-                Some(0), // 0 to clear status code
+                Some(0),              // 0 to clear status code
                 Some("".to_string()), // Empty string to clear branch
                 None,
                 None,
@@ -322,7 +324,10 @@ pub async fn delete_custom_domain(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsDelete);
 
-    info!("Deleting custom domain: {} for project: {}", domain_id, project_id);
+    info!(
+        "Deleting custom domain: {} for project: {}",
+        domain_id, project_id
+    );
 
     // Verify domain belongs to project
     let existing_domain = state

@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ActiveModelTrait, Set};
 use std::path::PathBuf;
 use std::sync::Arc;
 use temps_database::test_utils::TestDatabase;
@@ -15,8 +15,7 @@ use temps_deployer::{docker::DockerRuntime, ContainerDeployer, ImageBuilder};
 use temps_deployments::services::{WorkflowExecutionService, WorkflowPlanner};
 use temps_deployments::CronConfigService;
 use temps_entities::{
-    deployments, deployment_containers, environments, projects,
-    types::ProjectType,
+    deployment_containers, deployments, environments, projects, types::ProjectType,
 };
 use temps_git::{GitProviderManagerError, GitProviderManagerTrait, RepositoryInfo};
 use temps_logs::LogService;
@@ -254,8 +253,17 @@ async fn test_workflow_execution_service_with_real_jobs() {
     // Create DSN service
     let dsn_service = Arc::new(temps_error_tracking::DSNService::new(db.clone()));
 
+    // Create ExternalServiceManager
+    let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(db.clone()));
+
     // Create jobs using WorkflowPlanner
-    let workflow_planner = WorkflowPlanner::new(db.clone(), log_service.clone(), config_service.clone(), dsn_service);
+    let workflow_planner = WorkflowPlanner::new(
+        db.clone(),
+        log_service.clone(),
+        external_service_manager,
+        config_service.clone(),
+        dsn_service,
+    );
 
     let jobs_created = match workflow_planner.create_deployment_jobs(deployment.id).await {
         Ok(jobs) => {

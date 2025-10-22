@@ -1,5 +1,5 @@
-pub mod platform_info;
 pub mod dns;
+pub mod platform_info;
 
-pub use platform_info::PlatformInfoService;
 pub use dns::DnsService;
+pub use platform_info::PlatformInfoService;

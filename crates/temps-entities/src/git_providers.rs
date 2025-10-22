@@ -1,5 +1,5 @@
-use sea_orm::entity::prelude::*;
 use async_trait::async_trait;
+use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
@@ -13,8 +13,8 @@ pub struct Model {
     pub provider_type: String, // github, gitlab, bitbucket, gitea, generic
     pub base_url: Option<String>, // For self-hosted instances (web UI URL)
     pub api_url: Option<String>, // API endpoint URL (different from base_url for GitHub Apps)
-    pub auth_method: String, // app, oauth, pat, basic, ssh
-    pub auth_config: Json, // JSON with provider-specific auth config
+    pub auth_method: String,   // app, oauth, pat, basic, ssh
+    pub auth_config: Json,     // JSON with provider-specific auth config
     pub webhook_secret: Option<String>,
     pub is_active: bool,
     pub is_default: bool,
@@ -41,7 +41,7 @@ impl ActiveModelBehavior for ActiveModel {
         C: ConnectionTrait,
     {
         let now = chrono::Utc::now();
-        
+
         if insert {
             if self.created_at.is_not_set() {
                 self.created_at = Set(now);
@@ -52,7 +52,7 @@ impl ActiveModelBehavior for ActiveModel {
         } else {
             self.updated_at = Set(now);
         }
-        
+
         Ok(self)
     }
 }

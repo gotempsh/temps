@@ -59,11 +59,9 @@ impl temps_core::plugin::TempsPlugin for ScreenshotsPlugin {
 
             let screenshot_service = ScreenshotService::new(config_service.clone())
                 .await
-                .map_err(|e| {
-                    PluginError::PluginRegistrationFailed {
-                        plugin_name: "screenshots".to_string(),
-                        error: format!("Failed to create screenshot service: {}", e),
-                    }
+                .map_err(|e| PluginError::PluginRegistrationFailed {
+                    plugin_name: "screenshots".to_string(),
+                    error: format!("Failed to create screenshot service: {}", e),
                 })?;
 
             info!(
@@ -76,7 +74,10 @@ impl temps_core::plugin::TempsPlugin for ScreenshotsPlugin {
         })
     }
 
-    fn configure_routes(&self, _context: &PluginContext) -> Option<temps_core::plugin::PluginRoutes> {
+    fn configure_routes(
+        &self,
+        _context: &PluginContext,
+    ) -> Option<temps_core::plugin::PluginRoutes> {
         // Screenshots don't need HTTP routes - they're used internally by jobs
         None
     }

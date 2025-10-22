@@ -41,7 +41,8 @@ impl AuthEmailService {
                     </div>
                 </body>
                 </html>"#,
-                base_url = base_url, token = token
+                base_url = base_url,
+                token = token
             )),
             from: None,
             reply_to: None,
@@ -81,7 +82,8 @@ impl AuthEmailService {
                     </div>
                 </body>
                 </html>"#,
-                base_url = base_url, token = token
+                base_url = base_url,
+                token = token
             )),
             from: None,
             reply_to: None,
@@ -131,8 +133,8 @@ impl AuthEmailService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use async_trait::async_trait;
+    use std::sync::Arc;
     use temps_core::notifications::EmailMessage;
 
     #[derive(Clone)]
@@ -159,7 +161,10 @@ mod tests {
             Ok(())
         }
 
-        async fn send_notification(&self, notification: temps_core::notifications::NotificationData) -> Result<(), NotificationError> {
+        async fn send_notification(
+            &self,
+            notification: temps_core::notifications::NotificationData,
+        ) -> Result<(), NotificationError> {
             Ok(())
         }
 
@@ -173,11 +178,9 @@ mod tests {
         let mock_service = Arc::new(MockNotificationService::new());
         let email_service = AuthEmailService::new(mock_service.clone());
 
-        let result = email_service.send_verification_email(
-            "test@example.com",
-            "test-token-123",
-            "https://example.com"
-        ).await;
+        let result = email_service
+            .send_verification_email("test@example.com", "test-token-123", "https://example.com")
+            .await;
 
         assert!(result.is_ok());
 
@@ -199,11 +202,13 @@ mod tests {
         let mock_service = Arc::new(MockNotificationService::new());
         let email_service = AuthEmailService::new(mock_service.clone());
 
-        let result = email_service.send_password_reset_email(
-            "user@example.com",
-            "reset-token-456",
-            "https://app.example.com"
-        ).await;
+        let result = email_service
+            .send_password_reset_email(
+                "user@example.com",
+                "reset-token-456",
+                "https://app.example.com",
+            )
+            .await;
 
         assert!(result.is_ok());
 
@@ -227,10 +232,9 @@ mod tests {
         let email_service = AuthEmailService::new(mock_service.clone());
 
         let magic_url = "https://example.com/auth/magic?token=magic-789";
-        let result = email_service.send_magic_link_email(
-            "magic@example.com",
-            magic_url
-        ).await;
+        let result = email_service
+            .send_magic_link_email("magic@example.com", magic_url)
+            .await;
 
         assert!(result.is_ok());
 
@@ -252,11 +256,9 @@ mod tests {
         let mock_service = Arc::new(MockNotificationService::new());
         let email_service = AuthEmailService::new(mock_service.clone());
 
-        let _ = email_service.send_verification_email(
-            "format@example.com",
-            "token",
-            "https://test.com"
-        ).await;
+        let _ = email_service
+            .send_verification_email("format@example.com", "token", "https://test.com")
+            .await;
 
         let sent_emails = mock_service.get_sent_emails().await;
         let html = sent_emails[0].html_body.as_ref().unwrap();
@@ -277,11 +279,13 @@ mod tests {
         let email_service = AuthEmailService::new(mock_service.clone());
 
         // Test verification email
-        let _ = email_service.send_verification_email(
-            "param@example.com",
-            "unique-token",
-            "https://unique-base.com"
-        ).await;
+        let _ = email_service
+            .send_verification_email(
+                "param@example.com",
+                "unique-token",
+                "https://unique-base.com",
+            )
+            .await;
 
         let sent_emails = mock_service.get_sent_emails().await;
         let html = sent_emails[0].html_body.as_ref().unwrap();

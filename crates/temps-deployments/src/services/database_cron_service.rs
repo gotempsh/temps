@@ -6,18 +6,18 @@ use async_trait::async_trait;
 use chrono::{DateTime, Timelike as _, Utc};
 use cron::Schedule;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, Set,
 };
-use temps_core::UtcDateTime;
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
+use temps_core::UtcDateTime;
 use temps_database::DbConnection;
 use temps_entities::{cron_executions, crons, deployment_containers, deployments};
+use thiserror::Error;
 use tokio::time::{self, Duration};
 use tracing::{debug, error, info, warn};
-use thiserror::Error;
 
 use crate::jobs::configure_crons::{CronConfig, CronConfigError, CronConfigService};
 
@@ -489,7 +489,11 @@ impl DatabaseCronConfigService {
                     last_successful_run: None,
                 };
 
-                if let Err(queue_err) = self.queue.send(temps_core::Job::CronInvocationError(error_data)).await {
+                if let Err(queue_err) = self
+                    .queue
+                    .send(temps_core::Job::CronInvocationError(error_data))
+                    .await
+                {
                     warn!(
                         "Failed to send cron error notification for cron {}: {}",
                         cron.id, queue_err
@@ -553,7 +557,7 @@ impl DatabaseCronConfigService {
             .map_err(|e| CronServiceError::ExecutionError {
                 cron_id: cron.id,
                 url: url.clone(),
-                message: format!("Failed with status: {}", e.to_string()),
+                message: format!("Failed with status: {}", e),
             })?;
 
         if !response.status().is_success() {
@@ -590,8 +594,14 @@ mod tests {
     // Helper function to create test project and environment
     async fn create_test_project_and_environment(
         db: &DatabaseConnection,
-    ) -> Result<(temps_entities::projects::Model, temps_entities::environments::Model), Box<dyn std::error::Error>> {
-        use temps_entities::{projects, environments, types::ProjectType};
+    ) -> Result<
+        (
+            temps_entities::projects::Model,
+            temps_entities::environments::Model,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        use temps_entities::{environments, projects, types::ProjectType};
 
         // Create project
         let project = projects::ActiveModel {

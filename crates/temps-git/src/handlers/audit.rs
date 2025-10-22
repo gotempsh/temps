@@ -1,7 +1,6 @@
+use anyhow::Result;
 use serde::Serialize;
 use temps_core::AuditOperation;
-use anyhow::Result;
-
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditContext {
@@ -22,7 +21,6 @@ pub struct PipelineTriggeredAudit {
     pub tag: Option<String>,
     pub commit: Option<String>,
 }
-
 
 impl AuditOperation for PipelineTriggeredAudit {
     fn operation_type(&self) -> String {
@@ -46,5 +44,3 @@ impl AuditOperation for PipelineTriggeredAudit {
             .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
     }
 }
-
-

@@ -6,12 +6,12 @@ const BOT_PATTERNS: &[&str] = &[
     "[ ]+bot",
     " daum[ /]",
     " deusu/",
-    "newsbot",  // More specific pattern
+    "newsbot",    // More specific pattern
     "googlebot",  // More specific pattern instead of lookahead
-    " bot",  // More specific - requires space before bot
-    "httpclient",  // More specific
+    " bot",       // More specific - requires space before bot
+    "httpclient", // More specific
     "scorecard",  // More specific
-    "scanner",  // More specific
+    "scanner",    // More specific
     "24x7",
     "@[a-z][\\w-]+\\.",
     "\\(\\)",
@@ -164,7 +164,7 @@ const BOT_PATTERNS: &[&str] = &[
     "bazqux",
     "bit\\.ly/",
     "bluecoat drtr",
-    "bot[/\\);-]",  // Simplified pattern
+    "bot[/\\);-]", // Simplified pattern
     "brandverity",
     "browsershots",
     "browsex",
@@ -288,7 +288,7 @@ const BOT_PATTERNS: &[&str] = &[
     "iplabel",
     "ips-agent",
     "iskanie",
-    "java/",  // Simplified - match java/ instead
+    "java/", // Simplified - match java/ instead
     "jetslide",
     "jetty",
     "kaspersky",
@@ -495,8 +495,7 @@ const BOT_PATTERNS: &[&str] = &[
 /// Full compiled pattern combining all bot patterns
 static FULL_PATTERN: Lazy<Regex> = Lazy::new(|| {
     let full_pattern_str = BOT_PATTERNS.join("|");
-    Regex::new(&format!("(?i){}", full_pattern_str))
-        .expect("Failed to compile full bot pattern")
+    Regex::new(&format!("(?i){}", full_pattern_str)).expect("Failed to compile full bot pattern")
 });
 
 /// Crawler detector that identifies bots and crawlers from user agent strings
@@ -514,9 +513,7 @@ impl CrawlerDetector {
     /// Find the first part of the user agent that matches a bot pattern
     pub fn find_bot_match(user_agent: Option<&str>) -> Option<String> {
         match user_agent {
-            Some(ua) if !ua.is_empty() => {
-                FULL_PATTERN.find(ua).map(|m| m.as_str().to_string())
-            }
+            Some(ua) if !ua.is_empty() => FULL_PATTERN.find(ua).map(|m| m.as_str().to_string()),
             _ => None,
         }
     }
@@ -539,7 +536,9 @@ mod tests {
     fn test_common_bots() {
         // Test common bot user agents
         assert!(CrawlerDetector::is_bot(Some("Googlebot/2.1")));
-        assert!(CrawlerDetector::is_bot(Some("Mozilla/5.0 (compatible; bingbot/2.0)")));
+        assert!(CrawlerDetector::is_bot(Some(
+            "Mozilla/5.0 (compatible; bingbot/2.0)"
+        )));
         assert!(CrawlerDetector::is_bot(Some("facebookexternalhit/1.1")));
         assert!(CrawlerDetector::is_bot(Some("Twitterbot/1.0")));
         assert!(CrawlerDetector::is_bot(Some("WhatsApp/2.19.81")));
@@ -573,7 +572,10 @@ mod tests {
     #[test]
     fn test_crawler_name_extraction() {
         assert!(CrawlerDetector::get_crawler_name(Some("Googlebot/2.1")).is_some());
-        assert!(CrawlerDetector::get_crawler_name(Some("Mozilla/5.0 (compatible; bingbot/2.0)")).is_some());
+        assert!(
+            CrawlerDetector::get_crawler_name(Some("Mozilla/5.0 (compatible; bingbot/2.0)"))
+                .is_some()
+        );
         assert_eq!(
             CrawlerDetector::get_crawler_name(Some("Regular Browser")),
             None

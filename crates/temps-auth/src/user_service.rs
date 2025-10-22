@@ -1,9 +1,5 @@
-use base32;
 use base64::Engine;
-use bcrypt;
 use chrono::Utc;
-use temps_core::UtcDateTime;
-use tracing::{error, info};
 use qrcode::QrCode;
 use rand::Rng;
 use sea_orm::{
@@ -12,9 +8,11 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::sync::Arc;
+use temps_core::UtcDateTime;
 use temps_entities::types::RoleType;
 use thiserror::Error;
 use totp_rs::{Algorithm, Secret, TOTP};
+use tracing::{error, info};
 
 // First add the custom error type at the top of the file
 #[derive(Error, Debug)]
@@ -621,7 +619,7 @@ impl UserService {
         user_update.mfa_enabled = Set(false);
         user_update.mfa_recovery_codes = Set(Some(
             serde_json::to_string(&hashed_recovery_codes)
-                .map_err(|e| UserServiceError::Serialization(e))?,
+                .map_err(UserServiceError::Serialization)?,
         ));
 
         user_update.update(self.db.as_ref()).await?;
@@ -646,7 +644,7 @@ impl UserService {
         let secret = user
             .mfa_secret
             .clone()
-            .ok_or_else(|| UserServiceError::MfaNotSetup(user_id))?;
+            .ok_or(UserServiceError::MfaNotSetup(user_id))?;
 
         // Verify TOTP code
         let totp = TOTP::new(
@@ -695,12 +693,12 @@ impl UserService {
 
         let secret = user
             .mfa_secret
-            .ok_or_else(|| UserServiceError::MfaNotSetup(user_id))?;
+            .ok_or(UserServiceError::MfaNotSetup(user_id))?;
 
         // Check if it's a recovery code
         if let Some(recovery_codes) = user.mfa_recovery_codes {
-            let hashed_codes: Vec<String> = serde_json::from_str(&recovery_codes)
-                .map_err(|e| UserServiceError::Serialization(e))?;
+            let hashed_codes: Vec<String> =
+                serde_json::from_str(&recovery_codes).map_err(UserServiceError::Serialization)?;
 
             // Clone hashed_codes for later use
             let hashed_codes_clone = hashed_codes.clone();
@@ -748,9 +746,8 @@ impl UserService {
         )
         .map_err(|e| UserServiceError::Mfa(format!("Failed to create TOTP: {}", e)))?;
 
-        Ok(totp
-            .check_current(code)
-            .map_err(|e| UserServiceError::Mfa(format!("Failed to verify TOTP code: {}", e)))?)
+        totp.check_current(code)
+            .map_err(|e| UserServiceError::Mfa(format!("Failed to verify TOTP code: {}", e)))
     }
 
     pub async fn disable_mfa(&self, user_id: i32) -> Result<(), UserServiceError> {

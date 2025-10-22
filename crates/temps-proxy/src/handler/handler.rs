@@ -5,10 +5,10 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use tracing::{error, info};
 use std::sync::Arc;
 use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
+use tracing::{error, info};
 use utoipa::OpenApi;
 
 use super::types::AppState;
@@ -71,7 +71,7 @@ pub async fn create_route(
             error!("Error creating route: {:?}", e);
             Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
                 .title("Failed to create route")
-                .detail(&format!("Error creating route: {}", e))
+                .detail(format!("Error creating route: {}", e))
                 .build())
         }
     }
@@ -107,7 +107,7 @@ pub async fn list_routes(
             error!("Error listing routes: {:?}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to list routes")
-                .detail(&format!("Error listing routes: {}", e))
+                .detail(format!("Error listing routes: {}", e))
                 .build())
         }
     }
@@ -135,7 +135,7 @@ pub async fn get_route(
             error!("Error getting route: {:?}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get route")
-                .detail(&format!("Error getting route: {}", e))
+                .detail(format!("Error getting route: {}", e))
                 .build())
         }
     }
@@ -169,7 +169,7 @@ pub async fn update_route(
             error!("Error updating route: {:?}", e);
             Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
                 .title("Failed to update route")
-                .detail(&format!("Error updating route: {}", e))
+                .detail(format!("Error updating route: {}", e))
                 .build())
         }
     }
@@ -197,7 +197,7 @@ pub async fn delete_route(
             error!("Error deleting route: {:?}", e);
             Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
                 .title("Failed to delete route")
-                .detail(&format!("Error deleting route: {}", e))
+                .detail(format!("Error deleting route: {}", e))
                 .build())
         }
     }

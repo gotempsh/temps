@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::{body_full, Docker};
 use futures::{StreamExt, TryStreamExt};
-use tracing::{error, info};
 use redis::{aio::ConnectionManager, Client};
 use sea_orm::prelude::*;
 use serde::Deserialize;
@@ -16,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
+use tracing::{error, info};
 
 const REDIS_IMAGE: &str = "redis:7.4.1-alpine";
 
@@ -91,7 +91,10 @@ impl RedisService {
         let containers = docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
                 all: true,
-                filters: Some(HashMap::from([("name".to_string(), vec![container_name.clone()])])),
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![container_name.clone()],
+                )])),
                 ..Default::default()
             }))
             .await?;
@@ -109,7 +112,7 @@ impl RedisService {
             (name_label_key.as_str(), self.name.as_str()),
         ]);
 
-        let env_vars = vec![format!("REDIS_PASSWORD={}", password)];
+        let env_vars = [format!("REDIS_PASSWORD={}", password)];
 
         let volume_name = format!("redis_data_{}", self.name);
         let host_config = bollard::models::HostConfig {
@@ -143,8 +146,17 @@ impl RedisService {
             image: Some(REDIS_IMAGE.to_string()),
             exposed_ports: Some(HashMap::from([("6379/tcp".to_string(), HashMap::new())])),
             env: Some(env_vars.iter().map(|s| s.as_str().to_string()).collect()),
-            labels: Some(container_labels.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
-            cmd: Some(vec!["redis-server".to_string(), "--appendonly".to_string(), "yes".to_string()]),
+            labels: Some(
+                container_labels
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            cmd: Some(vec![
+                "redis-server".to_string(),
+                "--appendonly".to_string(),
+                "yes".to_string(),
+            ]),
             host_config: Some(bollard::models::HostConfig {
                 restart_policy: Some(bollard::models::RestartPolicy {
                     name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
@@ -273,7 +285,9 @@ impl RedisService {
                 .query_async::<()>(&mut conn.clone())
                 .await?;
 
-            redis::cmd("FLUSHDB").query_async::<()>(&mut conn.clone()).await?;
+            redis::cmd("FLUSHDB")
+                .query_async::<()>(&mut conn.clone())
+                .await?;
 
             // Remove the mapping
             redis::cmd("DEL")
@@ -500,7 +514,10 @@ impl ExternalService for RedisService {
             .docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
                 all: true,
-                filters: Some(HashMap::from([("name".to_string(), vec![container_name.clone()])])),
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![container_name.clone()],
+                )])),
                 ..Default::default()
             }))
             .await?;
@@ -545,7 +562,10 @@ impl ExternalService for RedisService {
             .docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
                 all: true,
-                filters: Some(HashMap::from([("name".to_string(), vec![container_name.clone()])])),
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![container_name.clone()],
+                )])),
                 ..Default::default()
             }))
             .await?;
@@ -575,7 +595,10 @@ impl ExternalService for RedisService {
             .docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
                 all: true,
-                filters: Some(HashMap::from([("name".to_string(), vec![container_name.clone()])])),
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![container_name.clone()],
+                )])),
                 ..Default::default()
             }))
             .await?;
@@ -603,7 +626,10 @@ impl ExternalService for RedisService {
         // Remove volume
         match self
             .docker
-            .remove_volume(&volume_name, None::<bollard::query_parameters::RemoveVolumeOptions>)
+            .remove_volume(
+                &volume_name,
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
             .await
         {
             Ok(_) => info!("Removed volume {}", volume_name),
@@ -666,7 +692,7 @@ impl ExternalService for RedisService {
         let backup_record = temps_entities::external_service_backups::Entity::insert(
             temps_entities::external_service_backups::ActiveModel {
                 service_id: Set(external_service.id),
-                backup_id: Set(backup.id.clone()),
+                backup_id: Set(backup.id),
                 backup_type: Set("full".to_string()),
                 state: Set("running".to_string()),
                 started_at: Set(Utc::now()),
@@ -725,36 +751,31 @@ impl ExternalService for RedisService {
             let mut temp_file = std::fs::File::create(&file_path)?;
 
             let output = self.docker.start_exec(&cat_exec.id, None).await?;
-            match output {
-                bollard::exec::StartExecResults::Attached { output, .. } => {
-                    let mut stream = output.boxed();
-                    while let Some(result) = stream.next().await {
-                        match result {
-                            Ok(log_output) => match log_output {
-                                bollard::container::LogOutput::StdOut { message }
-                                | bollard::container::LogOutput::StdErr { message } => {
-                                    temp_file.write_all(&message)?;
-                                }
-                                _ => (),
-                            },
-                            Err(e) => {
-                                error!("Error streaming backup data for {}: {}", file, e);
-                                // Update backup record with error
-                                let mut backup_update: temps_entities::external_service_backups::ActiveModel = backup_record.clone().into();
-                                backup_update.state = Set("failed".to_string());
-                                backup_update.error_message = Set(Some(e.to_string()));
-                                backup_update.finished_at = Set(Some(Utc::now()));
-                                temps_entities::external_service_backups::Entity::update(
-                                    backup_update,
-                                )
+            if let bollard::exec::StartExecResults::Attached { output, .. } = output {
+                let mut stream = output.boxed();
+                while let Some(result) = stream.next().await {
+                    match result {
+                        Ok(log_output) => match log_output {
+                            bollard::container::LogOutput::StdOut { message }
+                            | bollard::container::LogOutput::StdErr { message } => {
+                                temp_file.write_all(&message)?;
+                            }
+                            _ => (),
+                        },
+                        Err(e) => {
+                            error!("Error streaming backup data for {}: {}", file, e);
+                            // Update backup record with error
+                            let mut backup_update: temps_entities::external_service_backups::ActiveModel = backup_record.clone().into();
+                            backup_update.state = Set("failed".to_string());
+                            backup_update.error_message = Set(Some(e.to_string()));
+                            backup_update.finished_at = Set(Some(Utc::now()));
+                            temps_entities::external_service_backups::Entity::update(backup_update)
                                 .exec(pool)
                                 .await?;
-                                return Err(anyhow::anyhow!("Failed to stream backup data: {}", e));
-                            }
+                            return Err(anyhow::anyhow!("Failed to stream backup data: {}", e));
                         }
                     }
                 }
-                _ => (),
             }
         }
 

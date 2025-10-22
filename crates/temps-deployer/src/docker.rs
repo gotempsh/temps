@@ -81,8 +81,8 @@ impl DockerRuntime {
             let mut tar_builder = tar::Builder::new(&mut tar_buffer);
             tar_builder
                 .append_dir_all(".", context_path)
-                .map_err(|e| BuilderError::IoError(e))?;
-            tar_builder.finish().map_err(|e| BuilderError::IoError(e))?;
+                .map_err(BuilderError::IoError)?;
+            tar_builder.finish().map_err(BuilderError::IoError)?;
         }
 
         // Create body from tar buffer as expected by Bollard
@@ -256,9 +256,7 @@ impl ImageBuilder for DockerRuntime {
                 // Legacy builder supports custom networks
                 Some(self.network_name.clone())
             },
-            platform: request
-                .platform
-                .unwrap_or_else(|| Self::get_native_platform()),
+            platform: request.platform.unwrap_or_else(Self::get_native_platform),
             memory: Some(((memory_limit * 1024 * 1024 * 1024) & 0x7FFFFFFF) as i32), // Convert GB to bytes
             cpuquota: Some((cpu_limit * 100000) as i32), // CPU quota in microseconds (cpu_limit * 100ms)
             cpuperiod: Some(100000),                     // CPU period in microseconds (100ms)
@@ -282,7 +280,7 @@ impl ImageBuilder for DockerRuntime {
             .append(true)
             .open(&request.log_path)
             .await
-            .map_err(|e| BuilderError::IoError(e))?;
+            .map_err(BuilderError::IoError)?;
 
         let mut build_stream = self.docker.build_image(
             build_options,
@@ -410,9 +408,7 @@ impl ImageBuilder for DockerRuntime {
                 // Legacy builder supports custom networks
                 Some(self.network_name.clone())
             },
-            platform: request
-                .platform
-                .unwrap_or_else(|| Self::get_native_platform()),
+            platform: request.platform.unwrap_or_else(Self::get_native_platform),
             memory: Some(((memory_limit * 1024 * 1024 * 1024) & 0x7FFFFFFF) as i32), // Convert GB to bytes
             cpuquota: Some((cpu_limit * 100000) as i32), // CPU quota in microseconds (cpu_limit * 100ms)
             cpuperiod: Some(100000),                     // CPU period in microseconds (100ms)
@@ -436,7 +432,7 @@ impl ImageBuilder for DockerRuntime {
             .append(true)
             .open(&request.log_path)
             .await
-            .map_err(|e| BuilderError::IoError(e))?;
+            .map_err(BuilderError::IoError)?;
 
         // Execute build using Bollard
         let mut build_stream = self.docker.build_image(
@@ -472,20 +468,18 @@ impl ImageBuilder for DockerRuntime {
                         return Err(BuilderError::BuildFailed(error));
                     }
                     if let Some(aux) = info.aux {
-                        match aux {
-                            bollard::models::BuildInfoAux::BuildKit(res) => {
-                                for log in res.logs {
-                                    // Write to file
-                                    let _ = log_file.write_all(&log.msg[..]).await;
-                                    debug!("BuildKit: {}", String::from_utf8_lossy(&log.msg));
+                        if let bollard::models::BuildInfoAux::BuildKit(res) = aux {
+                            for log in res.logs {
+                                // Write to file
+                                let _ = log_file.write_all(&log.msg[..]).await;
+                                debug!("BuildKit: {}", String::from_utf8_lossy(&log.msg));
 
-                                    // Call log callback if provided
-                                    if let Some(ref callback) = log_callback {
-                                        callback(String::from_utf8_lossy(&log.msg[..]).to_string()).await;
-                                    }
+                                // Call log callback if provided
+                                if let Some(ref callback) = log_callback {
+                                    callback(String::from_utf8_lossy(&log.msg[..]).to_string())
+                                        .await;
                                 }
                             }
-                            _ => {}
                         }
                     }
                 }
@@ -540,7 +534,7 @@ impl ImageBuilder for DockerRuntime {
 
         let file = tokio::fs::File::open(&image_path)
             .await
-            .map_err(|e| BuilderError::IoError(e))?;
+            .map_err(BuilderError::IoError)?;
 
         let byte_stream =
             tokio_util::codec::FramedRead::new(file, tokio_util::codec::BytesCodec::new())
@@ -650,7 +644,7 @@ impl ImageBuilder for DockerRuntime {
         };
 
         // Download from container
-        let temp_dir = TempDir::new().map_err(|e| BuilderError::IoError(e))?;
+        let temp_dir = TempDir::new().map_err(BuilderError::IoError)?;
         let temp_path = temp_dir.path();
 
         let response_stream = self.docker.download_from_container(
@@ -983,7 +977,7 @@ impl ContainerDeployer for DockerRuntime {
             status: Self::map_container_status(
                 &state.status.map(|s| s.to_string()).unwrap_or_default(),
             ),
-            created_at: container.created.unwrap_or_else(|| chrono::Utc::now()),
+            created_at: container.created.unwrap_or_else(chrono::Utc::now),
             ports: port_mappings,
             environment_vars: env_vars,
         })

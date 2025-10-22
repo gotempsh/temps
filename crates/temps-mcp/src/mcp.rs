@@ -1,12 +1,11 @@
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use tracing::{info, error, debug};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracing::{debug, error, info};
 
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{
         router::{prompt::PromptRouter, tool::ToolRouter},
         wrapper::Parameters,
@@ -14,7 +13,7 @@ use rmcp::{
     model::*,
     prompt, prompt_handler, prompt_router, schemars,
     service::RequestContext,
-    tool, tool_handler, tool_router,
+    tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
 };
 
 // Import project service from temps-projects crate
@@ -64,7 +63,6 @@ pub struct ProjectInfoArgs {
     pub project_slug: String,
 }
 
-
 #[derive(Clone, Serialize, Deserialize)]
 pub struct McpResource {
     pub id: String,
@@ -99,10 +97,12 @@ impl McpService {
                 Ok(projects) => {
                     let projects_json = serde_json::to_string_pretty(&projects)
                         .unwrap_or_else(|_| "Failed to serialize projects".to_string());
-                    
-                    Ok(CallToolResult::success(vec![
-                        Content::text(format!("Found {} projects:\n{}", projects.len(), projects_json))
-                    ]))
+
+                    Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Found {} projects:\n{}",
+                        projects.len(),
+                        projects_json
+                    ))]))
                 }
                 Err(e) => {
                     error!("Failed to fetch projects: {}", e);
@@ -126,23 +126,31 @@ impl McpService {
         Parameters(args): Parameters<ProjectInfoArgs>,
     ) -> Result<CallToolResult, McpError> {
         if let Some(project_service) = &self.project_service {
-            match project_service.get_project_by_slug(&args.project_slug).await {
+            match project_service
+                .get_project_by_slug(&args.project_slug)
+                .await
+            {
                 Ok(project) => {
-                    let mut result = format!("Project Information:\n");
+                    let mut result = "Project Information:\n".to_string();
                     result.push_str(&format!("ID: {}\n", project.id));
                     result.push_str(&format!("Name: {}\n", project.name));
                     result.push_str(&format!("Slug: {}\n", project.slug));
-                    result.push_str(&format!("Repository: {}/{}\n", 
+                    result.push_str(&format!(
+                        "Repository: {}/{}\n",
                         project.repo_owner.unwrap_or("unknown".to_string()),
-                        project.repo_name.unwrap_or("unknown".to_string())));
+                        project.repo_name.unwrap_or("unknown".to_string())
+                    ));
                     result.push_str(&format!("Directory: {}\n", project.directory));
                     result.push_str(&format!("Branch: {}\n", project.main_branch));
                     result.push_str(&format!("Auto Deploy: {}\n", project.automatic_deploy));
                     result.push_str(&format!("Created: {}\n", project.created_at));
                     result.push_str(&format!("Updated: {}\n", project.updated_at));
-                    
-                    result.push_str(&format!("\nNote: Deployment information is not available in this service.\n"));
-                    
+
+                    result.push_str(
+                        &"\nNote: Deployment information is not available in this service.\n"
+                            .to_string(),
+                    );
+
                     Ok(CallToolResult::success(vec![Content::text(result)]))
                 }
                 Err(ProjectError::NotFound(_)) => {
@@ -164,7 +172,6 @@ impl McpService {
         }
     }
 
-
     pub fn with_project_service(mut self, project_service: Arc<ProjectService>) -> Self {
         self.project_service = Some(project_service);
         self
@@ -172,13 +179,15 @@ impl McpService {
 
     pub async fn initialize_mcp_server(&self) -> anyhow::Result<()> {
         info!("Initializing MCP server with built-in prompts and resources");
-        
+
         // Populate resources dynamically
         self.populate_resources().await?;
-        
-        info!("MCP server initialized with {} prompts and {} resources", 
-               self.prompts.read().await.len(), 
-               self.resources.read().await.len());
+
+        info!(
+            "MCP server initialized with {} prompts and {} resources",
+            self.prompts.read().await.len(),
+            self.resources.read().await.len()
+        );
         Ok(())
     }
 
@@ -205,7 +214,10 @@ impl McpService {
                             id: format!("project-{}", project.slug),
                             uri: format!("project://{}", project.slug),
                             name: format!("Project: {}", project.name),
-                            description: format!("Access to {} project data and configurations", project.name),
+                            description: format!(
+                                "Access to {} project data and configurations",
+                                project.name
+                            ),
                             mime_type: Some("application/json".to_string()),
                             client_id: None,
                         });
@@ -220,8 +232,19 @@ impl McpService {
         Ok(())
     }
 
-    pub async fn add_client(&self, id: String, name: String, command: String, args: Vec<String>) -> anyhow::Result<()> {
-        let client = McpClient { id, name: name.clone(), command, args };
+    pub async fn add_client(
+        &self,
+        id: String,
+        name: String,
+        command: String,
+        args: Vec<String>,
+    ) -> anyhow::Result<()> {
+        let client = McpClient {
+            id,
+            name: name.clone(),
+            command,
+            args,
+        };
         let mut clients = self.clients.write().await;
         clients.push(client);
         info!("Added MCP client: {}", name);
@@ -246,7 +269,9 @@ impl McpService {
 
     pub async fn connect_to_client(&self, id: &str) -> anyhow::Result<Value> {
         let clients = self.clients.read().await;
-        let client = clients.iter().find(|c| c.id == id)
+        let client = clients
+            .iter()
+            .find(|c| c.id == id)
             .ok_or_else(|| anyhow::anyhow!("Client not found"))?;
 
         debug!("Connecting to MCP client: {}", client.name);
@@ -254,7 +279,7 @@ impl McpService {
         // For now, we'll return a mock response
         // In production, this would establish actual MCP client connections
         info!("Mock connection to MCP client: {}", client.name);
-        
+
         Ok(serde_json::json!({
             "status": "connected",
             "client_id": id,
@@ -262,9 +287,14 @@ impl McpService {
         }))
     }
 
-    pub async fn execute_tool(&self, client_id: &str, tool_name: &str, arguments: Value) -> anyhow::Result<Value> {
+    pub async fn execute_tool(
+        &self,
+        client_id: &str,
+        tool_name: &str,
+        arguments: Value,
+    ) -> anyhow::Result<Value> {
         debug!("Executing tool {} on client {}", tool_name, client_id);
-        
+
         Ok(serde_json::json!({
             "result": "Tool execution not yet implemented",
             "tool": tool_name,
@@ -281,19 +311,25 @@ impl McpService {
 
     pub async fn get_prompt(&self, id: &str) -> anyhow::Result<McpPrompt> {
         let prompts = self.prompts.read().await;
-        prompts.iter().find(|p| p.id == id)
+        prompts
+            .iter()
+            .find(|p| p.id == id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Prompt not found"))
     }
 
-    pub async fn execute_prompt(&self, id: &str, arguments: HashMap<String, String>) -> anyhow::Result<String> {
+    pub async fn execute_prompt(
+        &self,
+        id: &str,
+        arguments: HashMap<String, String>,
+    ) -> anyhow::Result<String> {
         let prompt = self.get_prompt(id).await?;
         let mut result = prompt.template.clone();
-        
+
         for (key, value) in arguments {
             result = result.replace(&format!("{{{{{}}}}}", key), &value);
         }
-        
+
         debug!("Executed prompt {}: {}", id, result);
         Ok(result)
     }
@@ -315,56 +351,52 @@ impl McpService {
     }
 
     async fn get_project_resource(&self, uri: &str) -> anyhow::Result<Value> {
-        let project_service = self.project_service.as_ref()
+        let project_service = self
+            .project_service
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Project service not available"))?;
 
         let path = uri.strip_prefix("project://").unwrap_or("");
-        
+
         if path.is_empty() {
             // Return list of all projects
             match project_service.get_projects().await {
-                Ok(projects) => {
-                    Ok(serde_json::json!({
-                        "type": "project_list",
-                        "uri": uri,
-                        "data": {
-                            "projects": projects,
-                            "count": projects.len()
-                        }
-                    }))
-                }
-                Err(e) => {
-                    Err(anyhow::anyhow!("Failed to fetch projects: {}", e))
-                }
+                Ok(projects) => Ok(serde_json::json!({
+                    "type": "project_list",
+                    "uri": uri,
+                    "data": {
+                        "projects": projects,
+                        "count": projects.len()
+                    }
+                })),
+                Err(e) => Err(anyhow::anyhow!("Failed to fetch projects: {}", e)),
             }
         } else {
             // Try to get project by slug first (preferred)
             match project_service.get_project_by_slug(path).await {
-                Ok(project) => {
-                    Ok(serde_json::json!({
-                        "type": "project_detail",
-                        "uri": uri,
-                        "data": {
-                            "project": project
-                        }
-                    }))
-                }
+                Ok(project) => Ok(serde_json::json!({
+                    "type": "project_detail",
+                    "uri": uri,
+                    "data": {
+                        "project": project
+                    }
+                })),
                 Err(_) => {
                     // If slug lookup fails, try ID as fallback (for backward compatibility)
                     if let Ok(project_id) = path.parse::<i32>() {
                         match project_service.get_project(project_id).await {
-                            Ok(project) => {
-                                Ok(serde_json::json!({
-                                    "type": "project_detail",
-                                    "uri": uri,
-                                    "data": {
-                                        "project": project
-                                    }
-                                }))
-                            }
-                            Err(e) => {
-                                Err(anyhow::anyhow!("Failed to fetch project '{}' by slug or ID: {}", path, e))
-                            }
+                            Ok(project) => Ok(serde_json::json!({
+                                "type": "project_detail",
+                                "uri": uri,
+                                "data": {
+                                    "project": project
+                                }
+                            })),
+                            Err(e) => Err(anyhow::anyhow!(
+                                "Failed to fetch project '{}' by slug or ID: {}",
+                                path,
+                                e
+                            )),
                         }
                     } else {
                         Err(anyhow::anyhow!("Project '{}' not found by slug", path))
@@ -373,7 +405,6 @@ impl McpService {
             }
         }
     }
-
 
     pub async fn add_resource(&self, resource: McpResource) -> anyhow::Result<()> {
         let mut resources = self.resources.write().await;
@@ -420,11 +451,13 @@ impl McpService {
         ];
 
         Ok(GetPromptResult {
-            description: Some(format!("Get information about project {}", args.project_slug)),
+            description: Some(format!(
+                "Get information about project {}",
+                args.project_slug
+            )),
             messages,
         })
     }
-
 }
 
 // ServerHandler implementation for MCP protocol
@@ -465,9 +498,7 @@ impl ServerHandler for McpService {
         let resources = self.resources.read().await;
         let raw_resources = resources
             .iter()
-            .map(|resource| {
-                RawResource::new(&resource.uri, resource.name.clone()).no_annotation()
-            })
+            .map(|resource| RawResource::new(&resource.uri, resource.name.clone()).no_annotation())
             .collect();
 
         Ok(ListResourcesResult {
@@ -482,14 +513,13 @@ impl ServerHandler for McpService {
         _: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
         match self.get_resource(&uri).await {
-            Ok(data) => {
-                Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::text(
-                        serde_json::to_string_pretty(&data).unwrap_or_else(|_| "Error serializing data".to_string()),
-                        uri,
-                    )],
-                })
-            }
+            Ok(data) => Ok(ReadResourceResult {
+                contents: vec![ResourceContents::text(
+                    serde_json::to_string_pretty(&data)
+                        .unwrap_or_else(|_| "Error serializing data".to_string()),
+                    uri,
+                )],
+            }),
             Err(_) => Err(McpError::resource_not_found(
                 "Resource not found",
                 Some(json!({ "uri": uri })),
@@ -511,7 +541,7 @@ impl ServerHandler for McpService {
     async fn initialize(
         &self,
         _request: InitializeRequestParam,
-        context: RequestContext<RoleServer>,
+        _context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
         info!("MCP server initialized");
         Ok(self.get_info())

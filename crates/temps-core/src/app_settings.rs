@@ -91,7 +91,7 @@ impl AppSettings {
     pub fn from_json(value: serde_json::Value) -> Self {
         serde_json::from_value(value).unwrap_or_default()
     }
-    
+
     /// Convert settings to JSON value
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))

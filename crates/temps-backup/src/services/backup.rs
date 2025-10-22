@@ -214,7 +214,7 @@ impl BackupService {
             .ok_or_else(|| BackupError::NotFound("S3 source not found".to_string()))?;
 
         // Create a temporary file for the backup
-        let mut temp_file = NamedTempFile::new().map_err(|e| BackupError::Io(e))?;
+        let mut temp_file = NamedTempFile::new().map_err(BackupError::Io)?;
 
         // Perform database backup
         self.backup_database(&mut temp_file).await?;
@@ -226,7 +226,7 @@ impl BackupService {
         let size_bytes = temp_file
             .as_file()
             .metadata()
-            .map_err(|e| BackupError::Io(e))?
+            .map_err(BackupError::Io)?
             .len() as i32;
 
         // Generate S3 location
@@ -333,7 +333,7 @@ impl BackupService {
             .key(&metadata_key)
             .body(
                 serde_json::to_vec(&metadata)
-                    .map_err(|e| BackupError::Serialization(e))?
+                    .map_err(BackupError::Serialization)?
                     .into(),
             )
             .content_type("application/json")
@@ -366,9 +366,9 @@ impl BackupService {
     }
 
     async fn backup_postgres_database(&self, temp_file: &mut NamedTempFile) -> Result<()> {
-        use bollard::query_parameters::RemoveContainerOptions;
         use bollard::exec::{CreateExecOptions, StartExecResults};
         use bollard::models::ContainerCreateBody as Config;
+        use bollard::query_parameters::RemoveContainerOptions;
         use bollard::Docker;
         use futures::stream::StreamExt as FuturesStreamExt;
 
@@ -378,7 +378,7 @@ impl BackupService {
         let database_url = &self.config_service.get_database_url();
 
         // Parse database URL to extract connection parameters
-        let url = url::Url::parse(&database_url)
+        let url = url::Url::parse(database_url)
             .map_err(|e| anyhow::anyhow!("Invalid DATABASE_URL format: {}", e))?;
 
         let host = url.host_str().unwrap_or("localhost");
@@ -959,7 +959,7 @@ impl BackupService {
 
         // Create S3 client
         let s3_client = self
-            .create_s3_client(&s3_source)
+            .create_s3_client(s3_source)
             .await
             .map_err(|e| BackupError::S3(e.to_string()))?;
 
@@ -1049,7 +1049,7 @@ impl BackupService {
         if db_path_buf.exists() {
             let _ = std::fs::remove_file(&db_path_buf);
         }
-        std::fs::copy(temp_file.path(), &db_path_buf).map_err(|e| BackupError::Io(e))?;
+        std::fs::copy(temp_file.path(), &db_path_buf).map_err(BackupError::Io)?;
 
         // Optionally run integrity check (best-effort)
         let _ = self
@@ -1075,7 +1075,7 @@ impl BackupService {
 
         // Create S3 client
         let s3_client = self
-            .create_s3_client(&s3_source)
+            .create_s3_client(s3_source)
             .await
             .map_err(|e| BackupError::S3(e.to_string()))?;
 
@@ -1110,7 +1110,7 @@ impl BackupService {
         let database_url = &self.config_service.get_database_url();
 
         // Parse database URL to extract connection parameters
-        let url = url::Url::parse(&database_url)
+        let url = url::Url::parse(database_url)
             .map_err(|e| BackupError::Internal(format!("Invalid DATABASE_URL format: {}", e)))?;
 
         let host = url.host_str().unwrap_or("localhost");
@@ -1338,7 +1338,7 @@ impl BackupService {
         // Calculate next run time
         let cron_schedule = Schedule::from_str(&request.schedule_expression)
             .map_err(|e| BackupError::Schedule(e.to_string()))?;
-        let next_run = cron_schedule.upcoming(Utc).next().map(|dt| dt);
+        let next_run = cron_schedule.upcoming(Utc).next();
 
         // Insert with SeaORM
         let now = chrono::Utc::now();
@@ -1756,7 +1756,7 @@ impl BackupService {
                 &subpath,
                 &subpath_root,
                 &self.db,
-                &service,
+                service,
                 service_config,
             )
             .await
@@ -2004,7 +2004,7 @@ impl BackupService {
             .map_err(|_| BackupError::Validation("Invalid backup schedule".into()))?;
 
         // Calculate next run time
-        let next_run = schedule.upcoming(Utc).next().map(|dt| dt);
+        let next_run = schedule.upcoming(Utc).next();
 
         // Get the schedule and update it
         let schedule_model = temps_entities::backup_schedules::Entity::find_by_id(schedule_id)
@@ -2057,7 +2057,7 @@ impl BackupService {
         // Calculate next run time based on the schedule expression
         let cron_schedule = Schedule::from_str(&schedule.schedule_expression)
             .map_err(|_| BackupError::Validation("Invalid backup schedule".into()))?;
-        let next_run = cron_schedule.upcoming(Utc).next().map(|dt| dt);
+        let next_run = cron_schedule.upcoming(Utc).next();
 
         // Update the schedule
         let mut schedule_update: temps_entities::backup_schedules::ActiveModel =
@@ -2076,9 +2076,7 @@ mod tests {
     use super::*;
     use bollard::Docker;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
-    use temps_core::notifications::{
-        EmailMessage, NotificationData, NotificationError,
-    };
+    use temps_core::notifications::{EmailMessage, NotificationData, NotificationError};
     use temps_core::EncryptionService;
     use temps_entities::{backup_schedules, s3_sources};
 

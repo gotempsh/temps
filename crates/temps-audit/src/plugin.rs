@@ -8,7 +8,7 @@ use temps_core::plugin::{
 use temps_core::AuditLogger;
 use utoipa::OpenApi;
 
-use crate::{AuditService, handlers};
+use crate::{handlers, AuditService};
 
 /// Audit Plugin for managing audit logs and user action tracking
 pub struct AuditPlugin;
@@ -40,10 +40,7 @@ impl TempsPlugin for AuditPlugin {
             let ip_address_service = context.require_service::<temps_geo::IpAddressService>();
 
             // Create AuditService
-            let audit_service = Arc::new(AuditService::new(
-                db.clone(),
-                ip_address_service.clone(),
-            ));
+            let audit_service = Arc::new(AuditService::new(db.clone(), ip_address_service.clone()));
             context.register_service(audit_service.clone());
             let audit_trait: Arc<dyn AuditLogger> = audit_service.clone();
             context.register_service(audit_trait);
@@ -54,18 +51,15 @@ impl TempsPlugin for AuditPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let audit_service = context.get_service::<AuditService>()
+        let audit_service = context
+            .get_service::<AuditService>()
             .expect("AuditService must be registered before configuring routes");
 
-        let app_state = Arc::new(handlers::types::AppState {
-            audit_service,
-        });
+        let app_state = Arc::new(handlers::types::AppState { audit_service });
 
         let routes = handlers::handlers::configure_routes().with_state(app_state);
 
-        Some(PluginRoutes {
-            router: routes,
-        })
+        Some(PluginRoutes { router: routes })
     }
 
     fn openapi_schema(&self) -> Option<utoipa::openapi::OpenApi> {

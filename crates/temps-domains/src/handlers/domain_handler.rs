@@ -89,12 +89,10 @@ impl From<RepositoryError> for Problem {
                     .detail(msg)
                     .build()
             }
-            RepositoryError::Internal(msg) => {
-                ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .title("Internal Error")
-                    .detail(msg)
-                    .build()
-            }
+            RepositoryError::Internal(msg) => ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Internal Error")
+                .detail(msg)
+                .build(),
         }
     }
 }
@@ -1226,15 +1224,11 @@ async fn list_orders(
 
     info!("Listing all ACME orders for user: {}", auth.user_id());
 
-    let acme_orders = app_state
-        .repository
-        .list_all_orders()
-        .await
-        .map_err(|e| {
-            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Failed to list orders")
-                .with_detail(e.to_string())
-        })?;
+    let acme_orders = app_state.repository.list_all_orders().await.map_err(|e| {
+        temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Failed to list orders")
+            .with_detail(e.to_string())
+    })?;
 
     let orders: Vec<AcmeOrderResponse> = acme_orders
         .into_iter()

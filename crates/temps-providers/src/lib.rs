@@ -1,11 +1,11 @@
 //! providers services and utilities
 
-pub mod services;
 mod externalsvc;
+pub mod services;
 pub use services::*;
-mod utils;
-mod types;
 pub mod plugin;
+mod types;
+mod utils;
 pub use externalsvc::ServiceType;
 pub mod handlers;
 

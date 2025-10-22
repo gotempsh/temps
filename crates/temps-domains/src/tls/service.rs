@@ -2,10 +2,12 @@ use anyhow::Result;
 use chrono::Utc;
 use hickory_resolver::config::{LookupIpStrategy, ResolverConfig, ResolverOpts};
 use hickory_resolver::TokioAsyncResolver;
-use tracing::{error, info, warn};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
-use temps_core::notifications::{NotificationData, NotificationService, NotificationType, NotificationPriority};
+use temps_core::notifications::{
+    NotificationData, NotificationPriority, NotificationService, NotificationType,
+};
+use tracing::{error, info, warn};
 
 use super::errors::{BuilderError, TlsError};
 use super::models::*;
@@ -49,7 +51,10 @@ impl TlsService {
         }
     }
 
-    pub fn with_notification_service(mut self, notification_service: Arc<dyn NotificationService>) -> Self {
+    pub fn with_notification_service(
+        mut self,
+        notification_service: Arc<dyn NotificationService>,
+    ) -> Self {
         self.notification_service = Some(notification_service);
         self
     }
@@ -65,16 +70,33 @@ impl TlsService {
     }
 
     // Certificate provisioning
-    pub async fn provision_certificate(&self, domain: &str, email: &str) -> Result<Certificate, TlsError> {
-        info!("Provisioning certificate for domain: {} using HTTP-01 challenge with email: {}", domain, email);
+    pub async fn provision_certificate(
+        &self,
+        domain: &str,
+        email: &str,
+    ) -> Result<Certificate, TlsError> {
+        info!(
+            "Provisioning certificate for domain: {} using HTTP-01 challenge with email: {}",
+            domain, email
+        );
         self.initiate_http_challenge(domain, email).await
     }
 
+    async fn initiate_http_challenge(
+        &self,
+        domain: &str,
+        email: &str,
+    ) -> Result<Certificate, TlsError> {
+        info!(
+            "Initiating HTTP-01 challenge for {} with email: {}",
+            domain, email
+        );
 
-    async fn initiate_http_challenge(&self, domain: &str, email: &str) -> Result<Certificate, TlsError> {
-        info!("Initiating HTTP-01 challenge for {} with email: {}", domain, email);
-
-        match self.cert_provider.provision(domain, ChallengeType::Http01, email).await? {
+        match self
+            .cert_provider
+            .provision(domain, ChallengeType::Http01, email)
+            .await?
+        {
             ProvisioningResult::Challenge(challenge_data) => {
                 // Save challenge data for the HTTP server to serve
                 let http_challenge = HttpChallengeData {
@@ -105,10 +127,18 @@ impl TlsService {
         }
     }
 
-    pub async fn complete_http_challenge(&self, domain: &str, email: &str) -> Result<Certificate, TlsError> {
-        info!("Completing HTTP-01 challenge for {} with email: {}", domain, email);
+    pub async fn complete_http_challenge(
+        &self,
+        domain: &str,
+        email: &str,
+    ) -> Result<Certificate, TlsError> {
+        info!(
+            "Completing HTTP-01 challenge for {} with email: {}",
+            domain, email
+        );
 
-        let challenge_data = self.repository
+        let challenge_data = self
+            .repository
             .find_http_challenge(domain)
             .await?
             .ok_or_else(|| TlsError::NotFound(format!("No HTTP challenge found for {}", domain)))?;
@@ -124,7 +154,10 @@ impl TlsService {
             order_url: None, // Order URL not stored for HTTP challenges
         };
 
-        let cert = self.cert_provider.complete_challenge(domain, &challenge, email).await?;
+        let cert = self
+            .cert_provider
+            .complete_challenge(domain, &challenge, email)
+            .await?;
         let saved_cert = self.repository.save_certificate(cert).await?;
 
         // Clean up challenge data
@@ -142,18 +175,37 @@ impl TlsService {
             .map_err(Into::into)
     }
 
-    pub async fn get_certificate_for_sni(&self, sni: &str) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, String, String)>, TlsError> {
+    pub async fn get_certificate_for_sni(
+        &self,
+        sni: &str,
+    ) -> Result<
+        Option<(
+            Vec<CertificateDer<'static>>,
+            PrivateKeyDer<'static>,
+            String,
+            String,
+        )>,
+        TlsError,
+    > {
         match self.repository.find_certificate_for_sni(sni).await? {
             Some(cert) if !cert.certificate_pem.is_empty() && !cert.private_key_pem.is_empty() => {
                 let cert_chain = load_certs(cert.certificate_pem.as_bytes())?;
                 let private_key = load_private_key(cert.private_key_pem.as_bytes())?;
-                Ok(Some((cert_chain, private_key, cert.certificate_pem, cert.private_key_pem)))
+                Ok(Some((
+                    cert_chain,
+                    private_key,
+                    cert.certificate_pem,
+                    cert.private_key_pem,
+                )))
             }
             _ => Ok(None),
         }
     }
 
-    pub async fn list_certificates(&self, filter: CertificateFilter) -> Result<Vec<Certificate>, TlsError> {
+    pub async fn list_certificates(
+        &self,
+        filter: CertificateFilter,
+    ) -> Result<Vec<Certificate>, TlsError> {
         self.repository
             .list_certificates(filter)
             .await
@@ -168,8 +220,15 @@ impl TlsService {
         }
     }
 
-    pub async fn renew_certificate(&self, domain: &str, email: &str) -> Result<Certificate, TlsError> {
-        info!("Renewing certificate for domain: {} with email: {}", domain, email);
+    pub async fn renew_certificate(
+        &self,
+        domain: &str,
+        email: &str,
+    ) -> Result<Certificate, TlsError> {
+        info!(
+            "Renewing certificate for domain: {} with email: {}",
+            domain, email
+        );
         self.provision_certificate(domain, email).await
     }
 
@@ -198,9 +257,15 @@ impl TlsService {
     /// - HTTP-01 certificates: Auto-renew
     /// - DNS-01 certificates: Send notification for manual renewal
     /// Threshold: 30 days before expiration
-    pub async fn check_and_renew_certificates(&self, renewal_threshold_days: i32) -> Result<RenewalReport, TlsError> {
+    pub async fn check_and_renew_certificates(
+        &self,
+        renewal_threshold_days: i32,
+    ) -> Result<RenewalReport, TlsError> {
         // Find all certificates expiring within threshold
-        let expiring = self.repository.find_expiring_certificates(renewal_threshold_days).await?;
+        let expiring = self
+            .repository
+            .find_expiring_certificates(renewal_threshold_days)
+            .await?;
 
         let mut report = RenewalReport {
             total_checked: expiring.len(),
@@ -220,7 +285,10 @@ impl TlsService {
                     self.handle_dns01_notification(&cert, &mut report).await;
                 }
                 _ => {
-                    warn!("Unknown verification method '{}' for domain {}", cert.verification_method, cert.domain);
+                    warn!(
+                        "Unknown verification method '{}' for domain {}",
+                        cert.verification_method, cert.domain
+                    );
                 }
             }
         }
@@ -283,7 +351,8 @@ impl TlsService {
                 });
 
                 // Send immediate notification for failed renewal
-                self.send_renewal_failure_notification(&cert.domain, &e.to_string()).await;
+                self.send_renewal_failure_notification(&cert.domain, &e.to_string())
+                    .await;
             }
         }
     }
@@ -321,23 +390,35 @@ impl TlsService {
         );
 
         if !report.auto_renewed.is_empty() {
-            message.push_str(&format!("\n✅ Auto-Renewed ({}):\n", report.auto_renewed.len()));
+            message.push_str(&format!(
+                "\n✅ Auto-Renewed ({}):\n",
+                report.auto_renewed.len()
+            ));
             for domain in &report.auto_renewed {
                 message.push_str(&format!("  • {}\n", domain));
             }
         }
 
         if !report.renewal_failed.is_empty() {
-            message.push_str(&format!("\n❌ Renewal Failed ({}):\n", report.renewal_failed.len()));
+            message.push_str(&format!(
+                "\n❌ Renewal Failed ({}):\n",
+                report.renewal_failed.len()
+            ));
             for failure in &report.renewal_failed {
                 message.push_str(&format!("  • {}: {}\n", failure.domain, failure.error));
             }
         }
 
         if !report.manual_action_needed.is_empty() {
-            message.push_str(&format!("\n⚠️  Manual Renewal Needed ({}):\n", report.manual_action_needed.len()));
+            message.push_str(&format!(
+                "\n⚠️  Manual Renewal Needed ({}):\n",
+                report.manual_action_needed.len()
+            ));
             for manual in &report.manual_action_needed {
-                message.push_str(&format!("  • {} (expires in {} days)\n", manual.domain, manual.days_remaining));
+                message.push_str(&format!(
+                    "  • {} (expires in {} days)\n",
+                    manual.domain, manual.days_remaining
+                ));
             }
         }
 
@@ -358,9 +439,18 @@ impl TlsService {
             severity: None,
             timestamp: Utc::now(),
             metadata: std::collections::HashMap::from([
-                ("auto_renewed".to_string(), report.auto_renewed.len().to_string()),
-                ("failed".to_string(), report.renewal_failed.len().to_string()),
-                ("manual_needed".to_string(), report.manual_action_needed.len().to_string()),
+                (
+                    "auto_renewed".to_string(),
+                    report.auto_renewed.len().to_string(),
+                ),
+                (
+                    "failed".to_string(),
+                    report.renewal_failed.len().to_string(),
+                ),
+                (
+                    "manual_needed".to_string(),
+                    report.manual_action_needed.len().to_string(),
+                ),
             ]),
             bypass_throttling: false,
         };
@@ -478,7 +568,10 @@ impl TlsService {
     }
 
     // Helper methods for HTTP challenges
-    pub async fn get_http_challenge(&self, domain: &str) -> Result<Option<HttpChallengeData>, TlsError> {
+    pub async fn get_http_challenge(
+        &self,
+        domain: &str,
+    ) -> Result<Option<HttpChallengeData>, TlsError> {
         self.repository
             .find_http_challenge(domain)
             .await
@@ -486,11 +579,12 @@ impl TlsService {
     }
 
     /// Get HTTP challenge debug information including DNS resolution
-    pub async fn get_http_challenge_debug(&self, domain: &str) -> Result<HttpChallengeDebugInfo, TlsError> {
+    pub async fn get_http_challenge_debug(
+        &self,
+        domain: &str,
+    ) -> Result<HttpChallengeDebugInfo, TlsError> {
         // Get challenge data
-        let challenge = self.repository
-            .find_http_challenge(domain)
-            .await?;
+        let challenge = self.repository.find_http_challenge(domain).await?;
 
         // Perform DNS resolution
         let dns_info = self.resolve_domain_info(domain).await;
@@ -499,9 +593,9 @@ impl TlsService {
             domain: domain.to_string(),
             challenge_exists: challenge.is_some(),
             challenge_token: challenge.as_ref().map(|c| c.token.clone()),
-            challenge_url: challenge.as_ref().map(|c| {
-                format!("http://{}/.well-known/acme-challenge/{}", domain, c.token)
-            }),
+            challenge_url: challenge
+                .as_ref()
+                .map(|c| format!("http://{}/.well-known/acme-challenge/{}", domain, c.token)),
             validation_url: challenge.as_ref().and_then(|c| c.validation_url.clone()),
             dns_a_records: dns_info.a_records,
             dns_aaaa_records: dns_info.aaaa_records,
@@ -618,15 +712,12 @@ impl TlsServiceBuilder {
         self
     }
 
-
-
     pub fn build(self) -> Result<TlsService, BuilderError> {
         Ok(TlsService::new(
             self.repository.ok_or(BuilderError::MissingRepository)?,
             self.cert_provider.ok_or(BuilderError::MissingProvider)?,
         ))
     }
-
 }
 
 // Helper functions
@@ -656,10 +747,13 @@ fn load_private_key(content: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tls::providers::CertificateProvider;
     use crate::tls::errors::ProviderError;
+    use crate::tls::models::{
+        Certificate, CertificateFilter, CertificateStatus, ChallengeData, ChallengeStrategy,
+        ChallengeType, DnsChallengeData, ProvisioningResult, ValidationResult,
+    };
+    use crate::tls::providers::CertificateProvider;
     use crate::tls::repository::test_utils::MockCertificateRepository;
-    use crate::tls::models::{Certificate, CertificateStatus, ChallengeData, ChallengeType, ChallengeStrategy, ProvisioningResult, ValidationResult, DnsChallengeData, CertificateFilter};
     use crate::tls::repository::DefaultCertificateRepository;
     use temps_core::{Job, JobQueue};
     use temps_database::test_utils::TestDatabase;
@@ -669,7 +763,6 @@ mod tests {
         // Create mock components
         let repo = Arc::new(MockCertificateRepository::new());
         let provider = Arc::new(MockCertificateProvider::new());
-
 
         // For now, we'll just test that the builder requires all components
         let result_missing_repo = TlsServiceBuilder::new()
@@ -714,7 +807,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CertificateProvider for MockCertificateProvider {
-        async fn provision(&self, domain: &str, _challenge: ChallengeType, _email: &str) -> Result<ProvisioningResult, ProviderError> {
+        async fn provision(
+            &self,
+            domain: &str,
+            _challenge: ChallengeType,
+            _email: &str,
+        ) -> Result<ProvisioningResult, ProviderError> {
             Ok(ProvisioningResult::Certificate(Certificate {
                 id: 1,
                 domain: domain.to_string(),
@@ -728,7 +826,12 @@ mod tests {
             }))
         }
 
-        async fn complete_challenge(&self, _domain: &str, _challenge_data: &ChallengeData, _email: &str) -> Result<Certificate, ProviderError> {
+        async fn complete_challenge(
+            &self,
+            _domain: &str,
+            _challenge_data: &ChallengeData,
+            _email: &str,
+        ) -> Result<Certificate, ProviderError> {
             Ok(Certificate {
                 id: 1,
                 domain: _domain.to_string(),
@@ -746,7 +849,11 @@ mod tests {
             vec![ChallengeType::Http01]
         }
 
-        async fn validate_prerequisites(&self, _domain: &str, _email: &str) -> Result<ValidationResult, ProviderError> {
+        async fn validate_prerequisites(
+            &self,
+            _domain: &str,
+            _email: &str,
+        ) -> Result<ValidationResult, ProviderError> {
             Ok(ValidationResult {
                 is_valid: true,
                 errors: vec![],
@@ -758,7 +865,6 @@ mod tests {
             Ok(())
         }
     }
-
 
     #[tokio::test]
     async fn test_builder_missing_components() {
@@ -772,7 +878,13 @@ mod tests {
 
         // Note: Can't create full service without ConfigService
         // But we can test the provider directly
-        let result = provider.provision("test.example.com", ChallengeType::Http01, "test@example.com").await;
+        let result = provider
+            .provision(
+                "test.example.com",
+                ChallengeType::Http01,
+                "test@example.com",
+            )
+            .await;
         assert!(result.is_ok());
 
         match result.unwrap() {
@@ -834,10 +946,9 @@ mod tests {
         assert_eq!(found.unwrap().domain, cert.domain);
 
         // Update status
-        repo.update_certificate_status(
-            &cert.domain,
-            CertificateStatus::Expired
-        ).await.unwrap();
+        repo.update_certificate_status(&cert.domain, CertificateStatus::Expired)
+            .await
+            .unwrap();
 
         // Verify status updated
         let updated = repo.find_certificate(&cert.domain).await.unwrap().unwrap();
@@ -906,7 +1017,10 @@ mod tests {
         let provider = MockCertificateProvider::new();
 
         // Test validation
-        let result = provider.validate_prerequisites("test.example.com", "test@example.com").await.unwrap();
+        let result = provider
+            .validate_prerequisites("test.example.com", "test@example.com")
+            .await
+            .unwrap();
         assert!(result.is_valid);
         assert!(result.errors.is_empty());
         assert!(result.warnings.is_empty());
@@ -926,13 +1040,12 @@ mod tests {
         let repo = Arc::new(DefaultCertificateRepository::new(db, encryption_service));
         let provider = Arc::new(MockCertificateProvider::new());
 
-        let service = TlsService::new(
-            repo.clone(),
-            provider,
-        );
+        let service = TlsService::new(repo.clone(), provider);
 
         // Test provisioning a certificate
-        let cert = service.provision_certificate("test.example.com", "test@example.com").await;
+        let cert = service
+            .provision_certificate("test.example.com", "test@example.com")
+            .await;
         assert!(cert.is_ok());
 
         let cert = cert.unwrap();
@@ -972,16 +1085,19 @@ mod tests {
         // Create service and renew
         let provider = Arc::new(MockCertificateProvider::new());
 
-        let service = TlsService::new(
-            repo.clone(),
-            provider,
-        );
+        let service = TlsService::new(repo.clone(), provider);
 
-        let renewed = service.renew_certificate("renew.example.com", "test@example.com").await;
+        let renewed = service
+            .renew_certificate("renew.example.com", "test@example.com")
+            .await;
         assert!(renewed.is_ok());
 
         // Check that the certificate was updated
-        let updated = repo.find_certificate("renew.example.com").await.unwrap().unwrap();
+        let updated = repo
+            .find_certificate("renew.example.com")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.certificate_pem, "mock cert"); // From MockCertificateProvider
     }
 
@@ -1117,7 +1233,10 @@ mod tests {
         repo.save_acme_account(account.clone()).await.unwrap();
 
         // Find account
-        let found = repo.find_acme_account("test_acme_account@example.com", "staging").await.unwrap();
+        let found = repo
+            .find_acme_account("test_acme_account@example.com", "staging")
+            .await
+            .unwrap();
         assert!(found.is_some());
 
         let found_account = found.unwrap();
@@ -1151,16 +1270,26 @@ mod tests {
 
         // Transition to PendingDns
         repo.update_certificate_status("status.example.com", CertificateStatus::PendingDns)
-            .await.unwrap();
+            .await
+            .unwrap();
 
-        let cert = repo.find_certificate("status.example.com").await.unwrap().unwrap();
+        let cert = repo
+            .find_certificate("status.example.com")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(cert.status, CertificateStatus::PendingDns));
 
         // Transition to Active
         repo.update_certificate_status("status.example.com", CertificateStatus::Active)
-            .await.unwrap();
+            .await
+            .unwrap();
 
-        let cert = repo.find_certificate("status.example.com").await.unwrap().unwrap();
+        let cert = repo
+            .find_certificate("status.example.com")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(cert.status, CertificateStatus::Active));
 
         // Transition to Failed
@@ -1169,10 +1298,16 @@ mod tests {
             CertificateStatus::Failed {
                 error: "Test error".to_string(),
                 error_type: "TestType".to_string(),
-            }
-        ).await.unwrap();
+            },
+        )
+        .await
+        .unwrap();
 
-        let cert = repo.find_certificate("status.example.com").await.unwrap().unwrap();
+        let cert = repo
+            .find_certificate("status.example.com")
+            .await
+            .unwrap()
+            .unwrap();
         match cert.status {
             CertificateStatus::Failed { error, error_type } => {
                 assert_eq!(error, "Test error");
@@ -1182,4 +1317,3 @@ mod tests {
         }
     }
 }
-

@@ -5,19 +5,17 @@
 //! 2. Build Image (using Docker to build the Node.js Dockerfile)
 //! 3. Deploy Image (simulated deployment)
 
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use temps_core::{WorkflowBuilder, WorkflowTask, WorkflowCancellationProvider};
-use temps_deployments::jobs::{
-    BuildImageJobBuilder,
-    DeployImageJobBuilder, DeploymentTarget,
-    DownloadRepoBuilder,
-};
-use temps_deployer::{ImageBuilder, ContainerDeployer, docker::DockerRuntime};
-use temps_git::{GitProviderManagerError, GitProviderManagerTrait, RepositoryInfo};
-use async_trait::async_trait;
 use temps_core::{LogWriter, WorkflowError};
+use temps_core::{WorkflowBuilder, WorkflowCancellationProvider, WorkflowTask};
+use temps_deployer::{docker::DockerRuntime, ContainerDeployer, ImageBuilder};
+use temps_deployments::jobs::{
+    BuildImageJobBuilder, DeployImageJobBuilder, DeploymentTarget, DownloadRepoBuilder,
+};
+use temps_git::{GitProviderManagerError, GitProviderManagerTrait, RepositoryInfo};
 use tokio::sync::Mutex;
 
 /// No-op cancellation provider for tests
@@ -79,21 +77,27 @@ impl GitProviderManagerTrait for LocalFixtureGitProvider {
         // Directory should not exist or should be empty
         if target_dir.exists() {
             let is_empty = std::fs::read_dir(target_dir)
-                .map_err(|e| GitProviderManagerError::CloneError(format!("Failed to read directory: {}", e)))?
+                .map_err(|e| {
+                    GitProviderManagerError::CloneError(format!("Failed to read directory: {}", e))
+                })?
                 .next()
                 .is_none();
 
             if !is_empty {
-                return Err(GitProviderManagerError::DirectoryNotEmpty(target_dir.display().to_string()));
+                return Err(GitProviderManagerError::DirectoryNotEmpty(
+                    target_dir.display().to_string(),
+                ));
             }
         }
 
         // Create directory and copy fixture files
-        std::fs::create_dir_all(target_dir)
-            .map_err(|e| GitProviderManagerError::CloneError(format!("Failed to create directory: {}", e)))?;
+        std::fs::create_dir_all(target_dir).map_err(|e| {
+            GitProviderManagerError::CloneError(format!("Failed to create directory: {}", e))
+        })?;
 
-        copy_dir_recursive(&self.fixture_path, target_dir)
-            .map_err(|e| GitProviderManagerError::CloneError(format!("Failed to copy fixture: {}", e)))?;
+        copy_dir_recursive(&self.fixture_path, target_dir).map_err(|e| {
+            GitProviderManagerError::CloneError(format!("Failed to copy fixture: {}", e))
+        })?;
         Ok(())
     }
 
@@ -120,7 +124,9 @@ impl GitProviderManagerTrait for LocalFixtureGitProvider {
         _archive_path: &std::path::Path,
     ) -> Result<(), GitProviderManagerError> {
         // Force fallback to clone
-        Err(GitProviderManagerError::Other("Archive not available for fixtures".to_string()))
+        Err(GitProviderManagerError::Other(
+            "Archive not available for fixtures".to_string(),
+        ))
     }
 }
 
@@ -162,11 +168,18 @@ async fn test_nodejs_three_stage_deployment() {
     }
 
     // Get fixture path
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/simple-nodejs");
+    let fixture_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/simple-nodejs");
 
-    assert!(fixture_path.exists(), "Fixture directory must exist: {:?}", fixture_path);
-    assert!(fixture_path.join("Dockerfile").exists(), "Dockerfile must exist in fixture");
+    assert!(
+        fixture_path.exists(),
+        "Fixture directory must exist: {:?}",
+        fixture_path
+    );
+    assert!(
+        fixture_path.join("Dockerfile").exists(),
+        "Dockerfile must exist in fixture"
+    );
 
     // Initialize service managers
     let git_manager: Arc<dyn GitProviderManagerTrait> = Arc::new(LocalFixtureGitProvider {
@@ -174,7 +187,11 @@ async fn test_nodejs_three_stage_deployment() {
     });
 
     // Create real Docker runtime (will skip test if Docker not available)
-    let docker_runtime = Arc::new(DockerRuntime::new(docker.clone(), false, "temps-test".to_string()));
+    let docker_runtime = Arc::new(DockerRuntime::new(
+        docker.clone(),
+        false,
+        "temps-test".to_string(),
+    ));
 
     // Ensure test network exists
     if let Err(e) = docker_runtime.ensure_network_exists().await {
@@ -240,9 +257,20 @@ async fn test_nodejs_three_stage_deployment() {
     assert_eq!(deploy_job.job_id(), "deploy_nodejs");
 
     // Verify dependency chain
-    assert!(download_job.depends_on().is_empty(), "Download should have no dependencies");
-    assert_eq!(build_job.depends_on(), vec!["download_nodejs"], "Build should depend on download");
-    assert_eq!(deploy_job.depends_on(), vec!["build_nodejs"], "Deploy should depend on build");
+    assert!(
+        download_job.depends_on().is_empty(),
+        "Download should have no dependencies"
+    );
+    assert_eq!(
+        build_job.depends_on(),
+        vec!["download_nodejs"],
+        "Build should depend on download"
+    );
+    assert_eq!(
+        deploy_job.depends_on(),
+        vec!["build_nodejs"],
+        "Deploy should depend on build"
+    );
 
     println!("✅ Dependency chain validated");
 
@@ -254,9 +282,12 @@ async fn test_nodejs_three_stage_deployment() {
         .with_workflow_run_id("nodejs-test-workflow".to_string())
         .with_deployment_context(1, 1, 1)
         .with_log_writer(log_writer.clone())
-        .with_var("repo_owner", "test").unwrap()
-        .with_var("repo_name", "nodejs-app").unwrap()
-        .with_var("image_tag", "nodejs-test-app:latest").unwrap()
+        .with_var("repo_owner", "test")
+        .unwrap()
+        .with_var("repo_name", "nodejs-app")
+        .unwrap()
+        .with_var("image_tag", "nodejs-test-app:latest")
+        .unwrap()
         .with_job(Arc::new(download_job))
         .with_job(Arc::new(build_job))
         .with_job(Arc::new(deploy_job))
@@ -274,7 +305,9 @@ async fn test_nodejs_three_stage_deployment() {
 
     let executor = WorkflowExecutor::new(None); // No job tracker for test
     let cancellation_provider = Arc::new(NoCancellationProvider);
-    let result = executor.execute_workflow(workflow_config, cancellation_provider).await;
+    let result = executor
+        .execute_workflow(workflow_config, cancellation_provider)
+        .await;
 
     // Check execution result
     match &result {
@@ -285,28 +318,33 @@ async fn test_nodejs_three_stage_deployment() {
             println!("🔍 Verifying stage outputs...");
 
             // Stage 1: Download - should have repo_dir output
-            let repo_dir: Option<String> = final_context.get_output("download_nodejs", "repo_dir")
+            let repo_dir: Option<String> = final_context
+                .get_output("download_nodejs", "repo_dir")
                 .expect("Should get repo_dir output");
             assert!(repo_dir.is_some(), "Download stage should produce repo_dir");
             println!("  ✓ Download stage: repo_dir = {:?}", repo_dir);
 
             // Stage 2: Build - should have image_tag and image_id outputs
-            let image_tag: Option<String> = final_context.get_output("build_nodejs", "image_tag")
+            let image_tag: Option<String> = final_context
+                .get_output("build_nodejs", "image_tag")
                 .expect("Should get image_tag output");
             assert!(image_tag.is_some(), "Build stage should produce image_tag");
             println!("  ✓ Build stage: image_tag = {:?}", image_tag);
 
-            let image_id: Option<String> = final_context.get_output("build_nodejs", "image_id")
+            let image_id: Option<String> = final_context
+                .get_output("build_nodejs", "image_id")
                 .expect("Should get image_id output");
             assert!(image_id.is_some(), "Build stage should produce image_id");
             println!("  ✓ Build stage: image_id = {:?}", image_id);
 
             // Stage 3: Deploy - should have deployment outputs
-            let deployment_status: Option<String> = final_context.get_output("deploy_nodejs", "status")
+            let deployment_status: Option<String> = final_context
+                .get_output("deploy_nodejs", "status")
                 .expect("Should get deployment status");
             println!("  ✓ Deploy stage: status = {:?}", deployment_status);
 
-            let deployment_id: Option<String> = final_context.get_output("deploy_nodejs", "deployment_id")
+            let deployment_id: Option<String> = final_context
+                .get_output("deploy_nodejs", "deployment_id")
                 .expect("Should get deployment_id output");
             if let Some(container_id) = deployment_id {
                 println!("\n🔍 Verifying Container Deployment:");
@@ -314,14 +352,22 @@ async fn test_nodejs_three_stage_deployment() {
 
                 // 1. Check if container exists and is running
                 use bollard::container::InspectContainerOptions;
-                match docker.inspect_container(&container_id, None::<InspectContainerOptions>).await {
+                match docker
+                    .inspect_container(&container_id, None::<InspectContainerOptions>)
+                    .await
+                {
                     Ok(inspect) => {
                         // Check running status
                         let state = inspect.state.as_ref();
                         let is_running = state.and_then(|s| s.running).unwrap_or(false);
-                        let status = state.and_then(|s| s.status.as_ref()).map(|s| format!("{:?}", s)).unwrap_or_else(|| "unknown".to_string());
+                        let status = state
+                            .and_then(|s| s.status.as_ref())
+                            .map(|s| format!("{:?}", s))
+                            .unwrap_or_else(|| "unknown".to_string());
                         let exit_code = state.and_then(|s| s.exit_code);
-                        let started_at = state.and_then(|s| s.started_at.as_ref()).map(|s| s.to_string());
+                        let started_at = state
+                            .and_then(|s| s.started_at.as_ref())
+                            .map(|s| s.to_string());
 
                         println!("  ✓ Container status: {}", status);
                         println!("  ✓ Running: {}", is_running);
@@ -340,12 +386,21 @@ async fn test_nodejs_three_stage_deployment() {
                                 }
                                 if let Some(env) = config.env {
                                     println!("    - Environment variables: {} entries", env.len());
-                                    for var in env.iter().filter(|v| v.starts_with("NODE_ENV") || v.starts_with("PORT")) {
+                                    for var in env.iter().filter(|v| {
+                                        v.starts_with("NODE_ENV") || v.starts_with("PORT")
+                                    }) {
                                         println!("      • {}", var);
                                     }
                                 }
                                 if let Some(exposed_ports) = config.exposed_ports {
-                                    println!("    - Exposed ports: {}", exposed_ports.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(", "));
+                                    println!(
+                                        "    - Exposed ports: {}",
+                                        exposed_ports
+                                            .keys()
+                                            .map(|k| k.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    );
                                 }
                             }
 
@@ -356,9 +411,14 @@ async fn test_nodejs_three_stage_deployment() {
                                     for (container_port, host_bindings) in ports.iter() {
                                         if let Some(bindings) = host_bindings {
                                             for binding in bindings {
-                                                let host_ip = binding.host_ip.as_deref().unwrap_or("0.0.0.0");
-                                                let host_port = binding.host_port.as_deref().unwrap_or("?");
-                                                println!("    - {}:{} -> {}", host_ip, host_port, container_port);
+                                                let host_ip =
+                                                    binding.host_ip.as_deref().unwrap_or("0.0.0.0");
+                                                let host_port =
+                                                    binding.host_port.as_deref().unwrap_or("?");
+                                                println!(
+                                                    "    - {}:{} -> {}",
+                                                    host_ip, host_port, container_port
+                                                );
                                             }
                                         }
                                     }
@@ -401,19 +461,31 @@ async fn test_nodejs_three_stage_deployment() {
                                 Ok(containers) => {
                                     for container in containers.iter() {
                                         let id = container.id.as_deref().unwrap_or("?");
-                                        let names = container.names.as_ref()
+                                        let names = container
+                                            .names
+                                            .as_ref()
                                             .map(|n| n.join(", "))
                                             .unwrap_or_else(|| "unnamed".to_string());
                                         let image = container.image.as_deref().unwrap_or("?");
                                         let status = container.status.as_deref().unwrap_or("?");
 
-                                        let marker = if id.starts_with(&container_id[..12]) { "👉" } else { "  " };
-                                        println!("    {} {} | {} | {} | {}", marker, &id[..12], names, image, status);
+                                        let marker = if id.starts_with(&container_id[..12]) {
+                                            "👉"
+                                        } else {
+                                            "  "
+                                        };
+                                        println!(
+                                            "    {} {} | {} | {} | {}",
+                                            marker,
+                                            &id[..12],
+                                            names,
+                                            image,
+                                            status
+                                        );
                                     }
                                 }
                                 Err(e) => println!("    Failed to list containers: {}", e),
                             }
-
                         } else {
                             println!("  ❌ Container is NOT running!");
                             println!("  Status: {}", status);
@@ -480,8 +552,11 @@ async fn test_nodejs_three_stage_deployment() {
     let all_logs = logs.join("\n");
 
     // Should have logs from each stage
-    let has_download_logs = all_logs.contains("download") || all_logs.contains("Download") || all_logs.contains("repository");
-    let has_build_logs = all_logs.contains("build") || all_logs.contains("Build") || all_logs.contains("image");
+    let has_download_logs = all_logs.contains("download")
+        || all_logs.contains("Download")
+        || all_logs.contains("repository");
+    let has_build_logs =
+        all_logs.contains("build") || all_logs.contains("Build") || all_logs.contains("image");
     let has_deploy_logs = all_logs.contains("deploy") || all_logs.contains("Deploy");
 
     if has_download_logs {
@@ -502,7 +577,10 @@ async fn test_nodejs_three_stage_deployment() {
 
         // Check if image exists using bollard
         let mut filters = std::collections::HashMap::new();
-        filters.insert("reference".to_string(), vec!["nodejs-test-app:latest".to_string()]);
+        filters.insert(
+            "reference".to_string(),
+            vec!["nodejs-test-app:latest".to_string()],
+        );
         let options = Some(ListImagesOptions::<String> {
             filters,
             ..Default::default()
@@ -529,20 +607,27 @@ async fn test_nodejs_three_stage_deployment() {
             ..Default::default()
         });
 
-        match docker.remove_image("nodejs-test-app:latest", remove_options, None).await {
+        match docker
+            .remove_image("nodejs-test-app:latest", remove_options, None)
+            .await
+        {
             Ok(_) => println!("  ✓ Image cleanup completed"),
             Err(e) => println!("  ⚠️  Image cleanup failed: {}", e),
         }
 
         // Also cleanup any deployed containers
         if let Ok(ref final_context) = result {
-            if let Ok(Some(container_id)) = final_context.get_output::<String>("deploy_nodejs", "deployment_id") {
+            if let Ok(Some(container_id)) =
+                final_context.get_output::<String>("deploy_nodejs", "deployment_id")
+            {
                 println!("🧹 Cleaning up deployed container...");
                 use bollard::container::RemoveContainerOptions;
 
                 // Stop container first
                 use bollard::container::StopContainerOptions;
-                let _ = docker.stop_container(&container_id, None::<StopContainerOptions>).await;
+                let _ = docker
+                    .stop_container(&container_id, None::<StopContainerOptions>)
+                    .await;
 
                 // Remove container
                 let container_remove_options = Some(RemoveContainerOptions {
@@ -550,7 +635,10 @@ async fn test_nodejs_three_stage_deployment() {
                     ..Default::default()
                 });
 
-                match docker.remove_container(&container_id, container_remove_options).await {
+                match docker
+                    .remove_container(&container_id, container_remove_options)
+                    .await
+                {
                     Ok(_) => println!("  ✓ Container cleanup completed"),
                     Err(e) => println!("  ⚠️  Container cleanup failed: {}", e),
                 }
@@ -575,34 +663,52 @@ async fn test_nodejs_three_stage_deployment() {
 
 #[test]
 fn test_nodejs_fixture_exists() {
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/simple-nodejs");
+    let fixture_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/simple-nodejs");
 
     assert!(fixture_path.exists(), "Fixture directory should exist");
-    assert!(fixture_path.join("Dockerfile").exists(), "Dockerfile should exist");
-    assert!(fixture_path.join("package.json").exists(), "package.json should exist");
-    assert!(fixture_path.join("index.js").exists(), "index.js should exist");
+    assert!(
+        fixture_path.join("Dockerfile").exists(),
+        "Dockerfile should exist"
+    );
+    assert!(
+        fixture_path.join("package.json").exists(),
+        "package.json should exist"
+    );
+    assert!(
+        fixture_path.join("index.js").exists(),
+        "index.js should exist"
+    );
 
     // Verify Dockerfile contains Node.js base image
-    let dockerfile_content = std::fs::read_to_string(fixture_path.join("Dockerfile"))
-        .expect("Should read Dockerfile");
-    assert!(dockerfile_content.contains("FROM node:"), "Dockerfile should use Node.js base image");
-    assert!(dockerfile_content.contains("EXPOSE 3000"), "Dockerfile should expose port 3000");
+    let dockerfile_content =
+        std::fs::read_to_string(fixture_path.join("Dockerfile")).expect("Should read Dockerfile");
+    assert!(
+        dockerfile_content.contains("FROM node:"),
+        "Dockerfile should use Node.js base image"
+    );
+    assert!(
+        dockerfile_content.contains("EXPOSE 3000"),
+        "Dockerfile should expose port 3000"
+    );
 }
 
 #[test]
 fn test_nodejs_package_json_valid() {
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/simple-nodejs");
+    let fixture_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/simple-nodejs");
 
     let package_json = std::fs::read_to_string(fixture_path.join("package.json"))
         .expect("Should read package.json");
 
     // Parse as JSON to verify it's valid
-    let parsed: serde_json::Value = serde_json::from_str(&package_json)
-        .expect("package.json should be valid JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&package_json).expect("package.json should be valid JSON");
 
     assert!(parsed["name"].is_string(), "Should have name field");
     assert!(parsed["version"].is_string(), "Should have version field");
-    assert!(parsed["dependencies"].is_object(), "Should have dependencies");
+    assert!(
+        parsed["dependencies"].is_object(),
+        "Should have dependencies"
+    );
 }

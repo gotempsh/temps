@@ -7,8 +7,8 @@
 use crate::DbConnection;
 use sea_orm::*;
 use sea_orm_migration::MigratorTrait;
-use temps_migrations::Migrator;
 use std::sync::Arc;
+use temps_migrations::Migrator;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::{Mutex, OnceCell};
 
@@ -22,10 +22,6 @@ static ACTIVE_INSTANCES: OnceCell<Arc<Mutex<usize>>> = OnceCell::const_new();
 /// This prevents race conditions when multiple tests try to create TimescaleDB
 /// continuous aggregates and internal types simultaneously
 static MIGRATION_LOCK: OnceCell<Arc<Mutex<()>>> = OnceCell::const_new();
-
-/// Global extension lock to ensure only one test creates extensions at a time
-/// This prevents conflicts when creating TimescaleDB and vector extensions
-static EXTENSION_LOCK: OnceCell<Arc<Mutex<()>>> = OnceCell::const_new();
 
 /// Shared container wrapper that holds the database container and connection details
 struct SharedContainer {
@@ -115,7 +111,9 @@ impl Drop for TestDatabase {
                             let mut container_opt = container_holder.lock().await;
                             if let Some(container) = container_opt.take() {
                                 drop(container); // Explicitly drop the SharedContainer
-                                eprintln!("Dropped shared test database container (all tests completed)");
+                                eprintln!(
+                                    "Dropped shared test database container (all tests completed)"
+                                );
                             }
                         }
                     }
@@ -137,7 +135,7 @@ impl TestDatabase {
                 Ok(Arc::new(Mutex::new(Some(container))))
             })
             .await
-            .map(|arc| Arc::clone(arc))
+            .map(Arc::clone)
     }
 
     /// Initialize or get the active instances counter
@@ -183,7 +181,9 @@ impl TestDatabase {
         // Create the unique schema
         let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {}", schema_name);
         let statement = Statement::from_string(DatabaseBackend::Postgres, create_schema_sql);
-        admin_db.execute(statement).await
+        admin_db
+            .execute(statement)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to create test schema: {}", e))?;
 
         // Now reconnect with the schema in the search_path via connection string parameter
@@ -202,7 +202,9 @@ impl TestDatabase {
         };
 
         // Verify connection works
-        test_db.test_connection().await
+        test_db
+            .test_connection()
+            .await
             .map_err(|e| anyhow::anyhow!("Initial connection test failed: {}", e))?;
 
         Ok(test_db)
@@ -257,7 +259,9 @@ impl TestDatabase {
         };
 
         // Verify connection works
-        test_db.test_connection().await
+        test_db
+            .test_connection()
+            .await
             .map_err(|e| anyhow::anyhow!("Initial connection test failed: {}", e))?;
         // Run migrations after creating the isolated test database
         use sea_orm_migration::MigratorTrait;
@@ -271,7 +275,9 @@ impl TestDatabase {
     ///
     /// Note: This method now creates an isolated container.
     /// Use `new()` for shared container (recommended) or `new_isolated()` for explicit isolation.
-    #[deprecated(note = "Use TestDatabase::new() for shared container or TestDatabase::new_isolated_with_config() for isolated container")]
+    #[deprecated(
+        note = "Use TestDatabase::new() for shared container or TestDatabase::new_isolated_with_config() for isolated container"
+    )]
     pub async fn with_config(
         db_name: &str,
         username: &str,
@@ -289,7 +295,9 @@ impl TestDatabase {
         let test_db = Self::new().await?;
 
         // Verify database connection is working before migrations
-        test_db.test_connection().await
+        test_db
+            .test_connection()
+            .await
             .map_err(|e| anyhow::anyhow!("Database connection test failed: {}", e))?;
 
         // Acquire the global migration lock to ensure only one test runs migrations at a time
@@ -302,12 +310,19 @@ impl TestDatabase {
 
         // Create extensions (protected by migration lock)
         // Extensions must be created in public schema (database-wide)
-        test_db.execute_sql("CREATE EXTENSION IF NOT EXISTS timescaledb WITH SCHEMA public CASCADE").await.ok();
-        test_db.execute_sql("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public CASCADE").await.ok();
+        test_db
+            .execute_sql("CREATE EXTENSION IF NOT EXISTS timescaledb WITH SCHEMA public CASCADE")
+            .await
+            .ok();
+        test_db
+            .execute_sql("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public CASCADE")
+            .await
+            .ok();
 
         // Run migrations in this test's unique schema
         // Since each test has its own schema, migrations always run, but only one at a time
-        Migrator::up(&*test_db.db, None).await
+        Migrator::up(&*test_db.db, None)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to run migrations: {}", e))?;
 
         // Verify migrations were successful by checking a known table in current schema
@@ -317,7 +332,9 @@ impl TestDatabase {
             AND table_name = 'users'
         )";
 
-        let result = test_db.query_sql(check_sql).await
+        let result = test_db
+            .query_sql(check_sql)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to verify migrations: {}", e))?;
 
         let users_table_exists = result
@@ -345,7 +362,9 @@ impl TestDatabase {
         let test_db = Self::new().await?;
 
         // Verify database connection is working
-        test_db.test_connection().await
+        test_db
+            .test_connection()
+            .await
             .map_err(|e| anyhow::anyhow!("Database connection test failed: {}", e))?;
 
         // Acquire the global migration lock to ensure only one test runs migrations at a time
@@ -355,11 +374,18 @@ impl TestDatabase {
         let _lock = migration_lock.lock().await;
 
         // Create extensions (protected by migration lock)
-        test_db.execute_sql("CREATE EXTENSION IF NOT EXISTS timescaledb WITH SCHEMA public CASCADE").await.ok();
-        test_db.execute_sql("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public CASCADE").await.ok();
+        test_db
+            .execute_sql("CREATE EXTENSION IF NOT EXISTS timescaledb WITH SCHEMA public CASCADE")
+            .await
+            .ok();
+        test_db
+            .execute_sql("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public CASCADE")
+            .await
+            .ok();
 
         // Run migrations in this test's unique schema
-        M::up(&*test_db.db, None).await
+        M::up(&*test_db.db, None)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to run custom migrations: {}", e))?;
 
         // Lock is automatically released when _lock goes out of scope
@@ -391,24 +417,31 @@ impl TestDatabase {
             match Database::connect(opt.clone()).await {
                 Ok(db) => {
                     // Verify connection with a simple query
-                    let test = Statement::from_string(
-                        DatabaseBackend::Postgres,
-                        "SELECT 1".to_owned()
-                    );
+                    let test =
+                        Statement::from_string(DatabaseBackend::Postgres, "SELECT 1".to_owned());
 
                     match db.execute(test).await {
                         Ok(_) => return Ok(db),
                         Err(e) if retries > 0 => {
-                            eprintln!("Database connected but test query failed (retries left: {}): {}", retries, e);
+                            eprintln!(
+                                "Database connected but test query failed (retries left: {}): {}",
+                                retries, e
+                            );
                             // Fall through to retry logic below
                         }
                         Err(e) => {
-                            return Err(anyhow::anyhow!("Database connected but not responsive: {}", e));
+                            return Err(anyhow::anyhow!(
+                                "Database connected but not responsive: {}",
+                                e
+                            ));
                         }
                     }
                 }
                 Err(e) if retries > 0 => {
-                    eprintln!("Failed to connect to database (retries left: {}): {}", retries, e);
+                    eprintln!(
+                        "Failed to connect to database (retries left: {}): {}",
+                        retries, e
+                    );
                     // Fall through to retry logic below
                 }
                 Err(e) => {
@@ -455,7 +488,7 @@ impl TestDatabase {
                     // Verify connection and search_path (include public for TimescaleDB)
                     let test = Statement::from_string(
                         DatabaseBackend::Postgres,
-                        format!("SET search_path TO {}, public", schema_name)
+                        format!("SET search_path TO {}, public", schema_name),
                     );
 
                     match db.execute(test).await {
@@ -463,20 +496,29 @@ impl TestDatabase {
                             // Verify search_path is set correctly
                             let check = Statement::from_string(
                                 DatabaseBackend::Postgres,
-                                "SHOW search_path".to_owned()
+                                "SHOW search_path".to_owned(),
                             );
                             match db.query_one(check).await {
                                 Ok(_) => return Ok(db),
                                 Err(e) if retries > 0 => {
-                                    eprintln!("Search path verification failed (retries left: {}): {}", retries, e);
+                                    eprintln!(
+                                        "Search path verification failed (retries left: {}): {}",
+                                        retries, e
+                                    );
                                 }
                                 Err(e) => {
-                                    return Err(anyhow::anyhow!("Failed to verify search_path: {}", e));
+                                    return Err(anyhow::anyhow!(
+                                        "Failed to verify search_path: {}",
+                                        e
+                                    ));
                                 }
                             }
                         }
                         Err(e) if retries > 0 => {
-                            eprintln!("Failed to set search_path (retries left: {}): {}", retries, e);
+                            eprintln!(
+                                "Failed to set search_path (retries left: {}): {}",
+                                retries, e
+                            );
                         }
                         Err(e) => {
                             return Err(anyhow::anyhow!("Failed to set search_path: {}", e));
@@ -484,7 +526,10 @@ impl TestDatabase {
                     }
                 }
                 Err(e) if retries > 0 => {
-                    eprintln!("Failed to connect to database (retries left: {}): {}", retries, e);
+                    eprintln!(
+                        "Failed to connect to database (retries left: {}): {}",
+                        retries, e
+                    );
                 }
                 Err(e) => {
                     return Err(anyhow::anyhow!("Failed to connect to database: {}", e));
@@ -506,14 +551,22 @@ impl TestDatabase {
     /// Execute raw SQL query for testing
     pub async fn execute_sql(&self, sql: &str) -> anyhow::Result<ExecResult> {
         let statement = Statement::from_string(DatabaseBackend::Postgres, sql.to_owned());
-        let result = self.db.execute(statement).await.map_err(anyhow::Error::from)?;
+        let result = self
+            .db
+            .execute(statement)
+            .await
+            .map_err(anyhow::Error::from)?;
         Ok(result)
     }
 
     /// Query raw SQL and return results
     pub async fn query_sql(&self, sql: &str) -> anyhow::Result<Vec<QueryResult>> {
         let statement = Statement::from_string(DatabaseBackend::Postgres, sql.to_owned());
-        let result = self.db.query_all(statement).await.map_err(anyhow::Error::from)?;
+        let result = self
+            .db
+            .query_all(statement)
+            .await
+            .map_err(anyhow::Error::from)?;
         Ok(result)
     }
 
@@ -524,13 +577,11 @@ impl TestDatabase {
     pub async fn cleanup_all_tables(&self) -> anyhow::Result<()> {
         // First, drop all TimescaleDB continuous aggregates (materialized views)
         let views = self
-            .query_sql(
-                "SELECT matviewname FROM pg_matviews WHERE schemaname = 'public'",
-            )
+            .query_sql("SELECT matviewname FROM pg_matviews WHERE schemaname = 'public'")
             .await?;
 
         for view in views {
-            if let Some(view_name) = view.try_get::<String>("", "matviewname").ok() {
+            if let Ok(view_name) = view.try_get::<String>("", "matviewname") {
                 let sql = format!("DROP MATERIALIZED VIEW IF EXISTS {} CASCADE", view_name);
                 self.execute_sql(&sql).await.ok(); // Ignore errors
             }
@@ -548,7 +599,7 @@ impl TestDatabase {
             .await?;
 
         for type_row in types {
-            if let Some(type_name) = type_row.try_get::<String>("", "typname").ok() {
+            if let Ok(type_name) = type_row.try_get::<String>("", "typname") {
                 let sql = format!("DROP TYPE IF EXISTS {} CASCADE", type_name);
                 self.execute_sql(&sql).await.ok(); // Ignore errors
             }
@@ -566,7 +617,7 @@ impl TestDatabase {
 
         // Truncate each table
         for table in tables {
-            if let Some(table_name) = table.try_get::<String>("", "tablename").ok() {
+            if let Ok(table_name) = table.try_get::<String>("", "tablename") {
                 let sql = format!("TRUNCATE TABLE {} CASCADE", table_name);
                 self.execute_sql(&sql).await?;
             }
@@ -730,9 +781,11 @@ mod tests {
         let test_db = TestDatabase::with_migrations().await?;
 
         // Verify users table exists
-        let result = test_db.query_sql(
-            "SELECT column_name FROM information_schema.columns WHERE table_name = 'users'"
-        ).await?;
+        let result = test_db
+            .query_sql(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'users'",
+            )
+            .await?;
 
         assert!(!result.is_empty(), "Users table should have columns");
         Ok(())

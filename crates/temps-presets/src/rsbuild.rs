@@ -105,8 +105,7 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     }
 
     fn dockerfile_with_build_dir(&self, _local_path: &PathBuf) -> String {
-        format!(
-            r#"
+        r#"
 # Use a lightweight base image
 FROM oven/bun:1.2-alpine
 
@@ -123,9 +122,8 @@ EXPOSE 3000
 
 # Use serve to host the static files
 CMD ["serve", "-s", "dist", "-l", "3000"]
-      
-"#,
-        )
+
+"#.to_string()
     }
 
     fn install_command(&self, local_path: &PathBuf) -> String {

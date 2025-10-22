@@ -51,7 +51,6 @@ pub struct Problem {
 }
 
 /// Create a new `Problem` response to send to the client.
-
 pub fn new<S>(status_code: S) -> Problem
 where
     S: Into<StatusCode>,

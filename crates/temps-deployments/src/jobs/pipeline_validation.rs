@@ -2,20 +2,22 @@
 //!
 //! This module provides synchronous validation of the complete deployment pipeline
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::path::Path;
-use temps_core::{WorkflowBuilder, WorkflowTask, LogWriter, WorkflowError};
-use temps_git::{GitProviderManagerTrait, GitProviderManagerError, RepositoryInfo};
 use async_trait::async_trait;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+use temps_core::{LogWriter, WorkflowBuilder, WorkflowError, WorkflowTask};
+use temps_git::{GitProviderManagerError, GitProviderManagerTrait, RepositoryInfo};
 
 use crate::jobs::{
-    DownloadRepoBuilder,
-    BuildImageJobBuilder, RepositoryOutput,
-    DeployImageJobBuilder, DeploymentTarget, BuildImageOutput
+    BuildImageJobBuilder, BuildImageOutput, DeployImageJobBuilder, DeploymentTarget,
+    DownloadRepoBuilder, RepositoryOutput,
 };
-use temps_deployer::{ImageBuilder, BuildRequest, BuildResult, BuilderError, ContainerDeployer, DeployRequest, DeployResult, DeployerError, ContainerInfo, ContainerStatus};
 use std::path::PathBuf;
+use temps_deployer::{
+    BuildRequest, BuildResult, BuilderError, ContainerDeployer, ContainerInfo, ContainerStatus,
+    DeployRequest, DeployResult, DeployerError, ImageBuilder,
+};
 
 /// Mock ImageBuilder for pipeline validation
 struct MockImageBuilder;
@@ -35,11 +37,19 @@ impl ImageBuilder for MockImageBuilder {
         Ok("sha256:imported".to_string())
     }
 
-    async fn extract_from_image(&self, _image_name: &str, _source_path: &str, _destination_path: &Path) -> Result<(), BuilderError> {
+    async fn extract_from_image(
+        &self,
+        _image_name: &str,
+        _source_path: &str,
+        _destination_path: &Path,
+    ) -> Result<(), BuilderError> {
         Ok(())
     }
 
-    async fn build_image_with_callback(&self, request: temps_deployer::BuildRequestWithCallback) -> Result<BuildResult, BuilderError> {
+    async fn build_image_with_callback(
+        &self,
+        request: temps_deployer::BuildRequestWithCallback,
+    ) -> Result<BuildResult, BuilderError> {
         self.build_image(request.request).await
     }
 
@@ -57,7 +67,10 @@ struct MockContainerDeployer;
 
 #[async_trait]
 impl ContainerDeployer for MockContainerDeployer {
-    async fn deploy_container(&self, request: DeployRequest) -> Result<DeployResult, DeployerError> {
+    async fn deploy_container(
+        &self,
+        request: DeployRequest,
+    ) -> Result<DeployResult, DeployerError> {
         Ok(DeployResult {
             container_id: "mock_container_123".to_string(),
             container_name: request.container_name,
@@ -87,7 +100,10 @@ impl ContainerDeployer for MockContainerDeployer {
         Ok(())
     }
 
-    async fn get_container_info(&self, _container_id: &str) -> Result<ContainerInfo, DeployerError> {
+    async fn get_container_info(
+        &self,
+        _container_id: &str,
+    ) -> Result<ContainerInfo, DeployerError> {
         Ok(ContainerInfo {
             container_id: "mock_container_123".to_string(),
             container_name: "mock_container".to_string(),
@@ -107,7 +123,10 @@ impl ContainerDeployer for MockContainerDeployer {
         Ok("mock logs".to_string())
     }
 
-    async fn stream_container_logs(&self, _container_id: &str) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, DeployerError> {
+    async fn stream_container_logs(
+        &self,
+        _container_id: &str,
+    ) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, DeployerError> {
         Err(DeployerError::Other("Not implemented".to_string()))
     }
 }
@@ -150,7 +169,9 @@ impl GitProviderManagerTrait for MockGitProviderManager {
         _branch_or_ref: &str,
         _archive_path: &Path,
     ) -> Result<(), GitProviderManagerError> {
-        Err(GitProviderManagerError::Other("Mock: not implemented".to_string()))
+        Err(GitProviderManagerError::Other(
+            "Mock: not implemented".to_string(),
+        ))
     }
 }
 
@@ -244,9 +265,20 @@ fn validate_job_creation() -> Result<(), String> {
     assert_eq!(deploy_job.job_id(), "deploy_image");
 
     // Validate dependency chain
-    assert!(download_job.depends_on().is_empty(), "Download job should have no dependencies");
-    assert_eq!(build_job.depends_on(), vec!["download_repo"], "Build job should depend on download");
-    assert_eq!(deploy_job.depends_on(), vec!["build_image"], "Deploy job should depend on build");
+    assert!(
+        download_job.depends_on().is_empty(),
+        "Download job should have no dependencies"
+    );
+    assert_eq!(
+        build_job.depends_on(),
+        vec!["download_repo"],
+        "Build job should depend on download"
+    );
+    assert_eq!(
+        deploy_job.depends_on(),
+        vec!["build_image"],
+        "Deploy job should depend on build"
+    );
 
     println!("    ✅ All jobs created with correct dependencies");
     Ok(())
@@ -258,19 +290,23 @@ fn validate_typed_data_flow() -> Result<(), String> {
     // Create workflow context
     let mut context = crate::test_utils::create_test_context(
         "validation-workflow".to_string(),
-        1,  // deployment_id
-        1,  // project_id
-        1   // environment_id
+        1, // deployment_id
+        1, // project_id
+        1, // environment_id
     );
 
     // Step 1: Simulate DownloadRepoJob outputs
-    context.set_output("download_repo", "repo_dir", "/tmp/workspace/webapp")
+    context
+        .set_output("download_repo", "repo_dir", "/tmp/workspace/webapp")
         .map_err(|e| format!("Failed to set download output: {}", e))?;
-    context.set_output("download_repo", "checkout_ref", "main")
+    context
+        .set_output("download_repo", "checkout_ref", "main")
         .map_err(|e| format!("Failed to set checkout_ref: {}", e))?;
-    context.set_output("download_repo", "repo_owner", "example")
+    context
+        .set_output("download_repo", "repo_owner", "example")
         .map_err(|e| format!("Failed to set repo_owner: {}", e))?;
-    context.set_output("download_repo", "repo_name", "webapp")
+    context
+        .set_output("download_repo", "repo_name", "webapp")
         .map_err(|e| format!("Failed to set repo_name: {}", e))?;
 
     // Validate we can extract typed repository output
@@ -280,18 +316,30 @@ fn validate_typed_data_flow() -> Result<(), String> {
     assert_eq!(repo_output.repo_owner, "example");
     assert_eq!(repo_output.repo_name, "webapp");
     assert_eq!(repo_output.checkout_ref, "main");
-    println!("    ✅ Repository output extracted: {}/{}", repo_output.repo_owner, repo_output.repo_name);
+    println!(
+        "    ✅ Repository output extracted: {}/{}",
+        repo_output.repo_owner, repo_output.repo_name
+    );
 
     // Step 2: Simulate BuildImageJob outputs
-    context.set_output("build_image", "image_tag", "webapp:v1.0.0")
+    context
+        .set_output("build_image", "image_tag", "webapp:v1.0.0")
         .map_err(|e| format!("Failed to set image_tag: {}", e))?;
-    context.set_output("build_image", "image_id", "sha256:abc123def456789")
+    context
+        .set_output("build_image", "image_id", "sha256:abc123def456789")
         .map_err(|e| format!("Failed to set image_id: {}", e))?;
-    context.set_output("build_image", "size_bytes", 157286400u64)
+    context
+        .set_output("build_image", "size_bytes", 157286400u64)
         .map_err(|e| format!("Failed to set size_bytes: {}", e))?;
-    context.set_output("build_image", "build_context", "/tmp/workspace/webapp")
+    context
+        .set_output("build_image", "build_context", "/tmp/workspace/webapp")
         .map_err(|e| format!("Failed to set build_context: {}", e))?;
-    context.set_output("build_image", "dockerfile_path", "/tmp/workspace/webapp/Dockerfile")
+    context
+        .set_output(
+            "build_image",
+            "dockerfile_path",
+            "/tmp/workspace/webapp/Dockerfile",
+        )
         .map_err(|e| format!("Failed to set dockerfile_path: {}", e))?;
 
     // Validate we can extract typed image output
@@ -301,29 +349,45 @@ fn validate_typed_data_flow() -> Result<(), String> {
     assert_eq!(image_output.image_tag, "webapp:v1.0.0");
     assert_eq!(image_output.image_id, "sha256:abc123def456789");
     assert_eq!(image_output.size_bytes, 157286400);
-    println!("    ✅ Image output extracted: {} ({})", image_output.image_tag, image_output.image_id);
+    println!(
+        "    ✅ Image output extracted: {} ({})",
+        image_output.image_tag, image_output.image_id
+    );
 
     // Step 3: Simulate DeployImageJob outputs
-    context.set_output("deploy_image", "deployment_id", "deploy-abc12345")
+    context
+        .set_output("deploy_image", "deployment_id", "deploy-abc12345")
         .map_err(|e| format!("Failed to set deployment_id: {}", e))?;
-    context.set_output("deploy_image", "service_name", "webapp")
+    context
+        .set_output("deploy_image", "service_name", "webapp")
         .map_err(|e| format!("Failed to set service_name: {}", e))?;
-    context.set_output("deploy_image", "namespace", "production")
+    context
+        .set_output("deploy_image", "namespace", "production")
         .map_err(|e| format!("Failed to set namespace: {}", e))?;
-    context.set_output("deploy_image", "endpoint_url", "https://webapp.production.example.com")
+    context
+        .set_output(
+            "deploy_image",
+            "endpoint_url",
+            "https://webapp.production.example.com",
+        )
         .map_err(|e| format!("Failed to set endpoint_url: {}", e))?;
 
     // Validate final outputs
-    let deployment_id: String = context.get_output("deploy_image", "deployment_id")
+    let deployment_id: String = context
+        .get_output("deploy_image", "deployment_id")
         .map_err(|e| format!("Failed to get deployment_id: {}", e))?
         .ok_or("deployment_id not found")?;
-    let endpoint_url: String = context.get_output("deploy_image", "endpoint_url")
+    let endpoint_url: String = context
+        .get_output("deploy_image", "endpoint_url")
         .map_err(|e| format!("Failed to get endpoint_url: {}", e))?
         .ok_or("endpoint_url not found")?;
 
     assert_eq!(deployment_id, "deploy-abc12345");
     assert_eq!(endpoint_url, "https://webapp.production.example.com");
-    println!("    ✅ Deployment output extracted: {} at {}", deployment_id, endpoint_url);
+    println!(
+        "    ✅ Deployment output extracted: {} at {}",
+        deployment_id, endpoint_url
+    );
 
     Ok(())
 }
@@ -344,7 +408,7 @@ fn validate_workflow_builder_integration() -> Result<(), String> {
             .git_provider_connection_id(1)
             .branch_ref("main".to_string())
             .build(git_manager)
-            .map_err(|e| format!("Failed to create download job: {}", e))?
+            .map_err(|e| format!("Failed to create download job: {}", e))?,
     );
 
     let build_job = Arc::new(
@@ -353,7 +417,7 @@ fn validate_workflow_builder_integration() -> Result<(), String> {
             .download_job_id("download_repo".to_string())
             .image_tag("webapp:latest".to_string())
             .build(image_builder)
-            .map_err(|e| format!("Failed to create build job: {}", e))?
+            .map_err(|e| format!("Failed to create build job: {}", e))?,
     );
 
     let deploy_job = Arc::new(
@@ -367,7 +431,7 @@ fn validate_workflow_builder_integration() -> Result<(), String> {
             .service_name("webapp".to_string())
             .namespace("test".to_string())
             .build(container_deployer)
-            .map_err(|e| format!("Failed to create deploy job: {}", e))?
+            .map_err(|e| format!("Failed to create deploy job: {}", e))?,
     );
 
     // Create workflow with all jobs
@@ -395,7 +459,9 @@ fn validate_workflow_builder_integration() -> Result<(), String> {
     assert_eq!(workflow_config.max_parallel_jobs, 1);
 
     // Validate all jobs are present
-    let job_ids: Vec<_> = workflow_config.jobs.iter()
+    let job_ids: Vec<_> = workflow_config
+        .jobs
+        .iter()
         .map(|j| j.job.job_id())
         .collect();
 
@@ -420,10 +486,18 @@ fn validate_error_handling() -> Result<(), String> {
     println!("    ✅ Correctly fails without download outputs");
 
     // Test 2: Add download outputs but missing build outputs should fail
-    context.set_output("download_repo", "repo_dir", "/tmp/repo").unwrap();
-    context.set_output("download_repo", "checkout_ref", "main").unwrap();
-    context.set_output("download_repo", "repo_owner", "user").unwrap();
-    context.set_output("download_repo", "repo_name", "project").unwrap();
+    context
+        .set_output("download_repo", "repo_dir", "/tmp/repo")
+        .unwrap();
+    context
+        .set_output("download_repo", "checkout_ref", "main")
+        .unwrap();
+    context
+        .set_output("download_repo", "repo_owner", "user")
+        .unwrap();
+    context
+        .set_output("download_repo", "repo_name", "project")
+        .unwrap();
 
     let deploy_result = BuildImageOutput::from_context(&context, "build_image");
     if deploy_result.is_ok() {
@@ -432,11 +506,21 @@ fn validate_error_handling() -> Result<(), String> {
     println!("    ✅ Correctly fails without build outputs");
 
     // Test 3: Complete chain should work
-    context.set_output("build_image", "image_tag", "project:latest").unwrap();
-    context.set_output("build_image", "image_id", "sha256:123").unwrap();
-    context.set_output("build_image", "size_bytes", 1000000u64).unwrap();
-    context.set_output("build_image", "build_context", "/tmp/repo").unwrap();
-    context.set_output("build_image", "dockerfile_path", "/tmp/repo/Dockerfile").unwrap();
+    context
+        .set_output("build_image", "image_tag", "project:latest")
+        .unwrap();
+    context
+        .set_output("build_image", "image_id", "sha256:123")
+        .unwrap();
+    context
+        .set_output("build_image", "size_bytes", 1000000u64)
+        .unwrap();
+    context
+        .set_output("build_image", "build_context", "/tmp/repo")
+        .unwrap();
+    context
+        .set_output("build_image", "dockerfile_path", "/tmp/repo/Dockerfile")
+        .unwrap();
 
     let repo_result = RepositoryOutput::from_context(&context, "download_repo");
     let build_result = BuildImageOutput::from_context(&context, "build_image");

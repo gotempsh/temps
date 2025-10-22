@@ -163,7 +163,10 @@ impl PostgresService {
         let containers = docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
                 all: true,
-                filters: Some(HashMap::from([("name".to_string(), vec![container_name.to_string()])])),
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![container_name.to_string()],
+                )])),
                 ..Default::default()
             }))
             .await?;
@@ -181,7 +184,7 @@ impl PostgresService {
             (name_label_key, self.name.to_string()),
         ]);
 
-        let env_vars = vec![
+        let env_vars = [
             format!("POSTGRES_USER={}", config.username),
             format!("POSTGRES_PASSWORD={}", config.password),
             format!("POSTGRES_DB={}", config.database),
@@ -409,21 +412,18 @@ impl PostgresService {
             .await?;
 
         let output = docker.start_exec(&exec.id, None).await?;
-        match output {
-            bollard::exec::StartExecResults::Attached { mut output, .. } => {
-                while let Some(Ok(output)) = output.next().await {
-                    match output {
-                        bollard::container::LogOutput::StdOut { message } => {
-                            info!("stdout: {}", String::from_utf8_lossy(&message));
-                        }
-                        bollard::container::LogOutput::StdErr { message } => {
-                            error!("stderr: {}", String::from_utf8_lossy(&message));
-                        }
-                        _ => {}
+        if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
+            while let Some(Ok(output)) = output.next().await {
+                match output {
+                    bollard::container::LogOutput::StdOut { message } => {
+                        info!("stdout: {}", String::from_utf8_lossy(&message));
                     }
+                    bollard::container::LogOutput::StdErr { message } => {
+                        error!("stderr: {}", String::from_utf8_lossy(&message));
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
         }
 
         Ok(())
@@ -505,33 +505,30 @@ impl ExternalService for PostgresService {
 
         let output: bollard::exec::StartExecResults =
             self.docker.start_exec(&exec.id, None).await?;
-        match output {
-            bollard::exec::StartExecResults::Attached { output, .. } => {
-                let mut stream = output.boxed();
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(log_output) => match log_output {
-                            bollard::container::LogOutput::StdOut { message }
-                            | bollard::container::LogOutput::StdErr { message } => {
-                                temp_file.write_all(&message)?;
-                            }
-                            _ => (),
-                        },
-                        Err(e) => {
-                            error!("Error streaming backup data: {}", e);
-                            // Update backup record with error
-                            let mut backup_update: external_service_backups::ActiveModel =
-                                backup_record.clone().into();
-                            backup_update.state = Set("failed".to_string());
-                            backup_update.error_message = Set(Some(e.to_string()));
-                            backup_update.finished_at = Set(Some(Utc::now()));
-                            backup_update.update(pool).await?;
-                            return Err(anyhow::anyhow!("Failed to stream backup data: {}", e));
+        if let bollard::exec::StartExecResults::Attached { output, .. } = output {
+            let mut stream = output.boxed();
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(log_output) => match log_output {
+                        bollard::container::LogOutput::StdOut { message }
+                        | bollard::container::LogOutput::StdErr { message } => {
+                            temp_file.write_all(&message)?;
                         }
+                        _ => (),
+                    },
+                    Err(e) => {
+                        error!("Error streaming backup data: {}", e);
+                        // Update backup record with error
+                        let mut backup_update: external_service_backups::ActiveModel =
+                            backup_record.clone().into();
+                        backup_update.state = Set("failed".to_string());
+                        backup_update.error_message = Set(Some(e.to_string()));
+                        backup_update.finished_at = Set(Some(Utc::now()));
+                        backup_update.update(pool).await?;
+                        return Err(anyhow::anyhow!("Failed to stream backup data: {}", e));
                     }
                 }
             }
-            _ => (),
         }
 
         // Generate backup path in S3
@@ -817,7 +814,10 @@ impl ExternalService for PostgresService {
             .docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
                 all: true,
-                filters: Some(HashMap::from([("name".to_string(), vec![container_name.clone()])])),
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![container_name.clone()],
+                )])),
                 ..Default::default()
             }))
             .await?;

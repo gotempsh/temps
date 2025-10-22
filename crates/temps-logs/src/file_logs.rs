@@ -8,11 +8,11 @@
 
 use chrono::Utc;
 use futures::Stream;
-use tracing::{debug, trace};
 use std::path::PathBuf;
 use tokio::fs::{create_dir_all, File};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom};
 use tokio::time::Duration;
+use tracing::{debug, trace};
 
 pub struct LogService {
     log_base_path: PathBuf,
@@ -296,7 +296,9 @@ mod tests {
         let log_id = "test-with-dashes_and_underscores";
         let log_path = log_service.get_log_path(log_id);
 
-        assert!(log_path.to_string_lossy().contains("test-with-dashes_and_underscores.log"));
+        assert!(log_path
+            .to_string_lossy()
+            .contains("test-with-dashes_and_underscores.log"));
 
         // Should be able to write to it
         log_service
@@ -318,7 +320,7 @@ mod tests {
 
         // Should create a date-based path structure
         let path_str = log_path.to_string_lossy();
-        assert!(path_str.contains("/"));  // Should have directory separators
+        assert!(path_str.contains("/")); // Should have directory separators
         assert!(path_str.ends_with("test-dir-structure.log"));
 
         // Directory should exist
@@ -471,12 +473,16 @@ mod tests {
 
         // Verify initial lines are present
         for i in 0..5 {
-            assert!(lines.iter().any(|line| line.contains(&format!("Initial line {}", i))));
+            assert!(lines
+                .iter()
+                .any(|line| line.contains(&format!("Initial line {}", i))));
         }
 
         // Verify concurrent writes are present
         for i in 0..10 {
-            assert!(lines.iter().any(|line| line.contains(&format!("Concurrent write {}", i))));
+            assert!(lines
+                .iter()
+                .any(|line| line.contains(&format!("Concurrent write {}", i))));
         }
     }
 
@@ -493,7 +499,10 @@ mod tests {
         let long_line = "B".repeat(50_000) + "\n";
 
         log_service.append_to_log(log_id, short_line).await.unwrap();
-        log_service.append_to_log(log_id, &medium_line).await.unwrap();
+        log_service
+            .append_to_log(log_id, &medium_line)
+            .await
+            .unwrap();
         log_service.append_to_log(log_id, &long_line).await.unwrap();
 
         let content = log_service.get_log_content(log_id).await.unwrap();
@@ -547,9 +556,18 @@ mod tests {
         let log_id = "test-line-endings";
 
         // Mix different line endings
-        log_service.append_to_log(log_id, "Unix line\n").await.unwrap();
-        log_service.append_to_log(log_id, "Windows line\r\n").await.unwrap();
-        log_service.append_to_log(log_id, "Mac line\r").await.unwrap();
+        log_service
+            .append_to_log(log_id, "Unix line\n")
+            .await
+            .unwrap();
+        log_service
+            .append_to_log(log_id, "Windows line\r\n")
+            .await
+            .unwrap();
+        log_service
+            .append_to_log(log_id, "Mac line\r")
+            .await
+            .unwrap();
 
         let content = log_service.get_log_content(log_id).await.unwrap();
         assert_eq!(content, "Unix line\nWindows line\r\nMac line\r");
@@ -566,7 +584,10 @@ mod tests {
         let binary_data = vec![0x00, 0xFF, 0xFE, 0xFD, 0x01, 0x02, 0x03];
         let binary_string = String::from_utf8_lossy(&binary_data);
 
-        log_service.append_to_log(log_id, &binary_string).await.unwrap();
+        log_service
+            .append_to_log(log_id, &binary_string)
+            .await
+            .unwrap();
 
         let content = log_service.get_log_content(log_id).await.unwrap();
         assert!(!content.is_empty());

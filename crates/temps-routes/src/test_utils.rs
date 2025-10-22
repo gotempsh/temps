@@ -4,7 +4,10 @@ use sea_orm::*;
 use std::sync::Arc;
 use temps_core::chrono::Utc;
 use temps_database::DbConnection;
-use temps_entities::{custom_routes, deployment_containers, deployments, environments, project_custom_domains, projects};
+use temps_entities::{
+    custom_routes, deployment_containers, deployments, environments, project_custom_domains,
+    projects,
+};
 
 /// Test database mock operations for route table tests
 pub struct TestDBMockOperations {
@@ -124,9 +127,7 @@ impl TestDBMockOperations {
         let _ = environments::Entity::delete_many()
             .exec(self.db.as_ref())
             .await;
-        let _ = projects::Entity::delete_many()
-            .exec(self.db.as_ref())
-            .await;
+        let _ = projects::Entity::delete_many().exec(self.db.as_ref()).await;
         Ok(())
     }
 }

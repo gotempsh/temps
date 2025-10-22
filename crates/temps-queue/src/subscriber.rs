@@ -1,12 +1,12 @@
 // Re-export for convenience - consumer modules can just subscribe directly
-pub use tokio::sync::broadcast;
 pub use temps_core::Job;
+pub use tokio::sync::broadcast;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::{GitPushEventJob, ProvisionCertificateJob};
     use crate::BroadcastQueueService;
+    use temps_core::{GitPushEventJob, ProvisionCertificateJob};
     use tokio::time::{timeout, Duration};
 
     #[tokio::test]
@@ -27,9 +27,12 @@ mod tests {
         };
         queue.send(Job::GitPushEvent(git_push_job)).await.unwrap();
 
-        queue.launch_certificate_provision(ProvisionCertificateJob {
-            domain: "test.com".to_string(),
-        }).await.unwrap();
+        queue
+            .launch_certificate_provision(ProvisionCertificateJob {
+                domain: "test.com".to_string(),
+            })
+            .await
+            .unwrap();
 
         // Simple pattern matching - this is what consumer modules would do
         let job1 = receiver.recv().await.unwrap();
@@ -60,9 +63,12 @@ mod tests {
         let mut receiver = queue.subscribe();
 
         // Send mixed jobs
-        queue.launch_certificate_provision(ProvisionCertificateJob {
-            domain: "example.com".to_string(),
-        }).await.unwrap();
+        queue
+            .launch_certificate_provision(ProvisionCertificateJob {
+                domain: "example.com".to_string(),
+            })
+            .await
+            .unwrap();
 
         let git_push_job = GitPushEventJob {
             owner: "acme-corp".to_string(),
@@ -74,7 +80,10 @@ mod tests {
         };
         queue.send(Job::GitPushEvent(git_push_job)).await.unwrap();
 
-        queue.launch_custom_domain_added("ignored.com".to_string()).await.unwrap();
+        queue
+            .launch_custom_domain_added("ignored.com".to_string())
+            .await
+            .unwrap();
 
         // Consumer module only caring about git push jobs would do this:
         let mut git_push_jobs = Vec::new();
@@ -95,7 +104,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_trait_based_usage() {
-        use temps_core::{JobQueue, GitPushEventJob};
+        use temps_core::{GitPushEventJob, JobQueue};
 
         // Consumer module would get a JobQueue trait object
         let queue: Box<dyn JobQueue> = crate::BroadcastQueueService::create_job_queue(10);

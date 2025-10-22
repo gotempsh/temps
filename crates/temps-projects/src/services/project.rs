@@ -1304,7 +1304,7 @@ impl ProjectService {
             branch: Some(branch_to_use.clone()),
             tag: tag.clone(),
             commit: commit_to_use.clone(),
-            project_id: project_id, // Include project_id
+            project_id, // Include project_id
         };
 
         // Send the job to the queue
@@ -1334,12 +1334,12 @@ impl ProjectService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_database::test_utils::TestDatabase;
-    use std::sync::Arc;
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_core::{JobQueue, QueueError};
-    use temps_core::async_trait::async_trait;
+    use std::sync::Arc;
     use std::sync::Mutex;
+    use temps_core::async_trait::async_trait;
+    use temps_core::{JobQueue, QueueError};
+    use temps_database::test_utils::TestDatabase;
 
     // Mock JobQueue for testing
     struct MockJobQueue {
@@ -1385,10 +1385,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let config_service = Arc::new(temps_config::ConfigService::new(
-            server_config,
-            db.clone(),
-        ));
+        let config_service = Arc::new(temps_config::ConfigService::new(server_config, db.clone()));
 
         // Create ExternalServiceManager
         let encryption_service = Arc::new(
@@ -1401,7 +1398,7 @@ mod tests {
         // Create Docker client for ExternalServiceManager
         let docker = Arc::new(
             bollard::Docker::connect_with_local_defaults()
-                .expect("Docker connection required for tests")
+                .expect("Docker connection required for tests"),
         );
 
         let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(

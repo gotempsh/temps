@@ -144,12 +144,16 @@ impl WorkflowContext {
 
     /// Set a context variable
     pub fn set_var<T: Serialize>(&mut self, key: &str, value: T) -> Result<(), WorkflowError> {
-        self.vars.insert(key.to_string(), serde_json::to_value(value)?);
+        self.vars
+            .insert(key.to_string(), serde_json::to_value(value)?);
         Ok(())
     }
 
     /// Get a context variable
-    pub fn get_var<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>, WorkflowError> {
+    pub fn get_var<T: for<'de> Deserialize<'de>>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, WorkflowError> {
         if let Some(value) = self.vars.get(key) {
             Ok(Some(serde_json::from_value(value.clone())?))
         } else {
@@ -158,14 +162,23 @@ impl WorkflowContext {
     }
 
     /// Set a job output
-    pub fn set_output<T: Serialize>(&mut self, job_id: &str, output_name: &str, value: T) -> Result<(), WorkflowError> {
-        let job_outputs = self.outputs.entry(job_id.to_string()).or_insert_with(HashMap::new);
+    pub fn set_output<T: Serialize>(
+        &mut self,
+        job_id: &str,
+        output_name: &str,
+        value: T,
+    ) -> Result<(), WorkflowError> {
+        let job_outputs = self.outputs.entry(job_id.to_string()).or_default();
         job_outputs.insert(output_name.to_string(), serde_json::to_value(value)?);
         Ok(())
     }
 
     /// Get a job output
-    pub fn get_output<T: for<'de> Deserialize<'de>>(&self, job_id: &str, output_name: &str) -> Result<Option<T>, WorkflowError> {
+    pub fn get_output<T: for<'de> Deserialize<'de>>(
+        &self,
+        job_id: &str,
+        output_name: &str,
+    ) -> Result<Option<T>, WorkflowError> {
         if let Some(job_outputs) = self.outputs.get(job_id) {
             if let Some(value) = job_outputs.get(output_name) {
                 return Ok(Some(serde_json::from_value(value.clone())?));
@@ -176,7 +189,7 @@ impl WorkflowContext {
 
     /// Set a job artifact
     pub fn set_artifact(&mut self, job_id: &str, artifact_name: &str, file_path: PathBuf) {
-        let job_artifacts = self.artifacts.entry(job_id.to_string()).or_insert_with(HashMap::new);
+        let job_artifacts = self.artifacts.entry(job_id.to_string()).or_default();
         job_artifacts.insert(artifact_name.to_string(), file_path);
     }
 
@@ -324,9 +337,15 @@ pub trait WorkflowTask: Send + Sync + std::fmt::Debug {
         cancellation_provider: &dyn WorkflowCancellationProvider,
     ) -> Result<JobResult, WorkflowError> {
         // Check for cancellation before starting
-        if cancellation_provider.is_cancelled(&context.workflow_run_id).await? {
+        if cancellation_provider
+            .is_cancelled(&context.workflow_run_id)
+            .await?
+        {
             // Write cancellation log immediately to persistent storage
-            let cancel_msg = format!("🛑 DEPLOYMENT CANCELLED: Job '{}' will not execute", self.name());
+            let cancel_msg = format!(
+                "🛑 DEPLOYMENT CANCELLED: Job '{}' will not execute",
+                self.name()
+            );
             let _ = context.log(&cancel_msg).await;
 
             let mut result = JobResult::cancelled(context);
@@ -339,9 +358,15 @@ pub trait WorkflowTask: Send + Sync + std::fmt::Debug {
 
         // Check for cancellation after execution
         if let Ok(ref job_result) = result {
-            if cancellation_provider.is_cancelled(&job_result.context.workflow_run_id).await? {
+            if cancellation_provider
+                .is_cancelled(&job_result.context.workflow_run_id)
+                .await?
+            {
                 // Write cancellation log immediately to persistent storage
-                let cancel_msg = format!("🛑 DEPLOYMENT CANCELLED: Job '{}' was cancelled after completion", self.name());
+                let cancel_msg = format!(
+                    "🛑 DEPLOYMENT CANCELLED: Job '{}' was cancelled after completion",
+                    self.name()
+                );
                 let _ = job_result.context.log(&cancel_msg).await;
 
                 let mut cancelled_result = JobResult::cancelled(job_result.context.clone());
@@ -364,7 +389,10 @@ pub trait WorkflowTask: Send + Sync + std::fmt::Debug {
     }
 
     /// Validate that the context has everything needed for this job
-    async fn validate_prerequisites(&self, _context: &WorkflowContext) -> Result<(), WorkflowError> {
+    async fn validate_prerequisites(
+        &self,
+        _context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
         Ok(())
     }
 
@@ -464,7 +492,12 @@ impl WorkflowBuilder {
     }
 
     /// Set the deployment context
-    pub fn with_deployment_context(mut self, deployment_id: i32, project_id: i32, environment_id: i32) -> Self {
+    pub fn with_deployment_context(
+        mut self,
+        deployment_id: i32,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Self {
         self.deployment_id = Some(deployment_id);
         self.project_id = Some(project_id);
         self.environment_id = Some(environment_id);
@@ -479,7 +512,8 @@ impl WorkflowBuilder {
 
     /// Add a context variable
     pub fn with_var<T: Serialize>(mut self, key: &str, value: T) -> Result<Self, WorkflowError> {
-        self.initial_context.insert(key.to_string(), serde_json::to_value(value)?);
+        self.initial_context
+            .insert(key.to_string(), serde_json::to_value(value)?);
         Ok(self)
     }
 
@@ -517,7 +551,11 @@ impl WorkflowBuilder {
     }
 
     /// Add a job with custom dependencies (overrides job.depends_on())
-    pub fn with_job_and_dependencies(mut self, job: Arc<dyn WorkflowTask>, dependencies: Vec<String>) -> Self {
+    pub fn with_job_and_dependencies(
+        mut self,
+        job: Arc<dyn WorkflowTask>,
+        dependencies: Vec<String>,
+    ) -> Self {
         self.jobs.push(JobConfig {
             job,
             required: true,
@@ -554,20 +592,25 @@ impl WorkflowBuilder {
 
     /// Build the workflow configuration
     pub fn build(self) -> Result<WorkflowConfig, WorkflowError> {
-        let workflow_run_id = self.workflow_run_id
-            .ok_or_else(|| WorkflowError::JobValidationFailed("workflow_run_id is required".to_string()))?;
+        let workflow_run_id = self.workflow_run_id.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("workflow_run_id is required".to_string())
+        })?;
 
-        let deployment_id = self.deployment_id
-            .ok_or_else(|| WorkflowError::JobValidationFailed("deployment_id is required".to_string()))?;
+        let deployment_id = self.deployment_id.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("deployment_id is required".to_string())
+        })?;
 
-        let project_id = self.project_id
-            .ok_or_else(|| WorkflowError::JobValidationFailed("project_id is required".to_string()))?;
+        let project_id = self.project_id.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("project_id is required".to_string())
+        })?;
 
-        let environment_id = self.environment_id
-            .ok_or_else(|| WorkflowError::JobValidationFailed("environment_id is required".to_string()))?;
+        let environment_id = self.environment_id.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("environment_id is required".to_string())
+        })?;
 
-        let log_writer = self.log_writer
-            .ok_or_else(|| WorkflowError::JobValidationFailed("log_writer is required".to_string()))?;
+        let log_writer = self.log_writer.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("log_writer is required".to_string())
+        })?;
 
         Ok(WorkflowConfig {
             workflow_run_id,
@@ -623,7 +666,10 @@ mod tests {
         }
 
         async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
-            Ok(JobResult::success_with_message(context, format!("Executed job: {}", self.name)))
+            Ok(JobResult::success_with_message(
+                context,
+                format!("Executed job: {}", self.name),
+            ))
         }
     }
 
@@ -634,7 +680,8 @@ mod tests {
             .with_workflow_run_id("test-run-123".to_string())
             .with_deployment_context(1, 1, 1)
             .with_log_writer(log_writer)
-            .with_var("test_var", "test_value").unwrap()
+            .with_var("test_var", "test_value")
+            .unwrap()
             .with_job(Arc::new(TestJob::new("job1", "First Job")))
             .with_job(Arc::new(TestJob::new("job2", "Second Job")))
             .continue_on_failure(true)
@@ -677,7 +724,11 @@ mod tests {
         assert_eq!(output, Some("success".to_string()));
 
         // Test artifacts
-        context.set_artifact("job1", "build_artifact", PathBuf::from("/tmp/artifact.tar.gz"));
+        context.set_artifact(
+            "job1",
+            "build_artifact",
+            PathBuf::from("/tmp/artifact.tar.gz"),
+        );
         let artifact = context.get_artifact("job1", "build_artifact");
         assert_eq!(artifact, Some(&PathBuf::from("/tmp/artifact.tar.gz")));
     }

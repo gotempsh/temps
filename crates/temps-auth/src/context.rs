@@ -1,6 +1,6 @@
-use super::permissions::{Role, Permission};
-use temps_entities::users;
+use super::permissions::{Permission, Role};
 use serde::{Deserialize, Serialize};
+use temps_entities::users;
 use utoipa::ToSchema;
 
 // Simplified user schema for OpenAPI documentation
@@ -13,12 +13,16 @@ pub struct UserSchema {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuthSource {
-    Session { user: users::Model },
-    CliToken { user: users::Model },
-    ApiKey { 
-        user: users::Model, 
-        role: Option<Role>,  // None for custom permissions
-        permissions: Option<Vec<Permission>>,  // Some for custom permissions
+    Session {
+        user: users::Model,
+    },
+    CliToken {
+        user: users::Model,
+    },
+    ApiKey {
+        user: users::Model,
+        role: Option<Role>,                   // None for custom permissions
+        permissions: Option<Vec<Permission>>, // Some for custom permissions
         key_name: String,
         key_id: i32,
     },
@@ -27,10 +31,14 @@ pub enum AuthSource {
 // Schema version for OpenAPI documentation
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub enum AuthSourceSchema {
-    Session { user: UserSchema },
-    CliToken { user: UserSchema },
-    ApiKey { 
-        user: UserSchema, 
+    Session {
+        user: UserSchema,
+    },
+    CliToken {
+        user: UserSchema,
+    },
+    ApiKey {
+        user: UserSchema,
         role: Option<Role>,
         permissions: Option<Vec<Permission>>,
         key_name: String,
@@ -43,7 +51,7 @@ pub struct AuthContext {
     pub user: users::Model,
     pub source: AuthSource,
     pub effective_role: Role,
-    pub custom_permissions: Option<Vec<Permission>>,  // Some for custom permissions
+    pub custom_permissions: Option<Vec<Permission>>, // Some for custom permissions
 }
 
 // Schema version for OpenAPI documentation
@@ -74,11 +82,17 @@ impl AuthContext {
         }
     }
 
-    pub fn new_api_key(user: users::Model, role: Option<Role>, permissions: Option<Vec<Permission>>, key_name: String, key_id: i32) -> Self {
+    pub fn new_api_key(
+        user: users::Model,
+        role: Option<Role>,
+        permissions: Option<Vec<Permission>>,
+        key_name: String,
+        key_id: i32,
+    ) -> Self {
         Self {
             user: user.clone(),
-            source: AuthSource::ApiKey { 
-                user, 
+            source: AuthSource::ApiKey {
+                user,
                 role: role.clone(),
                 permissions: permissions.clone(),
                 key_name,
@@ -94,7 +108,7 @@ impl AuthContext {
         if let Some(ref permissions) = self.custom_permissions {
             return permissions.contains(permission);
         }
-        
+
         // Fall back to role-based permissions
         self.effective_role.has_permission(permission)
     }
@@ -125,7 +139,9 @@ impl AuthContext {
 
     pub fn api_key_info(&self) -> Option<(String, i32)> {
         match &self.source {
-            AuthSource::ApiKey { key_name, key_id, .. } => Some((key_name.clone(), *key_id)),
+            AuthSource::ApiKey {
+                key_name, key_id, ..
+            } => Some((key_name.clone(), *key_id)),
             _ => None,
         }
     }

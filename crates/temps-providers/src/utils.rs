@@ -1,7 +1,9 @@
 use bollard::{models::NetworkCreateRequest, query_parameters::ListNetworksOptions, Docker};
 use tracing::{error, info};
 
-pub(crate) async fn ensure_network_exists(docker: &Docker) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) async fn ensure_network_exists(
+    docker: &Docker,
+) -> Result<(), Box<dyn std::error::Error>> {
     const NETWORK_NAME: &str = "temps-app-network";
 
     // Check if network exists

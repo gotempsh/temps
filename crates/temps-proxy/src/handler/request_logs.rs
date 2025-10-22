@@ -136,7 +136,7 @@ pub async fn get_request_logs(
             error!("Error fetching request logs: {:?}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to fetch request logs")
-                .detail(&format!("Error fetching request logs: {}", e))
+                .detail(format!("Error fetching request logs: {}", e))
                 .build())
         }
     }
@@ -172,13 +172,13 @@ pub async fn get_request_log_by_id(
         Ok(Some(log)) => Ok((StatusCode::OK, Json(log)).into_response()),
         Ok(None) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
             .title("Request log not found")
-            .detail(&format!("No request log found with ID {}", id))
+            .detail(format!("No request log found with ID {}", id))
             .build()),
         Err(e) => {
             error!("Error fetching request log: {:?}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to fetch request log")
-                .detail(&format!("Error fetching request log: {}", e))
+                .detail(format!("Error fetching request log: {}", e))
                 .build())
         }
     }

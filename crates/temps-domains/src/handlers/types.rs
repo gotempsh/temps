@@ -1,13 +1,12 @@
-use crate::{CertificateRepository, TlsService, DomainService};
-use std::sync::Arc;
+use crate::{CertificateRepository, DomainService, TlsService};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use utoipa::ToSchema;
 
-
 pub struct DomainAppState {
     pub tls_service: Arc<TlsService>,
-	pub repository: Arc<dyn CertificateRepository>,
+    pub repository: Arc<dyn CertificateRepository>,
     pub domain_service: Arc<DomainService>,
 }
 
@@ -98,12 +97,8 @@ impl From<temps_entities::domains::Model> for DomainResponse {
             id: domain.id,
             domain: domain.domain,
             status: domain.status,
-            expiration_time: domain
-                .expiration_time
-                .map(|dt| dt.timestamp_millis()),
-            last_renewed: domain
-                .last_renewed
-                .map(|dt| dt.timestamp_millis()),
+            expiration_time: domain.expiration_time.map(|dt| dt.timestamp_millis()),
+            last_renewed: domain.last_renewed.map(|dt| dt.timestamp_millis()),
             dns_challenge_token: domain.dns_challenge_token,
             dns_challenge_value: domain.dns_challenge_value,
             last_error: domain.last_error,
@@ -126,7 +121,10 @@ impl From<crate::tls::models::Certificate> for DomainResponse {
             CertificateStatus::Pending => "pending".to_string(),
             CertificateStatus::PendingDns => "pending_dns".to_string(),
             CertificateStatus::PendingValidation => "pending_validation".to_string(),
-            CertificateStatus::Failed { error: _, error_type: _ } => "failed".to_string(),
+            CertificateStatus::Failed {
+                error: _,
+                error_type: _,
+            } => "failed".to_string(),
             CertificateStatus::Expired => "expired".to_string(),
         };
 

@@ -741,8 +741,7 @@ mod tests {
             .expect("Failed to create encryption service"),
         );
         let docker = Arc::new(
-            bollard::Docker::connect_with_local_defaults()
-                .expect("Docker required for tests")
+            bollard::Docker::connect_with_local_defaults().expect("Docker required for tests"),
         );
         let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
             db.clone(),
@@ -781,7 +780,13 @@ mod tests {
 
         // Verify jobs were created (nextjs project should create 5 jobs including configure_crons)
         let job_ids: Vec<String> = jobs.iter().map(|j| j.job_id.clone()).collect();
-        assert_eq!(jobs.len(), 5, "Expected 5 jobs but got {}: {:?}", jobs.len(), job_ids);
+        assert_eq!(
+            jobs.len(),
+            5,
+            "Expected 5 jobs but got {}: {:?}",
+            jobs.len(),
+            job_ids
+        );
 
         // Verify all expected jobs are present
         assert!(job_ids.contains(&"download_repo".to_string()));
@@ -814,8 +819,7 @@ mod tests {
             .expect("Failed to create encryption service"),
         );
         let docker = Arc::new(
-            bollard::Docker::connect_with_local_defaults()
-                .expect("Docker required for tests")
+            bollard::Docker::connect_with_local_defaults().expect("Docker required for tests"),
         );
         let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
             db.clone(),
@@ -884,7 +888,13 @@ mod tests {
 
         // Should create 3 jobs (no download_repo): build_image, deploy_container, mark_deployment_complete
         let job_ids: Vec<String> = jobs.iter().map(|j| j.job_id.clone()).collect();
-        assert_eq!(jobs.len(), 3, "Expected 3 jobs but got {}: {:?}", jobs.len(), job_ids);
+        assert_eq!(
+            jobs.len(),
+            3,
+            "Expected 3 jobs but got {}: {:?}",
+            jobs.len(),
+            job_ids
+        );
 
         assert!(!job_ids.contains(&"download_repo".to_string()));
         assert!(job_ids.contains(&"build_image".to_string()));
@@ -909,8 +919,7 @@ mod tests {
             .expect("Failed to create encryption service"),
         );
         let docker = Arc::new(
-            bollard::Docker::connect_with_local_defaults()
-                .expect("Docker required for tests")
+            bollard::Docker::connect_with_local_defaults().expect("Docker required for tests"),
         );
         let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
             db.clone(),

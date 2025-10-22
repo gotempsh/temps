@@ -8,13 +8,13 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use tracing::{error, info};
 use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
 use temps_core::{
     error_builder::{bad_request, forbidden, internal_server_error, not_found},
     problemdetails::Problem,
 };
+use tracing::{error, info};
 use utoipa::OpenApi;
 
 use super::audit::{
@@ -42,7 +42,7 @@ use temps_core::RequestMetadata;
 async fn get_service_types(RequireAuth(auth): RequireAuth) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
 
-    let service_types: Vec<ServiceTypeRoute> = ServiceTypeRoute::get_all().into();
+    let service_types: Vec<ServiceTypeRoute> = ServiceTypeRoute::get_all();
     Ok((StatusCode::OK, Json(service_types)))
 }
 
@@ -132,7 +132,7 @@ async fn get_service_type_parameters(
         {
             Ok(parameters) => Ok((StatusCode::OK, Json(parameters))),
             Err(e) => Err(internal_server_error()
-                .detail(&format!("Failed to get parameters: {}", e))
+                .detail(format!("Failed to get parameters: {}", e))
                 .build()),
         },
         Err(_) => Err(not_found().detail("Service type not found").build()),
@@ -160,7 +160,7 @@ async fn list_services(
         Err(e) => {
             error!("Failed to list services: {}", e);
             Err(internal_server_error()
-                .detail(&format!("Failed to list services: {}", e))
+                .detail(format!("Failed to list services: {}", e))
                 .build())
         }
     }
@@ -196,7 +196,7 @@ async fn get_service(
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
             _ => Err(internal_server_error()
-                .detail(&format!("Failed to get service: {}", e))
+                .detail(format!("Failed to get service: {}", e))
                 .build()),
         },
     }
@@ -263,7 +263,7 @@ async fn create_service(
                 Err(bad_request().detail(&error_msg).build())
             } else {
                 Err(internal_server_error()
-                    .detail(&format!("Failed to create service: {}", e))
+                    .detail(format!("Failed to create service: {}", e))
                     .build())
             }
         }
@@ -328,10 +328,10 @@ async fn update_service(
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
             _ if e.to_string().contains("validation failed") => {
-                Err(bad_request().detail(&e.to_string()).build())
+                Err(bad_request().detail(e.to_string()).build())
             }
             _ => Err(internal_server_error()
-                .detail(&format!("Failed to update service: {}", e))
+                .detail(format!("Failed to update service: {}", e))
                 .build()),
         },
     }
@@ -387,13 +387,13 @@ async fn delete_service(
                 Err(e) => match e.to_string().as_str() {
                     "Service not found" => Err(not_found().detail("Service not found").build()),
                     _ => Err(internal_server_error()
-                        .detail(&format!("Failed to delete service: {}", e))
+                        .detail(format!("Failed to delete service: {}", e))
                         .build()),
                 },
             }
         }
         Err(e) => Err(internal_server_error()
-            .detail(&format!("Failed to get service details: {}", e))
+            .detail(format!("Failed to get service details: {}", e))
             .build()),
     }
 }
@@ -428,7 +428,7 @@ async fn check_health(
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
             _ => Err(internal_server_error()
-                .detail(&format!("Health check failed: {}", e))
+                .detail(format!("Health check failed: {}", e))
                 .build()),
         },
     }
@@ -461,7 +461,11 @@ async fn start_service(
         .await
     {
         Ok(service_details) => {
-            match app_state.external_service_manager.start_service(service_details.service.id).await {
+            match app_state
+                .external_service_manager
+                .start_service(service_details.service.id)
+                .await
+            {
                 Ok(service) => {
                     // Create audit log with metadata
                     let audit = ExternalServiceStatusChangedAudit {
@@ -487,14 +491,14 @@ async fn start_service(
                     match e.to_string().as_str() {
                         "Service not found" => Err(not_found().detail("Service not found").build()),
                         _ => Err(internal_server_error()
-                            .detail(&format!("Failed to start service: {}", e))
+                            .detail(format!("Failed to start service: {}", e))
                             .build()),
                     }
                 }
             }
         }
         Err(e) => Err(internal_server_error()
-            .detail(&format!("Failed to get service details: {}", e))
+            .detail(format!("Failed to get service details: {}", e))
             .build()),
     }
 }
@@ -526,7 +530,11 @@ async fn stop_service(
         .await
     {
         Ok(service_details) => {
-            match app_state.external_service_manager.stop_service(service_details.service.id).await {
+            match app_state
+                .external_service_manager
+                .stop_service(service_details.service.id)
+                .await
+            {
                 Ok(service) => {
                     // Create audit log with metadata
                     let audit = ExternalServiceStatusChangedAudit {
@@ -552,14 +560,14 @@ async fn stop_service(
                     match e.to_string().as_str() {
                         "Service not found" => Err(not_found().detail("Service not found").build()),
                         _ => Err(internal_server_error()
-                            .detail(&format!("Failed to stop service: {}", e))
+                            .detail(format!("Failed to stop service: {}", e))
                             .build()),
                     }
                 }
             }
         }
         Err(e) => Err(internal_server_error()
-            .detail(&format!("Failed to get service details: {}", e))
+            .detail(format!("Failed to get service details: {}", e))
             .build()),
     }
 }
@@ -595,10 +603,10 @@ async fn link_service_to_project(
         Ok(info) => Ok((StatusCode::CREATED, Json(info))),
         Err(e) => match e.to_string().as_str() {
             "Service not found" | "Project not found" => {
-                Err(not_found().detail(&e.to_string()).build())
+                Err(not_found().detail(e.to_string()).build())
             }
             _ => Err(internal_server_error()
-                .detail(&format!("Failed to link service: {}", e))
+                .detail(format!("Failed to link service: {}", e))
                 .build()),
         },
     }
@@ -633,9 +641,9 @@ async fn unlink_service_from_project(
     {
         Ok(_) => Ok(StatusCode::NO_CONTENT),
         Err(e) => match e.to_string().as_str() {
-            "Service link not found" => Err(not_found().detail(&e.to_string()).build()),
+            "Service link not found" => Err(not_found().detail(e.to_string()).build()),
             _ => Err(internal_server_error()
-                .detail(&format!("Failed to unlink service: {}", e))
+                .detail(format!("Failed to unlink service: {}", e))
                 .build()),
         },
     }
@@ -671,7 +679,7 @@ async fn list_service_projects(
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
             _ => Err(internal_server_error()
-                .detail(&format!("Failed to list projects: {}", e))
+                .detail(format!("Failed to list projects: {}", e))
                 .build()),
         },
     }
@@ -707,7 +715,7 @@ async fn list_project_services(
         Err(e) => match e.to_string().as_str() {
             "Project not found" => Err(not_found().detail("Project not found").build()),
             _ => Err(internal_server_error()
-                .detail(&format!("Failed to list services: {}", e))
+                .detail(format!("Failed to list services: {}", e))
                 .build()),
         },
     }
@@ -745,13 +753,13 @@ async fn get_service_environment_variable(
         Ok(var_info) => Ok((StatusCode::OK, Json(var_info))),
         Err(e) => match e.to_string().as_str() {
             "Service not found" | "Project not found" | "Variable not found" => {
-                Err(not_found().detail(&e.to_string()).build())
+                Err(not_found().detail(e.to_string()).build())
             }
             "Access denied for encrypted variable" => {
-                Err(forbidden().detail(&e.to_string()).build())
+                Err(forbidden().detail(e.to_string()).build())
             }
             _ => Err(internal_server_error()
-                .detail(&format!("Failed to get environment variable: {}", e))
+                .detail(format!("Failed to get environment variable: {}", e))
                 .build()),
         },
     }
@@ -787,10 +795,10 @@ async fn get_service_environment_variables(
         Ok(variables) => Ok((StatusCode::OK, Json(variables))),
         Err(e) => match e.to_string().as_str() {
             "Service not found" | "Project not found" => {
-                Err(not_found().detail(&e.to_string()).build())
+                Err(not_found().detail(e.to_string()).build())
             }
             _ => Err(internal_server_error()
-                .detail(&format!("Failed to get environment variables: {}", e))
+                .detail(format!("Failed to get environment variables: {}", e))
                 .build()),
         },
     }
@@ -824,9 +832,9 @@ async fn get_project_service_environment_variables(
     {
         Ok(variables) => Ok((StatusCode::OK, Json(variables))),
         Err(e) => match e.to_string().as_str() {
-            "Project not found" => Err(not_found().detail(&e.to_string()).build()),
+            "Project not found" => Err(not_found().detail(e.to_string()).build()),
             _ => Err(internal_server_error()
-                .detail(&format!("Failed to get environment variables: {}", e))
+                .detail(format!("Failed to get environment variables: {}", e))
                 .build()),
         },
     }
@@ -859,7 +867,9 @@ async fn get_service_by_slug(
     {
         Ok(service) => service,
         Err(e) => {
-            return Err(not_found().detail(format!("Service not found: {}", e)).build());
+            return Err(not_found()
+                .detail(format!("Service not found: {}", e))
+                .build());
         }
     };
     // .ok_or_else(|| (StatusCode::NOT_FOUND, Json("Service not found")).into_response());
@@ -872,7 +882,7 @@ async fn get_service_by_slug(
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
             _ => Err(internal_server_error()
-                .detail(&format!("Failed to get service: {}", e))
+                .detail(format!("Failed to get service: {}", e))
                 .build()),
         },
     }
@@ -908,7 +918,7 @@ async fn get_service_preview_environment_variable_names(
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
             _ => Err(internal_server_error()
-                .detail(&format!(
+                .detail(format!(
                     "Failed to get preview environment variable names: {}",
                     e
                 ))
@@ -947,7 +957,7 @@ async fn get_service_preview_environment_variables_masked(
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
             _ => Err(internal_server_error()
-                .detail(&format!(
+                .detail(format!(
                     "Failed to get preview environment variables: {}",
                     e
                 ))

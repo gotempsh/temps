@@ -2,8 +2,8 @@
 //!
 //! Defines the interface for screenshot providers (local, remote, etc.)
 
-use async_trait::async_trait;
 use crate::error::ScreenshotResult;
+use async_trait::async_trait;
 
 /// Screenshot provider trait - implement this for different screenshot backends
 #[async_trait]

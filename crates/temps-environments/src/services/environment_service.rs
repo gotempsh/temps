@@ -1,16 +1,16 @@
-use tracing::{info, warn};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DbErr, EntityTrait,
-    QueryFilter, QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder, Set,
+    TransactionTrait,
 };
 use serde::Serialize;
 use serde_json::json;
 use slug::slugify;
 use std::sync::Arc;
 use temps_core::problemdetails::Problem;
-use temps_core::{Job, JobQueue, EnvironmentCreatedJob};
+use temps_core::{EnvironmentCreatedJob, Job, JobQueue};
 use temps_entities::{environment_domains, environments, projects};
 use thiserror::Error;
+use tracing::{info, warn};
 
 #[derive(Error, Debug)]
 pub enum EnvironmentError {
@@ -190,7 +190,10 @@ impl EnvironmentService {
                     environment.id, e
                 );
             } else {
-                info!("Emitted EnvironmentCreated job for environment {}", environment.id);
+                info!(
+                    "Emitted EnvironmentCreated job for environment {}",
+                    environment.id
+                );
             }
         }
 

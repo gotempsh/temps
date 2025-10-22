@@ -6,8 +6,8 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, Qu
 use serde_json;
 use std::sync::Arc;
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
-use tracing::{debug, info, warn};
 use temps_logs::LogService;
+use tracing::{debug, info, warn};
 #[derive(Debug, Clone)]
 pub struct JobDefinition {
     pub job_id: String,
@@ -56,8 +56,8 @@ impl WorkflowPlanner {
         project: &projects::Model,
         environment: &environments::Model,
     ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        use temps_entities::{env_vars, env_var_environments, project_services};
         use std::collections::HashMap;
+        use temps_entities::{env_var_environments, env_vars, project_services};
 
         let mut env_vars_map = HashMap::new();
 
@@ -84,7 +84,10 @@ impl WorkflowPlanner {
             }
         }
 
-        debug!("📦 Loaded {} environment variables from env_vars table via env_var_environments", env_vars_map.len());
+        debug!(
+            "📦 Loaded {} environment variables from env_vars table via env_var_environments",
+            env_vars_map.len()
+        );
 
         // 2. Get runtime environment variables from external services
         // First, get all services linked to this project
@@ -93,12 +96,19 @@ impl WorkflowPlanner {
             .all(self.db.as_ref())
             .await?;
 
-        debug!("🔌 Found {} external services linked to project {}", project_services_list.len(), project.id);
+        debug!(
+            "🔌 Found {} external services linked to project {}",
+            project_services_list.len(),
+            project.id
+        );
 
         // Get runtime environment variables from each external service
         if let Some(ref service_manager) = self.external_service_manager {
             for project_service in project_services_list {
-                debug!("🔍 Fetching runtime env vars for service ID {}", project_service.service_id);
+                debug!(
+                    "🔍 Fetching runtime env vars for service ID {}",
+                    project_service.service_id
+                );
 
                 match service_manager
                     .get_runtime_env_vars(
@@ -136,12 +146,16 @@ impl WorkflowPlanner {
         // 3. Get or create Sentry DSN for error tracking
         // Generate/fetch DSN for this project/environment combination
         // This ensures each environment has its own DSN for proper error isolation
-        debug!("🔑 Fetching or generating Sentry DSN for project {} environment {}", project.id, environment.id);
+        debug!(
+            "🔑 Fetching or generating Sentry DSN for project {} environment {}",
+            project.id, environment.id
+        );
 
         // Get base URL from config service for DSN generation
         match self.config_service.get_external_url_or_default().await {
             Ok(base_url) => {
-                match self.dsn_service
+                match self
+                    .dsn_service
                     .get_or_create_project_dsn(
                         project.id,
                         Some(environment.id),
@@ -177,7 +191,10 @@ impl WorkflowPlanner {
             }
         }
 
-        info!("✅ Gathered {} total environment variables for deployment", env_vars_map.len());
+        info!(
+            "✅ Gathered {} total environment variables for deployment",
+            env_vars_map.len()
+        );
         Ok(env_vars_map)
     }
 
@@ -208,7 +225,9 @@ impl WorkflowPlanner {
         );
 
         // Determine jobs based on project configuration and deployment
-        let job_definitions = self.plan_jobs_for_project(&project, &environment, &deployment).await?;
+        let job_definitions = self
+            .plan_jobs_for_project(&project, &environment, &deployment)
+            .await?;
 
         debug!(
             "🔧 Creating {} jobs for deployment {}",
@@ -241,7 +260,7 @@ impl WorkflowPlanner {
             if let Some(config_obj) = job_config.as_object_mut() {
                 config_obj.insert(
                     "_required_for_completion".to_string(),
-                    serde_json::Value::Bool(job_def.required_for_completion)
+                    serde_json::Value::Bool(job_def.required_for_completion),
                 );
             }
 
@@ -292,8 +311,13 @@ impl WorkflowPlanner {
         debug!("🔍 Planning jobs for project: {}", project.name);
 
         // Gather environment variables for the deployment
-        let env_vars = self.gather_environment_variables(project, environment).await?;
-        debug!("📦 Gathered {} environment variables for deployment", env_vars.len());
+        let env_vars = self
+            .gather_environment_variables(project, environment)
+            .await?;
+        debug!(
+            "📦 Gathered {} environment variables for deployment",
+            env_vars.len()
+        );
 
         // Check if git info is available
         let has_git_info = project.repo_owner.is_some() && project.repo_name.is_some();
@@ -384,7 +408,9 @@ impl WorkflowPlanner {
             job_id: "mark_deployment_complete".to_string(),
             job_type: "MarkDeploymentCompleteJob".to_string(),
             name: "Mark Deployment Complete".to_string(),
-            description: Some("Mark deployment as complete and update environment routing".to_string()),
+            description: Some(
+                "Mark deployment as complete and update environment routing".to_string(),
+            ),
             dependencies: vec!["deploy_container".to_string()],
             job_config: Some(serde_json::json!({
                 "deployment_id": deployment.id
@@ -453,30 +479,42 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use sea_orm::Set;
+    use std::path::PathBuf;
+    use temps_config::{ConfigService, ServerConfig};
     use temps_core::EncryptionService;
     use temps_database::test_utils::TestDatabase;
     use temps_entities::types::ProjectType;
-    use temps_config::{ConfigService, ServerConfig};
-    use std::path::PathBuf;
 
     fn create_test_config_service(db: Arc<DatabaseConnection>) -> Arc<ConfigService> {
-        let server_config = Arc::new(ServerConfig::new(
-            "127.0.0.1:3000".to_string(),
-            "postgresql://test".to_string(),
-            None,
-            Some("127.0.0.1:8000".to_string()),
-        ).unwrap());
+        let server_config = Arc::new(
+            ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgresql://test".to_string(),
+                None,
+                Some("127.0.0.1:8000".to_string()),
+            )
+            .unwrap(),
+        );
         Arc::new(ConfigService::new(server_config, db))
     }
 
-    fn create_test_dsn_service(db: Arc<DatabaseConnection>) -> Arc<temps_error_tracking::DSNService> {
+    fn create_test_dsn_service(
+        db: Arc<DatabaseConnection>,
+    ) -> Arc<temps_error_tracking::DSNService> {
         Arc::new(temps_error_tracking::DSNService::new(db))
     }
 
-    fn create_test_external_service_manager(db: Arc<DatabaseConnection>) -> Arc<temps_providers::ExternalServiceManager> {
-        let encryption_service = Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+    fn create_test_external_service_manager(
+        db: Arc<DatabaseConnection>,
+    ) -> Arc<temps_providers::ExternalServiceManager> {
+        let encryption_service =
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().ok().unwrap());
-        Arc::new(temps_providers::ExternalServiceManager::new(db, encryption_service, docker))
+        Arc::new(temps_providers::ExternalServiceManager::new(
+            db,
+            encryption_service,
+            docker,
+        ))
     }
 
     async fn create_test_project(
@@ -542,7 +580,13 @@ mod tests {
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let planner = WorkflowPlanner::new(db.clone(), log_service, external_service_manager, config_service, dsn_service);
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service,
+            external_service_manager,
+            config_service,
+            dsn_service,
+        );
 
         let (project, environment, deployment) =
             create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
@@ -552,7 +596,11 @@ mod tests {
 
         // Should create 5 jobs: download_repo, build_image, deploy_container, mark_deployment_complete, configure_crons
         // Screenshots may or may not be included depending on config
-        assert!(jobs.len() >= 5, "Expected at least 5 jobs, got {}", jobs.len());
+        assert!(
+            jobs.len() >= 5,
+            "Expected at least 5 jobs, got {}",
+            jobs.len()
+        );
 
         let job_ids: Vec<String> = jobs.iter().map(|j| j.job_id.clone()).collect();
         assert!(job_ids.contains(&"download_repo".to_string()));
@@ -564,7 +612,9 @@ mod tests {
         // Check that all jobs are in pending state
         for job in &jobs {
             assert_eq!(job.status, JobStatus::Pending);
-            assert!(job.log_id.contains(&format!("deployment-{}", deployment.id)));
+            assert!(job
+                .log_id
+                .contains(&format!("deployment-{}", deployment.id)));
         }
 
         Ok(())
@@ -578,7 +628,13 @@ mod tests {
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let planner = WorkflowPlanner::new(db.clone(), log_service, external_service_manager, config_service, dsn_service);
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service,
+            external_service_manager,
+            config_service,
+            dsn_service,
+        );
 
         // Create project without git info
         let project = projects::ActiveModel {
@@ -627,7 +683,11 @@ mod tests {
         // Should succeed and create only build_image, deploy_container, and mark_deployment_complete jobs
         // (no download_repo or configure_crons since git info is missing)
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
-        assert!(jobs.len() >= 3, "Expected at least 3 jobs, got {}", jobs.len());
+        assert!(
+            jobs.len() >= 3,
+            "Expected at least 3 jobs, got {}",
+            jobs.len()
+        );
 
         let job_ids: Vec<String> = jobs.iter().map(|j| j.job_id.clone()).collect();
         assert!(job_ids.contains(&"build_image".to_string()));
@@ -648,7 +708,13 @@ mod tests {
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let planner = WorkflowPlanner::new(db.clone(), log_service, external_service_manager, config_service, dsn_service);
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service,
+            external_service_manager,
+            config_service,
+            dsn_service,
+        );
 
         let (project, environment, deployment) =
             create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
@@ -665,8 +731,14 @@ mod tests {
         let job_order: Vec<String> = jobs.iter().map(|j| j.job_id.clone()).collect();
         let download_index = job_order.iter().position(|x| x == "download_repo").unwrap();
         let build_index = job_order.iter().position(|x| x == "build_image").unwrap();
-        let deploy_index = job_order.iter().position(|x| x == "deploy_container").unwrap();
-        let mark_complete_index = job_order.iter().position(|x| x == "mark_deployment_complete").unwrap();
+        let deploy_index = job_order
+            .iter()
+            .position(|x| x == "deploy_container")
+            .unwrap();
+        let mark_complete_index = job_order
+            .iter()
+            .position(|x| x == "mark_deployment_complete")
+            .unwrap();
 
         assert!(download_index < build_index);
         assert!(build_index < deploy_index);
@@ -683,7 +755,13 @@ mod tests {
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let planner = WorkflowPlanner::new(db.clone(), log_service, external_service_manager, config_service, dsn_service);
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service,
+            external_service_manager,
+            config_service,
+            dsn_service,
+        );
 
         let (project, environment, deployment) =
             create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
@@ -693,7 +771,10 @@ mod tests {
 
         // Find specific jobs and check their dependencies
         let build_job = jobs.iter().find(|j| j.job_id == "build_image").unwrap();
-        let deploy_job = jobs.iter().find(|j| j.job_id == "deploy_container").unwrap();
+        let deploy_job = jobs
+            .iter()
+            .find(|j| j.job_id == "deploy_container")
+            .unwrap();
 
         // Check dependencies are stored correctly
         if let Some(build_deps) = &build_job.dependencies {
@@ -717,7 +798,13 @@ mod tests {
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let planner = WorkflowPlanner::new(db.clone(), log_service, external_service_manager, config_service, dsn_service);
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service,
+            external_service_manager,
+            config_service,
+            dsn_service,
+        );
 
         let (project, environment, deployment) =
             create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
@@ -735,7 +822,10 @@ mod tests {
             assert!(config_obj.get("build_args").is_some());
         }
 
-        let deploy_job = jobs.iter().find(|j| j.job_id == "deploy_container").unwrap();
+        let deploy_job = jobs
+            .iter()
+            .find(|j| j.job_id == "deploy_container")
+            .unwrap();
         assert!(deploy_job.job_config.is_some());
 
         if let Some(config) = &deploy_job.job_config {
@@ -755,7 +845,13 @@ mod tests {
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let planner = WorkflowPlanner::new(db.clone(), log_service, external_service_manager, config_service, dsn_service);
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service,
+            external_service_manager,
+            config_service,
+            dsn_service,
+        );
 
         let (project, environment, deployment) =
             create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
@@ -765,10 +861,23 @@ mod tests {
 
         // Verify log_id format - should be hierarchical: {project_slug}/{env_slug}/{year}/{month}/{day}/{hour}/{minute}/deployment-{id}-job-{job_id}.log
         for job in &jobs {
-            assert!(job.log_id.contains(&project.slug), "log_id should contain project slug");
-            assert!(job.log_id.contains(&environment.slug), "log_id should contain environment slug");
-            assert!(job.log_id.contains(&format!("deployment-{}-job-{}.log", deployment.id, job.job_id)),
-                    "log_id should contain deployment-{}-job-{}.log", deployment.id, job.job_id);
+            assert!(
+                job.log_id.contains(&project.slug),
+                "log_id should contain project slug"
+            );
+            assert!(
+                job.log_id.contains(&environment.slug),
+                "log_id should contain environment slug"
+            );
+            assert!(
+                job.log_id.contains(&format!(
+                    "deployment-{}-job-{}.log",
+                    deployment.id, job.job_id
+                )),
+                "log_id should contain deployment-{}-job-{}.log",
+                deployment.id,
+                job.job_id
+            );
         }
 
         Ok(())

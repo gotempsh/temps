@@ -1,10 +1,13 @@
 //! notifications services and utilities
 
-pub mod services;
 pub mod plugin;
-pub use services::{NotificationProvider, NotificationService, NotificationPreferencesService, NotificationPreferences};
-pub use handlers::{NotificationProvidersApiDoc, configure_routes};
+pub mod services;
+pub use handlers::{configure_routes, NotificationProvidersApiDoc};
 pub use plugin::NotificationsPlugin;
 pub use services::*;
-mod types;
+pub use services::{
+    NotificationPreferences, NotificationPreferencesService, NotificationProvider,
+    NotificationService,
+};
 mod handlers;
+mod types;

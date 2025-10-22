@@ -2,7 +2,6 @@
 mod proxy_tests {
     use crate::config::ProxyConfig;
     use crate::proxy::LoadBalancer as ProxyLoadBalancer;
-    use temps_routes::CachedPeerTable;
     use crate::services::*;
     use crate::test_utils::*;
     use crate::traits::*;
@@ -13,6 +12,7 @@ mod proxy_tests {
     use std::sync::Arc;
     use temps_core::CookieCrypto;
     use temps_database::test_utils::TestDatabase;
+    use temps_routes::CachedPeerTable;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
@@ -146,15 +146,20 @@ mod proxy_tests {
     }
     fn create_crypto_cookie_crypto() -> Arc<temps_core::CookieCrypto> {
         let encryption_key = "default-32-byte-key-for-testing!";
-        Arc::new(temps_core::CookieCrypto::new(encryption_key).expect("Failed to create cookie crypto"))
+        Arc::new(
+            temps_core::CookieCrypto::new(encryption_key).expect("Failed to create cookie crypto"),
+        )
     }
 
-    fn create_mock_ip_service(db: Arc<sea_orm::DatabaseConnection>) -> Arc<temps_geo::IpAddressService> {
+    fn create_mock_ip_service(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> Arc<temps_geo::IpAddressService> {
         // Force mock mode for tests by setting environment variable
         std::env::set_var("TEMPS_GEO_MOCK", "true");
 
         // Create mock GeoIP service
-        let geoip_service = Arc::new(temps_geo::GeoIpService::new().expect("Failed to create GeoIpService"));
+        let geoip_service =
+            Arc::new(temps_geo::GeoIpService::new().expect("Failed to create GeoIpService"));
         Arc::new(temps_geo::IpAddressService::new(db, geoip_service))
     }
     #[async_trait::async_trait]
@@ -220,19 +225,28 @@ mod proxy_tests {
 
         let ip_service = create_mock_ip_service(test_db.db.clone());
 
-        let request_logger =
-            Arc::new(RequestLoggerImpl::new(LoggingConfig::default(), test_db.db.clone(), ip_service.clone())) as Arc<dyn RequestLogger>;
+        let request_logger = Arc::new(RequestLoggerImpl::new(
+            LoggingConfig::default(),
+            test_db.db.clone(),
+            ip_service.clone(),
+        )) as Arc<dyn RequestLogger>;
 
-        let proxy_log_service = Arc::new(crate::service::proxy_log_service::ProxyLogService::new(test_db.db.clone(), ip_service.clone()));
+        let proxy_log_service = Arc::new(crate::service::proxy_log_service::ProxyLogService::new(
+            test_db.db.clone(),
+            ip_service.clone(),
+        ));
 
         let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(mock_route_table))
             as Arc<dyn ProjectContextResolver>;
 
-        let visitor_manager = Arc::new(VisitorManagerImpl::new(test_db.db.clone(), crypto.clone(), ip_service))
-            as Arc<dyn VisitorManager>;
+        let visitor_manager = Arc::new(VisitorManagerImpl::new(
+            test_db.db.clone(),
+            crypto.clone(),
+            ip_service,
+        )) as Arc<dyn VisitorManager>;
 
-        let session_manager =
-            Arc::new(SessionManagerImpl::new(test_db.db.clone(), crypto.clone())) as Arc<dyn SessionManager>;
+        let session_manager = Arc::new(SessionManagerImpl::new(test_db.db.clone(), crypto.clone()))
+            as Arc<dyn SessionManager>;
 
         let lb = ProxyLoadBalancer::new(
             upstream_resolver,
@@ -261,7 +275,9 @@ mod proxy_tests {
     #[ignore] // TODO: Fix route table lookup - CachedPeerTable.load_routes() not finding custom domain entries
     async fn test_proxy_context_resolution() -> Result<()> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone()).await.unwrap();
+        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
+            .await
+            .unwrap();
 
         // Create test project with unique domain
         let test_domain = format!("context-test-{}.example.com", get_next_port());
@@ -296,7 +312,9 @@ mod proxy_tests {
     #[tokio::test]
     async fn test_proxy_route_resolution() -> Result<()> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone()).await.unwrap();
+        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
+            .await
+            .unwrap();
 
         // Start mock server
         let mock_server_addr = start_simple_server().await;
@@ -335,13 +353,16 @@ mod proxy_tests {
     #[tokio::test]
     async fn test_proxy_visitor_management() -> Result<()> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone()).await.unwrap();
+        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
+            .await
+            .unwrap();
 
         let server_config = ProxyConfig::default();
         let crypto = create_crypto_cookie_crypto();
 
         let ip_service = create_mock_ip_service(test_db.db.clone());
-        let visitor_manager = VisitorManagerImpl::new(test_db.db.clone(), crypto.clone(), ip_service);
+        let visitor_manager =
+            VisitorManagerImpl::new(test_db.db.clone(), crypto.clone(), ip_service);
 
         // Test visitor creation
         let visitor = visitor_manager
@@ -388,7 +409,8 @@ mod proxy_tests {
         let server_config = ProxyConfig::default();
         let crypto = create_crypto_cookie_crypto();
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let session_manager = SessionManagerImpl::new(test_db_mock.connection_arc().clone(), crypto.clone());
+        let session_manager =
+            SessionManagerImpl::new(test_db_mock.connection_arc().clone(), crypto.clone());
 
         let visitor = Visitor {
             visitor_id: "test-visitor-123".to_string(),
@@ -430,7 +452,9 @@ mod proxy_tests {
     #[tokio::test]
     async fn test_proxy_visitor_tracking_decisions() -> Result<()> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone()).await.unwrap();
+        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
+            .await
+            .unwrap();
 
         let server_config = ProxyConfig::default();
         let crypto = create_crypto_cookie_crypto();
@@ -505,7 +529,10 @@ mod proxy_tests {
             .get_redirect_info("non-redirect-host.com")
             .await;
 
-        assert!(no_redirect.is_none(), "Non-redirect host should return None");
+        assert!(
+            no_redirect.is_none(),
+            "Non-redirect host should return None"
+        );
 
         Ok(())
     }

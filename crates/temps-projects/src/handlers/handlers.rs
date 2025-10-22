@@ -333,10 +333,10 @@ pub async fn update_project(
         build_command: project.build_command.clone(),
         install_command: project.install_command.clone(),
         environment_variables: project.environment_variables.clone(),
-        automatic_deploy: project.automatic_deploy.clone().unwrap_or_else(|| false),
+        automatic_deploy: project.automatic_deploy.unwrap_or(false),
         project_type: project.project_type.clone(),
-        is_web_app: project.is_web_app.clone().unwrap_or_else(|| true),
-        performance_metrics_enabled: project.performance_metrics_enabled.clone(),
+        is_web_app: project.is_web_app.unwrap_or(true),
+        performance_metrics_enabled: project.performance_metrics_enabled,
         storage_service_ids: project.storage_service_ids.clone(),
         use_default_wildcard: None,       // Keep existing setting
         custom_domain: None,              // Keep existing setting

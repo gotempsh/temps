@@ -93,16 +93,13 @@ impl From<GitProviderManagerError> for Problem {
     }
 }
 
-
 impl From<GitProviderError> for Problem {
     fn from(error: GitProviderError) -> Self {
         match error {
-            GitProviderError::DatabaseError(e) => {
-                problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_type("https://docs.temps.sh/errors/database_error")
-                    .with_title("Database Error")
-                    .with_detail(e.to_string())
-            }
+            GitProviderError::DatabaseError(e) => problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_type("https://docs.temps.sh/errors/database_error")
+                .with_title("Database Error")
+                .with_detail(e.to_string()),
             GitProviderError::ProviderNotFound(msg) => problem_new(StatusCode::NOT_FOUND)
                 .with_type("https://docs.temps.sh/errors/provider_not_found")
                 .with_title("Provider Not Found")
@@ -138,8 +135,6 @@ impl From<GitProviderError> for Problem {
         }
     }
 }
-
-
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateProviderRequest {
@@ -218,7 +213,7 @@ pub struct ConnectionResponse {
     pub is_expired: bool,
     pub syncing: bool,
     #[schema(value_type = Option<String>, format = DateTime)]
-    pub last_synced_at: Option<UtcDateTime>,    
+    pub last_synced_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = DateTime)]
     pub created_at: UtcDateTime,
     #[schema(value_type = String, format = DateTime)]

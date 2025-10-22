@@ -37,7 +37,7 @@ impl PermissionInfo {
     pub fn from_permission(perm: &Permission) -> Self {
         let name = perm.to_string();
         let parts: Vec<&str> = name.split(':').collect();
-        let category = parts.get(0).unwrap_or(&"general").to_string();
+        let category = parts.first().unwrap_or(&"general").to_string();
 
         let description = match perm {
             Permission::ProjectsRead => "View projects and their details",

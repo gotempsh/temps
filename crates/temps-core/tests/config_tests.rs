@@ -52,7 +52,7 @@ fn test_pagination_params_normalize() {
 
     // Test boundary conditions
     let params = PaginationParams {
-        page: Some(0), // Should be normalized to 1
+        page: Some(0),        // Should be normalized to 1
         page_size: Some(150), // Should be capped at 100
         sort_by: None,
         sort_order: None,

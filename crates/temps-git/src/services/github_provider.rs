@@ -298,7 +298,7 @@ impl GitHubProvider {
                     .get("X-RateLimit-Remaining")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<i32>().ok())
-                    .map_or(false, |remaining| remaining == 0)
+                    == Some(0)
                 {
                     Err(GitProviderError::RateLimitExceeded)
                 } else {
@@ -438,7 +438,7 @@ impl GitProviderService for GitHubProvider {
                     .get("X-RateLimit-Remaining")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<i32>().ok())
-                    .map_or(false, |remaining| remaining == 0)
+                    == Some(0)
                 {
                     Err(GitProviderError::RateLimitExceeded)
                 } else {
@@ -924,7 +924,7 @@ impl GitProviderService for GitHubProvider {
             author_email: commit_response.commit.author.email,
             date: DateTime::parse_from_rfc3339(&commit_response.commit.author.date)
                 .map(|dt| dt.into())
-                .unwrap_or_else(|_| chrono::Utc::now().into()),
+                .unwrap_or_else(|_| chrono::Utc::now()),
         })
     }
 

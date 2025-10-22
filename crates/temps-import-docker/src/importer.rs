@@ -948,7 +948,6 @@ impl DockerImporter {
                 RestartPolicyNameEnum::UNLESS_STOPPED => {
                     Some(temps_import_types::RestartPolicy::UnlessStopped)
                 }
-                _ => None,
             });
 
         Ok(WorkloadSnapshot {

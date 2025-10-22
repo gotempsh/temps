@@ -1,12 +1,10 @@
 use chrono::Utc;
 use rand::Rng;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
-};
+use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::sync::Arc;
 use temps_entities::{project_dsns, projects};
 
-use super::types::{SentryIngesterError, ParsedDSN, ProjectDSN};
+use super::types::{ParsedDSN, ProjectDSN, SentryIngesterError};
 
 /// Service for managing Data Source Names (DSNs) for error tracking
 pub struct DSNService {
@@ -322,10 +320,7 @@ impl DSNService {
             .replace("http://", "")
             .replace(":8080", "");
 
-        let dsn = format!(
-            "https://{}@{}/{}",
-            updated_dsn.public_key, host, project_id
-        );
+        let dsn = format!("https://{}@{}/{}", updated_dsn.public_key, host, project_id);
 
         Ok(ProjectDSN {
             id: updated_dsn.id,
@@ -553,4 +548,3 @@ mod tests {
         assert!(!is_valid);
     }
 }
-

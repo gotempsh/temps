@@ -43,7 +43,7 @@ pub enum PackageManager {
 }
 
 impl PackageManager {
-    pub fn detect(local_path: &PathBuf) -> Self {
+    pub fn detect(local_path: &Path) -> Self {
         if local_path.join("pnpm-lock.yaml").exists() {
             PackageManager::Pnpm
         } else if local_path.join("package-lock.json").exists() {
@@ -98,12 +98,12 @@ pub trait Preset: fmt::Display + Send + Sync {
         build_vars: Option<&Vec<String>>,
         project_slug: &str,
     ) -> String;
-    fn dockerfile_with_build_dir(&self, local_path: &PathBuf) -> String;
-    fn install_command(&self, local_path: &PathBuf) -> String {
+    fn dockerfile_with_build_dir(&self, local_path: &Path) -> String;
+    fn install_command(&self, local_path: &Path) -> String {
         let build_system = BuildSystem::detect(local_path);
         build_system.get_install_command()
     }
-    fn build_command(&self, local_path: &PathBuf) -> String {
+    fn build_command(&self, local_path: &Path) -> String {
         let build_system = BuildSystem::detect(local_path);
         build_system.get_build_command(None)
     }
@@ -192,7 +192,7 @@ pub fn detect_preset_from_files(files: &[String]) -> Option<Box<dyn Preset>> {
         return Some(Box::new(Rsbuild));
     }
 
-    return Some(create_custom_preset(
+    Some(create_custom_preset(
         "Custom".to_string(),
         "".to_string(),
         ProjectType::Server,
@@ -201,7 +201,7 @@ pub fn detect_preset_from_files(files: &[String]) -> Option<Box<dyn Preset>> {
         "".to_string(),
         "".to_string(),
         "".to_string(),
-    ));
+    ))
 }
 
 // Add this function to register the new docker_custom preset

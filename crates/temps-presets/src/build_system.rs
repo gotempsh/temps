@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use super::PackageManager;
 #[derive(Debug, Clone)]
 pub enum MonorepoTool {
@@ -9,7 +9,7 @@ pub enum MonorepoTool {
 }
 
 impl MonorepoTool {
-    pub fn detect(path: &PathBuf) -> Self {
+    pub fn detect(path: &Path) -> Self {
         if path.join("lerna.json").exists() {
             MonorepoTool::Lerna
         } else if path.join("turbo.json").exists() {
@@ -77,7 +77,7 @@ pub struct BuildSystem {
 }
 
 impl BuildSystem {
-    pub fn detect(path: &PathBuf) -> Self {
+    pub fn detect(path: &Path) -> Self {
         Self {
             package_manager: PackageManager::detect(path),
             monorepo_tool: MonorepoTool::detect(path),

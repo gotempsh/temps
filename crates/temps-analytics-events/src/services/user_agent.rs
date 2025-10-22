@@ -1,24 +1,12 @@
 use woothee::parser::{Parser, WootheeResult};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ParsedUserAgent {
     pub browser: Option<String>,
     pub browser_version: Option<String>,
     pub operating_system: Option<String>,
     pub operating_system_version: Option<String>,
     pub device_type: Option<String>,
-}
-
-impl Default for ParsedUserAgent {
-    fn default() -> Self {
-        Self {
-            browser: None,
-            browser_version: None,
-            operating_system: None,
-            operating_system_version: None,
-            device_type: None,
-        }
-    }
 }
 
 impl ParsedUserAgent {
@@ -41,11 +29,11 @@ impl ParsedUserAgent {
 
     fn from_woothee_result(result: &WootheeResult) -> Self {
         Self {
-            browser: Self::clean_name(&result.name),
-            browser_version: Self::clean_version(&result.version),
-            operating_system: Self::clean_name(&result.os),
+            browser: Self::clean_name(result.name),
+            browser_version: Self::clean_version(result.version),
+            operating_system: Self::clean_name(result.os),
             operating_system_version: Self::clean_version(&result.os_version),
-            device_type: Self::determine_device_type(&result.category),
+            device_type: Self::determine_device_type(result.category),
         }
     }
 

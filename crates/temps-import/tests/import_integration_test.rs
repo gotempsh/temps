@@ -7,7 +7,6 @@
 /// 4. Deployment container records with container ID and ports
 ///
 /// Note: This test requires Docker to be running and a test database
-
 use std::sync::Arc;
 use temps_import_docker::DockerWorkloadImporter;
 use temps_import_types::{ImportSource, WorkloadId, WorkloadImporter};
@@ -23,13 +22,16 @@ async fn test_docker_import_creates_deployment_containers() {
     println!("=== Docker Import Integration Test ===\n");
 
     // Step 1: Create Docker importer and list containers
-    let importer = DockerWorkloadImporter::new().await
+    let importer = DockerWorkloadImporter::new()
+        .await
         .expect("Failed to create Docker importer - is Docker running?");
 
     println!("✓ Docker importer created");
 
     // Step 2: List available containers
-    let containers = importer.list_workloads().await
+    let containers = importer
+        .list_workloads()
+        .await
         .expect("Failed to list Docker containers");
 
     println!("✓ Found {} Docker containers", containers.len());
@@ -41,15 +43,20 @@ async fn test_docker_import_creates_deployment_containers() {
     }
 
     // Step 3: Find our test container
-    let test_container = containers.iter()
+    let test_container = containers
+        .iter()
         .find(|c| c.name.contains("nginx") || c.name.contains("test"))
         .or_else(|| containers.first())
         .expect("No suitable test container found");
 
-    println!("✓ Using container: {} (ID: {})", test_container.name, test_container.id);
+    println!(
+        "✓ Using container: {} (ID: {})",
+        test_container.name, test_container.id
+    );
 
     // Step 4: Generate import plan
-    let plan = importer.generate_plan(WorkloadId::new(&test_container.id))
+    let plan = importer
+        .generate_plan(WorkloadId::new(&test_container.id))
         .await
         .expect("Failed to generate import plan");
 
@@ -59,32 +66,48 @@ async fn test_docker_import_creates_deployment_containers() {
     println!("  - Ports: {} exposed", plan.deployment.ports.len());
 
     // Step 5: Verify plan contains container ID
-    assert!(!plan.source_container_id.is_empty(), "Plan should contain source container ID");
+    assert!(
+        !plan.source_container_id.is_empty(),
+        "Plan should contain source container ID"
+    );
     assert_eq!(
-        plan.source_container_id,
-        test_container.id,
+        plan.source_container_id, test_container.id,
         "Plan should reference the correct container ID"
     );
 
     // Step 6: Verify plan contains ports
-    assert!(!plan.deployment.ports.is_empty(), "Plan should contain at least one port");
+    assert!(
+        !plan.deployment.ports.is_empty(),
+        "Plan should contain at least one port"
+    );
 
     for port in &plan.deployment.ports {
-        println!("  - Port {}/{} (primary: {})",
+        println!(
+            "  - Port {}/{} (primary: {})",
             port.container_port,
-            if port.protocol == temps_import_types::Protocol::Tcp { "tcp" } else { "udp" },
+            if port.protocol == temps_import_types::Protocol::Tcp {
+                "tcp"
+            } else {
+                "udp"
+            },
             port.is_primary
         );
     }
 
     println!("\n✓ Import plan validation passed!");
     println!("\nTo complete the test:");
-    println!("1. The plan contains the container ID: {}", plan.source_container_id);
+    println!(
+        "1. The plan contains the container ID: {}",
+        plan.source_container_id
+    );
     println!("2. When execute_import runs, it should:");
     println!("   - Create a deployment record with state='completed'");
     println!("   - Create deployment_container records with:");
     println!("     * container_id = {}", plan.source_container_id);
-    println!("     * container_port = {} (and other ports)", plan.deployment.ports[0].container_port);
+    println!(
+        "     * container_port = {} (and other ports)",
+        plan.deployment.ports[0].container_port
+    );
     println!("     * status = 'running'");
     println!("\nRun this with database integration to test full execution.");
 }
@@ -98,17 +121,19 @@ fn test_deployment_container_structure() {
 
     // Simulate what would be in an import plan
     let container_id = "f5a74835dfb74445d948d9407b33d48c58fbc243accaa11e6c83d2fa4bb9b70f";
-    let ports = vec![
-        PortMapping {
-            container_port: 80,
-            host_port: Some(8888),
-            protocol: Protocol::Tcp,
-            is_primary: true,
-        }
-    ];
+    let ports = vec![PortMapping {
+        container_port: 80,
+        host_port: Some(8888),
+        protocol: Protocol::Tcp,
+        is_primary: true,
+    }];
 
     // Validate structure
-    assert_eq!(container_id.len(), 64, "Docker container IDs are 64 hex characters");
+    assert_eq!(
+        container_id.len(),
+        64,
+        "Docker container IDs are 64 hex characters"
+    );
     assert_eq!(ports.len(), 1, "Should have one port mapping");
     assert_eq!(ports[0].container_port, 80);
     assert_eq!(ports[0].host_port, Some(8888));

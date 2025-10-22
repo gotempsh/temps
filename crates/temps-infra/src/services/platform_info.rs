@@ -1,13 +1,11 @@
 use bollard::Docker;
-use tracing::{info, error, debug};
+use parking_lot::RwLock;
 use std::net::IpAddr;
 use std::sync::Arc;
-use parking_lot::RwLock;
 use std::time::{Duration, Instant};
+use tracing::{debug, error, info};
 
-use crate::types::{
-    PlatformInfo, PublicIpInfo, PrivateIpInfo, NetworkInterface, ServerMode
-};
+use crate::types::{NetworkInterface, PlatformInfo, PrivateIpInfo, PublicIpInfo, ServerMode};
 
 /// Cached network information
 #[derive(Debug, Clone)]
@@ -142,8 +140,7 @@ impl PlatformInfoService {
                 IpAddr::V4(addr) => {
                     // Check if it's a private IP address (RFC 1918)
                     let octets = addr.octets();
-                    let is_private =
-                        (octets[0] == 10) || // 10.0.0.0/8
+                    let is_private = (octets[0] == 10) || // 10.0.0.0/8
                         (octets[0] == 172 && (octets[1] >= 16 && octets[1] <= 31)) || // 172.16.0.0/12
                         (octets[0] == 192 && octets[1] == 168); // 192.168.0.0/16
 
@@ -172,13 +169,18 @@ impl PlatformInfoService {
         }
 
         // Find the most likely private IP (prefer 192.168.x.x, then 10.x.x.x, then 172.16-31.x.x)
-        let primary_private_ip = ipv4_addresses.iter()
+        let primary_private_ip = ipv4_addresses
+            .iter()
             .filter(|iface| iface.is_private.unwrap_or(false))
             .min_by_key(|iface| {
                 let ip = &iface.address;
-                if ip.starts_with("192.168.") { 0 }
-                else if ip.starts_with("10.") { 1 }
-                else { 2 }
+                if ip.starts_with("192.168.") {
+                    0
+                } else if ip.starts_with("10.") {
+                    1
+                } else {
+                    2
+                }
             })
             .map(|iface| iface.address.clone());
 
@@ -195,7 +197,10 @@ impl PlatformInfoService {
     }
 
     /// Get the server mode from request headers
-    pub async fn get_server_mode_from_headers(&self, headers: &axum::http::HeaderMap) -> ServerMode {
+    pub async fn get_server_mode_from_headers(
+        &self,
+        headers: &axum::http::HeaderMap,
+    ) -> ServerMode {
         // Check for Cloudflare headers first
         let has_cf_ray = headers.get("cf-ray").is_some();
         let has_cf_connecting_ip = headers.get("cf-connecting-ip").is_some();
@@ -205,19 +210,21 @@ impl PlatformInfoService {
         }
 
         // Get the Host header to check what address was used to access the API
-        let host_header = headers.get("host")
+        let host_header = headers
+            .get("host")
             .and_then(|h| h.to_str().ok())
             .map(|h| h.to_string());
 
         // Check if accessing via localhost or local IP
-        let is_local_access = host_header.as_ref()
+        let is_local_access = host_header
+            .as_ref()
             .map(|host| {
                 let host_without_port = host.split(':').next().unwrap_or(host);
 
-                host_without_port == "localhost" ||
-                host_without_port == "127.0.0.1" ||
-                host_without_port == "::1" ||
-                is_private_ip(host_without_port)
+                host_without_port == "localhost"
+                    || host_without_port == "127.0.0.1"
+                    || host_without_port == "::1"
+                    || is_private_ip(host_without_port)
             })
             .unwrap_or(false);
 
@@ -339,7 +346,11 @@ impl PlatformInfoService {
     }
 
     /// Determine server mode from IP addresses
-    fn determine_mode_from_ips(&self, public_ip: &Option<String>, private_ip: &Option<String>) -> ServerMode {
+    fn determine_mode_from_ips(
+        &self,
+        public_ip: &Option<String>,
+        private_ip: &Option<String>,
+    ) -> ServerMode {
         match (public_ip, private_ip) {
             (Some(pub_ip), Some(priv_ip)) if pub_ip != priv_ip && is_private_ip(priv_ip) => {
                 ServerMode::Nat
@@ -355,9 +366,7 @@ fn is_private_ip(ip: &str) -> bool {
     if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
         match addr {
             std::net::IpAddr::V4(ipv4) => {
-                ipv4.is_private() ||
-                ipv4.is_loopback() ||
-                ipv4.is_link_local()
+                ipv4.is_private() || ipv4.is_loopback() || ipv4.is_link_local()
             }
             std::net::IpAddr::V6(ipv6) => {
                 ipv6.is_loopback() ||

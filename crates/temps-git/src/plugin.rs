@@ -28,6 +28,12 @@ use crate::services::{
 /// Git Plugin for managing Git provider integrations
 pub struct GitPlugin;
 
+impl Default for GitPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GitPlugin {
     pub fn new() -> Self {
         Self

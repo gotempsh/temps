@@ -1,10 +1,9 @@
+use crate::email_templates::AuthEmailService;
 use argon2::{PasswordHasher, PasswordVerifier};
 use axum::http::header::SET_COOKIE;
 use axum::http::HeaderMap;
 use chrono::{Duration, Utc};
 use cookie::Cookie;
-use tracing::error;
-use tracing::info;
 use rand::Rng;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
@@ -13,9 +12,10 @@ use sea_orm::{
 use serde::Serialize;
 use std::sync::Arc;
 use temps_core::notifications::DynNotificationService;
-use crate::email_templates::AuthEmailService;
 use thiserror::Error;
 use totp_rs::Secret;
+use tracing::error;
+use tracing::info;
 use uuid::Uuid;
 const DEFAULT_EXTERNAL_URL: &str = "http://localhost:8000";
 #[derive(Serialize)]
@@ -236,7 +236,7 @@ impl AuthService {
                     1,
                     30,
                     Secret::Raw(
-                        base32::decode(base32::Alphabet::Rfc4648 { padding: true }, &secret)
+                        base32::decode(base32::Alphabet::Rfc4648 { padding: true }, secret)
                             .unwrap(),
                     )
                     .to_bytes()
@@ -256,7 +256,7 @@ impl AuthService {
     ) -> Result<temps_entities::users::Model, UserAuthError> {
         // Check if email already exists
         let existing_user = temps_entities::users::Entity::find()
-            .filter(temps_entities::users::Column::Email.eq(&request.email.to_lowercase()))
+            .filter(temps_entities::users::Column::Email.eq(request.email.to_lowercase()))
             .one(self.db.as_ref())
             .await?;
 
@@ -297,8 +297,7 @@ impl AuthService {
         // Update user with verification token
         let mut user_update: temps_entities::users::ActiveModel = user.into();
         user_update.email_verification_token = Set(Some(verification_token.clone()));
-        user_update.email_verification_expires =
-            Set(Some(Utc::now() + Duration::hours(24)));
+        user_update.email_verification_expires = Set(Some(Utc::now() + Duration::hours(24)));
         let updated_user = user_update.update(self.db.as_ref()).await?;
         let settings = self.get_settings().await?;
 
@@ -322,7 +321,7 @@ impl AuthService {
     ) -> Result<temps_entities::users::Model, UserAuthError> {
         // Find user by email
         let user = temps_entities::users::Entity::find()
-            .filter(temps_entities::users::Column::Email.eq(&request.email.to_lowercase()))
+            .filter(temps_entities::users::Column::Email.eq(request.email.to_lowercase()))
             .one(self.db.as_ref())
             .await?
             .ok_or(UserAuthError::InvalidCredentials)?;
@@ -334,7 +333,7 @@ impl AuthService {
             .ok_or(UserAuthError::InvalidCredentials)?;
 
         // Verify password
-        let parsed_hash = argon2::password_hash::PasswordHash::new(&password_hash)
+        let parsed_hash = argon2::password_hash::PasswordHash::new(password_hash)
             .map_err(|_| UserAuthError::InvalidCredentials)?;
 
         let argon2 = argon2::Argon2::default();
@@ -351,7 +350,7 @@ impl AuthService {
 
         // Check if user exists
         let user = temps_entities::users::Entity::find()
-            .filter(temps_entities::users::Column::Email.eq(&request.email.to_lowercase()))
+            .filter(temps_entities::users::Column::Email.eq(request.email.to_lowercase()))
             .one(self.db.as_ref())
             .await?;
 
@@ -432,7 +431,7 @@ impl AuthService {
         // Check if email service is configured
         // Find user by email
         let user = temps_entities::users::Entity::find()
-            .filter(temps_entities::users::Column::Email.eq(&email.to_lowercase()))
+            .filter(temps_entities::users::Column::Email.eq(email.to_lowercase()))
             .one(self.db.as_ref())
             .await?;
 
@@ -461,7 +460,10 @@ impl AuthService {
     }
 
     // Reset password with token
-    pub async fn reset_password(&self, request: ResetPasswordRequest) -> Result<temps_entities::users::Model, UserAuthError> {
+    pub async fn reset_password(
+        &self,
+        request: ResetPasswordRequest,
+    ) -> Result<temps_entities::users::Model, UserAuthError> {
         // Find user by reset token
         let user = temps_entities::users::Entity::find()
             .filter(temps_entities::users::Column::PasswordResetToken.eq(&request.token))
@@ -500,7 +502,10 @@ impl AuthService {
     }
 
     // Verify email with token
-    pub async fn verify_email(&self, token: &str) -> Result<temps_entities::users::Model, UserAuthError> {
+    pub async fn verify_email(
+        &self,
+        token: &str,
+    ) -> Result<temps_entities::users::Model, UserAuthError> {
         // Find user by verification token
         let user = temps_entities::users::Entity::find()
             .filter(temps_entities::users::Column::EmailVerificationToken.eq(token))
@@ -634,8 +639,8 @@ mod tests {
         }
     }
 
-    use temps_core::notifications::{NotificationError, NotificationService};
     use async_trait::async_trait;
+    use temps_core::notifications::{NotificationError, NotificationService};
 
     #[async_trait]
     impl NotificationService for MockEmailService {
@@ -650,20 +655,22 @@ mod tests {
                     if let Some(start) = message.body.find("token is: ") {
                         let token = &message.body[start + 10..];
                         let url = format!("/auth/verify?token={}", token);
-                        self.verification_emails_sent
-                            .lock()
-                            .unwrap()
-                            .push((to.clone(), "".to_string(), url));
+                        self.verification_emails_sent.lock().unwrap().push((
+                            to.clone(),
+                            "".to_string(),
+                            url,
+                        ));
                     }
                 } else if message.subject.contains("Password") {
                     // Extract reset token from body
                     if let Some(start) = message.body.find("token is: ") {
                         let token = &message.body[start + 10..];
                         let url = format!("/auth/reset-password?token={}", token);
-                        self.password_reset_emails_sent
-                            .lock()
-                            .unwrap()
-                            .push((to.clone(), "".to_string(), url));
+                        self.password_reset_emails_sent.lock().unwrap().push((
+                            to.clone(),
+                            "".to_string(),
+                            url,
+                        ));
                     }
                 } else if message.subject.contains("Magic") {
                     // Extract magic link URL from body
@@ -1197,7 +1204,10 @@ mod tests {
         };
         let user = user.insert(db.db.as_ref()).await.unwrap();
 
-        auth_service.verify_email(&verification_token).await.unwrap();
+        auth_service
+            .verify_email(&verification_token)
+            .await
+            .unwrap();
 
         // Verify email was marked as verified
         let updated_user = users::Entity::find_by_id(user.id)
@@ -1294,7 +1304,9 @@ mod tests {
         };
         session.insert(db.db.as_ref()).await.unwrap();
 
-        let result = auth_service.verify_mfa_challenge(session_token, "123456").await;
+        let result = auth_service
+            .verify_mfa_challenge(session_token, "123456")
+            .await;
 
         assert!(result.is_err());
         matches!(result.unwrap_err(), AuthError::GenericError(_));

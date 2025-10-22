@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use crate::services::service::PerformanceService;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AppState {

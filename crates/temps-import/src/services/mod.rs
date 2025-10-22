@@ -45,26 +45,20 @@ pub type ImportServiceResult<T> = Result<T, ImportServiceError>;
 impl From<ImportServiceError> for Problem {
     fn from(error: ImportServiceError) -> Self {
         match error {
-            ImportServiceError::SessionNotFound(msg) => {
-                problemdetails::new(StatusCode::NOT_FOUND)
-                    .with_title("Session Not Found")
-                    .with_detail(msg)
-            }
+            ImportServiceError::SessionNotFound(msg) => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Session Not Found")
+                .with_detail(msg),
             ImportServiceError::SourceNotAvailable(msg) => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Source Not Available")
                     .with_detail(msg)
             }
-            ImportServiceError::ValidationFailed => {
-                problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("Validation Failed")
-                    .with_detail("Import validation failed")
-            }
-            ImportServiceError::Validation(msg) => {
-                problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("Validation Error")
-                    .with_detail(msg)
-            }
+            ImportServiceError::ValidationFailed => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Validation Failed")
+                .with_detail("Import validation failed"),
+            ImportServiceError::Validation(msg) => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Validation Error")
+                .with_detail(msg),
             ImportServiceError::Configuration(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Configuration Error")
@@ -80,11 +74,9 @@ impl From<ImportServiceError> for Problem {
                     .with_title("Database Error")
                     .with_detail(e.to_string())
             }
-            ImportServiceError::Import(e) => {
-                problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("Import Error")
-                    .with_detail(e.to_string())
-            }
+            ImportServiceError::Import(e) => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Import Error")
+                .with_detail(e.to_string()),
             ImportServiceError::Internal(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")

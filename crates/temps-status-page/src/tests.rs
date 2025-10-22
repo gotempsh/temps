@@ -6,7 +6,10 @@ use std::sync::Arc;
 use temps_config::{ConfigService, ServerConfig};
 use temps_core::{Job, JobQueue, JobReceiver, QueueError};
 use temps_database::test_utils::TestDatabase;
-use temps_entities::{deployments, environments, projects, status_monitors, types::{PipelineStatus, ProjectType}};
+use temps_entities::{
+    deployments, environments, projects, status_monitors,
+    types::{PipelineStatus, ProjectType},
+};
 
 fn create_test_config_service(db: &Arc<DatabaseConnection>) -> Arc<ConfigService> {
     let config = ServerConfig::new(
@@ -14,7 +17,8 @@ fn create_test_config_service(db: &Arc<DatabaseConnection>) -> Arc<ConfigService
         "postgres://test:test@localhost/test".to_string(),
         None,
         None,
-    ).expect("Failed to create test config");
+    )
+    .expect("Failed to create test config");
     Arc::new(ConfigService::new(Arc::new(config), db.clone()))
 }
 
@@ -195,8 +199,7 @@ mod integration_tests {
     impl JobReceiver for MockReceiver {
         async fn recv(&mut self) -> Result<Job, QueueError> {
             let mut jobs = self.jobs.lock().await;
-            jobs.pop_front()
-                .ok_or(QueueError::ChannelClosed)
+            jobs.pop_front().ok_or(QueueError::ChannelClosed)
         }
     }
 
@@ -357,7 +360,10 @@ mod integration_tests {
                 environment_id: environment.id,
                 check_interval_seconds: Some(60),
             };
-            monitor_service.create_monitor(project.id, request).await.unwrap();
+            monitor_service
+                .create_monitor(project.id, request)
+                .await
+                .unwrap();
         }
 
         // List all monitors for the project
@@ -411,16 +417,14 @@ mod integration_tests {
             environment_id: environment.id,
             check_interval_seconds: Some(60),
         };
-        let monitor = monitor_service.create_monitor(project.id, request).await.unwrap();
+        let monitor = monitor_service
+            .create_monitor(project.id, request)
+            .await
+            .unwrap();
 
         // Record a check
         let check = monitor_service
-            .record_check(
-                monitor.id,
-                "operational".to_string(),
-                Some(150),
-                None,
-            )
+            .record_check(monitor.id, "operational".to_string(), Some(150), None)
             .await
             .unwrap();
 
@@ -720,7 +724,11 @@ mod integration_tests {
                     )
                     .await;
 
-                assert!(result.is_ok(), "Failed to create monitor: {:?}", result.err());
+                assert!(
+                    result.is_ok(),
+                    "Failed to create monitor: {:?}",
+                    result.err()
+                );
                 let monitor = result.unwrap();
                 assert_eq!(monitor.environment_id, Some(environment.id));
                 assert_eq!(monitor.project_id, project.id);
@@ -784,7 +792,10 @@ mod integration_tests {
                 environment_id: environment.id,
                 check_interval_seconds: Some(60),
             };
-            monitor_service.create_monitor(project.id, request).await.unwrap();
+            monitor_service
+                .create_monitor(project.id, request)
+                .await
+                .unwrap();
         }
 
         // Verify monitors exist
@@ -818,7 +829,12 @@ mod integration_tests {
                 // Delete each monitor
                 for monitor in monitors {
                     let result = monitor_service.delete_monitor(monitor.id).await;
-                    assert!(result.is_ok(), "Failed to delete monitor {}: {:?}", monitor.id, result.err());
+                    assert!(
+                        result.is_ok(),
+                        "Failed to delete monitor {}: {:?}",
+                        monitor.id,
+                        result.err()
+                    );
                 }
             }
             _ => panic!("Unexpected job type"),
@@ -865,7 +881,10 @@ mod integration_tests {
         match receiver.recv().await.unwrap() {
             temps_core::Job::ProjectCreated(job) => {
                 // ProjectCreated doesn't create monitors, just log
-                println!("Received ProjectCreated job: project_id={}, name={}", job.project_id, job.project_name);
+                println!(
+                    "Received ProjectCreated job: project_id={}, name={}",
+                    job.project_id, job.project_name
+                );
             }
             _ => panic!("Unexpected job type"),
         }
@@ -888,7 +907,10 @@ mod integration_tests {
         match receiver.recv().await.unwrap() {
             temps_core::Job::ProjectDeleted(job) => {
                 // ProjectDeleted doesn't delete monitors directly, environments handle that
-                println!("Received ProjectDeleted job: project_id={}, name={}", job.project_id, job.project_name);
+                println!(
+                    "Received ProjectDeleted job: project_id={}, name={}",
+                    job.project_id, job.project_name
+                );
             }
             _ => panic!("Unexpected job type"),
         }

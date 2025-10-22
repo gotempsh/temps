@@ -5,8 +5,8 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use temps_core::DateTime;
 use std::sync::Arc;
+use temps_core::DateTime;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::service::proxy_log_service::{ProxyLogResponse, ProxyLogService};
@@ -218,7 +218,10 @@ pub fn create_routes() -> axum::Router<Arc<ProxyLogService>> {
     axum::Router::new()
         .route("/proxy-logs", get(get_proxy_logs))
         .route("/proxy-logs/{id}", get(get_proxy_log_by_id))
-        .route("/proxy-logs/request/{request_id}", get(get_proxy_log_by_request_id))
+        .route(
+            "/proxy-logs/request/{request_id}",
+            get(get_proxy_log_by_request_id),
+        )
 }
 
 /// Get OpenAPI documentation for proxy logs handlers
@@ -227,15 +230,8 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
 
     #[derive(OpenApi)]
     #[openapi(
-        paths(
-            get_proxy_logs,
-            get_proxy_log_by_id,
-            get_proxy_log_by_request_id,
-        ),
-        components(schemas(
-            ProxyLogResponse,
-            ProxyLogsPaginatedResponse,
-        ))
+        paths(get_proxy_logs, get_proxy_log_by_id, get_proxy_log_by_request_id,),
+        components(schemas(ProxyLogResponse, ProxyLogsPaginatedResponse,))
     )]
     struct ApiDoc;
 

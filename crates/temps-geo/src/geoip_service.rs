@@ -1,9 +1,9 @@
-use tracing::{info, debug};
 use maxminddb::geoip2;
 use rand::seq::SliceRandom;
 use serde::Serialize;
 use std::net::IpAddr;
 use thiserror::Error;
+use tracing::{debug, info};
 
 #[derive(Debug, Serialize, Clone)]
 pub struct GeoLocation {
@@ -135,7 +135,8 @@ impl GeoIpService {
         // Check if we should use mock service for local development
         let use_mock = std::env::var("TEMPS_GEO_MOCK")
             .unwrap_or_else(|_| "false".to_string())
-            .to_lowercase() == "true";
+            .to_lowercase()
+            == "true";
 
         if use_mock {
             info!("Using mock GeoIP service for local development");
@@ -177,7 +178,7 @@ impl MaxMindGeoIpService {
                 let country_code = city
                     .country
                     .as_ref()
-                    .and_then(|c| c.iso_code.clone())
+                    .and_then(|c| c.iso_code)
                     .map(|s| s.to_string());
 
                 let city_name = city
@@ -198,7 +199,7 @@ impl MaxMindGeoIpService {
                 let location = city.location.as_ref();
                 let latitude = location.and_then(|l| l.latitude);
                 let longitude = location.and_then(|l| l.longitude);
-                let timezone = location.and_then(|l| l.time_zone.clone()).map(|s| s.to_string());
+                let timezone = location.and_then(|l| l.time_zone).map(|s| s.to_string());
 
                 let is_eu = city
                     .country
@@ -225,6 +226,12 @@ impl MaxMindGeoIpService {
 /// Mock GeoIP service for local development
 pub struct MockGeoIpService;
 
+impl Default for MockGeoIpService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockGeoIpService {
     pub fn new() -> Self {
         Self
@@ -235,7 +242,8 @@ impl MockGeoIpService {
         if ip.is_loopback() || Self::is_private_ip(&ip) {
             info!("Mock geolocating IP: {} (localhost/private)", ip);
             let mut rng = rand::thread_rng();
-            let mock_city = MOCK_CITIES.choose(&mut rng)
+            let mock_city = MOCK_CITIES
+                .choose(&mut rng)
                 .ok_or_else(|| GeoIpError::Other("Failed to select mock city".to_string()))?;
 
             return Ok(GeoLocation {
@@ -266,12 +274,8 @@ impl MockGeoIpService {
 
     fn is_private_ip(ip: &IpAddr) -> bool {
         match ip {
-            IpAddr::V4(ipv4) => {
-                ipv4.is_private() || ipv4.is_link_local()
-            }
-            IpAddr::V6(ipv6) => {
-                ipv6.is_loopback() || ipv6.is_unique_local()
-            }
+            IpAddr::V4(ipv4) => ipv4.is_private() || ipv4.is_link_local(),
+            IpAddr::V6(ipv6) => ipv6.is_loopback() || ipv6.is_unique_local(),
         }
     }
 }

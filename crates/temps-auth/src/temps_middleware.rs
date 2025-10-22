@@ -174,7 +174,7 @@ impl AuthMiddleware {
             .headers()
             .get("x-forwarded-proto")
             .and_then(|h| h.to_str().ok())
-            .map_or(false, |s| s == "https")
+            == Some("https")
         {
             "https"
         } else {

@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use async_trait::async_trait;
 use pingora_core::{upstreams::peer::HttpPeer, Result as PingoraResult};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use temps_core::UtcDateTime;
-use temps_entities::{projects, environments, deployments};
+use temps_entities::{deployments, environments, projects};
 
 /// Context information about a request's project, environment, and deployment
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,7 +94,10 @@ pub trait UpstreamResolver: Send + Sync {
 #[async_trait]
 pub trait RequestLogger: Send + Sync {
     /// Log a completed request with all metadata
-    async fn log_request(&self, data: RequestLogData) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn log_request(
+        &self,
+        data: RequestLogData,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// Log an error that occurred during request processing
     async fn log_error(
@@ -178,7 +181,10 @@ pub trait SessionManager: Send + Sync {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>; // Returns Set-Cookie header value
 
     /// Extend session expiry time
-    async fn extend_session(&self, session: &Session) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn extend_session(
+        &self,
+        session: &Session,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// Get session cookie configuration
     fn get_session_cookie_config(&self) -> &CookieConfig;

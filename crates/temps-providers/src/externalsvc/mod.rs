@@ -111,13 +111,11 @@ pub trait ExternalService: Send + Sync {
 
         // Check for required parameters
         for param in &required_params {
-            if param.required {
-                if !parameters.contains_key(&param.name) {
-                    return Err(anyhow::anyhow!(
-                        "Missing required parameter: {}",
-                        param.name
-                    ));
-                }
+            if param.required && !parameters.contains_key(&param.name) {
+                return Err(anyhow::anyhow!(
+                    "Missing required parameter: {}",
+                    param.name
+                ));
             }
         }
 

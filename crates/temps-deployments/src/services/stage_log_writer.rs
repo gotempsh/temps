@@ -50,20 +50,20 @@ mod tests {
 
         let log_service = Arc::new(temps_logs::LogService::new(temp_dir.clone()));
 
-        let writer = DeploymentStageLogWriter::new(
-            log_service.clone(),
-            123,
-            "test-log".to_string(),
-        );
+        let writer =
+            DeploymentStageLogWriter::new(log_service.clone(), 123, "test-log".to_string());
 
         assert_eq!(writer.stage_id(), 123);
 
         // Test writing logs (file will be created automatically)
-        writer.write_log("Test message\n".to_string()).await.unwrap();
-        writer.write_logs(vec![
-            "Line 1\n".to_string(),
-            "Line 2\n".to_string(),
-        ]).await.unwrap();
+        writer
+            .write_log("Test message\n".to_string())
+            .await
+            .unwrap();
+        writer
+            .write_logs(vec!["Line 1\n".to_string(), "Line 2\n".to_string()])
+            .await
+            .unwrap();
 
         // Verify logs were written
         let content = log_service.get_log_content("test-log").await.unwrap();

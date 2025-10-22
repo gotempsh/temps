@@ -1,8 +1,8 @@
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashMap;
-use temps_core::AuditOperation;
 pub use temps_core::AuditContext;
+use temps_core::AuditOperation;
 
 // Re-export AuditContext from temps_audit
 

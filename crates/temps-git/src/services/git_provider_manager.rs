@@ -983,9 +983,9 @@ impl GitProviderManager {
         let repository = repositories::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?;
-        Ok(repository.ok_or_else(|| {
+        repository.ok_or_else(|| {
             GitProviderManagerError::RepositoryNotFound(format!("Repository {} not found", id))
-        })?)
+        })
     }
     pub async fn get_repository_by_owner_and_name_in_connection(
         &self,
@@ -1000,12 +1000,12 @@ impl GitProviderManager {
             .one(self.db.as_ref())
             .await?;
 
-        Ok(repository.ok_or_else(|| {
+        repository.ok_or_else(|| {
             GitProviderManagerError::RepositoryNotFound(format!(
                 "Repository {}/{} not found in connection {}",
                 owner, name, connection_id
             ))
-        })?)
+        })
     }
 
     /// Get a specific connection
@@ -1259,7 +1259,7 @@ impl GitProviderManager {
                             .queue_service
                             .send(temps_core::Job::CalculateRepositoryPreset(
                                 temps_core::CalculateRepositoryPresetJob {
-                                    repository_id: repository.id.clone(),
+                                    repository_id: repository.id,
                                 },
                             ))
                             .await
@@ -2079,7 +2079,7 @@ impl GitProviderManager {
                             .full_name
                             .to_lowercase()
                             .contains(&search_term.to_lowercase())
-                        || repo.description.as_ref().map_or(false, |desc| {
+                        || repo.description.as_ref().is_some_and(|desc| {
                             desc.to_lowercase().contains(&search_term.to_lowercase())
                         })
                 })
@@ -2183,11 +2183,7 @@ impl GitProviderManager {
         {
             Ok(files) => {
                 // Use the preset detection logic
-                if let Some(preset) = detect_preset_from_files(&files) {
-                    Some(preset.slug())
-                } else {
-                    None
-                }
+                detect_preset_from_files(&files).map(|preset| preset.slug())
             }
             Err(e) => {
                 tracing::warn!("Failed to detect preset for {}/{}: {}", owner, repo, e);
@@ -2424,7 +2420,7 @@ impl GitProviderManager {
 
             directory_files
                 .entry(directory.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(path.clone());
         }
 
@@ -2439,7 +2435,7 @@ impl GitProviderManager {
                 continue;
             }
 
-            let preset = self.detect_preset_from_directory_files(&files);
+            let preset = self.detect_preset_from_directory_files(files);
 
             if let Some(preset) = preset {
                 if dir.is_empty() {
@@ -3378,10 +3374,10 @@ impl GitProviderManagerTrait for GitProviderManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_entities::{git_providers, git_provider_connections};
-    use temps_core::{Job, QueueError, JobReceiver, async_trait::async_trait};
+    use sea_orm::{ActiveModelTrait, Set};
+    use temps_core::{async_trait::async_trait, Job, JobReceiver, QueueError};
     use temps_database::test_utils::TestDatabase;
-    use sea_orm::{Set, ActiveModelTrait};
+    use temps_entities::{git_provider_connections, git_providers};
 
     // Mock implementations for tests
     struct MockJobQueue;
@@ -3413,8 +3409,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_installation_deactivates_provider() {
-        use temps_entities::users;
         use chrono::Utc;
+        use temps_entities::users;
 
         // Create real test database
         let test_db = TestDatabase::with_migrations().await.unwrap();
@@ -3468,14 +3464,21 @@ mod tests {
         connection.insert(db.as_ref()).await.unwrap();
 
         let encryption_service = Arc::new(
-            temps_core::EncryptionService::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-                .unwrap()
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
         );
 
         let queue_service = Arc::new(MockJobQueue) as Arc<dyn JobQueue>;
         let config_service = create_test_config_service(db.clone());
 
-        let manager = GitProviderManager::new(db.clone(), encryption_service, queue_service, config_service);
+        let manager = GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            queue_service,
+            config_service,
+        );
 
         // Test delete_installation
         let result = manager.delete_installation(12345).await;
@@ -3493,14 +3496,21 @@ mod tests {
         let db = test_db.connection_arc();
 
         let encryption_service = Arc::new(
-            temps_core::EncryptionService::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-                .unwrap()
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
         );
 
         let queue_service = Arc::new(MockJobQueue) as Arc<dyn JobQueue>;
         let config_service = create_test_config_service(db.clone());
 
-        let manager = GitProviderManager::new(db.clone(), encryption_service, queue_service, config_service);
+        let manager = GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            queue_service,
+            config_service,
+        );
 
         // Should succeed even if installation not found (idempotent)
         let result = manager.delete_installation(99999).await;

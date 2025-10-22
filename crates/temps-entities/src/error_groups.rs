@@ -127,10 +127,7 @@ impl Model {
 
     /// Create a vector embedding from tokenized message
     /// This converts token IDs to a fixed-size vector representation
-    pub fn create_embedding_from_tokens(
-        tokens: &[u32],
-        embedding_size: usize,
-    ) -> PgVector {
+    pub fn create_embedding_from_tokens(tokens: &[u32], embedding_size: usize) -> PgVector {
         // Simple approach: use token frequency as features
         let mut embedding = vec![0.0; embedding_size];
 

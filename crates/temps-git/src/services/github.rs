@@ -535,7 +535,7 @@ impl GithubAppService {
         );
 
         let repo_owner = repo.owner.as_ref().map(|o| o.login.as_str()).unwrap_or("");
-        let full_name_val = repo.full_name.clone().unwrap_or_else(|| "".to_string());
+        let full_name_val = repo.full_name.clone().unwrap_or_default();
 
         // Check if the repository already exists in the database
         let existing_repo = repositories::Entity::find()
@@ -648,7 +648,7 @@ impl GithubAppService {
                 fork: Set(false),
                 created_at: Set(repo.created_at),
                 updated_at: Set(repo.updated_at),
-                pushed_at: Set(repo.pushed_at.unwrap_or_else(|| chrono::Utc::now())),
+                pushed_at: Set(repo.pushed_at.unwrap_or_else(chrono::Utc::now)),
                 size: Set(0),
                 stargazers_count: Set(repo.stargazers_count),
                 watchers_count: Set(repo.watchers_count),
@@ -679,7 +679,7 @@ impl GithubAppService {
                 active_repo.installation_id = Set(Some(installation_id_p));
                 active_repo.private = Set(repo.private);
                 active_repo.updated_at = Set(chrono::Utc::now());
-                active_repo.pushed_at = Set(repo.pushed_at.unwrap_or_else(|| chrono::Utc::now()));
+                active_repo.pushed_at = Set(repo.pushed_at.unwrap_or_else(chrono::Utc::now));
                 active_repo.stargazers_count = Set(repo.stargazers_count);
                 active_repo.watchers_count = Set(repo.watchers_count);
                 active_repo.language = Set(Some(repo.language.clone()));
@@ -841,7 +841,7 @@ impl GithubAppService {
                     description: repo.description,
                     framework: Some(Framework::Unknown.to_string()),
                     installation_id: installation_id_p,
-                    pushed_at: repo.pushed_at.map(|date| date),
+                    pushed_at: repo.pushed_at,
                     stargazers_count: repo.stargazers_count.map_or(0, |count| count as i32),
                     watchers_count: repo.watchers_count.map_or(0, |count| count as i32),
                     language: repo
@@ -1060,7 +1060,7 @@ impl GithubAppService {
         active_provider
             .update(self.db.as_ref())
             .await
-            .map_err(|e| GithubAppServiceError::DatabaseError(e))?;
+            .map_err(GithubAppServiceError::DatabaseError)?;
 
         info!(
             "Updated ping_received_at to {} for GitHub App with id: {}",
@@ -1134,7 +1134,7 @@ impl GithubAppService {
                             // Check if this installation belongs to this app
                             if let Some(installation_app_id) = installation.app_id {
                                 if app_data.app_id == installation_app_id.0 as i32 {
-                                    info!("Found installation {} belongs to GitHub App: {} (app_id: {})", 
+                                    info!("Found installation {} belongs to GitHub App: {} (app_id: {})",
                                         installation_id_p, app_data.name, installation_app_id.0);
                                     found_app = Some(app_data);
                                     break;

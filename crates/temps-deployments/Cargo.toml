@@ -56,8 +56,3 @@ mockall = "0.12"
 [features]
 default = []
 integration-tests = []
-
-[[test]]
-name = "integration_tests"
-path = "tests/integration_tests.rs"
-required-features = ["integration-tests"]

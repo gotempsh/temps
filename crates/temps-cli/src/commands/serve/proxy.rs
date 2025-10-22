@@ -38,7 +38,10 @@ pub fn start_proxy_server(
         match config_service.get_settings().await {
             Ok(settings) => Ok::<Option<String>, anyhow::Error>(Some(settings.preview_domain)),
             Err(e) => {
-                warn!("Failed to fetch preview_domain from settings: {}, using default 'localhost'", e);
+                warn!(
+                    "Failed to fetch preview_domain from settings: {}, using default 'localhost'",
+                    e
+                );
                 Ok(Some("localhost".to_string()))
             }
         }
@@ -51,7 +54,10 @@ pub fn start_proxy_server(
         preview_domain,
     };
 
-    info!("Starting proxy server with preview_domain: {:?}", proxy_config.preview_domain);
+    info!(
+        "Starting proxy server with preview_domain: {:?}",
+        proxy_config.preview_domain
+    );
 
     // Note: Route table is now created and listener is started in serve/mod.rs
     // The same instance is shared between console API and proxy server
@@ -59,14 +65,21 @@ pub fn start_proxy_server(
     let shutdown_signal = Box::new(CtrlCShutdownSignal::new(
         Duration::from_secs(30),
         db.clone(),
-        data_dir.clone()
+        data_dir.clone(),
     )) as Box<dyn ProxyShutdownSignal>;
 
-    match temps_proxy::setup_proxy_server(db, proxy_config, cookie_crypto, encryption_service, route_table, shutdown_signal) {
+    match temps_proxy::setup_proxy_server(
+        db,
+        proxy_config,
+        cookie_crypto,
+        encryption_service,
+        route_table,
+        shutdown_signal,
+    ) {
         Ok(_) => {
             info!("Proxy server exited");
             Ok(())
-        },
+        }
         Err(e) => {
             error!("Failed to start proxy server: {}", e);
             Err(anyhow::anyhow!("Failed to start proxy server: {}", e))

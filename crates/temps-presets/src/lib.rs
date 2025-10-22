@@ -13,17 +13,16 @@ mod mod_rs {
 
 // Re-export main types for easy access
 pub use {
-    ProjectType, PackageManager, Preset,
-    all_presets, get_preset_by_slug, create_custom_preset,
-    detect_preset_from_files, register_docker_custom_preset
+    all_presets, create_custom_preset, detect_preset_from_files, get_preset_by_slug,
+    register_docker_custom_preset, PackageManager, Preset, ProjectType,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    use tempfile::TempDir;
+
     use std::fs;
+    use tempfile::TempDir;
 
     /// Helper function to create a temporary directory with test files
     fn create_test_dir_with_files(files: &[&str]) -> TempDir {
@@ -73,7 +72,10 @@ mod tests {
 
     #[test]
     fn test_detect_docusaurus_preset() {
-        let files = vec!["docusaurus.config.js".to_string(), "package.json".to_string()];
+        let files = vec![
+            "docusaurus.config.js".to_string(),
+            "package.json".to_string(),
+        ];
         let preset = detect_preset_from_files(&files);
 
         assert!(preset.is_some());
@@ -138,8 +140,14 @@ mod tests {
     #[test]
     fn test_package_manager_commands() {
         assert_eq!(PackageManager::Npm.install_command(), "npm install");
-        assert_eq!(PackageManager::Yarn.install_command(), "yarn install --frozen-lockfile");
-        assert_eq!(PackageManager::Pnpm.install_command(), "pnpm install --frozen-lockfile");
+        assert_eq!(
+            PackageManager::Yarn.install_command(),
+            "yarn install --frozen-lockfile"
+        );
+        assert_eq!(
+            PackageManager::Pnpm.install_command(),
+            "pnpm install --frozen-lockfile"
+        );
         assert_eq!(PackageManager::Bun.install_command(), "bun install");
 
         assert_eq!(PackageManager::Npm.build_command(), "npm run build");
@@ -196,7 +204,7 @@ mod tests {
                 Some("npm run build"),
                 Some("dist"),
                 None,
-                "test-project"
+                "test-project",
             );
 
             // Basic checks that dockerfile contains expected content
@@ -232,7 +240,7 @@ mod tests {
         let files = vec![
             "Dockerfile".to_string(),
             "next.config.js".to_string(),
-            "vite.config.js".to_string()
+            "vite.config.js".to_string(),
         ];
         let preset = detect_preset_from_files(&files);
 
@@ -245,7 +253,7 @@ mod tests {
         // Docusaurus should be detected before Next.js if both configs exist
         let files = vec![
             "docusaurus.config.js".to_string(),
-            "next.config.js".to_string()
+            "next.config.js".to_string(),
         ];
         let preset = detect_preset_from_files(&files);
 

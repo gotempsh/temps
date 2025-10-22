@@ -458,10 +458,8 @@ impl FunnelService {
                 "COALESCE(event_name, event_type) = $2".to_string(),
                 "session_id IS NOT NULL".to_string(),
             ];
-            let mut values: Vec<sea_orm::Value> = vec![
-                project_id.into(),
-                event_name.clone().into(),
-            ];
+            let mut values: Vec<sea_orm::Value> =
+                vec![project_id.into(), event_name.clone().into()];
             let mut param_index = 3;
 
             // Apply event-specific filters from step.event_filter

@@ -74,7 +74,10 @@ impl MarkDeploymentCompleteJob {
 
     /// Mark deployment as complete and update environment
     /// Also updates deployment with workflow outputs (image info, container info)
-    async fn mark_complete(&self, context: &WorkflowContext) -> Result<MarkCompleteOutput, WorkflowError> {
+    async fn mark_complete(
+        &self,
+        context: &WorkflowContext,
+    ) -> Result<MarkCompleteOutput, WorkflowError> {
         self.log("🎯 Marking deployment as complete...".to_string())
             .await?;
 
@@ -104,7 +107,9 @@ impl MarkDeploymentCompleteJob {
         }
 
         // Extract container info from deploy job output and create deployment_container record
-        if let Ok(Some(container_id)) = context.get_output::<String>("deploy_container", "container_id") {
+        if let Ok(Some(container_id)) =
+            context.get_output::<String>("deploy_container", "container_id")
+        {
             let container_name = context
                 .get_output::<String>("deploy_container", "container_name")
                 .ok()
@@ -144,15 +149,22 @@ impl MarkDeploymentCompleteJob {
                 ..Default::default()
             };
 
-            deployment_container.insert(self.db.as_ref()).await.map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!("Failed to create deployment_container: {}", e))
-            })?;
+            deployment_container
+                .insert(self.db.as_ref())
+                .await
+                .map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to create deployment_container: {}",
+                        e
+                    ))
+                })?;
 
             info!(
                 "✅ Created deployment_container record for container {}",
                 container_id
             );
-            self.log(format!("✅ Container {} registered", container_id)).await?;
+            self.log(format!("✅ Container {} registered", container_id))
+                .await?;
         }
 
         // Update deployment status to completed
@@ -168,10 +180,7 @@ impl MarkDeploymentCompleteJob {
                 WorkflowError::JobExecutionFailed(format!("Failed to update deployment: {}", e))
             })?;
 
-        info!(
-            "✅ Deployment {} marked as complete",
-            self.deployment_id
-        );
+        info!("✅ Deployment {} marked as complete", self.deployment_id);
         self.log(format!(
             "✅ Deployment {} status updated to Completed",
             self.deployment_id
@@ -186,7 +195,10 @@ impl MarkDeploymentCompleteJob {
                 WorkflowError::JobExecutionFailed(format!("Failed to find environment: {}", e))
             })?
             .ok_or_else(|| {
-                WorkflowError::JobExecutionFailed(format!("Environment {} not found", environment_id))
+                WorkflowError::JobExecutionFailed(format!(
+                    "Environment {} not found",
+                    environment_id
+                ))
             })?;
 
         let mut active_environment: environments::ActiveModel = environment.into();

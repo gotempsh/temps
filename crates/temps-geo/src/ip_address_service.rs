@@ -2,11 +2,11 @@ use crate::geoip_service::GeoIpService;
 use anyhow::Context;
 
 use chrono::Utc;
-use tracing::{error, info};
 use sea_orm::{prelude::*, QueryFilter, QueryOrder, QuerySelect, Set};
 use std::sync::Arc;
-use temps_entities::ip_geolocations;
 use temps_core::UtcDateTime;
+use temps_entities::ip_geolocations;
+use tracing::{error, info};
 
 #[derive(Debug)]
 pub struct IpAddressInfo {

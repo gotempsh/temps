@@ -6,9 +6,8 @@ use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::Docker;
 use futures::TryStreamExt;
 use http::Uri;
-use tracing::{debug, error, info};
 use rand::{distributions::Alphanumeric, Rng};
-use sea_orm::{prelude::*};
+use sea_orm::prelude::*;
 use serde::Deserialize;
 use serde_json::{self};
 use std::collections::HashMap;
@@ -17,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
+use tracing::{debug, error, info};
 
 use crate::utils::ensure_network_exists;
 
@@ -121,7 +121,10 @@ impl S3Service {
         let containers = docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
                 all: true,
-                filters: Some(HashMap::from([("name".to_string(), vec![container_name.clone()])])),
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![container_name.clone()],
+                )])),
                 ..Default::default()
             }))
             .await?;
@@ -139,7 +142,7 @@ impl S3Service {
             (name_label_key.as_str(), self.name.as_str()),
         ]);
 
-        let env_vars = vec![
+        let env_vars = [
             format!("MINIO_ROOT_USER={}", config.access_key),
             format!("MINIO_ROOT_PASSWORD={}", config.secret_key),
         ];
@@ -177,7 +180,12 @@ impl S3Service {
             networking_config,
             exposed_ports: Some(HashMap::from([("9000/tcp".to_string(), HashMap::new())])),
             env: Some(env_vars.iter().map(|s| s.as_str().to_string()).collect()),
-            labels: Some(container_labels.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
+            labels: Some(
+                container_labels
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
             cmd: Some(vec!["server".to_string(), "/data".to_string()]),
             host_config: Some(bollard::models::HostConfig {
                 restart_policy: Some(bollard::models::RestartPolicy {
@@ -518,7 +526,10 @@ impl ExternalService for S3Service {
         let containers = docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
                 all: true,
-                filters: Some(HashMap::from([("name".to_string(), vec![container_name.clone()])])),
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![container_name.clone()],
+                )])),
                 ..Default::default()
             }))
             .await?;
@@ -531,7 +542,7 @@ impl ExternalService for S3Service {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("S3 configuration not found"))?
                 .clone();
-            self.create_container(&docker, &config).await?;
+            self.create_container(docker, &config).await?;
         } else {
             docker
                 .start_container(
@@ -542,7 +553,7 @@ impl ExternalService for S3Service {
                 .context("Failed to start existing MinIO container")?;
         }
 
-        self.wait_for_container_health(&docker, &container_name)
+        self.wait_for_container_health(docker, &container_name)
             .await?;
 
         Ok(())
@@ -560,7 +571,10 @@ impl ExternalService for S3Service {
         let containers = docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
                 all: true,
-                filters: Some(HashMap::from([("name".to_string(), vec![container_name.clone()])])),
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![container_name.clone()],
+                )])),
                 ..Default::default()
             }))
             .await?;
@@ -643,7 +657,10 @@ impl ExternalService for S3Service {
         let containers = docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
                 all: true,
-                filters: Some(HashMap::from([("name".to_string(), vec![container_name.clone()])])),
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec![container_name.clone()],
+                )])),
                 ..Default::default()
             }))
             .await?;
@@ -670,7 +687,10 @@ impl ExternalService for S3Service {
 
         // Remove volume
         match docker
-            .remove_volume(&volume_name, None::<bollard::query_parameters::RemoveVolumeOptions>)
+            .remove_volume(
+                &volume_name,
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
             .await
         {
             Ok(_) => info!("Removed volume {}", volume_name),
@@ -772,7 +792,7 @@ impl ExternalService for S3Service {
         let backup_record = temps_entities::external_service_backups::Entity::insert(
             temps_entities::external_service_backups::ActiveModel {
                 service_id: Set(external_service.id),
-                backup_id: Set(backup.id.clone()),
+                backup_id: Set(backup.id),
                 backup_type: Set("full".to_string()),
                 state: Set("running".to_string()),
                 started_at: Set(Utc::now()),
@@ -802,7 +822,7 @@ impl ExternalService for S3Service {
             .clone()
             .unwrap_or(format!("{}:{}", s3_source.bucket_name, "9000"));
 
-        let env_vars = vec![
+        let env_vars = [
             format!(
                 "MC_HOST_source=http://{}:{}@{}:{}",
                 s3_source_config.access_key,
@@ -833,7 +853,8 @@ impl ExternalService for S3Service {
         };
 
         // Create the container
-        let container = self.docker
+        let container = self
+            .docker
             .create_container(
                 Some(
                     bollard::query_parameters::CreateContainerOptionsBuilder::new()
@@ -893,7 +914,8 @@ impl ExternalService for S3Service {
         for cmd in commands {
             info!("Executing command: {:?}", cmd);
 
-            let exec = self.docker
+            let exec = self
+                .docker
                 .create_exec(
                     &container.id,
                     bollard::exec::CreateExecOptions {
@@ -974,7 +996,7 @@ impl ExternalService for S3Service {
     async fn restore_from_s3(
         &self,
         // we are not using the s3 client for this restore, we are using the mc container to restore the backup
-        _s3_client: &aws_sdk_s3::Client, 
+        _s3_client: &aws_sdk_s3::Client,
         backup_location: &str,
         s3_source: &temps_entities::s3_sources::Model,
         service_config: ServiceConfig,
@@ -992,7 +1014,7 @@ impl ExternalService for S3Service {
         self.pull_mc_image(docker).await?;
 
         // Create environment variables for mc
-        let env_vars = vec![
+        let env_vars = [
             format!(
                 "MC_HOST_source=http://{}:{}@{}",
                 s3_source.access_key_id,

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use crate::DeploymentService;
 use crate::services::database_cron_service::DatabaseCronConfigService;
+use crate::DeploymentService;
 
 pub struct AppState {
     pub deployment_service: Arc<DeploymentService>,
@@ -153,7 +153,6 @@ impl DeploymentResponse {
         }
     }
 }
-
 
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CustomDomainRequest {

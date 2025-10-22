@@ -2,17 +2,18 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{Json, Redirect},
-    routing::{get, post}, Router,
+    routing::{get, post},
+    Router,
 };
 use bytes::Bytes;
-use tracing::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
 use super::types::GitAppState as AppState;
-use temps_core::problemdetails::{Problem, new as problem_new};
+use temps_core::problemdetails::{new as problem_new, Problem};
 // use crate::services::audit_service::{AuditContext, PipelineTriggeredAudit};
 // use crate::services::project::crud::ProjectCrud;
 // use crate::services::project::pipelines::ProjectPipelines;
@@ -47,9 +48,7 @@ pub struct WebhookResponse {
     message: String,
 }
 
-async fn github_webhook(
-    Json(payload): Json<serde_json::Value>,
-) -> Json<WebhookResponse> {
+async fn github_webhook(Json(payload): Json<serde_json::Value>) -> Json<WebhookResponse> {
     if let Some(event_type) = payload.get("event_type") {
         if event_type == "push" {
             info!("Received a GitHub push event");
@@ -269,10 +268,10 @@ async fn handle_push_event(
     let git_ref = push_event.r#ref;
     let branch = if git_ref.starts_with("refs/heads/") {
         Some(git_ref.replace("refs/heads/", ""))
-    } else if let Some(base_ref) = push_event.base_ref {
-        Some(base_ref.replace("refs/heads/", ""))
     } else {
-        None
+        push_event
+            .base_ref
+            .map(|base_ref| base_ref.replace("refs/heads/", ""))
     };
 
     let tag = if git_ref.starts_with("refs/tags/") {
@@ -585,7 +584,10 @@ async fn github_app_installation_callback(
             error!("Failed to process installation: {:?}", e);
             Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Installation Processing Failed")
-                .with_detail(format!("Failed to process installation {}: {}", installation_id, e)))
+                .with_detail(format!(
+                    "Failed to process installation {}: {}",
+                    installation_id, e
+                )))
         }
     }
 }

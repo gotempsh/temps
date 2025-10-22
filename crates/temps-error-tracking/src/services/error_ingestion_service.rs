@@ -1,7 +1,7 @@
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    Set, FromQueryResult,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
+    Set,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -98,21 +98,22 @@ impl ErrorIngestionService {
     /// Generate a fingerprint for error matching
     pub fn generate_fingerprint(&self, error_data: &CreateErrorEventData) -> String {
         // Use first exception for fingerprint, or fall back to legacy fields
-        let (exception_type, exception_value, stack_trace) = if let Some(first_exception) = error_data.exceptions.first() {
-            (
-                first_exception.exception_type.clone(),
-                first_exception.exception_value.clone().unwrap_or_default(),
-                &first_exception.stack_trace,
-            )
-        } else {
-            (
-                error_data.exception_type.clone().unwrap_or_default(),
-                error_data.exception_value.clone().unwrap_or_default(),
-                &error_data.stack_trace,
-            )
-        };
+        let (exception_type, exception_value, stack_trace) =
+            if let Some(first_exception) = error_data.exceptions.first() {
+                (
+                    first_exception.exception_type.clone(),
+                    first_exception.exception_value.clone().unwrap_or_default(),
+                    &first_exception.stack_trace,
+                )
+            } else {
+                (
+                    error_data.exception_type.clone().unwrap_or_default(),
+                    error_data.exception_value.clone().unwrap_or_default(),
+                    &error_data.stack_trace,
+                )
+            };
 
-        let components = vec![
+        let components = [
             exception_type,
             self.normalize_error_message(&exception_value),
             self.extract_stack_signature(stack_trace, 3),
@@ -132,7 +133,8 @@ impl ErrorIngestionService {
         let mut normalized = message.to_lowercase();
 
         // Replace UUIDs (e.g., 550e8400-e29b-41d4-a716-446655440000) - FIRST
-        let uuid_regex = Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap();
+        let uuid_regex =
+            Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap();
         normalized = uuid_regex.replace_all(&normalized, "<uuid>").to_string();
 
         // Replace hex IDs (e.g., 0x1a2b3c4d, deadbeef) - SECOND
@@ -149,10 +151,14 @@ impl ErrorIngestionService {
 
         // Replace file paths (Unix and Windows style) - AFTER URLs/emails
         let unix_path_regex = Regex::new(r"/[\w/.]+\.[\w]+").unwrap();
-        normalized = unix_path_regex.replace_all(&normalized, "<path>").to_string();
+        normalized = unix_path_regex
+            .replace_all(&normalized, "<path>")
+            .to_string();
 
         let windows_path_regex = Regex::new(r"[a-z]:\\[\w\\]+\.[\w]+").unwrap();
-        normalized = windows_path_regex.replace_all(&normalized, "<path>").to_string();
+        normalized = windows_path_regex
+            .replace_all(&normalized, "<path>")
+            .to_string();
 
         // Replace IP addresses (v4) - BEFORE table refs and numbers
         let ip_regex = Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").unwrap();
@@ -160,7 +166,9 @@ impl ErrorIngestionService {
 
         // Replace database table references (table_123, users_456) - BEFORE general numbers
         let table_ref_regex = Regex::new(r"\b(\w+)_\d+\b").unwrap();
-        normalized = table_ref_regex.replace_all(&normalized, "${1}_<id>").to_string();
+        normalized = table_ref_regex
+            .replace_all(&normalized, "${1}_<id>")
+            .to_string();
 
         // Replace numeric IDs and timestamps (standalone numbers of 4+ digits) - LAST number operation
         let number_regex = Regex::new(r"\b\d{4,}\b").unwrap();
@@ -168,7 +176,9 @@ impl ErrorIngestionService {
 
         // Replace quoted strings (often dynamic user input) - FINAL
         let quoted_string_regex = Regex::new(r#"["']([^"']{10,})["']"#).unwrap();
-        normalized = quoted_string_regex.replace_all(&normalized, r#""<string>""#).to_string();
+        normalized = quoted_string_regex
+            .replace_all(&normalized, r#""<string>""#)
+            .to_string();
 
         // Truncate to 200 characters
         normalized.chars().take(200).collect::<String>()
@@ -204,7 +214,11 @@ impl ErrorIngestionService {
     /// Normalize filenames for consistent grouping
     fn normalize_filename(&self, filename: &str) -> String {
         // Remove absolute paths, keep relative structure
-        filename.split('/').last().unwrap_or(filename).to_string()
+        filename
+            .split('/')
+            .next_back()
+            .unwrap_or(filename)
+            .to_string()
     }
 
     /// Find existing group by fingerprint hash within the same project
@@ -253,8 +267,7 @@ impl ErrorIngestionService {
         );
 
         // Query for similar error groups using pgvector cosine distance
-        let sql = format!(
-            r#"
+        let sql = r#"
             SELECT id, embedding <=> $1::vector AS distance
             FROM error_groups
             WHERE project_id = $2
@@ -264,10 +277,10 @@ impl ErrorIngestionService {
             ORDER BY distance ASC
             LIMIT 1
             "#
-        );
+        .to_string();
 
-        let result: Option<SimilarGroup> = sea_orm::FromQueryResult::find_by_statement(
-            sea_orm::Statement::from_sql_and_values(
+        let result: Option<SimilarGroup> =
+            sea_orm::FromQueryResult::find_by_statement(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &sql,
                 vec![
@@ -275,10 +288,9 @@ impl ErrorIngestionService {
                     project_id.into(),
                     SIMILARITY_THRESHOLD.into(),
                 ],
-            ),
-        )
-        .one(self.db.as_ref())
-        .await?;
+            ))
+            .one(self.db.as_ref())
+            .await?;
 
         Ok(result.map(|r| r.id))
     }
@@ -290,25 +302,32 @@ impl ErrorIngestionService {
         _fingerprint: &str,
     ) -> Result<i32, ErrorTrackingError> {
         // Use first exception for title, or fall back to legacy fields
-        let (exception_type, exception_value) = if let Some(first_exception) = error_data.exceptions.first() {
-            (
-                first_exception.exception_type.clone(),
-                first_exception.exception_value.clone().unwrap_or_else(|| "Unknown error".to_string()),
-            )
-        } else {
-            (
-                error_data.exception_type.clone().unwrap_or_else(|| "Error".to_string()),
-                error_data.exception_value.clone().unwrap_or_else(|| "Unknown error".to_string()),
-            )
-        };
+        let (exception_type, exception_value) =
+            if let Some(first_exception) = error_data.exceptions.first() {
+                (
+                    first_exception.exception_type.clone(),
+                    first_exception
+                        .exception_value
+                        .clone()
+                        .unwrap_or_else(|| "Unknown error".to_string()),
+                )
+            } else {
+                (
+                    error_data
+                        .exception_type
+                        .clone()
+                        .unwrap_or_else(|| "Error".to_string()),
+                    error_data
+                        .exception_value
+                        .clone()
+                        .unwrap_or_else(|| "Unknown error".to_string()),
+                )
+            };
 
         let title = format!(
             "{}: {}",
             exception_type,
-            exception_value
-                .chars()
-                .take(100)
-                .collect::<String>()
+            exception_value.chars().take(100).collect::<String>()
         );
 
         // Create embedding from error message for similarity search (reuse exception_value from above)
@@ -348,110 +367,121 @@ impl ErrorIngestionService {
         let data_json = if let Some(raw_sentry) = &error_data.raw_sentry_event {
             // Wrap the raw Sentry event in our structure with source metadata
             let mut wrapper = serde_json::Map::new();
-            wrapper.insert("source".to_string(), serde_json::Value::String("sentry".to_string()));
+            wrapper.insert(
+                "source".to_string(),
+                serde_json::Value::String("sentry".to_string()),
+            );
             wrapper.insert("sentry".to_string(), raw_sentry.clone());
             serde_json::Value::Object(wrapper)
         } else {
             use temps_entities::error_events::{
-                ErrorEventData, UserContext, DeviceContext, RequestContext,
-                StackFrame, EnvironmentContext, TraceContext
+                DeviceContext, EnvironmentContext, ErrorEventData, RequestContext, StackFrame,
+                TraceContext, UserContext,
             };
 
             // Build structured data from individual fields (for non-Sentry sources)
             let event_data = ErrorEventData {
                 source: Some("custom".to_string()),
-            user: Some(UserContext {
-                user_id: error_data.user_id.clone(),
-                email: error_data.user_email.clone(),
-                username: error_data.user_username.clone(),
-                ip_address: error_data.user_ip_address.clone(),
-                segment: error_data.user_segment.clone(),
-                session_id: error_data.session_id.clone(),
-                custom: error_data.user_context.clone(),
-            }),
-            device: Some(DeviceContext {
-                browser: error_data.browser.clone(),
-                browser_version: error_data.browser_version.clone(),
-                os: error_data.operating_system.clone(),
-                os_version: error_data.operating_system_version.clone(),
-                os_build: error_data.os_build.clone(),
-                os_kernel_version: error_data.os_kernel_version.clone(),
-                device_type: error_data.device_type.clone(),
-                device_arch: error_data.device_arch.clone(),
-                screen_width: error_data.screen_width,
-                screen_height: error_data.screen_height,
-                viewport_width: error_data.viewport_width,
-                viewport_height: error_data.viewport_height,
-                locale: error_data.locale.clone(),
-                timezone: error_data.timezone.clone(),
-                processor_count: error_data.device_processor_count,
-                processor_frequency: error_data.device_processor_frequency,
-                memory_size: error_data.device_memory_size,
-                free_memory: error_data.device_free_memory,
-                boot_time: error_data.device_boot_time.map(|dt| dt.to_string()),
-            }),
-            request: Some(RequestContext {
-                url: error_data.url.clone(),
-                method: error_data.method.clone(),
-                user_agent: error_data.user_agent.clone(),
-                referrer: error_data.referrer.clone(),
-                headers: error_data.headers.clone(),
-                cookies: error_data.request_cookies.clone(),
-                query_string: error_data.request_query_string.clone(),
-                post_data: error_data.request_data.clone(),
-            }),
-            // Try to parse stack trace into our format, extract frames if it's a Sentry stacktrace object
-            stack_trace: error_data.stack_trace.as_ref().and_then(|st| {
-                // If it's a Sentry stacktrace object with "frames" field, extract the frames
-                if let serde_json::Value::Object(obj) = st {
-                    if let Some(frames) = obj.get("frames") {
-                        return serde_json::from_value::<Vec<StackFrame>>(frames.clone()).ok();
+                user: Some(UserContext {
+                    user_id: error_data.user_id.clone(),
+                    email: error_data.user_email.clone(),
+                    username: error_data.user_username.clone(),
+                    ip_address: error_data.user_ip_address.clone(),
+                    segment: error_data.user_segment.clone(),
+                    session_id: error_data.session_id.clone(),
+                    custom: error_data.user_context.clone(),
+                }),
+                device: Some(DeviceContext {
+                    browser: error_data.browser.clone(),
+                    browser_version: error_data.browser_version.clone(),
+                    os: error_data.operating_system.clone(),
+                    os_version: error_data.operating_system_version.clone(),
+                    os_build: error_data.os_build.clone(),
+                    os_kernel_version: error_data.os_kernel_version.clone(),
+                    device_type: error_data.device_type.clone(),
+                    device_arch: error_data.device_arch.clone(),
+                    screen_width: error_data.screen_width,
+                    screen_height: error_data.screen_height,
+                    viewport_width: error_data.viewport_width,
+                    viewport_height: error_data.viewport_height,
+                    locale: error_data.locale.clone(),
+                    timezone: error_data.timezone.clone(),
+                    processor_count: error_data.device_processor_count,
+                    processor_frequency: error_data.device_processor_frequency,
+                    memory_size: error_data.device_memory_size,
+                    free_memory: error_data.device_free_memory,
+                    boot_time: error_data.device_boot_time.map(|dt| dt.to_string()),
+                }),
+                request: Some(RequestContext {
+                    url: error_data.url.clone(),
+                    method: error_data.method.clone(),
+                    user_agent: error_data.user_agent.clone(),
+                    referrer: error_data.referrer.clone(),
+                    headers: error_data.headers.clone(),
+                    cookies: error_data.request_cookies.clone(),
+                    query_string: error_data.request_query_string.clone(),
+                    post_data: error_data.request_data.clone(),
+                }),
+                // Try to parse stack trace into our format, extract frames if it's a Sentry stacktrace object
+                stack_trace: error_data.stack_trace.as_ref().and_then(|st| {
+                    // If it's a Sentry stacktrace object with "frames" field, extract the frames
+                    if let serde_json::Value::Object(obj) = st {
+                        if let Some(frames) = obj.get("frames") {
+                            return serde_json::from_value::<Vec<StackFrame>>(frames.clone()).ok();
+                        }
                     }
-                }
-                // Otherwise try to parse the whole thing as Vec<StackFrame>
-                serde_json::from_value::<Vec<StackFrame>>(st.clone()).ok()
-            }),
-            environment: Some(EnvironmentContext {
-                sdk_name: error_data.sdk_name.clone(),
-                sdk_version: error_data.sdk_version.clone(),
-                sdk_integrations: error_data.sdk_integrations.as_ref().and_then(|v| {
-                    serde_json::from_value(v.clone()).ok()
+                    // Otherwise try to parse the whole thing as Vec<StackFrame>
+                    serde_json::from_value::<Vec<StackFrame>>(st.clone()).ok()
                 }),
-                platform: error_data.platform.clone(),
-                release: error_data.release_version.clone(),
-                build: error_data.build_number.clone(),
-                server_name: error_data.server_name.clone(),
-                environment: error_data.environment.clone(),
-                runtime_name: error_data.runtime_name.clone(),
-                runtime_version: error_data.runtime_version.clone(),
-                app_start_time: error_data.app_start_time.map(|dt| dt.to_string()),
-                app_memory: error_data.app_memory,
-            }),
-            trace: Some(TraceContext {
-                transaction: error_data.transaction_name.clone(),
-                breadcrumbs: error_data.breadcrumbs.as_ref().and_then(|v| {
-                    serde_json::from_value(v.clone()).ok()
+                environment: Some(EnvironmentContext {
+                    sdk_name: error_data.sdk_name.clone(),
+                    sdk_version: error_data.sdk_version.clone(),
+                    sdk_integrations: error_data
+                        .sdk_integrations
+                        .as_ref()
+                        .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                    platform: error_data.platform.clone(),
+                    release: error_data.release_version.clone(),
+                    build: error_data.build_number.clone(),
+                    server_name: error_data.server_name.clone(),
+                    environment: error_data.environment.clone(),
+                    runtime_name: error_data.runtime_name.clone(),
+                    runtime_version: error_data.runtime_version.clone(),
+                    app_start_time: error_data.app_start_time.map(|dt| dt.to_string()),
+                    app_memory: error_data.app_memory,
                 }),
-                extra: error_data.extra_context.clone(),
-                contexts: error_data.contexts.clone(),
-            }),
-            sentry: None, // Can be populated from raw SDK payload if needed
-        };
-            event_data.to_json_value().unwrap_or_else(|| serde_json::json!({}))
+                trace: Some(TraceContext {
+                    transaction: error_data.transaction_name.clone(),
+                    breadcrumbs: error_data
+                        .breadcrumbs
+                        .as_ref()
+                        .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                    extra: error_data.extra_context.clone(),
+                    contexts: error_data.contexts.clone(),
+                }),
+                sentry: None, // Can be populated from raw SDK payload if needed
+            };
+            event_data
+                .to_json_value()
+                .unwrap_or_else(|| serde_json::json!({}))
         };
 
         // Use first exception for event fields (legacy compatibility)
-        let (event_exception_type, event_exception_value) = if let Some(first_exception) = error_data.exceptions.first() {
-            (
-                first_exception.exception_type.clone(),
-                first_exception.exception_value.clone(),
-            )
-        } else {
-            (
-                error_data.exception_type.clone().unwrap_or_else(|| "Error".to_string()),
-                error_data.exception_value.clone(),
-            )
-        };
+        let (event_exception_type, event_exception_value) =
+            if let Some(first_exception) = error_data.exceptions.first() {
+                (
+                    first_exception.exception_type.clone(),
+                    first_exception.exception_value.clone(),
+                )
+            } else {
+                (
+                    error_data
+                        .exception_type
+                        .clone()
+                        .unwrap_or_else(|| "Error".to_string()),
+                    error_data.exception_value.clone(),
+                )
+            };
 
         let new_event = error_events::ActiveModel {
             error_group_id: Set(group_id),

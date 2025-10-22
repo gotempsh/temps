@@ -12,10 +12,22 @@ fn test_permission_display() {
 
 #[test]
 fn test_permission_from_str() {
-    assert_eq!(Permission::from_str("projects:read"), Some(Permission::ProjectsRead));
-    assert_eq!(Permission::from_str("projects:write"), Some(Permission::ProjectsWrite));
-    assert_eq!(Permission::from_str("system:admin"), Some(Permission::SystemAdmin));
-    assert_eq!(Permission::from_str("mcp:connect"), Some(Permission::McpConnect));
+    assert_eq!(
+        Permission::from_str("projects:read"),
+        Some(Permission::ProjectsRead)
+    );
+    assert_eq!(
+        Permission::from_str("projects:write"),
+        Some(Permission::ProjectsWrite)
+    );
+    assert_eq!(
+        Permission::from_str("system:admin"),
+        Some(Permission::SystemAdmin)
+    );
+    assert_eq!(
+        Permission::from_str("mcp:connect"),
+        Some(Permission::McpConnect)
+    );
     assert_eq!(Permission::from_str("invalid:permission"), None);
     assert_eq!(Permission::from_str(""), None);
 }
@@ -27,7 +39,12 @@ fn test_permission_from_str_roundtrip() {
     for permission in all_permissions {
         let string_repr = permission.to_string();
         let parsed = Permission::from_str(&string_repr);
-        assert_eq!(parsed, Some(permission), "Failed roundtrip for permission: {}", string_repr);
+        assert_eq!(
+            parsed,
+            Some(permission),
+            "Failed roundtrip for permission: {}",
+            string_repr
+        );
     }
 }
 
@@ -41,7 +58,11 @@ fn test_permission_all() {
 
     // Check that we have the expected number of permissions (should match enum variants)
     // This test will fail if new permissions are added but not included in all()
-    assert!(permissions.len() >= 80, "Expected at least 80 permissions, got {}", permissions.len());
+    assert!(
+        permissions.len() >= 80,
+        "Expected at least 80 permissions, got {}",
+        permissions.len()
+    );
 }
 
 #[test]
@@ -73,7 +94,12 @@ fn test_role_from_str_roundtrip() {
     for role in all_roles {
         let string_repr = role.to_string();
         let parsed = Role::from_str(&string_repr);
-        assert_eq!(parsed, Some(role), "Failed roundtrip for role: {}", string_repr);
+        assert_eq!(
+            parsed,
+            Some(role),
+            "Failed roundtrip for role: {}",
+            string_repr
+        );
     }
 }
 

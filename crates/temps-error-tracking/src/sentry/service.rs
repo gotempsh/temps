@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use thiserror::Error;
 
-use super::{envelope::Envelope, mapper, dsn_service::DSNService};
+use super::{dsn_service::DSNService, envelope::Envelope, mapper};
 use crate::services::error_tracking_service::ErrorTrackingService;
 
 #[derive(Error, Debug)]
@@ -48,7 +48,9 @@ impl From<super::types::SentryIngesterError> for SentryIngestionError {
             super::types::SentryIngesterError::Database(e) => SentryIngestionError::Database(e),
             super::types::SentryIngesterError::ProjectNotFound => SentryIngestionError::NotFound,
             super::types::SentryIngesterError::InvalidDSN => SentryIngestionError::Unauthorized,
-            super::types::SentryIngesterError::Validation(msg) => SentryIngestionError::Validation(msg),
+            super::types::SentryIngesterError::Validation(msg) => {
+                SentryIngestionError::Validation(msg)
+            }
         }
     }
 }
@@ -78,7 +80,8 @@ impl SentryIngestionService {
         envelope_data: &[u8],
     ) -> Result<Vec<String>, SentryIngestionError> {
         // 1. Validate DSN and get environment/deployment context
-        let dsn_record = self.dsn_service
+        let dsn_record = self
+            .dsn_service
             .validate_dsn(project_id, public_key)
             .await?;
 
@@ -111,7 +114,8 @@ impl SentryIngestionService {
                     )?;
 
                     // Store in database
-                    let _group_id = self.error_tracking_service
+                    let _group_id = self
+                        .error_tracking_service
                         .process_error_event(error_data)
                         .await
                         .map_err(|e| SentryIngestionError::ErrorTracking(e.to_string()))?;
@@ -149,7 +153,8 @@ impl SentryIngestionService {
         event_json: serde_json::Value,
     ) -> Result<String, SentryIngestionError> {
         // 1. Validate DSN
-        let dsn_record = self.dsn_service
+        let dsn_record = self
+            .dsn_service
             .validate_dsn(project_id, public_key)
             .await?;
 

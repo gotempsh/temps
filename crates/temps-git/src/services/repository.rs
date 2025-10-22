@@ -1,14 +1,14 @@
+use sea_orm::{prelude::*, JoinType, QueryFilter, QueryOrder, QuerySelect, RelationTrait};
 use std::sync::Arc;
-use sea_orm::{prelude::*, QueryFilter, QueryOrder, QuerySelect, JoinType, RelationTrait};
 use temps_core::UtcDateTime;
-use temps_entities::{repositories, git_provider_connections};
+use temps_entities::{git_provider_connections, repositories};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum RepositoryServiceError {
     #[error("Database error: {0}")]
     DatabaseError(#[from] sea_orm::DbErr),
-    
+
     #[error("Git provider connection not found")]
     ConnectionNotFound,
 }
@@ -75,9 +75,10 @@ impl RepositoryService {
 
         if let Some(search) = &filter.search {
             query = query.filter(
-                repositories::Column::Name.contains(search)
+                repositories::Column::Name
+                    .contains(search)
                     .or(repositories::Column::FullName.contains(search))
-                    .or(repositories::Column::Description.contains(search))
+                    .or(repositories::Column::Description.contains(search)),
             );
         }
 
@@ -106,13 +107,19 @@ impl RepositoryService {
             Some("pushed_at") => query = query.order_by_asc(repositories::Column::PushedAt),
             Some("pushed_at_desc") => query = query.order_by_desc(repositories::Column::PushedAt),
             Some("stars") => query = query.order_by_asc(repositories::Column::StargazersCount),
-            Some("stars_desc") => query = query.order_by_desc(repositories::Column::StargazersCount),
+            Some("stars_desc") => {
+                query = query.order_by_desc(repositories::Column::StargazersCount)
+            }
             Some("watchers") => query = query.order_by_asc(repositories::Column::WatchersCount),
-            Some("watchers_desc") => query = query.order_by_desc(repositories::Column::WatchersCount),
+            Some("watchers_desc") => {
+                query = query.order_by_desc(repositories::Column::WatchersCount)
+            }
             Some("size") => query = query.order_by_asc(repositories::Column::Size),
             Some("size_desc") => query = query.order_by_desc(repositories::Column::Size),
             Some("issues") => query = query.order_by_asc(repositories::Column::OpenIssuesCount),
-            Some("issues_desc") => query = query.order_by_desc(repositories::Column::OpenIssuesCount),
+            Some("issues_desc") => {
+                query = query.order_by_desc(repositories::Column::OpenIssuesCount)
+            }
             _ => query = query.order_by_desc(repositories::Column::PushedAt),
         }
 
@@ -127,32 +134,35 @@ impl RepositoryService {
 
         let repositories = query.all(self.db.as_ref()).await?;
 
-        Ok(repositories.into_iter().map(|repo| RepositoryModel {
-            id: repo.id,
-            owner: repo.owner,
-            name: repo.name,
-            full_name: repo.full_name,
-            description: repo.description,
-            private: repo.private,
-            fork: repo.fork,
-            created_at: repo.created_at,
-            updated_at: repo.updated_at,
-            pushed_at: repo.pushed_at,
-            size: repo.size,
-            stargazers_count: repo.stargazers_count,
-            watchers_count: repo.watchers_count,
-            language: repo.language,
-            default_branch: repo.default_branch,
-            open_issues_count: repo.open_issues_count,
-            topics: repo.topics,
-            framework: repo.framework,
-            framework_version: repo.framework_version,
-            package_manager: repo.package_manager,
-            clone_url: repo.clone_url,
-            ssh_url: repo.ssh_url,
-            preset: repo.preset,
-            git_provider_connection_id: repo.git_provider_connection_id,
-        }).collect())
+        Ok(repositories
+            .into_iter()
+            .map(|repo| RepositoryModel {
+                id: repo.id,
+                owner: repo.owner,
+                name: repo.name,
+                full_name: repo.full_name,
+                description: repo.description,
+                private: repo.private,
+                fork: repo.fork,
+                created_at: repo.created_at,
+                updated_at: repo.updated_at,
+                pushed_at: repo.pushed_at,
+                size: repo.size,
+                stargazers_count: repo.stargazers_count,
+                watchers_count: repo.watchers_count,
+                language: repo.language,
+                default_branch: repo.default_branch,
+                open_issues_count: repo.open_issues_count,
+                topics: repo.topics,
+                framework: repo.framework,
+                framework_version: repo.framework_version,
+                package_manager: repo.package_manager,
+                clone_url: repo.clone_url,
+                ssh_url: repo.ssh_url,
+                preset: repo.preset,
+                git_provider_connection_id: repo.git_provider_connection_id,
+            })
+            .collect())
     }
 
     pub async fn verify_git_provider_connection_exists(
@@ -261,32 +271,35 @@ impl RepositoryService {
             .all(self.db.as_ref())
             .await?;
 
-        Ok(repositories.into_iter().map(|repo| RepositoryModel {
-            id: repo.id,
-            owner: repo.owner,
-            name: repo.name,
-            full_name: repo.full_name,
-            description: repo.description,
-            private: repo.private,
-            fork: repo.fork,
-            created_at: repo.created_at,
-            updated_at: repo.updated_at,
-            pushed_at: repo.pushed_at,
-            size: repo.size,
-            stargazers_count: repo.stargazers_count,
-            watchers_count: repo.watchers_count,
-            language: repo.language,
-            default_branch: repo.default_branch,
-            open_issues_count: repo.open_issues_count,
-            topics: repo.topics,
-            framework: repo.framework,
-            framework_version: repo.framework_version,
-            package_manager: repo.package_manager,
-            clone_url: repo.clone_url,
-            ssh_url: repo.ssh_url,
-            preset: repo.preset,
-            git_provider_connection_id: repo.git_provider_connection_id,
-        }).collect())
+        Ok(repositories
+            .into_iter()
+            .map(|repo| RepositoryModel {
+                id: repo.id,
+                owner: repo.owner,
+                name: repo.name,
+                full_name: repo.full_name,
+                description: repo.description,
+                private: repo.private,
+                fork: repo.fork,
+                created_at: repo.created_at,
+                updated_at: repo.updated_at,
+                pushed_at: repo.pushed_at,
+                size: repo.size,
+                stargazers_count: repo.stargazers_count,
+                watchers_count: repo.watchers_count,
+                language: repo.language,
+                default_branch: repo.default_branch,
+                open_issues_count: repo.open_issues_count,
+                topics: repo.topics,
+                framework: repo.framework,
+                framework_version: repo.framework_version,
+                package_manager: repo.package_manager,
+                clone_url: repo.clone_url,
+                ssh_url: repo.ssh_url,
+                preset: repo.preset,
+                git_provider_connection_id: repo.git_provider_connection_id,
+            })
+            .collect())
     }
 
     /// List all repositories linked to a specific git provider
@@ -297,37 +310,40 @@ impl RepositoryService {
         let repositories = repositories::Entity::find()
             .join(
                 JoinType::InnerJoin,
-                repositories::Relation::GitProviderConnection.def()
+                repositories::Relation::GitProviderConnection.def(),
             )
             .filter(git_provider_connections::Column::ProviderId.eq(provider_id))
             .all(self.db.as_ref())
             .await?;
 
-        Ok(repositories.into_iter().map(|repo| RepositoryModel {
-            id: repo.id,
-            owner: repo.owner,
-            name: repo.name,
-            full_name: repo.full_name,
-            description: repo.description,
-            private: repo.private,
-            fork: repo.fork,
-            created_at: repo.created_at,
-            updated_at: repo.updated_at,
-            pushed_at: repo.pushed_at,
-            size: repo.size,
-            stargazers_count: repo.stargazers_count,
-            watchers_count: repo.watchers_count,
-            language: repo.language,
-            default_branch: repo.default_branch,
-            open_issues_count: repo.open_issues_count,
-            topics: repo.topics,
-            framework: repo.framework,
-            framework_version: repo.framework_version,
-            package_manager: repo.package_manager,
-            clone_url: repo.clone_url,
-            ssh_url: repo.ssh_url,
-            preset: repo.preset,
-            git_provider_connection_id: repo.git_provider_connection_id,
-        }).collect())
+        Ok(repositories
+            .into_iter()
+            .map(|repo| RepositoryModel {
+                id: repo.id,
+                owner: repo.owner,
+                name: repo.name,
+                full_name: repo.full_name,
+                description: repo.description,
+                private: repo.private,
+                fork: repo.fork,
+                created_at: repo.created_at,
+                updated_at: repo.updated_at,
+                pushed_at: repo.pushed_at,
+                size: repo.size,
+                stargazers_count: repo.stargazers_count,
+                watchers_count: repo.watchers_count,
+                language: repo.language,
+                default_branch: repo.default_branch,
+                open_issues_count: repo.open_issues_count,
+                topics: repo.topics,
+                framework: repo.framework,
+                framework_version: repo.framework_version,
+                package_manager: repo.package_manager,
+                clone_url: repo.clone_url,
+                ssh_url: repo.ssh_url,
+                preset: repo.preset,
+                git_provider_connection_id: repo.git_provider_connection_id,
+            })
+            .collect())
     }
 }

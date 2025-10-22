@@ -9,109 +9,109 @@ pub enum Permission {
     ProjectsWrite,
     ProjectsDelete,
     ProjectsCreate,
-    
+
     // Deployment permissions
     DeploymentsRead,
     DeploymentsWrite,
     DeploymentsDelete,
     DeploymentsCreate,
-    
+
     // Domain permissions
     DomainsRead,
     DomainsWrite,
     DomainsDelete,
     DomainsCreate,
-    
+
     // Environment permissions
     EnvironmentsRead,
     EnvironmentsWrite,
     EnvironmentsDelete,
     EnvironmentsCreate,
-    
+
     // Analytics permissions
     AnalyticsRead,
     AnalyticsWrite,
-    
+
     // User management permissions
     UsersRead,
     UsersWrite,
     UsersDelete,
     UsersCreate,
-    
+
     // System admin permissions
     SystemAdmin,
     SystemRead,
-    
+
     // MCP specific permissions
     McpConnect,
     McpExecute,
     McpRead,
     McpWrite,
-    
+
     // API Key management
     ApiKeysRead,
     ApiKeysWrite,
     ApiKeysDelete,
     ApiKeysCreate,
-    
+
     // Audit permissions
     AuditRead,
-    
+
     // Backup permissions
     BackupsRead,
     BackupsWrite,
     BackupsDelete,
     BackupsCreate,
-    
+
     // Cron permissions
     CronsRead,
     CronsWrite,
     CronsDelete,
     CronsCreate,
-    
+
     // External Services permissions
     ExternalServicesRead,
     ExternalServicesWrite,
     ExternalServicesDelete,
     ExternalServicesCreate,
-    
+
     // Settings permissions
     SettingsRead,
     SettingsWrite,
-    
+
     // Files permissions
     FilesRead,
     FilesWrite,
     FilesDelete,
     FilesUpload,
-    
+
     // Funnel permissions
     FunnelRead,
     FunnelWrite,
-    
+
     // Github permissions
     GithubRead,
     GithubWrite,
     GithubConnect,
-    
+
     // Load Balancer permissions
     LoadBalancerRead,
     LoadBalancerWrite,
-    
+
     // Logs permissions
     LogsRead,
-    
+
     // Metrics permissions
     MetricsRead,
-    
+
     // Notifications permissions
     NotificationsRead,
     NotificationsWrite,
-    
+
     // Notification Preferences permissions
     NotificationPreferencesRead,
     NotificationPreferencesWrite,
-    
+
     // Notification Providers permissions
     NotificationProvidersRead,
     NotificationProvidersWrite,
@@ -124,22 +124,22 @@ pub enum Permission {
     PipelinesCreate,
     PipelinesDelete,
     PipelinesExecute,
-    
+
     // Platform Info permissions
     PlatformInfoRead,
-    
+
     // Session Metrics permissions
     SessionMetricsRead,
-    
+
     // Speed Insights permissions
     SpeedInsightsRead,
-    
+
     // Webhooks permissions
     WebhooksRead,
     WebhooksWrite,
     WebhooksCreate,
     WebhooksDelete,
-    
+
     // WebSocket Proxy permissions
     WebSocketProxyConnect,
 
@@ -481,14 +481,14 @@ pub enum Role {
     Reader,
     Mcp,
     ApiReader,
-    Custom,  // For API keys with custom permissions
+    Custom, // For API keys with custom permissions
 }
 
 impl fmt::Display for Role {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Role::Admin => "admin",
-            Role::User => "user", 
+            Role::User => "user",
             Role::Reader => "reader",
             Role::Mcp => "mcp",
             Role::ApiReader => "api_reader",
@@ -740,7 +740,7 @@ impl Role {
                 Permission::DeploymentsRead,
                 Permission::AnalyticsRead,
             ],
-            Role::Custom => &[],  // Custom role has no default permissions
+            Role::Custom => &[], // Custom role has no default permissions
         }
     }
 

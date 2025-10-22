@@ -1,7 +1,8 @@
 use axum::{
     extract::{Query, State},
     http::StatusCode,
-    response::Redirect, Router,
+    response::Redirect,
+    Router,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,7 +59,7 @@ async fn gitlab_oauth_callback(
         .map_err(|e| {
             problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Failed to list providers")
-                .with_detail(&format!("Error: {}", e))
+                .with_detail(format!("Error: {}", e))
         })?;
 
     let gitlab_provider = providers
@@ -87,7 +88,7 @@ async fn gitlab_oauth_callback(
         .map_err(|e| {
             problem_new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("OAuth Callback Failed")
-                .with_detail(&format!("Failed to handle GitLab OAuth callback: {}", e))
+                .with_detail(format!("Failed to handle GitLab OAuth callback: {}", e))
         })?;
 
     info!(

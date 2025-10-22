@@ -1,7 +1,7 @@
 use super::types::AppState;
 use crate::services::service::{
-    Screen, SessionMetadata, SessionReplayError, SessionReplayInfo,
-    SessionReplayWithEvents, SessionReplayWithVisitor, Viewport,
+    Screen, SessionMetadata, SessionReplayError, SessionReplayInfo, SessionReplayWithEvents,
+    SessionReplayWithVisitor, Viewport,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -515,9 +515,7 @@ pub async fn get_session_replay_events(
         .get_session_replay(session_id)
         .await
     {
-        Ok(session_replay_with_events) => {
-            Ok(Json(session_replay_with_events.into()))
-        }
+        Ok(session_replay_with_events) => Ok(Json(session_replay_with_events.into())),
         Err(e) => Err(e.into()),
     }
 }
@@ -656,31 +654,34 @@ pub async fn init_session_replay(
         request.session_id
     );
 
-    let visitor_id = metadata
-        .visitor_id_cookie
-        .ok_or_else(|| ErrorBuilder::new(StatusCode::BAD_REQUEST).title("Visitor ID is required").build())?;
+    let visitor_id = metadata.visitor_id_cookie.ok_or_else(|| {
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Visitor ID is required")
+            .build()
+    })?;
 
     // Resolve project, environment, and deployment from route table
-    let (project_id, environment_id, deployment_id) = match state.route_table.get_route(&metadata.host) {
-        Some(route_info) => {
-            let project_id = route_info.project.as_ref().map(|p| p.id).unwrap_or(1);
-            let environment_id = route_info.environment.as_ref().map(|e| e.id);
-            let deployment_id = route_info.deployment.as_ref().map(|d| d.id);
+    let (project_id, environment_id, deployment_id) =
+        match state.route_table.get_route(&metadata.host) {
+            Some(route_info) => {
+                let project_id = route_info.project.as_ref().map(|p| p.id).unwrap_or(1);
+                let environment_id = route_info.environment.as_ref().map(|e| e.id);
+                let deployment_id = route_info.deployment.as_ref().map(|d| d.id);
 
-            info!(
-                "Resolved host {} to project={}, env={:?}, deploy={:?}",
-                metadata.host, project_id, environment_id, deployment_id
-            );
+                info!(
+                    "Resolved host {} to project={}, env={:?}, deploy={:?}",
+                    metadata.host, project_id, environment_id, deployment_id
+                );
 
-            (project_id, environment_id, deployment_id)
-        }
-        None => {
-            return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-                .title("Host not found in route table")
-                .detail(format!("Host {} not found", metadata.host))
-                .build());
-        }
-    };
+                (project_id, environment_id, deployment_id)
+            }
+            None => {
+                return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+                    .title("Host not found in route table")
+                    .detail(format!("Host {} not found", metadata.host))
+                    .build());
+            }
+        };
 
     let session_metadata = SessionMetadata {
         visitor_id,
