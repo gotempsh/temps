@@ -10,9 +10,42 @@
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 
-[Features](#-features) • [Quick Start](#-quick-start) • [Installation](#-installation) • [Deploy an App](#-deploying-your-first-application) • [Contributing](#-contributing)
+[Quick Start](#-quick-start) • [Features](#-features) • [Installation](#-installation) • [Deploy an App](#-deploying-your-first-application) • [Contributing](#-contributing)
 
 </div>
+
+---
+
+## ⚡ Quick Start
+
+**Deploy your first app in 60 seconds:**
+
+```bash
+# 1. Download and install Temps
+curl -LO https://github.com/gotempsh/temps/releases/latest/download/temps-linux-amd64
+chmod +x temps-linux-amd64
+sudo mv temps-linux-amd64 /usr/local/bin/temps
+
+# 2. Setup database (one-time)
+createdb temps
+psql temps -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
+
+# 3. Start Temps
+temps serve --database-url postgresql://localhost/temps
+
+# 4. Open http://localhost:8080 in your browser
+
+# 5. Connect GitHub/GitLab → Select repository → Click "Deploy"
+
+# ✅ Your app is now live with:
+#    • HTTPS (automatic TLS)
+#    • Analytics
+#    • Error tracking
+#    • Monitoring
+#    • Live logs
+```
+
+**That's it!** No configuration files, no Docker Compose, no Kubernetes manifests. Just point Temps at your Git repo and deploy.
 
 ---
 
@@ -62,26 +95,6 @@ Temps is your **self-hosted deployment platform** that makes it effortless to de
 - **Temps**: ~$50/month (VPS + storage)
 - **Vercel + Sentry + Analytics**: ~$500+/month
 - **AWS + third-party tools**: ~$800+/month
-
-### Deploy Your First App in 60 Seconds
-
-```bash
-# 1. Start Temps (one-time setup)
-temps serve --database-url postgresql://localhost/temps
-
-# 2. Open http://localhost:8080
-
-# 3. Connect GitHub/GitLab
-
-# 4. Select repository → Click "Deploy"
-
-# 5. Done! Your app is live with:
-#    ✅ HTTPS (automatic TLS)
-#    ✅ Analytics
-#    ✅ Error tracking
-#    ✅ Monitoring
-#    ✅ Live logs
-```
 
 ---
 
