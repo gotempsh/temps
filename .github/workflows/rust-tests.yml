@@ -63,8 +63,20 @@ jobs:
 
   all-tests:
     name: All Tests
-    runs-on: ubuntu-latest-4-cores
+    runs-on: ubuntu-latest
     steps:
+      - name: Free up disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          echo "Disk space after cleanup:"
+          df -h
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -81,3 +93,4 @@ jobs:
         run: cargo test --workspace --all-features
         env:
           RUST_BACKTRACE: 1
+          CARGO_INCREMENTAL: 0
