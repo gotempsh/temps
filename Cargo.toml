@@ -227,9 +227,14 @@ woothee = "0.13.0"
 # ============================================================================
 testcontainers = { git = "https://github.com/testcontainers/testcontainers-rs", rev = "5ea0d04" }
 
+
+[profile.release]
+codegen-units = 1
+opt-level = 3
+
 [profile.dev]
 opt-level = 0
-debug = true      # Skip debug info
+debug = true
 incremental = true
 codegen-units = 256
 
