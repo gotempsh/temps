@@ -1,212 +1,974 @@
 # Temps
 
-A modern, self-hosted platform for deploying and managing web applications with built-in analytics, monitoring, and error tracking.
+<div align="center">
 
-## Features
+**Deploy ANY application from Git with built-in analytics, monitoring, and error tracking.**
 
-- 🚀 **Easy Deployment** - Deploy from Git repositories with automatic builds
-- 📊 **Analytics** - Built-in analytics with funnels, session replay, and performance monitoring
-- 🔍 **Error Tracking** - Sentry-compatible error tracking with grouping and deduplication
-- 🌐 **Reverse Proxy** - Automatic TLS/ACME certificate management
-- 📦 **Managed Services** - PostgreSQL, Redis, S3/MinIO support
-- 🔐 **Authentication** - Built-in user management and permissions
-- 📈 **Status Page** - Uptime monitoring and incident management
-- 💾 **Backups** - Automated backup and restore for your data
+**Self-hosted • Production-ready • Zero vendor lock-in**
 
-## Quick Start
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 
-### Installation
+[Features](#-features) • [Quick Start](#-quick-start) • [Installation](#-installation) • [Deploy an App](#-deploying-your-first-application) • [Contributing](#-contributing)
 
-**Linux AMD64:**
-```bash
-curl -LO https://github.com/YOUR_ORG/temps/releases/latest/download/temps-linux-amd64
-chmod +x temps-linux-amd64
-sudo mv temps-linux-amd64 /usr/local/bin/temps
-```
+</div>
 
-### Running
+---
 
-```bash
-# Initialize and start the server
-temps serve --address 0.0.0.0:8080 --database-url postgresql://user:pass@localhost/temps
-```
+## 🌟 Overview
 
-## Development
+Temps is your **self-hosted deployment platform** that makes it effortless to deploy and manage ANY application - from React frontends to Node.js APIs, Python backends, static sites, and everything in between. Simply point it at your Git repository, and Temps handles the rest.
+
+**Deploy once, monitor forever** - with built-in analytics, error tracking, session replay, uptime monitoring, and performance insights that would normally require 5+ separate SaaS subscriptions.
+
+### Why Temps?
+
+- **🚀 Deploy Anything**: React, Next.js, Vue, Python, Node.js, Go, Rust, static sites - if it runs in Docker, Temps can deploy it
+- **⚡ Git Push to Deploy**: Connect your GitHub or GitLab repo, select a branch, and deploy in seconds
+- **🏠 Self-Hosted**: Run on your own infrastructure - complete control, no vendor lock-in, no usage limits
+- **📊 All-in-One Observability**: Analytics, error tracking (Sentry-compatible), session replay, uptime monitoring, and performance metrics built-in
+- **🔐 Production-Grade**: Automatic TLS/ACME certificates, managed databases (PostgreSQL, Redis), S3 storage, and enterprise security
+- **💰 Zero SaaS Costs**: Replace Vercel + Sentry + Datadog + Logtail and save thousands per month
+
+---
+
+## ✨ Features
+
+### 🚀 Deploy ANY Application
+
+**Temps supports ANY application that can run in a container:**
+
+#### **Frontend Frameworks**
+- ✅ React, Next.js, Vue.js, Nuxt, Svelte, SvelteKit
+- ✅ Vite, Rsbuild, Webpack, Parcel, Rollup
+- ✅ Static sites (Hugo, Jekyll, Gatsby, Docusaurus)
+- ✅ Angular, Ember, Preact, Solid.js
+
+#### **Backend Languages & Frameworks**
+- ✅ Node.js (Express, Fastify, NestJS, Koa, Hapi)
+- ✅ Python (Django, Flask, FastAPI, Pyramid)
+- ✅ Go (Gin, Echo, Fiber, Chi)
+- ✅ Rust (Axum, Actix, Rocket, Warp)
+- ✅ Ruby (Rails, Sinatra, Hanami)
+- ✅ PHP (Laravel, Symfony, WordPress)
+- ✅ Java/Kotlin (Spring Boot, Micronaut, Ktor)
+- ✅ .NET (ASP.NET Core)
+
+#### **How Deployment Works**
+1. **Connect Git Repository**: Link your GitHub or GitLab repo
+2. **Auto-Detection**: Temps detects your stack and builds automatically
+3. **Containerization**: Creates optimized Docker containers
+4. **Deploy**: Zero-downtime deployment with automatic rollback
+5. **Monitor**: Built-in analytics, logs, errors, and performance metrics
+
+#### **Deployment Features**
+- **Zero-Config Presets**: Built-in support for Next.js, Vite, Docusaurus, and more
+- **Custom Dockerfiles**: Full control with your own Dockerfile
+- **Environment Variables**: Secure environment management per deployment
+- **Multiple Environments**: Deploy staging, production, and custom environments
+- **Automatic TLS**: Free SSL certificates with automatic renewal (ACME/Let's Encrypt)
+- **Custom Domains**: Connect unlimited custom domains to your applications
+- **Rollback**: One-click rollback to any previous deployment
+- **Git Branch Tracking**: Auto-deploy on push to specific branches
+
+### 📊 Analytics & Observability
+
+- **Event Tracking**: Capture custom events and user interactions
+- **Funnel Analysis**: Track user journeys and conversion rates
+- **Session Replay**: Record and replay user sessions for debugging
+- **Performance Monitoring**: Real-time performance metrics and insights
+- **User Behavior Analytics**: Understand how users interact with your applications
+- **Geolocation Data**: Track user locations and regional performance
+
+### 🔍 Error Tracking & Debugging
+
+- **Sentry-Compatible**: Use existing Sentry SDKs without code changes
+- **Smart Error Grouping**: AI-powered error clustering with embeddings
+- **Stack Trace Analysis**: Detailed stack traces with source mapping
+- **Real-Time Alerts**: Get notified when errors occur
+- **Error Deduplication**: Intelligent grouping to reduce noise
+
+### 📈 Monitoring & Status Pages
+
+- **Uptime Monitoring**: Track application availability 24/7
+- **Status Pages**: Public status pages for your services
+- **Incident Management**: Create and track incidents
+- **Health Checks**: Automated endpoint monitoring
+- **Performance Metrics**: CPU, memory, and response time tracking
+
+### 🔐 Security & Access Control
+
+- **Role-Based Access Control (RBAC)**: Fine-grained permissions system
+- **User Management**: Built-in authentication and user administration
+- **AES-256 Encryption**: Encrypt sensitive data at rest
+- **Audit Logging**: Complete audit trail of all operations
+- **Session Management**: Secure session handling with encrypted cookies
+- **2FA Support**: Two-factor authentication with TOTP
+
+### 💾 Data Management
+
+- **Automated Backups**: Schedule automatic backups of your databases
+- **Point-in-Time Recovery**: Restore to any point in time
+- **Data Retention Policies**: Automatic cleanup of old data
+- **Export Capabilities**: Export your data in standard formats
+- **Database Migrations**: Versioned schema migrations with Sea-ORM
+
+### 🎨 Modern Web Interface
+
+- **Responsive Dashboard**: Beautiful, dark/light mode UI built with React
+- **Real-Time Updates**: Live data streaming with React Query
+- **Terminal Access**: In-browser terminal for container logs
+- **Analytics Visualizations**: Interactive charts with Nivo
+- **Component Library**: Built with shadcn/ui and Radix UI
+
+---
+
+## 🚀 Quick Start
 
 ### Prerequisites
 
-- Rust 1.70+ (https://rustup.rs)
-- Bun (https://bun.sh)
-- PostgreSQL 15+ with TimescaleDB
-- Docker (for testing)
+- **PostgreSQL 15+** with TimescaleDB extension
+- **Linux AMD64** or **macOS** (ARM64 support coming soon)
+- **Docker** (optional, for container deployments)
+
+### Installation
+
+#### Linux AMD64
+
+```bash
+# Download the latest release
+curl -LO https://github.com/gotempsh/temps/releases/latest/download/temps-linux-amd64
+
+# Make it executable
+chmod +x temps-linux-amd64
+
+# Move to your PATH
+sudo mv temps-linux-amd64 /usr/local/bin/temps
+
+# Verify installation
+temps --version
+```
+
+#### macOS
+
+```bash
+# Download the latest release
+curl -LO https://github.com/gotempsh/temps/releases/latest/download/temps-macos-amd64
+
+# Make it executable
+chmod +x temps-macos-amd64
+
+# Move to your PATH
+sudo mv temps-macos-amd64 /usr/local/bin/temps
+
+# Verify installation
+temps --version
+```
+
+#### Build from Source
+
+```bash
+# Clone the repository
+git clone https://github.com/gotempsh/temps.git
+cd temps
+
+# Build release binary (includes web UI)
+cargo build --release
+
+# The binary will be at target/release/temps
+sudo cp target/release/temps /usr/local/bin/
+
+# Verify installation
+temps --version
+```
+
+### Database Setup
+
+```bash
+# Install PostgreSQL 15+ and TimescaleDB
+# Ubuntu/Debian:
+sudo apt-get install postgresql-15 timescaledb-postgresql-15
+
+# macOS with Homebrew:
+brew install postgresql@15 timescaledb
+
+# Create database
+createdb temps
+
+# Enable TimescaleDB extension
+psql temps -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
+```
+
+### Running Temps
+
+```bash
+# Start the server
+temps serve \
+  --address 0.0.0.0:8080 \
+  --database-url postgresql://postgres:password@localhost:5432/temps
+
+# Or use environment variables
+export TEMPS_ADDRESS=0.0.0.0:8080
+export TEMPS_DATABASE_URL=postgresql://postgres:password@localhost:5432/temps
+temps serve
+```
+
+The web interface will be available at `http://localhost:8080`
+
+On first run, Temps will:
+1. Create data directory at `~/.temps`
+2. Generate encryption keys and secrets
+3. Run database migrations
+4. Create the default admin user
+
+### First Login
+
+After starting Temps for the first time, you can log in with the credentials displayed in the console output.
+
+---
+
+## 🎯 Deploying Your First Application
+
+Once Temps is running, deploying an application takes just a few clicks:
+
+### Step 1: Connect Git Provider
+
+1. Navigate to **Settings → Git Providers**
+2. Click **Connect GitHub** or **Connect GitLab**
+3. Authorize Temps to access your repositories
+
+### Step 2: Create a Project
+
+1. Go to **Projects → New Project**
+2. Select your repository from the list
+3. Choose the branch to deploy (e.g., `main`)
+4. Pick an environment (staging, production, or create custom)
+
+### Step 3: Configure & Deploy
+
+**For supported frameworks (auto-detected):**
+```
+✅ Temps automatically detects:
+   - Next.js, Vite, React, Vue, Svelte
+   - Node.js, Python, Go, Rust
+   - Docusaurus, Hugo, Jekyll
+
+✅ Zero configuration needed - just click "Deploy"
+```
+
+**For custom applications:**
+```dockerfile
+# Add a Dockerfile to your repository
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+RUN npm run build
+CMD ["npm", "start"]
+```
+
+### Step 4: Access Your Application
+
+After deployment completes (~30-60 seconds):
+
+- **URL**: `https://your-project.temps.yourdomain.com`
+- **Logs**: View real-time build and runtime logs
+- **Metrics**: CPU, memory, response times
+- **Errors**: Automatic error tracking (Sentry-compatible)
+
+### Example Deployments
+
+#### Deploy a Next.js App
+```bash
+# Your repository structure
+my-nextjs-app/
+├── package.json
+├── next.config.js
+└── pages/
+    └── index.tsx
+
+# Temps auto-detects and deploys with:
+# - Build command: npm run build
+# - Start command: npm start
+# - Port: 3000 (auto-detected)
+```
+
+#### Deploy a Python FastAPI App
+```bash
+# Your repository structure
+my-api/
+├── requirements.txt
+├── main.py
+└── Dockerfile (optional)
+
+# Temps auto-detects Python and uses:
+# - pip install -r requirements.txt
+# - uvicorn main:app --host 0.0.0.0
+```
+
+#### Deploy a Static Site
+```bash
+# Any static HTML/CSS/JS site
+my-site/
+├── index.html
+├── style.css
+└── script.js
+
+# Temps serves with nginx automatically
+```
+
+### Advanced: Custom Build Configuration
+
+Override auto-detection with a `temps.yml` in your repository:
+
+```yaml
+# temps.yml
+build:
+  command: npm run build
+  output: dist/
+
+runtime:
+  command: npm start
+  port: 3000
+
+env:
+  NODE_ENV: production
+  API_URL: https://api.example.com
+
+health_check:
+  path: /health
+  interval: 30s
+```
+
+---
+
+## 📖 Documentation
+
+### Configuration
+
+Temps can be configured via environment variables or command-line flags:
+
+| Environment Variable | CLI Flag | Default | Description |
+|---------------------|----------|---------|-------------|
+| `TEMPS_ADDRESS` | `--address` | `127.0.0.1:3000` | HTTP server address |
+| `TEMPS_DATABASE_URL` | `--database-url` | (required) | PostgreSQL connection string |
+| `TEMPS_TLS_ADDRESS` | `--tls-address` | (optional) | HTTPS server address |
+| `TEMPS_DATA_DIR` | `--data-dir` | `~/.temps` | Data directory for keys/config |
+| `TEMPS_LOG_LEVEL` | `--log-level` | `info` | Log level (trace, debug, info, warn, error) |
+| `TEMPS_CONSOLE_ADDRESS` | `--console-address` | (optional) | Admin console address |
+
+### Data Directory
+
+Temps stores sensitive data in the data directory (`~/.temps` by default):
+
+```
+~/.temps/
+├── encryption_key    # AES-256 encryption key (auto-generated)
+└── auth_secret       # Session authentication secret (auto-generated)
+```
+
+**⚠️ Important**: Back up these files! Losing them means you cannot decrypt existing data.
+
+### Commands
+
+```bash
+# Start the full HTTP API server
+temps serve [OPTIONS]
+
+# Start only the proxy server
+temps proxy [OPTIONS]
+
+# Show help
+temps --help
+
+# Show version
+temps --version
+```
+
+### Database Migrations
+
+Temps automatically runs migrations on startup. To manually manage migrations:
+
+```bash
+# Migrations are handled automatically
+# No manual intervention needed
+```
+
+---
+
+## 🏗️ Architecture
+
+Temps is built as a **Cargo workspace** with 40+ specialized crates following a clean three-layer architecture:
+
+### Three-Layer Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  HTTP Layer (Axum Handlers)                             │
+│  - Request/response handling                            │
+│  - OpenAPI documentation                                │
+│  - Authentication & authorization                       │
+└─────────────────────────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────┐
+│  Service Layer (Business Logic)                         │
+│  - Domain logic                                         │
+│  - Transaction management                               │
+│  - External service integration                         │
+└─────────────────────────────────────────────────────────┘
+                         ↓
+┌─────────────────────────────────────────────────────────┐
+│  Data Access Layer (Sea-ORM)                            │
+│  - Database queries                                     │
+│  - Entity management                                    │
+│  - Relationship handling                                │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Key Crates
+
+**Application Layer:**
+- `temps-cli` - Main binary and CLI entry point
+
+**Core Infrastructure:**
+- `temps-core` - Shared utilities, cryptography services
+- `temps-database` - Database connection pooling
+- `temps-entities` - Sea-ORM database entities
+- `temps-migrations` - Database schema migrations
+- `temps-auth` - Authentication & authorization
+- `temps-routes` - HTTP route definitions
+
+**Feature Domains:**
+- `temps-deployments` - Deployment orchestration
+- `temps-deployer` - Docker/container runtime
+- `temps-proxy` - Reverse proxy (Pingora-based)
+- `temps-analytics` - Analytics engine
+- `temps-analytics-funnels` - Funnel tracking
+- `temps-analytics-session-replay` - Session replay
+- `temps-error-tracking` - Error tracking (Sentry-compatible)
+- `temps-monitoring` - Uptime monitoring
+- `temps-git` - Git provider integrations
+- `temps-providers` - Managed services (PostgreSQL, Redis, S3)
+- `temps-logs` - Container log streaming
+- `temps-backup` - Backup & restore
+- `temps-notifications` - Email & notifications
+- `temps-audit` - Audit logging
+
+### Technology Stack
+
+**Backend:**
+- **Language**: Rust 1.70+ (Edition 2021)
+- **Web Framework**: Axum (async HTTP)
+- **Database ORM**: Sea-ORM with PostgreSQL + TimescaleDB
+- **Reverse Proxy**: Pingora (Cloudflare's production proxy)
+- **Container Runtime**: Bollard (Docker SDK)
+- **API Docs**: Utoipa (OpenAPI/Swagger)
+- **Authentication**: Custom with Argon2 password hashing
+- **Cryptography**: AES-GCM-256, SHA-256, TOTP
+- **TLS**: Instant-ACME, rcgen
+
+**Frontend:**
+- **Framework**: React 19 with TypeScript
+- **Build Tool**: Rsbuild (Rspack-based)
+- **Component Library**: shadcn/ui (Radix UI primitives)
+- **Styling**: Tailwind CSS
+- **Data Fetching**: TanStack Query (React Query)
+- **Forms**: React Hook Form + Zod validation
+- **Charts**: Nivo
+- **Terminal**: XTerm.js
+- **Session Replay**: rrweb
+
+**Infrastructure:**
+- **Database**: PostgreSQL 15+ with TimescaleDB
+- **Cache**: Redis (optional)
+- **Storage**: S3-compatible (MinIO, AWS S3)
+- **Container**: Docker
+- **Email**: SMTP via Lettre
+
+---
+
+## 🛠️ Development
+
+### Prerequisites
+
+- **Rust**: 1.70+ ([Install via rustup](https://rustup.rs))
+- **Bun**: Latest version ([Install Bun](https://bun.sh))
+- **PostgreSQL**: 15+ with TimescaleDB
+- **Docker**: For testing and deployments
 
 ### Setup
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_ORG/temps.git
+git clone https://github.com/gotempsh/temps.git
 cd temps
 
-# Install Rust dependencies
+# Install pre-commit hooks (recommended)
+./scripts/setup-hooks.sh
+
+# Build the project (debug mode, fast)
 cargo build
 
-# Install web dependencies
-cd web
-bun install
-cd ..
-```
-
-### Building
-
-```bash
-# Development build (fast, skips web build)
-cargo build
-
-# Development build with web UI
+# Build with web UI
 FORCE_WEB_BUILD=1 cargo build
 
-# Release build (includes web UI automatically)
+# Build release version (includes web UI automatically)
 cargo build --release
 ```
 
-### Testing
+### Development Workflow
+
+#### Backend Development
 
 ```bash
-# Run unit tests
+# Check compilation (fast, use after every change)
+cargo check --lib
+
+# Run specific crate tests
+cargo test --lib -p temps-deployments
+
+# Run all unit tests
 cargo test --workspace --lib
 
-# Run all tests (requires Docker)
+# Run with Docker integration tests
 cargo test --workspace
+
+# Run linter
+cargo clippy --workspace -- -D warnings
+
+# Format code
+cargo fmt --all
 ```
 
-### Development Server
+#### Frontend Development
 
-**Terminal 1 - Rust server:**
+```bash
+cd web
+
+# Install dependencies
+bun install
+
+# Start dev server (with hot reload)
+bun run dev
+
+# Build for production
+bun run build
+
+# Type checking
+bun run typecheck
+
+# Linting
+bun run lint
+```
+
+#### Full Stack Development
+
+**Terminal 1 - Backend API:**
 ```bash
 cargo run --bin temps serve \
   --address 127.0.0.1:8081 \
   --database-url postgresql://postgres:postgres@localhost:5432/temps
 ```
 
-**Terminal 2 - Web UI:**
+**Terminal 2 - Frontend Dev Server:**
 ```bash
 cd web
 bun run dev
 ```
 
-Open http://localhost:3000 (web dev server proxies API to port 8081)
+Open [http://localhost:3000](http://localhost:3000) - the dev server proxies API requests to port 8081.
 
-## Architecture
-
-Temps is a Cargo workspace with 30+ crates organized by domain:
-
-- **temps-cli** - Command-line interface and main binary
-- **temps-core** - Core types and utilities
-- **temps-analytics** - Analytics engine with funnels and session replay
-- **temps-auth** - Authentication and authorization
-- **temps-deployer** - Docker/container runtime
-- **temps-deployments** - Deployment workflow orchestration
-- **temps-git** - Git provider integrations (GitHub, GitLab)
-- **temps-proxy** - Reverse proxy with TLS (Pingora-based)
-- **temps-providers** - Managed services (PostgreSQL, Redis, S3)
-- **temps-error-tracking** - Sentry-compatible error tracking
-- **temps-monitoring** - Status page and uptime monitoring
-
-See [CLAUDE.md](CLAUDE.md) for detailed architecture and development guidelines.
-
-## Project Structure
+### Project Structure
 
 ```
 temps/
-├── crates/           # Rust workspace crates
-│   ├── temps-cli/    # Main binary
-│   │   └── dist/     # Web UI build output (generated)
-│   ├── temps-core/   # Core functionality
-│   └── ...           # Other crates
-├── web/              # React web UI
-│   ├── src/          # Source code
-│   └── public/       # Static assets
-├── scripts/          # Helper scripts
-├── .github/          # GitHub Actions workflows
-├── CLAUDE.md         # AI assistant development guide
-└── RELEASING.md      # Release process documentation
+├── crates/                   # Rust workspace crates
+│   ├── temps-cli/            # Main binary
+│   │   ├── src/              # CLI source code
+│   │   ├── dist/             # Web UI build output (generated)
+│   │   └── build.rs          # Build script for web integration
+│   ├── temps-core/           # Core utilities
+│   ├── temps-analytics/      # Analytics engine
+│   ├── temps-auth/           # Authentication
+│   ├── temps-deployer/       # Container runtime
+│   ├── temps-deployments/    # Deployment workflows
+│   ├── temps-proxy/          # Reverse proxy
+│   └── ...                   # Other domain crates
+├── web/                      # React web UI
+│   ├── src/
+│   │   ├── components/       # React components
+│   │   ├── pages/            # Page components
+│   │   ├── api/              # API client (generated)
+│   │   ├── hooks/            # Custom React hooks
+│   │   ├── lib/              # Utility functions
+│   │   └── contexts/         # React contexts
+│   ├── public/               # Static assets
+│   └── rsbuild.config.ts     # Build configuration
+├── scripts/                  # Helper scripts
+│   ├── release.sh            # Release automation
+│   └── setup-hooks.sh        # Git hooks setup
+├── .github/                  # GitHub Actions workflows
+│   └── workflows/
+│       └── release.yml       # Release workflow
+├── Cargo.toml                # Workspace configuration
+├── CLAUDE.md                 # AI assistant development guide
+├── CHANGELOG.md              # Version history
+├── RELEASING.md              # Release process
+└── README.md                 # This file
 ```
 
-## Configuration
+### Code Quality
 
-### Environment Variables
+Temps enforces high code quality standards:
 
-- `TEMPS_ADDRESS` - HTTP server address (default: `127.0.0.1:3000`)
-- `TEMPS_DATABASE_URL` - PostgreSQL connection string (required)
-- `TEMPS_TLS_ADDRESS` - HTTPS server address (optional)
-- `TEMPS_DATA_DIR` - Data directory (default: `~/.temps`)
-- `TEMPS_LOG_LEVEL` - Log level (default: `info`)
+- ✅ **Warning-Free Compilation**: All new code must compile without warnings
+- ✅ **Comprehensive Testing**: All new features must have passing tests
+- ✅ **Conventional Commits**: Follow conventional commit format for auto-generated CHANGELOGs
+- ✅ **Type Safety**: Use typed errors, no `unwrap()` in production code
+- ✅ **Documentation**: OpenAPI docs for all HTTP endpoints
 
-### Data Directory
+### Running Tests
 
-Temps stores encryption keys and configuration in the data directory:
-- `~/.temps/encryption_key` - AES-256 encryption key
-- `~/.temps/auth_secret` - Session authentication secret
+```bash
+# Unit tests (no external dependencies)
+cargo test --lib --workspace
 
-These are auto-generated on first run.
+# Specific crate tests
+cargo test --lib -p temps-backup
 
-## Deployment
+# Integration tests (requires Docker)
+cargo test --workspace --features integration-tests
 
-### Docker (Coming Soon)
+# Run with output
+cargo test --lib -p temps-deployments -- --nocapture
+
+# Run ignored tests (Docker-dependent)
+cargo test --workspace -- --ignored
+```
+
+### Pre-Commit Hooks
+
+Temps uses git hooks to ensure code quality:
+
+```bash
+# Setup hooks (one-time)
+./scripts/setup-hooks.sh
+
+# Run hooks manually
+pre-commit run --all-files  # or: prek run --all-files
+```
+
+Hooks include:
+- Conventional commit message validation
+- Code formatting (`cargo fmt`)
+- Linting (`cargo clippy`)
+- CHANGELOG format validation
+- YAML validation
+
+---
+
+## 🚢 Deployment
+
+### Production Deployment
+
+#### Using Binary
+
+```bash
+# Download and install (see Installation section)
+
+# Create systemd service
+sudo tee /etc/systemd/system/temps.service > /dev/null <<EOF
+[Unit]
+Description=Temps Platform
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=temps
+WorkingDirectory=/opt/temps
+Environment="TEMPS_DATABASE_URL=postgresql://temps:password@localhost/temps"
+Environment="TEMPS_ADDRESS=0.0.0.0:8080"
+ExecStart=/usr/local/bin/temps serve
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Enable and start service
+sudo systemctl daemon-reload
+sudo systemctl enable temps
+sudo systemctl start temps
+
+# Check status
+sudo systemctl status temps
+```
+
+#### Using Docker (Coming Soon)
 
 ```bash
 docker run -d \
+  --name temps \
   -p 8080:8080 \
   -v temps-data:/root/.temps \
-  -e TEMPS_DATABASE_URL=postgresql://... \
+  -e TEMPS_DATABASE_URL=postgresql://user:pass@postgres:5432/temps \
   temps/temps:latest
 ```
 
-### Systemd
+#### Reverse Proxy Setup (nginx)
 
-See [docs/systemd.md](docs/systemd.md) for systemd service configuration.
+```nginx
+server {
+    listen 80;
+    server_name temps.yourdomain.com;
 
-## Contributing
-
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-### Development Workflow
-
-1. Fork and clone the repository
-2. Create a feature branch: `git checkout -b feature/my-feature`
-3. Make your changes following [CLAUDE.md](CLAUDE.md) guidelines
-4. Run tests: `cargo test --workspace`
-5. Run clippy: `cargo clippy --workspace -- -D warnings`
-6. Format code: `cargo fmt --all`
-7. Commit and push your changes
-8. Open a pull request
-
-## Releasing
-
-See [RELEASING.md](RELEASING.md) for the release process.
-
-Quick release:
-```bash
-./scripts/release.sh 1.0.0
+    location / {
+        proxy_pass http://localhost:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+    }
+}
 ```
 
-## License
+### Environment-Specific Configuration
 
-MIT OR Apache-2.0
+**Development:**
+```bash
+export TEMPS_LOG_LEVEL=debug
+export TEMPS_ADDRESS=127.0.0.1:3000
+```
 
-## Support
+**Production:**
+```bash
+export TEMPS_LOG_LEVEL=info
+export TEMPS_ADDRESS=0.0.0.0:8080
+export TEMPS_TLS_ADDRESS=0.0.0.0:8443
+```
 
-- 📖 [Documentation](https://docs.temps.dev)
-- 💬 [Discord](https://discord.gg/temps)
-- 🐛 [Issue Tracker](https://github.com/YOUR_ORG/temps/issues)
-- 📧 [Email](mailto:support@temps.dev)
+### Backup and Recovery
 
-## Credits
+```bash
+# Backups are managed through the web UI or API
+# Data directory should be backed up regularly:
+tar -czf temps-backup-$(date +%Y%m%d).tar.gz ~/.temps/
 
-Built with:
-- [Rust](https://www.rust-lang.org/) - Systems programming language
-- [Pingora](https://github.com/cloudflare/pingora) - Reverse proxy framework
-- [Sea-ORM](https://www.sea-ql.org/SeaORM/) - Database ORM
-- [React](https://react.dev/) - Web UI framework
-- [Rsbuild](https://rsbuild.dev/) - Build tooling
-- [TimescaleDB](https://www.timescale.com/) - Time-series database
+# Database backup
+pg_dump temps > temps-db-$(date +%Y%m%d).sql
+```
+
+---
+
+## 🤝 Contributing
+
+We welcome contributions! Whether it's bug reports, feature requests, documentation improvements, or code contributions.
+
+### How to Contribute
+
+1. **Fork** the repository
+2. **Clone** your fork: `git clone https://github.com/YOUR_USERNAME/temps.git`
+3. **Create** a feature branch: `git checkout -b feature/amazing-feature`
+4. **Make** your changes following our guidelines (see [CLAUDE.md](CLAUDE.md))
+5. **Test** your changes: `cargo test --workspace`
+6. **Format** code: `cargo fmt --all`
+7. **Lint** code: `cargo clippy --workspace -- -D warnings`
+8. **Commit** using conventional commits: `git commit -m "feat: add amazing feature"`
+9. **Push** to your fork: `git push origin feature/amazing-feature`
+10. **Open** a Pull Request
+
+### Commit Message Format
+
+Follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<type>(<scope>): <description>
+
+[optional body]
+
+[optional footer]
+```
+
+**Types:**
+- `feat:` - New feature
+- `fix:` - Bug fix
+- `docs:` - Documentation only
+- `style:` - Code style (formatting)
+- `refactor:` - Code refactoring
+- `perf:` - Performance improvement
+- `test:` - Adding tests
+- `chore:` - Maintenance tasks
+
+**Examples:**
+```bash
+feat(auth): add JWT token refresh
+fix(api): handle null response from external service
+docs: update installation instructions
+chore(deps): update rust dependencies
+```
+
+### Development Guidelines
+
+Detailed development guidelines are in [CLAUDE.md](CLAUDE.md), including:
+- Architecture patterns
+- Service layer design
+- HTTP handler best practices
+- Database query patterns
+- Error handling
+- Testing requirements
+- Security considerations
+
+### Code Review Process
+
+1. All PRs require at least one approval
+2. CI must pass (tests, linting, formatting)
+3. Conventional commit format required
+4. Code must compile without warnings
+5. New features must include tests
+
+---
+
+## 📋 Roadmap
+
+### v0.1.0 (Current)
+- ✅ Core deployment functionality
+- ✅ Analytics engine with funnels
+- ✅ Error tracking (Sentry-compatible)
+- ✅ Git provider integrations
+- ✅ Reverse proxy with TLS
+- ✅ Web UI with React
+
+### v0.2.0 (Next)
+- [ ] Docker Compose support
+- [ ] Kubernetes deployment option
+- [ ] Enhanced monitoring dashboards
+- [ ] Slack/Discord integrations
+- [ ] Custom domain management UI
+- [ ] Multi-user workspace support
+
+### Future
+- [ ] GraphQL API
+- [ ] Plugin system for extensions
+- [ ] Mobile app for monitoring
+- [ ] AI-powered error analysis
+- [ ] Cost optimization recommendations
+- [ ] Multi-cloud support (AWS, GCP, Azure)
+
+---
+
+## 🐛 Troubleshooting
+
+### Common Issues
+
+**Database Connection Error**
+```bash
+# Ensure PostgreSQL is running
+sudo systemctl status postgresql
+
+# Test connection
+psql postgresql://user:pass@localhost:5432/temps
+
+# Check TimescaleDB extension
+psql temps -c "SELECT * FROM pg_extension WHERE extname = 'timescaledb';"
+```
+
+**Web UI Not Loading**
+```bash
+# Rebuild with web UI
+FORCE_WEB_BUILD=1 cargo build --release
+
+# Check if dist directory exists
+ls -la crates/temps-cli/dist/
+```
+
+**Permission Denied**
+```bash
+# Check data directory permissions
+ls -la ~/.temps/
+
+# Fix permissions
+chmod 700 ~/.temps/
+chmod 600 ~/.temps/encryption_key
+chmod 600 ~/.temps/auth_secret
+```
+
+**Port Already in Use**
+```bash
+# Find process using port
+lsof -i :8080
+
+# Use different port
+temps serve --address 0.0.0.0:9000
+```
+
+### Getting Help
+
+- 📖 **Documentation**: Check [CLAUDE.md](CLAUDE.md) for detailed development guides
+- 🐛 **Issues**: Report bugs at [GitHub Issues](https://github.com/gotempsh/temps/issues)
+- 💬 **Discussions**: Ask questions in [GitHub Discussions](https://github.com/gotempsh/temps/discussions)
+- 📧 **Email**: Contact maintainers at support@temps.dev
+
+---
+
+## 📄 License
+
+Temps is dual-licensed under:
+
+- **MIT License** ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+- **Apache License 2.0** ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+
+You may choose either license for your use.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in Temps by you shall be dual-licensed as above, without any additional terms or conditions.
+
+---
+
+## 🙏 Acknowledgments
+
+Temps is built on the shoulders of giants. Special thanks to:
+
+- **[Cloudflare Pingora](https://github.com/cloudflare/pingora)** - Production-grade reverse proxy framework
+- **[Sea-ORM](https://www.sea-ql.org/SeaORM/)** - Robust async ORM for Rust
+- **[Axum](https://github.com/tokio-rs/axum)** - Ergonomic web framework
+- **[TimescaleDB](https://www.timescale.com/)** - Time-series database for PostgreSQL
+- **[React](https://react.dev/)** - UI framework
+- **[Rsbuild](https://rsbuild.dev/)** - Build tooling
+- **[shadcn/ui](https://ui.shadcn.com/)** - Beautiful component library
+
+And all the other amazing open-source projects we depend on!
+
+---
+
+## 🌟 Star History
+
+If you find Temps useful, please consider giving it a star on GitHub! It helps others discover the project.
+
+[![Star History Chart](https://api.star-history.com/svg?repos=gotempsh/temps&type=Date)](https://star-history.com/#gotempsh/temps&Date)
+
+---
+
+## 📞 Contact
+
+- **Website**: https://temps.dev (coming soon)
+- **GitHub**: https://github.com/gotempsh/temps
+- **Twitter**: [@tempsdev](https://twitter.com/tempsdev) (coming soon)
+- **Email**: hello@temps.dev
+
+---
+
+<div align="center">
+
+**Built with ❤️ by the Temps community**
+
+[Documentation](https://docs.temps.dev) • [GitHub](https://github.com/gotempsh/temps) • [Community](https://discord.gg/temps)
+
+</div>
