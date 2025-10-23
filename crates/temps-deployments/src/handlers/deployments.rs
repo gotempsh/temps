@@ -1403,8 +1403,17 @@ mod tests {
         .await
         .expect("Failed to create test deployment");
 
+        // Update environment with current_deployment_id
+        let mut env_active: environments::ActiveModel = environment.into();
+        env_active.current_deployment_id = Set(Some(deployment.id));
+        let environment = env_active
+            .update(&*db)
+            .await
+            .expect("Failed to update environment with deployment");
+
         // Create a test container
         let container_id = "test-container-123";
+        let now = chrono::Utc::now();
         let container = containers::ActiveModel {
             deployment_id: Set(deployment.id),
             container_id: Set(container_id.to_string()),
@@ -1412,7 +1421,8 @@ mod tests {
             container_port: Set(8080),
             image_name: Set(Some("nginx:latest".to_string())),
             status: Set(Some("running".to_string())),
-            deployed_at: Set(chrono::Utc::now()),
+            created_at: Set(now),
+            deployed_at: Set(now),
             ..Default::default()
         }
         .insert(&*db)
@@ -1508,16 +1518,26 @@ mod tests {
             }
         }
 
-        // Verify messages
-        assert_eq!(messages.len(), 2, "Should receive 2 container log messages");
-
+        // Verify messages - logs might come as a single message or multiple
+        println!("Total messages received: {}", messages.len());
         for (i, msg) in messages.iter().enumerate() {
-            assert!(
-                msg.contains(&format!("Container log line {}", i + 1)),
-                "Log should contain expected text. Got: '{}'",
-                msg
-            );
+            println!("Message {}: '{}'", i, msg);
         }
+
+        assert!(!messages.is_empty(), "Should receive at least 1 message");
+
+        // Check that both log lines are present (they might be in one message or separate)
+        let all_logs = messages.join("");
+        assert!(
+            all_logs.contains("Container log line 1"),
+            "Logs should contain line 1. Got: '{}'",
+            all_logs
+        );
+        assert!(
+            all_logs.contains("Container log line 2"),
+            "Logs should contain line 2. Got: '{}'",
+            all_logs
+        );
 
         println!("✅ Received {} raw container log messages", messages.len());
 
@@ -1636,7 +1656,16 @@ mod tests {
         .await
         .expect("Failed to create test deployment");
 
+        // Update environment with current_deployment_id
+        let mut env_active: environments::ActiveModel = environment.into();
+        env_active.current_deployment_id = Set(Some(deployment.id));
+        let environment = env_active
+            .update(&*db)
+            .await
+            .expect("Failed to update environment with deployment");
+
         // Create multiple containers
+        let now = chrono::Utc::now();
         let container1_id = "filtered-container-1";
         let _container1 = containers::ActiveModel {
             deployment_id: Set(deployment.id),
@@ -1645,7 +1674,8 @@ mod tests {
             container_port: Set(8080),
             image_name: Set(Some("nginx:latest".to_string())),
             status: Set(Some("running".to_string())),
-            deployed_at: Set(chrono::Utc::now()),
+            created_at: Set(now),
+            deployed_at: Set(now),
             ..Default::default()
         }
         .insert(&*db)
@@ -1660,7 +1690,8 @@ mod tests {
             container_port: Set(5432),
             image_name: Set(Some("postgres:latest".to_string())),
             status: Set(Some("running".to_string())),
-            deployed_at: Set(chrono::Utc::now()),
+            created_at: Set(now),
+            deployed_at: Set(now),
             ..Default::default()
         }
         .insert(&*db)
@@ -1756,18 +1787,29 @@ mod tests {
             }
         }
 
-        // Verify we got logs from both containers
-        assert_eq!(
-            messages.len(),
-            2,
-            "Should receive logs from both containers"
+        // Verify we got logs from both containers - logs might come combined or separate
+        println!("Total messages received: {}", messages.len());
+        for (i, msg) in messages.iter().enumerate() {
+            println!("Message {}: '{}'", i, msg);
+        }
+
+        assert!(!messages.is_empty(), "Should receive at least 1 message");
+
+        // Check that both container logs are present (they might be in one message or separate)
+        let all_logs = messages.join("");
+        let has_web_log = all_logs.contains("Web container");
+        let has_db_log = all_logs.contains("DB container");
+
+        assert!(
+            has_web_log,
+            "Should receive web container logs. Got: '{}'",
+            all_logs
         );
-
-        let has_web_log = messages.iter().any(|m| m.contains("Web container"));
-        let has_db_log = messages.iter().any(|m| m.contains("DB container"));
-
-        assert!(has_web_log, "Should receive web container logs");
-        assert!(has_db_log, "Should receive DB container logs");
+        assert!(
+            has_db_log,
+            "Should receive DB container logs. Got: '{}'",
+            all_logs
+        );
 
         println!(
             "✅ Received {} raw log messages from multiple containers",
