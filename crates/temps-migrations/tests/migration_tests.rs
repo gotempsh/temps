@@ -7,6 +7,15 @@ use temps_migrations::Migrator;
 /// Test that migrations can be applied successfully
 #[tokio::test]
 async fn test_migration_up() -> anyhow::Result<()> {
+    // Skip this test if TEMPS_TEST_DATABASE_URL is set
+    // (external databases may already have migrations applied)
+    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+        println!(
+            "⏭️  Skipping test_migration_up: using external database via TEMPS_TEST_DATABASE_URL"
+        );
+        return Ok(());
+    }
+
     // Start TimescaleDB container
     let postgres_container = GenericImage::new("timescale/timescaledb", "latest-pg17")
         .with_env_var("POSTGRES_DB", "postgres")
@@ -69,6 +78,15 @@ async fn test_migration_up() -> anyhow::Result<()> {
 /// Test that migrations can be rolled back successfully
 #[tokio::test]
 async fn test_migration_down() -> anyhow::Result<()> {
+    // Skip this test if TEMPS_TEST_DATABASE_URL is set
+    // (running down migrations would destroy data in external database)
+    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+        println!(
+            "⏭️  Skipping test_migration_down: using external database via TEMPS_TEST_DATABASE_URL"
+        );
+        return Ok(());
+    }
+
     // Start TimescaleDB container
     let postgres_container = GenericImage::new("timescale/timescaledb", "latest-pg17")
         .with_env_var("POSTGRES_DB", "postgres")
@@ -136,6 +154,13 @@ async fn test_migration_down() -> anyhow::Result<()> {
 /// Test migration status
 #[tokio::test]
 async fn test_migration_status() -> anyhow::Result<()> {
+    // Skip this test if TEMPS_TEST_DATABASE_URL is set
+    // (external databases may already have migrations applied)
+    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+        println!("⏭️  Skipping test_migration_status: using external database via TEMPS_TEST_DATABASE_URL");
+        return Ok(());
+    }
+
     // Start TimescaleDB container
     let postgres_container = GenericImage::new("timescale/timescaledb", "latest-pg17")
         .with_env_var("POSTGRES_DB", "postgres")
@@ -303,6 +328,13 @@ async fn test_pgvector_extension() -> anyhow::Result<()> {
 /// Test specific table creation and constraints
 #[tokio::test]
 async fn test_table_constraints() -> anyhow::Result<()> {
+    // Skip this test if TEMPS_TEST_DATABASE_URL is set
+    // (external databases may already have migrations applied)
+    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+        println!("⏭️  Skipping test_table_constraints: using external database via TEMPS_TEST_DATABASE_URL");
+        return Ok(());
+    }
+
     // Start TimescaleDB container
     let postgres_container = GenericImage::new("timescale/timescaledb", "latest-pg17")
         .with_env_var("POSTGRES_DB", "postgres")

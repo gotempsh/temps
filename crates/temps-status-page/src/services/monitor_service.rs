@@ -859,7 +859,9 @@ mod tests {
     use temps_entities::{environments, projects};
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> projects::Model {
-        let slug = format!("test-project-{}", chrono::Utc::now().timestamp());
+        // Use nanoseconds for better uniqueness in parallel tests
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let slug = format!("test-project-{}", nanos);
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set(slug.clone()),
@@ -875,11 +877,14 @@ mod tests {
         db: &Arc<DatabaseConnection>,
         project_id: i32,
     ) -> environments::Model {
-        let subdomain = format!("test-env-{}", chrono::Utc::now().timestamp());
+        // Use nanoseconds for better uniqueness in parallel tests
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let subdomain = format!("test-env-{}", nanos);
+        let slug = format!("test-env-{}", nanos);
         let env = environments::ActiveModel {
             project_id: Set(project_id),
-            name: Set("test-env".to_string()),
-            slug: Set("test-env".to_string()),
+            name: Set(slug.clone()),
+            slug: Set(slug),
             subdomain: Set(subdomain.clone()),
             host: Set(format!("{}.local", subdomain)),
             upstreams: Set(serde_json::json!([])),

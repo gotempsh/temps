@@ -52,6 +52,8 @@ rand = { workspace = true }
 testcontainers = { workspace = true }
 tokio-test = "0.4"
 mockall = "0.12"
+tokio-tungstenite = "0.24"
+tower = { workspace = true }
 
 [features]
 default = []

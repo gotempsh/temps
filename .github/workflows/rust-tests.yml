@@ -64,6 +64,23 @@ jobs:
   all-tests:
     name: All Tests
     runs-on: ubuntu-latest
+
+    services:
+      timescaledb:
+        image: timescale/timescaledb:latest-pg17
+        env:
+          POSTGRES_DB: test_db
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test_user -d test_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -74,11 +91,15 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Verify Docker is available
-        run: docker --version
+      - name: Verify TimescaleDB is ready
+        run: |
+          echo "Checking if TimescaleDB port is open..."
+          timeout 60 bash -c 'until nc -z localhost 5432; do sleep 1; done'
+          echo "TimescaleDB is ready!"
 
       - name: Run all workspace tests
         run: cargo test --workspace --all-features
         env:
           RUST_BACKTRACE: 1
           CARGO_INCREMENTAL: 0
+          TEMPS_TEST_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db

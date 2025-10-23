@@ -233,13 +233,17 @@ impl DeployImageJob {
     }
 
     /// Write log message to job-specific log file
-    async fn log(&self, message: String) -> Result<(), WorkflowError> {
+    /// Write log message to both job-specific log file and context log writer
+    async fn log(&self, context: &WorkflowContext, message: String) -> Result<(), WorkflowError> {
+        // Write to job-specific log file
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
                 .append_to_log(log_id, &format!("{}\n", message))
                 .await
                 .map_err(|e| WorkflowError::Other(format!("Failed to write log: {}", e)))?;
         }
+        // Also write to context log writer (for real-time streaming and test capture)
+        context.log(&message).await?;
         Ok(())
     }
 
@@ -275,35 +279,48 @@ impl DeployImageJob {
         image_output: &BuildImageOutput,
         context: &WorkflowContext,
     ) -> Result<DeploymentOutput, WorkflowError> {
-        self.log(format!(
-            "🚀 Starting deployment of image: {}",
-            image_output.image_tag
-        ))
+        self.log(
+            context,
+            format!(
+                "🚀 Starting deployment of image: {}",
+                image_output.image_tag
+            ),
+        )
         .await?;
-        self.log(format!("🎯 Target: {:?}", self.target)).await?;
-        self.log(format!(
-            "⚙️  Service: {} in namespace: {}",
-            self.config.service_name, self.config.namespace
-        ))
+        self.log(context, format!("🎯 Target: {:?}", self.target))
+            .await?;
+        self.log(
+            context,
+            format!(
+                "⚙️  Service: {} in namespace: {}",
+                self.config.service_name, self.config.namespace
+            ),
+        )
         .await?;
 
         // Pre-deployment validation
-        self.log("🔍 Validating deployment configuration...".to_string())
-            .await?;
+        self.log(
+            context,
+            "🔍 Validating deployment configuration...".to_string(),
+        )
+        .await?;
         self.validate_deployment_config(context).await?;
 
         // Prepare deployment request using temps-deployer types
-        self.log("📦 Deploying container image...".to_string())
+        self.log(context, "📦 Deploying container image...".to_string())
             .await?;
 
         let log_path = std::env::temp_dir().join(format!("deploy_{}.log", self.job_id));
 
         // Allocate a random available port on the host
         let host_port = Self::find_available_port()?;
-        self.log(format!(
-            "🔌 Allocated host port: {} → container port: {}",
-            host_port, self.config.port
-        ))
+        self.log(
+            context,
+            format!(
+                "🔌 Allocated host port: {} → container port: {}",
+                host_port, self.config.port
+            ),
+        )
         .await?;
 
         let port_mappings = vec![PortMapping {
@@ -348,14 +365,14 @@ impl DeployImageJob {
                 WorkflowError::JobExecutionFailed(format!("Failed to deploy container: {}", e))
             })?;
 
-        self.log(format!(
-            "✅ Deployment created: {}",
-            deploy_result.container_id
-        ))
+        self.log(
+            context,
+            format!("✅ Deployment created: {}", deploy_result.container_id),
+        )
         .await?;
 
         // Wait for deployment to be ready (with timeout)
-        self.log("⏳ Waiting for container to start...".to_string())
+        self.log(context, "⏳ Waiting for container to start...".to_string())
             .await?;
         let max_wait_time = std::time::Duration::from_secs(300); // 5 minutes
         let start_time = std::time::Instant::now();
@@ -375,34 +392,43 @@ impl DeployImageJob {
 
             match container_info.status {
                 DeployerContainerStatus::Running => {
-                    self.log("✅ Container is running".to_string()).await?;
+                    self.log(context, "✅ Container is running".to_string())
+                        .await?;
                     break;
                 }
                 DeployerContainerStatus::Exited | DeployerContainerStatus::Dead => {
-                    self.log("❌ Container failed to start".to_string()).await?;
+                    self.log(context, "❌ Container failed to start".to_string())
+                        .await?;
                     return Err(WorkflowError::JobExecutionFailed(
                         "Container failed to start".to_string(),
                     ));
                 }
                 DeployerContainerStatus::Created => {
                     if start_time.elapsed() > max_wait_time {
-                        self.log("❌ Container start timeout".to_string()).await?;
+                        self.log(context, "❌ Container start timeout".to_string())
+                            .await?;
                         return Err(WorkflowError::JobExecutionFailed(
                             "Container timeout - took too long to start".to_string(),
                         ));
                     }
-                    self.log(format!(
-                        "⏳ Container status: {:?}, waiting...",
-                        container_info.status
-                    ))
+                    self.log(
+                        context,
+                        format!(
+                            "⏳ Container status: {:?}, waiting...",
+                            container_info.status
+                        ),
+                    )
                     .await?;
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
                 _ => {
-                    self.log(format!(
-                        "⏳ Container status: {:?}, waiting...",
-                        container_info.status
-                    ))
+                    self.log(
+                        context,
+                        format!(
+                            "⏳ Container status: {:?}, waiting...",
+                            container_info.status
+                        ),
+                    )
                     .await?;
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
@@ -410,15 +436,21 @@ impl DeployImageJob {
         }
 
         // Phase 2: Wait for application to be ready (connectivity check)
-        self.log("⏳ Waiting for application to be ready...".to_string())
-            .await?;
+        self.log(
+            context,
+            "⏳ Waiting for application to be ready...".to_string(),
+        )
+        .await?;
         let health_check_url = format!(
             "http://localhost:{}{}",
             host_port,
             self.config.health_check_path.as_deref().unwrap_or("/")
         );
-        self.log(format!("🔍 Health check URL: {}", health_check_url))
-            .await?;
+        self.log(
+            context,
+            format!("🔍 Health check URL: {}", health_check_url),
+        )
+        .await?;
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
@@ -432,7 +464,7 @@ impl DeployImageJob {
 
         loop {
             if start_time.elapsed() > max_wait_time {
-                self.log("❌ Application readiness timeout".to_string())
+                self.log(context, "❌ Application readiness timeout".to_string())
                     .await?;
                 return Err(WorkflowError::JobExecutionFailed(
                     "Application timeout - connectivity checks did not pass in time".to_string(),
@@ -443,40 +475,52 @@ impl DeployImageJob {
                 Ok(response) => {
                     // Any response (including 404, 500, etc.) means the server is responding
                     consecutive_successes += 1;
-                    self.log(format!(
+                    self.log(
+                        context,
+                        format!(
                         "✅ Connectivity check passed - server responding with status {} ({}/{})",
                         response.status(),
                         consecutive_successes,
                         required_successes
-                    ))
+                    ),
+                    )
                     .await?;
 
                     if consecutive_successes >= required_successes {
-                        self.log("🎉 Application is ready and responding!".to_string())
-                            .await?;
+                        self.log(
+                            context,
+                            "🎉 Application is ready and responding!".to_string(),
+                        )
+                        .await?;
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
                 Err(e) => {
                     consecutive_successes = 0; // Reset counter on connection error
-                    self.log(format!("⏳ Connectivity check failed ({}), retrying...", e))
-                        .await?;
+                    self.log(
+                        context,
+                        format!("⏳ Connectivity check failed ({}), retrying...", e),
+                    )
+                    .await?;
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
         }
 
         let endpoint_url = Some(format!("http://localhost:{}", deploy_result.host_port));
-        self.log(format!(
-            "🌐 Service endpoint: {}",
-            endpoint_url.as_ref().unwrap()
-        ))
+        self.log(
+            context,
+            format!("🌐 Service endpoint: {}", endpoint_url.as_ref().unwrap()),
+        )
         .await?;
-        self.log(format!(
-            "📊 Replicas: {}, Resources: {:?}",
-            self.config.replicas, self.config.resources
-        ))
+        self.log(
+            context,
+            format!(
+                "📊 Replicas: {}, Resources: {:?}",
+                self.config.replicas, self.config.resources
+            ),
+        )
         .await?;
 
         // Convert deployer status to deployment status
@@ -501,7 +545,7 @@ impl DeployImageJob {
 
     async fn validate_deployment_config(
         &self,
-        _context: &WorkflowContext,
+        context: &WorkflowContext,
     ) -> Result<(), WorkflowError> {
         if self.config.service_name.is_empty() {
             return Err(WorkflowError::JobValidationFailed(
@@ -521,7 +565,7 @@ impl DeployImageJob {
             ));
         }
 
-        self.log("✅ Deployment configuration is valid".to_string())
+        self.log(context, "✅ Deployment configuration is valid".to_string())
             .await?;
         Ok(())
     }

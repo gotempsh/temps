@@ -159,6 +159,47 @@ mod integration_tests {
     use std::collections::VecDeque;
     use tokio::sync::Mutex;
 
+    // Helper function to create unique test project (avoids deadlocks in parallel tests)
+    async fn create_unique_test_project(db: &Arc<DatabaseConnection>) -> projects::Model {
+        let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let slug = format!("test-project-{}", nanos);
+        let project = projects::ActiveModel {
+            name: Set(format!("Test Project {}", nanos)),
+            slug: Set(slug.clone()),
+            project_type: Set(ProjectType::Static),
+            directory: Set(format!("/test-{}", nanos)),
+            main_branch: Set("main".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        project.insert(db.as_ref()).await.unwrap()
+    }
+
+    // Helper function to create unique test environment (avoids deadlocks in parallel tests)
+    async fn create_unique_test_environment(
+        db: &Arc<DatabaseConnection>,
+        project_id: i32,
+        name: &str,
+    ) -> environments::Model {
+        let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let slug = format!("{}-{}", name, nanos);
+        let subdomain = format!("{}-{}", name, nanos);
+        let environment = environments::ActiveModel {
+            project_id: Set(project_id),
+            name: Set(name.to_string()),
+            slug: Set(slug),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.test.local", subdomain)),
+            upstreams: Set(serde_json::json!([])),
+            branch: Set(Some("main".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        environment.insert(db.as_ref()).await.unwrap()
+    }
+
     // Mock Queue implementation for testing
     struct MockQueue {
         jobs: Arc<Mutex<VecDeque<Job>>>,
@@ -204,12 +245,14 @@ mod integration_tests {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
 
-        // Create a project first
+        // Create a project first (use nanoseconds for uniqueness in parallel tests)
+        let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let project_slug = format!("test-project-{}", nanos);
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
-            slug: Set("test-project".to_string()),
+            slug: Set(project_slug.clone()),
             project_type: Set(ProjectType::Static),
-            directory: Set("/test".to_string()),
+            directory: Set(format!("/test-{}", nanos)),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -218,12 +261,13 @@ mod integration_tests {
         let project = project.insert(db.as_ref()).await.unwrap();
 
         // Create an environment
+        let env_subdomain = format!("production-{}", nanos);
         let environment = environments::ActiveModel {
             project_id: Set(project.id),
             name: Set("production".to_string()),
-            slug: Set("production".to_string()),
-            subdomain: Set("production".to_string()),
-            host: Set("production.test.local".to_string()),
+            slug: Set(format!("production-{}", nanos)),
+            subdomain: Set(env_subdomain.clone()),
+            host: Set(format!("{}.test.local", env_subdomain)),
             upstreams: Set(serde_json::json!([])),
             branch: Set(Some("main".to_string())),
             created_at: Set(Utc::now()),
@@ -264,12 +308,14 @@ mod integration_tests {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
 
-        // Create a project
+        // Create a project (use nanoseconds for uniqueness in parallel tests)
+        let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let project_slug = format!("test-project-{}", nanos);
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
-            slug: Set("test-project".to_string()),
+            slug: Set(project_slug.clone()),
             project_type: Set(ProjectType::Static),
-            directory: Set("/test".to_string()),
+            directory: Set(format!("/test-{}", nanos)),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -278,12 +324,13 @@ mod integration_tests {
         let project = project.insert(db.as_ref()).await.unwrap();
 
         // Create an environment
+        let env_subdomain = format!("staging-{}", nanos);
         let environment = environments::ActiveModel {
             project_id: Set(project.id),
             name: Set("staging".to_string()),
-            slug: Set("staging".to_string()),
-            subdomain: Set("staging".to_string()),
-            host: Set("staging.test.local".to_string()),
+            slug: Set(format!("staging-{}", nanos)),
+            subdomain: Set(env_subdomain.clone()),
+            host: Set(format!("{}.test.local", env_subdomain)),
             upstreams: Set(serde_json::json!([])),
             branch: Set(Some("staging".to_string())),
             created_at: Set(Utc::now()),
@@ -318,32 +365,9 @@ mod integration_tests {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
 
-        // Create a project
-        let project = projects::ActiveModel {
-            name: Set("Test Project".to_string()),
-            slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
-            directory: Set("/test".to_string()),
-            main_branch: Set("main".to_string()),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let project = project.insert(db.as_ref()).await.unwrap();
-
-        // Create an environment
-        let environment = environments::ActiveModel {
-            project_id: Set(project.id),
-            name: Set("test-env".to_string()),
-            slug: Set("test-env".to_string()),
-            subdomain: Set("test-env".to_string()),
-            host: Set("test-env.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let environment = environment.insert(db.as_ref()).await.unwrap();
+        // Create a project and environment (using helpers to avoid deadlocks)
+        let project = create_unique_test_project(&db).await;
+        let environment = create_unique_test_environment(&db, project.id, "test-env").await;
 
         let config_service = create_test_config_service(&db);
         let monitor_service = MonitorService::new(db.clone(), config_service);
@@ -376,32 +400,9 @@ mod integration_tests {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
 
-        // Create a project
-        let project = projects::ActiveModel {
-            name: Set("Test Project".to_string()),
-            slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
-            directory: Set("/test".to_string()),
-            main_branch: Set("main".to_string()),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let project = project.insert(db.as_ref()).await.unwrap();
-
-        // Create an environment
-        let environment = environments::ActiveModel {
-            project_id: Set(project.id),
-            name: Set("test-env".to_string()),
-            slug: Set("test-env".to_string()),
-            subdomain: Set("test-env".to_string()),
-            host: Set("test-env.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let environment = environment.insert(db.as_ref()).await.unwrap();
+        // Create a project and environment (using helpers to avoid deadlocks)
+        let project = create_unique_test_project(&db).await;
+        let environment = create_unique_test_environment(&db, project.id, "test-env").await;
 
         let config_service = create_test_config_service(&db);
         let monitor_service = MonitorService::new(db.clone(), config_service);
@@ -443,32 +444,9 @@ mod integration_tests {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
 
-        // Create a project
-        let project = projects::ActiveModel {
-            name: Set("Test Project".to_string()),
-            slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
-            directory: Set("/test".to_string()),
-            main_branch: Set("main".to_string()),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let project = project.insert(db.as_ref()).await.unwrap();
-
-        // Create an environment
-        let environment = environments::ActiveModel {
-            project_id: Set(project.id),
-            name: Set("test-env".to_string()),
-            slug: Set("test-env".to_string()),
-            subdomain: Set("test-env".to_string()),
-            host: Set("test-env.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let environment = environment.insert(db.as_ref()).await.unwrap();
+        // Create a project and environment (using helpers to avoid deadlocks)
+        let project = create_unique_test_project(&db).await;
+        let environment = create_unique_test_environment(&db, project.id, "test-env").await;
 
         let incident_service = IncidentService::new(db.clone());
 
@@ -500,32 +478,9 @@ mod integration_tests {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
 
-        // Create a project
-        let project = projects::ActiveModel {
-            name: Set("Test Project".to_string()),
-            slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
-            directory: Set("/test".to_string()),
-            main_branch: Set("main".to_string()),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let project = project.insert(db.as_ref()).await.unwrap();
-
-        // Create an environment
-        let environment = environments::ActiveModel {
-            project_id: Set(project.id),
-            name: Set("test-env".to_string()),
-            slug: Set("test-env".to_string()),
-            subdomain: Set("test-env".to_string()),
-            host: Set("test-env.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let environment = environment.insert(db.as_ref()).await.unwrap();
+        // Create a project and environment (using helpers to avoid deadlocks)
+        let project = create_unique_test_project(&db).await;
+        let environment = create_unique_test_environment(&db, project.id, "test-env").await;
 
         let incident_service = IncidentService::new(db.clone());
 

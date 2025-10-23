@@ -25,7 +25,7 @@ interface LogViewerProps {
   job: DeploymentJobResponse
 }
 
-function useLogSSE(
+function useLogWebSocket(
   project: ProjectResponse,
   deployment: DeploymentResponse,
   job: DeploymentJobResponse
@@ -34,26 +34,33 @@ function useLogSSE(
   const [connectionStatus, setConnectionStatus] = useState<
     'connecting' | 'connected' | 'error'
   >('connecting')
-  const eventSourceRef = useRef<EventSource | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
 
   useEffect(() => {
     if (!project.slug || !deployment.id || !job.job_id) {
-      console.error('Missing required parameters for SSE connection')
+      console.error('Missing required parameters for WebSocket connection')
       return
     }
 
-    const connectSSE = () => {
-      const sseUrl = `/api/projects/${project.id}/deployments/${deployment.id}/jobs/${job.job_id}/logs/tail`
+    let reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null
+    let isCleaningUp = false
+
+    const connectWS = () => {
+      // Don't reconnect if component is unmounting
+      if (isCleaningUp) return
+
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const wsUrl = `${protocol}//${window.location.host}/api/projects/${project.id}/deployments/${deployment.id}/jobs/${job.job_id}/logs/tail`
       setLogs('')
 
-      eventSourceRef.current = new EventSource(sseUrl)
+      wsRef.current = new WebSocket(wsUrl)
       setConnectionStatus('connecting')
 
-      eventSourceRef.current.onopen = () => {
+      wsRef.current.onopen = () => {
         setConnectionStatus('connected')
       }
 
-      eventSourceRef.current.onmessage = (event) => {
+      wsRef.current.onmessage = (event) => {
         setLogs((prevLogs) => {
           try {
             const data = JSON.parse(event.data)
@@ -67,19 +74,32 @@ function useLogSSE(
         })
       }
 
-      eventSourceRef.current.onerror = () => {
+      wsRef.current.onerror = () => {
         setConnectionStatus('error')
-        eventSourceRef.current?.close()
-        // Retry connection after 10 seconds
-        setTimeout(connectSSE, 10000)
+      }
+
+      wsRef.current.onclose = (event) => {
+        // Only reconnect if:
+        // 1. Not a normal closure (code 1000)
+        // 2. Component is not being cleaned up
+        // 3. Connection was previously established or connecting
+        if (!isCleaningUp && event.code !== 1000) {
+          setConnectionStatus('error')
+          // Retry connection after 10 seconds
+          reconnectTimeoutId = setTimeout(connectWS, 10000)
+        }
       }
     }
 
-    connectSSE()
+    connectWS()
 
     return () => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close()
+      isCleaningUp = true
+      if (reconnectTimeoutId) {
+        clearTimeout(reconnectTimeoutId)
+      }
+      if (wsRef.current) {
+        wsRef.current.close(1000, 'Component unmounting')
       }
     }
   }, [project.id, deployment.id, job.job_id, project.slug])
@@ -89,7 +109,7 @@ function useLogSSE(
 
 function LogViewer({ project, deployment, job }: LogViewerProps) {
   const scrollAreaRef = useRef<HTMLDivElement>(null)
-  const { logs, connectionStatus } = useLogSSE(project, deployment, job)
+  const { logs, connectionStatus } = useLogWebSocket(project, deployment, job)
 
   useEffect(() => {
     if (logs) {

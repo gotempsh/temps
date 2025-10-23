@@ -164,19 +164,24 @@ impl BuildImageJob {
     }
 
     /// Write log message to job-specific log file
-    async fn log(&self, message: String) -> Result<(), WorkflowError> {
+    /// Write log message to both job-specific log file and context log writer
+    async fn log(&self, context: &WorkflowContext, message: String) -> Result<(), WorkflowError> {
+        // Write to job-specific log file
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
                 .append_to_log(log_id, &format!("{}\n", message))
                 .await
                 .map_err(|e| WorkflowError::Other(format!("Failed to write log: {}", e)))?;
         }
+        // Also write to context log writer (for real-time streaming and test capture)
+        context.log(&message).await?;
         Ok(())
     }
 
     /// Generate Dockerfile from preset if it doesn't exist
     async fn ensure_dockerfile(
         &self,
+        context: &WorkflowContext,
         repo_dir: &PathBuf,
         dockerfile_path: &PathBuf,
     ) -> Result<(), WorkflowError> {
@@ -192,10 +197,13 @@ impl BuildImageJob {
             )
         })?;
 
-        self.log(format!(
-            "📝 Dockerfile not found, generating from preset: {}",
-            preset_slug
-        ))
+        self.log(
+            context,
+            format!(
+                "📝 Dockerfile not found, generating from preset: {}",
+                preset_slug
+            ),
+        )
         .await?;
 
         // Get the preset
@@ -225,11 +233,14 @@ impl BuildImageJob {
         // Write the Dockerfile
         fs::write(dockerfile_path, dockerfile_content).map_err(WorkflowError::IoError)?;
 
-        self.log(format!(
-            "✅ Generated Dockerfile at: {} with {} build args",
-            dockerfile_path.display(),
-            build_vars.len()
-        ))
+        self.log(
+            context,
+            format!(
+                "✅ Generated Dockerfile at: {} with {} build args",
+                dockerfile_path.display(),
+                build_vars.len()
+            ),
+        )
         .await?;
 
         Ok(())
@@ -239,10 +250,13 @@ impl BuildImageJob {
     async fn build_image(
         &self,
         repo_output: &RepositoryOutput,
-        _context: &WorkflowContext,
+        context: &WorkflowContext,
     ) -> Result<ImageOutput, WorkflowError> {
-        self.log(format!("🐳 Starting image build for {}", self.image_tag))
-            .await?;
+        self.log(
+            context,
+            format!("🐳 Starting image build for {}", self.image_tag),
+        )
+        .await?;
 
         // Determine dockerfile path
         let dockerfile_path = if let Some(ref dockerfile) = self.build_config.dockerfile_path {
@@ -251,14 +265,14 @@ impl BuildImageJob {
             repo_output.repo_dir.join("Dockerfile")
         };
 
-        self.log(format!(
-            "📄 Using Dockerfile: {}",
-            dockerfile_path.display()
-        ))
+        self.log(
+            context,
+            format!("📄 Using Dockerfile: {}", dockerfile_path.display()),
+        )
         .await?;
 
         // Ensure Dockerfile exists (generate from preset if needed)
-        self.ensure_dockerfile(&repo_output.repo_dir, &dockerfile_path)
+        self.ensure_dockerfile(context, &repo_output.repo_dir, &dockerfile_path)
             .await?;
 
         // Determine build context
@@ -268,14 +282,17 @@ impl BuildImageJob {
             repo_output.repo_dir.clone()
         };
 
-        self.log(format!("📁 Build context: {}", build_context.display()))
-            .await?;
+        self.log(
+            context,
+            format!("📁 Build context: {}", build_context.display()),
+        )
+        .await?;
 
         // Create a temporary log file for the build
         let log_path = std::env::temp_dir().join(format!("build_{}.log", self.job_id));
 
         // Build the image using ImageBuilder trait
-        self.log("🔨 Building container image...".to_string())
+        self.log(context, "🔨 Building container image...".to_string())
             .await?;
 
         let mut build_args = HashMap::new();
@@ -321,20 +338,26 @@ impl BuildImageJob {
                 WorkflowError::JobExecutionFailed(format!("Failed to build image: {}", e))
             })?;
 
-        self.log(format!(
-            "✅ Image built successfully: {} ({})",
-            build_result.image_name, build_result.image_id
-        ))
+        self.log(
+            context,
+            format!(
+                "✅ Image built successfully: {} ({})",
+                build_result.image_name, build_result.image_id
+            ),
+        )
         .await?;
-        self.log(format!(
-            "📊 Image size: {} MB",
-            build_result.size_bytes / (1024 * 1024)
-        ))
+        self.log(
+            context,
+            format!(
+                "📊 Image size: {} MB",
+                build_result.size_bytes / (1024 * 1024)
+            ),
+        )
         .await?;
-        self.log(format!(
-            "⏱️  Build time: {} ms",
-            build_result.build_duration_ms
-        ))
+        self.log(
+            context,
+            format!("⏱️  Build time: {} ms", build_result.build_duration_ms),
+        )
         .await?;
 
         Ok(ImageOutput {

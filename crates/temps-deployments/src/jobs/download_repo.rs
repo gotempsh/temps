@@ -97,14 +97,17 @@ impl DownloadRepoJob {
         self
     }
 
-    /// Write log message to job-specific log file
-    async fn log(&self, message: String) -> Result<(), WorkflowError> {
+    /// Write log message to both job-specific log file and context log writer
+    async fn log(&self, context: &WorkflowContext, message: String) -> Result<(), WorkflowError> {
+        // Write to job-specific log file
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
                 .append_to_log(log_id, &format!("{}\n", message))
                 .await
                 .map_err(|e| WorkflowError::Other(format!("Failed to write log: {}", e)))?;
         }
+        // Also write to context log writer (for real-time streaming and test capture)
+        context.log(&message).await?;
         Ok(())
     }
 
@@ -152,14 +155,17 @@ impl DownloadRepoJob {
         &self,
         context: &WorkflowContext,
     ) -> Result<PathBuf, WorkflowError> {
-        self.log(format!(
-            "🔽 Starting repository download for {}/{}",
-            self.repo_owner, self.repo_name
-        ))
+        self.log(
+            context,
+            format!(
+                "🔽 Starting repository download for {}/{}",
+                self.repo_owner, self.repo_name
+            ),
+        )
         .await?;
 
         let checkout_ref = self.get_checkout_ref(context);
-        self.log(format!("📌 Checking out ref: {}", checkout_ref))
+        self.log(context, format!("📌 Checking out ref: {}", checkout_ref))
             .await?;
 
         // Create temp directory
@@ -167,10 +173,10 @@ impl DownloadRepoJob {
         let repo_dir = temp_dir.join("repository");
         std::fs::create_dir_all(&repo_dir).map_err(WorkflowError::IoError)?;
 
-        self.log(format!(
-            "📁 Created repository directory at: {}",
-            repo_dir.display()
-        ))
+        self.log(
+            context,
+            format!("📁 Created repository directory at: {}", repo_dir.display()),
+        )
         .await?;
 
         // Try download archive first (faster)
@@ -187,8 +193,11 @@ impl DownloadRepoJob {
             .await
         {
             Ok(()) => {
-                self.log("📦 Successfully downloaded repository archive".to_string())
-                    .await?;
+                self.log(
+                    context,
+                    "📦 Successfully downloaded repository archive".to_string(),
+                )
+                .await?;
 
                 // Extract the archive
                 let output = tokio::process::Command::new("tar")
@@ -214,20 +223,29 @@ impl DownloadRepoJob {
                     )));
                 }
 
-                self.log("📂 Successfully extracted repository archive".to_string())
-                    .await?;
+                self.log(
+                    context,
+                    "📂 Successfully extracted repository archive".to_string(),
+                )
+                .await?;
 
                 // Clean up archive
                 if let Err(e) = std::fs::remove_file(&archive_path) {
-                    self.log(format!("Warning: Failed to clean up archive file: {}", e))
-                        .await?;
+                    self.log(
+                        context,
+                        format!("Warning: Failed to clean up archive file: {}", e),
+                    )
+                    .await?;
                 }
             }
             Err(e) => {
-                self.log(format!(
-                    "📦 Archive download failed, falling back to git clone: {}",
-                    e
-                ))
+                self.log(
+                    context,
+                    format!(
+                        "📦 Archive download failed, falling back to git clone: {}",
+                        e
+                    ),
+                )
                 .await?;
 
                 // Fall back to git clone - directory must be empty for trait method
@@ -255,7 +273,7 @@ impl DownloadRepoJob {
                         ))
                     })?;
 
-                self.log("🔄 Successfully cloned repository".to_string())
+                self.log(context, "🔄 Successfully cloned repository".to_string())
                     .await?;
             }
         }
@@ -267,7 +285,7 @@ impl DownloadRepoJob {
             ));
         }
 
-        self.log("✅ Repository validation passed".to_string())
+        self.log(context, "✅ Repository validation passed".to_string())
             .await?;
 
         Ok(repo_dir)
