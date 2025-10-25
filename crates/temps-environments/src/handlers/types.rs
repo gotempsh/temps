@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::AuditLogger;
+use temps_entities::deployment_config::DeploymentConfig;
 use utoipa::ToSchema;
 
 use crate::services::env_var_service::EnvVarService;
@@ -63,16 +64,10 @@ pub struct EnvironmentResponse {
     pub current_deployment_id: Option<i32>,
     pub created_at: i64,
     pub updated_at: i64,
-    pub cpu_request: Option<i32>,
-    pub cpu_limit: Option<i32>,
-    pub memory_request: Option<i32>,
-    pub memory_limit: Option<i32>,
-    pub replicas: Option<i32>,
     pub branch: Option<String>,
-    /// Port exposed by the container (overrides project-level port for this environment)
+    /// Deployment configuration for this environment (overrides project-level config)
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(example = 8080)]
-    pub exposed_port: Option<i32>,
+    pub deployment_config: Option<DeploymentConfig>,
 }
 
 impl From<temps_entities::environments::Model> for EnvironmentResponse {
@@ -86,16 +81,8 @@ impl From<temps_entities::environments::Model> for EnvironmentResponse {
             current_deployment_id: env.current_deployment_id,
             created_at: env.created_at.timestamp_millis(),
             updated_at: env.updated_at.timestamp_millis(),
-            cpu_request: env.deployment_config.as_ref().and_then(|c| c.cpu_request),
-            cpu_limit: env.deployment_config.as_ref().and_then(|c| c.cpu_limit),
-            memory_request: env
-                .deployment_config
-                .as_ref()
-                .and_then(|c| c.memory_request),
-            memory_limit: env.deployment_config.as_ref().and_then(|c| c.memory_limit),
-            replicas: env.deployment_config.as_ref().map(|c| c.replicas),
             branch: env.branch,
-            exposed_port: env.deployment_config.as_ref().and_then(|c| c.exposed_port),
+            deployment_config: env.deployment_config,
         }
     }
 }
@@ -137,6 +124,15 @@ pub struct UpdateEnvironmentSettingsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 8080)]
     pub exposed_port: Option<i32>,
+    /// Enable/disable automatic deployments for this environment
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automatic_deploy: Option<bool>,
+    /// Enable/disable performance metrics collection
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub performance_metrics_enabled: Option<bool>,
+    /// Enable/disable session recording
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_recording_enabled: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

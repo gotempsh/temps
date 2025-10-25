@@ -171,6 +171,52 @@ impl JobTracker for DeploymentJobTracker {
         debug!("Saved outputs for job {}", job_execution_id);
         Ok(())
     }
+
+    async fn cancel_pending_jobs(
+        &self,
+        _workflow_run_id: &str,
+        reason: String,
+    ) -> Result<(), WorkflowError> {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        // Update all pending jobs to cancelled status
+        let sql = r#"
+            UPDATE deployment_jobs
+            SET status = $1, error_message = $2, finished_at = $3
+            WHERE deployment_id = $4
+              AND status = $5
+        "#;
+
+        let now = chrono::Utc::now();
+        let affected_rows = self
+            .db
+            .as_ref()
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                sql,
+                vec![
+                    EntityJobStatus::Cancelled.into(),
+                    reason.clone().into(),
+                    now.into(),
+                    self.deployment_id.into(),
+                    EntityJobStatus::Pending.into(),
+                ],
+            ))
+            .await
+            .map_err(|e| {
+                WorkflowError::Other(format!("Failed to cancel pending jobs: {}", e))
+            })?
+            .rows_affected();
+
+        if affected_rows > 0 {
+            debug!(
+                "Cancelled {} pending job(s) for deployment {} with reason: {}",
+                affected_rows, self.deployment_id, reason
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +238,8 @@ mod tests {
             preset: Set(Preset::NextJs),
             directory: Set("/".to_string()),
             main_branch: Set("main".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
             ..Default::default()
@@ -218,7 +266,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("test-deployment".to_string()),
             state: Set("running".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
             ..Default::default()
@@ -521,6 +569,92 @@ mod tests {
             .all(db.as_ref())
             .await?;
         assert_eq!(pending_jobs.len(), 2); // crons and screenshot still pending
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cancel_pending_jobs_on_required_job_failure(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (deployment_id, _environment_id) = create_test_deployment(&db).await?;
+
+        // Create 5 jobs: job1 (pending), job2 (will fail), job3 (pending), job4 (pending), job5 (pending)
+        let job1_id =
+            create_test_job(&db, deployment_id, "job1", true, EntityJobStatus::Pending).await?;
+        let job2_id =
+            create_test_job(&db, deployment_id, "job2", true, EntityJobStatus::Pending).await?;
+        let job3_id =
+            create_test_job(&db, deployment_id, "job3", true, EntityJobStatus::Pending).await?;
+        let job4_id =
+            create_test_job(&db, deployment_id, "job4", true, EntityJobStatus::Pending).await?;
+        let job5_id =
+            create_test_job(&db, deployment_id, "job5", true, EntityJobStatus::Pending).await?;
+
+        let tracker = DeploymentJobTracker::new(db.clone(), deployment_id);
+
+        // Mark job1 as success
+        tracker
+            .update_job_status(job1_id, CoreJobStatus::Success, None)
+            .await?;
+
+        // Mark job2 as failed (simulating the 2nd job failing)
+        tracker
+            .update_job_status(
+                job2_id,
+                CoreJobStatus::Failure,
+                Some("Job 2 failed".to_string()),
+            )
+            .await?;
+
+        // Now cancel all pending jobs
+        tracker
+            .cancel_pending_jobs(
+                "deployment-workflow",
+                "Required job 'job2' failed: Job 2 failed".to_string(),
+            )
+            .await?;
+
+        // Verify: job1 should still be Success
+        let job1 = DeploymentJobs::find_by_id(job1_id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(job1.status, EntityJobStatus::Success);
+
+        // Verify: job2 should still be Failure
+        let job2 = DeploymentJobs::find_by_id(job2_id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(job2.status, EntityJobStatus::Failure);
+        assert_eq!(job2.error_message, Some("Job 2 failed".to_string()));
+
+        // Verify: job3, job4, job5 should be Cancelled
+        let job3 = DeploymentJobs::find_by_id(job3_id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(job3.status, EntityJobStatus::Cancelled);
+        assert_eq!(
+            job3.error_message,
+            Some("Required job 'job2' failed: Job 2 failed".to_string())
+        );
+        assert!(job3.finished_at.is_some());
+
+        let job4 = DeploymentJobs::find_by_id(job4_id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(job4.status, EntityJobStatus::Cancelled);
+
+        let job5 = DeploymentJobs::find_by_id(job5_id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(job5.status, EntityJobStatus::Cancelled);
 
         Ok(())
     }

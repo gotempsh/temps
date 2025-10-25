@@ -37,6 +37,16 @@ pub struct GroupedPageMetricsQuery {
     group_by: String, // "path", "country", "device_type", "browser", "operating_system"
 }
 
+#[derive(Deserialize, Clone, ToSchema)]
+pub struct HasMetricsQuery {
+    project_id: i32,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HasMetricsResponse {
+    pub has_metrics: bool,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ErrorResponse {
     pub error: String,
@@ -91,6 +101,7 @@ pub struct UpdateSpeedMetricsPayload {
         get_performance_metrics,
         get_metrics_over_time,
         get_grouped_page_metrics,
+        has_performance_metrics,
         record_speed_metrics,
         update_speed_metrics
     ),
@@ -102,6 +113,8 @@ pub struct UpdateSpeedMetricsPayload {
             GroupedPageMetric,
             PerformanceMetricsQuery,
             GroupedPageMetricsQuery,
+            HasMetricsQuery,
+            HasMetricsResponse,
             SpeedMetricsPayload,
             UpdateSpeedMetricsPayload,
             ErrorResponse
@@ -118,6 +131,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/performance/metrics", get(get_performance_metrics))
         .route("/performance/metrics-over-time", get(get_metrics_over_time))
         .route("/performance/page-metrics", get(get_grouped_page_metrics))
+        .route("/performance/has-metrics", get(has_performance_metrics))
         .route("/_temps/speed", post(record_speed_metrics))
         .route("/_temps/speed/update", post(update_speed_metrics))
 }
@@ -279,6 +293,42 @@ async fn get_grouped_page_metrics(
                 Json(ErrorResponse {
                     error: "Failed to fetch grouped page metrics".to_string(),
                     details: Some(format!("Error retrieving metrics: {:?}", e)),
+                }),
+            ))
+        }
+    }
+}
+
+/// Check if performance metrics exist for a project
+#[utoipa::path(
+    tag = "Performance",
+    get,
+    path = "/performance/has-metrics",
+    params(
+        ("project_id" = i32, Query, description = "Project ID")
+    ),
+    responses(
+        (status = 200, description = "Successfully checked performance metrics availability", body = HasMetricsResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
+async fn has_performance_metrics(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HasMetricsQuery>,
+) -> Result<Json<HasMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    match state
+        .performance_service
+        .has_metrics(query.project_id)
+        .await
+    {
+        Ok(has_metrics) => Ok(Json(HasMetricsResponse { has_metrics })),
+        Err(e) => {
+            error!("Error checking performance metrics: {:?}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Failed to check performance metrics".to_string(),
+                    details: Some(format!("Error checking metrics: {:?}", e)),
                 }),
             ))
         }

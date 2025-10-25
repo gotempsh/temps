@@ -69,7 +69,7 @@ import {
   X,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import * as z from 'zod/v4'
@@ -104,6 +104,17 @@ const SERVICE_TYPES = [
     description: 'SQLite-compatible Database',
   },
 ]
+
+// Helper function to slugify path for project name
+const slugifyPath = (path: string): string => {
+  if (!path || path === '.' || path === './' || path === 'root') {
+    return ''
+  }
+  // Remove leading ./ if present
+  const cleanPath = path.startsWith('./') ? path.slice(2) : path
+  // Replace / with - and remove any other special characters
+  return cleanPath.replace(/\//g, '-').replace(/[^a-zA-Z0-9-]/g, '')
+}
 
 // Form schema definition
 const formSchema = z.object({
@@ -159,7 +170,6 @@ interface ProjectConfiguratorProps {
   connectionId: number
 
   // Optional data
-  presetData?: RepositoryPresetResponse
   branches?: BranchInfo[]
 
   // Display modes
@@ -178,7 +188,6 @@ interface ProjectConfiguratorProps {
 export function ProjectConfigurator({
   repository,
   connectionId,
-  presetData,
   branches,
   mode: _mode = 'wizard',
   onSubmit,
@@ -239,23 +248,26 @@ export function ProjectConfigurator({
     [branches, branchesData?.branches]
   )
 
-  // Fetch preset data if not provided
+  // Watch the selected branch to refetch presets when it changes
+  const selectedBranch = useWatch({
+    control: form.control,
+    name: 'branch',
+  })
+
+  // Fetch preset data (will refetch when branch changes due to query key)
   const {
-    data: fetchedPresetData,
+    data: presetData,
     isLoading: presetLoading,
     error: presetError,
+    refetch: refetchPresets,
   } = useQuery({
     ...getRepositoryPresetLiveOptions({
       path: { repository_id: repository.id || 0 },
+      query: { branch: selectedBranch },
     }),
-    enabled: !presetData && !!repository.id,
+    enabled: !!repository.id && !!selectedBranch,
+    // Key includes branch, so React Query will refetch when branch changes
   })
-
-  const effectivePresetData = useMemo(
-    () => presetData || fetchedPresetData,
-    [presetData, fetchedPresetData]
-  )
-  const isPresetLoading = !presetData && presetLoading
 
   // Default project creation mutation
   const projectMutation = useMutation({
@@ -273,13 +285,13 @@ export function ProjectConfigurator({
 
   // Compute the default preset value based on preset data
   const defaultPresetValue = useMemo(() => {
-    if (!effectivePresetData) {
+    if (!presetData) {
       return null
     }
 
     // New schema: use presets array
-    if (effectivePresetData.presets && effectivePresetData.presets.length > 0) {
-      const firstPreset = effectivePresetData.presets[0]
+    if (presetData.presets && presetData.presets.length > 0) {
+      const firstPreset = presetData.presets[0]
       const presetName = firstPreset.preset || 'custom'
       const presetPath = firstPreset.path || './'
       const normalizedPath = normalizePath(presetPath)
@@ -295,7 +307,7 @@ export function ProjectConfigurator({
         rootDir: './',
       }
     }
-  }, [effectivePresetData])
+  }, [presetData])
 
   // Auto-set preset when data is available (select first available preset)
   useEffect(() => {
@@ -483,7 +495,7 @@ export function ProjectConfigurator({
             if (!field.value) return ''
 
             // Find matching preset to get the path (detected presets)
-            const matchingPreset = effectivePresetData?.presets?.find(
+            const matchingPreset = presetData?.presets?.find(
               (p: ProjectPresetResponse) => p.preset === field.value
             )
             if (matchingPreset) {
@@ -501,18 +513,27 @@ export function ProjectConfigurator({
             <FormItem>
               <FormControl>
                 <FrameworkSelector
-                  presetData={effectivePresetData}
-                  isLoading={isPresetLoading}
+                  presetData={presetData}
+                  isLoading={presetLoading}
                   error={presetError}
                   selectedPreset={selectValue}
+                  onRefresh={() => refetchPresets()}
                   onSelectPreset={(value) => {
                     if (value === 'custom') {
                       field.onChange('custom')
                       form.setValue('rootDirectory', './')
                     } else {
-                      const [presetName, presetPath] = value.split('::')
+                      const [_presetName, presetPath] = value.split('::')
                       // Store the full preset key (preset::path) to distinguish between same preset at different paths
                       field.onChange(value)
+
+                      // Set project name based on repository name and preset path
+                      const repoName = repository.name || 'project'
+                      const slugifiedPath = slugifyPath(presetPath)
+                      const projectName = slugifiedPath
+                        ? `${repoName}-${slugifiedPath}`
+                        : repoName
+                      form.setValue('name', projectName)
 
                       // Treat empty, '.', and 'root' as root directory
                       if (

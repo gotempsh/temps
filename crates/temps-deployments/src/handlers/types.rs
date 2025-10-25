@@ -98,7 +98,7 @@ pub struct DeploymentResponse {
     pub id: i32,
     pub project_id: i32,
     pub environment_id: i32,
-    pub environment: DeploymentEnvironmentResponse, // Add this field
+    pub environment: DeploymentEnvironmentResponse,
     pub status: String,
     pub url: String,
     pub commit_hash: Option<String>,
@@ -113,6 +113,10 @@ pub struct DeploymentResponse {
     pub commit_date: Option<i64>,
     pub is_current: bool,
     pub cancelled_reason: Option<String>,
+    /// Deployment configuration snapshot (CPU, memory, replicas, environment variables, etc.)
+    pub deployment_config: Option<temps_entities::deployment_config::DeploymentConfigSnapshot>,
+    /// Deployment metadata (build info, git event, etc.)
+    pub metadata: Option<temps_entities::prelude::DeploymentMetadata>,
 }
 
 // Add new struct for environment info in response
@@ -150,6 +154,8 @@ impl DeploymentResponse {
             commit_date: deployment.commit_date.map(|d| d.timestamp_millis()),
             is_current: deployment.is_current,
             cancelled_reason: deployment.cancelled_reason,
+            deployment_config: deployment.deployment_config,
+            metadata: deployment.metadata,
         }
     }
 }

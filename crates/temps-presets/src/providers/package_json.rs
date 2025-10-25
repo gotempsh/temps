@@ -48,7 +48,7 @@ pub struct PackageJson {
 
 impl PackageJson {
     /// Parse package.json from string
-    pub fn from_str(content: &str) -> Result<Self, serde_json::Error> {
+    pub fn parse(content: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(content)
     }
 
@@ -107,7 +107,7 @@ mod tests {
             }
         }"#;
 
-        let pkg = PackageJson::from_str(content).unwrap();
+        let pkg = PackageJson::parse(content).unwrap();
         assert_eq!(pkg.name, Some("test-app".to_string()));
         assert_eq!(pkg.version, Some("1.0.0".to_string()));
         assert_eq!(pkg.get_dependency("react"), Some("^18.0.0"));
@@ -125,7 +125,7 @@ mod tests {
             }
         }"#;
 
-        let pkg = PackageJson::from_str(content).unwrap();
+        let pkg = PackageJson::parse(content).unwrap();
         assert!(pkg.has_dependency("react"));
         assert!(pkg.has_dependency("typescript"));
         assert!(!pkg.has_dependency("vue"));
@@ -137,7 +137,7 @@ mod tests {
             "packageManager": "pnpm@8.15.0"
         }"#;
 
-        let pkg = PackageJson::from_str(content).unwrap();
+        let pkg = PackageJson::parse(content).unwrap();
         assert_eq!(pkg.package_manager, Some("pnpm@8.15.0".to_string()));
     }
 
@@ -150,7 +150,7 @@ mod tests {
             }
         }"#;
 
-        let pkg = PackageJson::from_str(content).unwrap();
+        let pkg = PackageJson::parse(content).unwrap();
         assert_eq!(pkg.get_script("build"), Some("tsc"));
         assert_eq!(pkg.get_script("dev"), Some("vite"));
         assert!(pkg.has_script("build"));

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use temps_core::{JobResult, TempsConfig, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
 use temps_entities::projects;
-use temps_logs::LogService;
+use temps_logs::{LogLevel, LogService};
 use tracing::warn;
 
 use crate::jobs::RepositoryOutput;
@@ -123,13 +123,27 @@ impl ConfigureCronsJob {
 
     /// Write log message to job-specific log file
     async fn log(&self, message: String) -> Result<(), WorkflowError> {
+        // Detect log level from message content/emojis
+        let level = Self::detect_log_level(&message);
+
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
-                .append_to_log(log_id, &format!("{}\n", message))
+                .append_structured_log(log_id, level, message.clone())
                 .await
                 .map_err(|e| WorkflowError::Other(format!("Failed to write log: {}", e)))?;
         }
         Ok(())
+    }
+
+    /// Detect log level from message content
+    fn detect_log_level(message: &str) -> LogLevel {
+        if message.contains("✅") || message.contains("Complete") || message.contains("success") {
+            LogLevel::Success
+        } else if message.contains("❌") || message.contains("Failed") || message.contains("Error") || message.contains("error") {
+            LogLevel::Error
+        } else {
+            LogLevel::Info
+        }
     }
 
     /// Load and parse .temps.yaml configuration
@@ -143,14 +157,14 @@ impl ConfigureCronsJob {
 
         if !config_path.exists() {
             self.log(format!(
-                "ℹ️  No .temps.yaml found at {:?}, skipping cron configuration",
+                "No .temps.yaml found at {:?}, skipping cron configuration",
                 config_path
             ))
             .await?;
             return Ok(None);
         }
 
-        self.log(format!("📄 Found .temps.yaml at {:?}", config_path))
+        self.log(format!("Found .temps.yaml at {:?}", config_path))
             .await?;
 
         let config_contents = fs::read_to_string(&config_path).map_err(WorkflowError::IoError)?;
@@ -164,7 +178,7 @@ impl ConfigureCronsJob {
 
     /// Configure cron jobs based on repository configuration
     async fn configure_crons(&self, repo_output: &RepositoryOutput) -> Result<(), WorkflowError> {
-        self.log("⏰ Starting cron configuration".to_string())
+        self.log("Starting cron configuration".to_string())
             .await?;
 
         // Load project to get directory
@@ -183,7 +197,7 @@ impl ConfigureCronsJob {
         {
             Some(config) => config,
             None => {
-                self.log("✅ No cron configuration needed".to_string())
+                self.log("No cron configuration needed".to_string())
                     .await?;
                 return Ok(());
             }
@@ -191,14 +205,14 @@ impl ConfigureCronsJob {
 
         // Check if config has cron jobs
         if !config.has_crons() {
-            self.log("ℹ️  No cron jobs defined in .temps.yaml".to_string())
+            self.log("No cron jobs defined in .temps.yaml".to_string())
                 .await?;
             return Ok(());
         }
 
         let cron_jobs = config.cron_jobs();
         self.log(format!(
-            "📋 Found {} cron job(s) to configure",
+            "Found {} cron job(s) to configure",
             cron_jobs.len()
         ))
         .await?;
@@ -220,7 +234,7 @@ impl ConfigureCronsJob {
                 WorkflowError::JobExecutionFailed(format!("Failed to configure cron jobs: {}", e))
             })?;
 
-        self.log("✅ Cron configuration completed successfully".to_string())
+        self.log("Cron configuration completed successfully".to_string())
             .await?;
 
         Ok(())

@@ -1157,7 +1157,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
             state: Set("in_progress".to_string()),
-            metadata: Set(serde_json::json!({})), // Empty metadata object
+            metadata: Set(None), // Empty metadata object
             ..Default::default()
         }
         .insert(&*db)
@@ -1179,15 +1179,15 @@ mod tests {
         .await
         .expect("Failed to create test deployment job");
 
-        // Pre-populate log files
+        // Pre-populate log files with structured logs
         app_state
             .log_service
-            .append_to_log(&job_log_id, "Job log line 1\n")
+            .append_structured_log(&job_log_id, temps_logs::LogLevel::Info, "Job log line 1")
             .await
             .expect("Failed to write job log");
         app_state
             .log_service
-            .append_to_log(&job_log_id, "Job log line 2\n")
+            .append_structured_log(&job_log_id, temps_logs::LogLevel::Info, "Job log line 2")
             .await
             .expect("Failed to write job log");
 
@@ -1396,7 +1396,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
             state: Set("running".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             ..Default::default()
         }
         .insert(&*db)
@@ -1429,13 +1429,13 @@ mod tests {
         .await
         .expect("Failed to create test container");
 
-        // Pre-populate container logs
+        // Pre-populate container logs with structured logs
         log_service
-            .append_to_log(container_id, "Container log line 1\n")
+            .append_structured_log(container_id, temps_logs::LogLevel::Info, "Container log line 1")
             .await
             .expect("Failed to write container log");
         log_service
-            .append_to_log(container_id, "Container log line 2\n")
+            .append_structured_log(container_id, temps_logs::LogLevel::Info, "Container log line 2")
             .await
             .expect("Failed to write container log");
 
@@ -1649,7 +1649,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
             state: Set("running".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             ..Default::default()
         }
         .insert(&*db)
@@ -1698,13 +1698,13 @@ mod tests {
         .await
         .expect("Failed to create container 2");
 
-        // Pre-populate logs for both containers
+        // Pre-populate logs for both containers with structured logs
         log_service
-            .append_to_log(container1_id, "Web container log 1\n")
+            .append_structured_log(container1_id, temps_logs::LogLevel::Info, "Web container log 1")
             .await
             .expect("Failed to write container 1 log");
         log_service
-            .append_to_log(container2_id, "DB container log 1\n")
+            .append_structured_log(container2_id, temps_logs::LogLevel::Info, "DB container log 1")
             .await
             .expect("Failed to write container 2 log");
 
@@ -1927,7 +1927,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
             state: Set("deployed".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             ..Default::default()
         }
         .insert(&*db)
@@ -2034,7 +2034,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set(format!("test-deployment-1-{}", uuid::Uuid::new_v4())),
             state: Set("deployed".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             ..Default::default()
         }
         .insert(&*db)
@@ -2046,7 +2046,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set(format!("test-deployment-2-{}", uuid::Uuid::new_v4())),
             state: Set("in_progress".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             ..Default::default()
         }
         .insert(&*db)
@@ -2146,7 +2146,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
             state: Set("deployed".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             ..Default::default()
         }
         .insert(&*db)
@@ -2245,7 +2245,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
             state: Set("deployed".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             ..Default::default()
         }
         .insert(&*db)
@@ -2371,7 +2371,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
             state: Set("deployed".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             ..Default::default()
         }
         .insert(&*db)
@@ -2492,7 +2492,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
             state: Set("in_progress".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             ..Default::default()
         }
         .insert(&*db)
@@ -2592,7 +2592,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
             state: Set("deployed".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             ..Default::default()
         }
         .insert(&*db)

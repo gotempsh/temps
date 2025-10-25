@@ -92,16 +92,16 @@ pub struct PresetProviderRegistry {
 impl PresetProviderRegistry {
     /// Create a new registry with all providers
     pub fn new() -> Self {
-        let registry = Self {
-            providers: Vec::new(),
-            by_slug: HashMap::new(),
-        };
+
 
         // Register all providers
         // registry.register(Box::new(providers::NextJsProvider));
         // TODO: Register other providers as they are implemented
 
-        registry
+        Self {
+            providers: Vec::new(),
+            by_slug: HashMap::new(),
+        }
     }
 
     /// Register a provider
@@ -127,7 +127,7 @@ impl PresetProviderRegistry {
                 };
 
                 // Update best match if this has higher confidence
-                if best_match.as_ref().map_or(true, |m| confidence > m.confidence) {
+                if best_match.as_ref().is_none_or(|m| confidence > m.confidence) {
                     best_match = Some(detection);
                 }
             }

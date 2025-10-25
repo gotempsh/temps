@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use bollard::{container::LogOutput, query_parameters::LogsOptions, Docker};
+use bollard::{query_parameters::LogsOptions, Docker};
 use futures::{StreamExt, TryStreamExt};
 use temps_core::UtcDateTime;
 
@@ -71,11 +71,7 @@ impl DockerLogService {
         let logs = self.docker.logs(container_id, log_options);
 
         let stream = logs.map(|result| match result {
-            Ok(log_output) => match log_output {
-                LogOutput::StdOut { message } => Ok(String::from_utf8_lossy(&message).to_string()),
-                LogOutput::StdErr { message } => Ok(String::from_utf8_lossy(&message).to_string()),
-                _ => Ok("".to_string()),
-            },
+            Ok(log_output) => Ok(String::from_utf8_lossy(&log_output.into_bytes()).to_string()),
             Err(e) => Err(DockerLogError::DockerError(e)),
         });
 

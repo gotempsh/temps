@@ -112,21 +112,17 @@ impl WorkflowPlanner {
         if let Some(ref service_manager) = self.external_service_manager {
             for project_service in project_services_list {
                 debug!(
-                    "🔍 Fetching runtime env vars for service ID {}",
-                    project_service.service_id
+                    "Fetching runtime env vars for service ID {} (project: {}, environment: {})",
+                    project_service.service_id, project.id, environment.id
                 );
 
                 match service_manager
-                    .get_runtime_env_vars(
-                        project_service.service_id,
-                        project.slug.clone(),
-                        environment.slug.clone(),
-                    )
+                    .get_runtime_env_vars(project_service.service_id, project.id, environment.id)
                     .await
                 {
                     Ok(service_env_vars) => {
                         debug!(
-                            "✅ Got {} env vars from service {}",
+                            "Got {} env vars from service {}",
                             service_env_vars.len(),
                             project_service.service_id
                         );
@@ -135,7 +131,7 @@ impl WorkflowPlanner {
                     }
                     Err(e) => {
                         warn!(
-                            "⚠️  Failed to get runtime env vars for service {}: {:?}",
+                            "Failed to get runtime env vars for service {}: {:?}",
                             project_service.service_id, e
                         );
                     }
@@ -143,7 +139,7 @@ impl WorkflowPlanner {
             }
         } else if !project_services_list.is_empty() {
             warn!(
-                "⚠️  Project has {} external services but ExternalServiceManager is not available. \
+                "Project has {} external services but ExternalServiceManager is not available. \
                 External service environment variables will NOT be included in deployment.",
                 project_services_list.len()
             );
@@ -172,7 +168,7 @@ impl WorkflowPlanner {
                 {
                     Ok(project_dsn) => {
                         debug!(
-                            "✅ Got DSN for project {} environment {}: {}",
+                            "Got DSN for project {} environment {}: {}",
                             project.id, environment.id, project_dsn.dsn
                         );
                         // Add both SENTRY_DSN and NEXT_PUBLIC_SENTRY_DSN for compatibility with different frameworks
@@ -181,7 +177,7 @@ impl WorkflowPlanner {
                     }
                     Err(e) => {
                         warn!(
-                            "⚠️  Failed to get or create DSN for project {} environment {}: {:?}. \
+                            "Failed to get or create DSN for project {} environment {}: {:?}. \
                             Sentry DSN environment variables will NOT be included.",
                             project.id, environment.id, e
                         );
@@ -190,7 +186,7 @@ impl WorkflowPlanner {
             }
             Err(e) => {
                 warn!(
-                    "⚠️  Failed to get external URL from config: {:?}. \
+                    "Failed to get external URL from config: {:?}. \
                     Sentry DSN environment variables will NOT be included.",
                     e
                 );
@@ -198,7 +194,7 @@ impl WorkflowPlanner {
         }
 
         info!(
-            "✅ Gathered {} total environment variables for deployment",
+            "Gathered {} total environment variables for deployment",
             env_vars_map.len()
         );
         Ok(env_vars_map)
@@ -226,7 +222,7 @@ impl WorkflowPlanner {
             .ok_or_else(|| anyhow::anyhow!("Environment not found"))?;
 
         info!(
-            "📋 Planning workflow for deployment {} (project: {}, env: {})",
+            "Planning workflow for deployment {} (project: {}, env: {})",
             deployment_id, project.name, environment.name
         );
 
@@ -290,14 +286,14 @@ impl WorkflowPlanner {
 
             let created_job = job_record.insert(self.db.as_ref()).await?;
             debug!(
-                "✅ Created job: {} ({})",
+                "Created job: {} ({})",
                 created_job.name, created_job.job_id
             );
             created_jobs.push(created_job);
         }
 
         info!(
-            "🎯 Successfully created {} jobs for deployment {}",
+            "Successfully created {} jobs for deployment {}",
             created_jobs.len(),
             deployment_id
         );
@@ -332,7 +328,7 @@ impl WorkflowPlanner {
         if let Some(ref deployment_config) = environment.deployment_config {
             if let Some(port) = deployment_config.exposed_port {
                 debug!(
-                    "✅ Using environment-level port override: {} (environment: {})",
+                    "Using environment-level port override: {} (environment: {})",
                     port, environment.name
                 );
                 return port as u16;
@@ -343,7 +339,7 @@ impl WorkflowPlanner {
         if let Some(ref deployment_config) = project.deployment_config {
             if let Some(port) = deployment_config.exposed_port {
                 debug!(
-                    "✅ Using project-level port override: {} (project: {})",
+                    "Using project-level port override: {} (project: {})",
                     port, project.name
                 );
                 return port as u16;
@@ -352,7 +348,7 @@ impl WorkflowPlanner {
 
         // 3. Default to 3000
         // Note: Image EXPOSE directive will be checked in DeployImageJob after build completes
-        debug!("ℹ️  Using default port: 3000 (will be overridden by image EXPOSE if present)");
+        debug!("Using default port: 3000 (will be overridden by image EXPOSE if present)");
         3000
     }
 
@@ -366,7 +362,7 @@ impl WorkflowPlanner {
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
 
-        debug!("🔍 Planning jobs for project: {}", project.name);
+        debug!("Planning jobs for project: {}", project.name);
 
         // Gather environment variables for the deployment
         let env_vars = self
@@ -412,7 +408,7 @@ impl WorkflowPlanner {
                 required_for_completion: true, // Core deployment job
             });
         } else {
-            debug!("⚠️  Skipping download_repo job - no git info available");
+            debug!("Skipping download_repo job - no git info available");
         }
 
         // Job 2: Build container image
@@ -435,18 +431,15 @@ impl WorkflowPlanner {
         let mut dockerfile_path = "Dockerfile".to_string();
         let mut build_context = project.directory.clone();
 
-        if let Some(preset_config) = &project.preset_config {
-            // Extract dockerfile_path and build_context from preset_config
-            // Only relevant for Dockerfile preset
-            if let temps_entities::preset::PresetConfig::Dockerfile(dockerfile_config) =
-                preset_config
-            {
-                if let Some(custom_dockerfile) = &dockerfile_config.dockerfile_path {
-                    dockerfile_path = custom_dockerfile.clone();
-                }
-                if let Some(custom_context) = &dockerfile_config.build_context {
-                    build_context = custom_context.clone();
-                }
+        // Extract dockerfile_path and build_context from preset_config (only relevant for Dockerfile preset)
+        if let Some(temps_entities::preset::PresetConfig::Dockerfile(dockerfile_config)) =
+            &project.preset_config
+        {
+            if let Some(custom_dockerfile) = &dockerfile_config.dockerfile_path {
+                dockerfile_path = custom_dockerfile.clone();
+            }
+            if let Some(custom_context) = &dockerfile_config.build_context {
+                build_context = custom_context.clone();
             }
         }
 
@@ -513,7 +506,7 @@ impl WorkflowPlanner {
             })),
             required_for_completion: true, // Critical job - ensures deployment is marked complete
         });
-        debug!("✅ Added mark_deployment_complete job as barrier between core and optional jobs");
+        debug!("Added mark_deployment_complete job as barrier between core and optional jobs");
 
         // Job 5: Configure cron jobs (only if git info is available)
         // This job reads .temps.yaml from the repository and configures cron jobs
@@ -534,9 +527,9 @@ impl WorkflowPlanner {
                 })),
                 required_for_completion: false, // Post-deployment job - not required for deployment success
             });
-            debug!("✅ Added configure_crons job to workflow (runs after deployment is marked complete)");
+            debug!("Added configure_crons job to workflow (runs after deployment is marked complete)");
         } else {
-            debug!("⚠️  Skipping configure_crons job - no git info available");
+            debug!("Skipping configure_crons job - no git info available");
         }
 
         // Job 6: Take screenshot (only if screenshots are enabled in config)
@@ -556,13 +549,13 @@ impl WorkflowPlanner {
                 })),
                 required_for_completion: false, // Post-deployment job - not required for deployment success
             });
-            debug!("✅ Added take_screenshot job to workflow (screenshot service will be injected by plugin system)");
+            debug!("Added take_screenshot job to workflow (screenshot service will be injected by plugin system)");
         } else {
-            debug!("⚠️  Skipping screenshot job - screenshots are disabled in config");
+            debug!("Skipping screenshot job - screenshots are disabled in config");
         }
 
         info!(
-            "📋 Planned {} jobs for project {}",
+            "Planned {} jobs for project {}",
             jobs.len(),
             project.name
         );
@@ -656,7 +649,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("test-deployment".to_string()),
             state: Set("pending".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -765,7 +758,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("test-deployment".to_string()),
             state: Set("pending".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()

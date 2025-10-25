@@ -1,6 +1,7 @@
 import { ProjectResponse } from '@/api/client'
 import {
   deleteProjectMutation,
+  updateProjectDeploymentConfigMutation,
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
@@ -32,10 +33,11 @@ import {
   FormLabel,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
 import { useState } from 'react'
-import { SubmitHandler, useForm } from 'react-hook-form'
+import { useForm } from 'react-hook-form'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { z } from 'zod'
@@ -47,11 +49,23 @@ interface GeneralSettingsProps {
 
 const projectSchema = z.object({
   name: z.string().min(1, 'Project name is required'),
-  port: z.coerce.number().min(1).max(65535).optional(),
   dockerfilePath: z.string().optional(),
 })
 
 type ProjectFormValues = z.infer<typeof projectSchema>
+
+const deploymentConfigSchema = z.object({
+  cpuRequest: z.string().optional(),
+  cpuLimit: z.string().optional(),
+  memoryRequest: z.string().optional(),
+  memoryLimit: z.string().optional(),
+  replicas: z.string().optional(),
+  automaticDeploy: z.boolean(),
+  performanceMetricsEnabled: z.boolean(),
+  sessionRecordingEnabled: z.boolean(),
+})
+
+type DeploymentConfigFormValues = z.infer<typeof deploymentConfigSchema>
 
 export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   const navigate = useNavigate()
@@ -62,12 +76,32 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
     },
   })
 
+  const updateDeploymentConfig = useMutation({
+    ...updateProjectDeploymentConfigMutation(),
+    meta: {
+      errorTitle: 'Failed to update deployment configuration',
+    },
+  })
+
   const projectForm = useForm<ProjectFormValues>({
     resolver: zodResolver(projectSchema),
     defaultValues: {
       name: project?.slug || '',
-      port: project?.exposed_port ? Number(project.exposed_port) : undefined,
       dockerfilePath: 'Dockerfile',
+    },
+  })
+
+  const deploymentForm = useForm<DeploymentConfigFormValues>({
+    resolver: zodResolver(deploymentConfigSchema),
+    defaultValues: {
+      cpuRequest: project?.cpu_request?.toString() ?? '',
+      cpuLimit: project?.cpu_limit?.toString() ?? '',
+      memoryRequest: project?.memory_request?.toString() ?? '',
+      memoryLimit: project?.memory_limit?.toString() ?? '',
+      replicas: '',
+      automaticDeploy: project?.automatic_deploy ?? false,
+      performanceMetricsEnabled: project?.performance_metrics_enabled ?? false,
+      sessionRecordingEnabled: false,
     },
   })
 
@@ -76,10 +110,9 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
 
     await toast.promise(
       updateProjectSettings.mutateAsync({
-        path: { project_id: project.id! as number },
+        path: { project_id: project.id!.toString() },
         body: {
           slug: values.name,
-          exposed_port: values.port,
         },
       }),
       {
@@ -88,9 +121,53 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         error: 'Failed to update project',
       }
     )
-    await refetch()
+    refetch()
     navigate(`/projects/${values.name}/settings/general`)
   }
+
+  const handleSaveDeploymentConfig = async (
+    values: DeploymentConfigFormValues
+  ) => {
+    if (!project?.id) return
+
+    await toast.promise(
+      updateDeploymentConfig.mutateAsync({
+        path: { project_id: project.id!.toString() },
+        body: {
+          cpu_request:
+            values.cpuRequest && values.cpuRequest.trim() !== ''
+              ? parseInt(values.cpuRequest)
+              : null,
+          cpu_limit:
+            values.cpuLimit && values.cpuLimit.trim() !== ''
+              ? parseInt(values.cpuLimit)
+              : null,
+          memory_request:
+            values.memoryRequest && values.memoryRequest.trim() !== ''
+              ? parseInt(values.memoryRequest)
+              : null,
+          memory_limit:
+            values.memoryLimit && values.memoryLimit.trim() !== ''
+              ? parseInt(values.memoryLimit)
+              : null,
+          replicas:
+            values.replicas && values.replicas.trim() !== ''
+              ? parseInt(values.replicas)
+              : null,
+          automatic_deploy: values.automaticDeploy,
+          performance_metrics_enabled: values.performanceMetricsEnabled,
+          session_recording_enabled: values.sessionRecordingEnabled,
+        },
+      }),
+      {
+        loading: 'Updating deployment configuration...',
+        success: 'Deployment configuration updated successfully',
+        error: 'Failed to update deployment configuration',
+      }
+    )
+    refetch()
+  }
+
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
   const deleteProjectMutationM = useMutation({
     ...deleteProjectMutation(),
@@ -98,6 +175,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       errorTitle: 'Failed to delete project',
     },
   })
+
   const handleDeleteProject = async () => {
     setIsDeleteDialogOpen(false)
     try {
@@ -107,7 +185,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         }),
         {
           loading: 'Deleting project...',
-          success: (_) => {
+          success: () => {
             navigate(`/projects`, {})
             return 'Project deleted'
           },
@@ -118,17 +196,15 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       console.error('Error deleting project:', error)
     }
   }
+
   return (
     <div className="space-y-6">
+      {/* Project Settings Card */}
       <Form {...projectForm}>
-        <form
-          onSubmit={projectForm.handleSubmit(
-            handleSaveProject as SubmitHandler<ProjectFormValues>
-          )}
-        >
+        <form onSubmit={projectForm.handleSubmit(handleSaveProject)}>
           <Card className="bg-background text-foreground">
             <CardHeader>
-              <CardTitle>Project slug</CardTitle>
+              <CardTitle>Project Settings</CardTitle>
               <CardDescription>
                 Used to identify your Project on the Dashboard, CLI, and in the
                 URL of your Deployments.
@@ -140,36 +216,12 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                 name="name"
                 render={({ field }) => (
                   <FormItem>
+                    <FormLabel>Project Slug</FormLabel>
                     <FormControl>
                       <Input {...field} className="max-w-[400px]" />
                     </FormControl>
                     <FormDescription className="text-muted-foreground">
                       This will be used in your project&apos;s URL
-                    </FormDescription>
-                  </FormItem>
-                )}
-              />
-
-              <FormField
-                control={projectForm.control}
-                name="port"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Exposed Port (Override)</FormLabel>
-                    <FormControl>
-                      <Input
-                        {...field}
-                        type="number"
-                        min="1"
-                        max="65535"
-                        placeholder="Auto-detected from image"
-                        className="max-w-[400px]"
-                      />
-                    </FormControl>
-                    <FormDescription className="text-muted-foreground">
-                      Optional: Override the port when your image has no EXPOSE
-                      directive. Priority: Image EXPOSE → Environment override →
-                      This value → Default (3000)
                     </FormDescription>
                   </FormItem>
                 )}
@@ -206,6 +258,222 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         </form>
       </Form>
 
+      {/* Deployment Configuration Card */}
+      <Form {...deploymentForm}>
+        <form
+          onSubmit={deploymentForm.handleSubmit(handleSaveDeploymentConfig)}
+        >
+          <Card className="bg-background text-foreground">
+            <CardHeader>
+              <CardTitle>Default Deployment Configuration</CardTitle>
+              <CardDescription>
+                Configure default resource limits and deployment settings for all
+                environments. These can be overridden per environment.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              {/* Resource Limits */}
+              <div className="space-y-4">
+                <h3 className="text-sm font-medium">Resource Limits</h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <FormField
+                    control={deploymentForm.control}
+                    name="cpuRequest"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>CPU Request (millicores)</FormLabel>
+                        <FormControl>
+                          <Input
+                            {...field}
+                            type="number"
+                            min="1"
+                            placeholder="e.g., 100"
+                          />
+                        </FormControl>
+                        <FormDescription className="text-muted-foreground">
+                          Minimum CPU resources (1000m = 1 CPU core)
+                        </FormDescription>
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={deploymentForm.control}
+                    name="cpuLimit"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>CPU Limit (millicores)</FormLabel>
+                        <FormControl>
+                          <Input
+                            {...field}
+                            type="number"
+                            min="1"
+                            placeholder="e.g., 200"
+                          />
+                        </FormControl>
+                        <FormDescription className="text-muted-foreground">
+                          Maximum CPU resources (1000m = 1 CPU core)
+                        </FormDescription>
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={deploymentForm.control}
+                    name="memoryRequest"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Memory Request (MB)</FormLabel>
+                        <FormControl>
+                          <Input
+                            {...field}
+                            type="number"
+                            min="1"
+                            placeholder="e.g., 128"
+                          />
+                        </FormControl>
+                        <FormDescription className="text-muted-foreground">
+                          Minimum memory allocation
+                        </FormDescription>
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={deploymentForm.control}
+                    name="memoryLimit"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Memory Limit (MB)</FormLabel>
+                        <FormControl>
+                          <Input
+                            {...field}
+                            type="number"
+                            min="1"
+                            placeholder="e.g., 256"
+                          />
+                        </FormControl>
+                        <FormDescription className="text-muted-foreground">
+                          Maximum memory allocation
+                        </FormDescription>
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={deploymentForm.control}
+                    name="replicas"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Default Replicas</FormLabel>
+                        <FormControl>
+                          <Input
+                            {...field}
+                            type="number"
+                            min="1"
+                            placeholder="e.g., 1"
+                          />
+                        </FormControl>
+                        <FormDescription className="text-muted-foreground">
+                          Default number of container instances
+                        </FormDescription>
+                      </FormItem>
+                    )}
+                  />
+                </div>
+              </div>
+
+              {/* Automation Settings */}
+              <div className="space-y-4">
+                <h3 className="text-sm font-medium">Automation</h3>
+                <FormField
+                  control={deploymentForm.control}
+                  name="automaticDeploy"
+                  render={({ field }) => (
+                    <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
+                      <div className="space-y-0.5">
+                        <FormLabel className="text-base">
+                          Automatic Deployments
+                        </FormLabel>
+                        <FormDescription>
+                          Automatically deploy when changes are pushed to the main
+                          branch
+                        </FormDescription>
+                      </div>
+                      <FormControl>
+                        <Switch
+                          checked={field.value}
+                          onCheckedChange={field.onChange}
+                        />
+                      </FormControl>
+                    </FormItem>
+                  )}
+                />
+              </div>
+
+              {/* Monitoring Settings */}
+              <div className="space-y-4">
+                <h3 className="text-sm font-medium">Monitoring</h3>
+                <div className="space-y-4">
+                  <FormField
+                    control={deploymentForm.control}
+                    name="performanceMetricsEnabled"
+                    render={({ field }) => (
+                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
+                        <div className="space-y-0.5">
+                          <FormLabel className="text-base">
+                            Performance Metrics
+                          </FormLabel>
+                          <FormDescription>
+                            Collect and display performance metrics for your
+                            deployments
+                          </FormDescription>
+                        </div>
+                        <FormControl>
+                          <Switch
+                            checked={field.value}
+                            onCheckedChange={field.onChange}
+                          />
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={deploymentForm.control}
+                    name="sessionRecordingEnabled"
+                    render={({ field }) => (
+                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
+                        <div className="space-y-0.5">
+                          <FormLabel className="text-base">
+                            Session Recording
+                          </FormLabel>
+                          <FormDescription>
+                            Record user sessions for debugging and analytics
+                          </FormDescription>
+                        </div>
+                        <FormControl>
+                          <Switch
+                            checked={field.value}
+                            onCheckedChange={field.onChange}
+                          />
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+                </div>
+              </div>
+            </CardContent>
+            <CardFooter>
+              <Button type="submit" disabled={updateDeploymentConfig.isPending}>
+                Save Configuration
+              </Button>
+            </CardFooter>
+          </Card>
+        </form>
+      </Form>
+
+      {/* Danger Zone */}
       <div className="border-t pt-6">
         <h3 className="text-lg font-medium text-destructive">Danger Zone</h3>
         <p className="text-sm text-muted-foreground mt-1 mb-4">
@@ -240,7 +508,6 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
             </AlertDialogFooter>
           </AlertDialogContent>
         </AlertDialog>
-        {/* <Button variant="destructive">Delete Project</Button> */}
       </div>
     </div>
   )

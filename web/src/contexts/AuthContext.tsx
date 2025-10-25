@@ -9,6 +9,7 @@ import { createContext, useContext, ReactNode } from 'react'
 interface AuthContextType {
   user: UserResponse | null
   isLoading: boolean
+  error: Error | null
   logout: () => Promise<void>
   refetch: () => void
 }
@@ -19,12 +20,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const {
     data: user,
     isLoading: userLoading,
+    error: userError,
     refetch: refetchUser,
   } = useQuery({
     ...getCurrentUserOptions({}),
     retry: (failureCount, error: any) => {
       // Don't retry on 401 (unauthorized) or cancelled requests
       if (error?.status === 401 || error?.name === 'AbortError') {
+        return false
+      }
+      // Don't retry on 504 or connection errors
+      if (error?.status === 504 || error?.code === 'ECONNREFUSED' || error?.message?.includes('Failed to fetch')) {
         return false
       }
       return failureCount < 1
@@ -46,6 +52,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const value = {
     user: user || null,
     isLoading: userLoading,
+    error: userError as Error | null,
     logout: async () => {
       await logout({})
     },

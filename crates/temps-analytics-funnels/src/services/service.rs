@@ -820,7 +820,7 @@ mod tests {
             commit_message: Set(Some("Test commit".to_string())),
             slug: Set("http://test.temps.localhost".to_string()),
             state: Set("active".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()

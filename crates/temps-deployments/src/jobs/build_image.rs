@@ -6,11 +6,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_deployer::{BuildRequest, ImageBuilder};
-use temps_logs::LogService;
+use temps_logs::{LogLevel, LogService};
 use temps_presets;
 
 /// Typed output from DownloadRepoJob
@@ -74,6 +74,7 @@ pub struct BuildConfig {
     pub dockerfile_path: Option<String>,
     pub build_context: Option<String>,
     pub build_args: Vec<(String, String)>,
+    pub build_args_buildkit: Vec<(String, String)>,
     pub target_platform: Option<String>,
     pub cache_from: Vec<String>,
 }
@@ -84,6 +85,7 @@ impl Default for BuildConfig {
             dockerfile_path: Some("Dockerfile".to_string()),
             build_context: Some(".".to_string()),
             build_args: Vec::new(),
+            build_args_buildkit: Vec::new(),
             target_platform: None,
             cache_from: Vec::new(),
         }
@@ -148,6 +150,11 @@ impl BuildImageJob {
         self
     }
 
+    pub fn with_build_args_buildkit(mut self, build_args_buildkit: Vec<(String, String)>) -> Self {
+        self.build_config.build_args_buildkit = build_args_buildkit;
+        self
+    }
+
     pub fn with_log_id(mut self, log_id: String) -> Self {
         self.log_id = Some(log_id);
         self
@@ -163,19 +170,34 @@ impl BuildImageJob {
         self
     }
 
-    /// Write log message to job-specific log file
     /// Write log message to both job-specific log file and context log writer
     async fn log(&self, context: &WorkflowContext, message: String) -> Result<(), WorkflowError> {
-        // Write to job-specific log file
+        // Detect log level from message content/emojis
+        let level = Self::detect_log_level(&message);
+
+        // Write structured log to job-specific log file
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
-                .append_to_log(log_id, &format!("{}\n", message))
+                .append_structured_log(log_id, level, message.clone())
                 .await
                 .map_err(|e| WorkflowError::Other(format!("Failed to write log: {}", e)))?;
         }
         // Also write to context log writer (for real-time streaming and test capture)
         context.log(&message).await?;
         Ok(())
+    }
+
+    /// Detect log level from message content
+    fn detect_log_level(message: &str) -> LogLevel {
+        if message.contains("✅") || message.contains("Complete") || message.contains("success") {
+            LogLevel::Success
+        } else if message.contains("❌") || message.contains("Failed") || message.contains("Error") || message.contains("error") {
+            LogLevel::Error
+        } else if message.contains("⏳") || message.contains("Waiting") || message.contains("warning") {
+            LogLevel::Warning
+        } else {
+            LogLevel::Info
+        }
     }
 
     /// Generate Dockerfile from preset if it doesn't exist
@@ -185,18 +207,20 @@ impl BuildImageJob {
     /// * `context` - Workflow context for logging
     /// * `build_context_dir` - The directory that will be used as Docker build context (where to generate/look for Dockerfile)
     /// * `dockerfile_path` - Full path where Dockerfile should be generated
+    ///
     /// Generate framework-specific nixpacks.toml configuration
     ///
     /// This method detects the Node.js framework being used (Astro, Vite, Next.js, etc.)
     /// and generates an optimized nixpacks.toml with framework-specific start commands.
     /// Only generates the file if:
+    ///
     /// 1. package.json exists (Node.js project)
     /// 2. No custom nixpacks.toml already exists
     /// 3. Framework has specific configuration (not all frameworks need overrides)
     async fn generate_framework_specific_nixpacks_config(
         &self,
         context: &WorkflowContext,
-        build_context_dir: &PathBuf,
+        build_context_dir: &Path,
     ) -> Result<(), WorkflowError> {
         let nixpacks_toml_path = build_context_dir.join("nixpacks.toml");
         let package_json_path = build_context_dir.join("package.json");
@@ -205,7 +229,7 @@ impl BuildImageJob {
         if nixpacks_toml_path.exists() {
             self.log(
                 context,
-                "ℹ️  Custom nixpacks.toml found, skipping framework detection".to_string(),
+                "Custom nixpacks.toml found, skipping framework detection".to_string(),
             )
             .await?;
             return Ok(());
@@ -221,7 +245,7 @@ impl BuildImageJob {
 
         self.log(
             context,
-            format!("🔍 Detected Node.js framework: {}", framework.name()),
+            format!("Detected Node.js framework: {}", framework.name()),
         )
         .await?;
 
@@ -232,7 +256,7 @@ impl BuildImageJob {
             self.log(
                 context,
                 format!(
-                    "✅ Generated framework-specific nixpacks.toml for {}",
+                    "Generated framework-specific nixpacks.toml for {}",
                     framework.name()
                 ),
             )
@@ -241,7 +265,7 @@ impl BuildImageJob {
             self.log(
                 context,
                 format!(
-                    "ℹ️  {} uses default nixpacks configuration",
+                    "{} uses default nixpacks configuration",
                     framework.name()
                 ),
             )
@@ -267,7 +291,7 @@ impl BuildImageJob {
             // Use provided preset
             self.log(
                 context,
-                format!("📝 Dockerfile not found, generating from preset: {}", slug),
+                format!("Dockerfile not found, generating from preset: {}", slug),
             )
             .await?;
             slug.clone()
@@ -275,7 +299,7 @@ impl BuildImageJob {
             // Auto-detect preset from project files
             self.log(
                 context,
-                "🔍 No preset specified, auto-detecting project type...".to_string(),
+                "No preset specified, auto-detecting project type...".to_string(),
             )
             .await?;
 
@@ -302,7 +326,7 @@ impl BuildImageJob {
                 if content.contains("\"react-scripts\"") {
                     self.log(
                         context,
-                        "✅ Detected project type: react-app (found react-scripts in package.json)"
+                        "Detected project type: react-app (found react-scripts in package.json)"
                             .to_string(),
                     )
                     .await?;
@@ -318,7 +342,7 @@ impl BuildImageJob {
                         })?;
 
                     let slug = detected_preset.slug().to_string();
-                    self.log(context, format!("✅ Detected project type: {}", slug))
+                    self.log(context, format!("Detected project type: {}", slug))
                         .await?;
                     slug
                 }
@@ -333,7 +357,7 @@ impl BuildImageJob {
                     })?;
 
                 let slug = detected_preset.slug().to_string();
-                self.log(context, format!("✅ Detected project type: {}", slug))
+                self.log(context, format!("Detected project type: {}", slug))
                     .await?;
                 slug
             };
@@ -377,7 +401,7 @@ impl BuildImageJob {
         self.log(
             context,
             format!(
-                "✅ Generated Dockerfile at: {} ({} build args from preset)",
+                "Generated Dockerfile at: {} ({} build args from preset)",
                 dockerfile_path.display(),
                 dockerfile_with_args.build_args.len()
             ),
@@ -402,7 +426,7 @@ impl BuildImageJob {
     ) -> Result<ImageOutput, WorkflowError> {
         self.log(
             context,
-            format!("🐳 Starting image build for {}", self.image_tag),
+            format!("Starting image build for {}", self.image_tag),
         )
         .await?;
 
@@ -422,7 +446,7 @@ impl BuildImageJob {
 
         self.log(
             context,
-            format!("📄 Using Dockerfile: {}", dockerfile_path.display()),
+            format!("Using Dockerfile: {}", dockerfile_path.display()),
         )
         .await?;
 
@@ -450,7 +474,7 @@ impl BuildImageJob {
 
         self.log(
             context,
-            format!("📁 Build context: {}", build_context.display()),
+            format!("Build context: {}", build_context.display()),
         )
         .await?;
 
@@ -458,7 +482,7 @@ impl BuildImageJob {
         let log_path = std::env::temp_dir().join(format!("build_{}.log", self.job_id));
 
         // Build the image using ImageBuilder trait
-        self.log(context, "🔨 Building container image...".to_string())
+        self.log(context, "Building container image...".to_string())
             .await?;
 
         let mut build_args = HashMap::new();
@@ -466,16 +490,22 @@ impl BuildImageJob {
             build_args.insert(key.clone(), value.clone());
         }
 
+        let mut build_args_buildkit = HashMap::new();
+        for (key, value) in &self.build_config.build_args_buildkit {
+            build_args_buildkit.insert(key.clone(), value.clone());
+        }
+
         let build_request = BuildRequest {
             image_name: self.image_tag.clone(),
             context_path: build_context.clone(),
             dockerfile_path: Some(dockerfile_path.clone()),
             build_args,
+            build_args_buildkit,
             platform: self.build_config.target_platform.clone(),
             log_path: log_path.clone(),
         };
 
-        // Create log callback to stream Docker build output to job logs
+        // Create log callback to stream Docker build output to job logs with structured logging
         let log_service = self.log_service.clone();
         let log_id = self.log_id.clone();
         let log_callback: Option<temps_deployer::LogCallback> =
@@ -484,7 +514,11 @@ impl BuildImageJob {
                     let log_svc_clone = log_svc.clone();
                     let log_id_clone = log_id_str.clone();
                     Box::pin(async move {
-                        let _ = log_svc_clone.append_to_log(&log_id_clone, &line).await;
+                        // Detect log level from Docker build output
+                        let level = Self::detect_log_level(&line);
+                        let _ = log_svc_clone
+                            .append_structured_log(&log_id_clone, level, line)
+                            .await;
                     })
                 }))
             } else {
@@ -507,7 +541,7 @@ impl BuildImageJob {
         self.log(
             context,
             format!(
-                "✅ Image built successfully: {} ({})",
+                "Image built successfully: {} ({})",
                 build_result.image_name, build_result.image_id
             ),
         )
@@ -522,7 +556,7 @@ impl BuildImageJob {
         .await?;
         self.log(
             context,
-            format!("⏱️  Build time: {} ms", build_result.build_duration_ms),
+            format!("Build time: {} ms", build_result.build_duration_ms),
         )
         .await?;
 
@@ -666,6 +700,11 @@ impl BuildImageJobBuilder {
         self
     }
 
+    pub fn build_args_buildkit(mut self, build_args_buildkit: Vec<(String, String)>) -> Self {
+        self.build_config.build_args_buildkit = build_args_buildkit;
+        self
+    }
+
     pub fn target_platform(mut self, target_platform: String) -> Self {
         self.build_config.target_platform = Some(target_platform);
         self
@@ -704,7 +743,7 @@ impl BuildImageJobBuilder {
         })?;
 
         let mut job = BuildImageJob::new(job_id, download_job_id, image_tag, image_builder)
-            .with_build_config(self.build_config);
+            .with_build_config(self.build_config.clone());
 
         if let Some(log_id) = self.log_id {
             job = job.with_log_id(log_id);

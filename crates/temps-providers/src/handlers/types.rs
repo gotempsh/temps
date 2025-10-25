@@ -204,7 +204,7 @@ impl ProviderMetadata {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ExternalServiceDetails {
     pub service: ExternalServiceInfo,
-    pub parameters: Vec<ServiceParameter>,
+    pub parameter_schema: Option<serde_json::Value>,
     pub current_parameters: Option<HashMap<String, String>>,
 }
 
@@ -213,12 +213,12 @@ pub struct CreateExternalServiceRequest {
     pub name: String,
     pub service_type: ServiceTypeRoute,
     pub version: Option<String>,
-    pub parameters: HashMap<String, String>,
+    pub parameters: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateExternalServiceRequest {
-    pub parameters: HashMap<String, String>,
+    pub parameters: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -237,4 +237,7 @@ pub struct ProjectServiceInfo {
 pub struct EnvironmentVariableInfo {
     pub name: String,
     pub value: String,
+    /// Whether this variable contains sensitive data (passwords, keys, tokens)
+    #[schema(example = false)]
+    pub sensitive: bool,
 }

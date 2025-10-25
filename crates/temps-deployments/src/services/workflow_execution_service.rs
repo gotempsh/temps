@@ -56,13 +56,18 @@ impl WorkflowExecutionService {
         }
     }
 
+    /// Get the container deployer (for cancelling deployments)
+    pub fn container_deployer(&self) -> Arc<dyn ContainerDeployer> {
+        self.container_deployer.clone()
+    }
+
     /// Execute the workflow for a deployment using its job records
     pub async fn execute_deployment_workflow(
         &self,
         deployment_id: i32,
     ) -> Result<(), WorkflowExecutionError> {
         info!(
-            "🔄 Starting workflow execution for deployment {}",
+            "Starting workflow execution for deployment {}",
             deployment_id
         );
 
@@ -79,7 +84,7 @@ impl WorkflowExecutionService {
         }
 
         debug!(
-            "📋 Found {} jobs for deployment {}",
+            "Found {} jobs for deployment {}",
             db_jobs.len(),
             deployment_id
         );
@@ -144,7 +149,7 @@ impl WorkflowExecutionService {
 
         let workflow = workflow_builder.build()?;
 
-        info!("✅ Built workflow with {} jobs", workflow.jobs.len());
+        info!("Built workflow with {} jobs", workflow.jobs.len());
 
         // Create job tracker for updating deployment_jobs table
         let job_tracker = Arc::new(DeploymentJobTracker::new(self.db.clone(), deployment_id));
@@ -164,7 +169,7 @@ impl WorkflowExecutionService {
         {
             Ok(_context) => {
                 info!(
-                    "🎉 Workflow execution completed successfully for deployment {}",
+                    "Workflow execution completed successfully for deployment {}",
                     deployment_id
                 );
 
@@ -175,7 +180,7 @@ impl WorkflowExecutionService {
                 // NOW teardown previous deployment for zero-downtime deployment
                 // This happens AFTER the new deployment is fully running
                 info!(
-                    "🔍 Checking for previous deployments to teardown after successful deployment"
+                    "Checking for previous deployments to teardown after successful deployment"
                 );
                 match self
                     .teardown_previous_deployment(
@@ -187,15 +192,15 @@ impl WorkflowExecutionService {
                 {
                     Ok(Some(stopped_container_id)) => {
                         info!(
-                            "✅ Successfully tore down previous deployment: {}",
+                            "Successfully tore down previous deployment: {}",
                             stopped_container_id
                         );
                     }
                     Ok(None) => {
-                        debug!("ℹ️  No previous deployment found to teardown");
+                        debug!("No previous deployment found to teardown");
                     }
                     Err(e) => {
-                        warn!("⚠️  Failed to teardown previous deployment: {}", e);
+                        warn!("Failed to teardown previous deployment: {}", e);
                         // Don't fail the deployment if teardown fails - the new deployment is already running
                     }
                 }
@@ -210,7 +215,7 @@ impl WorkflowExecutionService {
 
                 if is_cancellation {
                     info!(
-                        "🛑 Workflow execution cancelled for deployment {}: {}",
+                        "Workflow execution cancelled for deployment {}: {}",
                         deployment_id, e
                     );
 
@@ -228,12 +233,12 @@ impl WorkflowExecutionService {
                     }
 
                     info!(
-                        "✅ Deployment {} cancellation completed - workflow stopped gracefully",
+                        "Deployment {} cancellation completed - workflow stopped gracefully",
                         deployment_id
                     );
                 } else {
                     error!(
-                        "❌ Workflow execution failed for deployment {}: {}",
+                        "Workflow execution failed for deployment {}: {}",
                         deployment_id, e
                     );
 
@@ -566,6 +571,7 @@ impl WorkflowExecutionService {
                     .db(self.db.clone())
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone())
+                    .container_deployer(self.container_deployer.clone())
                     .build()?;
 
                 Ok(Arc::new(job))
@@ -604,7 +610,7 @@ impl WorkflowExecutionService {
             // Unsupported job types - log warning but don't fail the entire workflow
             "HealthCheckJob" | "DeployBasicJob" | "BuildStaticJob" | "DeployStaticJob" => {
                 warn!(
-                    "⚠️  Skipping unsupported job type: {} (not yet implemented)",
+                    "Skipping unsupported job type: {} (not yet implemented)",
                     db_job.job_type
                 );
                 // Return a no-op job that succeeds immediately
@@ -614,7 +620,7 @@ impl WorkflowExecutionService {
             }
 
             _ => {
-                warn!("⚠️  Unknown job type: {}", db_job.job_type);
+                warn!("Unknown job type: {}", db_job.job_type);
                 Err(WorkflowExecutionError::UnsupportedJobType(
                     db_job.job_type.clone(),
                 ))
@@ -746,7 +752,7 @@ impl WorkflowExecutionService {
             deployment_container.insert(self.db.as_ref()).await?;
 
             info!(
-                "✅ Created deployment_container record for container {}",
+                "Created deployment_container record for container {}",
                 container_id
             );
         }
@@ -757,7 +763,7 @@ impl WorkflowExecutionService {
         active_deployment.update(self.db.as_ref()).await?;
 
         info!(
-            "✅ Updated deployment {} with workflow outputs",
+            "Updated deployment {} with workflow outputs",
             deployment_id
         );
         Ok(())
@@ -795,7 +801,7 @@ impl WorkflowExecutionService {
         active_environment.update(self.db.as_ref()).await?;
 
         info!(
-            "✅ Updated environment {} to point to deployment {}",
+            "Updated environment {} to point to deployment {}",
             deployment.environment_id, deployment_id
         );
         Ok(())
@@ -832,7 +838,7 @@ impl WorkflowExecutionService {
 
             if !containers.is_empty() {
                 info!(
-                    "🔄 Tearing down previous deployment {} ({} containers)",
+                    "Tearing down previous deployment {} ({} containers)",
                     deployment.id,
                     containers.len()
                 );
@@ -845,10 +851,10 @@ impl WorkflowExecutionService {
                     // Stop and remove the container
                     match self.container_deployer.stop_container(&container_id).await {
                         Ok(_) => {
-                            info!("✅ Stopped container {}", container_id);
+                            info!("Stopped container {}", container_id);
                         }
                         Err(e) => {
-                            warn!("⚠️  Failed to stop container {}: {}", container_id, e);
+                            warn!("Failed to stop container {}: {}", container_id, e);
                         }
                     }
 
@@ -858,10 +864,10 @@ impl WorkflowExecutionService {
                         .await
                     {
                         Ok(_) => {
-                            info!("✅ Removed container {}", container_id);
+                            info!("Removed container {}", container_id);
                         }
                         Err(e) => {
-                            warn!("⚠️  Failed to remove container {}: {}", container_id, e);
+                            warn!("Failed to remove container {}: {}", container_id, e);
                         }
                     }
 
@@ -932,7 +938,7 @@ impl WorkflowCancellationProvider for DatabaseCancellationProvider {
                 let is_cancelled = deployment.state == "cancelled";
                 if is_cancelled {
                     info!(
-                        "🛑 Cancellation detected for deployment {} (workflow: {}) - stopping workflow execution",
+                        "Cancellation detected for deployment {} (workflow: {}) - stopping workflow execution",
                         self.deployment_id, workflow_run_id
                     );
                 }
@@ -940,14 +946,14 @@ impl WorkflowCancellationProvider for DatabaseCancellationProvider {
             }
             Ok(None) => {
                 warn!(
-                    "⚠️  Deployment {} not found during cancellation check",
+                    "Deployment {} not found during cancellation check",
                     self.deployment_id
                 );
                 Ok(false)
             }
             Err(e) => {
                 error!(
-                    "❌ Error checking cancellation status for deployment {}: {}",
+                    "Error checking cancellation status for deployment {}: {}",
                     self.deployment_id, e
                 );
                 // Don't cancel on error to avoid false positives
@@ -1251,7 +1257,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("test-deployment".to_string()),
             state: Set("pending".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()

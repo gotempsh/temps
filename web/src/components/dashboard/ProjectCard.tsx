@@ -66,7 +66,7 @@ export function ProjectCard({ project }: ProjectCardProps) {
               </Avatar>
               <div className="space-y-0.5">
                 <div className="flex flex-col sm:flex-row sm:items-center sm:gap-2">
-                  <h2 className="font-semibold leading-none">{project.name}</h2>
+                  <h2 className="font-semibold leading-none">{project.slug}</h2>
                   {!project.last_deployment && (
                     <Badge variant="outline" className="mt-1 w-fit sm:mt-0">
                       Not deployed

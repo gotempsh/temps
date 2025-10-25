@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::types::AppState;
@@ -159,13 +160,13 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
 }
 
-/// Get parameters for a specific service type
+/// Get parameter schema for a specific service type
 #[utoipa::path(
     get,
     path = "/external-services/types/{service_type}/parameters",
     tag = "External Services",
     responses(
-        (status = 200, description = "Service type parameters", body = Vec<ServiceParameter>),
+        (status = 200, description = "Service type parameter schema"),
         (status = 404, description = "Service type not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -183,12 +184,12 @@ async fn get_service_type_parameters(
     match ServiceTypeRoute::from_str(&service_type) {
         Ok(service_type) => match app_state
             .external_service_manager
-            .get_service_type_parameters(service_type.into())
+            .get_service_type_schema(service_type.into())
             .await
         {
-            Ok(parameters) => Ok((StatusCode::OK, Json(parameters))),
+            Ok(schema) => Ok((StatusCode::OK, Json(schema))),
             Err(e) => Err(internal_server_error()
-                .detail(format!("Failed to get parameters: {}", e))
+                .detail(format!("Failed to get parameter schema: {}", e))
                 .build()),
         },
         Err(_) => Err(not_found().detail("Service type not found").build()),
@@ -278,8 +279,6 @@ async fn create_service(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesCreate);
 
-    info!("Creating new external service");
-
     let service_config = crate::services::CreateExternalServiceRequest {
         name: request.name.clone(),
         service_type: request.service_type.into(),
@@ -362,6 +361,22 @@ async fn update_service(
         .await
     {
         Ok(service) => {
+            // Convert parameters to strings for audit log
+            let params_as_strings: HashMap<String, String> = request
+                .parameters
+                .iter()
+                .map(|(k, v)| {
+                    let v_str = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        serde_json::Value::Bool(b) => b.to_string(),
+                        serde_json::Value::Null => String::new(),
+                        _ => v.to_string(),
+                    };
+                    (k.clone(), v_str)
+                })
+                .collect();
+
             // Create audit log with metadata
             let audit = ExternalServiceUpdatedAudit {
                 context: AuditContext {
@@ -372,7 +387,7 @@ async fn update_service(
                 service_id: service.id,
                 name: service.name.clone(),
                 service_type: service.service_type.to_string(),
-                updated_parameters: request.parameters,
+                updated_parameters: params_as_strings,
             };
 
             if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {

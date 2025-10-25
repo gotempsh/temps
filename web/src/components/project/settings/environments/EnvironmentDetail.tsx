@@ -42,6 +42,7 @@ import {
 import { useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
+import { EnvironmentGitConfigCard } from './EnvironmentGitConfigCard'
 import { EnvironmentResourcesCard } from './EnvironmentResourcesCard'
 
 interface EnvironmentDetailProps {
@@ -494,18 +495,13 @@ export function EnvironmentDetail({ project }: EnvironmentDetailProps) {
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>General</CardTitle>
-          <CardDescription>General environment settings.</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          <div className="space-y-2">
-            <Label>Branch</Label>
-            <p className="text-sm font-mono">{environment.branch}</p>
-          </div>
-        </CardContent>
-      </Card>
+      <EnvironmentGitConfigCard
+        project={project}
+        environment={environment}
+        onUpdate={() => {
+          queryClient.invalidateQueries({ queryKey: ['environment'] })
+        }}
+      />
       <EnvironmentResourcesCard
         project={project}
         environment={environment}

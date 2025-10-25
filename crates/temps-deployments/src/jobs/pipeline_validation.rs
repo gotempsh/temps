@@ -191,7 +191,7 @@ impl LogWriter for MockLogWriter {
 
 /// Validate the complete deployment pipeline works end-to-end
 pub fn validate_complete_deployment_pipeline() -> Result<(), String> {
-    println!("🚀 Validating complete deployment pipeline...");
+    println!("Validating complete deployment pipeline...");
 
     // Phase 1: Job Creation and Configuration
     validate_job_creation()?;
@@ -205,7 +205,7 @@ pub fn validate_complete_deployment_pipeline() -> Result<(), String> {
     // Phase 4: Error Handling
     validate_error_handling()?;
 
-    println!("✅ Complete deployment pipeline validation passed!");
+    println!("Complete deployment pipeline validation passed!");
     Ok(())
 }
 
@@ -248,9 +248,9 @@ fn validate_job_creation() -> Result<(), String> {
     let deploy_job = DeployImageJobBuilder::new()
         .job_id("deploy_image".to_string())
         .build_job_id("build_image".to_string()) // Typed dependency!
-        .target(DeploymentTarget::Kubernetes {
-            cluster_name: "test-cluster".to_string(),
-            kubeconfig_path: None,
+        .target(DeploymentTarget::Docker {
+            registry_url: "registry.example.com".to_string(),
+            network: Some("app-network".to_string()),
         })
         .service_name("webapp".to_string())
         .namespace("production".to_string())
@@ -280,7 +280,7 @@ fn validate_job_creation() -> Result<(), String> {
         "Deploy job should depend on build"
     );
 
-    println!("    ✅ All jobs created with correct dependencies");
+    println!("    All jobs created with correct dependencies");
     Ok(())
 }
 
@@ -317,7 +317,7 @@ fn validate_typed_data_flow() -> Result<(), String> {
     assert_eq!(repo_output.repo_name, "webapp");
     assert_eq!(repo_output.checkout_ref, "main");
     println!(
-        "    ✅ Repository output extracted: {}/{}",
+        "    Repository output extracted: {}/{}",
         repo_output.repo_owner, repo_output.repo_name
     );
 
@@ -350,7 +350,7 @@ fn validate_typed_data_flow() -> Result<(), String> {
     assert_eq!(image_output.image_id, "sha256:abc123def456789");
     assert_eq!(image_output.size_bytes, 157286400);
     println!(
-        "    ✅ Image output extracted: {} ({})",
+        "    Image output extracted: {} ({})",
         image_output.image_tag, image_output.image_id
     );
 
@@ -385,7 +385,7 @@ fn validate_typed_data_flow() -> Result<(), String> {
     assert_eq!(deployment_id, "deploy-abc12345");
     assert_eq!(endpoint_url, "https://webapp.production.example.com");
     println!(
-        "    ✅ Deployment output extracted: {} at {}",
+        "    Deployment output extracted: {} at {}",
         deployment_id, endpoint_url
     );
 
@@ -424,9 +424,9 @@ fn validate_workflow_builder_integration() -> Result<(), String> {
         DeployImageJobBuilder::new()
             .job_id("deploy_image".to_string())
             .build_job_id("build_image".to_string())
-            .target(DeploymentTarget::Kubernetes {
-                cluster_name: "test-cluster".to_string(),
-                kubeconfig_path: None,
+            .target(DeploymentTarget::Docker {
+                registry_url: "registry.test.com".to_string(),
+                network: Some("test-network".to_string()),
             })
             .service_name("webapp".to_string())
             .namespace("test".to_string())
@@ -469,7 +469,7 @@ fn validate_workflow_builder_integration() -> Result<(), String> {
     assert!(job_ids.contains(&"build_image"));
     assert!(job_ids.contains(&"deploy_image"));
 
-    println!("    ✅ WorkflowBuilder integration validated");
+    println!("    WorkflowBuilder integration validated");
     Ok(())
 }
 
@@ -483,7 +483,7 @@ fn validate_error_handling() -> Result<(), String> {
     if build_result.is_ok() {
         return Err("Should fail when download outputs missing".to_string());
     }
-    println!("    ✅ Correctly fails without download outputs");
+    println!("    Correctly fails without download outputs");
 
     // Test 2: Add download outputs but missing build outputs should fail
     context
@@ -503,7 +503,7 @@ fn validate_error_handling() -> Result<(), String> {
     if deploy_result.is_ok() {
         return Err("Should fail when build outputs missing".to_string());
     }
-    println!("    ✅ Correctly fails without build outputs");
+    println!("    Correctly fails without build outputs");
 
     // Test 3: Complete chain should work
     context
@@ -528,33 +528,16 @@ fn validate_error_handling() -> Result<(), String> {
     if repo_result.is_err() || build_result.is_err() {
         return Err("Should succeed with all outputs present".to_string());
     }
-    println!("    ✅ Complete chain works when all outputs present");
+    println!("    Complete chain works when all outputs present");
 
     Ok(())
 }
 
-/// Validate different deployment target configurations
+/// Validate Docker deployment target configuration
 pub fn validate_deployment_configurations() -> Result<(), String> {
-    println!("⚙️  Validating deployment target configurations...");
+    println!("Validating deployment target configuration...");
 
     let container_deployer: Arc<dyn ContainerDeployer> = Arc::new(MockContainerDeployer);
-
-    // Test Kubernetes deployment
-    let k8s_job = DeployImageJobBuilder::new()
-        .job_id("deploy_k8s".to_string())
-        .build_job_id("build_image".to_string())
-        .target(DeploymentTarget::Kubernetes {
-            cluster_name: "prod-cluster".to_string(),
-            kubeconfig_path: Some("/etc/kubernetes/kubeconfig".to_string()),
-        })
-        .service_name("webapp".to_string())
-        .namespace("production".to_string())
-        .replicas(3)
-        .build(container_deployer.clone())
-        .map_err(|e| format!("Failed to create Kubernetes deploy job: {}", e))?;
-
-    assert_eq!(k8s_job.config().replicas, 3);
-    assert_eq!(k8s_job.config().namespace, "production");
 
     // Test Docker deployment
     let docker_job = DeployImageJobBuilder::new()
@@ -567,41 +550,30 @@ pub fn validate_deployment_configurations() -> Result<(), String> {
         .service_name("webapp".to_string())
         .namespace("default".to_string())
         .replicas(1)
-        .build(container_deployer.clone())
+        .build(container_deployer)
         .map_err(|e| format!("Failed to create Docker deploy job: {}", e))?;
 
     assert_eq!(docker_job.config().replicas, 1);
+    assert_eq!(docker_job.config().namespace, "default");
 
-    // Test Cloud Run deployment
-    let _cloudrun_job = DeployImageJobBuilder::new()
-        .job_id("deploy_cloudrun".to_string())
-        .build_job_id("build_image".to_string())
-        .target(DeploymentTarget::CloudRun {
-            project_id: "my-gcp-project".to_string(),
-            region: "us-central1".to_string(),
-        })
-        .service_name("webapp".to_string())
-        .build(container_deployer)
-        .map_err(|e| format!("Failed to create Cloud Run deploy job: {}", e))?;
-
-    println!("✅ All deployment configurations validated");
+    println!("Docker deployment configuration validated");
     Ok(())
 }
 
 /// Run complete pipeline validation
 pub fn run_complete_validation() -> Result<(), String> {
-    println!("🎯 Running complete pipeline validation...\n");
+    println!("Running complete pipeline validation...\n");
 
     validate_complete_deployment_pipeline()?;
     println!();
     validate_deployment_configurations()?;
 
-    println!("\n🎉 All pipeline validations passed successfully!");
-    println!("   ✅ Job creation and dependency chain");
-    println!("   ✅ Typed data flow between stages");
-    println!("   ✅ WorkflowBuilder integration");
-    println!("   ✅ Error handling and validation");
-    println!("   ✅ Multiple deployment target support");
+    println!("\nAll pipeline validations passed successfully!");
+    println!("   Job creation and dependency chain");
+    println!("   Typed data flow between stages");
+    println!("   WorkflowBuilder integration");
+    println!("   Error handling and validation");
+    println!("   Docker deployment target support");
 
     Ok(())
 }

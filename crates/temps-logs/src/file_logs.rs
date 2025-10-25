@@ -14,13 +14,20 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader, SeekFrom
 use tokio::time::Duration;
 use tracing::{debug, trace};
 
+use crate::structured_logs::{LogEntry, LogLevel, StructuredLogService};
+
 pub struct LogService {
     log_base_path: PathBuf,
+    structured_service: StructuredLogService,
 }
 
 impl LogService {
     pub fn new(log_base_path: PathBuf) -> Self {
-        LogService { log_base_path }
+        let structured_service = StructuredLogService::new(log_base_path.clone());
+        LogService {
+            log_base_path,
+            structured_service,
+        }
     }
 
     pub fn get_log_path(&self, log_id: &str) -> PathBuf {
@@ -54,21 +61,31 @@ impl LogService {
         Ok(log_path)
     }
 
-    pub async fn append_to_log(
-        &self,
-        log_path: &str,
-        log_entry: &str,
-    ) -> Result<(), std::io::Error> {
-        use tokio::io::AsyncWriteExt;
+    // REMOVED FROM PUBLIC API: append_to_log() - Use append_structured_log() instead
+    // This method has been removed from the public API to enforce structured logging.
+    // All production code must use append_structured_log() with explicit log levels.
+    //
+    // Migration guide:
+    //   Before: service.append_to_log(log_id, "message\n").await?;
+    //   After:  service.append_structured_log(log_id, LogLevel::Info, "message").await?;
+    //
+    // Helper methods available:
+    //   - log_info(log_id, message)
+    //   - log_success(log_id, message)
+    //   - log_warning(log_id, message)
+    //   - log_error(log_id, message)
 
-        let log_path = self.get_log_path(log_path);
+    /// Internal method for tests only - DO NOT USE in production code
+    /// Use append_structured_log() or helper methods instead
+    #[cfg(test)]
+    async fn append_to_log(&self, log_id: &str, content: &str) -> Result<(), std::io::Error> {
+        let log_path = self.get_log_path(log_id);
         let mut file = tokio::fs::OpenOptions::new()
-            .append(true)
             .create(true)
-            .open(log_path)
+            .append(true)
+            .open(&log_path)
             .await?;
-
-        file.write_all(log_entry.as_bytes()).await?;
+        file.write_all(content.as_bytes()).await?;
         Ok(())
     }
 
@@ -141,6 +158,89 @@ impl LogService {
             }
         })
     }
+
+    // ========== Structured Logging Helpers ==========
+    // These methods provide convenient access to structured logging
+    // while maintaining backward compatibility with existing append_to_log() usage
+
+    /// Append a structured log entry with automatic JSONL formatting
+    ///
+    /// This is a convenience wrapper that creates structured logs transparently.
+    /// Callers can continue using the same API while getting structured benefits.
+    pub async fn append_structured_log(
+        &self,
+        log_id: &str,
+        level: LogLevel,
+        message: impl Into<String>,
+    ) -> Result<(), std::io::Error> {
+        let entry = LogEntry::new(level, message);
+        self.structured_service.append_log(log_id, entry).await
+    }
+
+    /// Append a structured log with metadata
+    pub async fn append_structured_log_with_metadata(
+        &self,
+        log_id: &str,
+        level: LogLevel,
+        message: impl Into<String>,
+        metadata: serde_json::Value,
+    ) -> Result<(), std::io::Error> {
+        let entry = LogEntry::new(level, message).with_metadata(metadata);
+        self.structured_service.append_log(log_id, entry).await
+    }
+
+    /// Read all structured log entries from a JSONL file
+    ///
+    /// Returns parsed LogEntry objects instead of raw strings.
+    /// Use this for fetching logs that need to be displayed with rich formatting.
+    pub async fn get_structured_logs(&self, log_id: &str) -> Result<Vec<LogEntry>, std::io::Error> {
+        self.structured_service.read_logs(log_id).await
+    }
+
+    /// Search structured logs by text (case-insensitive)
+    ///
+    /// This is much more efficient than searching raw log text because
+    /// it only searches the message field and can leverage indexing later.
+    pub async fn search_structured_logs(
+        &self,
+        log_id: &str,
+        query: &str,
+    ) -> Result<Vec<LogEntry>, std::io::Error> {
+        self.structured_service.search_logs(log_id, query).await
+    }
+
+    /// Filter structured logs by level
+    ///
+    /// Returns only logs matching the specified level (info, success, warning, error)
+    pub async fn filter_structured_logs_by_level(
+        &self,
+        log_id: &str,
+        level: LogLevel,
+    ) -> Result<Vec<LogEntry>, std::io::Error> {
+        self.structured_service.filter_by_level(log_id, level).await
+    }
+
+    // ========== Convenience Methods for Common Log Levels ==========
+
+    /// Log an info message (ℹ️ icon in UI)
+    pub async fn log_info(&self, log_id: &str, message: impl Into<String>) -> Result<(), std::io::Error> {
+        self.append_structured_log(log_id, LogLevel::Info, message).await
+    }
+
+    /// Log a success message (✓ icon in UI)
+    pub async fn log_success(&self, log_id: &str, message: impl Into<String>) -> Result<(), std::io::Error> {
+        self.append_structured_log(log_id, LogLevel::Success, message).await
+    }
+
+    /// Log a warning message (⏳ icon in UI)
+    pub async fn log_warning(&self, log_id: &str, message: impl Into<String>) -> Result<(), std::io::Error> {
+        self.append_structured_log(log_id, LogLevel::Warning, message).await
+    }
+
+    /// Log an error message (✗ icon in UI)
+    pub async fn log_error(&self, log_id: &str, message: impl Into<String>) -> Result<(), std::io::Error> {
+        self.append_structured_log(log_id, LogLevel::Error, message).await
+    }
 }
 
 #[cfg(test)]
@@ -183,21 +283,20 @@ mod tests {
         let log_service = LogService::new(temp_dir.path().to_path_buf());
 
         let log_id = "test-append";
-        let log_path = log_service.create_log_path(log_id).await.unwrap();
-        let log_path_str = log_path.to_str().unwrap();
+        log_service.create_log_path(log_id).await.unwrap();
 
         // Append some content
         log_service
-            .append_to_log(log_path_str, "First line\n")
+            .append_to_log(log_id, "First line\n")
             .await
             .unwrap();
         log_service
-            .append_to_log(log_path_str, "Second line\n")
+            .append_to_log(log_id, "Second line\n")
             .await
             .unwrap();
 
         // Read back the content
-        let content = log_service.get_log_content(log_path_str).await.unwrap();
+        let content = log_service.get_log_content(log_id).await.unwrap();
         assert_eq!(content, "First line\nSecond line\n");
     }
 

@@ -5,10 +5,10 @@ use aws_sdk_s3::Client;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::Docker;
 use futures::TryStreamExt;
-use http::Uri;
 use rand::{distributions::Alphanumeric, Rng};
+use schemars::JsonSchema;
 use sea_orm::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{self};
 use std::collections::HashMap;
 use std::net::TcpListener;
@@ -20,19 +20,74 @@ use tracing::{debug, error, info};
 
 use crate::utils::ensure_network_exists;
 
-use super::{ExternalService, ServiceConfig, ServiceParameter, ServiceType};
+use super::{ExternalService, ServiceConfig, ServiceType};
 
-#[derive(Debug, Clone, Deserialize)]
+/// Input configuration for creating an S3/MinIO service
+/// This is what users provide when creating the service
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(title = "S3/MinIO Configuration", description = "Configuration for S3-compatible storage service (MinIO)")]
+pub struct S3InputConfig {
+    /// S3/MinIO port (auto-assigned if not provided)
+    #[schemars(example = "example_port")]
+    pub port: Option<String>,
+
+    /// S3 access key (auto-generated if not provided or empty)
+    #[serde(default, deserialize_with = "deserialize_optional_key")]
+    #[schemars(with = "Option<String>", example = "example_access_key")]
+    pub access_key: Option<String>,
+
+    /// S3 secret key (auto-generated if not provided or empty)
+    #[serde(default, deserialize_with = "deserialize_optional_key")]
+    #[schemars(with = "Option<String>", example = "example_secret_key")]
+    pub secret_key: Option<String>,
+
+    /// S3 host address
+    #[serde(default = "default_host")]
+    #[schemars(example = "example_host", default = "default_host")]
+    pub host: String,
+
+    /// S3 region
+    #[serde(default = "default_region")]
+    #[schemars(example = "example_region", default = "default_region")]
+    pub region: String,
+}
+
+/// Internal runtime configuration for S3/MinIO service
+/// This is what the service uses internally after processing input
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct S3Config {
     pub port: String,
-    #[serde(default = "default_access_key")]
     pub access_key: String,
-    #[serde(default = "default_secret_key")]
     pub secret_key: String,
-    #[serde(default = "default_host")]
     pub host: String,
-    #[serde(default = "default_region")]
     pub region: String,
+}
+
+impl From<S3InputConfig> for S3Config {
+    fn from(input: S3InputConfig) -> Self {
+        Self {
+            port: input.port.unwrap_or_else(|| {
+                find_available_port(9000)
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "9000".to_string())
+            }),
+            access_key: input.access_key.unwrap_or_else(default_access_key),
+            secret_key: input.secret_key.unwrap_or_else(default_secret_key),
+            host: input.host,
+            region: input.region,
+        }
+    }
+}
+
+fn deserialize_optional_key<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(match opt {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => None,
+    })
 }
 fn default_region() -> String {
     "us-east-1".to_string()
@@ -55,6 +110,35 @@ fn default_secret_key() -> String {
         .take(15)
         .map(char::from)
         .collect()
+}
+
+// Schema example functions
+fn example_port() -> &'static str {
+    "9000"
+}
+
+fn example_access_key() -> &'static str {
+    "minioadmin"
+}
+
+fn example_secret_key() -> &'static str {
+    "minioadmin"
+}
+
+fn example_host() -> &'static str {
+    "localhost"
+}
+
+fn example_region() -> &'static str {
+    "us-east-1"
+}
+
+fn is_port_available(port: u16) -> bool {
+    TcpListener::bind(("0.0.0.0", port)).is_ok()
+}
+
+fn find_available_port(start_port: u16) -> Option<u16> {
+    (start_port..start_port + 100).find(|&port| is_port_available(port))
 }
 
 pub struct S3Service {
@@ -223,7 +307,7 @@ impl S3Service {
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
-            .context("Failed to start MinIO container")?;
+            .map_err(|e| anyhow::anyhow!("Failed to start MinIO container: {}", e))?;
 
         // Wait for container to be healthy
         self.wait_for_container_health(docker, &container.id)
@@ -281,17 +365,6 @@ impl S3Service {
         }
 
         Err(anyhow::anyhow!("MinIO container health check timed out"))
-    }
-
-    fn get_default_port(&self) -> String {
-        // Start with default MinIO port
-        let start_port = 9000;
-
-        // Find next available port
-        match find_available_port(start_port) {
-            Some(port) => port.to_string(),
-            None => start_port.to_string(), // Fallback to default if no ports found
-        }
     }
 
     async fn initialize_client(&self, config: ServiceConfig) -> Result<Client> {
@@ -360,7 +433,7 @@ impl S3Service {
                     .bucket(&sanitized_name)
                     .send()
                     .await
-                    .context("Failed to delete bucket")?;
+                    .map_err(|e| anyhow::anyhow!("Failed to delete bucket: {}", e))?;
 
                 info!("Deleted bucket {}", sanitized_name);
                 Ok(())
@@ -372,34 +445,11 @@ impl S3Service {
         }
     }
     fn get_s3_config(&self, service_config: ServiceConfig) -> Result<S3Config> {
-        let port = service_config
-            .parameters
-            .get("port")
-            .context("Missing port parameter")?;
-        let host = service_config
-            .parameters
-            .get("host")
-            .context("Missing host parameter")?;
-        let access_key = service_config
-            .parameters
-            .get("access_key")
-            .context("Missing access_key parameter")?;
-        let secret_key = service_config
-            .parameters
-            .get("secret_key")
-            .context("Missing secret_key parameter")?;
-        let region = service_config
-            .parameters
-            .get("region")
-            .context("Missing region parameter")?;
+        // Parse input config and transform to runtime config
+        let input_config: S3InputConfig = serde_json::from_value(service_config.parameters)
+            .map_err(|e| anyhow::anyhow!("Failed to parse S3 configuration: {}", e))?;
 
-        Ok(S3Config {
-            port: port.as_str().unwrap_or("9000").to_string(),
-            host: host.as_str().unwrap_or("localhost").to_string(),
-            access_key: access_key.as_str().unwrap_or("minio").to_string(),
-            secret_key: secret_key.as_str().unwrap_or("minio123").to_string(),
-            region: region.as_str().unwrap_or("us-east-1").to_string(),
-        })
+        Ok(S3Config::from(input_config))
     }
 }
 
@@ -412,26 +462,33 @@ impl ExternalService for S3Service {
 
     async fn init(&self, config: ServiceConfig) -> Result<HashMap<String, String>> {
         info!("Initializing S3 service {:?}", config);
-        let s3_config: S3Config = serde_json::from_value(config.parameters)
-            .context("Failed to parse S3 configuration")?;
-        info!("Initializing S3 config {:?}", s3_config);
-        let mut inferred_params = HashMap::new();
-        inferred_params.insert("host".to_string(), s3_config.host.clone());
-        inferred_params.insert("port".to_string(), s3_config.port.clone());
-        inferred_params.insert(
-            "endpoint".to_string(),
-            format!("http://{}:{}", s3_config.host, s3_config.port),
-        );
 
-        // Generate credentials if Docker is available
-        inferred_params.insert("access_key".to_string(), s3_config.access_key.clone());
-        inferred_params.insert("secret_key".to_string(), s3_config.secret_key.clone());
-        inferred_params.insert("region".to_string(), s3_config.region.clone());
+        // Parse input config and transform to runtime config
+        let s3_config = self.get_s3_config(config)?;
+        info!("Initializing S3 config {:?}", s3_config);
+
+        // Store runtime config
+        *self.config.write().await = Some(s3_config.clone());
 
         // Create Docker container
         self.create_container(&self.docker, &s3_config).await?;
 
-        *self.config.write().await = Some(s3_config);
+        // Serialize the full runtime config to save to database
+        // This ensures auto-generated values (keys, port) are persisted
+        let runtime_config_json = serde_json::to_value(&s3_config)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize S3 runtime config: {}", e))?;
+
+        let runtime_config_map = runtime_config_json
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Runtime config is not an object"))?;
+
+        let mut inferred_params = HashMap::new();
+        for (key, value) in runtime_config_map {
+            if let Some(str_value) = value.as_str() {
+                inferred_params.insert(key.clone(), str_value.to_string());
+            }
+        }
+
         info!("Inferred params {:?}", inferred_params);
         Ok(inferred_params)
     }
@@ -475,48 +532,10 @@ impl ExternalService for S3Service {
         Ok(())
     }
 
-    fn validate_parameters(&self, parameters: &HashMap<String, String>) -> Result<()> {
-        // // Use default validation from trait
-        // ExternalService::validate_parameters(self, parameters)?;
-
-        // Additional S3-specific validation
-        if let Some(endpoint) = parameters.get("endpoint") {
-            endpoint
-                .parse::<Uri>()
-                .map_err(|_| anyhow::anyhow!("Invalid endpoint URL format"))?;
-        }
-
-        // Validate access key length
-        if let Some(access_key) = parameters.get("access_key_id") {
-            if access_key.len() < 3 {
-                return Err(anyhow::anyhow!(
-                    "Access key must be at least 3 characters long"
-                ));
-            }
-        }
-
-        // Validate secret key length
-        if let Some(secret_key) = parameters.get("secret_access_key") {
-            if secret_key.len() < 8 {
-                return Err(anyhow::anyhow!(
-                    "Secret access key must be at least 8 characters long"
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn get_parameter_definitions(&self) -> Vec<ServiceParameter> {
-        vec![ServiceParameter {
-            name: "port".to_string(),
-            required: true,
-            encrypted: false,
-            description: "Port to expose MinIO service".to_string(),
-            default_value: Some(self.get_default_port()),
-            validation_pattern: Some(r"^\d+$".to_string()),
-            choices: None,
-        }]
+    fn get_parameter_schema(&self) -> Option<serde_json::Value> {
+        // Generate JSON Schema from S3InputConfig
+        let schema = schemars::schema_for!(S3InputConfig);
+        serde_json::to_value(schema).ok()
     }
 
     async fn start(&self) -> Result<()> {
@@ -551,7 +570,7 @@ impl ExternalService for S3Service {
                     None::<bollard::query_parameters::StartContainerOptions>,
                 )
                 .await
-                .context("Failed to start existing MinIO container")?;
+                .map_err(|e| anyhow::anyhow!("Failed to start existing MinIO container: {}", e))?;
         }
 
         self.wait_for_container_health(docker, &container_name)
@@ -584,7 +603,7 @@ impl ExternalService for S3Service {
             docker
                 .stop_container(&container_name, None::<StopContainerOptions>)
                 .await
-                .context("Failed to stop MinIO container")?;
+                .map_err(|e| anyhow::anyhow!("Failed to stop MinIO container: {}", e))?;
         }
 
         Ok(())
@@ -594,6 +613,7 @@ impl ExternalService for S3Service {
             name: "S3_BUCKET".to_string(),
             description: "S3 bucket name for this project/environment".to_string(),
             example: "project_123_production".to_string(),
+            sensitive: false,
         }]
     }
 
@@ -671,7 +691,7 @@ impl ExternalService for S3Service {
             docker
                 .stop_container(&container_name, None::<StopContainerOptions>)
                 .await
-                .context("Failed to stop MinIO container")?;
+                .map_err(|e| anyhow::anyhow!("Failed to stop MinIO container: {}", e))?;
 
             // Remove the container
             docker
@@ -683,7 +703,7 @@ impl ExternalService for S3Service {
                     }),
                 )
                 .await
-                .context("Failed to remove MinIO container")?;
+                .map_err(|e| anyhow::anyhow!("Failed to remove MinIO container: {}", e))?;
         }
 
         // Remove volume
@@ -707,9 +727,11 @@ impl ExternalService for S3Service {
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
 
-        let endpoint = parameters
-            .get("endpoint")
-            .context("Missing endpoint parameter")?;
+        // Build endpoint from host and port
+        let host = parameters.get("host").context("Missing host parameter")?;
+        let port = parameters.get("port").context("Missing port parameter")?;
+        let endpoint = format!("http://{}:{}", host, port);
+
         let access_key = parameters
             .get("access_key")
             .context("Missing access key parameter")?;
@@ -720,6 +742,8 @@ impl ExternalService for S3Service {
         let region = parameters.get("region").unwrap_or(&region_val);
 
         env_vars.insert("S3_ENDPOINT".to_string(), endpoint.clone());
+        env_vars.insert("S3_HOST".to_string(), host.clone());
+        env_vars.insert("S3_PORT".to_string(), port.clone());
         env_vars.insert("S3_ACCESS_KEY".to_string(), access_key.clone());
         env_vars.insert("S3_SECRET_KEY".to_string(), secret_key.clone());
         env_vars.insert("S3_REGION".to_string(), region.clone());
@@ -728,10 +752,7 @@ impl ExternalService for S3Service {
         env_vars.insert("AWS_ACCESS_KEY_ID".to_string(), access_key.clone());
         env_vars.insert("AWS_SECRET_ACCESS_KEY".to_string(), secret_key.clone());
         env_vars.insert("AWS_DEFAULT_REGION".to_string(), region.clone());
-
-        if !endpoint.contains("amazonaws.com") {
-            env_vars.insert("AWS_ENDPOINT_URL".to_string(), endpoint.clone());
-        }
+        env_vars.insert("AWS_ENDPOINT_URL".to_string(), endpoint.clone());
 
         Ok(env_vars)
     }
@@ -787,7 +808,7 @@ impl ExternalService for S3Service {
 
         // Use a standard backup path without versioning
         let backup_prefix = subpath_root;
-        let container_name = format!("mc_backup_{}", backup.id);
+        let container_name = format!("mc-backup-{}", backup.id);
 
         // Create a backup record directly using ActiveModel setters (no need to build and then copy)
         let backup_record = temps_entities::external_service_backups::Entity::insert(
@@ -1008,7 +1029,7 @@ impl ExternalService for S3Service {
         );
 
         let docker = &self.docker;
-        let container_name = format!("mc_restore_{}", uuid::Uuid::new_v4());
+        let container_name = format!("mc-restore-{}", uuid::Uuid::new_v4());
         let s3_config = self.get_s3_config(service_config)?;
 
         // Pull the MinIO Client image
@@ -1284,14 +1305,6 @@ impl ExternalService for S3Service {
         info!("S3 restore completed successfully");
         Ok(())
     }
-}
-
-fn is_port_available(port: u16) -> bool {
-    TcpListener::bind(("0.0.0.0", port)).is_ok()
-}
-
-fn find_available_port(start_port: u16) -> Option<u16> {
-    (start_port..start_port + 100).find(|&port| is_port_available(port))
 }
 
 fn parse_multiline_json_output(output: &str) -> Result<Vec<serde_json::Value>> {

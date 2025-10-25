@@ -25,12 +25,6 @@ use octocrab::Octocrab;
 use reqwest::Url;
 
 #[derive(Debug, Clone)]
-struct PresetInfo {
-    slug: String,
-    label: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct ProjectPresetDomain {
     pub path: String,
     pub preset: String,
@@ -2372,131 +2366,29 @@ impl GitProviderManager {
 
     /// Detect presets in directories with proper grouping and filtering
     async fn detect_presets_in_directories(&self, files: &[String]) -> Vec<ProjectPresetDomain> {
-        use std::collections::HashMap;
+        // Use the centralized file tree detection from temps-presets
+        let detected_presets = temps_presets::detect_presets_from_file_tree(files);
 
-        // Group files by directory
-        let mut directory_files: HashMap<String, Vec<String>> = HashMap::new();
-
-        for path in files {
-            let directory = match path.rfind('/') {
-                Some(idx) => path[..idx].to_string(),
-                None => "".to_string(), // Root directory
-            };
-
-            directory_files
-                .entry(directory.clone())
-                .or_default()
-                .push(path.clone());
-        }
-
-        let mut presets = Vec::new();
-
-        // Check each directory for presets
-        for (dir, files) in &directory_files {
-            // Limit to 2 levels deep
-            let depth = dir.matches('/').count();
-            if depth > 2 {
-                continue;
-            }
-
-            let preset = self.detect_preset_from_directory_files(files);
-
-            if let Some(preset) = preset {
-                // Include both root and subdirectory presets in the same array
-                // Use relative paths: "./" for root, subdirectory name for others
-                let path = if dir.is_empty() {
-                    "./".to_string() // Root directory (relative)
-                } else {
-                    dir.clone()
-                };
-
-                // Parse preset slug to get exposed port
+        // Convert to ProjectPresetDomain
+        detected_presets
+            .into_iter()
+            .map(|preset| {
+                // Parse preset slug to get exposed port from entity enum
                 let exposed_port = preset
                     .slug
                     .parse::<temps_entities::preset::Preset>()
                     .ok()
-                    .and_then(|p| p.exposed_port());
+                    .and_then(|p| p.exposed_port())
+                    .or(preset.exposed_port);
 
-                presets.push(ProjectPresetDomain {
-                    path,
+                ProjectPresetDomain {
+                    path: preset.path,
                     preset: preset.slug,
                     preset_label: preset.label,
                     exposed_port,
-                });
-            }
-        }
-
-        // Sort presets by path for consistent output (root "/" comes first)
-        presets.sort_by(|a, b| a.path.cmp(&b.path));
-
-        presets
-    }
-
-    /// Detect preset from a specific directory's files
-    fn detect_preset_from_directory_files(&self, files: &[String]) -> Option<PresetInfo> {
-        // Check for Dockerfile first (highest priority)
-        if files
-            .iter()
-            .any(|path| path.ends_with("/Dockerfile") || path == "Dockerfile")
-        {
-            return Some(PresetInfo {
-                slug: "dockerfile".to_string(),
-                label: "Dockerfile".to_string(),
-            });
-        }
-
-        // Check for Docusaurus
-        if files.iter().any(|path| {
-            path.ends_with("docusaurus.config.js") || path.ends_with("docusaurus.config.ts")
-        }) {
-            return Some(PresetInfo {
-                slug: "docusaurus".to_string(),
-                label: "Docusaurus".to_string(),
-            });
-        }
-
-        // Check for Next.js
-        if files.iter().any(|path| {
-            path.ends_with("next.config.js")
-                || path.ends_with("next.config.mjs")
-                || path.ends_with("next.config.ts")
-        }) {
-            return Some(PresetInfo {
-                slug: "nextjs".to_string(),
-                label: "Next.js".to_string(),
-            });
-        }
-
-        // Check for Vite
-        if files
-            .iter()
-            .any(|path| path.ends_with("vite.config.js") || path.ends_with("vite.config.ts"))
-        {
-            return Some(PresetInfo {
-                slug: "vite".to_string(),
-                label: "Vite".to_string(),
-            });
-        }
-
-        // Check for Create React App
-        if files.iter().any(|path| path.contains("react-scripts")) {
-            return Some(PresetInfo {
-                slug: "create-react-app".to_string(),
-                label: "Create React App".to_string(),
-            });
-        }
-
-        // Check for Rsbuild
-        if files.iter().any(|path| path.ends_with("rsbuild.config.ts")) {
-            return Some(PresetInfo {
-                slug: "rsbuild".to_string(),
-                label: "Rsbuild".to_string(),
-            });
-        }
-
-        // Don't return anything for directories without framework-specific files
-        // This prevents directories like "src", "public", etc. from being detected as having presets
-        None
+                }
+            })
+            .collect()
     }
 
     /// Update access token for a connection (for when tokens expire or are rotated)

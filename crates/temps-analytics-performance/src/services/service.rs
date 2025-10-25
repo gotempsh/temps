@@ -711,4 +711,55 @@ impl PerformanceService {
 
         Ok(())
     }
+
+    /// Check if performance metrics exist for a project
+    pub async fn has_metrics(&self, project_id: i32) -> Result<bool, PerformanceError> {
+        info!("Checking if performance metrics exist for project: {}", project_id);
+
+        let count = performance_metrics::Entity::find()
+            .filter(performance_metrics::Column::ProjectId.eq(project_id))
+            .count(self.db.as_ref())
+            .await?;
+
+        Ok(count > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    #[tokio::test]
+    async fn test_has_metrics_returns_true_when_metrics_exist() {
+        // Create mock database that returns count > 0
+        // The count query returns a tuple with the count value
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[maplit::btreemap! {
+                "num_items" => sea_orm::Value::BigInt(Some(5)),
+            }]])
+            .into_connection();
+
+        let service = PerformanceService::new(Arc::new(db));
+        let result = service.has_metrics(1).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_has_metrics_returns_false_when_no_metrics_exist() {
+        // Create mock database that returns count = 0
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[maplit::btreemap! {
+                "num_items" => sea_orm::Value::BigInt(Some(0)),
+            }]])
+            .into_connection();
+
+        let service = PerformanceService::new(Arc::new(db));
+        let result = service.has_metrics(1).await;
+
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
 }

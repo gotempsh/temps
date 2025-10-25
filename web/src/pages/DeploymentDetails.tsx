@@ -194,7 +194,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     }
   }, [deployment?.status, deployment?.id, deployment, project.id, queryClient])
 
-  usePageTitle(`${project.name} - Deployment ${deploymentId}`)
+  usePageTitle(`${project.slug} - Deployment ${deploymentId}`)
 
   if (error) {
     return (
@@ -277,188 +277,172 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
   return (
     <div className="flex-1 overflow-auto">
       <div className="sm:p-6 space-y-6">
-        {/* Header with Navigation and Deployment Info */}
+        {/* Header with Navigation and Title */}
         {deployment && (
-          <Card>
-            <div className="p-4">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-4">
-                  <Button variant="outline" size="sm" asChild>
-                    <Link to={`/projects/${project.slug}/deployments`}>
-                      <ArrowLeft className="mr-2 h-4 w-4" />
-                      Back to Deployments
-                    </Link>
-                  </Button>
-                  <Badge
-                    variant={
+          <div className="space-y-4">
+            <Button variant="ghost" size="sm" asChild className="gap-2">
+              <Link to={`/projects/${project.slug}/deployments`}>
+                <ArrowLeft className="h-4 w-4" />
+                Back to Deployments
+              </Link>
+            </Button>
+
+            {/* Metadata Row - Single Line with Status and Actions */}
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-4 text-sm text-muted-foreground">
+                <Badge
+                  variant={
+                    deployment.status === 'completed'
+                      ? 'success'
+                      : deployment.status === 'failed'
+                        ? 'destructive'
+                        : deployment.status === 'cancelled'
+                          ? 'outline'
+                          : 'secondary'
+                  }
+                  className="capitalize flex items-center gap-1.5"
+                >
+                  <span
+                    className={`h-2 w-2 rounded-full ${
                       deployment.status === 'completed'
-                        ? 'success'
+                        ? 'bg-green-500 dark:bg-green-400'
                         : deployment.status === 'failed'
-                          ? 'destructive'
+                          ? 'bg-red-500 dark:bg-red-400'
                           : deployment.status === 'cancelled'
-                            ? 'outline'
-                            : 'secondary'
-                    }
-                  >
-                    {deployment.status}
-                  </Badge>
-
-                  <div className="flex items-center gap-2">
-                    <Clock className="h-4 w-4 text-muted-foreground" />
-                    <TimeAgo date={deployment.created_at} className="text-sm" />
-                  </div>
+                            ? 'bg-gray-500 dark:bg-gray-400'
+                            : deployment.status === 'running'
+                              ? 'bg-orange-500 dark:bg-orange-400 animate-pulse'
+                              : 'bg-blue-500 dark:bg-blue-400'
+                    }`}
+                  />
+                  {deployment.status}
+                </Badge>
+                <span className="text-muted-foreground/30">•</span>
+                <div className="flex items-center gap-1.5">
+                  <Clock className="h-4 w-4" />
+                  <span>Started:</span>
+                  <TimeAgo date={deployment.created_at} />
                 </div>
-
-                <div className="flex items-center gap-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setIsRedeployModalOpen(true)}
-                    title="Redeploy"
-                  >
-                    <RotateCw className="h-4 w-4" />
-                  </Button>
-                  {(deployment.status === 'completed' ||
-                    deployment.status === 'paused' ||
-                    deployment.status === 'running' ||
-                    deployment.status === 'pending') && (
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          title="More actions"
-                        >
-                          <MoreVertical className="h-4 w-4" />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        {(deployment?.status === 'running' ||
-                          deployment?.status === 'pending') && (
-                          <DropdownMenuItem
-                            onClick={handleCancelDeployment}
-                            disabled={cancelDeployment.isPending}
-                          >
-                            <X className="mr-2 h-4 w-4" />
-                            Cancel Deployment
-                          </DropdownMenuItem>
+                {deployment.finished_at && (
+                  <>
+                    <span className="text-muted-foreground/30">•</span>
+                    <div className="flex items-center gap-1.5">
+                      <Clock className="h-4 w-4" />
+                      <span>Duration:</span>
+                      <span>
+                        {Math.round(
+                          (new Date(deployment.finished_at).getTime() -
+                            new Date(deployment.created_at).getTime()) /
+                            1000 /
+                            60
                         )}
-                        {deployment?.status === 'completed' && (
-                          <DropdownMenuItem
-                            onClick={handlePauseDeployment}
-                            disabled={pauseDeployment.isPending}
-                          >
-                            <Pause className="mr-2 h-4 w-4" />
-                            Pause Deployment
-                          </DropdownMenuItem>
+                        m{' '}
+                        {Math.round(
+                          ((new Date(deployment.finished_at).getTime() -
+                            new Date(deployment.created_at).getTime()) /
+                            1000) %
+                            60
                         )}
-                        {deployment?.status === 'paused' && (
-                          <DropdownMenuItem
-                            onClick={handleResumeDeployment}
-                            disabled={resumeDeployment.isPending}
-                          >
-                            <Play className="mr-2 h-4 w-4" />
-                            Resume Deployment
-                          </DropdownMenuItem>
-                        )}
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  )}
-                </div>
-              </div>
-            </div>
-          </Card>
-        )}
-
-        {deployment && (
-          <div className="grid gap-6 lg:grid-cols-3">
-            {/* Left Column - Deployment Information */}
-            <div className="lg:col-span-1 space-y-6">
-              {/* Deployment Information Card */}
-              <Card>
-                <div className="p-6">
-                  <h3 className="text-lg font-semibold mb-4">
-                    Deployment Information
-                  </h3>
-
-                  {/* Status */}
-                  <div className="mb-4">
-                    <div className="text-sm text-muted-foreground mb-1">
-                      Status
-                    </div>
-                    <Badge
-                      variant={
-                        deployment.status === 'completed'
-                          ? 'success'
-                          : deployment.status === 'failed'
-                            ? 'destructive'
-                            : deployment.status === 'cancelled'
-                              ? 'outline'
-                              : 'secondary'
-                      }
-                    >
-                      {deployment.status}
-                    </Badge>
-                    {deployment.status === 'completed' && (
-                      <div className="text-sm text-muted-foreground mt-1">
-                        Pipeline execution started
-                      </div>
-                    )}
-                    {deployment.status === 'failed' &&
-                      deployment.error_message && (
-                        <div className="mt-2 p-3 rounded-lg bg-destructive/10 border border-destructive/20">
-                          <div className="text-sm font-medium text-destructive mb-1">
-                            Error
-                          </div>
-                          <div className="text-sm text-destructive/90">
-                            {deployment.error_message}
-                          </div>
-                        </div>
-                      )}
-                    {deployment.status === 'cancelled' &&
-                      deployment.cancelled_reason && (
-                        <div className="mt-2 p-3 rounded-lg bg-muted border">
-                          <div className="text-sm font-medium mb-1">
-                            Cancellation Reason
-                          </div>
-                          <div className="text-sm text-muted-foreground">
-                            {deployment.cancelled_reason}
-                          </div>
-                        </div>
-                      )}
-                  </div>
-
-                  {/* URLs */}
-                  <div className="space-y-3">
-                    <div className="text-sm font-medium">Source</div>
-                    <div className="space-y-2">
-                      <div className="flex items-center gap-2">
-                        <GitBranch className="h-4 w-4 text-muted-foreground" />
-                        <span className="text-sm">{deployment.branch}</span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <GitCommit className="h-4 w-4 text-muted-foreground" />
-                        <span className="font-mono text-sm">
-                          {deployment.commit_hash?.slice(0, 7)}
-                        </span>
-                        <span className="text-sm text-muted-foreground">
-                          {deployment.commit_author || ''}
-                        </span>
-                      </div>
-                      <span className="font-mono text-sm text-muted-foreground">
-                        {deployment.commit_message}
+                        s
                       </span>
                     </div>
-                  </div>
+                  </>
+                )}
+                <span className="text-muted-foreground/30">•</span>
+                <div className="flex items-center gap-1.5">
+                  <GitBranch className="h-4 w-4" />
+                  <span>Branch:</span>
+                  <span className="font-medium text-foreground">
+                    {deployment.branch}
+                  </span>
                 </div>
-              </Card>
+                <span className="text-muted-foreground/30">•</span>
+                <div className="flex items-center gap-1.5">
+                  <GitCommit className="h-4 w-4" />
+                  <span>Commit:</span>
+                  <span className="font-mono font-medium text-foreground">
+                    {deployment.commit_hash?.slice(0, 7)}
+                  </span>
+                </div>
+                {deployment.environment && (
+                  <>
+                    <span className="text-muted-foreground/30">•</span>
+                    <div className="flex items-center gap-1.5">
+                      <span>Environment:</span>
+                      <Badge variant="secondary" className="capitalize">
+                        {deployment.environment.name}
+                      </Badge>
+                    </div>
+                  </>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setIsRedeployModalOpen(true)}
+                  title="Redeploy"
+                >
+                  <RotateCw className="h-4 w-4" />
+                </Button>
+                {(deployment.status === 'completed' ||
+                  deployment.status === 'paused' ||
+                  deployment.status === 'running' ||
+                  deployment.status === 'pending') && (
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="outline" size="sm" title="More actions">
+                        <MoreVertical className="h-4 w-4" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      {(deployment?.status === 'running' ||
+                        deployment?.status === 'pending') && (
+                        <DropdownMenuItem
+                          onClick={handleCancelDeployment}
+                          disabled={cancelDeployment.isPending}
+                        >
+                          <X className="mr-2 h-4 w-4" />
+                          Cancel Deployment
+                        </DropdownMenuItem>
+                      )}
+                      {deployment?.status === 'completed' && (
+                        <DropdownMenuItem
+                          onClick={handlePauseDeployment}
+                          disabled={pauseDeployment.isPending}
+                        >
+                          <Pause className="mr-2 h-4 w-4" />
+                          Pause Deployment
+                        </DropdownMenuItem>
+                      )}
+                      {deployment?.status === 'paused' && (
+                        <DropdownMenuItem
+                          onClick={handleResumeDeployment}
+                          disabled={resumeDeployment.isPending}
+                        >
+                          <Play className="mr-2 h-4 w-4" />
+                          Resume Deployment
+                        </DropdownMenuItem>
+                      )}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                )}
+              </div>
             </div>
 
-            {/* Right Column - Logs and Stages */}
-            <div className="lg:col-span-2">
-              <DeploymentStages project={project} deployment={deployment} />
-            </div>
+            {/* Commit Message - Separate line if exists */}
+            {deployment.commit_message && (
+              <div className="text-sm text-muted-foreground italic border-l-2 border-muted pl-3 mt-2">
+                &ldquo;{deployment.commit_message}&rdquo;
+              </div>
+            )}
           </div>
+        )}
+
+        {/* Deployment Pipeline */}
+        {deployment && (
+          <DeploymentStages project={project} deployment={deployment} />
         )}
 
         <RedeploymentModal

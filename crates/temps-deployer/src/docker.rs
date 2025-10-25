@@ -238,7 +238,10 @@ impl ImageBuilder for DockerRuntime {
 
         let mut labels = HashMap::new();
         labels.insert("built-by".to_string(), "temps".to_string());
-
+        let mut build_args = Some(build_args.clone());
+        if self.use_buildkit && !request.build_args_buildkit.is_empty() {
+            build_args = Some(request.build_args_buildkit.clone());
+        }
         let build_options = bollard::query_parameters::BuildImageOptions {
             dockerfile: request
                 .dockerfile_path
@@ -247,11 +250,11 @@ impl ImageBuilder for DockerRuntime {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "Dockerfile".to_string()),
             t: Some(request.image_name.clone()),
-            buildargs: Some(build_args),
+            buildargs: build_args,
             labels: Some(labels),
             networkmode: if self.use_buildkit {
                 // BuildKit only supports "default", "host", or "none"
-                Some("default".to_string())
+                Some("host".to_string())
             } else {
                 // Legacy builder supports custom networks
                 Some(self.network_name.clone())
@@ -1157,6 +1160,7 @@ CMD ["cat", "/hello.txt"]
                     context_path,
                     dockerfile_path: None,
                     build_args: HashMap::new(),
+                    build_args_buildkit: HashMap::new(),
                     platform: None,
                     log_path: temp_dir.path().join("build.log"),
                 };

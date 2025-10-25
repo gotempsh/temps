@@ -5,12 +5,15 @@
 
 use sea_orm::FromJsonQueryResult;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use utoipa::ToSchema;
 
 /// Deployment configuration shared between projects and environments
 ///
 /// This configuration can be set at the project level (as defaults) and
 /// overridden at the environment level for specific deployments.
+///
+/// Note: Environment variables are managed separately and are not part of this config.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, FromJsonQueryResult)]
 #[serde(rename_all = "camelCase")]
 pub struct DeploymentConfig {
@@ -53,6 +56,54 @@ pub struct DeploymentConfig {
     pub replicas: i32,
 }
 
+/// Deployment configuration snapshot for deployments
+///
+/// This extends DeploymentConfig with environment variables to capture
+/// the complete state of a deployment at the time it was created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, FromJsonQueryResult)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentConfigSnapshot {
+    /// CPU request in millicores
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_request: Option<i32>,
+
+    /// CPU limit in millicores
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_limit: Option<i32>,
+
+    /// Memory request in megabytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_request: Option<i32>,
+
+    /// Memory limit in megabytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_limit: Option<i32>,
+
+    /// Port exposed by the container
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exposed_port: Option<i32>,
+
+    /// Environment variables used for this deployment
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub environment_variables: HashMap<String, String>,
+
+    /// Enable automatic deployments on git push
+    #[serde(default)]
+    pub automatic_deploy: bool,
+
+    /// Enable performance metrics collection
+    #[serde(default)]
+    pub performance_metrics_enabled: bool,
+
+    /// Enable session recording
+    #[serde(default)]
+    pub session_recording_enabled: bool,
+
+    /// Number of replicas
+    #[serde(default = "default_replicas")]
+    pub replicas: i32,
+}
+
 fn default_replicas() -> i32 {
     1
 }
@@ -65,6 +116,23 @@ impl Default for DeploymentConfig {
             memory_request: None,
             memory_limit: None,
             exposed_port: None,
+            automatic_deploy: false,
+            performance_metrics_enabled: false,
+            session_recording_enabled: false,
+            replicas: 1,
+        }
+    }
+}
+
+impl Default for DeploymentConfigSnapshot {
+    fn default() -> Self {
+        Self {
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
+            exposed_port: None,
+            environment_variables: HashMap::new(),
             automatic_deploy: false,
             performance_metrics_enabled: false,
             session_recording_enabled: false,
@@ -122,7 +190,54 @@ impl DeploymentConfig {
 
         // Port should be in valid range
         if let Some(port) = self.exposed_port {
-            if port < 1 || port > 65535 {
+            if !(1..=65535).contains(&port) {
+                return Err(format!("Port {} is not in valid range (1-65535)", port));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl DeploymentConfigSnapshot {
+    /// Create a snapshot from a DeploymentConfig and environment variables
+    pub fn from_config(
+        config: &DeploymentConfig,
+        environment_variables: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            cpu_request: config.cpu_request,
+            cpu_limit: config.cpu_limit,
+            memory_request: config.memory_request,
+            memory_limit: config.memory_limit,
+            exposed_port: config.exposed_port,
+            environment_variables,
+            automatic_deploy: config.automatic_deploy,
+            performance_metrics_enabled: config.performance_metrics_enabled,
+            session_recording_enabled: config.session_recording_enabled,
+            replicas: config.replicas,
+        }
+    }
+
+    /// Validate the resource configuration
+    pub fn validate(&self) -> Result<(), String> {
+        // CPU request should not exceed CPU limit
+        if let (Some(request), Some(limit)) = (self.cpu_request, self.cpu_limit) {
+            if request > limit {
+                return Err("CPU request cannot exceed CPU limit".to_string());
+            }
+        }
+
+        // Memory request should not exceed memory limit
+        if let (Some(request), Some(limit)) = (self.memory_request, self.memory_limit) {
+            if request > limit {
+                return Err("Memory request cannot exceed memory limit".to_string());
+            }
+        }
+
+        // Port should be in valid range
+        if let Some(port) = self.exposed_port {
+            if !(1..=65535).contains(&port) {
                 return Err(format!("Port {} is not in valid range (1-65535)", port));
             }
         }
@@ -235,5 +350,37 @@ mod tests {
         let deserialized: DeploymentConfig = serde_json::from_value(json).unwrap();
 
         assert_eq!(config, deserialized);
+    }
+
+    #[test]
+    fn test_snapshot_from_config() {
+        let config = DeploymentConfig {
+            cpu_request: Some(100),
+            cpu_limit: Some(1000),
+            memory_request: Some(128),
+            memory_limit: Some(512),
+            exposed_port: Some(3000),
+            automatic_deploy: true,
+            performance_metrics_enabled: true,
+            session_recording_enabled: false,
+            replicas: 2,
+        };
+
+        let mut env_vars = HashMap::new();
+        env_vars.insert("NODE_ENV".to_string(), "production".to_string());
+        env_vars.insert("DB_HOST".to_string(), "localhost".to_string());
+
+        let snapshot = DeploymentConfigSnapshot::from_config(&config, env_vars);
+
+        assert_eq!(snapshot.cpu_request, Some(100));
+        assert_eq!(snapshot.cpu_limit, Some(1000));
+        assert_eq!(snapshot.memory_request, Some(128));
+        assert_eq!(snapshot.memory_limit, Some(512));
+        assert_eq!(snapshot.exposed_port, Some(3000));
+        assert_eq!(snapshot.environment_variables.len(), 2);
+        assert_eq!(snapshot.environment_variables.get("NODE_ENV"), Some(&"production".to_string()));
+        assert_eq!(snapshot.environment_variables.get("DB_HOST"), Some(&"localhost".to_string()));
+        assert!(snapshot.automatic_deploy);
+        assert_eq!(snapshot.replicas, 2);
     }
 }

@@ -5,33 +5,24 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import {
   CreateServiceResponse,
-  ProviderMetadata,
-  ServiceTypeParameterResponse,
   ServiceTypeRoute,
 } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import {
   Form,
   FormControl,
-  FormDescription,
   FormField,
   FormItem,
   FormLabel,
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
+import { DynamicForm } from '@/components/forms/DynamicForm'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { customAlphabet } from 'nanoid'
-import { ArrowLeft, Loader2 } from 'lucide-react'
+import { ArrowLeft } from 'lucide-react'
 import { useEffect, useMemo } from 'react'
 import { useForm } from 'react-hook-form'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'

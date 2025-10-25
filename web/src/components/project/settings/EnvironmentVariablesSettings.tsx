@@ -117,6 +117,11 @@ function EnvironmentVariableRow({
     number[]
   >(variable.environments.map((env) => env.id))
 
+  // Update selected environments when variable changes (after refetch)
+  useEffect(() => {
+    setSelectedEditEnvironments(variable.environments.map((env) => env.id))
+  }, [variable.environments])
+
   const handleEdit = async () => {
     if (isEditing) {
       await updateMutation.mutateAsync({
@@ -131,6 +136,7 @@ function EnvironmentVariableRow({
         },
       })
       setIsEditModalOpen(false)
+      setIsEditing(false)
     } else {
       setIsEditing(true)
       setIsEditModalOpen(true)

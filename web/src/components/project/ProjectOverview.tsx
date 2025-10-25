@@ -203,7 +203,7 @@ export function ProjectOverview({
         {currentDeployment && (
           <LastDeployment
             deployment={currentDeployment}
-            projectName={project.name}
+            projectName={project.slug}
           />
         )}
       </div>

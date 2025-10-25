@@ -1827,7 +1827,7 @@ mod tests {
             environment_id: Set(1),
             slug: Set("test-deployment".to_string()),
             state: Set("ready".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             ..Default::default()
         }
         .insert(db.as_ref())

@@ -515,7 +515,7 @@ export type CreateEnvironmentVariableRequest = {
 export type CreateExternalServiceRequest = {
     name: string;
     parameters: {
-        [key: string]: string;
+        [key: string]: unknown;
     };
     service_type: ServiceTypeRoute;
     version?: string | null;
@@ -752,6 +752,57 @@ export type CustomDomainResponse = {
 };
 
 /**
+ * Deployment configuration snapshot for deployments
+ *
+ * This extends DeploymentConfig with environment variables to capture
+ * the complete state of a deployment at the time it was created.
+ */
+export type DeploymentConfigSnapshot = {
+    /**
+     * Enable automatic deployments on git push
+     */
+    automaticDeploy?: boolean;
+    /**
+     * CPU limit in millicores
+     */
+    cpuLimit?: number | null;
+    /**
+     * CPU request in millicores
+     */
+    cpuRequest?: number | null;
+    /**
+     * Environment variables used for this deployment
+     */
+    environmentVariables?: {
+        [key: string]: string;
+    };
+    /**
+     * Port exposed by the container
+     */
+    exposedPort?: number | null;
+    /**
+     * Memory limit in megabytes
+     */
+    memoryLimit?: number | null;
+    /**
+     * Memory request in megabytes
+     */
+    memoryRequest?: number | null;
+    /**
+     * Enable performance metrics collection
+     */
+    performanceMetricsEnabled?: boolean;
+    /**
+     * Number of replicas
+     */
+    replicas?: number;
+    /**
+     * Enable session recording
+     */
+    sessionRecordingEnabled?: boolean;
+};
+
+/**
  * Deployment-level configuration
  */
 export type DeploymentConfiguration = {
@@ -838,6 +889,49 @@ export type DeploymentListResponse = {
     total: number;
 };
 
+/**
+ * Deployment metadata - typed information about the deployment
+ */
+export type DeploymentMetadata = {
+    /**
+     * Build duration in milliseconds
+     */
+    buildDurationMs?: number | null;
+    /**
+     * Docker builder used (e.g., "nixpacks", "dockerfile")
+     */
+    builder?: string | null;
+    /**
+     * Deployment duration in milliseconds
+     */
+    deploymentDurationMs?: number | null;
+    /**
+     * Dockerfile path if using Dockerfile builder
+     */
+    dockerfilePath?: string | null;
+    /**
+     * Number of files in the build output
+     */
+    fileCount?: number | null;
+    gitPushEvent?: null | GitPushEvent;
+    /**
+     * Total size of the built image in bytes
+     */
+    imageSizeBytes?: number | null;
+    /**
+     * Whether this is a rollback deployment
+     */
+    isRollback?: boolean;
+    /**
+     * Custom labels/tags for the deployment
+     */
+    labels?: Array<string>;
+    /**
+     * ID of the deployment this was rolled back from (if applicable)
+     */
+    rolledBackFromId?: number | null;
+};
+
 export type DeploymentResponse = {
     branch?: string | null;
     cancelled_reason?: string | null;
@@ -846,11 +940,13 @@ export type DeploymentResponse = {
     commit_hash?: string | null;
     commit_message?: string | null;
     created_at: number;
+    deployment_config?: null | DeploymentConfigSnapshot;
     environment: DeploymentEnvironmentResponse;
     environment_id: number;
     finished_at?: number | null;
     id: number;
     is_current: boolean;
+    metadata?: null | DeploymentMetadata;
     project_id: number;
     screenshot_location?: string | null;
     started_at?: number | null;
@@ -1130,6 +1226,10 @@ export type EnvironmentVariable = {
 
 export type EnvironmentVariableInfo = {
     name: string;
+    /**
+     * Whether this variable contains sensitive data (passwords, keys, tokens)
+     */
+    sensitive: boolean;
     value: string;
 };
 
@@ -1393,7 +1493,7 @@ export type ExternalServiceDetails = {
     current_parameters?: {
         [key: string]: string;
     } | null;
-    parameters: Array<ServiceParameter>;
+    parameter_schema?: unknown;
     service: ExternalServiceInfo;
 };
 
@@ -1537,6 +1637,28 @@ export type GetVisitorSessionsResponse = {
     total_count: number;
 };
 
+/**
+ * Git push event information that triggered the deployment
+ */
+export type GitPushEvent = {
+    /**
+     * Branch that was pushed
+     */
+    branch: string;
+    /**
+     * Commit SHA
+     */
+    commit: string;
+    /**
+     * Repository owner/organization
+     */
+    owner: string;
+    /**
+     * Repository name
+     */
+    repo: string;
+};
+
 export type GroupedPageMetric = {
     cls?: number | null;
     events: number;
@@ -1577,6 +1699,14 @@ export type HasEventsQuery = {
 
 export type HasEventsResponse = {
     has_events: boolean;
+};
+
+export type HasMetricsQuery = {
+    project_id: number;
+};
+
+export type HasMetricsResponse = {
+    has_metrics: boolean;
 };
 
 /**
@@ -3647,6 +3777,18 @@ export type UpdateCustomDomainRequest = {
     status_code?: number | null;
 };
 
+export type UpdateDeploymentConfigRequest = {
+    automatic_deploy?: boolean | null;
+    cpu_limit?: number | null;
+    cpu_request?: number | null;
+    exposed_port?: number | null;
+    memory_limit?: number | null;
+    memory_request?: number | null;
+    performance_metrics_enabled?: boolean | null;
+    replicas?: number | null;
+    session_recording_enabled?: boolean | null;
+};
+
 export type UpdateEmailProviderRequest = {
     config: EmailConfig;
     enabled?: boolean | null;
@@ -3654,6 +3796,10 @@ export type UpdateEmailProviderRequest = {
 };
 
 export type UpdateEnvironmentSettingsRequest = {
+    /**
+     * Enable/disable automatic deployments for this environment
+     */
+    automatic_deploy?: boolean | null;
     branch?: string | null;
     cpu_limit?: number | null;
     cpu_request?: number | null;
@@ -3669,7 +3815,15 @@ export type UpdateEnvironmentSettingsRequest = {
     exposed_port?: number | null;
     memory_limit?: number | null;
     memory_request?: number | null;
+    /**
+     * Enable/disable performance metrics collection
+     */
+    performance_metrics_enabled?: boolean | null;
     replicas?: number | null;
+    /**
+     * Enable/disable session recording
+     */
+    session_recording_enabled?: boolean | null;
 };
 
 export type UpdateErrorGroupRequest = {
@@ -3679,7 +3833,7 @@ export type UpdateErrorGroupRequest = {
 
 export type UpdateExternalServiceRequest = {
     parameters: {
-        [key: string]: string;
+        [key: string]: unknown;
     };
 };
 
@@ -6989,12 +7143,10 @@ export type GetServiceTypeParametersErrors = {
 
 export type GetServiceTypeParametersResponses = {
     /**
-     * Service type parameters
+     * Service type parameter schema
      */
-    200: Array<ServiceParameter>;
+    200: unknown;
 };
-
-export type GetServiceTypeParametersResponse = GetServiceTypeParametersResponses[keyof GetServiceTypeParametersResponses];
 
 export type DeleteServiceData = {
     body?: never;
@@ -9292,6 +9444,36 @@ export type ListOrdersResponses = {
 
 export type ListOrdersResponse2 = ListOrdersResponses[keyof ListOrdersResponses];
 
+export type HasPerformanceMetricsData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    url: '/performance/has-metrics';
+};
+
+export type HasPerformanceMetricsErrors = {
+    /**
+     * Internal server error
+     */
+    500: ErrorResponse;
+};
+
+export type HasPerformanceMetricsError = HasPerformanceMetricsErrors[keyof HasPerformanceMetricsErrors];
+
+export type HasPerformanceMetricsResponses = {
+    /**
+     * Successfully checked performance metrics availability
+     */
+    200: HasMetricsResponse;
+};
+
+export type HasPerformanceMetricsResponse = HasPerformanceMetricsResponses[keyof HasPerformanceMetricsResponses];
+
 export type GetPerformanceMetricsData = {
     body?: never;
     path?: never;
@@ -10240,6 +10422,50 @@ export type LinkCustomDomainToCertificateResponses = {
 };
 
 export type LinkCustomDomainToCertificateResponse = LinkCustomDomainToCertificateResponses[keyof LinkCustomDomainToCertificateResponses];
+
+export type UpdateProjectDeploymentConfigData = {
+    body: UpdateDeploymentConfigRequest;
+    path: {
+        /**
+         * Project ID or slug
+         */
+        project_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployment-config';
+};
+
+export type UpdateProjectDeploymentConfigErrors = {
+    /**
+     * Invalid deployment configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateProjectDeploymentConfigResponses = {
+    /**
+     * Deployment configuration updated successfully
+     */
+    200: ProjectResponse;
+};
+
+export type UpdateProjectDeploymentConfigResponse = UpdateProjectDeploymentConfigResponses[keyof UpdateProjectDeploymentConfigResponses];
 
 export type GetDeploymentData = {
     body?: never;

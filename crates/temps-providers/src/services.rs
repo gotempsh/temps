@@ -1,6 +1,6 @@
 use crate::externalsvc::{
     mongodb::MongodbService, postgres::PostgresService, redis::RedisService, s3::S3Service,
-    ExternalService, ServiceConfig, ServiceParameter, ServiceType,
+    ExternalService, ServiceConfig, ServiceType,
 };
 use crate::types::EnvironmentVariableInfo;
 use anyhow::Result;
@@ -13,10 +13,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_entities::{
-    external_service_backups, external_service_params, external_services, project_services,
-    projects,
-};
+use temps_entities::{external_service_backups, external_services, project_services, projects};
 use thiserror::Error;
 use tracing::{error, info};
 // use crate::routes::types::external_services::EnvironmentVariableInfo;
@@ -122,20 +119,20 @@ pub struct CreateExternalServiceRequest {
     pub name: String,
     pub service_type: ServiceType,
     pub version: Option<String>,
-    pub parameters: HashMap<String, String>,
+    pub parameters: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateExternalServiceRequest {
     pub name: Option<String>,
-    pub parameters: HashMap<String, String>,
+    pub parameters: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ExternalServiceDetails {
     pub service: ExternalServiceInfo,
-    pub parameters: Vec<ServiceParameter>,
-    pub current_parameters: Option<HashMap<String, String>>,
+    pub parameter_schema: Option<serde_json::Value>,
+    pub current_parameters: Option<HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -262,90 +259,85 @@ impl ExternalServiceManager {
         info!("Creating new external service");
         let service_slug = Self::generate_slug(&request.name);
 
-        // Create service instance and validate parameters before transaction
-        let service_instance =
-            self.create_service_instance(request.name.clone(), request.service_type.clone());
-
-        if let Err(e) = service_instance.validate_parameters(&request.parameters) {
-            return Err(ExternalServiceError::ParameterValidationFailed {
-                service_id: 0, // Not created yet
-                reason: e.to_string(),
-            });
-        }
-
-        let encryption_service = Arc::clone(&self.encryption_service);
-        let param_defs = service_instance.get_parameter_definitions();
-
         // Auto-generate values for optional parameters that have defaults or generation logic
         let mut parameters = request.parameters.clone();
-        for param_def in &param_defs {
-            if !param_def.required && !parameters.contains_key(&param_def.name) {
-                // For MongoDB password, auto-generate if not provided
-                if request.service_type == ServiceType::Mongodb && param_def.name == "password" {
-                    use rand::{distributions::Alphanumeric, Rng};
-                    let generated_password: String = rand::thread_rng()
-                        .sample_iter(&Alphanumeric)
-                        .take(16)
-                        .map(char::from)
-                        .collect();
-                    parameters.insert("password".to_string(), generated_password);
-                }
+
+        // Auto-assign port if not provided or empty
+        let port_empty = parameters
+            .get("port")
+            .and_then(|v| v.as_str())
+            .map(|s| s.is_empty())
+            .unwrap_or(true);
+
+        if port_empty {
+            let default_port = match request.service_type {
+                ServiceType::Mongodb => 27017,
+                ServiceType::Postgres => 5432,
+                ServiceType::Redis => 6379,
+                ServiceType::S3 => 9000,
+            };
+
+            let assigned_port = Self::find_available_port(default_port)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| default_port.to_string());
+
+            parameters.insert("port".to_string(), serde_json::Value::String(assigned_port));
+        }
+
+        // For MongoDB password, auto-generate if not provided or empty
+        if request.service_type == ServiceType::Mongodb {
+            let password_empty = parameters
+                .get("password")
+                .map(|v| v.as_str().map(|s| s.is_empty()).unwrap_or(true))
+                .unwrap_or(true);
+
+            if password_empty {
+                use rand::{distributions::Alphanumeric, Rng};
+                let generated_password: String = rand::thread_rng()
+                    .sample_iter(&Alphanumeric)
+                    .take(16)
+                    .map(char::from)
+                    .collect();
+                parameters.insert(
+                    "password".to_string(),
+                    serde_json::Value::String(generated_password),
+                );
             }
         }
+
+        // Serialize parameters to JSON and encrypt
+        let config_json = serde_json::to_string(&parameters).map_err(|e| {
+            ExternalServiceError::InternalError {
+                reason: format!("Failed to serialize config to JSON: {}", e),
+            }
+        })?;
+
+        let encrypted_config = self
+            .encryption_service
+            .encrypt_string(&config_json)
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to encrypt config: {}", e),
+            })?;
 
         // Start transaction
         let service = self
             .db
             .transaction::<_, external_services::Model, ExternalServiceError>(|txn| {
                 Box::pin(async move {
-                    // Create service record
+                    // Create service record with encrypted config
                     let new_service = external_services::ActiveModel {
                         name: Set(request.name.clone()),
                         slug: Set(Some(service_slug.clone())),
                         service_type: Set(request.service_type.to_string()),
                         version: Set(request.version.clone()),
                         status: Set("pending".to_string()),
+                        config: Set(Some(encrypted_config)),
                         created_at: Set(Utc::now()),
                         updated_at: Set(Utc::now()),
                         ..Default::default()
                     };
 
                     let service = new_service.insert(txn).await?;
-
-                    // Store parameters (including auto-generated ones)
-                    for (key, value) in &parameters {
-                        let param_def =
-                            param_defs.iter().find(|p| p.name == *key).ok_or_else(|| {
-                                ExternalServiceError::ParameterValidationFailed {
-                                    service_id: service.id,
-                                    reason: format!("Parameter '{}' not found in definitions", key),
-                                }
-                            })?;
-
-                        let encrypted_value = if param_def.encrypted {
-                            encryption_service.encrypt_string(value).map_err(|e| {
-                                ExternalServiceError::EncryptionFailed {
-                                    service_id: service.id,
-                                    param_name: key.clone(),
-                                    reason: e.to_string(),
-                                }
-                            })?
-                        } else {
-                            value.clone()
-                        };
-
-                        // Insert parameter (all params are now encrypted)
-                        let new_param = external_service_params::ActiveModel {
-                            service_id: Set(service.id),
-                            key: Set(key.clone()),
-                            value: Set(encrypted_value),
-                            created_at: Set(Utc::now()),
-                            updated_at: Set(Utc::now()),
-                            ..Default::default()
-                        };
-
-                        new_param.insert(txn).await?;
-                    }
 
                     Ok(service)
                 })
@@ -427,7 +419,7 @@ impl ExternalServiceManager {
 
         Ok(ExternalServiceDetails {
             service: service_info,
-            parameters: service_instance.get_parameter_definitions(),
+            parameter_schema: service_instance.get_parameter_schema(),
             current_parameters: Some(parameters),
         })
     }
@@ -438,12 +430,6 @@ impl ExternalServiceManager {
         request: UpdateExternalServiceRequest,
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
-        let service_type = ServiceType::from_str(&service.service_type.clone()).map_err(|_| {
-            ExternalServiceError::InvalidServiceType {
-                id: service_id,
-                service_type: service.service_type.clone(),
-            }
-        })?;
 
         // Generate new slug if name is being updated
         if let Some(new_name) = &request.name {
@@ -457,68 +443,25 @@ impl ExternalServiceManager {
             service_update.update(self.db.as_ref()).await?;
         }
 
-        let service_instance = self.create_service_instance(service.name.clone(), service_type);
+        // Serialize parameters to JSON and encrypt
+        let config_json = serde_json::to_string(&request.parameters).map_err(|e| {
+            ExternalServiceError::InternalError {
+                reason: format!("Failed to serialize config to JSON: {}", e),
+            }
+        })?;
 
-        // Validate parameters
-        service_instance
-            .validate_parameters(&request.parameters)
-            .map_err(|e| ExternalServiceError::ParameterValidationFailed {
-                service_id,
-                reason: e.to_string(),
+        let encrypted_config = self
+            .encryption_service
+            .encrypt_string(&config_json)
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to encrypt config: {}", e),
             })?;
 
-        // Clone encryption service to avoid lifetime issues
-        let encryption_service = Arc::clone(&self.encryption_service);
-
-        // Update parameters in transaction
-        self.db
-            .transaction::<_, (), ExternalServiceError>(move |txn| {
-                Box::pin(async move {
-                    // Delete existing parameters
-                    external_service_params::Entity::delete_many()
-                        .filter(external_service_params::Column::ServiceId.eq(service_id))
-                        .exec(txn)
-                        .await?;
-
-                    // Insert new parameters
-                    for (key, value) in &request.parameters {
-                        let param_defs = service_instance.get_parameter_definitions();
-                        let param_def = param_defs.iter().find(|p| p.name == *key).ok_or(
-                            ExternalServiceError::ParameterValidationFailed {
-                                service_id,
-                                reason: format!("Parameter '{}' not found in definitions", key),
-                            },
-                        )?;
-
-                        let encrypted_value = if param_def.encrypted {
-                            encryption_service.encrypt_string(value).map_err(|e| {
-                                ExternalServiceError::EncryptionFailed {
-                                    service_id,
-                                    param_name: key.clone(),
-                                    reason: e.to_string(),
-                                }
-                            })?
-                        } else {
-                            value.clone()
-                        };
-
-                        let new_param = external_service_params::ActiveModel {
-                            service_id: Set(service_id),
-                            key: Set(key.clone()),
-                            value: Set(encrypted_value),
-                            created_at: Set(Utc::now()),
-                            updated_at: Set(Utc::now()),
-                            ..Default::default()
-                        };
-
-                        new_param.insert(txn).await?;
-                    }
-
-                    Ok(())
-                })
-            })
-            .await
-            .map_err(ExternalServiceError::from)?;
+        // Update service config in database
+        let mut service_update: external_services::ActiveModel = service.into();
+        service_update.config = Set(Some(encrypted_config));
+        service_update.updated_at = Set(Utc::now());
+        service_update.update(self.db.as_ref()).await?;
 
         // Reinitialize the service
         self.initialize_service(service_id).await?;
@@ -546,12 +489,6 @@ impl ExternalServiceManager {
                     // Delete project links
                     project_services::Entity::delete_many()
                         .filter(project_services::Column::ServiceId.eq(service_id))
-                        .exec(txn)
-                        .await?;
-
-                    // Delete parameters first due to foreign key constraint
-                    external_service_params::Entity::delete_many()
-                        .filter(external_service_params::Column::ServiceId.eq(service_id))
                         .exec(txn)
                         .await?;
 
@@ -628,47 +565,38 @@ impl ExternalServiceManager {
     async fn get_service_parameters(
         &self,
         service_id_val: i32,
-    ) -> Result<HashMap<String, String>, ExternalServiceError> {
-        let params = external_service_params::Entity::find()
-            .filter(external_service_params::Column::ServiceId.eq(service_id_val))
-            .all(self.db.as_ref())
-            .await?;
-
-        // Get service to determine parameter definitions
+    ) -> Result<HashMap<String, serde_json::Value>, ExternalServiceError> {
         let service = self.get_service(service_id_val).await?;
-        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
-            ExternalServiceError::InvalidServiceType {
-                id: service_id_val,
-                service_type: service.service_type.clone(),
-            }
-        })?;
-        let service_instance = self.create_service_instance(service.name.clone(), service_type);
-        let param_defs = service_instance.get_parameter_definitions();
 
-        let mut result = HashMap::new();
-        for param in params {
-            // Only decrypt if parameter is marked as encrypted in definition
-            let param_def = param_defs.iter().find(|p| p.name == param.key);
-            let is_encrypted = param_def.map(|p| p.encrypted).unwrap_or(false);
+        // Get encrypted config from service record
+        let encrypted_config =
+            service
+                .config
+                .ok_or_else(|| ExternalServiceError::InternalError {
+                    reason: format!("Service {} has no config", service_id_val),
+                })?;
 
-            let value_val = if is_encrypted {
-                // Decrypt encrypted parameters
-                self.encryption_service
-                    .decrypt_string(&param.value)
-                    .map_err(|e| ExternalServiceError::DecryptionFailed {
-                        service_id: service_id_val,
-                        param_name: param.key.clone(),
-                        reason: e.to_string(),
-                    })?
-            } else {
-                // Return plaintext parameters as-is
-                param.value
-            };
+        // Decrypt config
+        let config_json = self
+            .encryption_service
+            .decrypt_string(&encrypted_config)
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Failed to decrypt config for service {}: {}",
+                    service_id_val, e
+                ),
+            })?;
 
-            result.insert(param.key, value_val);
-        }
+        // Deserialize JSON to HashMap
+        let parameters: HashMap<String, serde_json::Value> = serde_json::from_str(&config_json)
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Failed to deserialize config for service {}: {}",
+                    service_id_val, e
+                ),
+            })?;
 
-        Ok(result)
+        Ok(parameters)
     }
 
     async fn initialize_service(&self, service_id: i32) -> Result<(), ExternalServiceError> {
@@ -710,10 +638,19 @@ impl ExternalServiceManager {
         })?;
 
         // Store inferred parameters
-        self.store_inferred_parameters(service_id, service_instance, inferred_params)
+        self.store_inferred_parameters(service_id, service_instance.as_ref(), inferred_params)
             .await?;
 
-        // Update status to initialized
+        // Start the service (create and start container)
+        service_instance
+            .start()
+            .await
+            .map_err(|e| ExternalServiceError::InitializationFailed {
+                id: service_id,
+                reason: format!("Failed to start service: {}", e),
+            })?;
+
+        // Update status to running
         let mut service_update: external_services::ActiveModel = service.clone().into();
         service_update.status = Set("running".to_string());
         service_update.updated_at = Set(Utc::now());
@@ -725,68 +662,37 @@ impl ExternalServiceManager {
     async fn store_inferred_parameters(
         &self,
         service_id: i32,
-        service_instance: Box<dyn ExternalService>,
+        _service_instance: &dyn ExternalService,
         inferred_params: HashMap<String, String>,
     ) -> Result<(), ExternalServiceError> {
-        let param_defs = service_instance.get_parameter_definitions();
+        // Get current parameters
+        let mut current_params = self.get_service_parameters(service_id).await?;
 
+        // Merge inferred parameters (convert String values to serde_json::Value)
         for (key, value) in inferred_params {
-            let param_def = param_defs.iter().find(|p| p.name == key);
-            let default_service_param = &ServiceParameter {
-                name: key.clone(),
-                required: false,
-                encrypted: false,
-                description: "Inferred parameter".to_string(),
-                default_value: None,
-                validation_pattern: None,
-                choices: None,
-            };
-            let param_def = param_def.unwrap_or(default_service_param);
-
-            let encrypted_value = if param_def.encrypted {
-                self.encryption_service
-                    .encrypt_string(&value)
-                    .map_err(|e| ExternalServiceError::EncryptionFailed {
-                        service_id,
-                        param_name: key.clone(),
-                        reason: e.to_string(),
-                    })?
-            } else {
-                value
-            };
-
-            let new_param = external_service_params::ActiveModel {
-                service_id: Set(service_id),
-                key: Set(key.clone()),
-                value: Set(encrypted_value.clone()),
-                created_at: Set(Utc::now()),
-                updated_at: Set(Utc::now()),
-                ..Default::default()
-            };
-
-            // Try to insert, if it fails due to conflict, try to update
-            match new_param.insert(self.db.as_ref()).await {
-                Ok(_) => {
-                    // Insert successful, continue
-                }
-                Err(_) => {
-                    // If insert fails, try to update existing parameter
-                    let existing = external_service_params::Entity::find()
-                        .filter(external_service_params::Column::ServiceId.eq(service_id))
-                        .filter(external_service_params::Column::Key.eq(&key))
-                        .one(self.db.as_ref())
-                        .await?;
-
-                    if let Some(existing_param) = existing {
-                        let mut update_param: external_service_params::ActiveModel =
-                            existing_param.into();
-                        update_param.value = Set(encrypted_value);
-                        update_param.updated_at = Set(Utc::now());
-                        update_param.update(self.db.as_ref()).await?;
-                    }
-                }
-            }
+            current_params.insert(key, serde_json::Value::String(value));
         }
+
+        // Serialize updated config to JSON and encrypt
+        let config_json = serde_json::to_string(&current_params).map_err(|e| {
+            ExternalServiceError::InternalError {
+                reason: format!("Failed to serialize config to JSON: {}", e),
+            }
+        })?;
+
+        let encrypted_config = self
+            .encryption_service
+            .encrypt_string(&config_json)
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to encrypt config: {}", e),
+            })?;
+
+        // Update service config
+        let service = self.get_service(service_id).await?;
+        let mut service_update: external_services::ActiveModel = service.into();
+        service_update.config = Set(Some(encrypted_config));
+        service_update.updated_at = Set(Utc::now());
+        service_update.update(self.db.as_ref()).await?;
 
         Ok(())
     }
@@ -807,63 +713,27 @@ impl ExternalServiceManager {
             .collect()
     }
 
-    /// Encrypts all parameters for external services that are marked as encrypted but not yet encrypted
-    pub async fn encrypt_all_parameters(&self) -> Result<(), ExternalServiceError> {
-        info!("Starting encryption of all external service parameters...");
+    /// Convert HashMap<String, serde_json::Value> to HashMap<String, String>
+    fn params_to_strings(params: &HashMap<String, serde_json::Value>) -> HashMap<String, String> {
+        params
+            .iter()
+            .map(|(k, v)| {
+                let v_str = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    serde_json::Value::Null => String::new(),
+                    _ => v.to_string(),
+                };
+                (k.clone(), v_str)
+            })
+            .collect()
+    }
 
-        // Get all external services
-        let services = external_services::Entity::find()
-            .all(self.db.as_ref())
-            .await?;
-
-        for service in services {
-            // Get service type to determine which parameters should be encrypted
-            let _service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
-                ExternalServiceError::InvalidServiceType {
-                    id: service.id,
-                    service_type: service.service_type.clone(),
-                }
-            })?;
-
-            // Get all parameters for this service
-            let params = external_service_params::Entity::find()
-                .filter(external_service_params::Column::ServiceId.eq(service.id))
-                .all(self.db.as_ref())
-                .await?;
-
-            for param in params {
-                // Since is_encrypted is removed, we assume all old params might be unencrypted
-                // Try to decrypt first, if that fails, assume it's unencrypted and encrypt it
-                let needs_encryption = self
-                    .encryption_service
-                    .decrypt_string(&param.value)
-                    .is_err();
-
-                if needs_encryption && !param.value.is_empty() {
-                    info!(
-                        "Encrypting parameter {} for service {}",
-                        param.key, service.id
-                    );
-
-                    let encrypted_value = self
-                        .encryption_service
-                        .encrypt_string(&param.value)
-                        .map_err(|e| ExternalServiceError::EncryptionFailed {
-                            service_id: service.id,
-                            param_name: param.key.clone(),
-                            reason: e.to_string(),
-                        })?;
-
-                    let mut param_update: external_service_params::ActiveModel = param.into();
-                    param_update.value = Set(encrypted_value);
-                    param_update.updated_at = Set(Utc::now());
-                    param_update.update(self.db.as_ref()).await?;
-                }
-            }
-        }
-
-        info!("Completed encryption of all external service parameters");
-        Ok(())
+    /// Find an available port starting from the given port
+    fn find_available_port(start_port: u16) -> Option<u16> {
+        use std::net::TcpListener;
+        (start_port..start_port + 100).find(|&port| TcpListener::bind(("0.0.0.0", port)).is_ok())
     }
 
     pub async fn start_service(
@@ -981,9 +851,12 @@ impl ExternalServiceManager {
 
         let service_instance = self.create_service_instance(service.name.clone(), service_type);
 
+        // Convert parameters to strings for the service
+        let params_str = Self::params_to_strings(&parameters);
+
         // Get connection info from the service instance
         service_instance
-            .get_environment_variables(&parameters)
+            .get_environment_variables(&params_str)
             .map_err(|e| ExternalServiceError::InternalError {
                 reason: format!("Failed to get environment variables: {}", e),
             })
@@ -992,8 +865,8 @@ impl ExternalServiceManager {
     pub async fn get_runtime_env_vars(
         &self,
         service_id_val: i32,
-        project_slug: String,
-        environment_slug: String,
+        project_id: i32,
+        environment_id: i32,
     ) -> Result<HashMap<String, String>, ExternalServiceError> {
         // Get service
         let service = self.get_service(service_id_val).await?;
@@ -1003,6 +876,23 @@ impl ExternalServiceManager {
                 service_type: service.service_type.clone(),
             }
         })?;
+
+        // Verify service is linked to project
+        let link_exists = project_services::Entity::find()
+            .filter(
+                project_services::Column::ServiceId
+                    .eq(service_id_val)
+                    .and(project_services::Column::ProjectId.eq(project_id)),
+            )
+            .one(self.db.as_ref())
+            .await?;
+
+        if link_exists.is_none() {
+            return Err(ExternalServiceError::ServiceNotLinkedToProject {
+                service_id: service_id_val,
+                project_id,
+            });
+        }
 
         // Create service instance
         let service_instance =
@@ -1019,7 +909,31 @@ impl ExternalServiceManager {
             })?,
         };
 
-        // Get runtime environment variables
+        // Initialize the service to populate its internal config
+        service_instance
+            .init(service_config.clone())
+            .await
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to initialize service: {}", e),
+            })?;
+
+        // Get project and environment slugs
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ExternalServiceError::ProjectNotFound { id: project_id })?;
+
+        let environment = temps_entities::environments::Entity::find_by_id(environment_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ExternalServiceError::InternalError {
+                reason: format!("Environment {} not found", environment_id),
+            })?;
+
+        let project_slug = project.slug;
+        let environment_slug = environment.slug;
+
+        // Get runtime environment variables (this provisions resources like databases/buckets)
         service_instance
             .get_runtime_env_vars(service_config, &project_slug, &environment_slug)
             .await
@@ -1062,8 +976,11 @@ impl ExternalServiceManager {
         let parameters = self.get_service_parameters(service_id_val).await?;
         let service_instance = self.create_service_instance(service.name.clone(), service_type);
 
+        // Convert parameters to strings for the service
+        let params_str = Self::params_to_strings(&parameters);
+
         service_instance
-            .get_docker_environment_variables(&parameters)
+            .get_docker_environment_variables(&params_str)
             .map_err(|e| ExternalServiceError::InternalError {
                 reason: format!("Failed to get docker environment variables: {}", e),
             })
@@ -1186,8 +1103,11 @@ impl ExternalServiceManager {
         }
 
         let service_instance = self.create_service_instance(service.name.clone(), service_type);
+        // Convert parameters to strings for the service
+        let params_str = Self::params_to_strings(&parameters);
+
         let env_vars = service_instance
-            .get_environment_variables(&parameters)
+            .get_environment_variables(&params_str)
             .map_err(|e| ExternalServiceError::InternalError {
                 reason: format!("Failed to get environment variables: {}", e),
             })?;
@@ -1195,26 +1115,17 @@ impl ExternalServiceManager {
         // Check if the variable exists
         match env_vars.get(var_name) {
             Some(value) => {
-                // All variables are now decrypted when retrieved, so we can return them
-                // Check if the variable is marked as sensitive in definitions
-                let param_defs = service_instance.get_parameter_definitions();
-                let is_sensitive = param_defs
+                // All config is encrypted at rest, but we can return env vars
+                // Mark common sensitive variable names as sensitive
+                let sensitive_vars = ["password", "secret", "key", "token", "api_key"];
+                let is_sensitive = sensitive_vars
                     .iter()
-                    .find(|p| p.name == var_name)
-                    .map(|p| p.encrypted)
-                    .unwrap_or(false);
-
-                if is_sensitive {
-                    // For sensitive variables, return masked value in responses
-                    return Err(ExternalServiceError::EncryptedVariableAccessDenied {
-                        service_id: service_id_val,
-                        var_name: var_name.to_string(),
-                    });
-                }
+                    .any(|s| var_name.to_lowercase().contains(s));
 
                 Ok(EnvironmentVariableInfo {
                     name: var_name.to_string(),
                     value: value.clone(),
+                    sensitive: is_sensitive,
                 })
             }
             None => Err(ExternalServiceError::EnvironmentVariableNotFound {
@@ -1265,12 +1176,12 @@ impl ExternalServiceManager {
         Ok(result)
     }
 
-    pub async fn get_service_type_parameters(
+    pub async fn get_service_type_schema(
         &self,
         service_type: ServiceType,
-    ) -> Result<Vec<ServiceParameter>, ExternalServiceError> {
+    ) -> Result<Option<serde_json::Value>, ExternalServiceError> {
         let service_instance = self.create_service_instance("temp".to_string(), service_type);
-        Ok(service_instance.get_parameter_definitions())
+        Ok(service_instance.get_parameter_schema())
     }
 
     pub async fn get_service_details_by_slug(
@@ -1287,7 +1198,7 @@ impl ExternalServiceManager {
 
         Ok(ExternalServiceDetails {
             service: service_info,
-            parameters: service_instance.get_parameter_definitions(),
+            parameter_schema: service_instance.get_parameter_schema(),
             current_parameters: Some(parameters),
         })
     }
@@ -1308,8 +1219,11 @@ impl ExternalServiceManager {
 
         let service_instance = self.create_service_instance(service.name.clone(), service_type);
 
+        // Convert parameters to strings for the service
+        let params_str = Self::params_to_strings(&parameters);
+
         let env_vars = service_instance
-            .get_environment_variables(&parameters)
+            .get_environment_variables(&params_str)
             .map_err(|e| ExternalServiceError::InternalError {
                 reason: format!("Failed to get environment variables: {}", e),
             })?;
@@ -1333,8 +1247,11 @@ impl ExternalServiceManager {
 
         let service_instance = self.create_service_instance(service.name.clone(), service_type);
 
+        // Convert parameters to strings for the service
+        let params_str = Self::params_to_strings(&parameters);
+
         let env_vars = service_instance
-            .get_environment_variables(&parameters)
+            .get_environment_variables(&params_str)
             .map_err(|e| ExternalServiceError::InternalError {
                 reason: format!("Failed to get environment variables: {}", e),
             })?;
@@ -1383,6 +1300,7 @@ impl ExternalServiceManager {
 mod tests {
     use super::*;
     use bollard::Docker;
+    use serde_json::Value as JsonValue;
     use std::collections::HashMap;
     use std::net::TcpListener;
     use temps_core::EncryptionService;
@@ -1412,11 +1330,26 @@ mod tests {
         let (manager, _test_db) = setup_test_manager().await;
         let random_unused_port = get_unused_port();
         let mut params = HashMap::new();
-        params.insert("database".to_string(), "testdb".to_string());
-        params.insert("username".to_string(), "testuser".to_string());
-        params.insert("password".to_string(), "testpass".to_string());
-        params.insert("port".to_string(), random_unused_port.to_string());
-        params.insert("host".to_string(), "localhost".to_string());
+        params.insert(
+            "database".to_string(),
+            JsonValue::String("testdb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            JsonValue::String("testuser".to_string()),
+        );
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("testpass".to_string()),
+        );
+        params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
+        params.insert(
+            "host".to_string(),
+            JsonValue::String("localhost".to_string()),
+        );
 
         let request = CreateExternalServiceRequest {
             name: "test-postgres".to_string(),
@@ -1447,7 +1380,10 @@ mod tests {
         let (manager, _test_db) = setup_test_manager().await;
         let random_unused_port = get_unused_port();
         let mut params = HashMap::new();
-        params.insert("port".to_string(), random_unused_port.to_string());
+        params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
         let request = CreateExternalServiceRequest {
             name: "test-redis".to_string(),
             service_type: ServiceType::Redis,
@@ -1472,7 +1408,10 @@ mod tests {
 
         let random_unused_port = get_unused_port();
         let mut params = HashMap::new();
-        params.insert("port".to_string(), random_unused_port.to_string());
+        params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
         // Note: bucket_name is not a parameter - buckets are created dynamically during provisioning
         // access_key and secret_key have defaults, so they're optional
 
@@ -1501,8 +1440,14 @@ mod tests {
         let random_unused_port = get_unused_port();
         // Create a service first
         let mut params = HashMap::new();
-        params.insert("port".to_string(), random_unused_port.to_string());
-        params.insert("host".to_string(), "localhost".to_string());
+        params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
+        params.insert(
+            "host".to_string(),
+            JsonValue::String("localhost".to_string()),
+        );
 
         let request = CreateExternalServiceRequest {
             name: "test-stop-start".to_string(),
@@ -1535,7 +1480,10 @@ mod tests {
 
         // Create a service first
         let mut params = HashMap::new();
-        params.insert("password".to_string(), "redis_pass".to_string());
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("redis_pass".to_string()),
+        );
 
         let request = CreateExternalServiceRequest {
             name: "test-delete".to_string(),
@@ -1567,9 +1515,18 @@ mod tests {
 
         // Create a service first
         let mut params = HashMap::new();
-        params.insert("database".to_string(), "original_db".to_string());
-        params.insert("username".to_string(), "original_user".to_string());
-        params.insert("password".to_string(), "original_pass".to_string());
+        params.insert(
+            "database".to_string(),
+            JsonValue::String("original_db".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            JsonValue::String("original_user".to_string()),
+        );
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("original_pass".to_string()),
+        );
 
         let request = CreateExternalServiceRequest {
             name: "test-update".to_string(),
@@ -1583,9 +1540,18 @@ mod tests {
 
         // Update service parameters
         let mut new_params = HashMap::new();
-        new_params.insert("database".to_string(), "updated_db".to_string());
-        new_params.insert("username".to_string(), "updated_user".to_string());
-        new_params.insert("password".to_string(), "updated_pass".to_string());
+        new_params.insert(
+            "database".to_string(),
+            JsonValue::String("updated_db".to_string()),
+        );
+        new_params.insert(
+            "username".to_string(),
+            JsonValue::String("updated_user".to_string()),
+        );
+        new_params.insert(
+            "password".to_string(),
+            JsonValue::String("updated_pass".to_string()),
+        );
 
         let update_request = UpdateExternalServiceRequest {
             name: Some("test-update-renamed".to_string()),
@@ -1607,7 +1573,10 @@ mod tests {
 
         // Create a service
         let mut params = HashMap::new();
-        params.insert("password".to_string(), "test".to_string());
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("test".to_string()),
+        );
 
         let request = CreateExternalServiceRequest {
             name: "unique-service-name".to_string(),
@@ -1635,7 +1604,10 @@ mod tests {
 
         // Create a service with a name that will be slugified
         let mut params = HashMap::new();
-        params.insert("password".to_string(), "test".to_string());
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("test".to_string()),
+        );
 
         let request = CreateExternalServiceRequest {
             name: "Service With Spaces".to_string(),
@@ -1666,7 +1638,10 @@ mod tests {
         for i in 0..3 {
             let random_unused_port = get_unused_port();
             let mut params = HashMap::new();
-            params.insert("port".to_string(), random_unused_port.to_string());
+            params.insert(
+                "port".to_string(),
+                JsonValue::String(random_unused_port.to_string()),
+            );
 
             let request = CreateExternalServiceRequest {
                 name: format!("service-{}", i),
@@ -1704,11 +1679,26 @@ mod tests {
         let random_unused_port = get_unused_port();
         // Create a postgres service
         let mut params = HashMap::new();
-        params.insert("database".to_string(), "envtest".to_string());
-        params.insert("username".to_string(), "envuser".to_string());
-        params.insert("password".to_string(), "envpass".to_string());
-        params.insert("port".to_string(), random_unused_port.to_string());
-        params.insert("host".to_string(), "localhost".to_string());
+        params.insert(
+            "database".to_string(),
+            JsonValue::String("envtest".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            JsonValue::String("envuser".to_string()),
+        );
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("envpass".to_string()),
+        );
+        params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
+        params.insert(
+            "host".to_string(),
+            JsonValue::String("localhost".to_string()),
+        );
 
         let request = CreateExternalServiceRequest {
             name: "env-test-service".to_string(),
@@ -1746,11 +1736,26 @@ mod tests {
         let random_unused_port = get_unused_port();
         // Create a service with sensitive parameters
         let mut params = HashMap::new();
-        params.insert("database".to_string(), "cryptodb".to_string());
-        params.insert("username".to_string(), "cryptouser".to_string());
-        params.insert("password".to_string(), "super_secret_password".to_string());
-        params.insert("port".to_string(), random_unused_port.to_string());
-        params.insert("host".to_string(), "localhost".to_string());
+        params.insert(
+            "database".to_string(),
+            JsonValue::String("cryptodb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            JsonValue::String("cryptouser".to_string()),
+        );
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("super_secret_password".to_string()),
+        );
+        params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
+        params.insert(
+            "host".to_string(),
+            JsonValue::String("localhost".to_string()),
+        );
 
         let request = CreateExternalServiceRequest {
             name: "crypto-service".to_string(),
@@ -1773,7 +1778,7 @@ mod tests {
         // Password should be decrypted for authorized access
         assert_eq!(
             current_params.get("password"),
-            Some(&"super_secret_password".to_string())
+            Some(&JsonValue::String("super_secret_password".to_string()))
         );
 
         // Cleanup
@@ -1860,10 +1865,22 @@ mod tests {
 
         // Create a service with sensitive parameters
         let mut params = HashMap::new();
-        params.insert("database".to_string(), "testdb".to_string());
-        params.insert("username".to_string(), "user".to_string());
-        params.insert("password".to_string(), "secret123".to_string());
-        params.insert("port".to_string(), random_unused_port.to_string());
+        params.insert(
+            "database".to_string(),
+            JsonValue::String("testdb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            JsonValue::String("user".to_string()),
+        );
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("secret123".to_string()),
+        );
+        params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
 
         let request = CreateExternalServiceRequest {
             name: "masked-test".to_string(),

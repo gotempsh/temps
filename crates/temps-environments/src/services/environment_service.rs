@@ -423,14 +423,40 @@ impl EnvironmentService {
 
         // Update deployment config with new resource settings
         let mut deployment_config = environment.deployment_config.clone().unwrap_or_default();
-        deployment_config.cpu_request = settings.cpu_request;
-        deployment_config.cpu_limit = settings.cpu_limit;
-        deployment_config.memory_request = settings.memory_request;
-        deployment_config.memory_limit = settings.memory_limit;
-        deployment_config.exposed_port = settings.exposed_port;
+
+        // Update only the fields that are provided
+        if settings.cpu_request.is_some() {
+            deployment_config.cpu_request = settings.cpu_request;
+        }
+        if settings.cpu_limit.is_some() {
+            deployment_config.cpu_limit = settings.cpu_limit;
+        }
+        if settings.memory_request.is_some() {
+            deployment_config.memory_request = settings.memory_request;
+        }
+        if settings.memory_limit.is_some() {
+            deployment_config.memory_limit = settings.memory_limit;
+        }
+        if settings.exposed_port.is_some() {
+            deployment_config.exposed_port = settings.exposed_port;
+        }
         if let Some(replicas) = settings.replicas {
             deployment_config.replicas = replicas;
         }
+        if let Some(automatic_deploy) = settings.automatic_deploy {
+            deployment_config.automatic_deploy = automatic_deploy;
+        }
+        if let Some(performance_metrics_enabled) = settings.performance_metrics_enabled {
+            deployment_config.performance_metrics_enabled = performance_metrics_enabled;
+        }
+        if let Some(session_recording_enabled) = settings.session_recording_enabled {
+            deployment_config.session_recording_enabled = session_recording_enabled;
+        }
+
+        // Validate the deployment config
+        deployment_config.validate().map_err(|e| {
+            EnvironmentError::InvalidInput(format!("Invalid deployment config: {}", e))
+        })?;
 
         active_model.deployment_config = Set(Some(deployment_config));
         active_model.branch = Set(settings.branch);

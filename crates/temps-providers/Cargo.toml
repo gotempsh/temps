@@ -38,6 +38,7 @@ utoipa = { workspace = true }
 thiserror = { workspace = true }
 axum = { workspace = true }
 axum-macros = { workspace = true }
+schemars = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

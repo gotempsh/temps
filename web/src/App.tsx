@@ -44,7 +44,7 @@ const Storage = lazy(() =>
   import('./pages/Storage').then((m) => ({ default: m.Storage }))
 )
 const CreateService = lazy(() =>
-  import('./pages/CreateService').then((m) => ({ default: m.CreateService }))
+  import('./pages/CreateServiceNew').then((m) => ({ default: m.CreateService }))
 )
 const ServiceDetail = lazy(() =>
   import('./pages/ServiceDetail').then((m) => ({ default: m.ServiceDetail }))

@@ -1,14 +1,15 @@
 use crate::utils::ensure_network_exists;
 
-use super::{ExternalService, ServiceConfig, ServiceParameter, ServiceType};
+use super::{ExternalService, ServiceConfig, ServiceType};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::{body_full, Docker};
 use futures::{StreamExt, TryStreamExt};
 use redis::{aio::ConnectionManager, Client};
+use schemars::JsonSchema;
 use sea_orm::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -19,9 +20,92 @@ use tracing::{error, info};
 
 const REDIS_IMAGE: &str = "redis:7.4.1-alpine";
 
-#[derive(Debug, Clone, Deserialize)]
+/// Input configuration for creating a Redis service
+/// This is what users provide when creating the service
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(title = "Redis Configuration", description = "Configuration for Redis service")]
+pub struct RedisInputConfig {
+    /// Redis host address
+    #[serde(default = "default_host")]
+    #[schemars(example = "example_host", default = "default_host")]
+    pub host: String,
+
+    /// Redis port (auto-assigned if not provided)
+    #[schemars(example = "example_port")]
+    pub port: Option<String>,
+
+    /// Redis password (auto-generated if not provided or empty)
+    #[serde(default, deserialize_with = "deserialize_optional_password")]
+    #[schemars(with = "Option<String>", example = "example_password")]
+    pub password: Option<String>,
+}
+
+/// Internal runtime configuration for Redis service
+/// This is what the service uses internally after processing input
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisConfig {
+    pub host: String,
     pub port: String,
+    pub password: String,
+}
+
+impl From<RedisInputConfig> for RedisConfig {
+    fn from(input: RedisInputConfig) -> Self {
+        Self {
+            host: input.host,
+            port: input.port.unwrap_or_else(|| {
+                find_available_port(6379)
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "6379".to_string())
+            }),
+            password: input.password.unwrap_or_else(generate_password),
+        }
+    }
+}
+
+fn deserialize_optional_password<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(match opt {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => None,
+    })
+}
+
+fn default_host() -> String {
+    "localhost".to_string()
+}
+
+fn generate_password() -> String {
+    use rand::{distributions::Alphanumeric, Rng};
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(16)
+        .map(char::from)
+        .collect()
+}
+
+// Schema example functions
+fn example_host() -> &'static str {
+    "localhost"
+}
+
+fn example_port() -> &'static str {
+    "6379"
+}
+
+fn example_password() -> &'static str {
+    "your-secure-password"
+}
+
+fn is_port_available(port: u16) -> bool {
+    TcpListener::bind(("0.0.0.0", port)).is_ok()
+}
+
+fn find_available_port(start_port: u16) -> Option<u16> {
+    (start_port..start_port + 100).find(|&port| is_port_available(port))
 }
 
 pub struct RedisService {
@@ -52,7 +136,7 @@ impl RedisService {
     }
 
     fn get_container_name(&self) -> String {
-        format!("redis_{}", self.name)
+        format!("redis-{}", self.name)
     }
 
     async fn create_container(
@@ -85,7 +169,7 @@ impl RedisService {
             )
             .try_collect::<Vec<_>>()
             .await
-            .context("Failed to pull Redis image")?;
+            .map_err(|e| anyhow::anyhow!("Failed to pull Redis image: {}", e))?;
 
         // Check if container already exists
         let containers = docker
@@ -242,17 +326,6 @@ impl RedisService {
         Err(anyhow::anyhow!("Redis container health check timed out"))
     }
 
-    fn get_default_port(&self) -> String {
-        // Start with default Redis port
-        let start_port = 6379;
-
-        // Find next available port
-        match find_available_port(start_port) {
-            Some(port) => port.to_string(),
-            None => start_port.to_string(), // Fallback to default if no ports found
-        }
-    }
-
     async fn create_database(&self, name: &str) -> Result<u8> {
         let conn = self.get_connection().await?;
 
@@ -316,14 +389,11 @@ impl RedisService {
     }
 
     fn get_redis_config(&self, service_config: ServiceConfig) -> Result<RedisConfig> {
-        let port = service_config
-            .parameters
-            .get("port")
-            .context("Missing port parameter")?;
+        // Parse input config and transform to runtime config
+        let input_config: RedisInputConfig = serde_json::from_value(service_config.parameters)
+            .map_err(|e| anyhow::anyhow!("Failed to parse Redis configuration: {}", e))?;
 
-        Ok(RedisConfig {
-            port: port.as_str().unwrap().to_string(),
-        })
+        Ok(RedisConfig::from(input_config))
     }
 }
 
@@ -331,24 +401,33 @@ impl RedisService {
 impl ExternalService for RedisService {
     async fn init(&self, config: ServiceConfig) -> Result<HashMap<String, String>> {
         info!("Initializing Redis service {:?}", config);
-        let redis_config = self.get_redis_config(config.clone())?;
 
-        let mut inferred_params = HashMap::new();
-        inferred_params.insert("host".to_string(), "localhost".to_string());
-        inferred_params.insert("port".to_string(), redis_config.port.clone());
+        // Parse input config and transform to runtime config
+        let redis_config = self.get_redis_config(config)?;
 
-        // Generate random password if Docker is available
-        let password = generate_random_password();
+        // Store runtime config
+        *self.config.write().await = Some(redis_config.clone());
 
-        // Create Docker container if Docker instance is provided
-        self.create_container(&self.docker, &redis_config, &password)
+        // Create Docker container
+        self.create_container(&self.docker, &redis_config, &redis_config.password)
             .await?;
 
-        if !password.is_empty() {
-            inferred_params.insert("password".to_string(), password);
-        }
+        // Serialize the full runtime config to save to database
+        // This ensures auto-generated values (password, port) are persisted
+        let runtime_config_json = serde_json::to_value(&redis_config)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize Redis runtime config: {}", e))?;
 
-        *self.config.write().await = Some(redis_config);
+        let runtime_config_map = runtime_config_json
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Runtime config is not an object"))
+            .map_err(|e| anyhow::anyhow!("Runtime config is not an object: {}", e))?;
+
+        let mut inferred_params = HashMap::new();
+        for (key, value) in runtime_config_map {
+            if let Some(str_value) = value.as_str() {
+                inferred_params.insert(key.clone(), str_value.to_string());
+            }
+        }
 
         Ok(inferred_params)
     }
@@ -391,30 +470,6 @@ impl ExternalService for RedisService {
         Ok(())
     }
 
-    fn validate_parameters(&self, parameters: &HashMap<String, String>) -> Result<()> {
-        // Additional Redis-specific validation
-        if let Some(port) = parameters.get("port") {
-            let port_num = port
-                .parse::<u16>()
-                .map_err(|_| anyhow::anyhow!("Port must be a valid number between 1 and 65535"))?;
-            if port_num == 0 {
-                return Err(anyhow::anyhow!("Port cannot be 0"));
-            }
-        }
-
-        if let Some(db) = parameters.get("database") {
-            let db_num = db
-                .parse::<u8>()
-                .map_err(|_| anyhow::anyhow!("Database must be a number between 0 and 15"))?;
-            if db_num > 15 {
-                return Err(anyhow::anyhow!(
-                    "Redis database number must be between 0 and 15"
-                ));
-            }
-        }
-
-        Ok(())
-    }
     fn get_docker_environment_variables(
         &self,
         parameters: &HashMap<String, String>,
@@ -439,16 +494,10 @@ impl ExternalService for RedisService {
         Ok(env_vars)
     }
 
-    fn get_parameter_definitions(&self) -> Vec<ServiceParameter> {
-        vec![ServiceParameter {
-            name: "port".to_string(),
-            required: true,
-            encrypted: false,
-            description: "Redis port".to_string(),
-            default_value: Some(self.get_default_port()),
-            validation_pattern: Some(r"^\d+$".to_string()),
-            choices: None,
-        }]
+    fn get_parameter_schema(&self) -> Option<serde_json::Value> {
+        // Generate JSON Schema from RedisInputConfig
+        let schema = schemars::schema_for!(RedisInputConfig);
+        serde_json::to_value(schema).ok()
     }
 
     fn get_runtime_env_definitions(&self) -> Vec<super::RuntimeEnvVar> {
@@ -457,11 +506,13 @@ impl ExternalService for RedisService {
                 name: "REDIS_DATABASE".to_string(),
                 description: "Redis database number for this project/environment".to_string(),
                 example: "1".to_string(),
+                sensitive: false,
             },
             super::RuntimeEnvVar {
                 name: "REDIS_URL".to_string(),
                 description: "Full Redis URL including database number".to_string(),
                 example: "redis://localhost:6379/1".to_string(),
+                sensitive: true, // May contain password
             },
         ]
     }
@@ -531,8 +582,7 @@ impl ExternalService for RedisService {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Redis configuration not found"))?
                 .clone();
-            let password = generate_random_password();
-            self.create_container(&self.docker, &config, &password)
+            self.create_container(&self.docker, &config, &config.password)
                 .await?;
         } else {
             self.docker
@@ -541,7 +591,7 @@ impl ExternalService for RedisService {
                     None::<bollard::query_parameters::StartContainerOptions>,
                 )
                 .await
-                .context("Failed to start existing Redis container")?;
+                .map_err(|e| anyhow::anyhow!("Failed to start existing Redis container: {}", e))?;
         }
 
         self.wait_for_container_health(&self.docker, &container_name)
@@ -575,7 +625,7 @@ impl ExternalService for RedisService {
             self.docker
                 .stop_container(&container_name, None::<StopContainerOptions>)
                 .await
-                .context("Failed to stop Redis container")?;
+                .map_err(|e| anyhow::anyhow!("Failed to stop Redis container: {}", e))?;
         }
 
         Ok(())
@@ -609,7 +659,7 @@ impl ExternalService for RedisService {
             self.docker
                 .stop_container(&container_name, None::<StopContainerOptions>)
                 .await
-                .context("Failed to stop Redis container")?;
+                .map_err(|e| anyhow::anyhow!("Failed to stop Redis container: {}", e))?;
 
             // Remove the container
             self.docker
@@ -621,7 +671,7 @@ impl ExternalService for RedisService {
                     }),
                 )
                 .await
-                .context("Failed to remove Redis container")?;
+                .map_err(|e| anyhow::anyhow!("Failed to remove Redis container: {}", e))?;
         }
 
         // Remove volume
@@ -905,21 +955,4 @@ impl ExternalService for RedisService {
         info!("Redis restore completed successfully");
         Ok(())
     }
-}
-
-fn generate_random_password() -> String {
-    use rand::{distributions::Alphanumeric, Rng};
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect()
-}
-
-fn is_port_available(port: u16) -> bool {
-    TcpListener::bind(("0.0.0.0", port)).is_ok()
-}
-
-fn find_available_port(start_port: u16) -> Option<u16> {
-    (start_port..start_port + 100).find(|&port| is_port_available(port))
 }

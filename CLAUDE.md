@@ -13,12 +13,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Create N+1 queries - ALWAYS use JOINs for related data
 - Leave the project in non-compilable state
 - Use `#[tokio::main]` when integrating with pingora
+- **Use plain text logging** - ALWAYS use structured logging with `append_structured_log()` or helper methods (`log_info`, `log_success`, `log_warning`, `log_error`)
 - **Create markdown documentation files (*.md) unless explicitly requested** - No README files, no documentation files unless the user asks
 
 ### ✅ ALWAYS
 - Run `cargo check --lib` after every modification
 - **New functionality must compile without warnings** - Fix all warnings before considering work complete
 - **Write tests for all new functionality AND verify they run successfully** - Tests that don't run are worthless
+- **Use structured logging with explicit log levels** - All logs must use `append_structured_log(log_id, LogLevel, message)` or helper methods
 - **Use Conventional Commits** - Format: `type(scope): description` (e.g., `feat: add user authentication`, `fix(api): handle null responses`)
   - Types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`, `perf`, `ci`, `build`, `revert`
   - CHANGELOG is auto-generated from commits using `git-cliff`
@@ -241,6 +243,103 @@ This is a **Cargo workspace** with 30+ crates organized by domain:
 - **temps-backup**: Backup and restore operations
 - **temps-config**: Configuration management
 - **temps-audit**: Audit logging
+
+## Logging
+
+### Structured Logging (JSONL Format)
+
+**CRITICAL**: All logs must use structured logging. Plain text logging via `append_to_log()` has been removed.
+
+#### Log Format
+
+All logs are stored in **JSONL (JSON Lines)** format with the following structure:
+
+```json
+{"level":"info","message":"Starting deployment","timestamp":"2025-01-25T12:34:56.789Z","line":1}
+{"level":"success","message":"Deployment complete","timestamp":"2025-01-25T12:35:12.456Z","line":2}
+```
+
+#### Log Levels
+
+- `info` - Informational messages (default)
+- `success` - Successful operations (✅)
+- `warning` - Warnings or non-critical issues (⏳, ⚠️)
+- `error` - Errors or failures (❌)
+
+#### Usage
+
+```rust
+use temps_logs::{LogLevel, LogService};
+
+// Basic usage - explicit level
+log_service
+    .append_structured_log(log_id, LogLevel::Info, "Starting deployment")
+    .await?;
+
+// Helper methods (recommended)
+log_service.log_info(log_id, "Processing...").await?;
+log_service.log_success(log_id, "Deployment complete").await?;
+log_service.log_warning(log_id, "Retrying connection...").await?;
+log_service.log_error(log_id, "Failed to connect").await?;
+```
+
+#### Automatic Level Detection
+
+When streaming logs (e.g., Docker build output), use level detection:
+
+```rust
+fn detect_log_level(message: &str) -> LogLevel {
+    if message.contains("✅") || message.contains("Complete") || message.contains("success") {
+        LogLevel::Success
+    } else if message.contains("❌") || message.contains("Failed") || message.contains("Error") {
+        LogLevel::Error
+    } else if message.contains("⏳") || message.contains("Waiting") || message.contains("warning") {
+        LogLevel::Warning
+    } else {
+        LogLevel::Info
+    }
+}
+
+// Use in callbacks
+let level = detect_log_level(&line);
+log_service.append_structured_log(log_id, level, line).await?;
+```
+
+#### Reading Logs
+
+```rust
+// Get structured logs
+let logs: Vec<LogEntry> = log_service.get_structured_logs(log_id).await?;
+
+// Search logs
+let results = log_service.search_structured_logs(log_id, "error").await?;
+
+// Filter by level
+let errors = log_service
+    .filter_structured_logs_by_level(log_id, LogLevel::Error)
+    .await?;
+```
+
+#### Migration from Plain Text Logging
+
+The `append_to_log()` method has been **removed**. All code must use structured logging:
+
+```rust
+// ❌ REMOVED - Will not compile
+log_service.append_to_log(log_id, "message\n").await?;
+
+// ✅ CORRECT - Use structured logging
+log_service.append_structured_log(log_id, LogLevel::Info, "message").await?;
+
+// ✅ BETTER - Use helper methods
+log_service.log_info(log_id, "message").await?;
+```
+
+**Why removed?**
+- Enforces consistent JSONL format across all logs
+- Prevents accidental plain text logs
+- Requires explicit log level selection
+- Enables frontend to display logs with proper icons, colors, and formatting
 
 ## Architecture
 

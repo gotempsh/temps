@@ -72,6 +72,9 @@ pub enum Preset {
     Rsbuild,
 
     // Python frameworks
+    #[sea_orm(string_value = "python")]
+    Python,
+
     #[serde(rename = "fastapi")]
     #[sea_orm(string_value = "fastapi")]
     FastApi,
@@ -130,6 +133,7 @@ impl Preset {
             Preset::React => "react",
             Preset::Docusaurus => "docusaurus",
             Preset::Rsbuild => "rsbuild",
+            Preset::Python => "python",
             Preset::FastApi => "fastapi",
             Preset::Flask => "flask",
             Preset::Django => "django",
@@ -159,6 +163,7 @@ impl Preset {
             Preset::React => "React",
             Preset::Docusaurus => "Docusaurus",
             Preset::Rsbuild => "Rsbuild",
+            Preset::Python => "Python",
             Preset::FastApi => "FastAPI",
             Preset::Flask => "Flask",
             Preset::Django => "Django",
@@ -189,7 +194,7 @@ impl Preset {
             | Preset::Docusaurus
             | Preset::Rsbuild
             | Preset::NodeJs => "node",
-            Preset::FastApi | Preset::Flask | Preset::Django => "python",
+            Preset::Python | Preset::FastApi | Preset::Flask | Preset::Django => "python",
             Preset::Rails => "ruby",
             Preset::Go => "go",
             Preset::Rust => "rust",
@@ -243,6 +248,7 @@ impl Preset {
             Preset::NodeJs => Some(3000), // Generic Node.js
 
             // Python frameworks
+            Preset::Python => Some(8000),  // Generic Python web apps
             Preset::FastApi => Some(8000), // FastAPI/uvicorn default
             Preset::Flask => Some(5000),   // Flask default
             Preset::Django => Some(8000),  // Django default
@@ -281,6 +287,7 @@ impl Preset {
             Preset::React,
             Preset::Docusaurus,
             Preset::Rsbuild,
+            Preset::Python,
             Preset::FastApi,
             Preset::Flask,
             Preset::Django,
@@ -319,6 +326,7 @@ impl std::str::FromStr for Preset {
             "react" => Ok(Preset::React),
             "docusaurus" => Ok(Preset::Docusaurus),
             "rsbuild" => Ok(Preset::Rsbuild),
+            "python" => Ok(Preset::Python),
             "fastapi" => Ok(Preset::FastApi),
             "flask" => Ok(Preset::Flask),
             "django" => Ok(Preset::Django),
@@ -557,6 +565,23 @@ pub struct RsbuildConfig {
     pub output_dir: Option<String>,
 }
 
+/// Python preset configuration (generic)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PythonConfig {
+    /// Python version (default: "3.11")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_version: Option<String>,
+
+    /// Requirements file path (default: "requirements.txt")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requirements_file: Option<String>,
+
+    /// Main application file
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_file: Option<String>,
+}
+
 /// FastAPI preset configuration
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "camelCase")]
@@ -744,6 +769,7 @@ pub enum PresetConfig {
     React(ReactConfig),
     Docusaurus(DocusaurusConfig),
     Rsbuild(RsbuildConfig),
+    Python(PythonConfig),
     #[serde(rename = "fastapi")]
     FastApi(FastApiConfig),
     Flask(FlaskConfig),
@@ -775,6 +801,7 @@ impl PresetConfig {
             Preset::React => PresetConfig::React(ReactConfig::default()),
             Preset::Docusaurus => PresetConfig::Docusaurus(DocusaurusConfig::default()),
             Preset::Rsbuild => PresetConfig::Rsbuild(RsbuildConfig::default()),
+            Preset::Python => PresetConfig::Python(PythonConfig::default()),
             Preset::FastApi => PresetConfig::FastApi(FastApiConfig::default()),
             Preset::Flask => PresetConfig::Flask(FlaskConfig::default()),
             Preset::Django => PresetConfig::Django(DjangoConfig::default()),
@@ -804,6 +831,7 @@ impl PresetConfig {
             PresetConfig::React(_) => Preset::React,
             PresetConfig::Docusaurus(_) => Preset::Docusaurus,
             PresetConfig::Rsbuild(_) => Preset::Rsbuild,
+            PresetConfig::Python(_) => Preset::Python,
             PresetConfig::FastApi(_) => Preset::FastApi,
             PresetConfig::Flask(_) => Preset::Flask,
             PresetConfig::Django(_) => Preset::Django,

@@ -13,6 +13,7 @@ use serde::Serialize;
 use super::types::{
     CreateProjectRequest, Project, ProjectError, ProjectStatistics, UpdateDeploymentSettingsRequest,
 };
+use crate::handlers::UpdateDeploymentConfigRequest;
 use super::{EnvVarService, EnvVarWithEnvironments};
 use temps_presets::get_preset_by_slug;
 // Placeholder functions - these should be implemented properly or imported from other services
@@ -1074,6 +1075,98 @@ impl ProjectService {
 
         Ok(Self::map_db_project_to_project(updated_project))
     }
+
+    /// Update deployment configuration for a project
+    pub async fn update_project_deployment_config(
+        &self,
+        project_id_or_slug: &str,
+        config: UpdateDeploymentConfigRequest,
+    ) -> Result<Project, ProjectError> {
+        // Find project by ID or slug
+        let project = if let Ok(project_id_int) = project_id_or_slug.parse::<i32>() {
+            projects::Entity::find_by_id(project_id_int)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or_else(|| {
+                    ProjectError::NotFound(format!("Project with id {} not found", project_id_int))
+                })?
+        } else {
+            projects::Entity::find()
+                .filter(projects::Column::Slug.eq(project_id_or_slug))
+                .one(self.db.as_ref())
+                .await?
+                .ok_or_else(|| {
+                    ProjectError::NotFound(format!(
+                        "Project with slug {} not found",
+                        project_id_or_slug
+                    ))
+                })?
+        };
+
+        // Get existing deployment config or create default
+        let mut deployment_config = project.deployment_config.clone().unwrap_or_default();
+
+        // Update only the fields that are provided
+        if let Some(cpu_request) = config.cpu_request {
+            deployment_config.cpu_request = Some(cpu_request);
+        }
+        if let Some(cpu_limit) = config.cpu_limit {
+            deployment_config.cpu_limit = Some(cpu_limit);
+        }
+        if let Some(memory_request) = config.memory_request {
+            deployment_config.memory_request = Some(memory_request);
+        }
+        if let Some(memory_limit) = config.memory_limit {
+            deployment_config.memory_limit = Some(memory_limit);
+        }
+        if let Some(exposed_port) = config.exposed_port {
+            deployment_config.exposed_port = Some(exposed_port);
+        }
+        if let Some(automatic_deploy) = config.automatic_deploy {
+            deployment_config.automatic_deploy = automatic_deploy;
+        }
+        if let Some(performance_metrics_enabled) = config.performance_metrics_enabled {
+            deployment_config.performance_metrics_enabled = performance_metrics_enabled;
+        }
+        if let Some(session_recording_enabled) = config.session_recording_enabled {
+            deployment_config.session_recording_enabled = session_recording_enabled;
+        }
+        if let Some(replicas) = config.replicas {
+            deployment_config.replicas = replicas;
+        }
+
+        // Validate the deployment config
+        deployment_config.validate().map_err(|e| {
+            ProjectError::InvalidInput(format!("Invalid deployment config: {}", e))
+        })?;
+
+        // Update the project
+        let mut active_project: projects::ActiveModel = project.clone().into();
+        active_project.deployment_config = Set(Some(deployment_config));
+
+        let updated_project = active_project.update(self.db.as_ref()).await?;
+
+        // Emit ProjectUpdated job
+        let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
+            project_id: updated_project.id,
+            project_name: updated_project.name.clone(),
+        });
+
+        if let Err(e) = self.queue_service.send(project_updated_job).await {
+            warn!(
+                "Failed to emit ProjectUpdated job for project {}: {}",
+                updated_project.id, e
+            );
+        } else {
+            info!(
+                "Emitted ProjectUpdated job for project {} (deployment config update)",
+                updated_project.id
+            );
+        }
+
+        Ok(Self::map_db_project_to_project(updated_project))
+    }
+
     /// Generate a unique project slug by checking for collisions and appending a short UUID if needed
     pub async fn generate_unique_project_slug(&self, name: &str) -> Result<String, ProjectError> {
         let base_slug = slugify(name);

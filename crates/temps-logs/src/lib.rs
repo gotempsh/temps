@@ -17,8 +17,10 @@
 pub mod docker_logs;
 pub mod file_logs;
 pub mod plugin;
+pub mod structured_logs;
 
 // Re-export the main types for convenience
 pub use docker_logs::{DockerLogError, DockerLogService};
 pub use file_logs::LogService;
 pub use plugin::LogsPlugin;
+pub use structured_logs::{LogEntry, LogLevel, StructuredLogService};

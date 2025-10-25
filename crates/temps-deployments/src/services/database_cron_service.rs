@@ -215,7 +215,7 @@ impl CronConfigService for DatabaseCronConfigService {
                     })?;
 
                     info!(
-                        "✅ Updated cron job '{}' with schedule '{}', next run at {:?}",
+                        "Updated cron job '{}' with schedule '{}', next run at {:?}",
                         cron.path, cron_config.schedule, next_run
                     );
                 }
@@ -247,7 +247,7 @@ impl CronConfigService for DatabaseCronConfigService {
                     match new_cron.insert(self.db.as_ref()).await {
                         Ok(cron) => {
                             info!(
-                                "✅ Created cron job '{}' with schedule '{}', next run at {:?}",
+                                "Created cron job '{}' with schedule '{}', next run at {:?}",
                                 cron.path, cron.schedule, cron.next_run
                             );
                         }
@@ -264,7 +264,7 @@ impl CronConfigService for DatabaseCronConfigService {
         }
 
         info!(
-            "✅ Successfully configured cron jobs for project {} in environment {}",
+            "Successfully configured cron jobs for project {} in environment {}",
             project_id, environment_id
         );
 

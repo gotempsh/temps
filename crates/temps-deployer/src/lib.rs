@@ -69,6 +69,7 @@ pub struct BuildRequest {
     pub context_path: PathBuf,
     pub dockerfile_path: Option<PathBuf>,
     pub build_args: HashMap<String, String>,
+    pub build_args_buildkit: HashMap<String, String>,
     pub platform: Option<String>,
     pub log_path: PathBuf,
 }
@@ -422,7 +423,8 @@ mod tests {
             image_name: "test-image:latest".to_string(),
             context_path: context_path.clone(),
             dockerfile_path: Some(context_path.join("Dockerfile")),
-            build_args,
+            build_args: build_args.clone(),
+            build_args_buildkit: build_args.clone(),
             platform: Some("linux/amd64".to_string()),
             log_path,
         };
@@ -631,6 +633,7 @@ mod tests {
             context_path: PathBuf::from("/tmp/build"),
             dockerfile_path: None,
             build_args: HashMap::new(),
+            build_args_buildkit: HashMap::new(),
             platform: None,
             log_path: PathBuf::from("/tmp/build.log"),
         };
@@ -700,7 +703,8 @@ CMD ["echo", "Hello from container"]
             image_name: "test-app:v1.0".to_string(),
             context_path: temp_dir.path().to_path_buf(),
             dockerfile_path: Some(dockerfile_path.clone()),
-            build_args,
+            build_args: build_args.clone(),
+            build_args_buildkit: build_args.clone(),
             platform: Some("linux/amd64".to_string()),
             log_path: temp_dir.path().join("build.log"),
         };

@@ -1030,7 +1030,7 @@ mod integration_tests {
             branch_ref: Set(Some("main".to_string())),
             slug: Set("test-deployment".to_string()),
             state: Set("deployed".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()

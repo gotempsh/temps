@@ -6,13 +6,13 @@
 //! is live before they run.
 
 use async_trait::async_trait;
-use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::{JobResult, UtcDateTime, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
 use temps_entities::{deployment_containers, deployments, environments};
-use temps_logs::LogService;
+use temps_logs::{LogLevel, LogService};
 use tracing::{debug, info};
 
 /// Output from MarkDeploymentCompleteJob
@@ -29,6 +29,7 @@ pub struct MarkDeploymentCompleteJob {
     db: Arc<DbConnection>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
+    container_deployer: Arc<dyn temps_deployer::ContainerDeployer>,
 }
 
 impl std::fmt::Debug for MarkDeploymentCompleteJob {
@@ -41,13 +42,19 @@ impl std::fmt::Debug for MarkDeploymentCompleteJob {
 }
 
 impl MarkDeploymentCompleteJob {
-    pub fn new(job_id: String, deployment_id: i32, db: Arc<DbConnection>) -> Self {
+    pub fn new(
+        job_id: String,
+        deployment_id: i32,
+        db: Arc<DbConnection>,
+        container_deployer: Arc<dyn temps_deployer::ContainerDeployer>,
+    ) -> Self {
         Self {
             job_id,
             deployment_id,
             db,
             log_id: None,
             log_service: None,
+            container_deployer,
         }
     }
 
@@ -63,13 +70,29 @@ impl MarkDeploymentCompleteJob {
 
     /// Write log message to job-specific log file
     async fn log(&self, message: String) -> Result<(), WorkflowError> {
+        // Detect log level from message content/emojis
+        let level = Self::detect_log_level(&message);
+
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
-                .append_to_log(log_id, &format!("{}\n", message))
+                .append_structured_log(log_id, level, message.clone())
                 .await
                 .map_err(|e| WorkflowError::Other(format!("Failed to write log: {}", e)))?;
         }
         Ok(())
+    }
+
+    /// Detect log level from message content
+    fn detect_log_level(message: &str) -> LogLevel {
+        if message.contains("✅") || message.contains("🎉") || message.contains("Complete") || message.contains("success") {
+            LogLevel::Success
+        } else if message.contains("❌") || message.contains("⚠️") || message.contains("Failed") || message.contains("Error") || message.contains("error") {
+            LogLevel::Error
+        } else if message.contains("⏳") || message.contains("🔄") || message.contains("🛑") || message.contains("Waiting") || message.contains("warning") || message.contains("Checking") || message.contains("Cancelling") {
+            LogLevel::Warning
+        } else {
+            LogLevel::Info
+        }
     }
 
     /// Mark deployment as complete and update environment
@@ -78,7 +101,7 @@ impl MarkDeploymentCompleteJob {
         &self,
         context: &WorkflowContext,
     ) -> Result<MarkCompleteOutput, WorkflowError> {
-        self.log("🎯 Marking deployment as complete...".to_string())
+        self.log("Marking deployment as complete...".to_string())
             .await?;
 
         // Get deployment
@@ -160,10 +183,10 @@ impl MarkDeploymentCompleteJob {
                 })?;
 
             info!(
-                "✅ Created deployment_container record for container {}",
+                "Created deployment_container record for container {}",
                 container_id
             );
-            self.log(format!("✅ Container {} registered", container_id))
+            self.log(format!("Container {} registered", container_id))
                 .await?;
         }
 
@@ -180,9 +203,9 @@ impl MarkDeploymentCompleteJob {
                 WorkflowError::JobExecutionFailed(format!("Failed to update deployment: {}", e))
             })?;
 
-        info!("✅ Deployment {} marked as complete", self.deployment_id);
+        info!("Deployment {} marked as complete", self.deployment_id);
         self.log(format!(
-            "✅ Deployment {} status updated to Completed",
+            "Deployment {} status updated to Completed",
             self.deployment_id
         ))
         .await?;
@@ -212,22 +235,165 @@ impl MarkDeploymentCompleteJob {
             })?;
 
         info!(
-            "✅ Environment {} current_deployment_id updated to {}",
+            "Environment {} current_deployment_id updated to {}",
             environment_id, self.deployment_id
         );
         self.log(format!(
-            "✅ Environment {} now points to deployment {}",
+            "Environment {} now points to deployment {}",
             environment_id, self.deployment_id
         ))
         .await?;
 
-        self.log("🎉 Deployment is now LIVE and ready for traffic!".to_string())
+        self.log("Deployment is now LIVE and ready for traffic!".to_string())
             .await?;
+
+        // Cancel and teardown all previous deployments for this environment
+        self.cancel_previous_deployments(environment_id).await;
 
         Ok(MarkCompleteOutput {
             completed_at: now,
             environment_id,
         })
+    }
+
+    /// Cancel and teardown all running/pending deployments for the same environment
+    /// This ensures only one active deployment per environment
+    async fn cancel_previous_deployments(&self, environment_id: i32) {
+        use sea_orm::Set;
+
+        self.log("Checking for previous deployments to cancel...".to_string())
+            .await
+            .ok();
+
+        // Find all running or pending deployments for this environment (excluding the new one)
+        let previous_deployments = match deployments::Entity::find()
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployments::Column::Id.ne(self.deployment_id))
+            .filter(
+                deployments::Column::State
+                    .is_in(vec!["pending", "running", "built", "completed"]),
+            )
+            .all(self.db.as_ref())
+            .await
+        {
+            Ok(deps) => deps,
+            Err(e) => {
+                self.log(format!("Failed to fetch previous deployments: {}", e))
+                    .await
+                    .ok();
+                return;
+            }
+        };
+
+        if previous_deployments.is_empty() {
+            self.log("No previous deployments to cancel".to_string())
+                .await
+                .ok();
+            return;
+        }
+
+        self.log(format!(
+            "Found {} previous deployment(s) to cancel",
+            previous_deployments.len()
+        ))
+        .await
+        .ok();
+
+        for deployment in previous_deployments {
+            let deployment_id = deployment.id;
+            self.log(format!(
+                "Cancelling deployment {} (state: {})",
+                deployment_id, deployment.state
+            ))
+            .await
+            .ok();
+
+            // Stop all containers for this deployment
+            let containers = match deployment_containers::Entity::find()
+                .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+                .filter(deployment_containers::Column::DeletedAt.is_null())
+                .all(self.db.as_ref())
+                .await
+            {
+                Ok(containers) => containers,
+                Err(e) => {
+                    self.log(format!(
+                        "Failed to fetch containers for deployment {}: {}",
+                        deployment_id, e
+                    ))
+                    .await
+                    .ok();
+                    continue;
+                }
+            };
+
+            for container in containers {
+                let container_id = container.container_id.clone();
+
+                // Stop container first
+                match self.container_deployer.stop_container(&container_id).await {
+                    Ok(_) => {
+                        self.log(format!("Stopped container {}", container_id))
+                            .await
+                            .ok();
+                    }
+                    Err(e) => {
+                        self.log(format!("Failed to stop container {}: {}", container_id, e))
+                            .await
+                            .ok();
+                    }
+                }
+
+                // Remove container from Docker
+                match self.container_deployer.remove_container(&container_id).await {
+                    Ok(_) => {
+                        self.log(format!("Removed container {}", container_id))
+                            .await
+                            .ok();
+                    }
+                    Err(e) => {
+                        self.log(format!("Failed to remove container {}: {}", container_id, e))
+                            .await
+                            .ok();
+                    }
+                }
+
+                // Mark container as deleted in database
+                let mut active_container: deployment_containers::ActiveModel = container.into();
+                active_container.deleted_at = Set(Some(chrono::Utc::now()));
+                active_container.status = Set(Some("removed".to_string()));
+                if let Err(e) = active_container.update(self.db.as_ref()).await {
+                    self.log(format!("Failed to update container status: {}", e))
+                        .await
+                        .ok();
+                }
+            }
+
+            // Update deployment to cancelled state
+            let mut active_deployment: deployments::ActiveModel = deployment.into();
+            active_deployment.state = Set("cancelled".to_string());
+            active_deployment.cancelled_reason =
+                Set(Some("Superseded by new deployment".to_string()));
+            active_deployment.finished_at = Set(Some(chrono::Utc::now()));
+            active_deployment.updated_at = Set(chrono::Utc::now());
+
+            match active_deployment.update(self.db.as_ref()).await {
+                Ok(_) => {
+                    self.log(format!("Cancelled deployment {}", deployment_id))
+                        .await
+                        .ok();
+                }
+                Err(e) => {
+                    self.log(format!("Failed to update deployment status: {}", e))
+                        .await
+                        .ok();
+                }
+            }
+        }
+
+        self.log("All previous deployments cancelled successfully".to_string())
+            .await
+            .ok();
     }
 }
 
@@ -253,7 +419,7 @@ impl WorkflowTask for MarkDeploymentCompleteJob {
 
     async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
         self.log(format!(
-            "🚀 Marking deployment {} as complete",
+            "Marking deployment {} as complete",
             self.deployment_id
         ))
         .await?;
@@ -269,7 +435,7 @@ impl WorkflowTask for MarkDeploymentCompleteJob {
         context.set_output(&self.job_id, "environment_id", output.environment_id)?;
         context.set_output(&self.job_id, "deployment_id", self.deployment_id)?;
 
-        self.log("✅ Deployment marked as complete successfully".to_string())
+        self.log("Deployment marked as complete successfully".to_string())
             .await?;
 
         Ok(JobResult::success(context))
@@ -304,6 +470,7 @@ pub struct MarkDeploymentCompleteJobBuilder {
     db: Option<Arc<DbConnection>>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
+    container_deployer: Option<Arc<dyn temps_deployer::ContainerDeployer>>,
 }
 
 impl MarkDeploymentCompleteJobBuilder {
@@ -314,6 +481,7 @@ impl MarkDeploymentCompleteJobBuilder {
             db: None,
             log_id: None,
             log_service: None,
+            container_deployer: None,
         }
     }
 
@@ -342,6 +510,11 @@ impl MarkDeploymentCompleteJobBuilder {
         self
     }
 
+    pub fn container_deployer(mut self, container_deployer: Arc<dyn temps_deployer::ContainerDeployer>) -> Self {
+        self.container_deployer = Some(container_deployer);
+        self
+    }
+
     pub fn build(self) -> Result<MarkDeploymentCompleteJob, WorkflowError> {
         let job_id = self
             .job_id
@@ -352,8 +525,11 @@ impl MarkDeploymentCompleteJobBuilder {
         let db = self.db.ok_or_else(|| {
             WorkflowError::JobValidationFailed("db connection is required".to_string())
         })?;
+        let container_deployer = self.container_deployer.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("container_deployer is required".to_string())
+        })?;
 
-        let mut job = MarkDeploymentCompleteJob::new(job_id, deployment_id, db);
+        let mut job = MarkDeploymentCompleteJob::new(job_id, deployment_id, db, container_deployer);
 
         if let Some(log_id) = self.log_id {
             job = job.with_log_id(log_id);

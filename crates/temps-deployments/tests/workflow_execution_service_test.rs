@@ -151,7 +151,7 @@ async fn create_test_data(
         environment_id: Set(environment.id),
         slug: Set("test-deployment".to_string()),
         state: Set("pending".to_string()),
-        metadata: Set(serde_json::json!({})),
+        metadata: Set(None),
         created_at: Set(Utc::now()),
         updated_at: Set(Utc::now()),
         ..Default::default()

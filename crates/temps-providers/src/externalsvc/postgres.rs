@@ -3,8 +3,9 @@ use async_trait::async_trait;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::{body_full, Docker};
 use futures::{StreamExt, TryStreamExt};
+use schemars::JsonSchema;
 use sea_orm::{prelude::*, *};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -16,27 +17,96 @@ use tracing::{error, info};
 
 use crate::utils::ensure_network_exists;
 
-use super::{ExternalService, RuntimeEnvVar, ServiceConfig, ServiceParameter, ServiceType};
+use super::{ExternalService, RuntimeEnvVar, ServiceConfig, ServiceType};
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct PostgresConfig {
+/// Input configuration for creating a PostgreSQL service
+/// This is what users provide when creating the service
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(title = "PostgreSQL Configuration", description = "Configuration for PostgreSQL service")]
+pub struct PostgresInputConfig {
+    /// PostgreSQL host address
     #[serde(default = "default_host")]
+    #[schemars(example = "example_host", default = "default_host")]
+    pub host: String,
+
+    /// PostgreSQL port (auto-assigned if not provided)
+    #[schemars(example = "example_port")]
+    pub port: Option<String>,
+
+    /// PostgreSQL database name
+    #[serde(default = "default_database")]
+    #[schemars(example = "example_database", default = "default_database")]
+    pub database: String,
+
+    /// PostgreSQL username
+    #[serde(default = "default_username")]
+    #[schemars(example = "example_username", default = "default_username")]
+    pub username: String,
+
+    /// PostgreSQL password (auto-generated if not provided or empty)
+    #[serde(default, deserialize_with = "deserialize_optional_password")]
+    #[schemars(with = "Option<String>", example = "example_password")]
+    pub password: Option<String>,
+
+    /// Maximum number of connections
+    #[serde(default = "default_max_connections")]
+    #[schemars(example = "example_max_connections", default = "default_max_connections")]
+    pub max_connections: u32,
+
+    /// SSL mode (disable, allow, prefer, require)
+    #[serde(default = "default_ssl_mode")]
+    #[schemars(example = "example_ssl_mode", default = "default_ssl_mode_string")]
+    pub ssl_mode: Option<String>,
+}
+
+/// Internal runtime configuration for PostgreSQL service
+/// This is what the service uses internally after processing input
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostgresConfig {
     pub host: String,
     pub port: String,
     pub database: String,
-    #[serde(default = "default_username")]
     pub username: String,
-    #[serde(default = "generate_password")]
     pub password: String,
-    #[serde(default = "default_max_connections")]
     pub max_connections: u32,
-    #[serde(default = "default_ssl_mode")]
-    #[allow(unused)]
     pub ssl_mode: Option<String>,
+}
+
+impl From<PostgresInputConfig> for PostgresConfig {
+    fn from(input: PostgresInputConfig) -> Self {
+        Self {
+            host: input.host,
+            port: input.port.unwrap_or_else(|| {
+                find_available_port(5432)
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "5432".to_string())
+            }),
+            database: input.database,
+            username: input.username,
+            password: input.password.unwrap_or_else(generate_password),
+            max_connections: input.max_connections,
+            ssl_mode: input.ssl_mode,
+        }
+    }
+}
+
+fn deserialize_optional_password<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(match opt {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => None,
+    })
 }
 
 fn default_host() -> String {
     "localhost".to_string()
+}
+
+fn default_database() -> String {
+    "postgres".to_string()
 }
 
 fn default_username() -> String {
@@ -53,11 +123,44 @@ fn generate_password() -> String {
 }
 
 fn default_max_connections() -> u32 {
-    5
+    100
 }
 
 fn default_ssl_mode() -> Option<String> {
     Some("disable".to_string())
+}
+
+fn default_ssl_mode_string() -> String {
+    "disable".to_string()
+}
+
+// Schema example functions
+fn example_host() -> &'static str {
+    "localhost"
+}
+
+fn example_port() -> &'static str {
+    "5432"
+}
+
+fn example_database() -> &'static str {
+    "myapp"
+}
+
+fn example_username() -> &'static str {
+    "postgres"
+}
+
+fn example_password() -> &'static str {
+    "your-secure-password"
+}
+
+fn example_max_connections() -> u32 {
+    10
+}
+
+fn example_ssl_mode() -> &'static str {
+    "disable"
 }
 
 fn is_port_available(port: u16) -> bool {
@@ -86,38 +189,14 @@ impl PostgresService {
     }
 
     fn get_postgres_config(&self, service_config: ServiceConfig) -> Result<PostgresConfig> {
-        let host = service_config
-            .parameters
-            .get("host")
-            .context("Missing host parameter")?;
-        let port = service_config
-            .parameters
-            .get("port")
-            .context("Missing port parameter")?;
-        let database = service_config
-            .parameters
-            .get("database")
-            .context("Missing database parameter")?;
-        let username = service_config
-            .parameters
-            .get("username")
-            .context("Missing username parameter")?;
-        let password = service_config
-            .parameters
-            .get("password")
-            .context("Missing password parameter")?;
-        Ok(PostgresConfig {
-            host: host.as_str().unwrap().to_string(),
-            port: port.as_str().unwrap().to_string(),
-            database: database.as_str().unwrap().to_string(),
-            username: username.as_str().unwrap().to_string(),
-            password: password.as_str().unwrap().to_string(),
-            max_connections: default_max_connections(),
-            ssl_mode: default_ssl_mode(),
-        })
+        // Parse input config and transform to runtime config
+        let input_config: PostgresInputConfig = serde_json::from_value(service_config.parameters)
+            .map_err(|e| anyhow::anyhow!("Failed to parse PostgreSQL configuration: {}", e))?;
+
+        Ok(PostgresConfig::from(input_config))
     }
     fn get_container_name(&self) -> String {
-        format!("postgres_{}", self.name)
+        format!("postgres-{}", self.name)
     }
 
     async fn create_container(&self, docker: &Docker, config: &PostgresConfig) -> Result<()> {
@@ -298,17 +377,6 @@ impl PostgresService {
         Err(anyhow::anyhow!(
             "PostgreSQL container health check timed out"
         ))
-    }
-
-    fn get_default_port(&self) -> String {
-        // Start with default PostgreSQL port
-        let start_port = 5432;
-
-        // Find next available port
-        match find_available_port(start_port) {
-            Some(port) => port.to_string(),
-            None => start_port.to_string(), // Fallback to default if no ports found
-        }
     }
 
     async fn create_database(&self, service_config: ServiceConfig, name: &str) -> Result<()> {
@@ -573,29 +641,33 @@ impl ExternalService for PostgresService {
     }
     async fn init(&self, config: ServiceConfig) -> Result<HashMap<String, String>> {
         info!("Initializing PostgreSQL service {:?}", config);
-        let mut postgres_config: PostgresConfig = serde_json::from_value(config.parameters)
-            .context("Failed to parse PostgreSQL configuration")?;
+
+        // Parse input config and transform to runtime config
+        let postgres_config = self.get_postgres_config(config)?;
+
+        // Store runtime config
+        *self.config.write().await = Some(postgres_config.clone());
+
+        // Create Docker container
+        self.create_container(&self.docker, &postgres_config).await?;
+
+        // Serialize the full runtime config to save to database
+        // This ensures auto-generated values (password, port) are persisted
+        let runtime_config_json = serde_json::to_value(&postgres_config)
+            .context("Failed to serialize PostgreSQL runtime config")?;
+
+        let runtime_config_map = runtime_config_json
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Runtime config is not an object"))?;
 
         let mut inferred_params = HashMap::new();
-        inferred_params.insert("host".to_string(), postgres_config.host.clone());
-        inferred_params.insert("port".to_string(), postgres_config.port.clone());
-        inferred_params.insert("database".to_string(), postgres_config.database.clone());
-        inferred_params.insert("username".to_string(), postgres_config.username.clone());
-
-        // Generate random password if Docker is available and password is not set
-        if postgres_config.password.is_empty() {
-            postgres_config.password = generate_password();
+        for (key, value) in runtime_config_map {
+            if let Some(str_value) = value.as_str() {
+                inferred_params.insert(key.clone(), str_value.to_string());
+            } else if let Some(num_value) = value.as_u64() {
+                inferred_params.insert(key.clone(), num_value.to_string());
+            }
         }
-
-        // Create Docker container if Docker instance is provided
-        self.create_container(&self.docker, &postgres_config)
-            .await?;
-
-        if !postgres_config.password.is_empty() {
-            inferred_params.insert("password".to_string(), postgres_config.password.clone());
-        }
-
-        *self.config.write().await = Some(postgres_config);
 
         Ok(inferred_params)
     }
@@ -635,11 +707,13 @@ impl ExternalService for PostgresService {
                 name: "POSTGRES_DATABASE".to_string(),
                 description: "Database name specific to this project/environment".to_string(),
                 example: "project_123_production".to_string(),
+                sensitive: false,
             },
             RuntimeEnvVar {
                 name: "POSTGRES_URL".to_string(),
                 description: "Full connection URL including project-specific database".to_string(),
                 example: "postgresql://user:pass@localhost:5432/project_123_production".to_string(),
+                sensitive: true, // Contains password
             },
         ]
     }
@@ -715,54 +789,10 @@ impl ExternalService for PostgresService {
         Ok(())
     }
 
-    fn get_parameter_definitions(&self) -> Vec<ServiceParameter> {
-        vec![
-            ServiceParameter {
-                name: "host".to_string(),
-                required: true,
-                encrypted: false,
-                description: "Database host".to_string(),
-                default_value: Some("localhost".to_string()),
-                validation_pattern: None,
-                choices: None,
-            },
-            ServiceParameter {
-                name: "port".to_string(),
-                required: true,
-                encrypted: false,
-                description: "Database port".to_string(),
-                default_value: Some(self.get_default_port()),
-                validation_pattern: Some(r"^\d+$".to_string()),
-                choices: None,
-            },
-            ServiceParameter {
-                name: "database".to_string(),
-                required: true,
-                encrypted: false,
-                description: "Database name".to_string(),
-                default_value: Some("postgres".to_string()),
-                validation_pattern: None,
-                choices: None,
-            },
-            ServiceParameter {
-                name: "username".to_string(),
-                required: true,
-                encrypted: false,
-                description: "Database username".to_string(),
-                default_value: Some("postgres".to_string()),
-                validation_pattern: None,
-                choices: None,
-            },
-            ServiceParameter {
-                name: "password".to_string(),
-                required: true,
-                encrypted: true,
-                description: "Database password".to_string(),
-                default_value: None,
-                validation_pattern: None,
-                choices: None,
-            },
-        ]
+    fn get_parameter_schema(&self) -> Option<serde_json::Value> {
+        // Generate JSON Schema from PostgresInputConfig
+        let schema = schemars::schema_for!(PostgresInputConfig);
+        serde_json::to_value(schema).ok()
     }
 
     async fn start(&self) -> Result<()> {

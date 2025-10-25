@@ -55,7 +55,7 @@ impl PackageManager {
     /// Extract package manager from packageManager field in package.json
     fn from_package_json_field(app: &App) -> Option<Self> {
         let content = app.read_file("package.json").ok()?;
-        let package_json = PackageJson::from_str(&content).ok()?;
+        let package_json = PackageJson::parse(&content).ok()?;
         let package_manager = package_json.package_manager.as_ref()?;
 
         // Format: "pnpm@8.15.0" or "yarn@4.0.2"
@@ -92,7 +92,7 @@ impl PackageManager {
     /// Extract package manager from engines field in package.json
     fn from_engines_field(app: &App) -> Option<Self> {
         let content = app.read_file("package.json").ok()?;
-        let package_json = PackageJson::from_str(&content).ok()?;
+        let package_json = PackageJson::parse(&content).ok()?;
         let engines = package_json.engines.as_ref()?;
 
         // Check in order: pnpm, bun, yarn, npm
@@ -131,7 +131,7 @@ impl PackageManager {
         }
 
         if let Ok(content) = app.read_file("package.json") {
-            if let Ok(package_json) = PackageJson::from_str(&content) {
+            if let Ok(package_json) = PackageJson::parse(&content) {
                 return package_json.package_manager.is_some();
             }
         }
@@ -246,7 +246,7 @@ impl PackageManager {
             Err(_) => return DEFAULT_NODE_VERSION,
         };
 
-        let package_json = match PackageJson::from_str(&content) {
+        let package_json = match PackageJson::parse(&content) {
             Ok(pj) => pj,
             Err(_) => return DEFAULT_NODE_VERSION,
         };
@@ -300,7 +300,7 @@ impl PackageManager {
     /// Get package manager version requirement for Corepack
     pub fn corepack_version(self, app: &App) -> Option<String> {
         let content = app.read_file("package.json").ok()?;
-        let package_json = PackageJson::from_str(&content).ok()?;
+        let package_json = PackageJson::parse(&content).ok()?;
 
         // Return the packageManager field value (format: "pnpm@8.15.0" or "yarn@4.0.2")
         package_json.package_manager.clone()

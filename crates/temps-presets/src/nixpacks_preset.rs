@@ -31,19 +31,30 @@ use tracing::{debug, info, warn};
 /// Nixpacks provider type - represents which language/framework nixpacks will use
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NixpacksProvider {
-    Auto,       // Auto-detect (default)
-    Node,       // Node.js / JavaScript
-    Python,     // Python
-    Rust,       // Rust
-    Go,         // Go
-    Java,       // Java
-    Php,        // PHP
-    Ruby,       // Ruby
-    Deno,       // Deno
-    Elixir,     // Elixir
-    CSharp,     // C# / .NET
-    Dart,       // Dart
-    Static,     // Static files
+    Auto,     // Auto-detect (default)
+    Node,     // Node.js / JavaScript
+    Python,   // Python
+    Rust,     // Rust
+    Go,       // Go
+    Java,     // Java
+    Php,      // PHP
+    Ruby,     // Ruby
+    Deno,     // Deno
+    Elixir,   // Elixir
+    CSharp,   // C# / .NET
+    FSharp,   // F# / .NET
+    Dart,     // Dart
+    Swift,    // Swift
+    Zig,      // Zig
+    Scala,    // Scala
+    Haskell,  // Haskell
+    Clojure,  // Clojure
+    Crystal,  // Crystal
+    Cobol,    // COBOL
+    Gleam,    // Gleam
+    Lunatic,  // Lunatic
+    Scheme,   // Scheme (Haunt)
+    Static,   // Static files
 }
 
 impl NixpacksProvider {
@@ -60,7 +71,18 @@ impl NixpacksProvider {
             Self::Deno => "Deno",
             Self::Elixir => "Elixir",
             Self::CSharp => "C# / .NET",
+            Self::FSharp => "F# / .NET",
             Self::Dart => "Dart",
+            Self::Swift => "Swift",
+            Self::Zig => "Zig",
+            Self::Scala => "Scala",
+            Self::Haskell => "Haskell",
+            Self::Clojure => "Clojure",
+            Self::Crystal => "Crystal",
+            Self::Cobol => "COBOL",
+            Self::Gleam => "Gleam",
+            Self::Lunatic => "Lunatic",
+            Self::Scheme => "Scheme",
             Self::Static => "Static Files",
         }
     }
@@ -78,7 +100,18 @@ impl NixpacksProvider {
             Self::Deno => "nixpacks-deno",
             Self::Elixir => "nixpacks-elixir",
             Self::CSharp => "nixpacks-csharp",
+            Self::FSharp => "nixpacks-fsharp",
             Self::Dart => "nixpacks-dart",
+            Self::Swift => "nixpacks-swift",
+            Self::Zig => "nixpacks-zig",
+            Self::Scala => "nixpacks-scala",
+            Self::Haskell => "nixpacks-haskell",
+            Self::Clojure => "nixpacks-clojure",
+            Self::Crystal => "nixpacks-crystal",
+            Self::Cobol => "nixpacks-cobol",
+            Self::Gleam => "nixpacks-gleam",
+            Self::Lunatic => "nixpacks-lunatic",
+            Self::Scheme => "nixpacks-scheme",
             Self::Static => "nixpacks-static",
         }
     }
@@ -96,7 +129,18 @@ impl NixpacksProvider {
             Self::Deno => "/presets/deno.svg",
             Self::Elixir => "/presets/elixir.svg",
             Self::CSharp => "/presets/dotnet.svg",
+            Self::FSharp => "/presets/fsharp.svg",
             Self::Dart => "/presets/dart.svg",
+            Self::Swift => "/presets/swift.svg",
+            Self::Zig => "/presets/zig.svg",
+            Self::Scala => "/presets/scala.svg",
+            Self::Haskell => "/presets/haskell.svg",
+            Self::Clojure => "/presets/clojure.svg",
+            Self::Crystal => "/presets/crystal.svg",
+            Self::Cobol => "/presets/cobol.svg",
+            Self::Gleam => "/presets/gleam.svg",
+            Self::Lunatic => "/presets/lunatic.svg",
+            Self::Scheme => "/presets/scheme.svg",
             Self::Static => "/presets/static.svg",
         }
     }
@@ -115,7 +159,18 @@ impl NixpacksProvider {
             Self::Deno,
             Self::Elixir,
             Self::CSharp,
+            Self::FSharp,
             Self::Dart,
+            Self::Swift,
+            Self::Zig,
+            Self::Scala,
+            Self::Haskell,
+            Self::Clojure,
+            Self::Crystal,
+            Self::Cobol,
+            Self::Gleam,
+            Self::Lunatic,
+            Self::Scheme,
             Self::Static,
         ]
     }
@@ -141,19 +196,108 @@ impl NixpacksPreset {
     pub fn detect_available_providers(path: &Path) -> Vec<NixpacksProvider> {
         let mut available = Vec::new();
 
+        // Check if a Nixpacks config file exists to pass as an option if present
+        // Supported: nixpacks.toml or .nixpacks.toml
+        let nixpacks_toml = path.join("nixpacks.toml");
+        let dot_nixpacks_toml = path.join(".nixpacks.toml");
+        let config_file = if nixpacks_toml.exists() {
+            Some(nixpacks_toml)
+        } else if dot_nixpacks_toml.exists() {
+            Some(dot_nixpacks_toml)
+        } else {
+            None
+        };
+
         // Check each provider (except Auto and Static)
-        let providers_to_check = vec![
-            (NixpacksProvider::Node, &nixpacks::providers::node::NodeProvider {} as &dyn nixpacks::providers::Provider),
-            (NixpacksProvider::Python, &nixpacks::providers::python::PythonProvider {}),
-            (NixpacksProvider::Rust, &nixpacks::providers::rust::RustProvider {}),
-            (NixpacksProvider::Go, &nixpacks::providers::go::GolangProvider {}),
-            (NixpacksProvider::Java, &nixpacks::providers::java::JavaProvider {}),
-            (NixpacksProvider::Php, &nixpacks::providers::php::PhpProvider {}),
-            (NixpacksProvider::Ruby, &nixpacks::providers::ruby::RubyProvider {}),
-            (NixpacksProvider::Deno, &nixpacks::providers::deno::DenoProvider {}),
-            (NixpacksProvider::Elixir, &nixpacks::providers::elixir::ElixirProvider {}),
-            (NixpacksProvider::CSharp, &nixpacks::providers::csharp::CSharpProvider {}),
-            (NixpacksProvider::Dart, &nixpacks::providers::dart::DartProvider {}),
+        let providers_to_check: Vec<(NixpacksProvider, &dyn nixpacks::providers::Provider)> = vec![
+            (
+                NixpacksProvider::Node,
+                &nixpacks::providers::node::NodeProvider {},
+            ),
+            (
+                NixpacksProvider::Python,
+                &nixpacks::providers::python::PythonProvider {},
+            ),
+            (
+                NixpacksProvider::Rust,
+                &nixpacks::providers::rust::RustProvider {},
+            ),
+            (
+                NixpacksProvider::Go,
+                &nixpacks::providers::go::GolangProvider {},
+            ),
+            (
+                NixpacksProvider::Java,
+                &nixpacks::providers::java::JavaProvider {},
+            ),
+            (
+                NixpacksProvider::Php,
+                &nixpacks::providers::php::PhpProvider {},
+            ),
+            (
+                NixpacksProvider::Ruby,
+                &nixpacks::providers::ruby::RubyProvider {},
+            ),
+            (
+                NixpacksProvider::Deno,
+                &nixpacks::providers::deno::DenoProvider {},
+            ),
+            (
+                NixpacksProvider::Elixir,
+                &nixpacks::providers::elixir::ElixirProvider {},
+            ),
+            (
+                NixpacksProvider::CSharp,
+                &nixpacks::providers::csharp::CSharpProvider {},
+            ),
+            (
+                NixpacksProvider::FSharp,
+                &nixpacks::providers::fsharp::FSharpProvider {},
+            ),
+            (
+                NixpacksProvider::Dart,
+                &nixpacks::providers::dart::DartProvider {},
+            ),
+            (
+                NixpacksProvider::Swift,
+                &nixpacks::providers::swift::SwiftProvider {},
+            ),
+            (
+                NixpacksProvider::Zig,
+                &nixpacks::providers::zig::ZigProvider {},
+            ),
+            (
+                NixpacksProvider::Scala,
+                &nixpacks::providers::scala::ScalaProvider {},
+            ),
+            (
+                NixpacksProvider::Haskell,
+                &nixpacks::providers::haskell::HaskellStackProvider {},
+            ),
+            (
+                NixpacksProvider::Clojure,
+                &nixpacks::providers::clojure::ClojureProvider {},
+            ),
+            (
+                NixpacksProvider::Crystal,
+                &nixpacks::providers::crystal::CrystalProvider {},
+            ),
+            (
+                NixpacksProvider::Cobol,
+                &nixpacks::providers::cobol::CobolProvider {},
+            ),
+            (
+                NixpacksProvider::Gleam,
+                &nixpacks::providers::gleam::GleamProvider {},
+            ),
+            (
+                NixpacksProvider::Lunatic,
+                &nixpacks::providers::lunatic::LunaticProvider {},
+            ),
+            (
+                NixpacksProvider::Scheme,
+                &nixpacks::providers::scheme::HauntProvider {},
+            ),
         ];
 
         let path_str = match path.to_str() {
@@ -171,13 +315,18 @@ impl NixpacksPreset {
             Err(_) => return available,
         };
 
-        // Check each provider individually
+        // Check each provider individually, passing config if present
         for (provider_type, provider) in providers_to_check {
             let providers_slice = vec![provider];
-            let mut generator = NixpacksBuildPlanGenerator::new(
-                &providers_slice,
-                GeneratePlanOptions::default(),
-            );
+
+            // Build options, include the config path if file exists
+            let mut options = GeneratePlanOptions::default();
+            if let Some(config_path) = &config_file {
+                // Only pass the config if the file exists
+                options.config_file = Some(config_path.to_string_lossy().to_string());
+            }
+
+            let mut generator = NixpacksBuildPlanGenerator::new(&providers_slice, options);
 
             if let Ok((plan, _)) = generator.generate_plan(&app, &environment) {
                 let phase_count = plan.phases.clone().map_or(0, |phases| phases.len());
@@ -230,7 +379,18 @@ impl NixpacksPreset {
             &nixpacks::providers::deno::DenoProvider {},
             &nixpacks::providers::elixir::ElixirProvider {},
             &nixpacks::providers::csharp::CSharpProvider {},
+            &nixpacks::providers::fsharp::FSharpProvider {},
             &nixpacks::providers::dart::DartProvider {},
+            &nixpacks::providers::swift::SwiftProvider {},
+            &nixpacks::providers::zig::ZigProvider {},
+            &nixpacks::providers::scala::ScalaProvider {},
+            &nixpacks::providers::haskell::HaskellStackProvider {},
+            &nixpacks::providers::clojure::ClojureProvider {},
+            &nixpacks::providers::crystal::CrystalProvider {},
+            &nixpacks::providers::cobol::CobolProvider {},
+            &nixpacks::providers::gleam::GleamProvider {},
+            &nixpacks::providers::lunatic::LunaticProvider {},
+            &nixpacks::providers::scheme::HauntProvider {},
             &nixpacks::providers::staticfile::StaticfileProvider {},
         ];
 
@@ -303,13 +463,26 @@ impl NixpacksPreset {
             &nixpacks::providers::deno::DenoProvider {},
             &nixpacks::providers::elixir::ElixirProvider {},
             &nixpacks::providers::csharp::CSharpProvider {},
+            &nixpacks::providers::fsharp::FSharpProvider {},
             &nixpacks::providers::dart::DartProvider {},
+            &nixpacks::providers::swift::SwiftProvider {},
+            &nixpacks::providers::zig::ZigProvider {},
+            &nixpacks::providers::scala::ScalaProvider {},
+            &nixpacks::providers::haskell::HaskellStackProvider {},
+            &nixpacks::providers::clojure::ClojureProvider {},
+            &nixpacks::providers::crystal::CrystalProvider {},
+            &nixpacks::providers::cobol::CobolProvider {},
+            &nixpacks::providers::gleam::GleamProvider {},
+            &nixpacks::providers::lunatic::LunaticProvider {},
+            &nixpacks::providers::scheme::HauntProvider {},
             &nixpacks::providers::staticfile::StaticfileProvider {},
         ];
 
         // Generate build plan
         let mut generator =
-            NixpacksBuildPlanGenerator::new(providers, GeneratePlanOptions::default());
+            NixpacksBuildPlanGenerator::new(providers, GeneratePlanOptions {
+                ..Default::default()
+            });
 
         let (plan, _app) = generator
             .generate_plan(&app, &environment)
@@ -323,10 +496,10 @@ impl NixpacksPreset {
                 .to_string());
         }
 
-        let start = plan.start_phase.clone().unwrap_or_default();
-        if start.cmd.is_none() {
-            return Err("No start command could be found in the build plan".to_string());
-        }
+        // let start = plan.start_phase.clone().unwrap_or_default();
+        // if start.cmd.is_none() {
+        //     return Err("No start command could be found in the build plan".to_string());
+        // }
 
         // Use DockerImageBuilder to generate the actual Dockerfile
         let builder = DockerImageBuilder::new(
@@ -384,7 +557,10 @@ impl Preset for NixpacksPreset {
     }
 
     async fn dockerfile(&self, config: DockerfileConfig<'_>) -> DockerfileWithArgs {
-        match self.generate_dockerfile_content(config.local_path, config.build_vars).await {
+        match self
+            .generate_dockerfile_content(config.local_path, config.build_vars)
+            .await
+        {
             Ok(dockerfile_with_args) => dockerfile_with_args,
             Err(e) => {
                 warn!("Failed to generate nixpacks Dockerfile: {}", e);
@@ -468,7 +644,18 @@ mod tests {
             &nixpacks::providers::deno::DenoProvider {},
             &nixpacks::providers::elixir::ElixirProvider {},
             &nixpacks::providers::csharp::CSharpProvider {},
+            &nixpacks::providers::fsharp::FSharpProvider {},
             &nixpacks::providers::dart::DartProvider {},
+            &nixpacks::providers::swift::SwiftProvider {},
+            &nixpacks::providers::zig::ZigProvider {},
+            &nixpacks::providers::scala::ScalaProvider {},
+            &nixpacks::providers::haskell::HaskellStackProvider {},
+            &nixpacks::providers::clojure::ClojureProvider {},
+            &nixpacks::providers::crystal::CrystalProvider {},
+            &nixpacks::providers::cobol::CobolProvider {},
+            &nixpacks::providers::gleam::GleamProvider {},
+            &nixpacks::providers::lunatic::LunaticProvider {},
+            &nixpacks::providers::scheme::HauntProvider {},
             &nixpacks::providers::staticfile::StaticfileProvider {},
         ];
 

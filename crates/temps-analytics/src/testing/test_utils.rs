@@ -139,7 +139,7 @@ impl AnalyticsTestUtils {
             slug: Set("https://deployment.example.com".to_string()),
             created_at: Set(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
             updated_at: Set(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             deploying_at: Set(None),
             ready_at: Set(None),
             static_dir_location: Set(None),

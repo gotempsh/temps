@@ -581,11 +581,11 @@ impl DeploymentService {
             .send(temps_core::Job::GitPushEvent(git_push_job))
             .await
             .map_err(|e| {
-                tracing::error!("❌ Failed to send GitPushEvent to queue: {}", e);
+                tracing::error!("Failed to send GitPushEvent to queue: {}", e);
                 DeploymentError::QueueError(e.to_string())
             })?;
 
-        tracing::debug!("✅ GitPushEvent successfully sent to queue");
+        tracing::debug!("GitPushEvent successfully sent to queue");
         Ok(())
     }
 
@@ -1022,6 +1022,8 @@ impl DeploymentService {
             commit_date,
             is_current,
             cancelled_reason: db_deployment.cancelled_reason.clone(),
+            deployment_config: db_deployment.deployment_config,
+            metadata: db_deployment.metadata,
         }
     }
 
@@ -1235,7 +1237,7 @@ impl DeploymentService {
         use temps_entities::{deployment_jobs, types::JobStatus};
 
         info!(
-            "🛑 Cancelling deployment {} for project {}",
+            "Cancelling deployment {} for project {}",
             deployment_id, project_id
         );
 
@@ -1247,14 +1249,14 @@ impl DeploymentService {
             .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
 
         info!(
-            "📋 Deployment {} current state: '{}' - checking if cancellable",
+            "Deployment {} current state: '{}' - checking if cancellable",
             deployment_id, deployment.state
         );
 
         // Only allow cancelling deployments in pending or running state
         if deployment.state != "pending" && deployment.state != "running" {
             info!(
-                "⚠️  Cannot cancel deployment {} - already in '{}' state",
+                "Cannot cancel deployment {} - already in '{}' state",
                 deployment_id, deployment.state
             );
             return Err(DeploymentError::InvalidInput(format!(
@@ -1278,12 +1280,12 @@ impl DeploymentService {
 
             // Write cancellation message to the job's log
             let cancel_msg = format!(
-                "\n🛑 DEPLOYMENT CANCELLED BY USER\n🛑 Job '{}' is being terminated\n",
+                "DEPLOYMENT CANCELLED BY USER - Job '{}' is being terminated",
                 job.name
             );
             if let Err(e) = self
                 .log_service
-                .append_to_log(&job.log_id, &cancel_msg)
+                .append_structured_log(&job.log_id, temps_logs::LogLevel::Error, &cancel_msg)
                 .await
             {
                 warn!(
@@ -1302,7 +1304,7 @@ impl DeploymentService {
         active_deployment.update(self.db.as_ref()).await?;
 
         info!(
-            "✅ Successfully cancelled deployment {} for project {} - workflow will stop at next checkpoint",
+            "Successfully cancelled deployment {} for project {} - workflow will stop at next checkpoint",
             deployment_id, project_id
         );
 
@@ -1323,7 +1325,7 @@ mod tests {
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{
         deployment_config::DeploymentConfig, deployments, env_vars, environments,
-        external_service_params, external_services, preset::Preset, project_services, projects,
+        external_services, preset::Preset, project_services, projects,
         upstream_config::UpstreamList,
     };
 
@@ -1432,7 +1434,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("test-deployment-123".to_string()),
             state: Set("deployed".to_string()),
-            metadata: Set(serde_json::json!({"message": "Test deployment"})),
+            metadata: Set(None),
             image_name: Set(Some("nginx:latest".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -1514,27 +1516,6 @@ mod tests {
             ..Default::default()
         };
         project_service.insert(db.as_ref()).await?;
-
-        // Create service parameters
-        let service_param = external_service_params::ActiveModel {
-            service_id: Set(external_service.id),
-            key: Set("host".to_string()),
-            value: Set("redis.example.com".to_string()),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        service_param.insert(db.as_ref()).await?;
-
-        let encrypted_param = external_service_params::ActiveModel {
-            service_id: Set(external_service.id),
-            key: Set("password".to_string()),
-            value: Set("encrypted_password".to_string()),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        encrypted_param.insert(db.as_ref()).await?;
 
         Ok(())
     }
@@ -1706,7 +1687,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("current-deployment-456".to_string()),
             state: Set("deployed".to_string()),
-            metadata: Set(serde_json::json!({"message": "Current deployment"})),
+            metadata: Set(None),
             image_name: Set(Some("nginx:current".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -1782,7 +1763,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("deployment2-456".to_string()),
             state: Set("deployed".to_string()),
-            metadata: Set(serde_json::json!({"message": "Second deployment"})),
+            metadata: Set(None),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -1996,7 +1977,7 @@ mod tests {
             assert!(log_id.starts_with(&format!("deployment-{}", deployment.id)));
             assert!(log_id.contains(&job.job_id));
 
-            println!("✅ Job '{}' has log_id: {}", job.name, log_id);
+            println!("Job '{}' has log_id: {}", job.name, log_id);
         }
 
         Ok(())

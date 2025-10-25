@@ -98,6 +98,8 @@ pub struct RuntimeEnvVar {
     pub name: String,
     pub description: String,
     pub example: String,
+    /// Whether this variable contains sensitive data (passwords, keys, tokens)
+    pub sensitive: bool,
 }
 
 #[async_trait]
@@ -122,57 +124,9 @@ pub trait ExternalService: Send + Sync {
     /// Cleanup/shutdown the service
     async fn cleanup(&self) -> Result<()>;
 
-    /// Get required parameters and their validation rules
-    fn get_parameter_definitions(&self) -> Vec<ServiceParameter>;
-
-    /// Validate parameters against the service's requirements
-    fn validate_parameters(&self, parameters: &HashMap<String, String>) -> Result<()> {
-        let required_params = self.get_parameter_definitions();
-
-        // Check for required parameters
-        for param in &required_params {
-            if param.required && !parameters.contains_key(&param.name) {
-                return Err(anyhow::anyhow!(
-                    "Missing required parameter: {}",
-                    param.name
-                ));
-            }
-        }
-
-        // Validate each provided parameter
-        for (key, value) in parameters {
-            if let Some(param) = required_params.iter().find(|p| p.name == *key) {
-                // Check if value is in allowed choices if choices are defined
-                if let Some(choices) = &param.choices {
-                    if !choices.contains(value) {
-                        return Err(anyhow::anyhow!(
-                            "Parameter {} value '{}' is not one of the allowed choices: {:?}",
-                            key,
-                            value,
-                            choices
-                        ));
-                    }
-                }
-
-                // Check validation pattern if it exists
-                if let Some(pattern) = &param.validation_pattern {
-                    let regex = regex::Regex::new(pattern)
-                        .map_err(|_| anyhow::anyhow!("Invalid validation pattern for {}", key))?;
-
-                    if !regex.is_match(value) {
-                        return Err(anyhow::anyhow!(
-                            "Parameter {} value does not match required pattern",
-                            key
-                        ));
-                    }
-                }
-            } else {
-                return Err(anyhow::anyhow!("Unknown parameter: {}", key));
-            }
-        }
-
-        Ok(())
-    }
+    /// Get parameter schema as JSON Schema
+    /// Services must implement this to provide their configuration schema
+    fn get_parameter_schema(&self) -> Option<serde_json::Value>;
 
     /// Start the service
     async fn start(&self) -> Result<()>;

@@ -56,6 +56,13 @@ pub trait JobTracker: Send + Sync {
         job_execution_id: i32,
         outputs: serde_json::Value,
     ) -> Result<(), WorkflowError>;
+
+    /// Cancel all pending jobs in the workflow
+    async fn cancel_pending_jobs(
+        &self,
+        workflow_run_id: &str,
+        reason: String,
+    ) -> Result<(), WorkflowError>;
 }
 
 /// Job execution state
@@ -115,6 +122,18 @@ impl WorkflowExecutor {
                 .await?
             {
                 warn!("🚫 Workflow {} was cancelled", config.workflow_run_id);
+
+                // Cancel all pending jobs via job tracker
+                if let Some(ref tracker) = self.job_tracker {
+                    warn!("🧹 Cancelling all pending jobs in workflow {}", config.workflow_run_id);
+                    if let Err(e) = tracker
+                        .cancel_pending_jobs(&config.workflow_run_id, "Workflow cancelled by user".to_string())
+                        .await
+                    {
+                        error!("Failed to cancel pending jobs: {}", e);
+                    }
+                }
+
                 return Err(WorkflowError::WorkflowCancelled);
             }
 
@@ -205,7 +224,23 @@ impl WorkflowExecutor {
                     // Check if required job failed
                     if job_state.job_config.required && result.status == JobStatus::Failure {
                         if !config.continue_on_failure {
-                            error!("❌ Required job '{}' failed, stopping workflow", job_id);
+                            error!("Required job '{}' failed, stopping workflow", job_id);
+
+                            // Cancel all pending jobs before failing the workflow
+                            if let Some(ref tracker) = self.job_tracker {
+                                let cancel_reason = format!(
+                                    "Required job '{}' failed: {}",
+                                    job_id,
+                                    result.message.as_ref().unwrap_or(&"Unknown error".to_string())
+                                );
+
+                                if let Err(e) = tracker.cancel_pending_jobs(&config.workflow_run_id, cancel_reason).await {
+                                    error!("Failed to cancel pending jobs: {}", e);
+                                } else {
+                                    info!("Cancelled all pending jobs due to required job failure");
+                                }
+                            }
+
                             return Err(WorkflowError::JobExecutionFailed(format!(
                                 "Required job '{}' failed: {:?}",
                                 job_id, result.message
@@ -470,10 +505,25 @@ impl WorkflowExecutor {
                                 }
                             }
 
+                            // Call cleanup if job was cancelled or failed
+                            if matches!(job_result.status, crate::JobStatus::Failure | crate::JobStatus::Cancelled) {
+                                warn!("🧹 Calling cleanup for job '{}' due to {:?} status", job_id_clone, job_result.status);
+                                if let Err(cleanup_err) = job.cleanup(&job_result.context).await {
+                                    error!("Failed to cleanup job '{}': {}", job_id_clone, cleanup_err);
+                                }
+                            }
+
                             (job_id_clone, job_result)
                         }
                         Err(e) => {
                             error!("❌ Job '{}' failed: {}", job_id_clone, e);
+
+                            // Call cleanup on job failure
+                            warn!("🧹 Calling cleanup for failed job '{}'", job_id_clone);
+                            if let Err(cleanup_err) = job.cleanup(&error_context).await {
+                                error!("Failed to cleanup job '{}': {}", job_id_clone, cleanup_err);
+                            }
+
                             (
                                 job_id_clone,
                                 JobResult::failure(error_context, e.to_string()),

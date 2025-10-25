@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use temps_core::UtcDateTime;
+use temps_entities::deployment_config::DeploymentConfig;
 use utoipa::ToSchema;
 
 use crate::services::custom_domains::CustomDomainService;
@@ -238,14 +239,10 @@ pub struct ProjectResponse {
     pub preset: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
-    pub automatic_deploy: bool,
-    pub cpu_request: Option<i32>,
-    pub cpu_limit: Option<i32>,
-    pub memory_request: Option<i32>,
-    pub memory_limit: Option<i32>,
-    pub performance_metrics_enabled: bool,
     pub last_deployment: Option<i64>,
     pub git_provider_connection_id: Option<i32>,
+    /// Deployment configuration (resources, autoscaling, features)
+    pub deployment_config: DeploymentConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -268,14 +265,19 @@ impl ProjectResponse {
             preset: project.preset,
             created_at: project.created_at.timestamp_millis(),
             updated_at: project.updated_at.timestamp_millis(),
-            automatic_deploy: project.automatic_deploy,
-            cpu_request: project.cpu_request,
-            cpu_limit: project.cpu_limit,
-            memory_request: project.memory_request,
-            memory_limit: project.memory_limit,
-            performance_metrics_enabled: project.performance_metrics_enabled,
             last_deployment: project.last_deployment.map(|d| d.timestamp_millis()),
             git_provider_connection_id: project.git_provider_connection_id,
+            deployment_config: DeploymentConfig {
+                cpu_request: project.cpu_request,
+                cpu_limit: project.cpu_limit,
+                memory_request: project.memory_request,
+                memory_limit: project.memory_limit,
+                exposed_port: None, // Not exposed in old Project struct
+                automatic_deploy: project.automatic_deploy,
+                performance_metrics_enabled: project.performance_metrics_enabled,
+                session_recording_enabled: false, // Default for old projects
+                replicas: 1, // Default
+            },
         }
     }
 }
@@ -371,6 +373,19 @@ pub struct UpdateDeploymentSettingsRequest {
     pub cpu_limit: Option<i32>,
     pub memory_request: Option<i32>,
     pub memory_limit: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, ToSchema)]
+pub struct UpdateDeploymentConfigRequest {
+    pub cpu_request: Option<i32>,
+    pub cpu_limit: Option<i32>,
+    pub memory_request: Option<i32>,
+    pub memory_limit: Option<i32>,
+    pub exposed_port: Option<i32>,
+    pub automatic_deploy: Option<bool>,
+    pub performance_metrics_enabled: Option<bool>,
+    pub session_recording_enabled: Option<bool>,
+    pub replicas: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, ToSchema)]

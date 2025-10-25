@@ -155,7 +155,7 @@ impl App {
 
     /// Check if any paths match a pattern
     pub fn has_match(&self, pattern: &str) -> bool {
-        self.find_files(pattern).map_or(false, |v| !v.is_empty())
+        self.find_files(pattern).is_ok_and(|v| !v.is_empty())
     }
 
     /// Read the contents of a file

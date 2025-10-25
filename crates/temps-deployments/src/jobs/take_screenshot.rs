@@ -10,7 +10,7 @@ use temps_config::ConfigService;
 use temps_core::{JobResult, UtcDateTime, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
 use temps_entities::{deployments, prelude::*};
-use temps_logs::LogService;
+use temps_logs::{LogLevel, LogService};
 use temps_screenshots::ScreenshotServiceTrait;
 
 /// Output from TakeScreenshotJob
@@ -71,13 +71,27 @@ impl TakeScreenshotJob {
 
     /// Write log message to job-specific log file
     async fn log(&self, message: String) -> Result<(), WorkflowError> {
+        // Detect log level from message content/emojis
+        let level = Self::detect_log_level(&message);
+
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
-                .append_to_log(log_id, &format!("{}\n", message))
+                .append_structured_log(log_id, level, message.clone())
                 .await
                 .map_err(|e| WorkflowError::Other(format!("Failed to write log: {}", e)))?;
         }
         Ok(())
+    }
+
+    /// Detect log level from message content
+    fn detect_log_level(message: &str) -> LogLevel {
+        if message.contains("✅") || message.contains("💾") || message.contains("Complete") || message.contains("success") || message.contains("captured") {
+            LogLevel::Success
+        } else if message.contains("❌") || message.contains("Failed") || message.contains("Error") || message.contains("error") {
+            LogLevel::Error
+        } else {
+            LogLevel::Info
+        }
     }
 
     /// Capture screenshot using the screenshot service and save to disk
@@ -86,14 +100,14 @@ impl TakeScreenshotJob {
         deployment_url: &str,
         filename: &str,
     ) -> Result<ScreenshotOutput, WorkflowError> {
-        self.log(format!("📸 Capturing screenshot of: {}", deployment_url))
+        self.log(format!("Capturing screenshot of: {}", deployment_url))
             .await?;
 
         // Generate screenshot path with timestamp structure
         let now = chrono::Utc::now();
 
         self.log(format!(
-            "🔄 Using screenshot service: {}",
+            "Using screenshot service: {}",
             self.screenshot_service.provider_name()
         ))
         .await?;
@@ -114,7 +128,7 @@ impl TakeScreenshotJob {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| screenshot_path.display().to_string());
 
-        self.log(format!("💾 Screenshot saved to: {}", relative_display))
+        self.log(format!("Screenshot saved to: {}", relative_display))
             .await?;
 
         Ok(ScreenshotOutput { captured_at: now })
@@ -144,7 +158,7 @@ impl WorkflowTask for TakeScreenshotJob {
         // it takes a bit of time for the route table to be ready
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         self.log(format!(
-            "📸 Taking screenshot for deployment ID: {}",
+            "Taking screenshot for deployment ID: {}",
             self.deployment_id
         ))
         .await?;
@@ -158,7 +172,7 @@ impl WorkflowTask for TakeScreenshotJob {
                 WorkflowError::JobExecutionFailed(format!("Failed to get deployment URL: {}", e))
             })?;
 
-        self.log(format!("🌐 Deployment URL: {}", deployment_url))
+        self.log(format!("Deployment URL: {}", deployment_url))
             .await?;
 
         // Generate screenshot filename with timestamp
@@ -172,7 +186,7 @@ impl WorkflowTask for TakeScreenshotJob {
         // Capture screenshot
         let screenshot_output = self.capture_screenshot(&deployment_url, &filename).await?;
 
-        self.log(format!("✅ Screenshot captured: {}", filename))
+        self.log(format!("Screenshot captured: {}", filename))
             .await?;
 
         // Update deployment with screenshot location (relative path)
@@ -199,7 +213,7 @@ impl WorkflowTask for TakeScreenshotJob {
             })?;
 
         self.log(format!(
-            "✅ Updated deployment screenshot_location: {}",
+            "Updated deployment screenshot_location: {}",
             filename
         ))
         .await?;

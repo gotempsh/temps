@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use temps_core::{LogWriter, WorkflowError};
-use temps_logs::LogService;
+use temps_logs::{LogLevel, LogService};
 
 /// Log writer implementation for deployment stages
 /// Each stage writes to its own log file via the LogService
@@ -21,13 +21,29 @@ impl DeploymentStageLogWriter {
             log_id,
         }
     }
+
+    /// Detect log level from message content
+    fn detect_log_level(message: &str) -> LogLevel {
+        if message.contains("✅") || message.contains("Complete") || message.contains("success") {
+            LogLevel::Success
+        } else if message.contains("❌") || message.contains("Failed") || message.contains("Error") || message.contains("error") {
+            LogLevel::Error
+        } else if message.contains("⏳") || message.contains("Waiting") || message.contains("warning") {
+            LogLevel::Warning
+        } else {
+            LogLevel::Info
+        }
+    }
 }
 
 #[async_trait]
 impl LogWriter for DeploymentStageLogWriter {
     async fn write_log(&self, message: String) -> Result<(), WorkflowError> {
+        // Detect log level from message content
+        let level = Self::detect_log_level(&message);
+
         self.log_service
-            .append_to_log(&self.log_id, &message)
+            .append_structured_log(&self.log_id, level, message)
             .await
             .map_err(|e| WorkflowError::Other(format!("Failed to write log: {}", e)))?;
         Ok(())
@@ -57,19 +73,20 @@ mod tests {
 
         // Test writing logs (file will be created automatically)
         writer
-            .write_log("Test message\n".to_string())
+            .write_log("Test message".to_string())
             .await
             .unwrap();
         writer
-            .write_logs(vec!["Line 1\n".to_string(), "Line 2\n".to_string()])
+            .write_logs(vec!["Line 1".to_string(), "Line 2".to_string()])
             .await
             .unwrap();
 
-        // Verify logs were written
-        let content = log_service.get_log_content("test-log").await.unwrap();
-        assert!(content.contains("Test message"));
-        assert!(content.contains("Line 1"));
-        assert!(content.contains("Line 2"));
+        // Verify logs were written as structured logs
+        let logs = log_service.get_structured_logs("test-log").await.unwrap();
+        assert!(logs.len() >= 3);
+        assert!(logs.iter().any(|l| l.message.contains("Test message")));
+        assert!(logs.iter().any(|l| l.message.contains("Line 1")));
+        assert!(logs.iter().any(|l| l.message.contains("Line 2")));
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).unwrap_or(());

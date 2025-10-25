@@ -102,12 +102,146 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_nixpacks_preset_fallback() {
-        let files = vec!["some-random-file.txt".to_string()];
+    fn test_no_preset_for_random_files() {
+        // Random files should NOT auto-detect any preset
+        let files = vec!["some-random-file.txt".to_string(), "src/main.rs".to_string()];
+        let preset = detect_preset_from_files(&files);
+
+        assert!(preset.is_none(), "Random files should not auto-detect a preset");
+    }
+
+    #[test]
+    fn test_detect_nixpacks_with_config() {
+        // Nixpacks should only be detected if nixpacks.toml is present
+        let files = vec!["nixpacks.toml".to_string(), "main.py".to_string()];
         let preset = detect_preset_from_files(&files);
 
         assert!(preset.is_some());
         assert_eq!(preset.unwrap().slug(), "nixpacks");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_empty() {
+        let files: Vec<String> = vec![];
+        let presets = detect_presets_from_file_tree(&files);
+        assert!(presets.is_empty());
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_root_only() {
+        let files = vec![
+            "package.json".to_string(),
+            "next.config.js".to_string(),
+            "src/app/page.tsx".to_string(),
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].path, "./");
+        assert_eq!(presets[0].slug, "nextjs");
+        assert_eq!(presets[0].label, "Next.js");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_monorepo() {
+        let files = vec![
+            "package.json".to_string(),
+            "apps/web/next.config.js".to_string(),
+            "apps/web/package.json".to_string(),
+            "apps/api/Dockerfile".to_string(),
+            "apps/api/main.go".to_string(),
+            "packages/ui/vite.config.ts".to_string(),
+            "packages/ui/package.json".to_string(),
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 3);
+
+        // Root should come first
+        assert_eq!(presets[0].path, "apps/api");
+        assert_eq!(presets[0].slug, "dockerfile");
+
+        assert_eq!(presets[1].path, "apps/web");
+        assert_eq!(presets[1].slug, "nextjs");
+
+        assert_eq!(presets[2].path, "packages/ui");
+        assert_eq!(presets[2].slug, "vite");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_skips_node_modules() {
+        let files = vec![
+            "next.config.js".to_string(),
+            "node_modules/some-package/vite.config.js".to_string(), // Should be ignored
+            "src/index.ts".to_string(),
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].slug, "nextjs"); // Only Next.js detected, not Vite
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_skips_build_dirs() {
+        let files = vec![
+            "vite.config.ts".to_string(),
+            "dist/next.config.js".to_string(), // Should be ignored
+            "build/rsbuild.config.ts".to_string(), // Should be ignored
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].slug, "vite");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_depth_limit() {
+        let files = vec![
+            "next.config.js".to_string(),
+            "a/b/c/d/e/vite.config.ts".to_string(), // Too deep (5 levels), should be ignored
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].slug, "nextjs");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_dockerfile_priority() {
+        let files = vec![
+            "Dockerfile".to_string(),
+            "next.config.js".to_string(),
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        // Dockerfile has higher priority
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].slug, "dockerfile");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_nixpacks_with_config() {
+        let files = vec![
+            "nixpacks.toml".to_string(),
+            "main.py".to_string(),
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].slug, "nixpacks");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_no_preset_for_random_files() {
+        let files = vec![
+            "README.md".to_string(),
+            "src/utils.js".to_string(), // Generic JS file (no framework config)
+            "data.json".to_string(),    // Random JSON file
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        // No framework-specific config files, so no presets should be detected
+        assert!(presets.is_empty());
     }
 
     #[test]

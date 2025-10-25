@@ -642,12 +642,13 @@ impl LoadBalancer {
     ) -> Result<()> {
         let duration = ctx.start_time.elapsed();
         info!(
-            "[{}] {} {} {} - {}ms",
+            "[{}] {} {} {} - {}ms - {}",
             ctx.method,
             ctx.host,
             ctx.path,
             upstream_response.status.as_u16(),
-            duration.as_millis()
+            duration.as_millis(),
+            ctx.ip_address.clone().unwrap_or_default()
         );
         upstream_response
             .insert_header("X-Response-Time", format!("{}ms", duration.as_millis()))?;

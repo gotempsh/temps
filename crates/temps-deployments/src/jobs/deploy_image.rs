@@ -3,16 +3,17 @@
 //! Deploys built container images to target environments
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_deployer::{
     ContainerDeployer, ContainerStatus as DeployerContainerStatus, DeployRequest, PortMapping,
     Protocol, ResourceLimits, RestartPolicy,
 };
-use temps_logs::LogService;
+use temps_logs::{LogLevel, LogService};
 
 /// Typed output from BuildImageJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,9 +110,10 @@ impl Default for ResourceUsage {
     }
 }
 
-/// Configuration for deployment
+/// Configuration for deployment job execution
+/// This is built from the entity's DeploymentConfig + runtime values
 #[derive(Debug, Clone)]
-pub struct DeploymentConfig {
+pub struct DeploymentJobConfig {
     pub namespace: String,
     pub service_name: String,
     pub replicas: u32,
@@ -123,7 +125,7 @@ pub struct DeploymentConfig {
     pub ingress_host: Option<String>,
 }
 
-impl Default for DeploymentConfig {
+impl Default for DeploymentJobConfig {
     fn default() -> Self {
         Self {
             namespace: "default".to_string(),
@@ -142,17 +144,9 @@ impl Default for DeploymentConfig {
 /// Target environment for deployment
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DeploymentTarget {
-    Kubernetes {
-        cluster_name: String,
-        kubeconfig_path: Option<String>,
-    },
     Docker {
         registry_url: String,
         network: Option<String>,
-    },
-    CloudRun {
-        project_id: String,
-        region: String,
     },
 }
 
@@ -161,10 +155,14 @@ pub struct DeployImageJob {
     job_id: String,
     build_job_id: String,
     target: DeploymentTarget,
-    config: DeploymentConfig,
+    config: DeploymentJobConfig,
     container_deployer: Arc<dyn ContainerDeployer>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
+    /// Container ID stored as soon as container is created for cleanup on failure
+    container_id: Arc<Mutex<Option<String>>>,
+    /// Background task handle for log streaming (aborted on cleanup)
+    log_stream_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl std::fmt::Debug for DeployImageJob {
@@ -190,14 +188,16 @@ impl DeployImageJob {
             job_id,
             build_job_id,
             target,
-            config: DeploymentConfig::default(),
+            config: DeploymentJobConfig::default(),
             container_deployer,
             log_id: None,
             log_service: None,
+            container_id: Arc::new(Mutex::new(None)),
+            log_stream_task: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub fn with_config(mut self, config: DeploymentConfig) -> Self {
+    pub fn with_config(mut self, config: DeploymentJobConfig) -> Self {
         self.config = config;
         self
     }
@@ -235,16 +235,32 @@ impl DeployImageJob {
     /// Write log message to job-specific log file
     /// Write log message to both job-specific log file and context log writer
     async fn log(&self, context: &WorkflowContext, message: String) -> Result<(), WorkflowError> {
-        // Write to job-specific log file
+        // Detect log level from message content/emojis
+        let level = Self::detect_log_level(&message);
+
+        // Write structured log to job-specific log file
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
-                .append_to_log(log_id, &format!("{}\n", message))
+                .append_structured_log(log_id, level, message.clone())
                 .await
                 .map_err(|e| WorkflowError::Other(format!("Failed to write log: {}", e)))?;
         }
         // Also write to context log writer (for real-time streaming and test capture)
         context.log(&message).await?;
         Ok(())
+    }
+
+    /// Detect log level from message content
+    fn detect_log_level(message: &str) -> LogLevel {
+        if message.contains("✅") || message.contains("Complete") || message.contains("success") {
+            LogLevel::Success
+        } else if message.contains("❌") || message.contains("Failed") || message.contains("Error") || message.contains("error") {
+            LogLevel::Error
+        } else if message.contains("⏳") || message.contains("Waiting") || message.contains("warning") {
+            LogLevel::Warning
+        } else {
+            LogLevel::Info
+        }
     }
 
     /// Find an available port on the host machine
@@ -279,7 +295,7 @@ impl DeployImageJob {
                         let _ = self
                             .log(
                                 context,
-                                format!("✅ Detected EXPOSE directive in image: port {}", port),
+                                format!("Detected EXPOSE directive in image: port {}", port),
                             )
                             .await;
                         return port;
@@ -287,7 +303,7 @@ impl DeployImageJob {
                     Ok(None) => {
                         let _ = self.log(
                             context,
-                            format!("ℹ️  No EXPOSE directive found in image, using configured port: {}", self.config.port),
+                            format!("No EXPOSE directive found in image, using configured port: {}", self.config.port),
                         ).await;
                     }
                     Err(e) => {
@@ -295,7 +311,7 @@ impl DeployImageJob {
                             .log(
                                 context,
                                 format!(
-                                    "⚠️  Failed to inspect image: {}, using configured port: {}",
+                                    "Failed to inspect image: {}, using configured port: {}",
                                     e, self.config.port
                                 ),
                             )
@@ -308,7 +324,7 @@ impl DeployImageJob {
                     .log(
                         context,
                         format!(
-                            "⚠️  Failed to connect to Docker: {}, using configured port: {}",
+                            "Failed to connect to Docker: {}, using configured port: {}",
                             e, self.config.port
                         ),
                     )
@@ -321,13 +337,59 @@ impl DeployImageJob {
     }
 
     /// Public getter for config to allow test access
-    pub fn config(&self) -> &DeploymentConfig {
+    pub fn config(&self) -> &DeploymentJobConfig {
         &self.config
     }
 
     /// Public getter for target to allow test access
     pub fn target(&self) -> &DeploymentTarget {
         &self.target
+    }
+
+    /// Remove the container if it exists (called on timeout/failure/cancellation)
+    async fn cleanup_container(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
+        // First, abort the background log streaming task if running
+        let should_log = {
+            let mut task_handle = self.log_stream_task.lock().unwrap();
+            if let Some(handle) = task_handle.take() {
+                handle.abort();
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_log {
+            self.log(context, "🧹 Stopped background log streaming".to_string())
+                .await?;
+        }
+
+        // Then clean up the container
+        let container_id = {
+            let guard = self.container_id.lock().unwrap();
+            guard.clone()
+        };
+
+        if let Some(ref container_id) = container_id {
+            self.log(
+                context,
+                format!("🧹 Cleaning up container: {}", container_id),
+            )
+            .await?;
+
+            if let Err(e) = self.container_deployer.remove_container(container_id).await {
+                self.log(
+                    context,
+                    format!("⚠️  Warning: Failed to remove container {}: {}", container_id, e),
+                )
+                .await?;
+            } else {
+                self.log(context, "✅ Container removed successfully".to_string())
+                    .await?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Deploy the container image with real-time logging
@@ -339,17 +401,17 @@ impl DeployImageJob {
         self.log(
             context,
             format!(
-                "🚀 Starting deployment of image: {}",
+                "Starting deployment of image: {}",
                 image_output.image_tag
             ),
         )
         .await?;
-        self.log(context, format!("🎯 Target: {:?}", self.target))
+        self.log(context, format!("Target: {:?}", self.target))
             .await?;
         self.log(
             context,
             format!(
-                "⚙️  Service: {} in namespace: {}",
+                "Service: {} in namespace: {}",
                 self.config.service_name, self.config.namespace
             ),
         )
@@ -358,13 +420,13 @@ impl DeployImageJob {
         // Pre-deployment validation
         self.log(
             context,
-            "🔍 Validating deployment configuration...".to_string(),
+            "Validating deployment configuration...".to_string(),
         )
         .await?;
         self.validate_deployment_config(context).await?;
 
         // Prepare deployment request using temps-deployer types
-        self.log(context, "📦 Deploying container image...".to_string())
+        self.log(context, "Deploying container image...".to_string())
             .await?;
 
         let log_path = std::env::temp_dir().join(format!("deploy_{}.log", self.job_id));
@@ -408,10 +470,15 @@ impl DeployImageJob {
             disk_limit_mb: None,
         };
 
+        // Add PORT environment variable to the container
+        // This tells the application which port to listen on inside the container
+        let mut environment_vars = self.config.environment_variables.clone();
+        environment_vars.insert("PORT".to_string(), container_port.to_string());
+
         let deploy_request = DeployRequest {
             image_name: image_output.image_tag.clone(),
             container_name: self.config.service_name.clone(),
-            environment_vars: self.config.environment_variables.clone(),
+            environment_vars,
             port_mappings,
             network_name: None,
             resource_limits,
@@ -428,14 +495,20 @@ impl DeployImageJob {
                 WorkflowError::JobExecutionFailed(format!("Failed to deploy container: {}", e))
             })?;
 
+        // CRITICAL: Store container_id immediately for cleanup on failure/cancellation
+        {
+            let mut container_id = self.container_id.lock().unwrap();
+            *container_id = Some(deploy_result.container_id.clone());
+        }
+
         self.log(
             context,
-            format!("✅ Deployment created: {}", deploy_result.container_id),
+            format!("Deployment created: {}", deploy_result.container_id),
         )
         .await?;
 
         // Wait for deployment to be ready (with timeout)
-        self.log(context, "⏳ Waiting for container to start...".to_string())
+        self.log(context, "Waiting for container to start...".to_string())
             .await?;
         let max_wait_time = std::time::Duration::from_secs(300); // 5 minutes
         let start_time = std::time::Instant::now();
@@ -462,14 +535,18 @@ impl DeployImageJob {
                 DeployerContainerStatus::Exited | DeployerContainerStatus::Dead => {
                     self.log(context, "❌ Container failed to start".to_string())
                         .await?;
+                    // Clean up failed container
+                    self.cleanup_container(context).await?;
                     return Err(WorkflowError::JobExecutionFailed(
                         "Container failed to start".to_string(),
                     ));
                 }
                 DeployerContainerStatus::Created => {
                     if start_time.elapsed() > max_wait_time {
-                        self.log(context, "❌ Container start timeout".to_string())
+                        self.log(context, "⏱️  Container start timeout".to_string())
                             .await?;
+                        // Clean up timed-out container
+                        self.cleanup_container(context).await?;
                         return Err(WorkflowError::JobExecutionFailed(
                             "Container timeout - took too long to start".to_string(),
                         ));
@@ -477,7 +554,7 @@ impl DeployImageJob {
                     self.log(
                         context,
                         format!(
-                            "⏳ Container status: {:?}, waiting...",
+                            "Container status: {:?}, waiting...",
                             container_info.status
                         ),
                     )
@@ -488,7 +565,7 @@ impl DeployImageJob {
                     self.log(
                         context,
                         format!(
-                            "⏳ Container status: {:?}, waiting...",
+                            "Container status: {:?}, waiting...",
                             container_info.status
                         ),
                     )
@@ -498,10 +575,102 @@ impl DeployImageJob {
             }
         }
 
+        // Stream container logs in background (non-blocking)
+        // This runs concurrently with health checks
+        let container_id_for_logs = deploy_result.container_id.clone();
+        let log_id = self.log_id.clone();
+        let log_service = self.log_service.clone();
+        let context_for_logs = context.clone();
+
+        let log_task = tokio::spawn(async move {
+            // Helper macro to write logs in the background task
+            macro_rules! write_log {
+                ($level:expr, $msg:expr) => {
+                    if let (Some(ref log_id), Some(ref log_service)) = (&log_id, &log_service) {
+                        let _ = log_service.append_structured_log(log_id, $level, $msg.clone()).await;
+                    }
+                    let _ = context_for_logs.log(&$msg).await;
+                };
+            }
+
+            write_log!(LogLevel::Info, format!("📋 Streaming container logs for 15s..."));
+
+            // Connect to Docker
+            let docker = match bollard::Docker::connect_with_local_defaults() {
+                Ok(d) => d,
+                Err(e) => {
+                    write_log!(LogLevel::Warning,
+                        format!("⚠️  Cannot stream logs - Docker connection failed: {}", e));
+                    return;
+                }
+            };
+
+            // Configure log options
+            let log_options = bollard::query_parameters::LogsOptions {
+                stdout: true,
+                stderr: true,
+                follow: true,
+                timestamps: false,
+                ..Default::default()
+            };
+
+            // Stream logs with timeout
+            let mut log_stream = docker.logs(&container_id_for_logs, Some(log_options));
+            let mut line_count = 0;
+            let max_lines = 100;
+            let timeout = tokio::time::sleep(std::time::Duration::from_secs(15));
+            tokio::pin!(timeout);
+
+            loop {
+                tokio::select! {
+                    _ = &mut timeout => {
+                        write_log!(LogLevel::Info,
+                            format!("📋 Log streaming complete ({} lines captured)", line_count));
+                        break;
+                    }
+                    log_result = log_stream.next() => {
+                        match log_result {
+                            Some(Ok(log_output)) => {
+                                let clean_msg = log_output.to_string().trim().to_string();
+                                if !clean_msg.is_empty() {
+                                    write_log!(LogLevel::Info,
+                                        format!("🐳 {}", clean_msg));
+                                    line_count += 1;
+
+                                    if line_count >= max_lines {
+                                        write_log!(LogLevel::Info,
+                                            format!("📋 Log limit reached ({} lines), stopping stream...", max_lines));
+                                        break;
+                                    }
+                                }
+                            }
+                            Some(Err(e)) => {
+                                write_log!(LogLevel::Warning,
+                                    format!("⚠️  Log stream error: {}", e));
+                                break;
+                            }
+                            None => {
+                                write_log!(LogLevel::Info,
+                                    format!("📋 Log streaming complete ({} lines captured)", line_count));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Store the task handle for cleanup on cancellation
+        {
+            let mut task_handle = self.log_stream_task.lock().unwrap();
+            *task_handle = Some(log_task);
+        }
+
         // Phase 2: Wait for application to be ready (connectivity check)
+        // This runs in parallel with log streaming
         self.log(
             context,
-            "⏳ Waiting for application to be ready...".to_string(),
+            "Waiting for application to be ready...".to_string(),
         )
         .await?;
         let health_check_url = format!(
@@ -511,7 +680,7 @@ impl DeployImageJob {
         );
         self.log(
             context,
-            format!("🔍 Health check URL: {}", health_check_url),
+            format!("Health check URL: {}", health_check_url),
         )
         .await?;
 
@@ -527,8 +696,10 @@ impl DeployImageJob {
 
         loop {
             if start_time.elapsed() > max_wait_time {
-                self.log(context, "❌ Application readiness timeout".to_string())
+                self.log(context, "⏱️  Application readiness timeout - connectivity checks failed".to_string())
                     .await?;
+                // Clean up container on connectivity timeout
+                self.cleanup_container(context).await?;
                 return Err(WorkflowError::JobExecutionFailed(
                     "Application timeout - connectivity checks did not pass in time".to_string(),
                 ));
@@ -541,7 +712,7 @@ impl DeployImageJob {
                     self.log(
                         context,
                         format!(
-                        "✅ Connectivity check passed - server responding with status {} ({}/{})",
+                        "Connectivity check passed - server responding with status {} ({}/{})",
                         response.status(),
                         consecutive_successes,
                         required_successes
@@ -552,7 +723,7 @@ impl DeployImageJob {
                     if consecutive_successes >= required_successes {
                         self.log(
                             context,
-                            "🎉 Application is ready and responding!".to_string(),
+                            "Application is ready and responding!".to_string(),
                         )
                         .await?;
                         break;
@@ -563,7 +734,7 @@ impl DeployImageJob {
                     consecutive_successes = 0; // Reset counter on connection error
                     self.log(
                         context,
-                        format!("⏳ Connectivity check failed ({}), retrying...", e),
+                        format!("Connectivity check failed ({}), retrying...", e),
                     )
                     .await?;
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -574,7 +745,7 @@ impl DeployImageJob {
         let endpoint_url = Some(format!("http://localhost:{}", deploy_result.host_port));
         self.log(
             context,
-            format!("🌐 Service endpoint: {}", endpoint_url.as_ref().unwrap()),
+            format!("Service endpoint: {}", endpoint_url.as_ref().unwrap()),
         )
         .await?;
         self.log(
@@ -628,7 +799,7 @@ impl DeployImageJob {
             ));
         }
 
-        self.log(context, "✅ Deployment configuration is valid".to_string())
+        self.log(context, "Deployment configuration is valid".to_string())
             .await?;
         Ok(())
     }
@@ -723,24 +894,9 @@ impl WorkflowTask for DeployImageJob {
     }
 
     async fn cleanup(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
-        // Get deployment ID from outputs if available
-        if let Ok(Some(deployment_id)) = context.get_output::<String>(&self.job_id, "deployment_id")
-        {
-            // Note: In a real implementation, you might want to conditionally clean up
-            // based on deployment lifecycle configuration (e.g., cleanup on failure only)
-            if let Err(e) = self
-                .container_deployer
-                .remove_container(&deployment_id)
-                .await
-            {
-                // Log but don't fail cleanup
-                eprintln!(
-                    "Warning: Failed to cleanup deployment {}: {}",
-                    deployment_id, e
-                );
-            }
-        }
-        Ok(())
+        // Use the stored container_id (set immediately after container creation)
+        // This ensures cleanup works even if deployment fails before setting outputs
+        self.cleanup_container(context).await
     }
 }
 
@@ -749,7 +905,7 @@ pub struct DeployImageJobBuilder {
     job_id: Option<String>,
     build_job_id: Option<String>,
     target: Option<DeploymentTarget>,
-    config: DeploymentConfig,
+    config: DeploymentJobConfig,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
 }
@@ -760,7 +916,7 @@ impl DeployImageJobBuilder {
             job_id: None,
             build_job_id: None,
             target: None,
-            config: DeploymentConfig::default(),
+            config: DeploymentJobConfig::default(),
             log_id: None,
             log_service: None,
         }
@@ -941,9 +1097,9 @@ mod tests {
     #[test]
     fn test_deploy_image_job_builder() {
         let container_deployer: Arc<dyn ContainerDeployer> = Arc::new(MockContainerDeployer);
-        let target = DeploymentTarget::Kubernetes {
-            cluster_name: "test-cluster".to_string(),
-            kubeconfig_path: None,
+        let target = DeploymentTarget::Docker {
+            registry_url: "registry.test.com".to_string(),
+            network: Some("test-network".to_string()),
         };
 
         let mut env_vars = HashMap::new();

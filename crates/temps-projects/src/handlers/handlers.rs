@@ -10,7 +10,7 @@ use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json,
 };
 use std::sync::Arc;
@@ -22,7 +22,8 @@ use tracing::{debug, error, info};
 use super::types::{
     CreateProjectRequest, PaginatedProjectList, PaginationParams, ProjectResponse,
     ProjectStatisticsResponse, TriggerPipelinePayload, TriggerPipelineResponse,
-    UpdateAutomaticDeployRequest, UpdateGitSettingsRequest, UpdateProjectSettingsRequest,
+    UpdateAutomaticDeployRequest, UpdateDeploymentConfigRequest, UpdateGitSettingsRequest,
+    UpdateProjectSettingsRequest,
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use temps_core::problemdetails;
@@ -56,6 +57,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/projects/{project_id}/automatic-deploy",
             post(update_automatic_deploy),
         )
+        .route(
+            "/projects/{project_id}/deployment-config",
+            patch(update_project_deployment_config),
+        )
         // Merge custom domain routes
         .merge(custom_domain_routes)
 }
@@ -72,6 +77,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         update_project_settings,
         update_git_settings,
         update_automatic_deploy,
+        update_project_deployment_config,
         trigger_project_pipeline,
         get_project_statistics,
         list_presets,
@@ -85,6 +91,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             UpdateProjectSettingsRequest,
             UpdateGitSettingsRequest,
             UpdateAutomaticDeployRequest,
+            UpdateDeploymentConfigRequest,
             TriggerPipelinePayload,
             TriggerPipelineResponse,
             ProjectStatisticsResponse,
@@ -633,6 +640,99 @@ pub async fn update_git_settings(
     Ok(Json(ProjectResponse::map_from_project(updated_project)))
 }
 
+/// Update deployment configuration for a project
+#[utoipa::path(
+    patch,
+    path = "/projects/{project_id}/deployment-config",
+    tag = "Projects",
+    request_body = UpdateDeploymentConfigRequest,
+    responses(
+        (status = 200, description = "Deployment configuration updated successfully", body = ProjectResponse),
+        (status = 400, description = "Invalid deployment configuration"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Project not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("project_id" = String, Path, description = "Project ID or slug")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn update_project_deployment_config(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<String>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(config): Json<UpdateDeploymentConfigRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+
+    info!("Updating deployment config for project: {}", project_id);
+
+    let updated_project = state
+        .project_service
+        .update_project_deployment_config(&project_id, config.clone())
+        .await
+        .map_err(|e| {
+            error!("Error updating deployment config: {:?}", e);
+            Problem::from(e)
+        })?;
+
+    // Create audit event
+    let audit_context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.to_string()),
+        user_agent: metadata.user_agent,
+    };
+
+    let mut updated_fields = std::collections::HashMap::new();
+    if config.cpu_request.is_some() {
+        updated_fields.insert("cpu_request".to_string(), "updated".to_string());
+    }
+    if config.cpu_limit.is_some() {
+        updated_fields.insert("cpu_limit".to_string(), "updated".to_string());
+    }
+    if config.memory_request.is_some() {
+        updated_fields.insert("memory_request".to_string(), "updated".to_string());
+    }
+    if config.memory_limit.is_some() {
+        updated_fields.insert("memory_limit".to_string(), "updated".to_string());
+    }
+    if config.exposed_port.is_some() {
+        updated_fields.insert("exposed_port".to_string(), "updated".to_string());
+    }
+    if config.automatic_deploy.is_some() {
+        updated_fields.insert("automatic_deploy".to_string(), "updated".to_string());
+    }
+    if config.performance_metrics_enabled.is_some() {
+        updated_fields.insert("performance_metrics_enabled".to_string(), "updated".to_string());
+    }
+    if config.session_recording_enabled.is_some() {
+        updated_fields.insert("session_recording_enabled".to_string(), "updated".to_string());
+    }
+    if config.replicas.is_some() {
+        updated_fields.insert("replicas".to_string(), "updated".to_string());
+    }
+
+    let audit_event = super::audit::DeploymentConfigUpdatedAudit {
+        context: audit_context,
+        project_id: updated_project.id,
+        project_name: updated_project.name.clone(),
+        project_slug: updated_project.slug.clone(),
+        updated_fields,
+    };
+
+    if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
+        error!("Failed to create audit log: {:?}", e);
+        // Continue with the operation even if audit logging fails
+    }
+
+    Ok(Json(ProjectResponse::map_from_project(updated_project)))
+}
+
 /// Trigger pipeline for a specific project
 #[utoipa::path(
     post,
@@ -833,6 +933,11 @@ pub async fn list_presets(RequireAuth(_auth): RequireAuth) -> Result<impl IntoRe
                     "static",
                 ),
                 Preset::Rsbuild => ("Rsbuild", "Fast Rspack-based build tool", "static"),
+                Preset::Python => (
+                    "Python",
+                    "Python web applications and services",
+                    "server",
+                ),
                 Preset::FastApi => (
                     "FastAPI",
                     "Modern, fast web framework for building APIs with Python",

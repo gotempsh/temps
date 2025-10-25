@@ -118,8 +118,8 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   useEffect(() => {
     if (!selectedTarget) return
 
-    // If containers are loading or no container is selected yet, wait
-    if (containersData !== undefined && !selectedContainer) return
+    // Wait for container to be selected - don't connect without a specific container
+    if (!selectedContainer) return
 
     // Prevent multiple simultaneous connections
     if (isConnectingRef.current) {
@@ -156,11 +156,9 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
         params.append('tail', tail.toString())
       }
 
-      // Use container-specific endpoint if container is selected, otherwise use default
+      // Use container-specific endpoint (selectedContainer is guaranteed by the guard above)
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const wsUrl = selectedContainer
-        ? `${protocol}//${window.location.host}/api/projects/${project.id}/environments/${selectedTarget}/containers/${selectedContainer}/logs?${params.toString()}`
-        : `${protocol}//${window.location.host}/api/projects/${project.id}/environments/${selectedTarget}/container-logs?${params.toString()}`
+      const wsUrl = `${protocol}//${window.location.host}/api/projects/${project.id}/environments/${selectedTarget}/containers/${selectedContainer}/logs?${params.toString()}`
 
       // Close existing connection if any
       if (wsRef.current) {
@@ -311,9 +309,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = selectedContainer
-      ? `${protocol}//${window.location.host}/api/projects/${project.id}/environments/${selectedTarget}/containers/${selectedContainer}/logs?${params.toString()}`
-      : `${protocol}//${window.location.host}/api/projects/${project.id}/environments/${selectedTarget}/container-logs?${params.toString()}`
+    const wsUrl = `${protocol}//${window.location.host}/api/projects/${project.id}/environments/${selectedTarget}/containers/${selectedContainer}/logs?${params.toString()}`
 
     // Close existing connection if any
     if (wsRef.current) {

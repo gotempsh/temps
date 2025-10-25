@@ -16,22 +16,16 @@ pub struct Model {
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
     pub slug: Option<String>,
+    /// Encrypted JSON configuration for the service
+    pub config: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "super::external_service_params::Entity")]
-    Params,
     #[sea_orm(has_many = "super::external_service_backups::Entity")]
     Backups,
     #[sea_orm(has_many = "super::project_services::Entity")]
     ProjectServices,
-}
-
-impl Related<super::external_service_params::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::Params.def()
-    }
 }
 
 impl Related<super::external_service_backups::Entity> for Entity {

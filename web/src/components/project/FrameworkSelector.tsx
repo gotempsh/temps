@@ -1,5 +1,5 @@
 import { useState, useMemo } from 'react'
-import { Folder, AlertCircle, Grid3x3 } from 'lucide-react'
+import { Folder, AlertCircle, Grid3x3, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -26,6 +26,7 @@ interface FrameworkSelectorProps {
   error?: Error | null
   selectedPreset: string
   onSelectPreset: (value: string) => void
+  onRefresh?: () => void
   disabled?: boolean
 }
 
@@ -35,6 +36,7 @@ export function FrameworkSelector({
   error,
   selectedPreset,
   onSelectPreset,
+  onRefresh,
   disabled = false,
 }: FrameworkSelectorProps) {
   const [manualMode, setManualMode] = useState(false)
@@ -110,6 +112,21 @@ export function FrameworkSelector({
       <div className="flex items-center justify-between">
         <label className="text-sm font-medium">Framework Preset</label>
         <div className="flex items-center gap-2">
+          {/* Refresh button */}
+          {onRefresh && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={onRefresh}
+              disabled={isLoading}
+              className="text-xs"
+            >
+              <RefreshCw className={`h-3 w-3 mr-1 ${isLoading ? 'animate-spin' : ''}`} />
+              Refresh
+            </Button>
+          )}
+
           {/* Toggle between detected and all presets */}
           {hasDetectedPresets && !manualMode && (
             <Button
@@ -343,9 +360,11 @@ function DetectedPresetCard({
 
             {/* Path indicator for monorepo */}
             {project.path && project.path !== '.' && (
-              <div className="flex items-center gap-1 text-xs text-muted-foreground mt-2 p-1.5 bg-muted/50 rounded">
-                <Folder className="h-3 w-3 flex-shrink-0" />
-                <span className="truncate font-mono">{project.path}</span>
+              <div className="flex items-start gap-1 text-xs text-muted-foreground mt-2 p-1.5 bg-muted/50 rounded">
+                <Folder className="h-3 w-3 flex-shrink-0 mt-0.5" />
+                <span className="font-mono break-all" title={project.path}>
+                  {project.path}
+                </span>
               </div>
             )}
 
@@ -359,71 +378,6 @@ function DetectedPresetCard({
         </div>
 
         {/* Selected indicator */}
-        {isSelected && (
-          <div className="mt-3 pt-3 border-t border-border">
-            <div className="flex items-center gap-1.5 text-xs font-medium text-primary">
-              <div className="w-1.5 h-1.5 bg-primary rounded-full" />
-              Selected
-            </div>
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  )
-}
-
-// Component for custom preset card
-function CustomPresetCard({
-  selectedPreset,
-  onSelectPreset,
-  disabled,
-  getPresetBySlug,
-}: {
-  selectedPreset: string
-  onSelectPreset: (value: string) => void
-  disabled: boolean
-  getPresetBySlug: (slug: string) => PresetResponse | undefined
-}) {
-  const customPreset = getPresetBySlug('custom')
-  const isSelected = selectedPreset === 'custom'
-
-  return (
-    <Card
-      className={`cursor-pointer transition-all hover:border-primary/50 ${
-        isSelected ? 'border-primary border-2 bg-primary/5' : 'border-border'
-      } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
-      onClick={() => !disabled && onSelectPreset('custom')}
-    >
-      <CardContent className="p-4">
-        <div className="flex items-start gap-3">
-          <div className="flex-shrink-0">
-            <img
-              src={customPreset?.icon_url || '/presets/custom.svg'}
-              alt={customPreset?.label || 'Custom'}
-              className="w-12 h-12 object-contain dark:invert"
-              onError={(e) => {
-                e.currentTarget.src = '/presets/custom.svg'
-              }}
-            />
-          </div>
-
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 mb-1">
-              <h3 className="font-semibold text-sm">
-                {customPreset?.label || 'Custom'}
-              </h3>
-              <Badge variant="outline" className="text-xs">
-                Manual
-              </Badge>
-            </div>
-
-            <p className="text-xs text-muted-foreground line-clamp-2">
-              {customPreset?.description ||
-                'Configure manually with custom settings'}
-            </p>
-          </div>
-        </div>
-
         {isSelected && (
           <div className="mt-3 pt-3 border-t border-border">
             <div className="flex items-center gap-1.5 text-xs font-medium text-primary">

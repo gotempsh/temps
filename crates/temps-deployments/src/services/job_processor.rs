@@ -2,10 +2,11 @@ use crate::services::workflow_execution_service::WorkflowExecutionService;
 use crate::services::workflow_planner::WorkflowPlanner;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde_json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use temps_core::{Job, JobReceiver};
 use temps_database::DbConnection;
-use temps_entities::{deployments, types::PipelineStatus};
+use temps_entities::{deployments, prelude::{DeploymentConfigSnapshot, DeploymentMetadata, GitPushEvent}, types::PipelineStatus};
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug)]
@@ -80,15 +81,15 @@ impl JobProcessorService {
 
     pub async fn run(&mut self) -> Result<(), JobProcessorError> {
         debug!("Starting job processor service for deployments");
-        debug!("🔍 Job processor initialized and ready to receive jobs");
+        debug!("Job processor initialized and ready to receive jobs");
 
         loop {
             debug!("🎧 Waiting for next job...");
             match self.job_receiver.recv().await {
                 Ok(job) => {
-                    info!("📨 Processing job: {}", job);
+                    info!("Processing job: {}", job);
                     debug!(
-                        "🔍 Job details received at: {}",
+                        "Job details received at: {}",
                         chrono::Utc::now().to_rfc3339()
                     );
 
@@ -103,7 +104,7 @@ impl JobProcessorService {
 
                             // Spawn a task to handle the job asynchronously
                             tokio::spawn(async move {
-                                debug!("🎯 Starting async processing for GitPushEvent job");
+                                debug!("Starting async processing for GitPushEvent job");
                                 Self::process_git_push_event_job(
                                     workflow_planner,
                                     workflow_executor,
@@ -112,23 +113,23 @@ impl JobProcessorService {
                                     git_push_job,
                                 )
                                 .await;
-                                debug!("✅ Completed async processing for GitPushEvent job");
+                                debug!("Completed async processing for GitPushEvent job");
                             });
                         }
                         _ => {
                             // Ignore jobs that aren't handled by this processor
-                            info!("⏭️ Ignoring unhandled job: {}", job);
+                            info!("Ignoring unhandled job: {}", job);
                             debug!(
-                                "🔍 Job type not handled by deployment processor: {}",
+                                "Job type not handled by deployment processor: {}",
                                 std::any::type_name_of_val(&job)
                             );
                         }
                     }
                 }
                 Err(e) => {
-                    error!("💥 Failed to receive job: {}", e);
-                    debug!("🔍 Queue error details: {:?}", e);
-                    debug!("🛑 Stopping job processor due to queue error");
+                    error!("Failed to receive job: {}", e);
+                    debug!("Queue error details: {:?}", e);
+                    debug!("Stopping job processor due to queue error");
                     return Err(JobProcessorError::QueueError(e.to_string()));
                 }
             }
@@ -241,7 +242,7 @@ impl JobProcessorService {
         git_provider_manager: Arc<temps_git::GitProviderManager>,
         job: temps_core::GitPushEventJob,
     ) {
-        Self::process_git_push_event(
+        process_git_push_event(
             workflow_planner,
             workflow_executor,
             db,
@@ -250,9 +251,10 @@ impl JobProcessorService {
         )
         .await;
     }
+}
 
-    // Extracted method for testing
-    async fn process_git_push_event(
+// Extracted free function for testing
+async fn process_git_push_event(
         workflow_planner: Arc<WorkflowPlanner>,
         workflow_executor: Arc<WorkflowExecutionService>,
         db: Arc<DbConnection>,
@@ -264,7 +266,7 @@ impl JobProcessorService {
             job.owner, job.repo, job.branch
         );
         debug!(
-            "🔍 GitPushEvent details - owner: {}, repo: {}, branch: {:?}, tag: {:?}, commit: {}",
+            "GitPushEvent details - owner: {}, repo: {}, branch: {:?}, tag: {:?}, commit: {}",
             job.owner, job.repo, job.branch, job.tag, job.commit
         );
 
@@ -331,17 +333,17 @@ impl JobProcessorService {
         let deployment_number = deployment_count + 1;
 
         // Fetch commit information from Git provider
-        let commit_info = match Self::fetch_commit_info(&git_provider_manager, &project, &job).await
+        let commit_info = match JobProcessorService::fetch_commit_info(&git_provider_manager, &project, &job).await
         {
             Ok(info) => {
                 info!(
-                    "✅ Fetched commit info: {} by {}",
+                    "Fetched commit info: {} by {}",
                     info.message, info.author
                 );
                 Some(info)
             }
             Err(e) => {
-                warn!("⚠️  Failed to fetch commit info: {}, using fallback", e);
+                warn!("Failed to fetch commit info: {}, using fallback", e);
                 None
             }
         };
@@ -349,20 +351,42 @@ impl JobProcessorService {
         // Generate URL as {project_slug}-{deployment_number}
         let env_slug = format!("{}-{}", project.slug, deployment_number);
 
+        // Get the effective deployment configuration by merging project and environment configs
+        let merged_config = if let Some(project_config) = &project.deployment_config {
+            if let Some(env_config) = &environment.deployment_config {
+                Some(project_config.merge(env_config))
+            } else {
+                Some(project_config.clone())
+            }
+        } else {
+            environment.deployment_config.clone()
+        };
+
+        // Create deployment config snapshot
+        // Note: Environment variables will be populated during workflow execution
+        // We store an empty map here and the workflow will update it with actual values
+        let deployment_config_snapshot = merged_config.map(|config| {
+            DeploymentConfigSnapshot::from_config(&config, HashMap::new())
+        });
+
+        // Create typed deployment metadata
+        let deployment_metadata = DeploymentMetadata {
+            git_push_event: Some(GitPushEvent {
+                owner: job.owner.clone(),
+                repo: job.repo.clone(),
+                branch: job.branch.clone().unwrap_or_default(),
+                commit: job.commit.clone(),
+            }),
+            ..Default::default()
+        };
+
         let new_deployment = deployments::ActiveModel {
             id: sea_orm::NotSet,
             project_id: sea_orm::Set(project.id),
             environment_id: sea_orm::Set(environment.id),
             slug: sea_orm::Set(env_slug),
             state: sea_orm::Set("pending".to_string()),
-            metadata: sea_orm::Set(serde_json::json!({
-                "git_push_event": {
-                    "owner": job.owner,
-                    "repo": job.repo,
-                    "branch": job.branch,
-                    "commit": job.commit
-                }
-            })),
+            metadata: sea_orm::Set(Some(deployment_metadata)),
             branch_ref: sea_orm::Set(job.branch.clone()),
             tag_ref: sea_orm::Set(job.tag.clone()),
             commit_sha: sea_orm::Set(Some(job.commit.clone())),
@@ -381,6 +405,7 @@ impl JobProcessorService {
             image_name: sea_orm::Set(None),
             cancelled_reason: sea_orm::Set(None),
             commit_json: sea_orm::Set(commit_info.as_ref().map(|c| c.commit_json.clone())),
+            deployment_config: sea_orm::Set(deployment_config_snapshot),
             created_at: sea_orm::Set(Utc::now()),
             updated_at: sea_orm::Set(Utc::now()),
         };
@@ -425,42 +450,42 @@ impl JobProcessorService {
             Ok(created_jobs) => {
                 let job_count = created_jobs.len();
                 info!(
-                    "📋 Created {} jobs for deployment {} from GitPushEvent",
+                    "Created {} jobs for deployment {} from GitPushEvent",
                     job_count, deployment_id
                 );
 
                 // Update deployment status to Running before executing workflow
-                match Self::update_deployment_status(&db, deployment_id, PipelineStatus::Running)
+                match JobProcessorService::update_deployment_status(&db, deployment_id, PipelineStatus::Running)
                     .await
                 {
-                    Ok(_) => info!("✅ Updated deployment {} status to Running", deployment_id),
+                    Ok(_) => info!("Updated deployment {} status to Running", deployment_id),
                     Err(e) => {
-                        error!("❌ Failed to update deployment status to Running: {}", e);
+                        error!("Failed to update deployment status to Running: {}", e);
                         return;
                     }
                 }
 
                 // Execute the workflow
-                info!("🚀 Executing workflow for deployment {}", deployment_id);
+                info!("Executing workflow for deployment {}", deployment_id);
                 match workflow_executor
                     .execute_deployment_workflow(deployment_id)
                     .await
                 {
                     Ok(_) => {
                         info!(
-                            "✅ Workflow execution completed for deployment {}",
+                            "Workflow execution completed for deployment {}",
                             deployment_id
                         );
                     }
                     Err(e) => {
                         let error_message = format!("{}", e);
                         error!(
-                            "❌ Workflow execution failed for deployment {}: {}",
+                            "Workflow execution failed for deployment {}: {}",
                             deployment_id, error_message
                         );
 
                         // Mark deployment as failed with error message
-                        if let Err(update_err) = Self::update_deployment_status_with_message(
+                        if let Err(update_err) = JobProcessorService::update_deployment_status_with_message(
                             &db,
                             deployment_id,
                             PipelineStatus::Failed,
@@ -468,9 +493,9 @@ impl JobProcessorService {
                         )
                         .await
                         {
-                            error!("❌ Failed to update deployment status: {}", update_err);
+                            error!("Failed to update deployment status: {}", update_err);
                         } else {
-                            debug!("✅ Updated deployment {} status to failed", deployment_id);
+                            debug!("Updated deployment {} status to failed", deployment_id);
                         }
                     }
                 }
@@ -482,12 +507,12 @@ impl JobProcessorService {
                 std::mem::drop(job_error);
 
                 error!(
-                    "❌ Failed to create jobs for deployment {}: {}",
+                    "Failed to create jobs for deployment {}: {}",
                     deployment_id, error_message
                 );
 
                 // Mark deployment as failed with error message
-                if let Err(update_err) = Self::update_deployment_status_with_message(
+                if let Err(update_err) = JobProcessorService::update_deployment_status_with_message(
                     &db,
                     deployment_id,
                     PipelineStatus::Failed,
@@ -495,14 +520,13 @@ impl JobProcessorService {
                 )
                 .await
                 {
-                    error!("❌ Failed to update deployment status: {}", update_err);
+                    error!("Failed to update deployment status: {}", update_err);
                 } else {
-                    debug!("✅ Updated deployment {} status to failed", deployment_id);
+                    debug!("Updated deployment {} status to failed", deployment_id);
                 }
             }
         }
     }
-}
 
 #[cfg(test)]
 mod tests {
@@ -586,7 +610,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("test-deployment-123".to_string()),
             state: Set("pending".to_string()),
-            metadata: Set(serde_json::json!({"message": "Test deployment"})),
+            metadata: Set(None),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -751,7 +775,7 @@ mod tests {
             environment_id: Set(environment_id),
             slug: Set("test-deployment".to_string()),
             state: Set("pending".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -858,7 +882,7 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("test-deployment".to_string()),
             state: Set("pending".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -927,7 +951,7 @@ mod tests {
             environment_id: Set(environment_id),
             slug: Set("test-deployment".to_string()),
             state: Set("pending".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()

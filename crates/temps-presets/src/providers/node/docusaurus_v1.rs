@@ -22,7 +22,7 @@ impl PresetProvider for DocusaurusV1PresetProvider {
     fn detect(&self, app: &App) -> Option<Confidence> {
         // Parse package.json to check for docusaurus v1
         let package_json_str = app.read_file("package.json").ok()?;
-        let package_json = PackageJson::from_str(&package_json_str).ok()?;
+        let package_json = PackageJson::parse(&package_json_str).ok()?;
 
         // Get "docusaurus" dependency (v1 uses plain "docusaurus", not "@docusaurus/core")
         let version = package_json.get_dependency("docusaurus")?;

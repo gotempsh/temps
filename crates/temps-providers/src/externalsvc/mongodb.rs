@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Result};
 use async_trait::async_trait;
 use bollard::exec::CreateExecOptions;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
@@ -7,8 +7,9 @@ use futures::StreamExt;
 use mongodb::bson::doc;
 use mongodb::options::ClientOptions;
 use mongodb::Client as MongoClient;
+use schemars::JsonSchema;
 use sea_orm::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -19,26 +20,129 @@ use tracing::{error, info};
 
 use crate::utils::ensure_network_exists;
 
-use super::{ExternalService, RuntimeEnvVar, ServiceConfig, ServiceParameter, ServiceType};
+use super::{ExternalService, RuntimeEnvVar, ServiceConfig, ServiceType};
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct MongodbConfig {
+/// Input configuration for creating a MongoDB service
+/// This is what users provide when creating the service
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(title = "MongoDB Configuration", description = "Configuration for MongoDB service")]
+pub struct MongodbInputConfig {
+    /// MongoDB host address
     #[serde(default = "default_host")]
+    #[schemars(example = "example_host", default = "default_host")]
+    pub host: String,
+
+    /// MongoDB port (auto-assigned if not provided)
+    #[schemars(example = "example_port")]
+    pub port: Option<String>,
+
+    /// MongoDB database name
+    #[serde(default = "default_database")]
+    #[schemars(example = "example_database", default = "default_database")]
+    pub database: String,
+
+    /// MongoDB username
+    #[serde(default = "default_username")]
+    #[schemars(example = "example_username", default = "default_username")]
+    pub username: String,
+
+    /// MongoDB password (auto-generated if not provided or empty)
+    #[serde(default, deserialize_with = "deserialize_optional_password")]
+    #[schemars(with = "Option<String>", example = "example_password")]
+    pub password: Option<String>,
+
+    /// Docker image to use for MongoDB
+    #[serde(default = "default_image")]
+    #[schemars(example = "example_image", default = "default_image")]
+    pub image: String,
+
+    /// MongoDB version
+    #[serde(default = "default_version")]
+    #[schemars(example = "example_version", default = "default_version")]
+    pub version: String,
+}
+
+// Example functions for schemars
+fn example_host() -> &'static str {
+    "localhost"
+}
+
+fn example_port() -> &'static str {
+    "27017"
+}
+
+fn example_database() -> &'static str {
+    "mydatabase"
+}
+
+fn example_username() -> &'static str {
+    "root"
+}
+
+fn example_password() -> &'static str {
+    ""
+}
+
+fn example_image() -> &'static str {
+    "mongo"
+}
+
+fn example_version() -> &'static str {
+    "8.0"
+}
+
+/// Internal runtime configuration for MongoDB service
+/// This is what the service uses internally after processing input
+/// and what gets saved to the database
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MongodbRuntimeConfig {
     pub host: String,
     pub port: String,
     pub database: String,
-    #[serde(default = "default_username")]
     pub username: String,
-    #[serde(default = "generate_password")]
     pub password: String,
-    #[serde(default = "default_image")]
     pub image: String,
-    #[serde(default = "default_version")]
     pub version: String,
+}
+
+impl From<MongodbInputConfig> for MongodbRuntimeConfig {
+    fn from(input: MongodbInputConfig) -> Self {
+        Self {
+            host: input.host,
+            port: input.port.unwrap_or_else(|| {
+                find_available_port(27017)
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "27017".to_string())
+            }),
+            database: input.database,
+            username: input.username,
+            password: input.password.unwrap_or_else(generate_password),
+            image: input.image,
+            version: input.version,
+        }
+    }
+}
+
+fn deserialize_optional_password<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Deserialize as Option to handle missing field
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+
+    // Return None if missing or empty (will trigger auto-generation)
+    Ok(match opt {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => None,
+    })
 }
 
 fn default_host() -> String {
     "localhost".to_string()
+}
+
+fn default_database() -> String {
+    "admin".to_string()
 }
 
 fn default_username() -> String {
@@ -62,6 +166,7 @@ fn default_version() -> String {
     "8.0".to_string()
 }
 
+
 fn is_port_available(port: u16) -> bool {
     TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
@@ -72,7 +177,7 @@ fn find_available_port(start_port: u16) -> Option<u16> {
 
 pub struct MongodbService {
     name: String,
-    config: Arc<RwLock<Option<MongodbConfig>>>,
+    config: Arc<RwLock<Option<MongodbRuntimeConfig>>>,
     docker: Arc<Docker>,
 }
 
@@ -85,70 +190,20 @@ impl MongodbService {
         }
     }
 
-    fn get_mongodb_config(&self, service_config: ServiceConfig) -> Result<MongodbConfig> {
-        let host = service_config
-            .parameters
-            .get("host")
-            .context("Missing host parameter")?;
-        let port = service_config
-            .parameters
-            .get("port")
-            .context("Missing port parameter")?;
-        let database = service_config
-            .parameters
-            .get("database")
-            .context("Missing database parameter")?;
-        let username = service_config
-            .parameters
-            .get("username")
-            .context("Missing username parameter")?;
+    fn get_mongodb_config(&self, service_config: ServiceConfig) -> Result<MongodbRuntimeConfig> {
+        // Deserialize input config from parameters
+        let input_config: MongodbInputConfig = serde_json::from_value(service_config.parameters)
+            .map_err(|e| anyhow::anyhow!("Failed to parse MongoDB input configuration: {}", e))?;
 
-        // Auto-generate password if not provided
-        let password = service_config
-            .parameters
-            .get("password")
-            .map(|v| v.as_str().unwrap_or("").to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(generate_password);
-
-        let image = service_config
-            .parameters
-            .get("image")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(default_image);
-
-        let version = service_config
-            .parameters
-            .get("version")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(default_version);
-
-        Ok(MongodbConfig {
-            host: host.as_str().unwrap().to_string(),
-            port: port.as_str().unwrap().to_string(),
-            database: database.as_str().unwrap().to_string(),
-            username: username.as_str().unwrap().to_string(),
-            password,
-            image,
-            version,
-        })
+        // Transform input config to runtime config (auto-generates password if needed)
+        Ok(input_config.into())
     }
 
     fn get_container_name(&self) -> String {
         format!("temps-mongodb-{}", self.name)
     }
 
-    fn get_default_port(&self) -> String {
-        if let Some(port) = find_available_port(27017) {
-            port.to_string()
-        } else {
-            "27017".to_string()
-        }
-    }
-
-    async fn create_container(&self, docker: &Docker, config: &MongodbConfig) -> Result<()> {
+    async fn create_container(&self, docker: &Docker, config: &MongodbRuntimeConfig) -> Result<()> {
         let container_name = self.get_container_name();
         let volume_name = format!("temps-mongodb-{}-data", self.name);
 
@@ -164,11 +219,9 @@ impl MongodbService {
 
         info!("Created MongoDB volume: {}", volume_name);
 
-        let env_vars = vec![
-            format!("MONGO_INITDB_ROOT_USERNAME={}", config.username),
+        let env_vars = [format!("MONGO_INITDB_ROOT_USERNAME={}", config.username),
             format!("MONGO_INITDB_ROOT_PASSWORD={}", config.password),
-            format!("MONGO_INITDB_DATABASE={}", config.database),
-        ];
+            format!("MONGO_INITDB_DATABASE={}", config.database)];
 
         let mut container_labels = HashMap::new();
         container_labels.insert("temps.service".to_string(), "mongodb".to_string());
@@ -365,17 +418,24 @@ impl MongodbService {
 #[async_trait]
 impl ExternalService for MongodbService {
     async fn init(&self, service_config: ServiceConfig) -> Result<HashMap<String, String>> {
+        // Parse input config and transform to runtime config
         let mongodb_config = self.get_mongodb_config(service_config.clone())?;
         *self.config.write().await = Some(mongodb_config.clone());
 
-        let mut inferred_params = HashMap::new();
+        // Serialize the full runtime config to save to database
+        // This ensures auto-generated values (password, port) are persisted
+        let runtime_config_json = serde_json::to_value(&mongodb_config)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize MongoDB runtime config: {}", e))?;
 
-        // Store the image and version if not already provided
-        if service_config.parameters.get("image").is_none() {
-            inferred_params.insert("image".to_string(), mongodb_config.image);
-        }
-        if service_config.parameters.get("version").is_none() {
-            inferred_params.insert("version".to_string(), mongodb_config.version);
+        let runtime_config_map = runtime_config_json
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Runtime config is not an object"))?;
+
+        let mut inferred_params = HashMap::new();
+        for (key, value) in runtime_config_map {
+            if let Some(str_value) = value.as_str() {
+                inferred_params.insert(key.clone(), str_value.to_string());
+            }
         }
 
         Ok(inferred_params)
@@ -426,81 +486,10 @@ impl ExternalService for MongodbService {
         Ok(())
     }
 
-    fn get_parameter_definitions(&self) -> Vec<ServiceParameter> {
-        vec![
-            ServiceParameter {
-                name: "host".to_string(),
-                required: true,
-                encrypted: false,
-                description: "MongoDB host".to_string(),
-                default_value: Some("localhost".to_string()),
-                validation_pattern: None,
-                choices: None,
-            },
-            ServiceParameter {
-                name: "port".to_string(),
-                required: true,
-                encrypted: false,
-                description: "MongoDB port".to_string(),
-                default_value: Some(self.get_default_port()),
-                validation_pattern: Some(r"^\d+$".to_string()),
-                choices: None,
-            },
-            ServiceParameter {
-                name: "database".to_string(),
-                required: true,
-                encrypted: false,
-                description: "MongoDB database name".to_string(),
-                default_value: Some("admin".to_string()),
-                validation_pattern: None,
-                choices: None,
-            },
-            ServiceParameter {
-                name: "username".to_string(),
-                required: true,
-                encrypted: false,
-                description: "MongoDB username".to_string(),
-                default_value: Some("root".to_string()),
-                validation_pattern: None,
-                choices: None,
-            },
-            ServiceParameter {
-                name: "password".to_string(),
-                required: false,
-                encrypted: true,
-                description: "MongoDB password (auto-generated if not provided)".to_string(),
-                default_value: None,
-                validation_pattern: None,
-                choices: None,
-            },
-            ServiceParameter {
-                name: "image".to_string(),
-                required: false,
-                encrypted: false,
-                description: "Docker image to use for MongoDB".to_string(),
-                default_value: Some("mongo".to_string()),
-                validation_pattern: None,
-                choices: Some(vec![
-                    "mongo".to_string(),
-                    "mongodb/mongodb-community-server".to_string(),
-                    "mongodb/mongodb-enterprise-server".to_string(),
-                ]),
-            },
-            ServiceParameter {
-                name: "version".to_string(),
-                required: false,
-                encrypted: false,
-                description: "MongoDB version".to_string(),
-                default_value: Some("8.0".to_string()),
-                validation_pattern: None,
-                choices: Some(vec![
-                    "5.0".to_string(),
-                    "6.0".to_string(),
-                    "7.0".to_string(),
-                    "8.0".to_string(),
-                ]),
-            },
-        ]
+    fn get_parameter_schema(&self) -> Option<serde_json::Value> {
+        // Generate JSON Schema from MongodbInputConfig
+        let schema = schemars::schema_for!(MongodbInputConfig);
+        serde_json::to_value(schema).ok()
     }
 
     async fn start(&self) -> Result<()> {
@@ -708,32 +697,38 @@ impl ExternalService for MongodbService {
                 name: "MONGODB_DATABASE".to_string(),
                 description: "MongoDB database name for this project/environment".to_string(),
                 example: "project1_production".to_string(),
+                sensitive: false,
             },
             RuntimeEnvVar {
                 name: "MONGODB_URL".to_string(),
                 description: "Full MongoDB connection URL".to_string(),
                 example: "mongodb://username:password@localhost:27017/project1_production"
                     .to_string(),
+                sensitive: true, // Contains password
             },
             RuntimeEnvVar {
                 name: "MONGODB_HOST".to_string(),
                 description: "MongoDB host".to_string(),
                 example: "localhost".to_string(),
+                sensitive: false,
             },
             RuntimeEnvVar {
                 name: "MONGODB_PORT".to_string(),
                 description: "MongoDB port".to_string(),
                 example: "27017".to_string(),
+                sensitive: false,
             },
             RuntimeEnvVar {
                 name: "MONGODB_USERNAME".to_string(),
                 description: "MongoDB username".to_string(),
                 example: "root".to_string(),
+                sensitive: false,
             },
             RuntimeEnvVar {
                 name: "MONGODB_PASSWORD".to_string(),
                 description: "MongoDB password".to_string(),
                 example: "password".to_string(),
+                sensitive: true,
             },
         ]
     }
@@ -754,17 +749,20 @@ impl ExternalService for MongodbService {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("MongoDB not configured"))?;
 
+        // Use container name as the Docker hostname for inter-container communication
+        let container_name = self.get_container_name();
+
         let mut env_vars = HashMap::new();
-        env_vars.insert("MONGODB_HOST".to_string(), config.host.clone());
-        env_vars.insert("MONGODB_PORT".to_string(), config.port.clone());
+        env_vars.insert("MONGODB_HOST".to_string(), container_name.clone());
+        env_vars.insert("MONGODB_PORT".to_string(), "27017".to_string());
         env_vars.insert("MONGODB_DATABASE".to_string(), db_name.clone());
         env_vars.insert("MONGODB_USERNAME".to_string(), config.username.clone());
         env_vars.insert("MONGODB_PASSWORD".to_string(), config.password.clone());
         env_vars.insert(
             "MONGODB_URL".to_string(),
             format!(
-                "mongodb://{}:{}@{}:{}/{}",
-                config.username, config.password, config.host, config.port, db_name
+                "mongodb://{}:{}@{}:27017/{}",
+                config.username, config.password, container_name, db_name
             ),
         );
 
@@ -1066,25 +1064,62 @@ mod tests {
     }
 
     #[test]
-    fn test_parameter_definitions() {
+    fn test_parameter_schema() {
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
-        let service = MongodbService::new("test-service".to_string(), docker);
-        let params = service.get_parameter_definitions();
+        let service = MongodbService::new("test-schema".to_string(), docker);
 
-        assert_eq!(params.len(), 7);
+        // Get the parameter schema
+        let schema_opt = service.get_parameter_schema();
+        assert!(schema_opt.is_some(), "Schema should be generated");
 
-        // Check image parameter has choices
-        let image_param = params.iter().find(|p| p.name == "image").unwrap();
-        assert!(image_param.choices.is_some());
-        assert_eq!(image_param.choices.as_ref().unwrap().len(), 3);
+        let schema = schema_opt.unwrap();
 
-        // Check version parameter has choices
-        let version_param = params.iter().find(|p| p.name == "version").unwrap();
-        assert!(version_param.choices.is_some());
-        assert_eq!(version_param.choices.as_ref().unwrap().len(), 4);
+        // Verify schema structure
+        let schema_obj = schema.as_object().expect("Schema should be an object");
 
-        // Check password is encrypted
-        let password_param = params.iter().find(|p| p.name == "password").unwrap();
-        assert!(password_param.encrypted);
+        // Check for schema metadata
+        assert!(schema_obj.contains_key("$schema"), "Should have $schema field");
+        assert!(schema_obj.contains_key("title"), "Should have title field");
+        assert!(schema_obj.contains_key("description"), "Should have description field");
+        assert!(schema_obj.contains_key("properties"), "Should have properties field");
+
+        // Verify title and description
+        assert_eq!(
+            schema_obj.get("title").and_then(|v| v.as_str()),
+            Some("MongoDB Configuration"),
+            "Title should match"
+        );
+
+        // Verify properties
+        let properties = schema_obj
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("Properties should be an object");
+
+        // Check for expected fields
+        let expected_fields = vec!["host", "port", "database", "username", "password", "image", "version"];
+        for field in &expected_fields {
+            assert!(
+                properties.contains_key(*field),
+                "Schema should contain '{}' field",
+                field
+            );
+        }
+
+        // Verify host field has default
+        let host_field = properties
+            .get("host")
+            .and_then(|v| v.as_object())
+            .expect("host field should be an object");
+        assert_eq!(host_field.get("default").and_then(|v| v.as_str()), Some("localhost"));
+
+        // Verify password field description
+        let password_field = properties
+            .get("password")
+            .and_then(|v| v.as_object())
+            .expect("password field should be an object");
+        let password_desc = password_field.get("description").and_then(|v| v.as_str());
+        assert!(password_desc.is_some());
+        assert!(password_desc.unwrap().contains("auto-generated"));
     }
 }

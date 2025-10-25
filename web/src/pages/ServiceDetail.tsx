@@ -41,6 +41,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
+import { toast } from 'sonner'
 
 export function ServiceDetail() {
   const { id } = useParams<{ id: string }>()
@@ -135,6 +136,7 @@ export function ServiceDetail() {
       errorTitle: 'Failed to delete service',
     },
     onSuccess: () => {
+      toast.success('Service deleted successfully')
       navigate('/storage')
     },
     onError: () => {

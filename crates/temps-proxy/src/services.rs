@@ -772,7 +772,7 @@ mod tests {
             project_id: Set(project.id),
             environment_id: Set(environment.id),
             slug: Set("test-deployment".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(None),
             state: Set("completed".to_string()),
             ..Default::default()
         };

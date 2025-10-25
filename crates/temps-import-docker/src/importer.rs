@@ -483,7 +483,7 @@ impl WorkloadImporter for DockerImporter {
             QueryFilter,
         };
         use std::time::Instant;
-        use temps_entities::{deployment_containers, deployments, environments, projects};
+        use temps_entities::{deployment_containers, deployments, environments, prelude::DeploymentMetadata, projects};
 
         let start_time = Instant::now();
         info!(
@@ -629,14 +629,13 @@ impl WorkloadImporter for DockerImporter {
 
         let deployment_number = deployment_count + 1;
         let deployment_slug = format!("{}-{}", project.slug, deployment_number);
-        let deployment_metadata = serde_json::json!({
-            "import_source": "docker",
-            "imported_at": chrono::Utc::now().to_rfc3339(),
-            "image": plan.deployment.image.clone(),
-            "ports": plan.deployment.ports.clone(),
-            "volumes": plan.deployment.volumes.clone(),
-            "env_vars_count": plan.deployment.env_vars.len(),
-        });
+
+        // Create typed deployment metadata
+        let deployment_metadata = DeploymentMetadata {
+            builder: Some("docker-import".to_string()),
+            labels: vec!["imported".to_string()],
+            ..Default::default()
+        };
 
         let now = chrono::Utc::now();
         let deployment = deployments::ActiveModel {
@@ -644,7 +643,7 @@ impl WorkloadImporter for DockerImporter {
             environment_id: Set(environment.id),
             slug: Set(deployment_slug.clone()),
             state: Set("completed".to_string()),
-            metadata: Set(deployment_metadata),
+            metadata: Set(Some(deployment_metadata)),
             image_name: Set(Some(plan.deployment.image.clone())),
             commit_message: Set(Some("Imported from Docker container".to_string())),
             deploying_at: Set(Some(now)),

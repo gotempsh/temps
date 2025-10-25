@@ -12,6 +12,9 @@ mod build_system;
 mod docker_custom;
 mod preset_config;
 mod framework_detector;
+mod rust_preset;
+mod go_preset;
+mod python_preset;
 
 // Preset configuration schemas
 // Source abstraction for file access
@@ -35,8 +38,11 @@ pub use vite::Vite;
 pub use build_system::MonorepoTool;
 pub use preset_config::PresetConfig;
 pub use framework_detector::{detect_node_framework, NodeFramework};
+pub use rust_preset::RustPreset;
+pub use go_preset::GoPreset;
+pub use python_preset::PythonPreset;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectType {
     Server,
     Static,
@@ -225,11 +231,17 @@ pub trait Preset: fmt::Display + Send + Sync {
 
 pub fn all_presets() -> Vec<Box<dyn Preset>> {
     vec![
+        // Node.js / TypeScript frameworks
         Box::new(NextJs),
         Box::new(Vite),
         Box::new(CreateReactApp),
         Box::new(Rsbuild),
         Box::new(Docusaurus),
+        // Language-specific presets (using Nixpacks)
+        Box::new(RustPreset::new()),
+        Box::new(GoPreset::new()),
+        Box::new(PythonPreset::new()),
+        // Generic presets
         Box::new(DockerfilePreset),
         Box::new(docker_custom::DockerCustomPreset),
         // Nixpacks auto-detect
@@ -296,7 +308,151 @@ pub fn detect_preset_from_files(files: &[String]) -> Option<Box<dyn Preset>> {
         return Some(Box::new(Rsbuild));
     }
 
-    // Fall back to Nixpacks for auto-detection (will be checked at generation time)
-    // This allows zero-config deployment for Python, Java, .NET, Go, etc.
-    Some(Box::new(NixpacksPreset::auto()))
+    // Check for Rust (Cargo.toml)
+    if files.iter().any(|path| path.ends_with("Cargo.toml")) {
+        return Some(Box::new(RustPreset::new()));
+    }
+
+    // Check for Go (go.mod)
+    if files.iter().any(|path| path.ends_with("go.mod")) {
+        return Some(Box::new(GoPreset::new()));
+    }
+
+    // Check for Python (requirements.txt, pyproject.toml, setup.py)
+    if files.iter().any(|path| {
+        path.ends_with("requirements.txt")
+            || path.ends_with("pyproject.toml")
+            || path.ends_with("setup.py")
+            || path.ends_with("Pipfile")
+    }) {
+        return Some(Box::new(PythonPreset::new()));
+    }
+
+    // Only detect Nixpacks if there's an explicit nixpacks.toml file
+    // This prevents Nixpacks from being auto-detected for every path
+    // Users can still manually select Nixpacks when creating a project
+    if files.iter().any(|path| path.ends_with("nixpacks.toml")) {
+        return Some(Box::new(NixpacksPreset::auto()));
+    }
+
+    // No preset detected - return None
+    // This prevents false positives for directories like "src", "public", etc.
+    None
+}
+
+/// Information about a detected preset in a specific directory
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedPreset {
+    /// Relative path from repository root (e.g., "./", "apps/web", "packages/api")
+    pub path: String,
+    /// Preset slug (e.g., "nextjs", "vite", "dockerfile")
+    pub slug: String,
+    /// Human-readable preset name (e.g., "Next.js", "Vite", "Dockerfile")
+    pub label: String,
+    /// Exposed port if applicable
+    pub exposed_port: Option<u16>,
+}
+
+/// Detect all presets in a file tree
+///
+/// This function analyzes a complete file tree and identifies presets in different directories.
+/// It groups files by directory, detects presets for each directory, and returns a list of
+/// detected presets with their locations.
+///
+/// # Arguments
+/// * `files` - Complete list of file paths from repository root (e.g., ["src/main.rs", "apps/web/next.config.js"])
+///
+/// # Returns
+/// A vector of detected presets, sorted by path (root first, then subdirectories)
+///
+/// # Example
+/// ```
+/// use temps_presets::detect_presets_from_file_tree;
+///
+/// let files = vec![
+///     "package.json".to_string(),
+///     "next.config.js".to_string(),
+///     "apps/api/Dockerfile".to_string(),
+///     "apps/web/vite.config.ts".to_string(),
+/// ];
+///
+/// let presets = detect_presets_from_file_tree(&files);
+/// // Returns presets for root (Next.js), apps/api (Dockerfile), apps/web (Vite)
+/// ```
+pub fn detect_presets_from_file_tree(files: &[String]) -> Vec<DetectedPreset> {
+    use std::collections::HashMap;
+
+    if files.is_empty() {
+        return Vec::new();
+    }
+
+    // Group files by directory
+    let mut directory_files: HashMap<String, Vec<String>> = HashMap::new();
+
+    for path in files {
+        let directory = match path.rfind('/') {
+            Some(idx) => path[..idx].to_string(),
+            None => String::new(), // Root directory
+        };
+
+        directory_files
+            .entry(directory)
+            .or_default()
+            .push(path.clone());
+    }
+
+    let mut presets = Vec::new();
+
+    // Check each directory for presets
+    for (dir, dir_files) in &directory_files {
+        // Limit directory depth to avoid detecting presets in deeply nested node_modules, etc.
+        // Depth is the number of slashes: "" = 0, "a" = 0, "a/b" = 1, "a/b/c" = 2, etc.
+        let depth = dir.matches('/').count();
+        if depth >= 4 {
+            continue;
+        }
+
+        // Skip common directories that shouldn't have presets
+        let dir_lower = dir.to_lowercase();
+        if dir_lower.contains("node_modules")
+            || dir_lower.contains(".git")
+            || dir_lower.contains("dist")
+            || dir_lower.contains("build")
+            || dir_lower.ends_with("/public")
+            || dir_lower.ends_with("/static")
+            || dir_lower.ends_with("/assets")
+        {
+            continue;
+        }
+
+        if let Some(preset) = detect_preset_from_files(dir_files) {
+            // Use relative paths: "./" for root, subdirectory name for others
+            let path = if dir.is_empty() {
+                "./".to_string()
+            } else {
+                dir.clone()
+            };
+
+            presets.push(DetectedPreset {
+                path,
+                slug: preset.slug(),
+                label: preset.label(),
+                exposed_port: None, // Port will be determined during deployment
+            });
+        }
+    }
+
+    // Sort presets by path for consistent output (root "./" comes first)
+    presets.sort_by(|a, b| {
+        // Root should come first
+        if a.path == "./" && b.path != "./" {
+            std::cmp::Ordering::Less
+        } else if a.path != "./" && b.path == "./" {
+            std::cmp::Ordering::Greater
+        } else {
+            a.path.cmp(&b.path)
+        }
+    });
+
+    presets
 }

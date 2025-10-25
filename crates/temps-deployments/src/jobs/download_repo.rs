@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_git::GitProviderManagerTrait;
-use temps_logs::LogService;
+use temps_logs::{LogLevel, LogService};
 
 /// Job for downloading repository source code
 pub struct DownloadRepoJob {
@@ -134,16 +134,32 @@ impl DownloadRepoJob {
 
     /// Write log message to both job-specific log file and context log writer
     async fn log(&self, context: &WorkflowContext, message: String) -> Result<(), WorkflowError> {
-        // Write to job-specific log file
+        // Detect log level from message content/emojis
+        let level = Self::detect_log_level(&message);
+
+        // Write structured log to job-specific log file
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
-                .append_to_log(log_id, &format!("{}\n", message))
+                .append_structured_log(log_id, level, message.clone())
                 .await
                 .map_err(|e| WorkflowError::Other(format!("Failed to write log: {}", e)))?;
         }
         // Also write to context log writer (for real-time streaming and test capture)
         context.log(&message).await?;
         Ok(())
+    }
+
+    /// Detect log level from message content
+    fn detect_log_level(message: &str) -> LogLevel {
+        if message.contains("✅") || message.contains("Complete") || message.contains("success") {
+            LogLevel::Success
+        } else if message.contains("❌") || message.contains("Failed") || message.contains("Error") || message.contains("error") {
+            LogLevel::Error
+        } else if message.contains("⏳") || message.contains("Waiting") || message.contains("warning") {
+            LogLevel::Warning
+        } else {
+            LogLevel::Info
+        }
     }
 
     /// Get the branch/ref to checkout based on priority
@@ -195,7 +211,7 @@ impl DownloadRepoJob {
     ) -> Result<(), WorkflowError> {
         self.log(
             context,
-            format!("🌍 Cloning public repository from: {}", git_url),
+            format!("Cloning public repository from: {}", git_url),
         )
         .await?;
 
@@ -223,7 +239,7 @@ impl DownloadRepoJob {
 
         self.log(
             context,
-            "✅ Successfully cloned public repository".to_string(),
+            "Successfully cloned public repository".to_string(),
         )
         .await?;
 
@@ -245,7 +261,7 @@ impl DownloadRepoJob {
         .await?;
 
         let checkout_ref = self.get_checkout_ref(context);
-        self.log(context, format!("📌 Checking out ref: {}", checkout_ref))
+        self.log(context, format!("Checking out ref: {}", checkout_ref))
             .await?;
 
         // Create temp directory
@@ -255,7 +271,7 @@ impl DownloadRepoJob {
 
         self.log(
             context,
-            format!("📁 Created repository directory at: {}", repo_dir.display()),
+            format!("Created repository directory at: {}", repo_dir.display()),
         )
         .await?;
 
@@ -373,7 +389,7 @@ impl DownloadRepoJob {
                         ))
                     })?;
 
-                self.log(context, "🔄 Successfully cloned repository".to_string())
+                self.log(context, "Successfully cloned repository".to_string())
                     .await?;
             }
         }
@@ -385,7 +401,7 @@ impl DownloadRepoJob {
             ));
         }
 
-        self.log(context, "✅ Repository validation passed".to_string())
+        self.log(context, "Repository validation passed".to_string())
             .await?;
 
         Ok(repo_dir)

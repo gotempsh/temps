@@ -44,17 +44,17 @@ impl PresetProvider for NextJsPresetProvider {
             .read_file("next.config.js")
             .ok()
             .as_ref()
-            .map_or(false, |content| content.contains("output: 'standalone'"))
+            .is_some_and(|content| content.contains("output: 'standalone'"))
             || app
                 .read_file("next.config.mjs")
                 .ok()
                 .as_ref()
-                .map_or(false, |content| content.contains("output: 'standalone'"))
+                .is_some_and(|content| content.contains("output: 'standalone'"))
             || app
                 .read_file("next.config.ts")
                 .ok()
                 .as_ref()
-                .map_or(false, |content| content.contains("output: 'standalone'"));
+                .is_some_and(|content| content.contains("output: 'standalone'"));
 
         let start_cmd = if is_standalone {
             "node server.js".to_string()

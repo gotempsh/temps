@@ -7,7 +7,6 @@ interface ProjectConfigurationWizardProps {
   onOpenChange: (open: boolean) => void
   repository: RepositoryResponse
   connectionId: number
-  presetData?: any
   branches?: any[]
   onSubmit: (data: ProjectFormValues) => Promise<void>
   mode: 'onboarding' | 'import'
@@ -18,7 +17,6 @@ export function ProjectConfigurationWizard({
   onOpenChange,
   repository,
   connectionId,
-  presetData,
   branches,
   onSubmit,
 }: ProjectConfigurationWizardProps) {
@@ -29,7 +27,6 @@ export function ProjectConfigurationWizard({
           <ProjectConfigurator
             repository={repository}
             connectionId={connectionId}
-            presetData={presetData}
             branches={branches}
             mode="wizard"
             onSubmit={async (data) => {

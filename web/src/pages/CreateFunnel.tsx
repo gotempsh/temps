@@ -22,7 +22,7 @@ export function CreateFunnel({ project }: CreateFunnelProps) {
     message: string
   } | null>(null)
 
-  usePageTitle(`Create Funnel - ${project.name}`)
+  usePageTitle(`Create Funnel - ${project.slug}`)
 
   React.useEffect(() => {
     setBreadcrumbs([

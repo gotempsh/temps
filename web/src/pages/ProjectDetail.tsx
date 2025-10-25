@@ -136,7 +136,7 @@ export function ProjectDetail() {
     setSearchParams,
   ])
 
-  usePageTitle(project?.name ? `${project.name}` : '')
+  usePageTitle(project?.slug ? `${project.slug}` : '')
 
   if (error?.message?.includes('404') || (!isLoading && !project)) {
     return <NotFound />
@@ -239,7 +239,7 @@ export function ProjectDetail() {
                 <AvatarFallback>{project.name.charAt(0)}</AvatarFallback>
               </Avatar>
               <div className="flex flex-wrap items-center gap-2">
-                <h1 className="text-lg font-semibold">{project.name}</h1>
+                <h1 className="text-lg font-semibold">{project.slug}</h1>
                 <Badge
                   variant={project.last_deployment ? 'default' : 'outline'}
                 >
