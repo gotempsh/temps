@@ -14,7 +14,7 @@ mod mod_rs {
 // Re-export main types for easy access
 pub use {
     all_presets, detect_node_framework, detect_preset_from_files, get_preset_by_slug,
-    DockerfileWithArgs, NixpacksPreset, NixpacksProvider, NodeFramework, PackageManager, Preset,
+    DockerfileWithArgs, JavaPreset, NixpacksPreset, NixpacksProvider, NodeFramework, PackageManager, Preset,
     PresetConfig, ProjectType,
 };
 
@@ -118,6 +118,33 @@ mod tests {
 
         assert!(preset.is_some());
         assert_eq!(preset.unwrap().slug(), "nixpacks");
+    }
+
+    #[test]
+    fn test_detect_java_maven_preset() {
+        let files = vec!["pom.xml".to_string(), "src/main/java/Main.java".to_string()];
+        let preset = detect_preset_from_files(&files);
+
+        assert!(preset.is_some());
+        assert_eq!(preset.unwrap().slug(), "java");
+    }
+
+    #[test]
+    fn test_detect_java_gradle_preset() {
+        let files = vec!["build.gradle".to_string(), "src/main/java/Main.java".to_string()];
+        let preset = detect_preset_from_files(&files);
+
+        assert!(preset.is_some());
+        assert_eq!(preset.unwrap().slug(), "java");
+    }
+
+    #[test]
+    fn test_detect_java_gradle_kts_preset() {
+        let files = vec!["build.gradle.kts".to_string(), "src/main/kotlin/Main.kt".to_string()];
+        let preset = detect_preset_from_files(&files);
+
+        assert!(preset.is_some());
+        assert_eq!(preset.unwrap().slug(), "java");
     }
 
     #[test]
@@ -318,6 +345,10 @@ mod tests {
         assert!(slugs.contains(&"vite".to_string()));
         assert!(slugs.contains(&"dockerfile".to_string()));
         assert!(slugs.contains(&"docusaurus".to_string()));
+        assert!(slugs.contains(&"java".to_string()));
+        assert!(slugs.contains(&"go".to_string()));
+        assert!(slugs.contains(&"python".to_string()));
+        assert!(slugs.contains(&"rust".to_string()));
     }
 
     #[test]

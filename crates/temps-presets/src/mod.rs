@@ -15,6 +15,7 @@ mod framework_detector;
 mod rust_preset;
 mod go_preset;
 mod python_preset;
+mod java_preset;
 
 // Preset configuration schemas
 // Source abstraction for file access
@@ -41,6 +42,7 @@ pub use framework_detector::{detect_node_framework, NodeFramework};
 pub use rust_preset::RustPreset;
 pub use go_preset::GoPreset;
 pub use python_preset::PythonPreset;
+pub use java_preset::JavaPreset;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectType {
@@ -241,6 +243,7 @@ pub fn all_presets() -> Vec<Box<dyn Preset>> {
         Box::new(RustPreset::new()),
         Box::new(GoPreset::new()),
         Box::new(PythonPreset::new()),
+        Box::new(JavaPreset::new()),
         // Generic presets
         Box::new(DockerfilePreset),
         Box::new(docker_custom::DockerCustomPreset),
@@ -326,6 +329,15 @@ pub fn detect_preset_from_files(files: &[String]) -> Option<Box<dyn Preset>> {
             || path.ends_with("Pipfile")
     }) {
         return Some(Box::new(PythonPreset::new()));
+    }
+
+    // Check for Java (pom.xml, build.gradle, build.gradle.kts)
+    if files.iter().any(|path| {
+        path.ends_with("pom.xml")
+            || path.ends_with("build.gradle")
+            || path.ends_with("build.gradle.kts")
+    }) {
+        return Some(Box::new(JavaPreset::new()));
     }
 
     // Only detect Nixpacks if there's an explicit nixpacks.toml file
