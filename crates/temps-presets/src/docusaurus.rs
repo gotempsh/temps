@@ -1,9 +1,11 @@
 use std::path::Path;
 
-use super::{PackageManager, Preset, ProjectType};
+use super::{DockerfileWithArgs, PackageManager, Preset, ProjectType};
+use async_trait::async_trait;
 
 pub struct Docusaurus;
 
+#[async_trait]
 impl Preset for Docusaurus {
     fn slug(&self) -> String {
         "docusaurus".to_string()
@@ -18,10 +20,10 @@ impl Preset for Docusaurus {
     }
 
     fn icon_url(&self) -> String {
-        "https://example.com/docusaurus-icon.png".to_string()
+        "/presets/docusaurus.svg".to_string()
     }
 
-    fn dockerfile(&self, config: super::DockerfileConfig) -> String {
+    async fn dockerfile(&self, config: super::DockerfileConfig<'_>) -> DockerfileWithArgs {
         let pkg_manager = PackageManager::detect(config.local_path);
 
         let lockfile = match pkg_manager {
@@ -61,6 +63,9 @@ RUN {}
 # Copy the rest of the application code
 COPY . .
 
+# Set production environment for build
+ENV NODE_ENV=production
+
 # Build the application
 RUN {}
 
@@ -76,9 +81,13 @@ RUN {}
 # Copy necessary files from the builder stage
 COPY --from=builder /app/build ./build
 
+# Set production environment
+ENV NODE_ENV=production
+
 # Expose the port the app runs on
 EXPOSE 3000
 
+# Serve the static files (serve binds to 0.0.0.0 by default in Docker)
 CMD ["serve", "-s", "build", "-l", "3000"]
 "#,
             config.build_command.unwrap_or(pkg_manager.build_command()),
@@ -91,11 +100,11 @@ CMD ["serve", "-s", "build", "-l", "3000"]
             }
         ));
 
-        dockerfile
+        DockerfileWithArgs::new(dockerfile)
     }
 
-    fn dockerfile_with_build_dir(&self, _local_path: &Path) -> String {
-        r#"
+    async fn dockerfile_with_build_dir(&self, _local_path: &Path) -> DockerfileWithArgs {
+        let content = r#"
 # Use a lightweight base image
 FROM oven/bun:1.2-alpine
 
@@ -107,13 +116,17 @@ COPY build ./build
 # Install serve globally
 RUN bun install -g serve
 
+# Set production environment
+ENV NODE_ENV=production
+
 # Expose the port the app runs on
 EXPOSE 3000
 
-# Use serve to host the static files
+# Use serve to host the static files (binds to 0.0.0.0 by default in Docker)
 CMD ["serve", "-s", "build", "-l", "3000"]
 
-"#.to_string()
+"#;
+        DockerfileWithArgs::new(content.to_string())
     }
 
     fn install_command(&self, local_path: &Path) -> String {

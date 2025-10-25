@@ -8,6 +8,7 @@ import { ConnectionsTable } from '@/components/git/ConnectionsTable'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { CopyButton } from '@/components/ui/copy-button'
 import {
   Card,
   CardContent,
@@ -343,13 +344,15 @@ export default function GitProviderDetail() {
                 <Separator />
                 {provider.base_url && (
                   <>
-                    <div className="flex justify-between items-center">
+                    <div className="flex justify-between items-center gap-3">
                       <Label className="text-sm font-medium">Base URL</Label>
-                      <div className="flex items-center gap-1 text-sm">
-                        <Globe className="h-3 w-3" />
-                        <span className="truncate max-w-48">
-                          {provider.base_url}
-                        </span>
+                      <div className="flex items-center gap-2 text-sm min-w-0">
+                        <Globe className="h-3 w-3 flex-shrink-0" />
+                        <span className="break-all">{provider.base_url}</span>
+                        <CopyButton
+                          value={provider.base_url}
+                          className="h-7 w-7 p-0 hover:bg-accent hover:text-accent-foreground rounded-md flex-shrink-0"
+                        />
                       </div>
                     </div>
                     <Separator />
@@ -531,6 +534,7 @@ export default function GitProviderDetail() {
                 onSyncRepository={handleSyncRepositories}
                 onAuthorize={handleAuthorize}
                 isSyncing={syncMutation.isPending}
+                onConnectionDeleted={refetchConnections}
               />
             )}
           </CardContent>

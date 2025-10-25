@@ -68,21 +68,15 @@ pub struct CreateProjectRequest {
     pub directory: String,
     pub main_branch: String,
     pub preset: String,
-    pub output_dir: Option<String>,
-    pub build_command: Option<String>,
-    pub install_command: Option<String>,
+    /// Preset-specific configuration (for Dockerfile preset, Nixpacks, etc.)
+    pub preset_config: Option<serde_json::Value>,
     pub environment_variables: Option<Vec<(String, String)>>,
     pub automatic_deploy: bool,
-    pub project_type: Option<String>,
-    pub is_web_app: bool,
-    pub performance_metrics_enabled: bool,
     pub storage_service_ids: Vec<i32>,
-    pub use_default_wildcard: Option<bool>,
-    pub custom_domain: Option<String>,
     pub is_public_repo: Option<bool>,
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
-    pub is_on_demand: Option<bool>,
+    pub exposed_port: Option<i32>,
 }
 
 #[derive(Deserialize)]

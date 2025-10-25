@@ -2780,16 +2780,16 @@ mod tests {
             .expect("Failed to create test user");
 
         // Create a test project in source database
-        use temps_entities::types::ProjectType;
+        use temps_entities::preset::Preset;
         let test_project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            repo_name: Set(Some("test-repo".to_string())),
-            repo_owner: Set(Some("test-owner".to_string())),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             directory: Set("/".to_string()),
             main_branch: Set("main".to_string()),
             git_url: Set(Some("https://github.com/test/repo".to_string())),
-            project_type: Set(ProjectType::Server),
+            preset: Set(Preset::Nixpacks),
             ..Default::default()
         };
         let created_project = test_project

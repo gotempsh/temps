@@ -33,6 +33,7 @@ export function EnvironmentResourcesCard({
     memory_limit: environment.memory_limit?.toString() ?? '',
     branch: environment.branch ?? '',
     replicas: environment.replicas?.toString() ?? '1',
+    exposed_port: environment.exposed_port?.toString() ?? '',
   })
   const updateEnvironmentSettings = useMutation({
     ...updateEnvironmentSettingsMutation(),
@@ -66,6 +67,9 @@ export function EnvironmentResourcesCard({
           : null,
         branch: formData.branch || null,
         replicas: formData.replicas ? parseInt(formData.replicas) : null,
+        exposed_port: formData.exposed_port
+          ? parseInt(formData.exposed_port)
+          : null,
       },
     })
 
@@ -189,6 +193,29 @@ export function EnvironmentResourcesCard({
                 />
                 <p className="text-xs text-muted-foreground mt-1">
                   Number of container instances
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div>
+                <Label>Exposed Port (Override)</Label>
+                <Input
+                  type="number"
+                  min="1"
+                  max="65535"
+                  value={formData.exposed_port}
+                  onChange={(e) =>
+                    setFormData((prev) => ({
+                      ...prev,
+                      exposed_port: e.target.value,
+                    }))
+                  }
+                  placeholder="Auto-detected from image"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  Override the port for this environment. Priority: Image EXPOSE
+                  → This value → Project port → Default (3000)
                 </p>
               </div>
             </div>

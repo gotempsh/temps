@@ -40,6 +40,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/projects", post(create_project))
         .route("/projects", get(get_projects))
         .route("/projects/statistics", get(get_project_statistics))
+        // Presets route
+        .route("/presets", get(list_presets))
         // Pipeline trigger route
         .route(
             "/projects/{id}/trigger-pipeline",
@@ -72,6 +74,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         update_automatic_deploy,
         trigger_project_pipeline,
         get_project_statistics,
+        list_presets,
     ),
     components(
         schemas(
@@ -85,10 +88,13 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             TriggerPipelinePayload,
             TriggerPipelineResponse,
             ProjectStatisticsResponse,
+            super::types::PresetResponse,
+            super::types::ListPresetsResponse,
         )
     ),
     tags(
-        (name = "Projects", description = "Project management endpoints")
+        (name = "Projects", description = "Project management endpoints"),
+        (name = "Presets", description = "Available deployment presets")
     ),
     nest(
         (path = "/projects", api = super::custom_domains::CustomDomainsApiDoc)
@@ -135,21 +141,14 @@ pub async fn create_project(
         directory: project.directory,
         main_branch: project.main_branch,
         preset: project.preset,
-        output_dir: project.output_dir,
-        build_command: project.build_command,
-        install_command: project.install_command,
+        preset_config: project.preset_config,
         environment_variables: project.environment_variables,
         automatic_deploy: project.automatic_deploy.unwrap_or(false),
-        project_type: project.project_type,
-        is_web_app: project.is_web_app.unwrap_or(true),
-        performance_metrics_enabled: project.performance_metrics_enabled,
         storage_service_ids: project.storage_service_ids,
-        use_default_wildcard: project.use_default_wildcard,
-        custom_domain: project.custom_domain,
         is_public_repo: project.is_public_repo,
         git_url: project.git_url,
         git_provider_connection_id: project.git_provider_connection_id,
-        is_on_demand: Some(false),
+        exposed_port: project.exposed_port,
     };
 
     let new_project = state
@@ -329,21 +328,14 @@ pub async fn update_project(
         directory: project.directory.clone(),
         main_branch: project.main_branch.clone(),
         preset: project.preset.clone(),
-        output_dir: project.output_dir.clone(),
-        build_command: project.build_command.clone(),
-        install_command: project.install_command.clone(),
+        preset_config: project.preset_config.clone(),
         environment_variables: project.environment_variables.clone(),
         automatic_deploy: project.automatic_deploy.unwrap_or(false),
-        project_type: project.project_type.clone(),
-        is_web_app: project.is_web_app.unwrap_or(true),
-        performance_metrics_enabled: project.performance_metrics_enabled,
         storage_service_ids: project.storage_service_ids.clone(),
-        use_default_wildcard: None,       // Keep existing setting
-        custom_domain: None,              // Keep existing setting
-        is_public_repo: None,             // Keep existing setting
-        git_url: None,                    // Keep existing setting
-        git_provider_connection_id: None, // Keep existing setting
-        is_on_demand: None,               // Keep existing setting
+        is_public_repo: None,               // Keep existing setting
+        git_url: None,                      // Keep existing setting
+        git_provider_connection_id: None,   // Keep existing setting
+        exposed_port: project.exposed_port, // Keep existing or update if provided
     };
     let updated_project = state
         .project_service
@@ -769,6 +761,147 @@ pub async fn get_project_statistics(
     let response = ProjectStatisticsResponse {
         total_count: statistics.total_count,
     };
+
+    Ok(Json(response))
+}
+
+/// List all available presets
+#[utoipa::path(
+    get,
+    path = "/presets",
+    tag = "Presets",
+    responses(
+        (status = 200, description = "List of available presets", body = super::types::ListPresetsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_presets(RequireAuth(_auth): RequireAuth) -> Result<impl IntoResponse, Problem> {
+    // No permission check needed - all authenticated users can list presets
+
+    use sea_orm::Iterable;
+    use temps_entities::preset::Preset;
+
+    // Get all preset variants from the enum
+    let presets: Vec<super::types::PresetResponse> = Preset::iter()
+        .map(|preset| {
+            let slug = format!("{:?}", preset).to_lowercase();
+
+            let (label, description, project_type) = match preset {
+                Preset::NextJs => (
+                    "Next.js",
+                    "React framework for production with hybrid static & server rendering",
+                    "static",
+                ),
+                Preset::Vite => ("Vite", "Next generation frontend tooling", "static"),
+                Preset::Astro => (
+                    "Astro",
+                    "Build faster websites with less client-side JavaScript",
+                    "static",
+                ),
+                Preset::Nuxt => ("Nuxt", "The Intuitive Vue Framework", "static"),
+                Preset::Remix => (
+                    "Remix",
+                    "Full stack web framework focused on web fundamentals",
+                    "static",
+                ),
+                Preset::SvelteKit => (
+                    "SvelteKit",
+                    "The fastest way to build Svelte apps",
+                    "static",
+                ),
+                Preset::SolidStart => (
+                    "SolidStart",
+                    "Meta-framework for building Solid apps",
+                    "static",
+                ),
+                Preset::Angular => (
+                    "Angular",
+                    "Platform for building mobile and desktop web applications",
+                    "static",
+                ),
+                Preset::Vue => ("Vue", "Progressive JavaScript Framework", "static"),
+                Preset::React => (
+                    "React",
+                    "JavaScript library for building user interfaces",
+                    "static",
+                ),
+                Preset::Docusaurus => (
+                    "Docusaurus",
+                    "Build optimized websites quickly, focus on your content",
+                    "static",
+                ),
+                Preset::Rsbuild => ("Rsbuild", "Fast Rspack-based build tool", "static"),
+                Preset::FastApi => (
+                    "FastAPI",
+                    "Modern, fast web framework for building APIs with Python",
+                    "server",
+                ),
+                Preset::Flask => (
+                    "Flask",
+                    "Lightweight WSGI web application framework for Python",
+                    "server",
+                ),
+                Preset::Django => ("Django", "High-level Python web framework", "server"),
+                Preset::Rails => (
+                    "Rails",
+                    "Server-side web application framework written in Ruby",
+                    "server",
+                ),
+                Preset::Go => (
+                    "Go",
+                    "Build simple, secure, scalable systems with Go",
+                    "server",
+                ),
+                Preset::Rust => (
+                    "Rust",
+                    "Fast, reliable, and memory-efficient applications",
+                    "server",
+                ),
+                Preset::Laravel => (
+                    "Laravel",
+                    "PHP web application framework with expressive syntax",
+                    "server",
+                ),
+                Preset::Dockerfile => (
+                    "Dockerfile",
+                    "Custom Docker container with your own Dockerfile",
+                    "server",
+                ),
+                Preset::Nixpacks => (
+                    "Nixpacks",
+                    "Auto-detect and build your application",
+                    "server",
+                ),
+                Preset::Static => (
+                    "Static Site",
+                    "Serve static HTML, CSS, and JavaScript files",
+                    "static",
+                ),
+                Preset::NodeJs => (
+                    "Node.js",
+                    "JavaScript runtime built on Chrome's V8 engine",
+                    "server",
+                ),
+            };
+
+            // Generate relative icon URL
+            let icon_url = format!("/presets/{}.svg", slug);
+
+            super::types::PresetResponse {
+                slug,
+                label: label.to_string(),
+                icon_url,
+                project_type: project_type.to_string(),
+                description: description.to_string(),
+            }
+        })
+        .collect();
+
+    let total = presets.len();
+
+    let response = super::types::ListPresetsResponse { presets, total };
 
     Ok(Json(response))
 }

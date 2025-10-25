@@ -453,10 +453,25 @@ impl JobProcessorService {
                         );
                     }
                     Err(e) => {
+                        let error_message = format!("{}", e);
                         error!(
                             "❌ Workflow execution failed for deployment {}: {}",
-                            deployment_id, e
+                            deployment_id, error_message
                         );
+
+                        // Mark deployment as failed with error message
+                        if let Err(update_err) = Self::update_deployment_status_with_message(
+                            &db,
+                            deployment_id,
+                            PipelineStatus::Failed,
+                            Some(error_message),
+                        )
+                        .await
+                        {
+                            error!("❌ Failed to update deployment status: {}", update_err);
+                        } else {
+                            debug!("✅ Updated deployment {} status to failed", deployment_id);
+                        }
                     }
                 }
             }
@@ -498,7 +513,8 @@ mod tests {
     use sea_orm::{ActiveModelTrait, Set};
     use temps_core::QueueError;
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::types::ProjectType;
+    use temps_entities::preset::Preset;
+    use temps_entities::upstream_config::UpstreamList;
     use temps_logs::LogService;
 
     fn create_test_config_service(db: Arc<DbConnection>) -> Arc<temps_config::ConfigService> {
@@ -533,24 +549,17 @@ mod tests {
         let project = temps_entities::projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            repo_owner: Set(Some("test-owner".to_string())),
-            repo_name: Set(Some("test-repo".to_string())),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
             git_provider_connection_id: Set(Some(1)),
-            preset: Set(Some("nextjs".to_string())),
+            preset: Set(Preset::NextJs),
             directory: Set("/".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
-            automatic_deploy: Set(false),
-            custom_domain: Set(None),
             deleted_at: Set(None),
             is_deleted: Set(false),
-            project_type: Set(ProjectType::Server),
-            is_web_app: Set(true),
-            performance_metrics_enabled: Set(false),
-            use_default_wildcard: Set(true),
             is_public_repo: Set(false),
             git_url: Set(None),
-            is_on_demand: Set(false),
             main_branch: Set("main".to_string()),
             ..Default::default()
         };
@@ -562,13 +571,8 @@ mod tests {
             name: Set("Test Environment".to_string()),
             slug: Set("test".to_string()),
             host: Set("test.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             current_deployment_id: Set(None),
-            replicas: Set(Some(1)),
-            cpu_request: Set(Some(100)),
-            cpu_limit: Set(Some(200)),
-            memory_request: Set(Some(128)),
-            memory_limit: Set(Some(256)),
             subdomain: Set("test.example.com".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -599,24 +603,17 @@ mod tests {
         let project = temps_entities::projects::ActiveModel {
             name: Set("Git Push Test Project".to_string()),
             slug: Set("git-push-test".to_string()),
-            repo_owner: Set(Some("test-owner".to_string())),
-            repo_name: Set(Some("test-repo".to_string())),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
             git_provider_connection_id: Set(Some(1)),
-            preset: Set(Some("nextjs".to_string())),
+            preset: Set(Preset::NextJs),
             directory: Set("/".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
-            automatic_deploy: Set(false),
-            custom_domain: Set(None),
             deleted_at: Set(None),
             is_deleted: Set(false),
-            project_type: Set(ProjectType::Server),
-            is_web_app: Set(true),
-            performance_metrics_enabled: Set(false),
-            use_default_wildcard: Set(true),
             is_public_repo: Set(false),
             git_url: Set(None),
-            is_on_demand: Set(false),
             main_branch: Set("main".to_string()),
             ..Default::default()
         };
@@ -628,13 +625,8 @@ mod tests {
             name: Set("Production".to_string()),
             slug: Set("production".to_string()),
             host: Set("test-production.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             current_deployment_id: Set(None),
-            replicas: Set(Some(2)),
-            cpu_request: Set(Some(100)),
-            cpu_limit: Set(Some(200)),
-            memory_request: Set(Some(128)),
-            memory_limit: Set(Some(256)),
             subdomain: Set("test-production.example.com".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -688,29 +680,21 @@ mod tests {
         // Create project without environment
         use chrono::Utc;
         use sea_orm::Set;
-        use temps_entities::types::ProjectType;
 
         let project = temps_entities::projects::ActiveModel {
             name: Set("Project Without Environment".to_string()),
             slug: Set("no-env-project".to_string()),
-            repo_owner: Set(Some("test-owner".to_string())),
-            repo_name: Set(Some("no-env-repo".to_string())),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("no-env-repo".to_string()),
             git_provider_connection_id: Set(Some(1)),
-            preset: Set(Some("nextjs".to_string())),
+            preset: Set(Preset::NextJs),
             directory: Set("/".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
-            automatic_deploy: Set(false),
-            custom_domain: Set(None),
             deleted_at: Set(None),
             is_deleted: Set(false),
-            project_type: Set(ProjectType::Server),
-            is_web_app: Set(true),
-            performance_metrics_enabled: Set(false),
-            use_default_wildcard: Set(true),
             is_public_repo: Set(false),
             git_url: Set(None),
-            is_on_demand: Set(false),
             main_branch: Set("main".to_string()),
             ..Default::default()
         };
@@ -841,14 +825,13 @@ mod tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project-no-git".to_string()),
-            repo_owner: Set(None), // No git info
-            repo_name: Set(None),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
             main_branch: Set("main".to_string()),
 
             git_provider_connection_id: Set(None),
-            preset: Set(Some("nextjs".to_string())),
+            preset: Set(Preset::NextJs),
             directory: Set("/".to_string()),
-            project_type: Set(ProjectType::Server),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -861,7 +844,7 @@ mod tests {
             name: Set("Production".to_string()),
             slug: Set("production".to_string()),
             host: Set("test.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             subdomain: Set("test.example.com".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),

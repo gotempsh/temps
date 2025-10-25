@@ -197,13 +197,8 @@ pub async fn get_repository_tags(
         .get_repository_by_owner_and_name_in_connection(&owner, &repo, params.connection_id)
         .await?;
 
-    // We already filtered by connection_id, so we know it exists
-    let connection_id = repository.git_provider_connection_id.ok_or(
-        ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("No git provider connection configured")
-            .detail("This repository does not have a git provider connection configured")
-            .build(),
-    )?;
+    // Repository always has a connection_id (required field)
+    let connection_id = repository.git_provider_connection_id;
 
     // Get the connection and provider
     let connection = state
@@ -317,12 +312,7 @@ pub async fn get_branches_by_repository_id(
         .await?;
 
     // Check if repository has a git provider connection
-    let connection_id = repository.git_provider_connection_id.ok_or_else(|| {
-        ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("No git provider configured")
-            .detail("This repository does not have a git provider connection configured")
-            .build()
-    })?;
+    let connection_id = repository.git_provider_connection_id;
 
     // Get the connection and provider
     let connection = state
@@ -449,12 +439,7 @@ pub async fn get_tags_by_repository_id(
         .await?;
 
     // Check if repository has a git provider connection
-    let connection_id = repository.git_provider_connection_id.ok_or_else(|| {
-        ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("No git provider configured")
-            .detail("This repository does not have a git provider connection configured")
-            .build()
-    })?;
+    let connection_id = repository.git_provider_connection_id;
 
     // Get the connection and provider
     let connection = state
@@ -570,12 +555,7 @@ pub async fn check_commit_exists(
         .await?;
 
     // Check if repository has a git provider connection
-    let connection_id = repository.git_provider_connection_id.ok_or_else(|| {
-        ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("No git provider configured")
-            .detail("This repository does not have a git provider connection configured")
-            .build()
-    })?;
+    let connection_id = repository.git_provider_connection_id;
 
     // Get the connection and provider
     let connection = state

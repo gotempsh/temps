@@ -1,7 +1,6 @@
 import {
   ExternalServiceInfo,
   ProjectResponse,
-  ServiceTypeRoute,
 } from '@/api/client'
 import {
   getServicePreviewEnvironmentVariablesMaskedOptions,
@@ -11,7 +10,6 @@ import {
   unlinkServiceFromProjectMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { CreateServiceButton } from '@/components/storage/CreateServiceButton'
-import { CreateServiceDialog } from '@/components/storage/CreateServiceDialog'
 import EmptyStateStorage from '@/components/storage/EmptyStateStorage'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -254,9 +252,6 @@ function ServiceCard({
 
 export function ProjectStorage({ project }: { project: ProjectResponse }) {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
-  const [selectedServiceType, setSelectedServiceType] =
-    useState<ServiceTypeRoute | null>(null)
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Storage', href: '/storage' }])
@@ -370,32 +365,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
               }}
             />
           </div>
-          <EmptyStateStorage
-            onCreateClick={(serviceType) => {
-              setSelectedServiceType(serviceType as ServiceTypeRoute)
-              setIsCreateDialogOpen(true)
-            }}
-          />
-
-          {/* Service creation dialog for empty state */}
-          {selectedServiceType && (
-            <CreateServiceDialog
-              open={isCreateDialogOpen}
-              onOpenChange={(open) => {
-                setIsCreateDialogOpen(open)
-                if (!open) {
-                  setSelectedServiceType(null)
-                }
-              }}
-              onSuccess={() => {
-                setIsCreateDialogOpen(false)
-                setSelectedServiceType(null)
-                refetchServices()
-                refetchServicesLinked()
-              }}
-              serviceType={selectedServiceType}
-            />
-          )}
+          <EmptyStateStorage />
         </div>
       </div>
     )

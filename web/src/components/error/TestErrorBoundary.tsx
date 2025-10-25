@@ -1,5 +1,11 @@
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
 import { useState } from 'react'
 
 /**
@@ -22,9 +28,9 @@ export function TestErrorBoundary() {
         <CardHeader>
           <CardTitle>Error Boundary Test</CardTitle>
           <CardDescription>
-            Test the error boundary by clicking the button below. This will throw an error
-            that should be caught by the ErrorBoundary component, keeping the sidebar and
-            header functional.
+            Test the error boundary by clicking the button below. This will
+            throw an error that should be caught by the ErrorBoundary component,
+            keeping the sidebar and header functional.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -34,7 +40,10 @@ export function TestErrorBoundary() {
               <li>The sidebar and header will remain functional</li>
               <li>Only the page content will show the error fallback UI</li>
               <li>You can navigate to other pages using the sidebar</li>
-              <li>The error fallback will have "Try Again" and "Back to Dashboard" buttons</li>
+              <li>
+                The error fallback will have "Try Again" and "Back to Dashboard"
+                buttons
+              </li>
             </ul>
           </div>
 

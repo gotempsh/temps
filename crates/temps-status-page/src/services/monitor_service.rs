@@ -856,7 +856,7 @@ mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::{environments, projects};
+    use temps_entities::{environments, projects, upstream_config::UpstreamList};
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> projects::Model {
         // Use nanoseconds for better uniqueness in parallel tests
@@ -867,7 +867,9 @@ mod tests {
             slug: Set(slug.clone()),
             directory: Set(slug),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
+            preset: Set(temps_entities::preset::Preset::Nixpacks),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             ..Default::default()
         };
         project.insert(db.as_ref()).await.unwrap()
@@ -887,7 +889,7 @@ mod tests {
             slug: Set(slug),
             subdomain: Set(subdomain.clone()),
             host: Set(format!("{}.local", subdomain)),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         };
         env.insert(db.as_ref()).await.unwrap()

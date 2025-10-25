@@ -442,6 +442,10 @@ export type ContainerListResponse = {
 };
 
 export type ContainerLogsQuery = {
+    /**
+     * Optional container name to get logs from (if deployment has multiple containers)
+     */
+    container_name?: string | null;
     end_date?: number | null;
     start_date?: number | null;
     tail?: string | null;
@@ -617,6 +621,18 @@ export type CreateProjectRequest = {
         string,
         string
     ]> | null;
+    /**
+     * Port exposed by the container (fallback when image has no EXPOSE directive)
+     *
+     * Priority order for port resolution:
+     * 1. Image EXPOSE directive (auto-detected from built image)
+     * 2. Environment-level exposed_port (overrides this value per environment)
+     * 3. This project-level exposed_port (fallback)
+     * 4. Default: 3000
+     *
+     * Only set this if your image doesn't use EXPOSE directive.
+     */
+    exposed_port?: number | null;
     git_provider_connection_id?: number | null;
     git_url?: string | null;
     install_command?: string | null;
@@ -628,6 +644,7 @@ export type CreateProjectRequest = {
     output_dir?: string | null;
     performance_metrics_enabled?: boolean;
     preset: string;
+    preset_config?: null | PresetConfigSchema;
     project_type?: string | null;
     repo_name?: string | null;
     repo_owner?: string | null;
@@ -951,6 +968,23 @@ export type DnsProviderSettingsMasked = {
     provider: string;
 };
 
+/**
+ * Configuration for Dockerfile preset
+ * Allows customizing the Dockerfile path and build context for Docker-based deployments
+ */
+export type DockerfilePresetConfig = {
+    /**
+     * Custom build context path (relative to repository root)
+     * If not specified, uses the project's directory setting
+     */
+    buildContext?: string | null;
+    /**
+     * Custom Dockerfile path (relative to build context)
+     * If not specified, defaults to "Dockerfile" in the build context
+     */
+    dockerfilePath?: string | null;
+};
+
 export type DomainChallengeResponse = {
     domain: string;
     status: string;
@@ -1061,6 +1095,10 @@ export type EnvironmentResponse = {
     cpu_request?: number | null;
     created_at: number;
     current_deployment_id?: number | null;
+    /**
+     * Port exposed by the container (overrides project-level port for this environment)
+     */
+    exposed_port?: number | null;
     id: number;
     main_url: string;
     memory_limit?: number | null;
@@ -1882,6 +1920,11 @@ export type ListOrdersResponse = {
     orders: Array<AcmeOrderResponse>;
 };
 
+export type ListPresetsResponse = {
+    presets: Array<PresetResponse>;
+    total: number;
+};
+
 export type LocationCount = {
     count: number;
     location: string;
@@ -2005,6 +2048,15 @@ export type NetworkConfiguration = {
  */
 export type NetworkMode = 'bridge' | 'host' | 'none' | {
     custom: string;
+};
+
+/**
+ * Configuration for Nixpacks preset
+ * Nixpacks auto-detects your application and uses nixpacks.toml for configuration
+ * No additional parameters needed - configuration is expressed in nixpacks.toml file
+ */
+export type NixpacksPresetConfig = {
+    [key: string]: unknown;
 };
 
 export type NotificationPreferencesResponse = {
@@ -2298,6 +2350,35 @@ export type PortMapping = {
 };
 
 /**
+ * Union type for preset configurations
+ * Use the appropriate configuration type based on your preset
+ */
+export type PresetConfigSchema = DockerfilePresetConfig | NixpacksPresetConfig | StaticPresetConfig;
+
+export type PresetResponse = {
+    /**
+     * Description of what this preset does
+     */
+    description: string;
+    /**
+     * Icon URL for the preset
+     */
+    icon_url: string;
+    /**
+     * Display name/label for the preset
+     */
+    label: string;
+    /**
+     * Project type (server or static)
+     */
+    project_type: string;
+    /**
+     * Unique identifier slug for the preset
+     */
+    slug: string;
+};
+
+/**
  * Representation of a Problem error to return to the client.
  * Follows RFC 7807 - Problem Details for HTTP APIs
  */
@@ -2362,6 +2443,10 @@ export type ProjectDsnResponse = {
 };
 
 export type ProjectPresetResponse = {
+    /**
+     * Default exposed port for this preset (e.g., 3000 for Next.js, 8000 for FastAPI)
+     */
+    exposed_port?: number | null;
     path: string;
     preset: string;
     preset_label: string;
@@ -2539,6 +2624,14 @@ export type ProviderDeletionCheckResponse = {
     projects_in_use: Array<ProjectUsageInfoResponse>;
 };
 
+export type ProviderMetadata = {
+    color: string;
+    description: string;
+    display_name: string;
+    icon_url: string;
+    service_type: ServiceTypeRoute;
+};
+
 export type ProviderResponse = {
     auth_method: string;
     base_url?: string | null;
@@ -2650,12 +2743,15 @@ export type RepositoryPresetResponse = {
     calculated_at: string;
     name: string;
     owner: string;
-    projects: Array<ProjectPresetResponse>;
+    presets: Array<ProjectPresetResponse>;
     repository_id: number;
-    root_preset?: string | null;
 };
 
 export type RepositoryResponse = {
+    /**
+     * HTTPS clone URL (e.g., https://github.com/owner/repo.git)
+     */
+    clone_url?: string | null;
     created_at: string;
     default_branch: string;
     description?: string | null;
@@ -2664,9 +2760,13 @@ export type RepositoryResponse = {
     language?: string | null;
     name: string;
     owner: string;
-    preset?: string | null;
+    preset?: Array<ProjectPresetResponse> | null;
     private: boolean;
     pushed_at: string;
+    /**
+     * SSH clone URL (e.g., git@github.com:owner/repo.git)
+     */
+    ssh_url?: string | null;
     updated_at: string;
 };
 
@@ -2909,6 +3009,7 @@ export type ServiceAccessInfo = {
 };
 
 export type ServiceParameter = {
+    choices?: Array<string> | null;
     default_value?: string | null;
     description: string;
     encrypted: boolean;
@@ -2922,7 +3023,7 @@ export type ServiceTypeInfo = {
     service_type: ServiceTypeRoute;
 };
 
-export type ServiceTypeRoute = 'postgres' | 'redis' | 's3';
+export type ServiceTypeRoute = 'mongodb' | 'postgres' | 'redis' | 's3';
 
 export type SessionDetails = {
     duration_seconds: number;
@@ -3295,6 +3396,48 @@ export type SpeedMetricsPayload = {
     viewportWidth?: number | null;
 };
 
+/**
+ * Configuration for static site presets (Vite, Next.js, Docusaurus, etc.)
+ * These presets build static sites that are served via a web server
+ */
+export type StaticPresetConfig = {
+    /**
+     * Custom build command (overrides preset default)
+     */
+    buildCommand?: string | null;
+    /**
+     * Custom build context path (relative to repository root)
+     * Useful for monorepo setups where the app is in a subdirectory
+     */
+    buildContext?: string | null;
+    /**
+     * Custom install command (overrides auto-detected package manager)
+     */
+    installCommand?: string | null;
+    /**
+     * Custom output directory (overrides preset default)
+     * Common values: "dist", "build", ".next", "out"
+     */
+    outputDir?: string | null;
+};
+
+/**
+ * Filters for statistics queries
+ */
+export type StatsFilters = {
+    client_ip?: string | null;
+    deployment_id?: number | null;
+    device_type?: string | null;
+    environment_id?: number | null;
+    host?: string | null;
+    is_bot?: boolean | null;
+    method?: string | null;
+    project_id?: number | null;
+    request_source?: string | null;
+    routing_status?: string | null;
+    status_code?: number | null;
+};
+
 export type StatusBucket = {
     avg_response_time_ms?: number | null;
     bucket_start: string;
@@ -3374,7 +3517,61 @@ export type TestProviderResponse = {
     success: boolean;
 };
 
+/**
+ * Time bucket statistics response
+ */
+export type TimeBucketStats = {
+    /**
+     * Average response time in milliseconds
+     */
+    avg_response_time_ms: number;
+    /**
+     * Bucket timestamp in RFC3339 format
+     */
+    bucket: string;
+    /**
+     * Number of errors (status >= 400)
+     */
+    error_count: number;
+    /**
+     * Total number of requests in this bucket
+     */
+    request_count: number;
+    /**
+     * Total request bytes
+     */
+    total_request_bytes: number;
+    /**
+     * Total response bytes
+     */
+    total_response_bytes: number;
+};
+
+/**
+ * Response for time bucket stats
+ */
+export type TimeBucketStatsResponse = {
+    bucket_interval: string;
+    end_time: string;
+    start_time: string;
+    stats: Array<TimeBucketStats>;
+};
+
 export type TlsMode = 'None' | 'Starttls' | 'Tls';
+
+/**
+ * Today's stats response
+ */
+export type TodayStatsResponse = {
+    /**
+     * Date for which stats are returned
+     */
+    date: string;
+    /**
+     * Total requests today
+     */
+    total_requests: number;
+};
 
 export type TokenRenewalRequest = {
     refresh_token: string;
@@ -3460,6 +3657,16 @@ export type UpdateEnvironmentSettingsRequest = {
     branch?: string | null;
     cpu_limit?: number | null;
     cpu_request?: number | null;
+    /**
+     * Port exposed by the container (overrides project-level port for this environment)
+     *
+     * Priority order for port resolution:
+     * 1. Image EXPOSE directive (auto-detected from built image)
+     * 2. This environment-level exposed_port (overrides project setting)
+     * 3. Project-level exposed_port (fallback)
+     * 4. Default: 3000
+     */
+    exposed_port?: number | null;
     memory_limit?: number | null;
     memory_request?: number | null;
     replicas?: number | null;
@@ -6679,6 +6886,61 @@ export type GetProjectServiceEnvironmentVariablesResponses = {
 
 export type GetProjectServiceEnvironmentVariablesResponse = GetProjectServiceEnvironmentVariablesResponses[keyof GetProjectServiceEnvironmentVariablesResponses];
 
+export type GetProvidersMetadataData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/external-services/providers/metadata';
+};
+
+export type GetProvidersMetadataErrors = {
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetProvidersMetadataResponses = {
+    /**
+     * List of provider metadata
+     */
+    200: Array<ProviderMetadata>;
+};
+
+export type GetProvidersMetadataResponse = GetProvidersMetadataResponses[keyof GetProvidersMetadataResponses];
+
+export type GetProviderMetadataData = {
+    body?: never;
+    path: {
+        /**
+         * Service type (mongodb, postgres, redis, s3)
+         */
+        service_type: string;
+    };
+    query?: never;
+    url: '/external-services/providers/metadata/{service_type}';
+};
+
+export type GetProviderMetadataErrors = {
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetProviderMetadataResponses = {
+    /**
+     * Provider metadata
+     */
+    200: ProviderMetadata;
+};
+
+export type GetProviderMetadataResponse = GetProviderMetadataResponses[keyof GetProviderMetadataResponses];
+
 export type GetServiceTypesData = {
     body?: never;
     path?: never;
@@ -9235,6 +9497,33 @@ export type GetPublicIpResponses = {
     200: unknown;
 };
 
+export type ListPresetsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/presets';
+};
+
+export type ListPresetsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListPresetsResponses = {
+    /**
+     * List of available presets
+     */
+    200: ListPresetsResponse;
+};
+
+export type ListPresetsResponse2 = ListPresetsResponses[keyof ListPresetsResponses];
+
 export type GetProjectsData = {
     body?: never;
     path?: never;
@@ -10093,13 +10382,6 @@ export type TailDeploymentJobLogsErrors = {
      * Internal server error
      */
     500: unknown;
-};
-
-export type TailDeploymentJobLogsResponses = {
-    /**
-     * Stream of deployment job logs
-     */
-    200: unknown;
 };
 
 export type PauseDeploymentData = {
@@ -11027,6 +11309,10 @@ export type GetContainerLogsData = {
          * Number of lines to tail (or 'all')
          */
         tail?: string;
+        /**
+         * Optional container name (defaults to first/primary container)
+         */
+        container_name?: string;
     };
     url: '/projects/{project_id}/environments/{environment_id}/container-logs';
 };
@@ -11037,20 +11323,13 @@ export type GetContainerLogsErrors = {
      */
     400: unknown;
     /**
-     * Project or deployment not found
+     * Project, deployment, or container not found
      */
     404: unknown;
     /**
      * Internal server error
      */
     500: unknown;
-};
-
-export type GetContainerLogsResponses = {
-    /**
-     * Server-Sent Events stream of container logs
-     */
-    200: unknown;
 };
 
 export type ListContainersData = {
@@ -11139,13 +11418,6 @@ export type GetContainerLogsByIdErrors = {
      * Internal server error
      */
     500: unknown;
-};
-
-export type GetContainerLogsByIdResponses = {
-    /**
-     * Server-Sent Events stream of container logs
-     */
-    200: unknown;
 };
 
 export type GetErrorDashboardStatsData = {
@@ -12683,6 +12955,158 @@ export type GetProxyLogByRequestIdResponses = {
 };
 
 export type GetProxyLogByRequestIdResponse = GetProxyLogByRequestIdResponses[keyof GetProxyLogByRequestIdResponses];
+
+export type GetTimeBucketStatsData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Start time (ISO 8601 format)
+         */
+        start_time: string;
+        /**
+         * End time (ISO 8601 format)
+         */
+        end_time: string;
+        /**
+         * Bucket interval (e.g., "1 hour", "1 day", "5 minutes")
+         */
+        bucket_interval?: string;
+        /**
+         * Filter by HTTP method
+         */
+        method?: string;
+        /**
+         * Filter by client IP
+         */
+        client_ip?: string;
+        /**
+         * Filter by project ID
+         */
+        project_id?: number;
+        /**
+         * Filter by environment ID
+         */
+        environment_id?: number;
+        /**
+         * Filter by deployment ID
+         */
+        deployment_id?: number;
+        /**
+         * Filter by host
+         */
+        host?: string;
+        /**
+         * Filter by status code
+         */
+        status_code?: number;
+        /**
+         * Filter by routing status
+         */
+        routing_status?: string;
+        /**
+         * Filter by request source
+         */
+        request_source?: string;
+        /**
+         * Filter by bot detection
+         */
+        is_bot?: boolean;
+        /**
+         * Filter by device type
+         */
+        device_type?: string;
+    };
+    url: '/proxy-logs/stats/time-buckets';
+};
+
+export type GetTimeBucketStatsErrors = {
+    /**
+     * Invalid parameters
+     */
+    400: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetTimeBucketStatsResponses = {
+    /**
+     * Time-bucketed statistics
+     */
+    200: TimeBucketStatsResponse;
+};
+
+export type GetTimeBucketStatsResponse = GetTimeBucketStatsResponses[keyof GetTimeBucketStatsResponses];
+
+export type GetTodayStatsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter by HTTP method
+         */
+        method?: string | null;
+        /**
+         * Filter by client IP
+         */
+        client_ip?: string | null;
+        /**
+         * Filter by project ID
+         */
+        project_id?: number | null;
+        /**
+         * Filter by environment ID
+         */
+        environment_id?: number | null;
+        /**
+         * Filter by deployment ID
+         */
+        deployment_id?: number | null;
+        /**
+         * Filter by host
+         */
+        host?: string | null;
+        /**
+         * Filter by status code
+         */
+        status_code?: number | null;
+        /**
+         * Filter by routing status
+         */
+        routing_status?: string | null;
+        /**
+         * Filter by request source
+         */
+        request_source?: string | null;
+        /**
+         * Filter by bot detection
+         */
+        is_bot?: boolean | null;
+        /**
+         * Filter by device type
+         */
+        device_type?: string | null;
+    };
+    url: '/proxy-logs/stats/today';
+};
+
+export type GetTodayStatsErrors = {
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetTodayStatsResponses = {
+    /**
+     * Today's request count
+     */
+    200: TodayStatsResponse;
+};
+
+export type GetTodayStatsResponse = GetTodayStatsResponses[keyof GetTodayStatsResponses];
 
 export type GetProxyLogByIdData = {
     body?: never;

@@ -178,7 +178,9 @@ mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::{deployments, environments, projects, types::ProjectType};
+    use temps_entities::{
+        deployments, environments, preset::Preset, projects, upstream_config::UpstreamList,
+    };
 
     async fn create_test_deployment(
         db: &Arc<DbConnection>,
@@ -187,7 +189,7 @@ mod tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Server),
+            preset: Set(Preset::NextJs),
             directory: Set("/".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(chrono::Utc::now()),
@@ -202,7 +204,7 @@ mod tests {
             name: Set("Production".to_string()),
             slug: Set("production".to_string()),
             host: Set("test.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             subdomain: Set("test.example.com".to_string()),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),

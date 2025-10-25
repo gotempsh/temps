@@ -61,6 +61,12 @@ impl WorkflowPlanner {
 
         let mut env_vars_map = HashMap::new();
 
+        // Add default HOST environment variable
+        // This ensures containers bind to all network interfaces (0.0.0.0)
+        // which is required for external access via port mapping
+        // Can be overridden by user-defined environment variables
+        env_vars_map.insert("HOST".to_string(), "0.0.0.0".to_string());
+
         // 1. Get environment variables for this project and environment
         // Query through the env_var_environments junction table to get all env vars
         // associated with this environment
@@ -298,6 +304,58 @@ impl WorkflowPlanner {
         Ok(created_jobs)
     }
 
+    /// Determine the fallback port configuration for the container
+    ///
+    /// This method resolves manual port overrides during job planning.
+    /// The actual port used at deployment time is determined by inspecting the built image
+    /// in DeployImageJob.resolve_container_port() with this priority:
+    ///
+    /// 1. Image EXPOSE directive (inspected after build - highest priority)
+    /// 2. Environment-level exposed_port
+    /// 3. Project-level exposed_port
+    /// 4. Default: 3000
+    ///
+    /// Note: Image inspection happens in the deploy job (after build completes),
+    /// not during planning, since the image doesn't exist yet at planning time.
+    ///
+    /// # Arguments
+    /// * `environment` - Environment model with optional exposed_port
+    /// * `project` - Project model with optional exposed_port
+    /// * `image_name` - Unused (kept for API compatibility, inspection happens in deploy job)
+    async fn resolve_exposed_port(
+        &self,
+        environment: &environments::Model,
+        project: &projects::Model,
+        _image_name: Option<&str>, // Unused - inspection happens in deploy job after build
+    ) -> u16 {
+        // 1. Check environment-level port override (from deployment_config)
+        if let Some(ref deployment_config) = environment.deployment_config {
+            if let Some(port) = deployment_config.exposed_port {
+                debug!(
+                    "✅ Using environment-level port override: {} (environment: {})",
+                    port, environment.name
+                );
+                return port as u16;
+            }
+        }
+
+        // 2. Check project-level port override (from deployment_config)
+        if let Some(ref deployment_config) = project.deployment_config {
+            if let Some(port) = deployment_config.exposed_port {
+                debug!(
+                    "✅ Using project-level port override: {} (project: {})",
+                    port, project.name
+                );
+                return port as u16;
+            }
+        }
+
+        // 3. Default to 3000
+        // Note: Image EXPOSE directive will be checked in DeployImageJob after build completes
+        debug!("ℹ️  Using default port: 3000 (will be overridden by image EXPOSE if present)");
+        3000
+    }
+
     /// Plan jobs based on project configuration
     /// Uses the 3 generic jobs: DownloadRepoJob -> BuildImageJob -> DeployImageJob
     async fn plan_jobs_for_project(
@@ -320,7 +378,7 @@ impl WorkflowPlanner {
         );
 
         // Check if git info is available
-        let has_git_info = project.repo_owner.is_some() && project.repo_name.is_some();
+        let has_git_info = !project.repo_owner.is_empty() && !project.repo_name.is_empty();
 
         // Job 1: Download repository (only if git info is available)
         if has_git_info {
@@ -373,6 +431,25 @@ impl WorkflowPlanner {
             build_args_map.insert(key.clone(), serde_json::Value::String(value.clone()));
         }
 
+        // Parse preset_config if present (for Dockerfile preset)
+        let mut dockerfile_path = "Dockerfile".to_string();
+        let mut build_context = project.directory.clone();
+
+        if let Some(preset_config) = &project.preset_config {
+            // Extract dockerfile_path and build_context from preset_config
+            // Only relevant for Dockerfile preset
+            if let temps_entities::preset::PresetConfig::Dockerfile(dockerfile_config) =
+                preset_config
+            {
+                if let Some(custom_dockerfile) = &dockerfile_config.dockerfile_path {
+                    dockerfile_path = custom_dockerfile.clone();
+                }
+                if let Some(custom_context) = &dockerfile_config.build_context {
+                    build_context = custom_context.clone();
+                }
+            }
+        }
+
         jobs.push(JobDefinition {
             job_id: "build_image".to_string(),
             job_type: "BuildImageJob".to_string(),
@@ -380,13 +457,31 @@ impl WorkflowPlanner {
             description: Some("Build Docker image from source code".to_string()),
             dependencies: build_dependencies,
             job_config: Some(serde_json::json!({
-                "dockerfile_path": "Dockerfile",
-                "build_args": build_args_map
+                "dockerfile_path": dockerfile_path,
+                "build_args": build_args_map,
+                "build_context": build_context
             })),
             required_for_completion: true, // Core deployment job
         });
 
         // Job 3: Deploy container
+        // Determine which port to expose using the resolution hierarchy:
+        // image EXPOSE directive > environment.exposed_port > project.exposed_port > default 3000
+
+        // Build the image name that will be created by the build job
+        // Format: temps-{project_slug}:{deployment_id}
+        let image_name = format!("temps-{}:{}", project.slug, deployment.id);
+
+        // Resolve the port to expose
+        let exposed_port = self
+            .resolve_exposed_port(environment, project, Some(&image_name))
+            .await;
+
+        debug!(
+            "📡 Container will expose port {} (image: {})",
+            exposed_port, image_name
+        );
+
         jobs.push(JobDefinition {
             job_id: "deploy_container".to_string(),
             job_type: "DeployImageJob".to_string(),
@@ -394,9 +489,10 @@ impl WorkflowPlanner {
             description: Some("Deploy the built container image".to_string()),
             dependencies: vec!["build_image".to_string()],
             job_config: Some(serde_json::json!({
-                "port": 3000,
+                "port": exposed_port,
                 "replicas": 1,
-                "environment_variables": env_vars
+                "environment_variables": env_vars,
+                "image_name": image_name
             })),
             required_for_completion: true, // Core deployment job
         });
@@ -483,7 +579,7 @@ mod tests {
     use temps_config::{ConfigService, ServerConfig};
     use temps_core::EncryptionService;
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::types::ProjectType;
+    use temps_entities::{preset::Preset, upstream_config::UpstreamList};
 
     fn create_test_config_service(db: Arc<DatabaseConnection>) -> Arc<ConfigService> {
         let server_config = Arc::new(
@@ -519,8 +615,7 @@ mod tests {
 
     async fn create_test_project(
         db: &DatabaseConnection,
-        project_type: ProjectType,
-        preset: Option<String>,
+        preset: Preset,
     ) -> Result<
         (projects::Model, environments::Model, deployments::Model),
         Box<dyn std::error::Error>,
@@ -529,13 +624,12 @@ mod tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            repo_owner: Set(Some("test-owner".to_string())),
-            repo_name: Set(Some("test-repo".to_string())),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
             main_branch: Set("main".to_string()),
             git_provider_connection_id: Set(Some(1)),
             preset: Set(preset),
             directory: Set("/".to_string()),
-            project_type: Set(project_type),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -548,7 +642,7 @@ mod tests {
             name: Set("Production".to_string()),
             slug: Set("production".to_string()),
             host: Set("test.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             subdomain: Set("test.example.com".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -589,8 +683,7 @@ mod tests {
         );
 
         let (_project, _environment, deployment) =
-            create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
-                .await?;
+            create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
 
@@ -640,13 +733,12 @@ mod tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            repo_owner: Set(None), // No git info
-            repo_name: Set(None),
+            repo_owner: Set("".to_string()), // No git info
+            repo_name: Set("".to_string()),
             main_branch: Set("main".to_string()),
             git_provider_connection_id: Set(None),
-            preset: Set(Some("nextjs".to_string())),
+            preset: Set(Preset::NextJs),
             directory: Set("/".to_string()),
-            project_type: Set(ProjectType::Server),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -659,7 +751,7 @@ mod tests {
             name: Set("Production".to_string()),
             slug: Set("production".to_string()),
             host: Set("test.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             subdomain: Set("test.example.com".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -717,8 +809,7 @@ mod tests {
         );
 
         let (_project, _environment, deployment) =
-            create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
-                .await?;
+            create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
 
@@ -764,8 +855,7 @@ mod tests {
         );
 
         let (_project, _environment, deployment) =
-            create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
-                .await?;
+            create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
 
@@ -807,8 +897,7 @@ mod tests {
         );
 
         let (_project, _environment, deployment) =
-            create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
-                .await?;
+            create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
 
@@ -854,8 +943,7 @@ mod tests {
         );
 
         let (project, environment, deployment) =
-            create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
-                .await?;
+            create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
 

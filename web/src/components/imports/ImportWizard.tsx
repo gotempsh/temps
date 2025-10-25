@@ -165,21 +165,14 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
   const defaultPresetValue = useMemo(() => {
     if (!presetData) return null
 
-    // If we have projects array, use the first one
-    if (presetData.projects && presetData.projects.length > 0) {
-      const firstPreset = presetData.projects[0]
+    // New schema: use presets array
+    if (presetData.presets && presetData.presets.length > 0) {
+      const firstPreset = presetData.presets[0]
       const presetName = firstPreset.preset || 'custom'
-      const presetPath = firstPreset.path || 'root'
+      const presetPath = firstPreset.path || './'
       return {
         value: `${presetName}::${presetPath}`,
-        rootDir: firstPreset.path ? `./${firstPreset.path}` : './',
-      }
-    }
-    // Otherwise if we have a root preset, use that
-    else if (presetData.root_preset) {
-      return {
-        value: `${presetData.root_preset}::root`,
-        rootDir: './',
+        rootDir: presetPath,
       }
     }
     // Fallback: use 'custom' as default
@@ -863,36 +856,23 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
                           <SelectValue placeholder="Select a framework preset" />
                         </SelectTrigger>
                         <SelectContent>
-                          {presetData?.projects?.map(
-                            (project: any, index: number) => (
+                          {presetData?.presets?.map(
+                            (preset: any, index: number) => (
                               <SelectItem
-                                key={`${index}-${project.preset}`}
-                                value={`${project.preset}::${project.path || 'root'}`}
+                                key={`${index}-${preset.preset}`}
+                                value={`${preset.preset}::${preset.path || './'}`}
                               >
                                 <div className="flex flex-col">
-                                  <span>{project.preset}</span>
+                                  <span>
+                                    {preset.preset_label || preset.preset}
+                                  </span>
                                   <span className="text-xs text-muted-foreground">
-                                    {project.path || './'}
+                                    {preset.path || './'}
                                   </span>
                                 </div>
                               </SelectItem>
                             )
                           )}
-                          {presetData?.root_preset &&
-                            !presetData?.projects?.some(
-                              (p: any) => p.preset === presetData.root_preset
-                            ) && (
-                              <SelectItem
-                                value={`${presetData.root_preset}::root`}
-                              >
-                                <div className="flex flex-col">
-                                  <span>{presetData.root_preset}</span>
-                                  <span className="text-xs text-muted-foreground">
-                                    ./
-                                  </span>
-                                </div>
-                              </SelectItem>
-                            )}
                           <SelectItem value="custom">Custom</SelectItem>
                         </SelectContent>
                       </Select>

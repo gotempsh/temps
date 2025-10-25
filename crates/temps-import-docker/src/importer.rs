@@ -530,18 +530,14 @@ impl WorkloadImporter for DockerImporter {
             context.project_name, context.preset
         );
 
-        // Get project type from preset
+        // Validate preset exists
         use temps_presets::get_preset_by_slug;
-        let project_type = match get_preset_by_slug(&context.preset) {
-            Some(preset_val) => preset_val.project_type().to_string(),
-            None => {
-                warnings.push(format!(
-                    "Preset '{}' not found, defaulting to 'server' project type",
-                    context.preset
-                ));
-                "server".to_string()
-            }
-        };
+        if get_preset_by_slug(&context.preset).is_none() {
+            warnings.push(format!(
+                "Preset '{}' not found, using default configuration",
+                context.preset
+            ));
+        }
 
         let create_project_request = temps_projects::services::types::CreateProjectRequest {
             name: context.project_name.clone(),
@@ -550,9 +546,7 @@ impl WorkloadImporter for DockerImporter {
             directory: context.directory.clone(),
             main_branch: context.main_branch.clone(),
             preset: context.preset.clone(),
-            output_dir: None,
-            build_command: None,
-            install_command: None,
+            preset_config: None,
             environment_variables: Some(
                 plan.deployment
                     .env_vars
@@ -562,16 +556,11 @@ impl WorkloadImporter for DockerImporter {
                     .collect(),
             ),
             automatic_deploy: false,
-            project_type: Some(project_type),
-            is_web_app: plan.project.is_web_app,
-            performance_metrics_enabled: false,
             storage_service_ids: vec![],
-            use_default_wildcard: Some(true),
-            custom_domain: None,
             is_public_repo: None,
             git_url: None,
             git_provider_connection_id: context.git_provider_connection_id,
-            is_on_demand: Some(false),
+            exposed_port: None,
         };
 
         let project = project_service
@@ -1064,14 +1053,6 @@ mod tests {
         // Verify project configuration
         assert_eq!(plan.project.name, "my-web-app");
         assert_eq!(plan.project.slug, "my-web-app");
-        assert_eq!(
-            plan.project.project_type,
-            temps_import_types::plan::ProjectType::Docker
-        );
-        assert!(
-            plan.project.is_web_app,
-            "Should be detected as web app due to ports"
-        );
 
         // Verify environment configuration
         assert_eq!(plan.environment.name, "production");

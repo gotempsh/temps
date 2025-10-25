@@ -87,8 +87,9 @@ impl TempsPlugin for DeploymentsPlugin {
                 tracing::debug!("Starting cron scheduler");
                 scheduler_service.start_cron_scheduler().await;
             });
-            // Get screenshot service if available (optional)
-            let screenshot_service = context.get_service::<temps_screenshots::ScreenshotService>();
+            // Get screenshot service (required)
+            let screenshot_service =
+                context.require_service::<temps_screenshots::ScreenshotService>();
 
             // Create WorkflowExecutionService
             let workflow_execution_service = Arc::new(WorkflowExecutionService::new(

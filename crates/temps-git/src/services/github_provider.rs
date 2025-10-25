@@ -1325,4 +1325,21 @@ impl GitProviderService for GitHubProvider {
         info!("Successfully downloaded archive to {:?}", target_path);
         Ok(())
     }
+
+    async fn create_source(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+    ) -> Result<Box<dyn temps_presets::source::ProjectSource>, GitProviderError> {
+        let octocrab = self.get_octocrab_client(access_token).await?;
+
+        Ok(Box::new(crate::sources::GitHubSource::new(
+            std::sync::Arc::new(octocrab),
+            owner.to_string(),
+            repo.to_string(),
+            reference.to_string(),
+        )))
+    }
 }

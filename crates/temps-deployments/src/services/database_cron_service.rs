@@ -576,6 +576,7 @@ impl DatabaseCronConfigService {
 mod tests {
     use super::*;
     use temps_database::test_utils::TestDatabase;
+    use temps_entities::upstream_config::UpstreamList;
 
     // Mock queue for tests
     struct MockQueue;
@@ -601,7 +602,7 @@ mod tests {
         ),
         Box<dyn std::error::Error>,
     > {
-        use temps_entities::{environments, projects, types::ProjectType};
+        use temps_entities::{environments, projects};
 
         // Create project
         let project = projects::ActiveModel {
@@ -609,7 +610,6 @@ mod tests {
             slug: Set("test-project".to_string()),
             directory: Set("test-directory".to_string()),
             main_branch: Set("main".to_string()),
-            project_type: Set(ProjectType::Server),
             ..Default::default()
         };
         let project = project.insert(db).await?;
@@ -621,7 +621,7 @@ mod tests {
             slug: Set("test-env".to_string()),
             subdomain: Set("test-env".to_string()),
             host: Set("test-env.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         };
         let environment = environment.insert(db).await?;

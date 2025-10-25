@@ -1,9 +1,11 @@
-use super::{Preset, ProjectType};
+use super::{DockerfileWithArgs, Preset, ProjectType};
+use async_trait::async_trait;
 use std::fmt;
 use std::path::Path;
 
 pub struct DockerCustomPreset;
 
+#[async_trait]
 impl Preset for DockerCustomPreset {
     fn slug(&self) -> String {
         "custom".to_string()
@@ -18,10 +20,10 @@ impl Preset for DockerCustomPreset {
     }
 
     fn icon_url(&self) -> String {
-        "/images/presets/docker.svg".to_string()
+        "/presets/docker.svg".to_string()
     }
 
-    fn dockerfile(&self, config: super::DockerfileConfig) -> String {
+    async fn dockerfile(&self, config: super::DockerfileConfig<'_>) -> DockerfileWithArgs {
         let base_image = "alpine:latest";
 
         // Create the initial part of the Dockerfile
@@ -102,10 +104,10 @@ CMD [\"nginx\", \"-g\", \"daemon off;\"]",
             app_dir
         );
 
-        dockerfile
+        DockerfileWithArgs::new(dockerfile)
     }
 
-    fn dockerfile_with_build_dir(&self, local_path: &Path) -> String {
+    async fn dockerfile_with_build_dir(&self, local_path: &Path) -> DockerfileWithArgs {
         // This method should return a Dockerfile that can be used with a build context directory
         // In this case, we'll use the same Dockerfile as the regular one
         self.dockerfile(super::DockerfileConfig {
@@ -116,7 +118,8 @@ CMD [\"nginx\", \"-g\", \"daemon off;\"]",
             output_dir: None,
             build_vars: None,
             project_slug: "app",
-        })
+            use_buildkit: false,
+        }).await
     }
 
     fn install_command(&self, _local_path: &Path) -> String {

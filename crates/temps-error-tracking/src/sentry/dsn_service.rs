@@ -410,7 +410,7 @@ impl DSNService {
 mod tests {
     use super::*;
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::projects;
+    use temps_entities::{preset::Preset, projects};
 
     async fn setup_test_db() -> TestDatabase {
         TestDatabase::with_migrations()
@@ -428,13 +428,7 @@ mod tests {
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             slug: Set(unique_slug),
-            project_type: Set(ProjectType::Server),
-            automatic_deploy: Set(true),
-            is_web_app: Set(false),
-            performance_metrics_enabled: Set(false),
-            use_default_wildcard: Set(true),
-            is_public_repo: Set(false),
-            is_on_demand: Set(false),
+            preset: Set(Preset::NextJs),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()

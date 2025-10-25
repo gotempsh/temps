@@ -724,6 +724,7 @@ impl ExternalService for PostgresService {
                 description: "Database host".to_string(),
                 default_value: Some("localhost".to_string()),
                 validation_pattern: None,
+                choices: None,
             },
             ServiceParameter {
                 name: "port".to_string(),
@@ -732,6 +733,7 @@ impl ExternalService for PostgresService {
                 description: "Database port".to_string(),
                 default_value: Some(self.get_default_port()),
                 validation_pattern: Some(r"^\d+$".to_string()),
+                choices: None,
             },
             ServiceParameter {
                 name: "database".to_string(),
@@ -740,6 +742,7 @@ impl ExternalService for PostgresService {
                 description: "Database name".to_string(),
                 default_value: Some("postgres".to_string()),
                 validation_pattern: None,
+                choices: None,
             },
             ServiceParameter {
                 name: "username".to_string(),
@@ -748,6 +751,7 @@ impl ExternalService for PostgresService {
                 description: "Database username".to_string(),
                 default_value: Some("postgres".to_string()),
                 validation_pattern: None,
+                choices: None,
             },
             ServiceParameter {
                 name: "password".to_string(),
@@ -756,6 +760,7 @@ impl ExternalService for PostgresService {
                 description: "Database password".to_string(),
                 default_value: None,
                 validation_pattern: None,
+                choices: None,
             },
         ]
     }

@@ -96,7 +96,7 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
 
-        if project.project_type != temps_entities::types::ProjectType::Server {
+        if project.preset == temps_entities::preset::Preset::Static {
             return Err(DeploymentError::Other(
                 "Container logs are only available for server-type projects".to_string(),
             ));
@@ -178,7 +178,7 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
 
-        if project.project_type != temps_entities::types::ProjectType::Server {
+        if project.preset == temps_entities::preset::Preset::Static {
             return Err(DeploymentError::Other(
                 "Container logs are only available for server-type projects".to_string(),
             ));
@@ -253,7 +253,7 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
 
-        if project.project_type != temps_entities::types::ProjectType::Server {
+        if project.preset == temps_entities::preset::Preset::Static {
             return Err(DeploymentError::Other(
                 "Containers are only available for server-type projects".to_string(),
             ));
@@ -319,11 +319,16 @@ impl DeploymentService {
             .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
 
         // Update the environment with new settings
-        let mut active_environment: environments::ActiveModel = environment.into();
-        active_environment.cpu_request = Set(settings.cpu_request);
-        active_environment.cpu_limit = Set(settings.cpu_limit);
-        active_environment.memory_request = Set(settings.memory_request);
-        active_environment.memory_limit = Set(settings.memory_limit);
+        let mut active_environment: environments::ActiveModel = environment.clone().into();
+
+        // Update deployment config with new resource settings
+        let mut deployment_config = environment.deployment_config.clone().unwrap_or_default();
+        deployment_config.cpu_request = settings.cpu_request;
+        deployment_config.cpu_limit = settings.cpu_limit;
+        deployment_config.memory_request = settings.memory_request;
+        deployment_config.memory_limit = settings.memory_limit;
+
+        active_environment.deployment_config = Set(Some(deployment_config));
         active_environment.update(self.db.as_ref()).await?;
 
         Ok(())
@@ -544,22 +549,20 @@ impl DeploymentService {
             project_id, environment_id
         );
         // Check if repo_owner and repo_name are present
-        let repo_owner = match &project.as_ref().unwrap().repo_owner {
-            Some(owner) => owner.clone(),
-            None => {
-                return Err(DeploymentError::InvalidInput(
-                    "Project repo_owner is missing".to_string(),
-                ));
-            }
-        };
-        let repo_name = match &project.as_ref().unwrap().repo_name {
-            Some(name) => name.clone(),
-            None => {
-                return Err(DeploymentError::InvalidInput(
-                    "Project repo_name is missing".to_string(),
-                ));
-            }
-        };
+        let repo_owner = project.as_ref().unwrap().repo_owner.clone();
+        let repo_name = project.as_ref().unwrap().repo_name.clone();
+
+        // Validate that they're not empty
+        if repo_owner.is_empty() {
+            return Err(DeploymentError::InvalidInput(
+                "Project repo_owner is missing".to_string(),
+            ));
+        }
+        if repo_name.is_empty() {
+            return Err(DeploymentError::InvalidInput(
+                "Project repo_name is missing".to_string(),
+            ));
+        }
         let git_push_job = temps_core::GitPushEventJob {
             owner: repo_owner,
             repo: repo_name,
@@ -1319,8 +1322,9 @@ mod tests {
     use temps_core::EncryptionService;
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{
-        deployments, env_vars, environments, external_service_params, external_services,
-        project_services, projects,
+        deployment_config::DeploymentConfig, deployments, env_vars, environments,
+        external_service_params, external_services, preset::Preset, project_services, projects,
+        upstream_config::UpstreamList,
     };
 
     // Mock for other services
@@ -1392,25 +1396,17 @@ mod tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            repo_owner: Set(Some("test-owner".to_string())),
-            repo_name: Set(Some("test-repo".to_string())),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
             git_provider_connection_id: Set(Some(1)),
-            preset: Set(Some("nextjs".to_string())),
+            preset: Set(Preset::NextJs),
             directory: Set("/".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
-            automatic_deploy: Set(false),
-            custom_domain: Set(None),
             deleted_at: Set(None),
             is_deleted: Set(false),
-            project_type: Set(temps_entities::types::ProjectType::Server),
-            is_web_app: Set(true),
-            performance_metrics_enabled: Set(false),
-            use_default_wildcard: Set(true),
-            is_public_repo: Set(false),
-            git_url: Set(None),
-            is_on_demand: Set(false),
-            main_branch: Set("main".to_string()),
+            deployment_config: Set(Some(DeploymentConfig::default())),
+            last_deployment: Set(None),
             ..Default::default()
         };
         let project = project.insert(db.as_ref()).await?;
@@ -1421,13 +1417,8 @@ mod tests {
             name: Set("Test Environment".to_string()),
             slug: Set("test".to_string()),
             host: Set("test.example.com".to_string()), // Add required host field
-            upstreams: Set(serde_json::json!([])),     // Add required upstreams field (empty array)
+            upstreams: Set(UpstreamList::default()),   // Add required upstreams field (empty array)
             current_deployment_id: Set(None),
-            replicas: Set(Some(1)),
-            cpu_request: Set(Some(100)),
-            cpu_limit: Set(Some(200)),
-            memory_request: Set(Some(128)),
-            memory_limit: Set(Some(256)),
             subdomain: Set("test.example.com".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -2159,7 +2150,7 @@ mod tests {
         let project = projects::ActiveModel {
             name: Set("Static Site".to_string()),
             slug: Set("static-site".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Static),
+            preset: Set(Preset::NextJs),
             main_branch: Set("main".to_string()),
             directory: Set("/".to_string()),
             created_at: Set(Utc::now()),
@@ -2174,7 +2165,7 @@ mod tests {
             name: Set("Test".to_string()),
             slug: Set("test".to_string()),
             host: Set("test.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             subdomain: Set("test.example.com".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),

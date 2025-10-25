@@ -263,6 +263,63 @@ impl DeployImageJob {
         Ok(port)
     }
 
+    /// Resolve the actual container port to expose
+    ///
+    /// Priority order:
+    /// 1. Auto-detected from Docker image EXPOSE directive (source of truth)
+    /// 2. Configured port from environment/project/default (fallback)
+    ///
+    /// This method inspects the built image and extracts exposed ports.
+    async fn resolve_container_port(&self, image_tag: &str, context: &WorkflowContext) -> u16 {
+        // Try to inspect the image and get exposed ports
+        match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => {
+                match crate::utils::docker_inspect::get_primary_port(&docker, image_tag).await {
+                    Ok(Some(port)) => {
+                        let _ = self
+                            .log(
+                                context,
+                                format!("✅ Detected EXPOSE directive in image: port {}", port),
+                            )
+                            .await;
+                        return port;
+                    }
+                    Ok(None) => {
+                        let _ = self.log(
+                            context,
+                            format!("ℹ️  No EXPOSE directive found in image, using configured port: {}", self.config.port),
+                        ).await;
+                    }
+                    Err(e) => {
+                        let _ = self
+                            .log(
+                                context,
+                                format!(
+                                    "⚠️  Failed to inspect image: {}, using configured port: {}",
+                                    e, self.config.port
+                                ),
+                            )
+                            .await;
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = self
+                    .log(
+                        context,
+                        format!(
+                            "⚠️  Failed to connect to Docker: {}, using configured port: {}",
+                            e, self.config.port
+                        ),
+                    )
+                    .await;
+            }
+        }
+
+        // Fallback to configured port (from environment/project/default)
+        self.config.port as u16
+    }
+
     /// Public getter for config to allow test access
     pub fn config(&self) -> &DeploymentConfig {
         &self.config
@@ -312,20 +369,26 @@ impl DeployImageJob {
 
         let log_path = std::env::temp_dir().join(format!("deploy_{}.log", self.job_id));
 
+        // Determine the actual container port to expose
+        // Priority: Image EXPOSE directive > configured port (from environment/project/default)
+        let container_port = self
+            .resolve_container_port(&image_output.image_tag, context)
+            .await;
+
         // Allocate a random available port on the host
         let host_port = Self::find_available_port()?;
         self.log(
             context,
             format!(
                 "🔌 Allocated host port: {} → container port: {}",
-                host_port, self.config.port
+                host_port, container_port
             ),
         )
         .await?;
 
         let port_mappings = vec![PortMapping {
             host_port,
-            container_port: self.config.port as u16,
+            container_port,
             protocol: Protocol::Tcp,
         }];
 

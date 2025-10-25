@@ -1,6 +1,6 @@
 use crate::externalsvc::{
-    postgres::PostgresService, redis::RedisService, s3::S3Service, ExternalService, ServiceConfig,
-    ServiceParameter, ServiceType,
+    mongodb::MongodbService, postgres::PostgresService, redis::RedisService, s3::S3Service,
+    ExternalService, ServiceConfig, ServiceParameter, ServiceType,
 };
 use crate::types::EnvironmentVariableInfo;
 use anyhow::Result;
@@ -220,6 +220,7 @@ impl ExternalServiceManager {
         service_type: ServiceType,
     ) -> Box<dyn ExternalService> {
         match service_type {
+            ServiceType::Mongodb => Box::new(MongodbService::new(name, self.docker.clone())),
             ServiceType::Postgres => Box::new(PostgresService::new(name, self.docker.clone())),
             ServiceType::Redis => Box::new(RedisService::new(name, self.docker.clone())),
             ServiceType::S3 => Box::new(S3Service::new(name, self.docker.clone())),
@@ -275,6 +276,23 @@ impl ExternalServiceManager {
         let encryption_service = Arc::clone(&self.encryption_service);
         let param_defs = service_instance.get_parameter_definitions();
 
+        // Auto-generate values for optional parameters that have defaults or generation logic
+        let mut parameters = request.parameters.clone();
+        for param_def in &param_defs {
+            if !param_def.required && !parameters.contains_key(&param_def.name) {
+                // For MongoDB password, auto-generate if not provided
+                if request.service_type == ServiceType::Mongodb && param_def.name == "password" {
+                    use rand::{distributions::Alphanumeric, Rng};
+                    let generated_password: String = rand::thread_rng()
+                        .sample_iter(&Alphanumeric)
+                        .take(16)
+                        .map(char::from)
+                        .collect();
+                    parameters.insert("password".to_string(), generated_password);
+                }
+            }
+        }
+
         // Start transaction
         let service = self
             .db
@@ -294,8 +312,8 @@ impl ExternalServiceManager {
 
                     let service = new_service.insert(txn).await?;
 
-                    // Store parameters
-                    for (key, value) in &request.parameters {
+                    // Store parameters (including auto-generated ones)
+                    for (key, value) in &parameters {
                         let param_def =
                             param_defs.iter().find(|p| p.name == *key).ok_or_else(|| {
                                 ExternalServiceError::ParameterValidationFailed {
@@ -721,6 +739,7 @@ impl ExternalServiceManager {
                 description: "Inferred parameter".to_string(),
                 default_value: None,
                 validation_pattern: None,
+                choices: None,
             };
             let param_def = param_def.unwrap_or(default_service_param);
 

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use temps_database::DbConnection;
 use temps_entities::{
     custom_routes, deployments, environments, project_custom_domains, projects, request_logs,
-    visitor,
+    upstream_config::UpstreamList, visitor,
 };
 
 /// Test database setup with TimescaleDB container
@@ -37,18 +37,18 @@ impl TestDBMockOperations {
         (projects::Model, environments::Model, deployments::Model),
         Box<dyn std::error::Error>,
     > {
-        use temps_entities::types::ProjectType;
+        use temps_entities::preset::Preset;
 
         // Create project with unique name based on domain
         let project_name = format!("test-project-{}", domain.replace(".", "-"));
         let project = projects::ActiveModel {
             name: Set(project_name.clone()),
-            custom_domain: Set(Some(domain.to_string())),
-            is_web_app: Set(true),
-            project_type: Set(ProjectType::Server),
+            preset: Set(Preset::Nixpacks), // Default to Nixpacks for tests
             slug: Set(project_name.clone()),
             directory: Set(".".to_string()),
             main_branch: Set("main".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             ..Default::default()
         };
         let project = project.insert(self.db.as_ref()).await?;
@@ -59,9 +59,8 @@ impl TestDBMockOperations {
             slug: Set("production".to_string()),
             subdomain: Set("http://localhost:8080".to_string()),
             host: Set(domain.to_string()),
-            upstreams: Set(sea_orm::JsonValue::Null),
+            upstreams: Set(UpstreamList::default()),
             project_id: Set(project.id),
-            use_default_wildcard: Set(true),
             ..Default::default()
         };
         let environment = environment.insert(self.db.as_ref()).await?;

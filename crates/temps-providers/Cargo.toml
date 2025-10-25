@@ -22,6 +22,7 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 sea-orm = { workspace = true }
 redis = { version = "0.28.2", features = ["tokio-comp", "connection-manager"] }
+mongodb = "3.3.0"
 aws-sdk-s3 = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

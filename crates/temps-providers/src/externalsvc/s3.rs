@@ -515,6 +515,7 @@ impl ExternalService for S3Service {
             description: "Port to expose MinIO service".to_string(),
             default_value: Some(self.get_default_port()),
             validation_pattern: Some(r"^\d+$".to_string()),
+            choices: None,
         }]
     }
 

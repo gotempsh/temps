@@ -1181,6 +1181,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use sea_orm::{Database, DatabaseConnection, DbErr};
     use std::sync::Arc;
+    use temps_entities::upstream_config::UpstreamList;
 
     async fn setup_test_db() -> Result<DatabaseConnection, DbErr> {
         Database::connect("sqlite::memory:").await
@@ -1798,13 +1799,8 @@ mod tests {
             main_branch: Set("main".to_string()),
             slug: Set("test-project".to_string()),
             is_deleted: Set(false),
-            automatic_deploy: Set(false),
-            project_type: Set(temps_entities::types::ProjectType::Static),
-            is_web_app: Set(false),
-            performance_metrics_enabled: Set(false),
-            use_default_wildcard: Set(false),
             is_public_repo: Set(false),
-            is_on_demand: Set(false),
+            preset: Set(temps_entities::preset::Preset::Static),
             ..Default::default()
         }
         .insert(db.as_ref())
@@ -1817,9 +1813,8 @@ mod tests {
             slug: Set("production".to_string()),
             subdomain: Set("test".to_string()),
             host: Set("test.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             project_id: Set(1),
-            use_default_wildcard: Set(false),
             ..Default::default()
         }
         .insert(db.as_ref())

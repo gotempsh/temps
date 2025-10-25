@@ -2,7 +2,11 @@ import React, { Component, ReactNode } from 'react'
 
 interface ErrorBoundaryProps {
   children: ReactNode
-  fallback?: (error: Error, errorInfo: React.ErrorInfo, resetError: () => void) => ReactNode
+  fallback?: (
+    error: Error,
+    errorInfo: React.ErrorInfo,
+    resetError: () => void
+  ) => ReactNode
   onError?: (error: Error, errorInfo: React.ErrorInfo) => void
 }
 
@@ -21,7 +25,10 @@ interface ErrorBoundaryState {
  *   <YourComponent />
  * </ErrorBoundary>
  */
-export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+export class ErrorBoundary extends Component<
+  ErrorBoundaryProps,
+  ErrorBoundaryState
+> {
   constructor(props: ErrorBoundaryProps) {
     super(props)
     this.state = {
@@ -44,7 +51,10 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     if (process.env.NODE_ENV === 'development') {
       console.error('[ErrorBoundary] Caught error:', error)
       console.error('[ErrorBoundary] Error info:', errorInfo)
-      console.error('[ErrorBoundary] Component stack:', errorInfo.componentStack)
+      console.error(
+        '[ErrorBoundary] Component stack:',
+        errorInfo.componentStack
+      )
     }
 
     // Update state with error info
@@ -74,14 +84,20 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     if (this.state.hasError && this.state.error && this.state.errorInfo) {
       // Custom fallback provided
       if (this.props.fallback) {
-        return this.props.fallback(this.state.error, this.state.errorInfo, this.resetError)
+        return this.props.fallback(
+          this.state.error,
+          this.state.errorInfo,
+          this.resetError
+        )
       }
 
       // Default fallback
       return (
         <div className="flex min-h-[400px] flex-col items-center justify-center p-4 text-center">
           <div className="space-y-4">
-            <h2 className="text-2xl font-bold tracking-tight">Something went wrong</h2>
+            <h2 className="text-2xl font-bold tracking-tight">
+              Something went wrong
+            </h2>
             <p className="text-muted-foreground">
               An error occurred while rendering this component.
             </p>

@@ -7,6 +7,7 @@ import {
 import { ThemeProvider } from '@/components/providers/ThemeProvider'
 import { ThemeWrapper } from '@/components/theme/ThemeWrapper'
 import { ProjectsProvider } from '@/contexts/ProjectsContext'
+import { PresetProvider } from '@/contexts/PresetContext'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
 import { lazy, Suspense } from 'react'
@@ -41,6 +42,9 @@ const Projects = lazy(() =>
 )
 const Storage = lazy(() =>
   import('./pages/Storage').then((m) => ({ default: m.Storage }))
+)
+const CreateService = lazy(() =>
+  import('./pages/CreateService').then((m) => ({ default: m.CreateService }))
 )
 const ServiceDetail = lazy(() =>
   import('./pages/ServiceDetail').then((m) => ({ default: m.ServiceDetail }))
@@ -153,214 +157,260 @@ const AppContent = () => {
     <BrowserRouter>
       <AuthProvider>
         <ProjectsProvider>
-          <Suspense fallback={<PageLoader />}>
-            <Routes>
-              {/* Public routes that don't require authentication */}
-              <Route path="/mfa-verify" element={<MfaVerify />} />
+          <PresetProvider>
+            <Suspense fallback={<PageLoader />}>
+              <Routes>
+                {/* Public routes that don't require authentication */}
+                <Route path="/mfa-verify" element={<MfaVerify />} />
 
-              {/* Protected routes */}
-              <Route
-                path="/*"
-                element={
-                  <ProtectedLayout>
-                    <BreadcrumbProvider>
-                      <SidebarProvider>
-                        {/* Wrap sidebar with independent error boundary */}
-                        <ErrorBoundary
-                          fallback={(error, _errorInfo, resetError) => (
-                            <CompactErrorFallback
-                              error={error}
-                              resetError={resetError}
-                              componentName="Sidebar"
-                            />
-                          )}
-                          onError={(error, errorInfo) => {
-                            console.error('[App] Sidebar error caught by boundary:', error)
-                            console.error('[App] Component stack:', errorInfo.componentStack)
-                          }}
-                        >
-                          <AppSidebar />
-                        </ErrorBoundary>
-                        <SidebarInset>
-                          {/* Wrap header with independent error boundary */}
+                {/* Protected routes */}
+                <Route
+                  path="/*"
+                  element={
+                    <ProtectedLayout>
+                      <BreadcrumbProvider>
+                        <SidebarProvider>
+                          {/* Wrap sidebar with independent error boundary */}
                           <ErrorBoundary
                             fallback={(error, _errorInfo, resetError) => (
                               <CompactErrorFallback
                                 error={error}
                                 resetError={resetError}
-                                componentName="Header"
-                                minimal
+                                componentName="Sidebar"
                               />
                             )}
                             onError={(error, errorInfo) => {
-                              console.error('[App] Header error caught by boundary:', error)
-                              console.error('[App] Component stack:', errorInfo.componentStack)
+                              console.error(
+                                '[App] Sidebar error caught by boundary:',
+                                error
+                              )
+                              console.error(
+                                '[App] Component stack:',
+                                errorInfo.componentStack
+                              )
                             }}
                           >
-                            <Header />
+                            <AppSidebar />
                           </ErrorBoundary>
-                          {/* Wrap page content with error boundary */}
-                          <ErrorBoundary
-                            fallback={(error, errorInfo, resetError) => (
-                              <ErrorFallback
-                                error={error}
-                                errorInfo={errorInfo}
-                                resetError={resetError}
-                              />
-                            )}
-                            onError={(error, errorInfo) => {
-                              // Log errors to console in development
-                              console.error('[App] Page error caught by boundary:', error)
-                              console.error('[App] Component stack:', errorInfo.componentStack)
-                              // In production, you could send to error tracking service
-                              // Example: Sentry.captureException(error, { contexts: { react: { componentStack: errorInfo.componentStack } } })
-                            }}
-                          >
-                            <div className="py-2 px-0 sm:p-4">
-                              <Routes>
-                                <Route
-                                  path="/"
-                                  element={<Navigate to="/dashboard" replace />}
+                          <SidebarInset>
+                            {/* Wrap header with independent error boundary */}
+                            <ErrorBoundary
+                              fallback={(error, _errorInfo, resetError) => (
+                                <CompactErrorFallback
+                                  error={error}
+                                  resetError={resetError}
+                                  componentName="Header"
+                                  minimal
                                 />
-                                <Route
-                                  path="/dashboard"
-                                  element={<Dashboard />}
+                              )}
+                              onError={(error, errorInfo) => {
+                                console.error(
+                                  '[App] Header error caught by boundary:',
+                                  error
+                                )
+                                console.error(
+                                  '[App] Component stack:',
+                                  errorInfo.componentStack
+                                )
+                              }}
+                            >
+                              <Header />
+                            </ErrorBoundary>
+                            {/* Wrap page content with error boundary */}
+                            <ErrorBoundary
+                              fallback={(error, errorInfo, resetError) => (
+                                <ErrorFallback
+                                  error={error}
+                                  errorInfo={errorInfo}
+                                  resetError={resetError}
                                 />
-                                <Route path="/account" element={<Account />} />
-                                <Route path="/projects" element={<Projects />} />
-                                <Route path="/storage" element={<Storage />} />
-                                <Route
-                                  path="/storage/:id"
-                                  element={<ServiceDetail />}
-                                />
-                                <Route path="/users" element={<Users />} />
-                                <Route
-                                  path="/load-balancer"
-                                  element={<CustomRoutes />}
-                                />
-                                <Route
-                                  path="/git-sources"
-                                  element={<GitSources />}
-                                />
-                                <Route
-                                  path="/git-sources/add"
-                                  element={<AddGitProvider />}
-                                />
-                                <Route
-                                  path="/git-providers/:id"
-                                  element={<GitProviderDetail />}
-                                />
-                                <Route path="/domains" element={<Domains />} />
-                                <Route
-                                  path="/domains/add"
-                                  element={<AddDomain />}
-                                />
-                                <Route
-                                  path="/domains/:id"
-                                  element={<DomainDetail />}
-                                />
-                                <Route
-                                  path="/domains/provisioning"
-                                  element={<DomainProvisioning />}
-                                />
-                                <Route path="/backups" element={<Backups />} />
-                                <Route
-                                  path="/backups/s3-sources/new"
-                                  element={<CreateS3Source />}
-                                />
-                                <Route
-                                  path="/monitoring"
-                                  element={<Monitoring />}
-                                >
+                              )}
+                              onError={(error, errorInfo) => {
+                                // Log errors to console in development
+                                console.error(
+                                  '[App] Page error caught by boundary:',
+                                  error
+                                )
+                                console.error(
+                                  '[App] Component stack:',
+                                  errorInfo.componentStack
+                                )
+                                // In production, you could send to error tracking service
+                                // Example: Sentry.captureException(error, { contexts: { react: { componentStack: errorInfo.componentStack } } })
+                              }}
+                            >
+                              <div className="py-2 px-0 sm:p-4">
+                                <Routes>
                                   <Route
-                                    index
-                                    element={<Navigate to="project" replace />}
+                                    path="/"
+                                    element={
+                                      <Navigate to="/dashboard" replace />
+                                    }
                                   />
                                   <Route
-                                    path="providers/add"
-                                    element={<AddNotificationProvider />}
+                                    path="/dashboard"
+                                    element={<Dashboard />}
                                   />
                                   <Route
-                                    path="providers/edit/:id"
-                                    element={<EditNotificationProvider />}
+                                    path="/account"
+                                    element={<Account />}
                                   />
                                   <Route
-                                    path=":section"
-                                    element={<MonitoringSettings />}
+                                    path="/projects"
+                                    element={<Projects />}
                                   />
-                                </Route>
-                                <Route
-                                  path="/backups/s3-sources/:id"
-                                  element={<S3SourceDetail />}
-                                />
-                                <Route
-                                  path="/backups/s3-sources/:id/backups/:backupId"
-                                  element={<BackupDetail />}
-                                />
-                                <Route
-                                  path="/projects/new"
-                                  element={<NewProject />}
-                                />
-                                <Route
-                                  path="/projects/import-wizard"
-                                  element={<Import />}
-                                />
-                                <Route
-                                  path="/projects/import/*"
-                                  element={<ImportProject />}
-                                />
-                                {/* <Route path="/projects/template/:name/import" element={<ImportTemplate />} /> */}
-                                <Route
-                                  path="/projects/:slug/*"
-                                  element={<ProjectDetail />}
-                                />
-                                <Route path="/settings" element={<Settings />} />
-                                <Route
-                                  path="/settings/audit-logs"
-                                  element={<AuditLogs />}
-                                />
-                                <Route
-                                  path="/proxy-logs"
-                                  element={<ProxyLogs />}
-                                />
-                                <Route
-                                  path="/proxy-logs/:id"
-                                  element={<ProxyLogDetail />}
-                                />
-                                <Route
-                                  path="/ip/:ip"
-                                  element={<IpGeolocationDetail />}
-                                />
-                                <Route
-                                  path="/setup/connectivity"
-                                  element={<ExternalConnectivitySetup />}
-                                />
-                                <Route path="/keys" element={<ApiKeys />} />
-                                <Route
-                                  path="/keys/new"
-                                  element={<ApiKeyCreate />}
-                                />
-                                <Route
-                                  path="/keys/:id"
-                                  element={<ApiKeyDetail />}
-                                />
-                                <Route
-                                  path="/keys/:id/edit"
-                                  element={<ApiKeyEdit />}
-                                />
-                                <Route path="*" element={<NotFound />} />
-                              </Routes>
-                            </div>
-                          </ErrorBoundary>
-                        </SidebarInset>
-                        <CommandPalette />
-                      </SidebarProvider>
-                    </BreadcrumbProvider>
-                  </ProtectedLayout>
-                }
-              />
-            </Routes>
-          </Suspense>
+                                  <Route
+                                    path="/storage"
+                                    element={<Storage />}
+                                  />
+                                  <Route
+                                    path="/storage/create"
+                                    element={<CreateService />}
+                                  />
+                                  <Route
+                                    path="/storage/:id"
+                                    element={<ServiceDetail />}
+                                  />
+                                  <Route path="/users" element={<Users />} />
+                                  <Route
+                                    path="/load-balancer"
+                                    element={<CustomRoutes />}
+                                  />
+                                  <Route
+                                    path="/git-sources"
+                                    element={<GitSources />}
+                                  />
+                                  <Route
+                                    path="/git-sources/add"
+                                    element={<AddGitProvider />}
+                                  />
+                                  <Route
+                                    path="/git-providers/:id"
+                                    element={<GitProviderDetail />}
+                                  />
+                                  <Route
+                                    path="/domains"
+                                    element={<Domains />}
+                                  />
+                                  <Route
+                                    path="/domains/add"
+                                    element={<AddDomain />}
+                                  />
+                                  <Route
+                                    path="/domains/:id"
+                                    element={<DomainDetail />}
+                                  />
+                                  <Route
+                                    path="/domains/provisioning"
+                                    element={<DomainProvisioning />}
+                                  />
+                                  <Route
+                                    path="/backups"
+                                    element={<Backups />}
+                                  />
+                                  <Route
+                                    path="/backups/s3-sources/new"
+                                    element={<CreateS3Source />}
+                                  />
+                                  <Route
+                                    path="/monitoring"
+                                    element={<Monitoring />}
+                                  >
+                                    <Route
+                                      index
+                                      element={
+                                        <Navigate to="project" replace />
+                                      }
+                                    />
+                                    <Route
+                                      path="providers/add"
+                                      element={<AddNotificationProvider />}
+                                    />
+                                    <Route
+                                      path="providers/edit/:id"
+                                      element={<EditNotificationProvider />}
+                                    />
+                                    <Route
+                                      path=":section"
+                                      element={<MonitoringSettings />}
+                                    />
+                                  </Route>
+                                  <Route
+                                    path="/backups/s3-sources/:id"
+                                    element={<S3SourceDetail />}
+                                  />
+                                  <Route
+                                    path="/backups/s3-sources/:id/backups/:backupId"
+                                    element={<BackupDetail />}
+                                  />
+                                  <Route
+                                    path="/projects/new"
+                                    element={<NewProject />}
+                                  />
+                                  <Route
+                                    path="/projects/import-wizard"
+                                    element={<Import />}
+                                  />
+                                  <Route
+                                    path="/projects/import/*"
+                                    element={<ImportProject />}
+                                  />
+                                  {/* <Route path="/projects/template/:name/import" element={<ImportTemplate />} /> */}
+                                  <Route
+                                    path="/projects/:slug/*"
+                                    element={<ProjectDetail />}
+                                  />
+                                  <Route
+                                    path="/settings"
+                                    element={<Settings />}
+                                  />
+                                  <Route
+                                    path="/settings/audit-logs"
+                                    element={<AuditLogs />}
+                                  />
+                                  <Route
+                                    path="/proxy-logs"
+                                    element={<ProxyLogs />}
+                                  />
+                                  <Route
+                                    path="/proxy-logs/:id"
+                                    element={<ProxyLogDetail />}
+                                  />
+                                  <Route
+                                    path="/ip/:ip"
+                                    element={<IpGeolocationDetail />}
+                                  />
+                                  <Route
+                                    path="/setup/connectivity"
+                                    element={<ExternalConnectivitySetup />}
+                                  />
+                                  <Route path="/keys" element={<ApiKeys />} />
+                                  <Route
+                                    path="/keys/new"
+                                    element={<ApiKeyCreate />}
+                                  />
+                                  <Route
+                                    path="/keys/:id"
+                                    element={<ApiKeyDetail />}
+                                  />
+                                  <Route
+                                    path="/keys/:id/edit"
+                                    element={<ApiKeyEdit />}
+                                  />
+                                  <Route path="*" element={<NotFound />} />
+                                </Routes>
+                              </div>
+                            </ErrorBoundary>
+                          </SidebarInset>
+                          <CommandPalette />
+                        </SidebarProvider>
+                      </BreadcrumbProvider>
+                    </ProtectedLayout>
+                  }
+                />
+              </Routes>
+            </Suspense>
+          </PresetProvider>
         </ProjectsProvider>
       </AuthProvider>
     </BrowserRouter>

@@ -74,6 +74,16 @@ import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import * as z from 'zod/v4'
 import { ServiceEnvPreview } from './ServiceEnvPreview'
+import { FrameworkSelector } from './FrameworkSelector'
+
+// Helper function to normalize path for consistent comparison
+// Normalizes '.', './', and empty strings to 'root'
+function normalizePath(path: string | undefined | null): string {
+  if (!path || path === '.' || path === './') {
+    return 'root'
+  }
+  return path
+}
 
 // Common service types
 const SERVICE_TYPES = [
@@ -110,6 +120,8 @@ const formSchema = z.object({
     })
   ),
   storageServices: z.array(z.number()),
+  dockerfilePath: z.string().optional(),
+  port: z.coerce.number().min(1).max(65535).optional(),
 })
 
 export type ProjectFormValues = z.infer<typeof formSchema>
@@ -189,6 +201,7 @@ export function ProjectConfigurator({
   const [newlyCreatedServiceIds, setNewlyCreatedServiceIds] = useState<
     number[]
   >([])
+  const [allowDirectoryOverride, setAllowDirectoryOverride] = useState(false)
 
   // Form initialization
   const form = useForm<ProjectFormValues>({
@@ -202,6 +215,8 @@ export function ProjectConfigurator({
       branch: defaultValues?.branch ?? repository?.default_branch ?? 'main',
       environmentVariables: defaultValues?.environmentVariables ?? [],
       storageServices: defaultValues?.storageServices ?? [],
+      dockerfilePath: defaultValues?.dockerfilePath ?? 'Dockerfile',
+      port: defaultValues?.port ?? 3000,
     },
   })
 
@@ -225,7 +240,11 @@ export function ProjectConfigurator({
   )
 
   // Fetch preset data if not provided
-  const { data: fetchedPresetData, isLoading: presetLoading } = useQuery({
+  const {
+    data: fetchedPresetData,
+    isLoading: presetLoading,
+    error: presetError,
+  } = useQuery({
     ...getRepositoryPresetLiveOptions({
       path: { repository_id: repository.id || 0 },
     }),
@@ -258,24 +277,15 @@ export function ProjectConfigurator({
       return null
     }
 
-    // If we have projects array, use the first one
-    if (
-      effectivePresetData.projects &&
-      effectivePresetData.projects.length > 0
-    ) {
-      const firstPreset = effectivePresetData.projects[0]
+    // New schema: use presets array
+    if (effectivePresetData.presets && effectivePresetData.presets.length > 0) {
+      const firstPreset = effectivePresetData.presets[0]
       const presetName = firstPreset.preset || 'custom'
-      const presetPath = firstPreset.path || 'root'
+      const presetPath = firstPreset.path || './'
+      const normalizedPath = normalizePath(presetPath)
       return {
-        value: `${presetName}::${presetPath}`,
-        rootDir: firstPreset.path ? `./${firstPreset.path}` : './',
-      }
-    }
-    // Otherwise if we have a root preset, use that
-    else if (effectivePresetData.root_preset) {
-      return {
-        value: `${effectivePresetData.root_preset}::root`,
-        rootDir: './',
+        value: `${presetName}::${normalizedPath}`,
+        rootDir: presetPath, // Keep original path for rootDirectory field
       }
     }
     // Fallback: use 'custom' as default
@@ -375,8 +385,12 @@ export function ProjectConfigurator({
         new Set([...(data.storageServices || []), ...newlyCreatedServiceIds])
       )
 
+      // Extract just the preset name from "preset::path" format for backend
+      const [presetName] = data.preset.split('::')
+
       const finalData = {
         ...data,
+        preset: presetName, // Use only the preset name, not the full "preset::path"
         storageServices: allServiceIds,
       }
 
@@ -392,7 +406,7 @@ export function ProjectConfigurator({
             main_branch: finalData.branch,
             repo_name: repository.name || '',
             repo_owner: repository.owner || '',
-            git_url: '',
+            git_url: repository.clone_url || repository.ssh_url || '',
             git_provider_connection_id: connectionId,
             project_type:
               finalData.preset === 'custom' ? 'static' : finalData.preset,
@@ -468,104 +482,57 @@ export function ProjectConfigurator({
             if (field.value === 'custom') return 'custom'
             if (!field.value) return ''
 
-            // Find matching project to get the path
-            const matchingProject = effectivePresetData?.projects?.find(
+            // Find matching preset to get the path (detected presets)
+            const matchingPreset = effectivePresetData?.presets?.find(
               (p: ProjectPresetResponse) => p.preset === field.value
             )
-            if (matchingProject) {
-              return `${matchingProject.preset}::${matchingProject.path || 'root'}`
+            if (matchingPreset) {
+              return `${matchingPreset.preset}::${matchingPreset.path || 'root'}`
             }
 
-            // Check if it matches root preset
-            if (effectivePresetData?.root_preset === field.value) {
-              return `${field.value}::root`
-            }
-
-            // Default fallback
-            return `${field.value}::root`
+            // If no match found in detected presets, return just the preset slug
+            // (This happens when selecting from "Browse all presets" mode)
+            return field.value
           }
 
           const selectValue = getSelectValue()
 
           return (
             <FormItem>
-              <FormLabel>Framework Preset</FormLabel>
-              {isPresetLoading ? (
-                <Skeleton className="h-10 w-full" />
-              ) : (
-                <Select
-                  value={selectValue}
-                  onValueChange={(value) => {
+              <FormControl>
+                <FrameworkSelector
+                  presetData={effectivePresetData}
+                  isLoading={isPresetLoading}
+                  error={presetError}
+                  selectedPreset={selectValue}
+                  onSelectPreset={(value) => {
                     if (value === 'custom') {
                       field.onChange('custom')
                       form.setValue('rootDirectory', './')
                     } else {
                       const [presetName, presetPath] = value.split('::')
-                      field.onChange(presetName)
+                      // Store the full preset key (preset::path) to distinguish between same preset at different paths
+                      field.onChange(value)
 
-                      if (presetPath && presetPath !== 'root') {
-                        form.setValue('rootDirectory', `./${presetPath}`)
+                      // Treat empty, '.', and 'root' as root directory
+                      if (
+                        presetPath &&
+                        presetPath !== 'root' &&
+                        presetPath !== '.' &&
+                        presetPath.trim() !== ''
+                      ) {
+                        // Remove leading ./ if present in the path
+                        const cleanPath = presetPath.startsWith('./')
+                          ? presetPath.slice(2)
+                          : presetPath
+                        form.setValue('rootDirectory', `./${cleanPath}`)
                       } else {
                         form.setValue('rootDirectory', './')
                       }
                     }
                   }}
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder="Select a framework">
-                      {(() => {
-                        const value = getSelectValue()
-                        if (!value || value === 'custom') return value
-                        const [presetName, presetPath] = value.split('::')
-                        return (
-                          <div className="flex items-center gap-2">
-                            <span>{presetName}</span>
-                            {presetPath && presetPath !== 'root' && (
-                              <span className="text-xs text-muted-foreground">
-                                ({presetPath})
-                              </span>
-                            )}
-                          </div>
-                        )
-                      })()}
-                    </SelectValue>
-                  </SelectTrigger>
-                  <SelectContent>
-                    {effectivePresetData?.projects?.map(
-                      (project: ProjectPresetResponse, index: number) => (
-                        <SelectItem
-                          key={`${index}-${project.preset}`}
-                          value={`${project.preset}::${project.path || 'root'}`}
-                        >
-                          <div className="flex flex-col">
-                            <span></span>
-                            <span className="text-xs text-muted-foreground">
-                              {project.path || './'}
-                            </span>
-                          </div>
-                        </SelectItem>
-                      )
-                    )}
-                    {effectivePresetData?.root_preset &&
-                      !effectivePresetData?.projects?.some(
-                        (p: ProjectPresetResponse) =>
-                          p.preset === effectivePresetData.root_preset
-                      ) && (
-                        <SelectItem
-                          value={`${effectivePresetData.root_preset}::root`}
-                        >
-                          <div className="flex flex-col">
-                            <span>{effectivePresetData.root_preset}</span>
-                            <span className="text-xs text-muted-foreground">
-                              ./
-                            </span>
-                          </div>
-                        </SelectItem>
-                      )}
-                    <SelectItem value="custom">Custom</SelectItem>
-                  </SelectContent>
-                </Select>
-              )}
+                />
+              </FormControl>
               <FormMessage />
             </FormItem>
           )
@@ -575,25 +542,70 @@ export function ProjectConfigurator({
       <FormField
         control={form.control}
         name="rootDirectory"
-        render={({ field }) => (
-          <FormItem>
-            <FormLabel>Root Directory</FormLabel>
-            <FormControl>
-              <Input
-                {...field}
-                placeholder="./"
-                readOnly={form.watch('preset') !== 'custom'}
-                className={form.watch('preset') !== 'custom' ? 'bg-muted' : ''}
-              />
-            </FormControl>
-            <p className="text-xs text-muted-foreground">
-              {form.watch('preset') !== 'custom'
-                ? 'Directory will be set based on the selected framework preset'
-                : 'Enter the root directory for your custom configuration'}
-            </p>
-            <FormMessage />
-          </FormItem>
-        )}
+        render={({ field }) => {
+          const currentPreset = form.watch('preset')
+          const isCustomPreset = currentPreset === 'custom'
+          const canEditDirectory = isCustomPreset || allowDirectoryOverride
+
+          return (
+            <FormItem>
+              <div className="flex items-center justify-between">
+                <FormLabel>Root Directory</FormLabel>
+                {!isCustomPreset && !allowDirectoryOverride && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setAllowDirectoryOverride(true)}
+                    className="h-auto py-1 px-2 text-xs"
+                  >
+                    Edit manually
+                  </Button>
+                )}
+                {!isCustomPreset && allowDirectoryOverride && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      setAllowDirectoryOverride(false)
+                      // Reset to preset-based directory if available
+                      const presetValue = form.getValues('preset')
+                      if (presetValue && presetValue !== 'custom') {
+                        const [, presetPath] = presetValue.split('::')
+                        if (presetPath && presetPath !== 'root') {
+                          const cleanPath = presetPath.startsWith('./')
+                            ? presetPath.slice(2)
+                            : presetPath
+                          form.setValue('rootDirectory', `./${cleanPath}`)
+                        } else {
+                          form.setValue('rootDirectory', './')
+                        }
+                      }
+                    }}
+                    className="h-auto py-1 px-2 text-xs"
+                  >
+                    Reset to preset
+                  </Button>
+                )}
+              </div>
+              <FormControl>
+                <Input
+                  {...field}
+                  placeholder="./"
+                  readOnly={!canEditDirectory}
+                  className={!canEditDirectory ? 'bg-muted' : ''}
+                />
+              </FormControl>
+              <p className="text-xs text-muted-foreground">
+                {canEditDirectory
+                  ? 'Enter the root directory for your configuration'
+                  : 'Directory will be set based on the selected framework preset'}
+              </p>
+              <FormMessage />
+            </FormItem>
+          )
+        }}
       />
 
       <FormField
@@ -613,6 +625,56 @@ export function ProjectConfigurator({
                 Automatically deploy when changes are pushed to the repository
               </p>
             </div>
+          </FormItem>
+        )}
+      />
+
+      {/* Docker Configuration - Only show for docker/dockerfile preset */}
+      {form.watch('preset')?.toLowerCase().includes('docker') && (
+        <>
+          <FormField
+            control={form.control}
+            name="dockerfilePath"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Dockerfile Path</FormLabel>
+                <FormControl>
+                  <Input
+                    {...field}
+                    placeholder="Dockerfile"
+                    value={field.value || 'Dockerfile'}
+                  />
+                </FormControl>
+                <p className="text-xs text-muted-foreground">
+                  Path to your Dockerfile relative to the root directory
+                </p>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        </>
+      )}
+
+      <FormField
+        control={form.control}
+        name="port"
+        render={({ field }) => (
+          <FormItem>
+            <FormLabel>Application Port</FormLabel>
+            <FormControl>
+              <Input
+                {...field}
+                type="number"
+                min="1"
+                max="65535"
+                placeholder="3000"
+                value={field.value || 3000}
+              />
+            </FormControl>
+            <p className="text-xs text-muted-foreground">
+              Port your application will listen on (e.g., 3000, 8080)
+            </p>
+            <FormMessage />
           </FormItem>
         )}
       />
@@ -933,6 +995,18 @@ export function ProjectConfigurator({
                 {formData.autoDeploy ? 'Enabled' : 'Disabled'}
               </span>
             </div>
+            {formData.dockerfilePath && (
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">Dockerfile:</span>
+                <span className="font-medium">{formData.dockerfilePath}</span>
+              </div>
+            )}
+            {formData.port && (
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">Port:</span>
+                <span className="font-medium">{formData.port}</span>
+              </div>
+            )}
           </CardContent>
         </Card>
 

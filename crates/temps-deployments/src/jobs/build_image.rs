@@ -179,35 +179,170 @@ impl BuildImageJob {
     }
 
     /// Generate Dockerfile from preset if it doesn't exist
-    async fn ensure_dockerfile(
+    /// Returns the build args from the preset (if any)
+    ///
+    /// # Arguments
+    /// * `context` - Workflow context for logging
+    /// * `build_context_dir` - The directory that will be used as Docker build context (where to generate/look for Dockerfile)
+    /// * `dockerfile_path` - Full path where Dockerfile should be generated
+    /// Generate framework-specific nixpacks.toml configuration
+    ///
+    /// This method detects the Node.js framework being used (Astro, Vite, Next.js, etc.)
+    /// and generates an optimized nixpacks.toml with framework-specific start commands.
+    /// Only generates the file if:
+    /// 1. package.json exists (Node.js project)
+    /// 2. No custom nixpacks.toml already exists
+    /// 3. Framework has specific configuration (not all frameworks need overrides)
+    async fn generate_framework_specific_nixpacks_config(
         &self,
         context: &WorkflowContext,
-        repo_dir: &PathBuf,
-        dockerfile_path: &PathBuf,
+        build_context_dir: &PathBuf,
     ) -> Result<(), WorkflowError> {
-        // If Dockerfile exists, we're done
-        if dockerfile_path.exists() {
+        let nixpacks_toml_path = build_context_dir.join("nixpacks.toml");
+        let package_json_path = build_context_dir.join("package.json");
+
+        // Skip if nixpacks.toml already exists (user provided)
+        if nixpacks_toml_path.exists() {
+            self.log(
+                context,
+                "ℹ️  Custom nixpacks.toml found, skipping framework detection".to_string(),
+            )
+            .await?;
             return Ok(());
         }
 
-        // If no preset is configured, we can't generate a Dockerfile
-        let preset_slug = self.preset.as_ref().ok_or_else(|| {
-            WorkflowError::JobExecutionFailed(
-                "Dockerfile not found and no preset configured to generate one".to_string(),
-            )
-        })?;
+        // Skip if not a Node.js project
+        if !package_json_path.exists() {
+            return Ok(());
+        }
+
+        // Detect framework
+        let framework = temps_presets::detect_node_framework(build_context_dir);
 
         self.log(
             context,
-            format!(
-                "📝 Dockerfile not found, generating from preset: {}",
-                preset_slug
-            ),
+            format!("🔍 Detected Node.js framework: {}", framework.name()),
         )
         .await?;
 
+        // Generate nixpacks.toml if framework has specific configuration
+        if let Some(config) = framework.nixpacks_config() {
+            fs::write(&nixpacks_toml_path, config).map_err(WorkflowError::IoError)?;
+
+            self.log(
+                context,
+                format!(
+                    "✅ Generated framework-specific nixpacks.toml for {}",
+                    framework.name()
+                ),
+            )
+            .await?;
+        } else {
+            self.log(
+                context,
+                format!(
+                    "ℹ️  {} uses default nixpacks configuration",
+                    framework.name()
+                ),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_dockerfile(
+        &self,
+        context: &WorkflowContext,
+        build_context_dir: &PathBuf,
+        dockerfile_path: &PathBuf,
+    ) -> Result<std::collections::HashMap<String, String>, WorkflowError> {
+        // If Dockerfile exists, we're done (no preset build args)
+        if dockerfile_path.exists() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Determine preset: either use provided slug or auto-detect
+        let preset_slug = if let Some(slug) = &self.preset {
+            // Use provided preset
+            self.log(
+                context,
+                format!("📝 Dockerfile not found, generating from preset: {}", slug),
+            )
+            .await?;
+            slug.clone()
+        } else {
+            // Auto-detect preset from project files
+            self.log(
+                context,
+                "🔍 No preset specified, auto-detecting project type...".to_string(),
+            )
+            .await?;
+
+            // Read directory to get list of files
+            let files: Vec<String> = fs::read_dir(build_context_dir)
+                .map_err(WorkflowError::IoError)?
+                .filter_map(|entry| {
+                    entry
+                        .ok()
+                        .and_then(|e| e.file_name().to_str().map(|s| s.to_string()))
+                })
+                .collect();
+
+            // Try to read package.json for more accurate detection
+            let package_json_path = build_context_dir.join("package.json");
+            let package_json_content = if package_json_path.exists() {
+                fs::read_to_string(&package_json_path).ok()
+            } else {
+                None
+            };
+
+            // Check for Create React App by looking for react-scripts in package.json
+            let detected_slug = if let Some(content) = &package_json_content {
+                if content.contains("\"react-scripts\"") {
+                    self.log(
+                        context,
+                        "✅ Detected project type: react-app (found react-scripts in package.json)"
+                            .to_string(),
+                    )
+                    .await?;
+                    "react-app".to_string()
+                } else {
+                    // Fall back to file-based detection
+                    let detected_preset = temps_presets::detect_preset_from_files(&files)
+                        .ok_or_else(|| {
+                            WorkflowError::JobExecutionFailed(
+                                format!("Could not auto-detect project type from files: {:?}. Please specify a preset explicitly.",
+                                files.iter().take(5).collect::<Vec<_>>())
+                            )
+                        })?;
+
+                    let slug = detected_preset.slug().to_string();
+                    self.log(context, format!("✅ Detected project type: {}", slug))
+                        .await?;
+                    slug
+                }
+            } else {
+                // No package.json, use file-based detection
+                let detected_preset = temps_presets::detect_preset_from_files(&files)
+                    .ok_or_else(|| {
+                        WorkflowError::JobExecutionFailed(
+                            format!("Could not auto-detect project type from files: {:?}. Please specify a preset explicitly.",
+                            files.iter().take(5).collect::<Vec<_>>())
+                        )
+                    })?;
+
+                let slug = detected_preset.slug().to_string();
+                self.log(context, format!("✅ Detected project type: {}", slug))
+                    .await?;
+                slug
+            };
+
+            detected_slug
+        };
+
         // Get the preset
-        let preset = temps_presets::get_preset_by_slug(preset_slug).ok_or_else(|| {
+        let preset = temps_presets::get_preset_by_slug(&preset_slug).ok_or_else(|| {
             WorkflowError::JobExecutionFailed(format!("Unknown preset: {}", preset_slug))
         })?;
 
@@ -220,30 +355,43 @@ impl BuildImageJob {
             .collect();
 
         // Generate Dockerfile content with build args
-        let dockerfile_content = preset.dockerfile(temps_presets::DockerfileConfig {
-            root_local_path: repo_dir,
-            local_path: repo_dir,
-            install_command: None,         // auto-detect
-            build_command: None,           // auto-detect
-            output_dir: None,              // auto-detect
-            build_vars: Some(&build_vars), // ARG directives for env vars
-            project_slug: "deployment",
-        });
+        // Use build_context_dir as both root and local path so preset detection works correctly
+        // TODO: Get use_buildkit from ImageBuilder configuration
+        let dockerfile_with_args = preset
+            .dockerfile(temps_presets::DockerfileConfig {
+                root_local_path: build_context_dir,
+                local_path: build_context_dir,
+                install_command: None,         // auto-detect
+                build_command: None,           // auto-detect
+                output_dir: None,              // auto-detect
+                build_vars: Some(&build_vars), // ARG directives for env vars
+                project_slug: "deployment",
+                use_buildkit: true, // Enable BuildKit for faster builds and caching
+            })
+            .await;
 
         // Write the Dockerfile
-        fs::write(dockerfile_path, dockerfile_content).map_err(WorkflowError::IoError)?;
+        fs::write(dockerfile_path, &dockerfile_with_args.content)
+            .map_err(WorkflowError::IoError)?;
 
         self.log(
             context,
             format!(
-                "✅ Generated Dockerfile at: {} with {} build args",
+                "✅ Generated Dockerfile at: {} ({} build args from preset)",
                 dockerfile_path.display(),
-                build_vars.len()
+                dockerfile_with_args.build_args.len()
             ),
         )
         .await?;
 
-        Ok(())
+        // If using nixpacks preset, detect framework and generate nixpacks.toml if needed
+        if preset_slug.starts_with("nixpacks") {
+            self.generate_framework_specific_nixpacks_config(context, build_context_dir)
+                .await?;
+        }
+
+        // Return the preset build args so the caller can merge them
+        Ok(dockerfile_with_args.build_args)
     }
 
     /// Build the container image with real-time logging
@@ -258,11 +406,18 @@ impl BuildImageJob {
         )
         .await?;
 
-        // Determine dockerfile path
-        let dockerfile_path = if let Some(ref dockerfile) = self.build_config.dockerfile_path {
-            repo_output.repo_dir.join(dockerfile)
+        // Determine build context first (needed for Dockerfile path)
+        let build_context = if let Some(ref context_path) = self.build_config.build_context {
+            repo_output.repo_dir.join(context_path)
         } else {
-            repo_output.repo_dir.join("Dockerfile")
+            repo_output.repo_dir.clone()
+        };
+
+        // Determine dockerfile path relative to build context
+        let dockerfile_path = if let Some(ref dockerfile) = self.build_config.dockerfile_path {
+            build_context.join(dockerfile)
+        } else {
+            build_context.join("Dockerfile")
         };
 
         self.log(
@@ -272,15 +427,26 @@ impl BuildImageJob {
         .await?;
 
         // Ensure Dockerfile exists (generate from preset if needed)
-        self.ensure_dockerfile(context, &repo_output.repo_dir, &dockerfile_path)
+        // This returns build args from the preset
+        let preset_build_args = self
+            .ensure_dockerfile(context, &build_context, &dockerfile_path)
             .await?;
 
-        // Determine build context
-        let build_context = if let Some(ref context_path) = self.build_config.build_context {
-            repo_output.repo_dir.join(context_path)
-        } else {
-            repo_output.repo_dir.clone()
-        };
+        // Merge preset build args with user-provided build args
+        // User-provided args take precedence
+        let user_arg_keys: std::collections::HashSet<String> = self
+            .build_config
+            .build_args
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        let mut build_args = self.build_config.build_args.clone();
+        for (key, value) in preset_build_args {
+            if !user_arg_keys.contains(&key) {
+                build_args.push((key, value));
+            }
+        }
 
         self.log(
             context,

@@ -10,7 +10,7 @@ async fn setup_test_db() -> TestDatabase {
 }
 
 async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
-    use temps_entities::types::ProjectType;
+    use temps_entities::preset::Preset;
     use uuid::Uuid;
 
     let unique_slug = format!("test-project-{}", Uuid::new_v4());
@@ -19,13 +19,7 @@ async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
         directory: Set("/test".to_string()),
         main_branch: Set("main".to_string()),
         slug: Set(unique_slug),
-        project_type: Set(ProjectType::Server),
-        automatic_deploy: Set(true),
-        is_web_app: Set(false),
-        performance_metrics_enabled: Set(false),
-        use_default_wildcard: Set(true),
-        is_public_repo: Set(false),
-        is_on_demand: Set(false),
+        preset: Set(Preset::NextJs),
         created_at: Set(chrono::Utc::now()),
         updated_at: Set(chrono::Utc::now()),
         ..Default::default()

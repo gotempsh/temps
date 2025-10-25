@@ -14,7 +14,12 @@ pub struct DownloadRepoJob {
     job_id: String,
     repo_owner: String,
     repo_name: String,
-    git_provider_connection_id: i32,
+    /// Git provider connection ID (optional - not needed for public repos)
+    git_provider_connection_id: Option<i32>,
+    /// Direct git URL for public repos or custom git servers
+    git_url: Option<String>,
+    /// Whether this is a public repository (no authentication needed)
+    is_public_repo: bool,
     branch_ref: Option<String>,
     tag_ref: Option<String>,
     commit_sha: Option<String>,
@@ -35,6 +40,8 @@ impl std::fmt::Debug for DownloadRepoJob {
                 "git_provider_connection_id",
                 &self.git_provider_connection_id,
             )
+            .field("git_url", &self.git_url)
+            .field("is_public_repo", &self.is_public_repo)
             .field("branch_ref", &self.branch_ref)
             .field("tag_ref", &self.tag_ref)
             .field("commit_sha", &self.commit_sha)
@@ -44,6 +51,7 @@ impl std::fmt::Debug for DownloadRepoJob {
 }
 
 impl DownloadRepoJob {
+    /// Create a new download job for a private repository (with git provider connection)
     pub fn new(
         job_id: String,
         repo_owner: String,
@@ -55,7 +63,34 @@ impl DownloadRepoJob {
             job_id,
             repo_owner,
             repo_name,
-            git_provider_connection_id,
+            git_provider_connection_id: Some(git_provider_connection_id),
+            git_url: None,
+            is_public_repo: false,
+            branch_ref: None,
+            tag_ref: None,
+            commit_sha: None,
+            project_directory: None,
+            git_provider_manager,
+            log_id: None,
+            log_service: None,
+        }
+    }
+
+    /// Create a new download job for a public repository (no authentication needed)
+    pub fn new_public(
+        job_id: String,
+        repo_owner: String,
+        repo_name: String,
+        git_url: String,
+        git_provider_manager: Arc<dyn GitProviderManagerTrait>,
+    ) -> Self {
+        Self {
+            job_id,
+            repo_owner,
+            repo_name,
+            git_provider_connection_id: None,
+            git_url: Some(git_url),
+            is_public_repo: true,
             branch_ref: None,
             tag_ref: None,
             commit_sha: None,
@@ -150,6 +185,51 @@ impl DownloadRepoJob {
         Ok(temp_dir)
     }
 
+    /// Clone a public repository using direct git clone (no authentication)
+    async fn clone_public_repository(
+        &self,
+        context: &WorkflowContext,
+        git_url: &str,
+        checkout_ref: &str,
+        repo_dir: &std::path::Path,
+    ) -> Result<(), WorkflowError> {
+        self.log(
+            context,
+            format!("🌍 Cloning public repository from: {}", git_url),
+        )
+        .await?;
+
+        // Use git clone command directly
+        let output = tokio::process::Command::new("git")
+            .arg("clone")
+            .arg("--depth=1")
+            .arg("--branch")
+            .arg(checkout_ref)
+            .arg(git_url)
+            .arg(repo_dir)
+            .output()
+            .await
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!("Failed to run git clone: {}", e))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorkflowError::JobExecutionFailed(format!(
+                "Failed to clone public repository: {}",
+                stderr
+            )));
+        }
+
+        self.log(
+            context,
+            "✅ Successfully cloned public repository".to_string(),
+        )
+        .await?;
+
+        Ok(())
+    }
+
     /// Download repository source code with real-time logging
     async fn download_repository(
         &self,
@@ -179,12 +259,32 @@ impl DownloadRepoJob {
         )
         .await?;
 
+        // Handle public repos differently - use direct git clone
+        if self.is_public_repo {
+            if let Some(ref git_url) = self.git_url {
+                self.clone_public_repository(context, git_url, &checkout_ref, &repo_dir)
+                    .await?;
+                return Ok(repo_dir);
+            } else {
+                return Err(WorkflowError::JobExecutionFailed(
+                    "Public repository requires git_url to be set".to_string(),
+                ));
+            }
+        }
+
+        // For private repos, verify we have a connection ID
+        let connection_id = self.git_provider_connection_id.ok_or_else(|| {
+            WorkflowError::JobExecutionFailed(
+                "Private repository requires git_provider_connection_id".to_string(),
+            )
+        })?;
+
         // Try download archive first (faster)
         let archive_path = temp_dir.join("source.tar.gz");
         match self
             .git_provider_manager
             .download_archive(
-                self.git_provider_connection_id,
+                connection_id,
                 &self.repo_owner,
                 &self.repo_name,
                 &checkout_ref,
@@ -259,7 +359,7 @@ impl DownloadRepoJob {
 
                 self.git_provider_manager
                     .clone_repository(
-                        self.git_provider_connection_id,
+                        connection_id,
                         &self.repo_owner,
                         &self.repo_name,
                         &repo_dir,
@@ -348,9 +448,18 @@ impl WorkflowTask for DownloadRepoJob {
                 "repo_name cannot be empty".to_string(),
             ));
         }
-        if self.git_provider_connection_id == 0 {
+
+        // For private repos, git_provider_connection_id is required
+        // For public repos, git_url is required
+        if !self.is_public_repo && self.git_provider_connection_id.is_none() {
             return Err(WorkflowError::JobValidationFailed(
-                "git_provider_connection_id must be provided".to_string(),
+                "git_provider_connection_id must be provided for private repositories".to_string(),
+            ));
+        }
+
+        if self.is_public_repo && self.git_url.is_none() {
+            return Err(WorkflowError::JobValidationFailed(
+                "git_url must be provided for public repositories".to_string(),
             ));
         }
 

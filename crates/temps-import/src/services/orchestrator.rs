@@ -180,10 +180,8 @@ impl ImportOrchestrator {
                     ImportServiceError::Validation(format!("Repository {} not found", repo_id))
                 })?;
 
-            let git_provider_conn_id = repository.git_provider_connection_id
-                .ok_or_else(|| ImportServiceError::Validation(
-                    format!("Repository {} does not have a git provider connection. Cannot import project without git provider connection.", repo_id)
-                ))?;
+            // Repository always has git_provider_connection_id now (no longer Optional)
+            let git_provider_conn_id = repository.git_provider_connection_id;
 
             let owner = repository.owner.clone();
             let name = repository.name.clone();
@@ -200,10 +198,11 @@ impl ImportOrchestrator {
                 .await
             {
                 Ok(preset_info) => {
-                    if let Some(root_preset) = preset_info.root_preset {
+                    // Find root preset (path == "./")
+                    if let Some(root_preset) = preset_info.presets.iter().find(|p| p.path == "./") {
                         info!(
                             "Detected preset '{}' for repository {}",
-                            root_preset, repo_id
+                            root_preset.preset, repo_id
                         );
 
                         // Update plan with preset information
@@ -222,13 +221,13 @@ impl ImportOrchestrator {
                         if let Some(ref mut build) = plan.deployment.build {
                             build
                                 .args
-                                .insert("DETECTED_PRESET".to_string(), root_preset.clone());
+                                .insert("DETECTED_PRESET".to_string(), root_preset.preset.clone());
                         }
 
                         // Add warning if Docker image will be replaced by build
                         plan.metadata.warnings.push(format!(
                             "Repository preset detected: {}. Consider using buildpack deployment instead of Docker image",
-                            root_preset
+                            root_preset.preset_label
                         ));
                     } else {
                         debug!("No preset detected for repository {}", repo_id);

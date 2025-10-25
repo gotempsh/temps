@@ -612,7 +612,7 @@ impl LoadBalancer {
     }
 
     #[allow(dead_code)]
-    fn is_page_visit(&self, upstream_response: &ResponseHeader, ctx: &ProxyContext) -> bool {
+    fn is_page_visit(&self, upstream_response: &ResponseHeader, _ctx: &ProxyContext) -> bool {
         let mut is_page_visit = upstream_response
             .headers
             .get("content-type")
@@ -624,11 +624,8 @@ impl LoadBalancer {
             })
             .unwrap_or(false);
 
-        if let Some(project) = &ctx.project {
-            if !project.is_web_app {
-                is_page_visit = true;
-            }
-        }
+        // Note: Removed is_web_app check - all projects are now preset-based
+        // Page visits are determined by URL patterns
 
         let status_code = upstream_response.status.as_u16();
         if status_code >= 400 {
@@ -645,8 +642,9 @@ impl LoadBalancer {
     ) -> Result<()> {
         let duration = ctx.start_time.elapsed();
         info!(
-            "[{}] {} {} - {}ms",
+            "[{}] {} {} {} - {}ms",
             ctx.method,
+            ctx.host,
             ctx.path,
             upstream_response.status.as_u16(),
             duration.as_millis()

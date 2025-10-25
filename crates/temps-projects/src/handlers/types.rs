@@ -10,6 +10,7 @@ use std::sync::Arc;
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
 use temps_core::AuditLogger;
+use temps_presets::preset_config_schema::PresetConfigSchema;
 
 pub struct AppState {
     pub project_service: Arc<ProjectService>,
@@ -134,6 +135,23 @@ pub struct CreateProjectRequest {
     pub directory: String,
     pub main_branch: String,
     pub preset: String,
+    /// Preset-specific configuration
+    ///
+    /// Different presets accept different configuration options:
+    /// - **Dockerfile preset**: Accepts `DockerfilePresetConfig` with `dockerfile_path` and `build_context`
+    /// - **Nixpacks preset**: Uses `nixpacks.toml` file for configuration (no params needed)
+    /// - **Static presets** (Vite, Next.js, etc.): Accept `StaticPresetConfig` with build commands and output dir
+    ///
+    /// Example for Dockerfile preset:
+    /// ```json
+    /// {
+    ///   "dockerfilePath": "docker/Dockerfile",
+    ///   "buildContext": "./api"
+    /// }
+    /// ```
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<PresetConfigSchema>)]
+    pub preset_config: Option<serde_json::Value>,
     pub output_dir: Option<String>,
     pub build_command: Option<String>,
     pub install_command: Option<String>,
@@ -150,6 +168,18 @@ pub struct CreateProjectRequest {
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
     pub is_on_demand: Option<bool>,
+    /// Port exposed by the container (fallback when image has no EXPOSE directive)
+    ///
+    /// Priority order for port resolution:
+    /// 1. Image EXPOSE directive (auto-detected from built image)
+    /// 2. Environment-level exposed_port (overrides this value per environment)
+    /// 3. This project-level exposed_port (fallback)
+    /// 4. Default: 3000
+    ///
+    /// Only set this if your image doesn't use EXPOSE directive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 8080)]
+    pub exposed_port: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -654,5 +684,26 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ListCustomDomainsResponse {
     pub domains: Vec<CustomDomainResponse>,
+    pub total: usize,
+}
+
+// Preset-related types
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct PresetResponse {
+    /// Unique identifier slug for the preset
+    pub slug: String,
+    /// Display name/label for the preset
+    pub label: String,
+    /// Icon URL for the preset
+    pub icon_url: String,
+    /// Project type (server or static)
+    pub project_type: String,
+    /// Description of what this preset does
+    pub description: String,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct ListPresetsResponse {
+    pub presets: Vec<PresetResponse>,
     pub total: usize,
 }

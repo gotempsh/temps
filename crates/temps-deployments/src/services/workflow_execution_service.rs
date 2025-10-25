@@ -29,7 +29,7 @@ pub struct WorkflowExecutionService {
     log_service: Arc<LogService>,
     cron_service: Arc<dyn CronConfigService>,
     config_service: Arc<temps_config::ConfigService>,
-    screenshot_service: Option<Arc<ScreenshotService>>,
+    screenshot_service: Arc<ScreenshotService>,
 }
 
 impl WorkflowExecutionService {
@@ -42,7 +42,7 @@ impl WorkflowExecutionService {
         log_service: Arc<LogService>,
         cron_service: Arc<dyn CronConfigService>,
         config_service: Arc<temps_config::ConfigService>,
-        screenshot_service: Option<Arc<ScreenshotService>>,
+        screenshot_service: Arc<ScreenshotService>,
     ) -> Self {
         Self {
             db,
@@ -100,12 +100,8 @@ impl WorkflowExecutionService {
             .with_max_parallel_jobs(3); // Allow parallel execution of configure_crons and take_screenshot
 
         // Add project metadata as workflow variables
-        if let Some(ref repo_owner) = project.repo_owner {
-            workflow_builder = workflow_builder.with_var("repo_owner", repo_owner)?;
-        }
-        if let Some(ref repo_name) = project.repo_name {
-            workflow_builder = workflow_builder.with_var("repo_name", repo_name)?;
-        }
+        workflow_builder = workflow_builder.with_var("repo_owner", &project.repo_owner)?;
+        workflow_builder = workflow_builder.with_var("repo_name", &project.repo_name)?;
 
         // Convert database job records to actual job instances
         // Create log paths for each job
@@ -409,10 +405,10 @@ impl WorkflowExecutionService {
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone());
 
-                // Pass preset if project has one
-                if let Some(ref preset) = project.preset {
-                    builder = builder.preset(preset.clone());
-                }
+                // Pass preset (always available since it's required)
+                // Convert preset enum to string for builder
+                let preset_str = format!("{:?}", project.preset).to_lowercase();
+                builder = builder.preset(preset_str);
 
                 // Add build args if present
                 if let Some(build_args_value) = config.get("build_args") {
@@ -422,6 +418,15 @@ impl WorkflowExecutionService {
                             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                             .collect();
                         builder = builder.build_args(build_args);
+                    }
+                }
+
+                // Add build context if present (for monorepo subdirectories)
+                if let Some(build_context_value) = config.get("build_context") {
+                    if let Some(build_context_str) = build_context_value.as_str() {
+                        if !build_context_str.is_empty() && build_context_str != "." {
+                            builder = builder.build_context(build_context_str.to_string());
+                        }
                     }
                 }
 
@@ -437,10 +442,11 @@ impl WorkflowExecutionService {
 
                 let port = config.get("port").and_then(|v| v.as_i64()).unwrap_or(3000) as u16;
 
-                // Get replicas from environment, fallback to config, then default to 1
+                // Get replicas from environment deployment_config, fallback to config, then default to 1
                 let replicas = environment
-                    .replicas
-                    .map(|r| r as u32)
+                    .deployment_config
+                    .as_ref()
+                    .map(|c| c.replicas as u32)
                     .or_else(|| {
                         config
                             .get("replicas")
@@ -566,12 +572,8 @@ impl WorkflowExecutionService {
             }
 
             "TakeScreenshotJob" => {
-                // Check if screenshot service is available
-                let screenshot_service = self.screenshot_service.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::JobCreationFailed(
-                        "Screenshot service is not available".to_string(),
-                    )
-                })?;
+                // Screenshot service is always available now
+                let screenshot_service = &self.screenshot_service;
 
                 let config = db_job.job_config.as_ref().ok_or_else(|| {
                     WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
@@ -1002,7 +1004,7 @@ mod tests {
     use sea_orm::{ActiveModelTrait, Set};
 
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::types::{JobStatus, ProjectType};
+    use temps_entities::{preset::Preset, types::JobStatus, upstream_config::UpstreamList};
 
     // Mock services for testing
     struct MockGitProvider;
@@ -1217,12 +1219,11 @@ mod tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            repo_owner: Set(Some("test-owner".to_string())),
-            repo_name: Set(Some("test-repo".to_string())),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
             git_provider_connection_id: Set(Some(1)),
-            preset: Set(Some("nextjs".to_string())),
+            preset: Set(Preset::NextJs),
             directory: Set("/".to_string()),
-            project_type: Set(ProjectType::Server),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -1236,7 +1237,7 @@ mod tests {
             name: Set("Production".to_string()),
             slug: Set("production".to_string()),
             host: Set("test.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             subdomain: Set("test.example.com".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -1286,7 +1287,7 @@ mod tests {
         let cron_service =
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
-        let screenshot_service = None;
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
         let _service = WorkflowExecutionService::new(
             db.clone(),
             git_provider,
@@ -1317,7 +1318,7 @@ mod tests {
         let cron_service =
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
-        let screenshot_service = None;
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
         let service = WorkflowExecutionService::new(
             db.clone(),
             git_provider,
@@ -1413,7 +1414,7 @@ mod tests {
         let cron_service =
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
-        let screenshot_service = None;
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
         let service = WorkflowExecutionService::new(
             db.clone(),
             git_provider,

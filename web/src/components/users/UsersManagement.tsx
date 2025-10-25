@@ -349,8 +349,9 @@ export function UsersManagement({
                           <SelectTrigger>
                             <SelectValue placeholder="Select a role">
                               {field.value &&
-                                availableRoles.find((r) => r.value === field.value)
-                                  ?.label}
+                                availableRoles.find(
+                                  (r) => r.value === field.value
+                                )?.label}
                             </SelectValue>
                           </SelectTrigger>
                         </FormControl>

@@ -288,22 +288,18 @@ impl CustomDomainService {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_entities::{environments, projects};
-
+    use temps_entities::{environments, projects, upstream_config::UpstreamList};
+    use temps_presets::PresetType;
     async fn setup_test_data(db: &Arc<sea_orm::DatabaseConnection>) -> (i32, i32) {
         // Create a test project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            repo_name: Set(Some("test-repo".to_string())),
-            repo_owner: Set(Some("test-owner".to_string())),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             directory: Set("/".to_string()),
             main_branch: Set("main".to_string()),
-            preset: Set(Some("static".to_string())),
-            automatic_deploy: Set(false),
-            project_type: Set(temps_entities::types::ProjectType::Static),
-            use_default_wildcard: Set(true),
-            is_public_repo: Set(false),
+            preset: Set(PresetType::Nixpacks),
             ..Default::default()
         };
         let project = project.insert(db.as_ref()).await.unwrap();
@@ -315,8 +311,7 @@ mod tests {
             slug: Set("production".to_string()),
             subdomain: Set("test-project".to_string()),
             host: Set("test-project.temps.dev".to_string()),
-            upstreams: Set(serde_json::json!([])),
-            use_default_wildcard: Set(true),
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         };
         let environment = environment.insert(db.as_ref()).await.unwrap();

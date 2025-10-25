@@ -4,6 +4,9 @@ use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
+use super::deployment_config::DeploymentConfig;
+use super::upstream_config::UpstreamList;
+
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "environments")]
 pub struct Model {
@@ -14,20 +17,31 @@ pub struct Model {
     pub subdomain: String,
     pub last_deployment: Option<DBDateTime>,
     pub host: String,
-    pub upstreams: Json,
+    pub upstreams: UpstreamList,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
     pub project_id: i32,
     pub current_deployment_id: Option<i32>,
-    pub cpu_request: Option<i32>,
-    pub cpu_limit: Option<i32>,
-    pub memory_request: Option<i32>,
-    pub memory_limit: Option<i32>,
     pub branch: Option<String>,
-    pub replicas: Option<i32>,
     pub deleted_at: Option<DBDateTime>,
-    pub use_default_wildcard: bool,
-    pub custom_domain: Option<String>,
+    /// Deployment configuration (CPU, memory, port, analytics, auto-deploy settings)
+    /// These override project-level defaults for this specific environment
+    pub deployment_config: Option<DeploymentConfig>,
+}
+
+impl Model {
+    /// Get the effective deployment configuration by merging project and environment configs
+    ///
+    /// The project configuration serves as defaults, and the environment configuration
+    /// overrides specific values. This allows setting project-wide defaults with
+    /// environment-specific overrides.
+    pub fn get_effective_deployment_config(
+        &self,
+        project_config: &DeploymentConfig,
+    ) -> DeploymentConfig {
+        let env_config = self.deployment_config.clone().unwrap_or_default();
+        project_config.merge(&env_config)
+    }
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

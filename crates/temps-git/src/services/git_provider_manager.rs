@@ -35,6 +35,7 @@ pub struct ProjectPresetDomain {
     pub path: String,
     pub preset: String,
     pub preset_label: String,
+    pub exposed_port: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,8 +43,7 @@ pub struct RepositoryPresetDomain {
     pub repository_id: i32,
     pub owner: String,
     pub name: String,
-    pub root_preset: Option<String>,
-    pub projects: Vec<ProjectPresetDomain>,
+    pub presets: Vec<ProjectPresetDomain>,
     pub calculated_at: UtcDateTime,
 }
 
@@ -1494,7 +1494,7 @@ impl GitProviderManager {
             } else {
                 // New repository - prepare for bulk insert
                 let new_repo = repositories::ActiveModel {
-                    git_provider_connection_id: Set(Some(connection_id)),
+                    git_provider_connection_id: Set(connection_id),
                     owner: Set(repo.owner.clone()),
                     name: Set(repo.name.clone()),
                     full_name: Set(repo.full_name.clone()),
@@ -1572,9 +1572,10 @@ impl GitProviderManager {
     pub async fn calculate_and_store_preset(
         &self,
         repo_id: i32,
-        connection_id: i32,
+        _connection_id: i32,
     ) -> Result<(), GitProviderManagerError> {
-        let repo = repositories::Entity::find_by_id(repo_id)
+        // Verify repository exists
+        let _ = repositories::Entity::find_by_id(repo_id)
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| {
@@ -1584,34 +1585,12 @@ impl GitProviderManager {
                 ))
             })?;
 
-        let connection = self.get_connection(connection_id).await?;
-        let provider_service = self.get_provider_service(connection.provider_id).await?;
-
-        // Decrypt access token
-        let access_token = if let Some(ref encrypted) = connection.access_token {
-            self.decrypt_string(encrypted).await?
-        } else {
-            return Err(GitProviderManagerError::InvalidConfiguration(
-                "No access token found".to_string(),
-            ));
-        };
-
-        // Calculate preset
-        let preset = self
-            .calculate_repository_preset(
-                &provider_service,
-                &access_token,
-                &repo.owner,
-                &repo.name,
-                &repo.default_branch,
+        // Calculate preset (this will automatically cache it in the database)
+        let _ = self
+            .calculate_repository_preset_live(
+                repo_id, None, // Use default branch
             )
-            .await;
-
-        // Update repository with preset
-        let mut active_model: repositories::ActiveModel = repo.into();
-        active_model.preset = Set(preset);
-        active_model.framework_last_updated_at = Set(Some(chrono::Utc::now()));
-        active_model.update(self.db.as_ref()).await?;
+            .await?;
 
         Ok(())
     }
@@ -2167,33 +2146,6 @@ impl GitProviderManager {
         Ok(data.clone())
     }
 
-    /// Calculate the preset for a repository by analyzing its files
-    async fn calculate_repository_preset(
-        &self,
-        provider_service: &Arc<dyn GitProviderService>,
-        access_token: &str,
-        owner: &str,
-        repo: &str,
-        branch: &str,
-    ) -> Option<String> {
-        use temps_presets::detect_preset_from_files;
-
-        // Try to get the repository tree to detect project type
-        match self
-            .get_repository_files(provider_service, access_token, owner, repo, branch)
-            .await
-        {
-            Ok(files) => {
-                // Use the preset detection logic
-                detect_preset_from_files(&files).map(|preset| preset.slug())
-            }
-            Err(e) => {
-                tracing::warn!("Failed to detect preset for {}/{}: {}", owner, repo, e);
-                None
-            }
-        }
-    }
-
     /// Get repository files for preset detection
     async fn get_repository_files(
         &self,
@@ -2329,7 +2281,7 @@ impl GitProviderManager {
         connection_id: i32,
         owner: &str,
         repo: &str,
-    ) -> Result<Option<String>, GitProviderManagerError> {
+    ) -> Result<Option<serde_json::Value>, GitProviderManagerError> {
         let repository = repositories::Entity::find()
             .filter(repositories::Column::GitProviderConnectionId.eq(connection_id))
             .filter(repositories::Column::Owner.eq(owner))
@@ -2357,12 +2309,8 @@ impl GitProviderManager {
                 ))
             })?;
 
-        // Check if repository has a git provider connection
-        let connection_id = repository.git_provider_connection_id.ok_or_else(|| {
-            GitProviderManagerError::InvalidConfiguration(
-                "Repository is not associated with a git provider connection".to_string(),
-            )
-        })?;
+        // Repository always has a git provider connection (required field)
+        let connection_id = repository.git_provider_connection_id;
 
         // Get the git provider connection
         let connection = self.get_connection(connection_id).await?;
@@ -2392,23 +2340,38 @@ impl GitProviderManager {
             .await?;
 
         // Detect presets in root and subdirectories
-        let (root_preset, projects) = self.detect_presets_in_directories(&files).await;
+        let presets = self.detect_presets_in_directories(&files).await;
+
+        // Cache presets in database as JSON
+        let preset_json = if presets.is_empty() {
+            None
+        } else {
+            Some(json!(presets
+                .iter()
+                .map(|p| json!({
+                    "path": p.path,
+                    "preset": p.preset,
+                    "preset_label": p.preset_label,
+                }))
+                .collect::<Vec<_>>()))
+        };
+
+        // Update repository with cached presets
+        let mut repo_update: repositories::ActiveModel = repository.clone().into();
+        repo_update.preset = Set(preset_json.clone());
+        repo_update.update(self.db.as_ref()).await?;
 
         Ok(RepositoryPresetDomain {
             repository_id,
             owner: repository.owner,
             name: repository.name,
-            root_preset,
-            projects,
+            presets,
             calculated_at: chrono::Utc::now(),
         })
     }
 
     /// Detect presets in directories with proper grouping and filtering
-    async fn detect_presets_in_directories(
-        &self,
-        files: &[String],
-    ) -> (Option<String>, Vec<ProjectPresetDomain>) {
+    async fn detect_presets_in_directories(&self, files: &[String]) -> Vec<ProjectPresetDomain> {
         use std::collections::HashMap;
 
         // Group files by directory
@@ -2426,8 +2389,7 @@ impl GitProviderManager {
                 .push(path.clone());
         }
 
-        let mut root_preset = None;
-        let mut projects = Vec::new();
+        let mut presets = Vec::new();
 
         // Check each directory for presets
         for (dir, files) in &directory_files {
@@ -2440,24 +2402,34 @@ impl GitProviderManager {
             let preset = self.detect_preset_from_directory_files(files);
 
             if let Some(preset) = preset {
-                if dir.is_empty() {
-                    // Root directory preset
-                    root_preset = Some(preset.slug);
+                // Include both root and subdirectory presets in the same array
+                // Use relative paths: "./" for root, subdirectory name for others
+                let path = if dir.is_empty() {
+                    "./".to_string() // Root directory (relative)
                 } else {
-                    // Subdirectory preset
-                    projects.push(ProjectPresetDomain {
-                        path: dir.clone(),
-                        preset: preset.slug,
-                        preset_label: preset.label,
-                    });
-                }
+                    dir.clone()
+                };
+
+                // Parse preset slug to get exposed port
+                let exposed_port = preset
+                    .slug
+                    .parse::<temps_entities::preset::Preset>()
+                    .ok()
+                    .and_then(|p| p.exposed_port());
+
+                presets.push(ProjectPresetDomain {
+                    path,
+                    preset: preset.slug,
+                    preset_label: preset.label,
+                    exposed_port,
+                });
             }
         }
 
-        // Sort projects by path for consistent output
-        projects.sort_by(|a, b| a.path.cmp(&b.path));
+        // Sort presets by path for consistent output (root "/" comes first)
+        presets.sort_by(|a, b| a.path.cmp(&b.path));
 
-        (root_preset, projects)
+        presets
     }
 
     /// Detect preset from a specific directory's files

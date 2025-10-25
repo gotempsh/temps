@@ -1,8 +1,10 @@
-use super::{PackageManager, Preset, ProjectType};
+use super::{DockerfileWithArgs, PackageManager, Preset, ProjectType};
+use async_trait::async_trait;
 use std::path::Path;
 
 pub struct Vite;
 
+#[async_trait]
 impl Preset for Vite {
     fn slug(&self) -> String {
         "vite".to_string()
@@ -17,23 +19,30 @@ impl Preset for Vite {
     }
 
     fn icon_url(&self) -> String {
-        "https://example.com/vite-icon.png".to_string()
+        "/presets/vite.svg".to_string()
     }
 
-    fn dockerfile(&self, config: super::DockerfileConfig) -> String {
+    async fn dockerfile(&self, config: super::DockerfileConfig<'_>) -> DockerfileWithArgs {
         let package_manager = PackageManager::detect(config.local_path);
         let install_cmd = config.install_command.unwrap_or(package_manager.install_command());
         let build_cmd = config.build_command.unwrap_or(package_manager.build_command());
         let output = config.output_dir.unwrap_or("dist");
 
+        // Use multi-stage build without BuildKit-specific --mount syntax
         let mut dockerfile = format!(
             r#"FROM {} as builder
 WORKDIR /app
+
+# Copy package files
+COPY package.json package-lock.json* yarn.lock* pnpm-lock.yaml* bun.lockb* ./
+
+# Install dependencies
+RUN {}
+
+# Copy source code
 COPY . .
-RUN --mount=type=cache,target=/app/node_modules,id=node_modules_{} {}
 "#,
             package_manager.base_image(),
-            config.project_slug,
             install_cmd
         );
 
@@ -46,21 +55,25 @@ RUN --mount=type=cache,target=/app/node_modules,id=node_modules_{} {}
 
         dockerfile.push_str(&format!(
             r#"
+# Build application
 RUN {}
 
+# Production stage with nginx
 FROM nginx:alpine
 COPY --from=builder /app/{} /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
 "#,
             build_cmd, output
         ));
 
-        dockerfile
+        DockerfileWithArgs::new(dockerfile)
     }
 
-    fn dockerfile_with_build_dir(&self, local_path: &Path) -> String {
+    async fn dockerfile_with_build_dir(&self, local_path: &Path) -> DockerfileWithArgs {
         let pkg_manager = PackageManager::detect(local_path);
 
-        format!(
+        let content = format!(
             r#"
 FROM {}
 
@@ -84,7 +97,8 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
                 PackageManager::Npm => "npm install -g serve",
                 PackageManager::Pnpm => "npm install -g serve",
             }
-        )
+        );
+        DockerfileWithArgs::new(content)
     }
 
     fn install_command(&self, local_path: &Path) -> String {

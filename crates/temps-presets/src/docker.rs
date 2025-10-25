@@ -1,9 +1,11 @@
-use super::{PackageManager, Preset, ProjectType};
+use super::{DockerfileWithArgs, PackageManager, Preset, ProjectType};
+use async_trait::async_trait;
 use std::fmt;
 use std::path::Path;
 
 pub struct DockerfilePreset;
 
+#[async_trait]
 impl Preset for DockerfilePreset {
     fn slug(&self) -> String {
         "dockerfile".to_string()
@@ -18,10 +20,10 @@ impl Preset for DockerfilePreset {
     }
 
     fn icon_url(&self) -> String {
-        "https://example.com/docker-icon.png".to_string()
+        "/presets/docker.svg".to_string()
     }
 
-    fn dockerfile(&self, config: super::DockerfileConfig) -> String {
+    async fn dockerfile(&self, config: super::DockerfileConfig<'_>) -> DockerfileWithArgs {
         // Read the existing Dockerfile content
         let dockerfile_path = config.local_path.join("Dockerfile");
         let mut dockerfile = std::fs::read_to_string(&dockerfile_path)
@@ -44,14 +46,15 @@ impl Preset for DockerfilePreset {
             }
         }
 
-        dockerfile
+        DockerfileWithArgs::new(dockerfile)
     }
 
-    fn dockerfile_with_build_dir(&self, local_path: &Path) -> String {
+    async fn dockerfile_with_build_dir(&self, local_path: &Path) -> DockerfileWithArgs {
         // For projects with their own Dockerfile, we'll use it directly
         let dockerfile_path = local_path.join("Dockerfile");
-        std::fs::read_to_string(&dockerfile_path)
-            .unwrap_or_else(|_| "# No Dockerfile found".to_string())
+        let content = std::fs::read_to_string(&dockerfile_path)
+            .unwrap_or_else(|_| "# No Dockerfile found".to_string());
+        DockerfileWithArgs::new(content)
     }
 
     fn install_command(&self, local_path: &Path) -> String {

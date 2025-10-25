@@ -315,8 +315,10 @@ export function ProvidersManagement() {
                 <CardContent>
                   <p className="text-sm text-muted-foreground truncate">
                     {provider.provider_type === 'email'
-                      ? typedProvider.config?.from_address || 'No address configured'
-                      : typedProvider.config?.webhook_url || 'No webhook configured'}
+                      ? typedProvider.config?.from_address ||
+                        'No address configured'
+                      : typedProvider.config?.webhook_url ||
+                        'No webhook configured'}
                   </p>
                 </CardContent>
               </Card>

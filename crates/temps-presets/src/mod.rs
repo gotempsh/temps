@@ -1,23 +1,40 @@
 use std::{fmt, path::Path};
+use async_trait::async_trait;
 
-mod custom;
 mod docker;
 mod docusaurus;
 mod nextjs;
+mod nixpacks_preset;
 mod react_app;
 mod rsbuild;
 mod vite;
 mod build_system;
 mod docker_custom;
+mod preset_config;
+mod framework_detector;
+
+// Preset configuration schemas
+// Source abstraction for file access
+pub mod source;
+pub mod preset_config_schema;
+
+// New preset provider system
+pub mod preset_provider;
+pub mod providers;
+
+// Re-export Preset enum from temps-entities
+pub use temps_entities::preset::Preset as PresetType;
 use build_system::BuildSystem;
-pub use custom::CustomPreset;
 use docusaurus::Docusaurus;
 use docker::DockerfilePreset;
 pub use nextjs::NextJs;
+pub use nixpacks_preset::{NixpacksPreset, NixpacksProvider};
 pub use react_app::CreateReactApp;
 use rsbuild::Rsbuild;
 pub use vite::Vite;
 pub use build_system::MonorepoTool;
+pub use preset_config::PresetConfig;
+pub use framework_detector::{detect_node_framework, NodeFramework};
 
 #[derive(Debug, Clone, Copy)]
 pub enum ProjectType {
@@ -93,14 +110,107 @@ pub struct DockerfileConfig<'a> {
     pub output_dir: Option<&'a str>,
     pub build_vars: Option<&'a Vec<String>>,
     pub project_slug: &'a str,
+    /// Whether BuildKit is available for use
+    /// If true, Dockerfiles can use --mount syntax for caching
+    /// If false, Dockerfiles must be compatible with standard Docker (default: false)
+    pub use_buildkit: bool,
 }
 
+impl<'a> DockerfileConfig<'a> {
+    /// Create a new DockerfileConfig with default values (BuildKit disabled)
+    pub fn new(
+        root_local_path: &'a Path,
+        local_path: &'a Path,
+        project_slug: &'a str,
+    ) -> Self {
+        Self {
+            root_local_path,
+            local_path,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug,
+            use_buildkit: false, // Default to false for compatibility
+        }
+    }
+
+    /// Enable BuildKit support (allows --mount syntax in Dockerfiles)
+    pub fn with_buildkit(mut self, enabled: bool) -> Self {
+        self.use_buildkit = enabled;
+        self
+    }
+
+    /// Set install command
+    pub fn with_install_command(mut self, cmd: &'a str) -> Self {
+        self.install_command = Some(cmd);
+        self
+    }
+
+    /// Set build command
+    pub fn with_build_command(mut self, cmd: &'a str) -> Self {
+        self.build_command = Some(cmd);
+        self
+    }
+
+    /// Set output directory
+    pub fn with_output_dir(mut self, dir: &'a str) -> Self {
+        self.output_dir = Some(dir);
+        self
+    }
+
+    /// Set build variables
+    pub fn with_build_vars(mut self, vars: &'a Vec<String>) -> Self {
+        self.build_vars = Some(vars);
+        self
+    }
+}
+
+/// Dockerfile content along with build arguments
+#[derive(Debug, Clone)]
+pub struct DockerfileWithArgs {
+    /// The Dockerfile content
+    pub content: String,
+    /// Build arguments to pass to `docker build --build-arg KEY=VALUE`
+    /// These are key-value pairs that will be available as ARG in the Dockerfile
+    pub build_args: std::collections::HashMap<String, String>,
+}
+
+impl DockerfileWithArgs {
+    /// Create a new DockerfileWithArgs with just content (no build args)
+    pub fn new(content: String) -> Self {
+        Self {
+            content,
+            build_args: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Create a new DockerfileWithArgs with content and build args
+    pub fn with_args(content: String, build_args: std::collections::HashMap<String, String>) -> Self {
+        Self {
+            content,
+            build_args,
+        }
+    }
+
+    /// Add a build argument
+    pub fn add_arg(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.build_args.insert(key.into(), value.into());
+        self
+    }
+}
+
+#[async_trait]
 pub trait Preset: fmt::Display + Send + Sync {
     fn project_type(&self) -> ProjectType;
     fn label(&self) -> String;
     fn icon_url(&self) -> String;
-    fn dockerfile(&self, config: DockerfileConfig) -> String;
-    fn dockerfile_with_build_dir(&self, local_path: &Path) -> String;
+    fn description(&self) -> String {
+        // Default implementation - presets can override
+        format!("Optimized for {} applications", self.label())
+    }
+    async fn dockerfile(&self, config: DockerfileConfig<'_>) -> DockerfileWithArgs;
+    async fn dockerfile_with_build_dir(&self, local_path: &Path) -> DockerfileWithArgs;
     fn install_command(&self, local_path: &Path) -> String {
         let build_system = BuildSystem::detect(local_path);
         build_system.get_install_command()
@@ -122,6 +232,21 @@ pub fn all_presets() -> Vec<Box<dyn Preset>> {
         Box::new(Docusaurus),
         Box::new(DockerfilePreset),
         Box::new(docker_custom::DockerCustomPreset),
+        // Nixpacks auto-detect
+        Box::new(NixpacksPreset::auto()),
+        // Nixpacks provider-specific variants
+        Box::new(NixpacksPreset::new(NixpacksProvider::Node)),
+        Box::new(NixpacksPreset::new(NixpacksProvider::Python)),
+        Box::new(NixpacksPreset::new(NixpacksProvider::Rust)),
+        Box::new(NixpacksPreset::new(NixpacksProvider::Go)),
+        Box::new(NixpacksPreset::new(NixpacksProvider::Java)),
+        Box::new(NixpacksPreset::new(NixpacksProvider::Php)),
+        Box::new(NixpacksPreset::new(NixpacksProvider::Ruby)),
+        Box::new(NixpacksPreset::new(NixpacksProvider::Deno)),
+        Box::new(NixpacksPreset::new(NixpacksProvider::Elixir)),
+        Box::new(NixpacksPreset::new(NixpacksProvider::CSharp)),
+        Box::new(NixpacksPreset::new(NixpacksProvider::Dart)),
+        Box::new(NixpacksPreset::new(NixpacksProvider::Static)),
     ]
 }
 
@@ -129,32 +254,6 @@ pub fn get_preset_by_slug(slug: &str) -> Option<Box<dyn Preset>> {
     all_presets()
         .into_iter()
         .find(|preset| preset.slug() == slug)
-}
-
-/// Configuration for creating a custom preset
-pub struct CreateCustomPresetConfig {
-    pub label: String,
-    pub icon_url: String,
-    pub project_type: ProjectType,
-    pub dockerfile: String,
-    pub slug: String,
-    pub install_command: String,
-    pub build_command: String,
-    pub dockerfile_with_build_dir: String,
-}
-
-/// Create a custom preset with the given configuration
-pub fn create_custom_preset(config: CreateCustomPresetConfig) -> Box<dyn Preset> {
-    Box::new(CustomPreset::new(custom::CustomPresetConfig {
-        label: config.label,
-        icon_url: config.icon_url,
-        project_type: config.project_type,
-        dockerfile: config.dockerfile,
-        dockerfile_with_build_dir: config.dockerfile_with_build_dir,
-        slug: config.slug,
-        install_command: config.install_command,
-        build_command: config.build_command,
-    }))
 }
 
 pub fn detect_preset_from_files(files: &[String]) -> Option<Box<dyn Preset>> {
@@ -197,82 +296,7 @@ pub fn detect_preset_from_files(files: &[String]) -> Option<Box<dyn Preset>> {
         return Some(Box::new(Rsbuild));
     }
 
-    Some(create_custom_preset(CreateCustomPresetConfig {
-        label: "Custom".to_string(),
-        icon_url: "".to_string(),
-        project_type: ProjectType::Server,
-        dockerfile: "".to_string(),
-        slug: "custom".to_string(),
-        install_command: "".to_string(),
-        build_command: "".to_string(),
-        dockerfile_with_build_dir: "".to_string(),
-    }))
-}
-
-// Add this function to register the new docker_custom preset
-pub fn register_docker_custom_preset() -> custom::CustomPreset {
-    custom::CustomPreset::new(custom::CustomPresetConfig {
-        label: "Docker Custom".to_string(),
-        icon_url: "/images/presets/docker.svg".to_string(), // Adjust icon path as needed
-        project_type: ProjectType::Server,
-        slug: "docker_custom".to_string(),
-        install_command: "{{INSTALL_COMMAND}}".to_string(),
-        build_command: "{{BUILD_COMMAND}}".to_string(),
-        dockerfile: r#"FROM alpine:latest
-
-ARG PROJECT_SLUG
-ARG INSTALL_COMMAND
-ARG BUILD_COMMAND
-
-# Install needed packages
-RUN apk add --no-cache nodejs npm git curl
-
-# Set up working directory
-WORKDIR /app
-
-# Copy project files
-COPY . .
-
-# Run install and build commands
-RUN sh -c "$INSTALL_COMMAND"
-RUN sh -c "$BUILD_COMMAND"
-
-# Use a lightweight web server
-RUN apk add --no-cache nginx
-
-# Set up nginx
-COPY nginx.conf /etc/nginx/nginx.conf
-
-EXPOSE 80
-
-CMD ["nginx", "-g", "daemon off;"]"#.to_string(),
-        dockerfile_with_build_dir: r#"FROM alpine:latest
-
-ARG PROJECT_SLUG
-ARG INSTALL_COMMAND
-ARG BUILD_COMMAND
-
-# Install needed packages
-RUN apk add --no-cache nodejs npm git curl
-
-# Set up working directory
-WORKDIR /app
-
-# Copy project files
-COPY . .
-
-# Run install and build commands
-RUN sh -c "$INSTALL_COMMAND"
-RUN sh -c "$BUILD_COMMAND"
-
-# Use a lightweight web server
-RUN apk add --no-cache nginx
-
-# Set up nginx
-COPY nginx.conf /etc/nginx/nginx.conf
-
-EXPOSE 80
-
-CMD ["nginx", "-g", "daemon off;"]"#.to_string(),
-    })
+    // Fall back to Nixpacks for auto-detection (will be checked at generation time)
+    // This allows zero-config deployment for Python, Java, .NET, Go, etc.
+    Some(Box::new(NixpacksPreset::auto()))
 }

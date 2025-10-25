@@ -29,12 +29,13 @@ import {
   FormDescription,
   FormField,
   FormItem,
+  FormLabel,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
 import { useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { SubmitHandler, useForm } from 'react-hook-form'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { z } from 'zod'
@@ -46,6 +47,8 @@ interface GeneralSettingsProps {
 
 const projectSchema = z.object({
   name: z.string().min(1, 'Project name is required'),
+  port: z.coerce.number().min(1).max(65535).optional(),
+  dockerfilePath: z.string().optional(),
 })
 
 type ProjectFormValues = z.infer<typeof projectSchema>
@@ -63,6 +66,8 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
     resolver: zodResolver(projectSchema),
     defaultValues: {
       name: project?.slug || '',
+      port: project?.exposed_port ? Number(project.exposed_port) : undefined,
+      dockerfilePath: 'Dockerfile',
     },
   })
 
@@ -71,8 +76,11 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
 
     await toast.promise(
       updateProjectSettings.mutateAsync({
-        path: { project_id: project.slug },
-        body: { slug: values.name },
+        path: { project_id: project.id! as number },
+        body: {
+          slug: values.name,
+          exposed_port: values.port,
+        },
       }),
       {
         loading: 'Updating project...',
@@ -94,7 +102,9 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
     setIsDeleteDialogOpen(false)
     try {
       await toast.promise(
-        deleteProjectMutationM.mutateAsync({ path: { id: project?.id! } }),
+        deleteProjectMutationM.mutateAsync({
+          path: { id: project?.id! as number },
+        }),
         {
           loading: 'Deleting project...',
           success: (_) => {
@@ -111,7 +121,11 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   return (
     <div className="space-y-6">
       <Form {...projectForm}>
-        <form onSubmit={projectForm.handleSubmit(handleSaveProject)}>
+        <form
+          onSubmit={projectForm.handleSubmit(
+            handleSaveProject as SubmitHandler<ProjectFormValues>
+          )}
+        >
           <Card className="bg-background text-foreground">
             <CardHeader>
               <CardTitle>Project slug</CardTitle>
@@ -120,7 +134,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                 URL of your Deployments.
               </CardDescription>
             </CardHeader>
-            <CardContent>
+            <CardContent className="space-y-6">
               <FormField
                 control={projectForm.control}
                 name="name"
@@ -135,6 +149,53 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                   </FormItem>
                 )}
               />
+
+              <FormField
+                control={projectForm.control}
+                name="port"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Exposed Port (Override)</FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        type="number"
+                        min="1"
+                        max="65535"
+                        placeholder="Auto-detected from image"
+                        className="max-w-[400px]"
+                      />
+                    </FormControl>
+                    <FormDescription className="text-muted-foreground">
+                      Optional: Override the port when your image has no EXPOSE
+                      directive. Priority: Image EXPOSE → Environment override →
+                      This value → Default (3000)
+                    </FormDescription>
+                  </FormItem>
+                )}
+              />
+
+              {project?.preset?.toLowerCase().includes('docker') && (
+                <FormField
+                  control={projectForm.control}
+                  name="dockerfilePath"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Dockerfile Path</FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          placeholder="Dockerfile"
+                          className="max-w-[400px]"
+                        />
+                      </FormControl>
+                      <FormDescription className="text-muted-foreground">
+                        Path to your Dockerfile relative to the root directory
+                      </FormDescription>
+                    </FormItem>
+                  )}
+                />
+              )}
             </CardContent>
             <CardFooter>
               <Button type="submit" disabled={updateProjectSettings.isPending}>

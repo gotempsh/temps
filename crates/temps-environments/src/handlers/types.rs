@@ -69,6 +69,10 @@ pub struct EnvironmentResponse {
     pub memory_limit: Option<i32>,
     pub replicas: Option<i32>,
     pub branch: Option<String>,
+    /// Port exposed by the container (overrides project-level port for this environment)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 8080)]
+    pub exposed_port: Option<i32>,
 }
 
 impl From<temps_entities::environments::Model> for EnvironmentResponse {
@@ -82,12 +86,16 @@ impl From<temps_entities::environments::Model> for EnvironmentResponse {
             current_deployment_id: env.current_deployment_id,
             created_at: env.created_at.timestamp_millis(),
             updated_at: env.updated_at.timestamp_millis(),
-            cpu_request: env.cpu_request,
-            cpu_limit: env.cpu_limit,
-            memory_request: env.memory_request,
-            memory_limit: env.memory_limit,
-            replicas: env.replicas,
+            cpu_request: env.deployment_config.as_ref().and_then(|c| c.cpu_request),
+            cpu_limit: env.deployment_config.as_ref().and_then(|c| c.cpu_limit),
+            memory_request: env
+                .deployment_config
+                .as_ref()
+                .and_then(|c| c.memory_request),
+            memory_limit: env.deployment_config.as_ref().and_then(|c| c.memory_limit),
+            replicas: env.deployment_config.as_ref().map(|c| c.replicas),
             branch: env.branch,
+            exposed_port: env.deployment_config.as_ref().and_then(|c| c.exposed_port),
         }
     }
 }
@@ -119,6 +127,16 @@ pub struct UpdateEnvironmentSettingsRequest {
     pub memory_limit: Option<i32>,
     pub branch: Option<String>,
     pub replicas: Option<i32>,
+    /// Port exposed by the container (overrides project-level port for this environment)
+    ///
+    /// Priority order for port resolution:
+    /// 1. Image EXPOSE directive (auto-detected from built image)
+    /// 2. This environment-level exposed_port (overrides project setting)
+    /// 3. Project-level exposed_port (fallback)
+    /// 4. Default: 3000
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 8080)]
+    pub exposed_port: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

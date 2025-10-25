@@ -5,6 +5,7 @@ pub mod jobs;
 pub mod plugin;
 pub mod services;
 pub mod test_utils;
+pub mod utils;
 
 #[allow(ambiguous_glob_reexports)]
 pub use handlers::*;

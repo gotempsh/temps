@@ -157,6 +157,7 @@ mod integration_tests {
     use super::*;
     use async_trait::async_trait;
     use std::collections::VecDeque;
+    use temps_entities::{preset::Preset, upstream_config::UpstreamList};
     use tokio::sync::Mutex;
 
     // Helper function to create unique test project (avoids deadlocks in parallel tests)
@@ -166,7 +167,6 @@ mod integration_tests {
         let project = projects::ActiveModel {
             name: Set(format!("Test Project {}", nanos)),
             slug: Set(slug.clone()),
-            project_type: Set(ProjectType::Static),
             directory: Set(format!("/test-{}", nanos)),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -191,7 +191,7 @@ mod integration_tests {
             slug: Set(slug),
             subdomain: Set(subdomain.clone()),
             host: Set(format!("{}.test.local", subdomain)),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             branch: Set(Some("main".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -251,7 +251,7 @@ mod integration_tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set(project_slug.clone()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set(format!("/test-{}", nanos)),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -268,7 +268,7 @@ mod integration_tests {
             slug: Set(format!("production-{}", nanos)),
             subdomain: Set(env_subdomain.clone()),
             host: Set(format!("{}.test.local", env_subdomain)),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             branch: Set(Some("main".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -314,7 +314,7 @@ mod integration_tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set(project_slug.clone()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set(format!("/test-{}", nanos)),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -331,7 +331,7 @@ mod integration_tests {
             slug: Set(format!("staging-{}", nanos)),
             subdomain: Set(env_subdomain.clone()),
             host: Set(format!("{}.test.local", env_subdomain)),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             branch: Set(Some("staging".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -530,7 +530,7 @@ mod integration_tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -570,7 +570,7 @@ mod integration_tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -586,7 +586,7 @@ mod integration_tests {
             slug: Set("production".to_string()),
             subdomain: Set("production".to_string()),
             host: Set("production.test.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             branch: Set(Some("main".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -623,7 +623,7 @@ mod integration_tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -639,7 +639,7 @@ mod integration_tests {
             slug: Set("production".to_string()),
             subdomain: Set("prod-subdomain".to_string()),
             host: Set("production.test.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             branch: Set(Some("main".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -708,7 +708,7 @@ mod integration_tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -724,7 +724,7 @@ mod integration_tests {
             slug: Set("staging".to_string()),
             subdomain: Set("staging-subdomain".to_string()),
             host: Set("staging.test.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             branch: Set(Some("staging".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -808,7 +808,7 @@ mod integration_tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -876,7 +876,7 @@ mod integration_tests {
         let project = projects::ActiveModel {
             name: Set("Multi-Env Project".to_string()),
             slug: Set("multi-env".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -900,7 +900,7 @@ mod integration_tests {
                 slug: Set(name.to_string()),
                 subdomain: Set(format!("{}-subdomain", name)),
                 host: Set(format!("{}.test.local", name)),
-                upstreams: Set(serde_json::json!([])),
+                upstreams: Set(UpstreamList::default()),
                 branch: Set(Some(name.to_string())),
                 created_at: Set(Utc::now()),
                 updated_at: Set(Utc::now()),
@@ -991,7 +991,7 @@ mod integration_tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -1009,7 +1009,7 @@ mod integration_tests {
                 slug: Set(format!("env-{}", i)),
                 subdomain: Set(format!("env-{}", i)),
                 host: Set(format!("env-{}.test.local", i)),
-                upstreams: Set(serde_json::json!([])),
+                upstreams: Set(UpstreamList::default()),
                 branch: Set(Some("main".to_string())),
                 created_at: Set(Utc::now()),
                 updated_at: Set(Utc::now()),

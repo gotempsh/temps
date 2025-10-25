@@ -1027,6 +1027,7 @@ mod tests {
     use std::sync::Arc;
     use temps_config::ConfigService;
     use temps_database::test_utils::TestDatabase;
+    use temps_entities::upstream_config::UpstreamList;
     use temps_logs::{DockerLogService, LogService};
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
@@ -1129,7 +1130,6 @@ mod tests {
             slug: Set("test-project".to_string()),
             directory: Set("/tmp/test-project".to_string()),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
             ..Default::default()
         }
         .insert(&*db)
@@ -1144,7 +1144,7 @@ mod tests {
             slug: Set("test-env".to_string()),
             subdomain: Set(subdomain.clone()),
             host: Set(format!("{}.localhost", subdomain)),
-            upstreams: Set(serde_json::json!([])), // Empty upstreams array
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         }
         .insert(&*db)
@@ -1295,6 +1295,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires actual Docker container
     async fn test_container_logs_by_id_websocket() {
         use axum::extract::Request;
         use axum::middleware;
@@ -1370,7 +1371,6 @@ mod tests {
             slug: Set("test-project".to_string()),
             directory: Set("/tmp/test-project".to_string()),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
             ..Default::default()
         }
         .insert(&*db)
@@ -1384,7 +1384,7 @@ mod tests {
             slug: Set("test-env".to_string()),
             subdomain: Set(subdomain.clone()),
             host: Set(format!("{}.localhost", subdomain)),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         }
         .insert(&*db)
@@ -1548,6 +1548,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires actual Docker container
     async fn test_filtered_container_logs_websocket() {
         use axum::extract::Request;
         use axum::middleware;
@@ -1623,7 +1624,6 @@ mod tests {
             slug: Set("test-project".to_string()),
             directory: Set("/tmp/test-project".to_string()),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
             ..Default::default()
         }
         .insert(&*db)
@@ -1637,7 +1637,7 @@ mod tests {
             slug: Set("test-env".to_string()),
             subdomain: Set(subdomain.clone()),
             host: Set(format!("{}.localhost", subdomain)),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         }
         .insert(&*db)
@@ -1902,7 +1902,6 @@ mod tests {
             slug: Set("test-project".to_string()),
             directory: Set("/tmp/test-project".to_string()),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
             ..Default::default()
         }
         .insert(&*db)
@@ -1916,7 +1915,7 @@ mod tests {
             slug: Set("test-env".to_string()),
             subdomain: Set(subdomain.clone()),
             host: Set(format!("{}.localhost", subdomain)),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         }
         .insert(&*db)
@@ -2009,7 +2008,6 @@ mod tests {
             slug: Set("test-project".to_string()),
             directory: Set("/tmp/test-project".to_string()),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
             ..Default::default()
         }
         .insert(&*db)
@@ -2023,7 +2021,7 @@ mod tests {
             slug: Set("test-env".to_string()),
             subdomain: Set(subdomain.clone()),
             host: Set(format!("{}.localhost", subdomain)),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         }
         .insert(&*db)
@@ -2123,7 +2121,6 @@ mod tests {
             slug: Set("test-project".to_string()),
             directory: Set("/tmp/test-project".to_string()),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
             ..Default::default()
         }
         .insert(&*db)
@@ -2137,7 +2134,7 @@ mod tests {
             slug: Set("test-env".to_string()),
             subdomain: Set(subdomain.clone()),
             host: Set(format!("{}.localhost", subdomain)),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         }
         .insert(&*db)
@@ -2223,7 +2220,6 @@ mod tests {
             slug: Set("test-project".to_string()),
             directory: Set("/tmp/test-project".to_string()),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
             ..Default::default()
         }
         .insert(&*db)
@@ -2237,7 +2233,7 @@ mod tests {
             slug: Set("test-env".to_string()),
             subdomain: Set(subdomain.clone()),
             host: Set(format!("{}.localhost", subdomain)),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         }
         .insert(&*db)
@@ -2350,7 +2346,6 @@ mod tests {
             slug: Set("test-project".to_string()),
             directory: Set("/tmp/test-project".to_string()),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
             ..Default::default()
         }
         .insert(&*db)
@@ -2364,7 +2359,7 @@ mod tests {
             slug: Set("test-env".to_string()),
             subdomain: Set(subdomain.clone()),
             host: Set(format!("{}.localhost", subdomain)),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         }
         .insert(&*db)
@@ -2472,7 +2467,6 @@ mod tests {
             slug: Set("test-project".to_string()),
             directory: Set("/tmp/test-project".to_string()),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
             ..Default::default()
         }
         .insert(&*db)
@@ -2486,7 +2480,7 @@ mod tests {
             slug: Set("test-env".to_string()),
             subdomain: Set(subdomain.clone()),
             host: Set(format!("{}.localhost", subdomain)),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         }
         .insert(&*db)
@@ -2573,7 +2567,6 @@ mod tests {
             slug: Set("test-project".to_string()),
             directory: Set("/tmp/test-project".to_string()),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
             ..Default::default()
         }
         .insert(&*db)
@@ -2587,7 +2580,7 @@ mod tests {
             slug: Set("test-env".to_string()),
             subdomain: Set(subdomain.clone()),
             host: Set(format!("{}.localhost", subdomain)),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         }
         .insert(&*db)
@@ -2672,7 +2665,6 @@ mod tests {
             slug: Set("test-project".to_string()),
             directory: Set("/tmp/test-project".to_string()),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
             ..Default::default()
         }
         .insert(&*db)
@@ -2686,7 +2678,7 @@ mod tests {
             slug: Set("test-env".to_string()),
             subdomain: Set(subdomain.clone()),
             host: Set(format!("{}.localhost", subdomain)),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         }
         .insert(&*db)

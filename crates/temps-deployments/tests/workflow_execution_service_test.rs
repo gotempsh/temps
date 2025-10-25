@@ -15,11 +15,11 @@ use temps_database::test_utils::TestDatabase;
 use temps_deployer::{docker::DockerRuntime, ContainerDeployer, ImageBuilder};
 use temps_deployments::services::{WorkflowExecutionService, WorkflowPlanner};
 use temps_deployments::CronConfigService;
-use temps_entities::{
-    deployment_containers, deployments, environments, projects, types::ProjectType,
-};
+use temps_entities::upstream_config::UpstreamList;
+use temps_entities::{deployment_containers, deployments, environments, preset::Preset, projects};
 use temps_git::{GitProviderManagerError, GitProviderManagerTrait, RepositoryInfo};
 use temps_logs::LogService;
+use temps_screenshots::ScreenshotService;
 
 /// Mock GitProviderManager that copies from local fixture directory
 struct LocalFixtureGitProvider {
@@ -119,12 +119,11 @@ async fn create_test_data(
     let project = projects::ActiveModel {
         name: Set("Test Node.js Project".to_string()),
         slug: Set("test-nodejs-project".to_string()),
-        repo_owner: Set(Some("test-owner".to_string())),
-        repo_name: Set(Some("nodejs-app".to_string())),
+        repo_owner: Set("test-owner".to_string()),
+        repo_name: Set("nodejs-app".to_string()),
         git_provider_connection_id: Set(Some(1)),
-        preset: Set(Some("nodejs".to_string())),
+        preset: Set(Preset::NextJs),
         directory: Set("/".to_string()),
-        project_type: Set(ProjectType::Server),
         main_branch: Set("main".to_string()),
         created_at: Set(Utc::now()),
         updated_at: Set(Utc::now()),
@@ -138,7 +137,7 @@ async fn create_test_data(
         name: Set("Test Environment".to_string()),
         slug: Set("test".to_string()),
         host: Set("test.example.com".to_string()),
-        upstreams: Set(serde_json::json!([])),
+        upstreams: Set(UpstreamList::default()),
         subdomain: Set("https://test.example.com".to_string()),
         created_at: Set(Utc::now()),
         updated_at: Set(Utc::now()),
@@ -331,6 +330,13 @@ async fn test_workflow_execution_service_with_real_jobs() {
     }
     let cron_config_service: Arc<dyn CronConfigService> = Arc::new(MockCronConfigService);
 
+    // Create screenshot service for test
+    let screenshot_service = Arc::new(
+        ScreenshotService::new(config_service.clone())
+            .await
+            .unwrap(),
+    );
+
     // Create WorkflowExecutionService
     let workflow_execution_service = Arc::new(WorkflowExecutionService::new(
         db.clone(),
@@ -339,8 +345,8 @@ async fn test_workflow_execution_service_with_real_jobs() {
         container_deployer,
         log_service,
         cron_config_service,
-        config_service,
-        None, // No screenshot service for test
+        config_service.clone(),
+        screenshot_service.clone(),
     ));
 
     // Execute the workflow

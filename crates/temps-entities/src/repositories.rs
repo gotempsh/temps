@@ -8,7 +8,8 @@ use temps_core::DBDateTime;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    pub git_provider_connection_id: Option<i32>, // Foreign key to git provider connections
+    /// Git provider connection ID (required - repositories are always linked to a connection)
+    pub git_provider_connection_id: i32,
     pub owner: String,
     pub name: String,
     pub full_name: String,
@@ -26,14 +27,11 @@ pub struct Model {
     pub open_issues_count: i32,
     pub topics: String,
     pub repo_object: String,
-    pub framework: Option<String>,
-    pub framework_version: Option<String>,
-    pub framework_last_updated_at: Option<DBDateTime>,
-    pub package_manager: Option<String>,
     pub installation_id: Option<i32>,
-    pub clone_url: Option<String>, // Added for non-API based cloning
-    pub ssh_url: Option<String>,   // Added for SSH cloning
-    pub preset: Option<String>,    // Stores the calculated project preset/type
+    pub clone_url: Option<String>, // HTTPS clone URL
+    pub ssh_url: Option<String>,   // SSH clone URL
+    #[sea_orm(column_type = "JsonBinary")]
+    pub preset: Option<Json>, // Stores preset cache as JSON array
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

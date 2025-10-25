@@ -343,7 +343,8 @@ impl ProjectContextResolver for ProjectContextResolverImpl {
         // Use cached project model from route table for O(1) lookup
         if let Some(route_info) = self.route_table.get_route(host) {
             if let Some(project) = route_info.project {
-                return project.project_type == temps_entities::types::ProjectType::Static;
+                // Check if the preset is Static
+                return project.preset == temps_entities::preset::Preset::Static;
             }
         }
         false
@@ -685,7 +686,10 @@ mod tests {
     use super::*;
 
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::{deployments, environments, projects, request_logs, visitor};
+    use temps_entities::{
+        deployments, environments, preset::Preset, projects, request_logs,
+        upstream_config::UpstreamList, visitor,
+    };
 
     fn create_mock_ip_service(db: Arc<DatabaseConnection>) -> Arc<temps_geo::IpAddressService> {
         let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
@@ -740,15 +744,13 @@ mod tests {
     }
 
     async fn create_test_project_context(db: &Arc<DatabaseConnection>) -> ProjectContext {
-        use temps_entities::types::ProjectType;
-
         // Create test project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
             directory: Set("/".to_string()),
             main_branch: Set("main".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::Nixpacks),
             ..Default::default()
         };
         let project = project.insert(db.as_ref()).await.unwrap();
@@ -759,7 +761,7 @@ mod tests {
             slug: Set("prod".to_string()),
             subdomain: Set("test".to_string()),
             host: Set("test.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             project_id: Set(project.id),
             ..Default::default()
         };

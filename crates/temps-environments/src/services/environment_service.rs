@@ -3,7 +3,6 @@ use sea_orm::{
     TransactionTrait,
 };
 use serde::Serialize;
-use serde_json::json;
 use slug::slugify;
 use std::sync::Arc;
 use temps_core::problemdetails::Problem;
@@ -126,8 +125,6 @@ impl EnvironmentService {
         memory_limit: Option<i32>,
         branch: String,
     ) -> anyhow::Result<environments::Model> {
-        use serde_json::json;
-
         // Start a transaction
         let txn = self.db.begin().await?;
 
@@ -149,16 +146,22 @@ impl EnvironmentService {
             slug: Set(env_slug.clone()),
             subdomain: Set(main_url.clone()),
             host: Set("".to_string()),
-            upstreams: Set(json!({})), // Fix: use serde_json::Value
+            upstreams: Set(temps_entities::upstream_config::UpstreamList::new()),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
             current_deployment_id: Set(None),
-            cpu_request: Set(cpu_request),
-            cpu_limit: Set(cpu_limit),
-            memory_request: Set(memory_request),
-            memory_limit: Set(memory_limit),
+            deployment_config: Set(Some(temps_entities::deployment_config::DeploymentConfig {
+                cpu_request,
+                cpu_limit,
+                memory_request,
+                memory_limit,
+                exposed_port: None,
+                automatic_deploy: false,
+                performance_metrics_enabled: false,
+                session_recording_enabled: false,
+                replicas: 1,
+            })),
             branch: Set(Some(branch)),
-            replicas: Set(Some(1)),
             ..Default::default()
         };
 
@@ -360,16 +363,17 @@ impl EnvironmentService {
             slug: Set(env_slug.clone()),
             subdomain: Set(main_url.clone()),
             host: Set("".to_string()),
-            upstreams: Set(json!({})),
+            upstreams: Set(temps_entities::upstream_config::UpstreamList::new()),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
             current_deployment_id: Set(None),
-            cpu_request: Set(None),
-            cpu_limit: Set(None),
-            memory_request: Set(None),
-            memory_limit: Set(None),
+            deployment_config: Set(replicas.map(|r| {
+                temps_entities::deployment_config::DeploymentConfig {
+                    replicas: r,
+                    ..Default::default()
+                }
+            })),
             branch: Set(Some(branch)),
-            replicas: Set(replicas.or(Some(1))),
             ..Default::default()
         };
 
@@ -415,13 +419,21 @@ impl EnvironmentService {
         let environment = self.get_environment(project_id_param, env_id).await?;
 
         // Update the environment with new settings
-        let mut active_model: environments::ActiveModel = environment.into();
-        active_model.cpu_request = Set(settings.cpu_request);
-        active_model.cpu_limit = Set(settings.cpu_limit);
-        active_model.memory_request = Set(settings.memory_request);
-        active_model.memory_limit = Set(settings.memory_limit);
+        let mut active_model: environments::ActiveModel = environment.clone().into();
+
+        // Update deployment config with new resource settings
+        let mut deployment_config = environment.deployment_config.clone().unwrap_or_default();
+        deployment_config.cpu_request = settings.cpu_request;
+        deployment_config.cpu_limit = settings.cpu_limit;
+        deployment_config.memory_request = settings.memory_request;
+        deployment_config.memory_limit = settings.memory_limit;
+        deployment_config.exposed_port = settings.exposed_port;
+        if let Some(replicas) = settings.replicas {
+            deployment_config.replicas = replicas;
+        }
+
+        active_model.deployment_config = Set(Some(deployment_config));
         active_model.branch = Set(settings.branch);
-        active_model.replicas = Set(settings.replicas);
         active_model.updated_at = Set(chrono::Utc::now());
 
         let updated_environment = active_model

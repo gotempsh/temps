@@ -511,6 +511,45 @@ pub trait GitProviderService: Send + Sync {
         ref_spec: &str, // Can be branch name, tag, or commit SHA
         target_path: &std::path::Path,
     ) -> Result<(), GitProviderError>;
+
+    /// Create a ProjectSource for framework detection and file access
+    ///
+    /// This method creates a provider-specific ProjectSource that allows
+    /// framework detection and configuration without cloning the repository.
+    /// The source makes on-demand API calls to fetch files as needed.
+    ///
+    /// # Arguments
+    /// * `access_token` - Access token for authentication
+    /// * `owner` - Repository owner (username or organization)
+    /// * `repo` - Repository name
+    /// * `reference` - Branch name, tag, or commit SHA
+    ///
+    /// # Example
+    /// ```ignore
+    /// use temps_git::services::git_provider::{GitProviderService, GitProviderFactory};
+    /// use temps_presets::frameworks::async_provider::AsyncProviderRegistry;
+    ///
+    /// async fn detect_framework(provider: &dyn GitProviderService, access_token: &str) {
+    ///     // Create a ProjectSource from the provider
+    ///     let source = provider
+    ///         .create_source(access_token, "owner", "repo", "main")
+    ///         .await
+    ///         .unwrap();
+    ///
+    ///     // Use with framework detection
+    ///     let detector = AsyncProviderRegistry::new();
+    ///     let detection = detector.detect(source.as_ref()).await;
+    ///
+    ///     println!("Detected framework: {:?}", detection);
+    /// }
+    /// ```
+    async fn create_source(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+    ) -> Result<Box<dyn temps_presets::source::ProjectSource>, GitProviderError>;
 }
 
 /// Factory for creating provider instances

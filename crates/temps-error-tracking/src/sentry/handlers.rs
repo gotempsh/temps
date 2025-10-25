@@ -305,8 +305,10 @@ mod tests {
     use axum::body::Bytes;
     use axum::http::{HeaderName, HeaderValue};
     use axum_test::TestServer;
+    use chrono::Utc;
     use std::sync::Arc;
     use temps_database::test_utils::TestDatabase;
+    use temps_entities::preset::Preset;
 
     // Mock audit logger for tests
     #[derive(Clone)]
@@ -345,15 +347,9 @@ mod tests {
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             slug: Set(unique_slug),
-            project_type: Set(ProjectType::Server),
-            automatic_deploy: Set(true),
-            is_web_app: Set(false),
-            performance_metrics_enabled: Set(false),
-            use_default_wildcard: Set(true),
-            is_public_repo: Set(false),
-            is_on_demand: Set(false),
-            created_at: Set(chrono::Utc::now()),
-            updated_at: Set(chrono::Utc::now()),
+            preset: Set(Preset::NextJs),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
             ..Default::default()
         }
         .insert(db.connection())

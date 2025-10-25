@@ -4,9 +4,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
 
+pub mod mongodb;
 pub mod postgres;
 pub mod redis;
 pub mod s3;
+
+// Re-export services for easier access
+pub use mongodb::MongodbService;
+pub use postgres::PostgresService;
+pub use redis::RedisService;
+pub use s3::S3Service;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
@@ -18,6 +25,7 @@ pub struct ServiceConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ServiceType {
+    Mongodb,
     Postgres,
     Redis,
     S3,
@@ -26,6 +34,7 @@ pub enum ServiceType {
 impl std::fmt::Display for ServiceType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ServiceType::Mongodb => write!(f, "mongodb"),
             ServiceType::Postgres => write!(f, "postgres"),
             ServiceType::Redis => write!(f, "redis"),
             ServiceType::S3 => write!(f, "s3"),
@@ -37,6 +46,7 @@ impl ServiceType {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
+            "mongodb" => Ok(ServiceType::Mongodb),
             "postgres" => Ok(ServiceType::Postgres),
             "redis" => Ok(ServiceType::Redis),
             "s3" => Ok(ServiceType::S3),
@@ -46,7 +56,12 @@ impl ServiceType {
 
     /// Returns a Vec containing all available service types
     pub fn get_all() -> Vec<ServiceType> {
-        vec![ServiceType::Postgres, ServiceType::Redis, ServiceType::S3]
+        vec![
+            ServiceType::Mongodb,
+            ServiceType::Postgres,
+            ServiceType::Redis,
+            ServiceType::S3,
+        ]
     }
 
     /// Returns a Vec containing string representations of all available service types
@@ -66,6 +81,9 @@ pub struct ServiceParameter {
     pub description: String,
     pub default_value: Option<String>,
     pub validation_pattern: Option<String>,
+    /// Optional list of valid choices for this parameter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choices: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +142,18 @@ pub trait ExternalService: Send + Sync {
         // Validate each provided parameter
         for (key, value) in parameters {
             if let Some(param) = required_params.iter().find(|p| p.name == *key) {
+                // Check if value is in allowed choices if choices are defined
+                if let Some(choices) = &param.choices {
+                    if !choices.contains(value) {
+                        return Err(anyhow::anyhow!(
+                            "Parameter {} value '{}' is not one of the allowed choices: {:?}",
+                            key,
+                            value,
+                            choices
+                        ));
+                    }
+                }
+
                 // Check validation pattern if it exists
                 if let Some(pattern) = &param.validation_pattern {
                     let regex = regex::Regex::new(pattern)

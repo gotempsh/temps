@@ -1,6 +1,7 @@
 import { defineConfig } from '@rsbuild/core'
 import { pluginReact } from '@rsbuild/plugin-react'
-
+const rsbuildOutputPath = process.env.RSBUILD_OUTPUT_PATH as string | undefined
+const nodeEnv = process.env.NODE_ENV as string | undefined
 export default defineConfig({
   plugins: [pluginReact()],
   html: {
@@ -23,9 +24,9 @@ export default defineConfig({
   },
   output: {
     // Allow custom output path from environment variable (used by Rust build.rs)
-    ...(process.env.RSBUILD_OUTPUT_PATH && {
+    ...(rsbuildOutputPath && {
       distPath: {
-        root: process.env.RSBUILD_OUTPUT_PATH,
+        root: rsbuildOutputPath,
       },
     }),
     // Add contenthash to filenames for cache busting
@@ -34,7 +35,7 @@ export default defineConfig({
       css: '[name].[contenthash:8].css',
     },
     // Disable caching in development
-    ...(process.env.NODE_ENV === 'development' && {
+    ...(nodeEnv === 'development' && {
       filename: {
         js: '[name].js?v=[hash:8]',
         css: '[name].css?v=[hash:8]',

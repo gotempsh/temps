@@ -257,11 +257,14 @@ impl From<temps_entities::environments::Model> for EnvironmentResponse {
             current_deployment_id: env.current_deployment_id,
             created_at: env.created_at.timestamp_millis(),
             updated_at: env.updated_at.timestamp_millis(),
-            cpu_request: env.cpu_request,
-            cpu_limit: env.cpu_limit,
-            memory_request: env.memory_request,
-            memory_limit: env.memory_limit,
-            replicas: env.replicas,
+            cpu_request: env.deployment_config.as_ref().and_then(|c| c.cpu_request),
+            cpu_limit: env.deployment_config.as_ref().and_then(|c| c.cpu_limit),
+            memory_request: env
+                .deployment_config
+                .as_ref()
+                .and_then(|c| c.memory_request),
+            memory_limit: env.deployment_config.as_ref().and_then(|c| c.memory_limit),
+            replicas: env.deployment_config.as_ref().map(|c| c.replicas),
             branch: env.branch,
         }
     }

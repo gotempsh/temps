@@ -1,9 +1,11 @@
 use std::path::Path;
 
-use super::{PackageManager, Preset, ProjectType};
+use super::{DockerfileWithArgs, PackageManager, Preset, ProjectType};
+use async_trait::async_trait;
 
 pub struct Rsbuild;
 
+#[async_trait]
 impl Preset for Rsbuild {
     fn slug(&self) -> String {
         "rsbuild".to_string()
@@ -18,10 +20,10 @@ impl Preset for Rsbuild {
     }
 
     fn icon_url(&self) -> String {
-        "https://example.com/vite-icon.png".to_string()
+        "/presets/rsbuild.svg".to_string()
     }
 
-    fn dockerfile(&self, config: super::DockerfileConfig) -> String {
+    async fn dockerfile(&self, config: super::DockerfileConfig<'_>) -> DockerfileWithArgs {
         let pkg_manager = PackageManager::detect(config.local_path);
 
         let lockfile = match pkg_manager {
@@ -40,13 +42,11 @@ WORKDIR /app
 # Copy package files
 {}
 
-# Install dependencies with caching
-RUN --mount=type=cache,target=/app/node_modules,id=node_modules_{} \
-    {}
+# Install dependencies
+RUN {}
 "#,
             pkg_manager.base_image(),
             lockfile,
-            config.project_slug,
             config.install_command.unwrap_or(pkg_manager.install_command())
         );
 
@@ -62,9 +62,8 @@ RUN --mount=type=cache,target=/app/node_modules,id=node_modules_{} \
 # Copy the rest of the application code
 COPY . .
 
-# Build the Rsbuild application with caching
-RUN --mount=type=cache,target=/app/node_modules,sharing=locked,id=node_modules_{} \
-    {}
+# Build the Rsbuild application
+RUN {}
 
 # Stage 2: Create the production image
 FROM {} AS runner
@@ -82,7 +81,6 @@ EXPOSE 3000
 
 CMD ["serve", "-s", "dist", "-l", "3000"]
 "#,
-            config.project_slug,
             config.build_command.unwrap_or(pkg_manager.build_command()),
             pkg_manager.base_image(),
             match pkg_manager {
@@ -93,11 +91,11 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
             }
         ));
 
-        dockerfile
+        DockerfileWithArgs::new(dockerfile)
     }
 
-    fn dockerfile_with_build_dir(&self, _local_path: &Path) -> String {
-        r#"
+    async fn dockerfile_with_build_dir(&self, _local_path: &Path) -> DockerfileWithArgs {
+        let content = r#"
 # Use a lightweight base image
 FROM oven/bun:1.2-alpine
 
@@ -115,7 +113,8 @@ EXPOSE 3000
 # Use serve to host the static files
 CMD ["serve", "-s", "dist", "-l", "3000"]
 
-"#.to_string()
+"#;
+        DockerfileWithArgs::new(content.to_string())
     }
 
     fn install_command(&self, local_path: &Path) -> String {

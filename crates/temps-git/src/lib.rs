@@ -9,6 +9,7 @@
 pub mod handlers;
 pub mod plugin;
 pub mod services;
+pub mod sources;
 
 // Re-export the plugin for easy access
 pub use plugin::GitPlugin;

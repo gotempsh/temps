@@ -210,35 +210,19 @@ function RepoConfigStep({
                 <SelectValue placeholder="Select a framework" />
               </SelectTrigger>
               <SelectContent>
-                {presetData?.projects?.map((project: any, index: number) => (
+                {presetData?.presets?.map((preset: any, index: number) => (
                   <SelectItem
-                    key={`preset-${index}-${project.preset}-${project.path || 'root'}`}
-                    value={`${project.preset}::${project.path || 'root'}`}
+                    key={`preset-${index}-${preset.preset}-${preset.path || './'}`}
+                    value={`${preset.preset}::${preset.path || './'}`}
                   >
                     <div className="flex flex-col">
-                      <span>{project.preset}</span>
+                      <span>{preset.preset_label || preset.preset}</span>
                       <span className="text-xs text-muted-foreground">
-                        {project.path || './'}
+                        {preset.path || './'}
                       </span>
                     </div>
                   </SelectItem>
                 ))}
-                {presetData?.root_preset &&
-                  !presetData?.projects?.some(
-                    (p: any) => p.preset === presetData.root_preset
-                  ) && (
-                    <SelectItem
-                      key={`preset-root-${presetData.root_preset}`}
-                      value={`${presetData.root_preset}::root`}
-                    >
-                      <div className="flex flex-col">
-                        <span>{presetData.root_preset}</span>
-                        <span className="text-xs text-muted-foreground">
-                          ./
-                        </span>
-                      </div>
-                    </SelectItem>
-                  )}
                 <SelectItem value="custom">Custom</SelectItem>
               </SelectContent>
             </Select>

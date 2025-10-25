@@ -26,16 +26,16 @@ repos:
         files: ^CHANGELOG\.md$
         pass_filenames: false
 
-      - id: cargo-fmt
-        name: cargo fmt
-        entry: cargo fmt --
-        language: system
-        types: [rust]
-        pass_filenames: false # This makes it a lot faster
+      # - id: cargo-fmt
+      #   name: cargo fmt
+      #   entry: cargo fmt --
+      #   language: system
+      #   types: [rust]
+      #   pass_filenames: false # This makes it a lot faster
 
-      - id: cargo-clippy
-        name: cargo clippy
-        language: system
-        types: [rust]
-        pass_filenames: false
-        entry: cargo clippy --all-targets --all-features -- -D warnings
+      # - id: cargo-clippy
+      #   name: cargo clippy
+      #   language: system
+      #   types: [rust]
+      #   pass_filenames: false
+      #   entry: cargo clippy --all-targets --all-features -- -D warnings

@@ -43,6 +43,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { TimeAgo } from '@/components/utils/TimeAgo'
+import { usePresets } from '@/contexts/PresetContext'
 
 interface RepositoryListProps {
   connectionId: number
@@ -55,7 +56,7 @@ interface RepositoryListProps {
   compactMode?: boolean
 }
 
-type SortOption = 'name' | 'updated' | 'created'
+type SortOption = 'name' | 'pushed' | 'created'
 type FilterOption = 'all' | 'public' | 'private'
 
 export function RepositoryList({
@@ -63,16 +64,17 @@ export function RepositoryList({
   onRepositorySelect,
   selectedRepositoryId,
   showSelection = false,
-  itemsPerPage = 12,
+  itemsPerPage = 20,
   className,
   showHeader = true,
   compactMode = false,
 }: RepositoryListProps) {
   const [searchQuery, setSearchQuery] = useState('')
   const [currentPage, setCurrentPage] = useState(1)
-  const [sortBy, setSortBy] = useState<SortOption>('updated')
+  const [sortBy, setSortBy] = useState<SortOption>('pushed')
   const [filterBy, setFilterBy] = useState<FilterOption>('all')
   const queryClient = useQueryClient()
+  const { getPresetBySlug } = usePresets()
 
   // Debounce search query to avoid too many API calls
   const debouncedSearchQuery = useDebounce(searchQuery, 300)
@@ -84,10 +86,10 @@ export function RepositoryList({
         return 'name'
       case 'created':
         return 'created_at'
-      case 'updated':
-        return 'updated_at'
+      case 'pushed':
+        return 'pushed_at'
       default:
-        return 'updated_at'
+        return 'pushed_at'
     }
   }
 
@@ -288,17 +290,17 @@ export function RepositoryList({
       {isLoading ? (
         <div
           className={cn(
-            'grid gap-3',
+            'grid gap-2',
             compactMode
               ? 'grid-cols-1'
               : 'grid-cols-1 md:grid-cols-2 xl:grid-cols-3'
           )}
         >
           {Array.from({ length: itemsPerPage }).map((_, i) => (
-            <Card key={i} className="p-4">
-              <Skeleton className="h-4 w-3/4 mb-2" />
-              <Skeleton className="h-3 w-1/2 mb-3" />
-              <Skeleton className="h-3 w-full" />
+            <Card key={i} className="p-3">
+              <Skeleton className="h-3 w-3/4 mb-1.5" />
+              <Skeleton className="h-2.5 w-1/2 mb-2" />
+              <Skeleton className="h-2.5 w-full" />
             </Card>
           ))}
         </div>
@@ -331,7 +333,7 @@ export function RepositoryList({
       ) : (
         <div
           className={cn(
-            'grid gap-3',
+            'grid gap-2',
             compactMode
               ? 'grid-cols-1'
               : 'grid-cols-1 md:grid-cols-2 xl:grid-cols-3'
@@ -341,7 +343,7 @@ export function RepositoryList({
             <Card
               key={repo.id}
               className={cn(
-                'group relative cursor-pointer transition-all hover:shadow-lg',
+                'group relative cursor-pointer transition-all hover:shadow-md',
                 showSelection && selectedRepositoryId === repo.id
                   ? 'ring-2 ring-primary border-primary bg-primary/5'
                   : 'hover:border-primary/50',
@@ -349,73 +351,111 @@ export function RepositoryList({
               )}
               onClick={() => handleRepositoryClick(repo)}
             >
-              <CardHeader className="pb-3">
-                <div className="space-y-2">
+              <CardHeader className="p-3 pb-2">
+                <div className="space-y-1.5">
                   <div className="flex items-start justify-between gap-2">
                     <div className="flex items-center gap-2 flex-1 min-w-0">
-                      <GitBranch className="h-4 w-4 text-primary flex-shrink-0" />
+                      <GitBranch className="h-3.5 w-3.5 text-primary flex-shrink-0" />
                       <div className="flex-1 min-w-0">
-                        <CardTitle className="text-base font-semibold leading-tight">
+                        <CardTitle className="text-sm font-semibold leading-tight">
                           {repo.name}
                         </CardTitle>
-                        <CardDescription className="text-sm text-muted-foreground mt-0.5">
+                        <CardDescription className="text-xs text-muted-foreground mt-0.5">
                           {repo.owner}
                         </CardDescription>
                       </div>
                     </div>
                     <div className="flex items-center gap-2 flex-shrink-0">
                       {showSelection && selectedRepositoryId === repo.id && (
-                        <CheckCircle2 className="h-5 w-5 text-primary" />
+                        <CheckCircle2 className="h-4 w-4 text-primary" />
                       )}
                     </div>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-1.5 flex-wrap">
                     {repo.private ? (
-                      <Badge variant="secondary" className="text-xs">
-                        <Lock className="h-3 w-3 mr-1" />
+                      <Badge
+                        variant="secondary"
+                        className="text-[10px] h-5 px-1.5"
+                      >
+                        <Lock className="h-2.5 w-2.5 mr-1" />
                         Private
                       </Badge>
                     ) : (
-                      <Badge variant="outline" className="text-xs">
-                        <Unlock className="h-3 w-3 mr-1" />
+                      <Badge
+                        variant="outline"
+                        className="text-[10px] h-5 px-1.5"
+                      >
+                        <Unlock className="h-2.5 w-2.5 mr-1" />
                         Public
                       </Badge>
+                    )}
+                    {repo.preset && repo.preset.length > 0 && (
+                      <>
+                        {repo.preset.map((presetItem, index) => {
+                          const presetInfo = getPresetBySlug(presetItem.preset)
+                          const iconUrl =
+                            presetInfo?.icon_url || '/presets/custom.svg'
+                          return (
+                            <Badge
+                              key={index}
+                              variant="default"
+                              className="text-[10px] h-5 px-1.5"
+                            >
+                              <img
+                                src={iconUrl}
+                                alt={presetItem.preset_label}
+                                className="h-2.5 w-2.5 mr-1"
+                                style={{ objectFit: 'contain' }}
+                                onError={(e) => {
+                                  e.currentTarget.src = '/presets/custom.svg'
+                                }}
+                              />
+                              {presetItem.preset_label}
+                              {presetItem.path !== './' && (
+                                <span className="text-[9px] ml-0.5 opacity-70">
+                                  ({presetItem.path})
+                                </span>
+                              )}
+                            </Badge>
+                          )
+                        })}
+                      </>
                     )}
                   </div>
                 </div>
               </CardHeader>
 
-              <CardContent className="pt-0">
-                <div className="space-y-2">
+              <CardContent className="p-3 pt-0">
+                <div className="space-y-1">
                   {repo.description && (
-                    <p className="text-xs text-muted-foreground line-clamp-2">
+                    <p className="text-[11px] text-muted-foreground line-clamp-1">
                       {repo.description}
                     </p>
                   )}
 
-                  <div className="flex items-center gap-4 text-xs text-muted-foreground">
+                  <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+                    {repo.updated_at && (
+                      <>
+                        <Calendar className="h-2.5 w-2.5" />
+                        <span>Updated </span>
+                        <TimeAgo date={repo.updated_at} className="" />
+                      </>
+                    )}
+                    {repo.language && repo.updated_at && (
+                      <span className="text-muted-foreground/50">•</span>
+                    )}
                     {repo.language && (
                       <div className="flex items-center gap-1">
                         <div
                           className={cn(
-                            'h-2 w-2 rounded-full',
+                            'h-1.5 w-1.5 rounded-full',
                             getLanguageColor(repo.language)
                           )}
                         />
                         {repo.language}
                       </div>
                     )}
-
-                    {/* Stars and forks not available in current API response */}
                   </div>
-
-                  {repo.updated_at && (
-                    <div className="flex items-center gap-1 text-xs text-muted-foreground">
-                      <Calendar className="h-3 w-3" />
-                      <span>Updated </span>
-                      <TimeAgo date={repo.updated_at} className="" />
-                    </div>
-                  )}
                 </div>
               </CardContent>
             </Card>

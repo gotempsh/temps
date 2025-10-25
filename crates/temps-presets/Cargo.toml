@@ -8,9 +8,23 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-entities = { path = "../temps-entities" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+anyhow = { workspace = true }
+regex = "1.11"
+toml = "0.8"
+serde_yaml = "0.9"
+utoipa = { workspace = true, optional = true }
+
+# Nixpacks integration
+nixpacks = "1.40.0"
+
+[features]
+openapi = ["utoipa"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

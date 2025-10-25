@@ -13,8 +13,9 @@ mod mod_rs {
 
 // Re-export main types for easy access
 pub use {
-    all_presets, create_custom_preset, detect_preset_from_files, get_preset_by_slug,
-    register_docker_custom_preset, PackageManager, Preset, ProjectType,
+    all_presets, detect_node_framework, detect_preset_from_files, get_preset_by_slug,
+    DockerfileWithArgs, NixpacksPreset, NixpacksProvider, NodeFramework, PackageManager, Preset,
+    PresetConfig, ProjectType,
 };
 
 #[cfg(test)]
@@ -101,12 +102,12 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_custom_preset_fallback() {
+    fn test_detect_nixpacks_preset_fallback() {
         let files = vec!["some-random-file.txt".to_string()];
         let preset = detect_preset_from_files(&files);
 
         assert!(preset.is_some());
-        assert_eq!(preset.unwrap().slug(), "custom");
+        assert_eq!(preset.unwrap().slug(), "nixpacks");
     }
 
     #[test]
@@ -191,47 +192,32 @@ mod tests {
         assert_eq!(ProjectType::Static.to_string(), "static");
     }
 
-    #[test]
-    fn test_dockerfile_generation() {
+    #[tokio::test]
+    async fn test_dockerfile_generation() {
         let temp_dir = create_test_dir_with_files(&["package.json"]);
         let path = temp_dir.path();
 
         if let Some(preset) = get_preset_by_slug("nextjs") {
-            let dockerfile = preset.dockerfile(DockerfileConfig {
-                root_local_path: path,
-                local_path: path,
-                install_command: Some("npm install"),
-                build_command: Some("npm run build"),
-                output_dir: Some("dist"),
-                build_vars: None,
-                project_slug: "test-project",
-            });
+            let result = preset
+                .dockerfile(DockerfileConfig {
+                    use_buildkit: true,
+                    root_local_path: path,
+                    local_path: path,
+                    install_command: Some("npm install"),
+                    build_command: Some("npm run build"),
+                    output_dir: Some("dist"),
+                    build_vars: None,
+                    project_slug: "test-project",
+                })
+                .await;
 
             // Basic checks that dockerfile contains expected content
-            assert!(dockerfile.contains("FROM"));
-            assert!(dockerfile.contains("npm install"));
-            assert!(dockerfile.contains("npm run build"));
+            assert!(result.content.contains("FROM"));
+            assert!(result.content.contains("npm install"));
+            assert!(result.content.contains("npm run build"));
         } else {
             panic!("NextJS preset should be available");
         }
-    }
-
-    #[test]
-    fn test_create_custom_preset() {
-        let custom_preset = create_custom_preset(CreateCustomPresetConfig {
-            label: "My Custom".to_string(),
-            icon_url: "https://example.com/icon.png".to_string(),
-            project_type: ProjectType::Server,
-            dockerfile: "FROM alpine\nRUN echo 'hello'".to_string(),
-            slug: "custom-test".to_string(),
-            install_command: "make install".to_string(),
-            build_command: "make build".to_string(),
-            dockerfile_with_build_dir: "FROM alpine\nWORKDIR /app".to_string(),
-        });
-
-        assert_eq!(custom_preset.slug(), "custom-test");
-        assert_eq!(custom_preset.label(), "My Custom");
-        assert!(matches!(custom_preset.project_type(), ProjectType::Server));
     }
 
     #[test]

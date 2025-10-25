@@ -1,6 +1,7 @@
 use sea_orm::{Database, DatabaseConnection};
 #[cfg(test)]
 use std::sync::Arc;
+use temps_entities::upstream_config::UpstreamList;
 use temps_migrations::{Migrator, MigratorTrait};
 use testcontainers::{
     core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
@@ -100,32 +101,15 @@ impl AnalyticsTestUtils {
             main_branch: Set("main".to_string()),
             slug: Set("test_project".to_string()),
             is_deleted: Set(false),
-            automatic_deploy: Set(false),
-            project_type: Set(temps_entities::types::ProjectType::Server), // or another valid variant
-            is_web_app: Set(true),
-            performance_metrics_enabled: Set(true),
-            use_default_wildcard: Set(false),
             is_public_repo: Set(false),
-            is_on_demand: Set(false),
             created_at: Set(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
             updated_at: Set(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
             // Fill Option fields with None or Some as appropriate
-            repo_name: Set(None),
-            repo_owner: Set(None),
-            preset: Set(None),
+            repo_name: Set("test_project".to_string()),
+            repo_owner: Set("test_project".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
             deleted_at: Set(None),
-            cpu_request: Set(None),
-            cpu_limit: Set(None),
-            memory_request: Set(None),
-            memory_limit: Set(None),
-            build_command: Set(None),
-            install_command: Set(None),
-            output_dir: Set(None),
             last_deployment: Set(None),
-            custom_domain: Set(None),
-            git_url: Set(None),
-            git_provider_connection_id: Set(None),
-            // Add any new fields here as needed
             ..Default::default()
         };
         let test_project = test_project.insert(db).await?; // Ignore if exists
@@ -137,20 +121,12 @@ impl AnalyticsTestUtils {
             subdomain: Set("https://test-environment.example.com".to_string()),
             last_deployment: Set(None),
             host: Set("test-environment.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])), // Assuming upstreams is a JSON array
+            upstreams: Set(UpstreamList::default()),
             created_at: Set(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
             updated_at: Set(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
             project_id: Set(test_project.id),
             current_deployment_id: Set(None),
-            cpu_request: Set(None),
-            cpu_limit: Set(None),
-            memory_request: Set(None),
-            memory_limit: Set(None),
             branch: Set(Some("main".to_string())),
-            replicas: Set(Some(1)),
-            deleted_at: Set(None),
-            use_default_wildcard: Set(false),
-            custom_domain: Set(None),
             ..Default::default()
         };
         let test_environment = test_environment.insert(db).await?; // Ignore if exists

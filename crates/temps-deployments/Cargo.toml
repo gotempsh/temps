@@ -54,6 +54,7 @@ tokio-test = "0.4"
 mockall = "0.12"
 tokio-tungstenite = "0.24"
 tower = { workspace = true }
+env_logger = "0.11"
 
 [features]
 default = []

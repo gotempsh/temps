@@ -109,15 +109,22 @@ impl MigrationTrait for Migration {
                             .primary_key(),
                     )
                     .col(ColumnDef::new(Alias::new("name")).string().not_null())
-                    .col(ColumnDef::new(Alias::new("repo_name")).string().null())
-                    .col(ColumnDef::new(Alias::new("repo_owner")).string().null())
+                    .col(ColumnDef::new(Alias::new("repo_name")).string().not_null())
+                    .col(ColumnDef::new(Alias::new("repo_owner")).string().not_null())
                     .col(ColumnDef::new(Alias::new("directory")).string().not_null())
                     .col(
                         ColumnDef::new(Alias::new("main_branch"))
                             .string()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(Alias::new("preset")).string().null())
+                    .col(ColumnDef::new(Alias::new("preset")).string().not_null())
+                    .col(ColumnDef::new(Alias::new("preset_config")).json_binary().null())
+                    .col(
+                        ColumnDef::new(Alias::new("deployment_config"))
+                            .json_binary()
+                            .null()
+                            .comment("Deployment configuration including CPU, memory, ports, and feature flags"),
+                    )
                     .col(
                         ColumnDef::new(Alias::new("created_at"))
                             .timestamp_with_time_zone()
@@ -145,61 +152,11 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .default(false),
                     )
-                    .col(ColumnDef::new(Alias::new("cpu_request")).integer().null())
-                    .col(ColumnDef::new(Alias::new("cpu_limit")).integer().null())
-                    .col(
-                        ColumnDef::new(Alias::new("memory_request"))
-                            .integer()
-                            .null(),
-                    )
-                    .col(ColumnDef::new(Alias::new("memory_limit")).integer().null())
-                    .col(ColumnDef::new(Alias::new("build_command")).string().null())
-                    .col(
-                        ColumnDef::new(Alias::new("install_command"))
-                            .string()
-                            .null(),
-                    )
-                    .col(ColumnDef::new(Alias::new("output_dir")).string().null())
-                    .col(
-                        ColumnDef::new(Alias::new("automatic_deploy"))
-                            .boolean()
-                            .not_null()
-                            .default(true),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("project_type"))
-                            .string()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("is_web_app"))
-                            .boolean()
-                            .not_null()
-                            .default(false),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("performance_metrics_enabled"))
-                            .boolean()
-                            .not_null()
-                            .default(false),
-                    )
                     .col(
                         ColumnDef::new(Alias::new("last_deployment"))
                             .timestamp_with_time_zone()
                             .null(),
                     )
-                    .col(
-                        ColumnDef::new(Alias::new("payment_provider_id"))
-                            .integer()
-                            .null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("use_default_wildcard"))
-                            .boolean()
-                            .not_null()
-                            .default(true),
-                    )
-                    .col(ColumnDef::new(Alias::new("custom_domain")).string().null())
                     .col(
                         ColumnDef::new(Alias::new("is_public_repo"))
                             .boolean()
@@ -212,12 +169,6 @@ impl MigrationTrait for Migration {
                             .integer()
                             .null(),
                     ) // Optional - null for public repos
-                    .col(
-                        ColumnDef::new(Alias::new("is_on_demand"))
-                            .boolean()
-                            .not_null()
-                            .default(false),
-                    ) // For on-demand/serverless deployments
                     .to_owned(),
             )
             .await?;
@@ -265,16 +216,13 @@ impl MigrationTrait for Migration {
                             .integer()
                             .null(),
                     )
-                    .col(ColumnDef::new(Alias::new("cpu_request")).integer().null())
-                    .col(ColumnDef::new(Alias::new("cpu_limit")).integer().null())
-                    .col(
-                        ColumnDef::new(Alias::new("memory_request"))
-                            .integer()
-                            .null(),
-                    )
-                    .col(ColumnDef::new(Alias::new("memory_limit")).integer().null())
                     .col(ColumnDef::new(Alias::new("branch")).string().null())
-                    .col(ColumnDef::new(Alias::new("replicas")).integer().null())
+                    .col(
+                        ColumnDef::new(Alias::new("deployment_config"))
+                            .json_binary()
+                            .null()
+                            .comment("Environment-specific deployment configuration (overrides project defaults)"),
+                    )
                     .col(
                         ColumnDef::new(Alias::new("payment_provider_live_mode"))
                             .boolean()
@@ -2311,8 +2259,8 @@ impl MigrationTrait for Migration {
                     .col(
                         ColumnDef::new(Alias::new("git_provider_connection_id"))
                             .integer()
-                            .null(),
-                    ) // Foreign key to git_provider_connections
+                            .not_null(),
+                    ) // Foreign key to git_provider_connections - repositories are always linked to a connection
                     .col(ColumnDef::new(Alias::new("owner")).string().not_null())
                     .col(ColumnDef::new(Alias::new("name")).string().not_null())
                     .col(ColumnDef::new(Alias::new("full_name")).string().not_null())
@@ -2362,30 +2310,14 @@ impl MigrationTrait for Migration {
                             .string()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(Alias::new("framework")).string().null())
-                    .col(
-                        ColumnDef::new(Alias::new("framework_version"))
-                            .string()
-                            .null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("framework_last_updated_at"))
-                            .timestamp_with_time_zone()
-                            .null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("package_manager"))
-                            .string()
-                            .null(),
-                    )
                     .col(
                         ColumnDef::new(Alias::new("installation_id"))
                             .integer()
                             .null(),
                     )
-                    .col(ColumnDef::new(Alias::new("clone_url")).string().null()) // Added for non-API based cloning
-                    .col(ColumnDef::new(Alias::new("ssh_url")).string().null()) // Added for SSH cloning
-                    .col(ColumnDef::new(Alias::new("preset")).string().null()) // Project preset/template
+                    .col(ColumnDef::new(Alias::new("clone_url")).string().null()) // HTTPS clone URL
+                    .col(ColumnDef::new(Alias::new("ssh_url")).string().null()) // SSH clone URL
+                    .col(ColumnDef::new(Alias::new("preset")).json_binary().null()) // Preset cache (JSON array for monorepo support)
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_repositories_git_provider_connection_id")
@@ -3786,8 +3718,10 @@ impl MigrationTrait for Migration {
         if manager.get_database_backend() == DatabaseBackend::Postgres {
             // Configure TimescaleDB for deployment_metrics and events
             let sql = r#"
-                -- Configure TimescaleDB for events table
+                -- Configure TimescaleDB for events table with id segmenting (space partitioning)
                 SELECT create_hypertable('events', 'timestamp',
+                    partitioning_column => 'id',
+                    number_partitions => 4,
                     chunk_time_interval => INTERVAL '1 day',
                     if_not_exists => TRUE);
 
@@ -3945,15 +3879,11 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(Alias::new("deployment_id")).integer())
                     .col(ColumnDef::new(Alias::new("visitor_id")).integer())
                     .col(ColumnDef::new(Alias::new("ip_geolocation_id")).integer())
-                    .col(
-                        ColumnDef::new(Alias::new("source"))
-                            .string_len(50)
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(Alias::new("source")).text().not_null())
                     // Indexed fields (ACID - fast queries)
                     .col(
                         ColumnDef::new(Alias::new("fingerprint_hash"))
-                            .string()
+                            .text()
                             .not_null(),
                     )
                     .col(
@@ -3971,10 +3901,10 @@ impl MigrationTrait for Migration {
                     // Core error data (frequently displayed)
                     .col(
                         ColumnDef::new(Alias::new("exception_type"))
-                            .string()
+                            .text()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(Alias::new("exception_value")).string())
+                    .col(ColumnDef::new(Alias::new("exception_value")).text())
                     // ALL STRUCTURED DATA IN ONE JSONB COLUMN
                     // Contains: user, device, request, stack_trace, environment, trace contexts
                     .col(ColumnDef::new(Alias::new("data")).json_binary())
@@ -4120,11 +4050,13 @@ impl MigrationTrait for Migration {
         // Convert error_events to TimescaleDB hypertable for time-series optimization
         // This enables efficient time-range queries, compression, and continuous aggregates
         if manager.get_database_backend() == sea_orm::DatabaseBackend::Postgres {
-            // 1. Convert to hypertable with 1-day chunks
+            // 1. Convert to hypertable with 1-day chunks and id segmenting (space partitioning)
             let create_hypertable_sql = r#"
                 SELECT create_hypertable(
                     'error_events',
                     'timestamp',
+                    partitioning_column => 'id',
+                    number_partitions => 4,
                     chunk_time_interval => INTERVAL '1 day',
                     if_not_exists => TRUE,
                     migrate_data => TRUE
@@ -4728,11 +4660,7 @@ impl MigrationTrait for Migration {
                             .integer()
                             .not_null(),
                     )
-                    .col(
-                        ColumnDef::new(Alias::new("status"))
-                            .string_len(50)
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(Alias::new("status")).text().not_null())
                     .col(
                         ColumnDef::new(Alias::new("response_time_ms"))
                             .integer()
@@ -4964,10 +4892,12 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Convert status_checks to TimescaleDB hypertable
+        // Convert status_checks to TimescaleDB hypertable with id segmenting (space partitioning)
         db.execute_unprepared(
             r#"
                 SELECT create_hypertable('status_checks', 'checked_at',
+                    partitioning_column => 'id',
+                    number_partitions => 4,
                     chunk_time_interval => INTERVAL '1 day',
                     if_not_exists => TRUE);
                 "#,
@@ -5324,10 +5254,10 @@ impl MigrationTrait for Migration {
                             .timestamp_with_time_zone()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(Alias::new("method")).string().not_null())
+                    .col(ColumnDef::new(Alias::new("method")).text().not_null())
                     .col(ColumnDef::new(Alias::new("path")).text().not_null())
                     .col(ColumnDef::new(Alias::new("query_string")).text().null())
-                    .col(ColumnDef::new(Alias::new("host")).string().not_null())
+                    .col(ColumnDef::new(Alias::new("host")).text().not_null())
                     .col(
                         ColumnDef::new(Alias::new("status_code"))
                             .small_integer()
@@ -5340,7 +5270,7 @@ impl MigrationTrait for Migration {
                     )
                     .col(
                         ColumnDef::new(Alias::new("request_source"))
-                            .string()
+                            .text()
                             .not_null(),
                     )
                     .col(
@@ -5351,7 +5281,7 @@ impl MigrationTrait for Migration {
                     )
                     .col(
                         ColumnDef::new(Alias::new("routing_status"))
-                            .string()
+                            .text()
                             .not_null(),
                     )
                     // Context (nullable for unrouted requests)
@@ -5362,35 +5292,27 @@ impl MigrationTrait for Migration {
                             .null(),
                     )
                     .col(ColumnDef::new(Alias::new("deployment_id")).integer().null())
-                    .col(ColumnDef::new(Alias::new("container_id")).string().null())
-                    .col(ColumnDef::new(Alias::new("upstream_host")).string().null())
+                    .col(ColumnDef::new(Alias::new("container_id")).text().null())
+                    .col(ColumnDef::new(Alias::new("upstream_host")).text().null())
                     // Error tracking
                     .col(ColumnDef::new(Alias::new("error_message")).text().null())
                     // Client information
-                    .col(ColumnDef::new(Alias::new("client_ip")).string().null())
+                    .col(ColumnDef::new(Alias::new("client_ip")).text().null())
                     .col(ColumnDef::new(Alias::new("user_agent")).text().null())
                     .col(ColumnDef::new(Alias::new("referrer")).text().null())
-                    .col(ColumnDef::new(Alias::new("request_id")).string().not_null())
+                    .col(ColumnDef::new(Alias::new("request_id")).text().not_null())
                     .col(
                         ColumnDef::new(Alias::new("ip_geolocation_id"))
                             .integer()
                             .null(),
                     )
                     // User agent parsing
-                    .col(ColumnDef::new(Alias::new("browser")).string().null())
-                    .col(
-                        ColumnDef::new(Alias::new("browser_version"))
-                            .string()
-                            .null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("operating_system"))
-                            .string()
-                            .null(),
-                    )
-                    .col(ColumnDef::new(Alias::new("device_type")).string().null())
+                    .col(ColumnDef::new(Alias::new("browser")).text().null())
+                    .col(ColumnDef::new(Alias::new("browser_version")).text().null())
+                    .col(ColumnDef::new(Alias::new("operating_system")).text().null())
+                    .col(ColumnDef::new(Alias::new("device_type")).text().null())
                     .col(ColumnDef::new(Alias::new("is_bot")).boolean().null())
-                    .col(ColumnDef::new(Alias::new("bot_name")).string().null())
+                    .col(ColumnDef::new(Alias::new("bot_name")).text().null())
                     // Additional metadata
                     .col(
                         ColumnDef::new(Alias::new("request_size_bytes"))
@@ -5468,35 +5390,17 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Convert to TimescaleDB hypertable
+        // Convert to TimescaleDB hypertable with id segmenting (space partitioning)
         manager
             .get_connection()
             .execute_unprepared(
                 "SELECT create_hypertable('proxy_logs', 'timestamp',
+         partitioning_column => 'id',
+         number_partitions => 4,
          chunk_time_interval => INTERVAL '1 day',
          if_not_exists => TRUE);",
             )
             .await?;
-
-        // Convert status_checks to hypertable partitioned by checked_at
-        // This will partition the table into chunks based on time
-        db.execute_unprepared(
-            "SELECT create_hypertable(
-                'status_checks',
-                'checked_at',
-                chunk_time_interval => INTERVAL '1 day',
-                if_not_exists => TRUE,
-                migrate_data => TRUE
-            )",
-        )
-        .await?;
-
-        // Create an index on monitor_id and checked_at for efficient queries
-        db.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_status_checks_monitor_checked
-             ON status_checks(monitor_id, checked_at DESC)",
-        )
-        .await?;
 
         // Create a continuous aggregate for hourly stats (optional but useful)
         db.execute_unprepared(

@@ -201,6 +201,11 @@ pub struct ProviderDeletionCheckResponse {
     pub message: String,
 }
 
+// Helper function to convert JSON preset cache to Vec<ProjectPresetResponse>
+fn convert_preset_json(json: Option<serde_json::Value>) -> Option<Vec<ProjectPresetResponse>> {
+    json.and_then(|value| serde_json::from_value::<Vec<ProjectPresetResponse>>(value).ok())
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ConnectionResponse {
     pub id: i32,
@@ -236,7 +241,11 @@ pub struct RepositoryResponse {
     pub updated_at: UtcDateTime,
     #[schema(value_type = String, format = DateTime)]
     pub pushed_at: UtcDateTime,
-    pub preset: Option<String>,
+    pub preset: Option<Vec<ProjectPresetResponse>>,
+    /// HTTPS clone URL (e.g., https://github.com/owner/repo.git)
+    pub clone_url: Option<String>,
+    /// SSH clone URL (e.g., git@github.com:owner/repo.git)
+    pub ssh_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -258,6 +267,8 @@ pub struct ProjectPresetResponse {
     pub path: String,
     pub preset: String,
     pub preset_label: String,
+    /// Default exposed port for this preset (e.g., 3000 for Next.js, 8000 for FastAPI)
+    pub exposed_port: Option<u16>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -265,8 +276,7 @@ pub struct RepositoryPresetResponse {
     pub repository_id: i32,
     pub owner: String,
     pub name: String,
-    pub root_preset: Option<String>,
-    pub projects: Vec<ProjectPresetResponse>,
+    pub presets: Vec<ProjectPresetResponse>,
     #[schema(value_type = String, format = DateTime)]
     pub calculated_at: UtcDateTime,
 }
@@ -605,7 +615,9 @@ pub async fn sync_repositories(
             created_at: r.created_at,
             updated_at: r.updated_at,
             pushed_at: r.pushed_at,
-            preset: r.preset.clone(),
+            preset: convert_preset_json(r.preset.clone()),
+            clone_url: r.clone_url.clone(),
+            ssh_url: r.ssh_url.clone(),
         })
         .collect();
 
@@ -726,7 +738,9 @@ pub async fn list_repositories_by_connection(
             created_at: r.created_at,
             updated_at: r.updated_at,
             pushed_at: r.pushed_at,
-            preset: r.preset.clone(),
+            preset: convert_preset_json(r.preset.clone()),
+            clone_url: r.clone_url,
+            ssh_url: r.ssh_url,
         })
         .collect();
 
@@ -784,7 +798,9 @@ pub async fn list_repositories_by_provider(
             created_at: r.created_at,
             updated_at: r.updated_at,
             pushed_at: r.pushed_at,
-            preset: r.preset.clone(),
+            preset: convert_preset_json(r.preset.clone()),
+            clone_url: r.clone_url,
+            ssh_url: r.ssh_url,
         })
         .collect();
     Ok(Json(response))
@@ -896,7 +912,9 @@ pub async fn list_synced_repositories(
             created_at: r.created_at,
             updated_at: r.updated_at,
             pushed_at: r.pushed_at,
-            preset: r.preset.clone(),
+            preset: convert_preset_json(r.preset.clone()),
+            clone_url: r.clone_url,
+            ssh_url: r.ssh_url,
         })
         .collect();
 
@@ -961,14 +979,14 @@ pub async fn get_repository_preset_by_name(
             repository_id: preset_result.repository_id,
             owner: preset_result.owner,
             name: preset_result.name,
-            root_preset: preset_result.root_preset,
-            projects: preset_result
-                .projects
+            presets: preset_result
+                .presets
                 .into_iter()
                 .map(|p| ProjectPresetResponse {
                     path: p.path,
                     preset: p.preset,
                     preset_label: p.preset_label,
+                    exposed_port: p.exposed_port,
                 })
                 .collect(),
             calculated_at: preset_result.calculated_at,
@@ -1050,7 +1068,9 @@ pub async fn get_repository_by_name(
             created_at: repository.created_at,
             updated_at: repository.updated_at,
             pushed_at: repository.pushed_at,
-            preset: repository.preset,
+            preset: convert_preset_json(repository.preset),
+            clone_url: repository.clone_url,
+            ssh_url: repository.ssh_url,
         }),
     ))
 }
@@ -1114,7 +1134,9 @@ pub async fn get_all_repositories_by_name(
             created_at: repository.created_at,
             updated_at: repository.updated_at,
             pushed_at: repository.pushed_at,
-            preset: repository.preset,
+            preset: convert_preset_json(repository.preset),
+            clone_url: repository.clone_url,
+            ssh_url: repository.ssh_url,
         })
         .collect();
 
@@ -1688,14 +1710,14 @@ pub async fn get_repository_preset_live(
             repository_id: preset_result.repository_id,
             owner: preset_result.owner,
             name: preset_result.name,
-            root_preset: preset_result.root_preset,
-            projects: preset_result
-                .projects
+            presets: preset_result
+                .presets
                 .into_iter()
                 .map(|p| ProjectPresetResponse {
                     path: p.path,
                     preset: p.preset,
                     preset_label: p.preset_label,
+                    exposed_port: p.exposed_port,
                 })
                 .collect(),
             calculated_at: preset_result.calculated_at,

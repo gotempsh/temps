@@ -2,6 +2,7 @@ import {
   getLastDeploymentOptions,
   getProjectBySlugOptions,
   getActiveVisitors2Options,
+  getRepositoryByNameOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import NotFound from '@/components/global/NotFound'
 import { ProjectAnalytics } from '@/components/project/ProjectAnalytics'
@@ -96,6 +97,17 @@ export function ProjectDetail() {
     }),
     enabled: !!project,
     refetchInterval: 15000, // Refresh every 30 seconds
+  })
+
+  // Fetch repository details for clone URL
+  const { data: repository } = useQuery({
+    ...getRepositoryByNameOptions({
+      path: {
+        owner: project?.repo_owner || '',
+        name: project?.repo_name || '',
+      },
+    }),
+    enabled: !!project?.repo_owner && !!project?.repo_name,
   })
 
   useEffect(() => {
@@ -246,19 +258,21 @@ export function ProjectDetail() {
                   </span>
                 </div>
               )}
-              <Link
-                to={`https://github.com/${project.repo_owner}/${project.repo_name}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className={cn(
-                  buttonVariants({
-                    variant: 'outline',
-                    size: 'sm',
-                  })
-                )}
-              >
-                Repository
-              </Link>
+              {repository?.clone_url && (
+                <Link
+                  to={repository.clone_url.replace('.git', '')}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className={cn(
+                    buttonVariants({
+                      variant: 'outline',
+                      size: 'sm',
+                    })
+                  )}
+                >
+                  Repository
+                </Link>
+              )}
               {lastDeployment && !isLoadingLastDeployment && (
                 <Link
                   to={lastDeployment.url}

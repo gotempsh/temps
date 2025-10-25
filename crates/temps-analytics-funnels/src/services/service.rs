@@ -767,34 +767,25 @@ impl FunnelService {
 mod tests {
     use super::*;
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::{deployments, environments, events, projects, types::ProjectType};
+    use temps_entities::{
+        deployments, environments, events, projects, types::ProjectType,
+        upstream_config::UpstreamList,
+    };
 
     async fn create_test_project(db: Arc<DatabaseConnection>) -> (i32, i32, i32) {
         // Create project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project-no-git".to_string()),
-            repo_owner: Set(None), // No git info
-            repo_name: Set(None),
-            git_provider_connection_id: Set(None),
-            preset: Set(Some("nextjs".to_string())),
+            repo_owner: Set("test_project".to_string()),
+            repo_name: Set("test_project".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
             directory: Set("/".to_string()),
-            project_type: Set(ProjectType::Server),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             main_branch: Set("main".to_string()),
             is_deleted: Set(false),
-            automatic_deploy: Set(false),
-            is_web_app: Set(true),
-            performance_metrics_enabled: Set(true),
-            use_default_wildcard: Set(false),
             is_public_repo: Set(false),
-            is_on_demand: Set(false),
-            deleted_at: Set(None),
-            cpu_request: Set(None),
-            cpu_limit: Set(None),
-            memory_request: Set(None),
-            memory_limit: Set(None),
             ..Default::default()
         };
         let project_result = projects::Entity::insert(project)
@@ -810,8 +801,7 @@ mod tests {
             slug: Set("test".to_string()),
             subdomain: Set("test.temps.localhost".to_string()),
             host: Set("localhost".to_string()),
-            upstreams: Set(serde_json::json!([])),
-            use_default_wildcard: Set(true),
+            upstreams: Set(UpstreamList::default()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()

@@ -23,8 +23,8 @@ use super::audit::{
 };
 use crate::handlers::types::{
     CreateExternalServiceRequest, EnvironmentVariableInfo, ExternalServiceDetails,
-    ExternalServiceInfo, LinkServiceRequest, ProjectServiceInfo, ServiceParameter, ServiceTypeInfo,
-    ServiceTypeRoute, UpdateExternalServiceRequest,
+    ExternalServiceInfo, LinkServiceRequest, ProjectServiceInfo, ProviderMetadata,
+    ServiceParameter, ServiceTypeInfo, ServiceTypeRoute, UpdateExternalServiceRequest,
 };
 use temps_core::AuditContext;
 use temps_core::RequestMetadata;
@@ -46,11 +46,67 @@ async fn get_service_types(RequireAuth(auth): RequireAuth) -> Result<impl IntoRe
     Ok((StatusCode::OK, Json(service_types)))
 }
 
+/// Get provider metadata (display names, icons, descriptions)
+#[utoipa::path(
+    get,
+    path = "/external-services/providers/metadata",
+    tag = "External Services",
+    responses(
+        (status = 200, description = "List of provider metadata", body = Vec<ProviderMetadata>),
+        (status = 500, description = "Internal server error")
+    )
+)]
+async fn get_providers_metadata(
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+
+    let metadata = ProviderMetadata::get_all();
+    Ok((StatusCode::OK, Json(metadata)))
+}
+
+/// Get metadata for a specific provider
+#[utoipa::path(
+    get,
+    path = "/external-services/providers/metadata/{service_type}",
+    tag = "External Services",
+    responses(
+        (status = 200, description = "Provider metadata", body = ProviderMetadata),
+        (status = 404, description = "Provider not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("service_type" = String, Path, description = "Service type (mongodb, postgres, redis, s3)")
+    )
+)]
+async fn get_provider_metadata(
+    RequireAuth(auth): RequireAuth,
+    Path(service_type): Path<String>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+
+    match ServiceTypeRoute::from_str(&service_type) {
+        Ok(service_type) => match ProviderMetadata::get_by_type(&service_type) {
+            Some(metadata) => Ok((StatusCode::OK, Json(metadata))),
+            None => Err(not_found().detail("Provider metadata not found").build()),
+        },
+        Err(_) => Err(not_found().detail("Invalid service type").build()),
+    }
+}
+
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/external-services", get(list_services))
         .route("/external-services", post(create_service))
         .route("/external-services/types", get(get_service_types))
+        .route(
+            "/external-services/providers/metadata",
+            get(get_providers_metadata),
+        )
+        .route(
+            "/external-services/providers/metadata/{service_type}",
+            get(get_provider_metadata),
+        )
         .route(
             "/external-services/types/{service_type}/parameters",
             get(get_service_type_parameters),
@@ -970,6 +1026,8 @@ async fn get_service_preview_environment_variables_masked(
 #[openapi(
     paths(
         get_service_types,
+        get_providers_metadata,
+        get_provider_metadata,
         get_service_type_parameters,
         list_services,
         get_service,
@@ -993,6 +1051,7 @@ async fn get_service_preview_environment_variables_masked(
         ServiceTypeInfo,
         ServiceTypeRoute,
         ServiceParameter,
+        ProviderMetadata,
         ExternalServiceDetails,
         ExternalServiceInfo,
         CreateExternalServiceRequest,

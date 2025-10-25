@@ -416,13 +416,15 @@ async fn github_install_webhook(
 }
 
 /// GitHub App OAuth authorization callback handler
-/// This handles the first step where the user authorizes the GitHub App
+/// This handles both the authorization step and the installation step
 #[utoipa::path(
     get,
     path = "/webhook/git/github/auth",
     params(
         ("code" = String, Query, description = "GitHub OAuth authorization code"),
-        ("state" = Option<String>, Query, description = "OAuth state parameter")
+        ("state" = Option<String>, Query, description = "OAuth state parameter"),
+        ("installation_id" = Option<i64>, Query, description = "GitHub installation ID (for OAuth flow)"),
+        ("setup_action" = Option<String>, Query, description = "Setup action (install, request, or update)")
     ),
     responses(
         (status = 302, description = "Redirect after successful authorization"),
@@ -438,6 +440,10 @@ async fn github_app_auth_callback(
 ) -> Result<(HeaderMap, Redirect), Problem> {
     let code = params.get("code").cloned().unwrap_or_default();
     let state_param = params.get("state").cloned();
+    let installation_id = params
+        .get("installation_id")
+        .and_then(|id| id.parse::<i64>().ok());
+    let setup_action = params.get("setup_action").cloned();
 
     // Log all parameters for debugging
     info!("GitHub App auth callback - params: {:?}", params);
@@ -448,9 +454,67 @@ async fn github_app_auth_callback(
             .with_detail("The 'code' parameter is required"));
     }
 
-    // Determine if this is a manifest conversion or OAuth flow
-    // Manifest flow: Only has 'code' and 'state' parameters
-    // OAuth flow: May have additional parameters like 'installation_id', 'setup_action'
+    // Extract the host from the request headers for consistent redirect URLs
+    let host = headers
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .map(|host| {
+            let scheme = headers
+                .get("x-forwarded-proto")
+                .and_then(|p| p.to_str().ok())
+                .unwrap_or("https");
+            format!("{}://{}", scheme, host)
+        });
+
+    // Determine the flow type based on parameters:
+    // 1. Manifest flow: Only has 'code' and 'state' parameters
+    // 2. OAuth installation flow: Has 'code' + 'installation_id' + 'setup_action'
+    // 3. OAuth auth-only flow: Only has 'code' (and possibly 'state')
+
+    // Check if this is an OAuth installation flow (has installation_id)
+    if let Some(installation_id) = installation_id {
+        info!(
+            "Detected OAuth installation flow - installation_id: {}, setup_action: {:?}",
+            installation_id, setup_action
+        );
+
+        // Validate setup_action if provided
+        if let Some(action) = &setup_action {
+            if action != "install" && action != "request" && action != "update" {
+                warn!("Unexpected setup_action: {}", action);
+            }
+        }
+
+        // Process the installation
+        match state
+            .github_service
+            .process_installation(installation_id as i32, None)
+            .await
+        {
+            Ok(_) => {
+                info!("Successfully processed installation {}", installation_id);
+
+                let redirect_url = host.unwrap_or_else(|| "http://localhost:8080".to_string())
+                    + "/dashboard?github_installation_complete=true";
+
+                let mut response_headers = HeaderMap::new();
+                response_headers.insert("Cache-Control", "no-store".parse().unwrap());
+
+                return Ok((response_headers, Redirect::to(&redirect_url)));
+            }
+            Err(e) => {
+                error!("Failed to process installation: {:?}", e);
+                return Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Installation Processing Failed")
+                    .with_detail(format!(
+                        "Failed to process installation {}: {}",
+                        installation_id, e
+                    )));
+            }
+        }
+    }
+
+    // Check if this is a manifest conversion flow (only code + state, no installation_id)
     let is_manifest_flow =
         params.len() == 2 && params.contains_key("code") && params.contains_key("state");
 
@@ -463,24 +527,9 @@ async fn github_app_auth_callback(
         return handle_manifest_conversion_with_source(&state, code, state_param, headers).await;
     }
 
-    // Extract the host from the request headers
-    let host = headers
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .map(|host| {
-            let scheme = headers
-                .get("x-forwarded-proto")
-                .and_then(|p| p.to_str().ok())
-                .unwrap_or("https");
-            format!("{}://{}", scheme, host)
-        });
+    // For auth-only flow (no installation_id yet), redirect and wait for webhook
+    info!("OAuth authorization code received without installation_id - waiting for installation webhook");
 
-    // For regular OAuth flow, we need to wait for the installation callback
-    // which will have both the code and installation_id
-    info!("OAuth authorization code received, redirecting to continue installation");
-
-    // Store the code in a temporary location or pass it through the redirect
-    // GitHub will redirect to the installation callback with the installation_id
     let redirect_url = host.unwrap_or_else(|| "http://localhost:8080".to_string()) + "/dashboard";
 
     let mut response_headers = HeaderMap::new();
@@ -489,8 +538,9 @@ async fn github_app_auth_callback(
     Ok((response_headers, Redirect::to(&redirect_url)))
 }
 
-/// Standardized GitHub App installation callback handler
-/// This handles the second step after the user has selected repositories
+/// Alternative GitHub App installation callback handler (legacy/fallback)
+/// Note: The primary callback is /webhook/git/github/auth which handles both auth and installation
+/// This endpoint is kept for backward compatibility or if GitHub sends callbacks to a different URL
 #[utoipa::path(
     get,
     path = "/webhook/git/github/callback",

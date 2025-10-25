@@ -1,6 +1,6 @@
 //! providers services and utilities
 
-mod externalsvc;
+pub mod externalsvc;
 pub mod services;
 pub use services::*;
 pub mod plugin;

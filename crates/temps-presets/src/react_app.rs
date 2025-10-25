@@ -1,9 +1,11 @@
 use std::path::Path;
 
-use super::{PackageManager, Preset, ProjectType};
+use super::{DockerfileWithArgs, PackageManager, Preset, ProjectType};
+use async_trait::async_trait;
 
 pub struct CreateReactApp;
 
+#[async_trait]
 impl Preset for CreateReactApp {
     fn slug(&self) -> String {
         "react-app".to_string()
@@ -18,10 +20,10 @@ impl Preset for CreateReactApp {
     }
 
     fn icon_url(&self) -> String {
-        "https://example.com/react-icon.png".to_string()
+        "/presets/react.svg".to_string()
     }
 
-    fn dockerfile(&self, config: super::DockerfileConfig) -> String {
+    async fn dockerfile(&self, config: super::DockerfileConfig<'_>) -> DockerfileWithArgs {
         let pkg_manager = self.package_manager(config.local_path);
 
         let lockfile = match pkg_manager {
@@ -42,11 +44,10 @@ WORKDIR /app
 {}
 
 # Install dependencies
-RUN --mount=type=cache,target=/app/node_modules,id=node_modules_{} {}
+RUN {}
 "#,
             pkg_manager.base_image(),
             lockfile,
-            config.project_slug,
             config.install_command.unwrap_or(&self.install_command(config.local_path))
         );
 
@@ -92,13 +93,13 @@ CMD ["serve", "-s", "build", "-l", "3000"]
             }
         ));
 
-        dockerfile
+        DockerfileWithArgs::new(dockerfile)
     }
 
-    fn dockerfile_with_build_dir(&self, local_path: &Path) -> String {
+    async fn dockerfile_with_build_dir(&self, local_path: &Path) -> DockerfileWithArgs {
         let pkg_manager = self.package_manager(local_path);
 
-        format!(
+        let content = format!(
             r#"
 FROM {}
 
@@ -122,7 +123,8 @@ CMD ["serve", "-s", "build", "-l", "3000"]
                 PackageManager::Npm => "npm install -g serve",
                 PackageManager::Pnpm => "npm install -g serve",
             }
-        )
+        );
+        DockerfileWithArgs::new(content)
     }
 
     fn install_command(&self, local_path: &Path) -> String {

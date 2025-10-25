@@ -1162,4 +1162,23 @@ impl GitProviderService for GitLabProvider {
         );
         Ok(())
     }
+
+    async fn create_source(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+    ) -> Result<Box<dyn temps_presets::source::ProjectSource>, GitProviderError> {
+        // GitLab uses "namespace/project" format
+        let project_id = format!("{}/{}", owner, repo);
+
+        Ok(Box::new(crate::sources::GitLabSource::new(
+            std::sync::Arc::new(self.get_client()),
+            self.base_url.clone(),
+            project_id,
+            reference.to_string(),
+            access_token.to_string(),
+        )))
+    }
 }
