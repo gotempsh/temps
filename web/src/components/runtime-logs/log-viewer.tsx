@@ -594,7 +594,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
             <div
               ref={parentRef}
               className={cn(
-                'h-[600px] overflow-auto p-4 font-mono text-sm bg-background text-foreground',
+                'h-[600px] overflow-auto p-4 font-mono text-xs bg-background text-foreground',
                 connectionStatus === 'connecting' && 'opacity-50'
               )}
               onScroll={handleScroll}

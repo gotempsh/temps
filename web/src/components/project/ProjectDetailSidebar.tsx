@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronRight,
   Database,
+  FileText,
   GitBranch,
   Home,
   Monitor,
@@ -77,9 +78,14 @@ const navItems: NavItem[] = [
       { title: 'Pages', url: 'analytics/pages' },
       { title: 'Replays', url: 'analytics/replays' },
       { title: 'Funnels', url: 'analytics/funnels' },
-      { title: 'Logs', url: 'analytics/requests' },
+      { title: 'Speed Insights', url: 'speed' },
       { title: 'Setup', url: 'analytics/setup' },
     ],
+  },
+  {
+    title: 'Request Logs',
+    url: 'analytics/requests',
+    icon: FileText,
   },
   {
     title: 'Storage',
@@ -92,12 +98,6 @@ const navItems: NavItem[] = [
     url: 'runtime',
     icon: ScrollText,
     kbd: 'L',
-  },
-  {
-    title: 'Speed Insights',
-    url: 'speed',
-    icon: Monitor,
-    kbd: 'I',
   },
   {
     title: 'Error Tracking',

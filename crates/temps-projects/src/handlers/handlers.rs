@@ -989,6 +989,11 @@ pub async fn list_presets(RequireAuth(_auth): RequireAuth) -> Result<impl IntoRe
                     "JavaScript runtime built on Chrome's V8 engine",
                     "server",
                 ),
+                Preset::Java => (
+                    "Java",
+                    "Java web applications and services",
+                    "server",
+                ),
             };
 
             // Generate relative icon URL

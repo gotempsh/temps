@@ -30,7 +30,7 @@ export const LogLine = memo(function LogLine({
   return (
     <div
       className={cn(
-        'py-0.5 px-2 whitespace-pre-wrap break-all font-mono text-sm leading-tight',
+        'py-0.5 px-2 whitespace-pre-wrap break-all font-mono text-xs leading-relaxed',
         isHighlighted && 'bg-accent'
       )}
     >

@@ -569,7 +569,8 @@ pub async fn list_containers(
         ("container_id" = String, Path, description = "Container ID"),
         ("start_date" = Option<i64>, Query, description = "Start date for logs"),
         ("end_date" = Option<i64>, Query, description = "End date for logs"),
-        ("tail" = Option<String>, Query, description = "Number of lines to tail (or 'all')")
+        ("tail" = Option<String>, Query, description = "Number of lines to tail (or 'all')"),
+        ("timestamps" = Option<bool>, Query, description = "Include timestamps in log output (default: false)")
     ),
     responses(
         (status = 101, description = "WebSocket connection established for streaming container logs"),
@@ -604,6 +605,7 @@ pub async fn get_container_logs_by_id(
             query.start_date,
             query.end_date,
             query.tail,
+            query.timestamps,
         )
     }))
 }
@@ -619,6 +621,7 @@ async fn handle_container_logs_socket(
     start_date: Option<i64>,
     end_date: Option<i64>,
     tail: Option<String>,
+    timestamps: bool,
 ) {
     debug!(
         "WebSocket connection established for container {} logs",
@@ -635,6 +638,7 @@ async fn handle_container_logs_socket(
             start_date,
             end_date,
             tail,
+            timestamps,
         )
         .await
     {
@@ -699,7 +703,8 @@ async fn handle_container_logs_socket(
         ("start_date" = Option<i64>, Query, description = "Start date for logs"),
         ("end_date" = Option<i64>, Query, description = "End date for logs"),
         ("tail" = Option<String>, Query, description = "Number of lines to tail (or 'all')"),
-        ("container_name" = Option<String>, Query, description = "Optional container name (defaults to first/primary container)")
+        ("container_name" = Option<String>, Query, description = "Optional container name (defaults to first/primary container)"),
+        ("timestamps" = Option<bool>, Query, description = "Include timestamps in log output (default: false)")
     ),
     responses(
         (status = 101, description = "WebSocket connection established for streaming container logs"),
@@ -734,6 +739,7 @@ pub async fn get_container_logs(
             query.end_date,
             query.tail,
             query.container_name,
+            query.timestamps,
         )
     }))
 }
@@ -749,6 +755,7 @@ async fn handle_filtered_container_logs_socket(
     end_date: Option<i64>,
     tail: Option<String>,
     container_name: Option<String>,
+    timestamps: bool,
 ) {
     debug!(
         "WebSocket connection established for environment {} container logs",
@@ -765,6 +772,7 @@ async fn handle_filtered_container_logs_socket(
             end_date,
             tail,
             container_name,
+            timestamps,
         )
         .await
     {

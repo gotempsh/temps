@@ -16,6 +16,14 @@ public class HelloController {
         response.put("version", "1.0.0");
         return response;
     }
+    @GetMapping("/{name}")
+    public Map<String, String> hello(@PathVariable String name) {
+        Map<String, String> response = new HashMap<>();
+        response.put("message", "Hello from Spring Boot! " + name);
+        response.put("status", "healthy");
+        response.put("version", "1.0.0");
+        return response;
+    }
 
     @GetMapping("/health")
     public Map<String, String> health() {

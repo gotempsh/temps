@@ -391,7 +391,7 @@ export function RepositoryList({
                     )}
                     {repo.preset && repo.preset.length > 0 && (
                       <>
-                        {repo.preset.map((presetItem, index) => {
+                        {repo.preset.slice(0, 3).map((presetItem, index) => {
                           const presetInfo = getPresetBySlug(presetItem.preset)
                           const iconUrl =
                             presetInfo?.icon_url || '/presets/custom.svg'
@@ -419,6 +419,14 @@ export function RepositoryList({
                             </Badge>
                           )
                         })}
+                        {repo.preset.length > 3 && (
+                          <Badge
+                            variant="secondary"
+                            className="text-[10px] h-5 px-1.5"
+                          >
+                            +{repo.preset.length - 3} more
+                          </Badge>
+                        )}
                       </>
                     )}
                   </div>

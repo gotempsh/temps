@@ -97,6 +97,10 @@ pub enum Preset {
     #[sea_orm(string_value = "rust")]
     Rust,
 
+    // Java frameworks
+    #[sea_orm(string_value = "java")]
+    Java,
+
     // PHP frameworks
     #[sea_orm(string_value = "laravel")]
     Laravel,
@@ -140,6 +144,7 @@ impl Preset {
             Preset::Rails => "rails",
             Preset::Go => "go",
             Preset::Rust => "rust",
+            Preset::Java => "java",
             Preset::Laravel => "laravel",
             Preset::Dockerfile => "dockerfile",
             Preset::Nixpacks => "nixpacks",
@@ -170,6 +175,7 @@ impl Preset {
             Preset::Rails => "Ruby on Rails",
             Preset::Go => "Go",
             Preset::Rust => "Rust",
+            Preset::Java => "Java",
             Preset::Laravel => "Laravel",
             Preset::Dockerfile => "Dockerfile",
             Preset::Nixpacks => "Nixpacks",
@@ -198,6 +204,7 @@ impl Preset {
             Preset::Rails => "ruby",
             Preset::Go => "go",
             Preset::Rust => "rust",
+            Preset::Java => "java",
             Preset::Laravel => "php",
             Preset::Dockerfile | Preset::Nixpacks | Preset::Static => "generic",
         }
@@ -262,6 +269,9 @@ impl Preset {
             // Rust
             Preset::Rust => Some(8080), // Common Rust web server port
 
+            // Java
+            Preset::Java => Some(8080), // Common Java web server port (Spring Boot, etc.)
+
             // PHP frameworks
             Preset::Laravel => Some(8000), // Laravel artisan serve default
 
@@ -294,6 +304,7 @@ impl Preset {
             Preset::Rails,
             Preset::Go,
             Preset::Rust,
+            Preset::Java,
             Preset::Laravel,
             Preset::Dockerfile,
             Preset::Nixpacks,
@@ -333,6 +344,7 @@ impl std::str::FromStr for Preset {
             "rails" => Ok(Preset::Rails),
             "go" => Ok(Preset::Go),
             "rust" => Ok(Preset::Rust),
+            "java" => Ok(Preset::Java),
             "laravel" => Ok(Preset::Laravel),
             "dockerfile" => Ok(Preset::Dockerfile),
             "nixpacks" => Ok(Preset::Nixpacks),
@@ -680,6 +692,27 @@ pub struct RustConfig {
     pub build_command: Option<String>,
 }
 
+/// Java preset configuration
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct JavaConfig {
+    /// Java version (default: "17")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub java_version: Option<String>,
+
+    /// Build tool (maven or gradle, default: auto-detected)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_tool: Option<String>,
+
+    /// Custom build command
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_command: Option<String>,
+
+    /// Main class or JAR file to run
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main_class: Option<String>,
+}
+
 /// Laravel preset configuration
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "camelCase")]
@@ -777,6 +810,7 @@ pub enum PresetConfig {
     Rails(RailsConfig),
     Go(GoConfig),
     Rust(RustConfig),
+    Java(JavaConfig),
     Laravel(LaravelConfig),
     Dockerfile(DockerfileConfig),
     Nixpacks(NixpacksConfig),
@@ -808,6 +842,7 @@ impl PresetConfig {
             Preset::Rails => PresetConfig::Rails(RailsConfig::default()),
             Preset::Go => PresetConfig::Go(GoConfig::default()),
             Preset::Rust => PresetConfig::Rust(RustConfig::default()),
+            Preset::Java => PresetConfig::Java(JavaConfig::default()),
             Preset::Laravel => PresetConfig::Laravel(LaravelConfig::default()),
             Preset::Dockerfile => PresetConfig::Dockerfile(DockerfileConfig::default()),
             Preset::Nixpacks => PresetConfig::Nixpacks(NixpacksConfig::default()),
@@ -838,6 +873,7 @@ impl PresetConfig {
             PresetConfig::Rails(_) => Preset::Rails,
             PresetConfig::Go(_) => Preset::Go,
             PresetConfig::Rust(_) => Preset::Rust,
+            PresetConfig::Java(_) => Preset::Java,
             PresetConfig::Laravel(_) => Preset::Laravel,
             PresetConfig::Dockerfile(_) => Preset::Dockerfile,
             PresetConfig::Nixpacks(_) => Preset::Nixpacks,

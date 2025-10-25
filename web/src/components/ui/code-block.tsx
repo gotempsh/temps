@@ -19,6 +19,7 @@ interface CodeBlockProps {
   title?: string
   defaultWrap?: boolean
   defaultShowLineNumbers?: boolean
+  disableWrapToggle?: boolean
 }
 
 export function CodeBlock({
@@ -29,6 +30,7 @@ export function CodeBlock({
   title,
   defaultWrap = false,
   defaultShowLineNumbers = false,
+  disableWrapToggle = false,
 }: CodeBlockProps) {
   const [copied, setCopied] = useState(false)
   const [wrapLines, setWrapLines] = useState(defaultWrap)
@@ -600,24 +602,26 @@ export function CodeBlock({
             />
             <span className="text-xs">Lines</span>
           </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            className={cn(
-              'h-7 px-2',
-              'bg-background/80 dark:bg-zinc-800/50',
-              'hover:bg-background dark:hover:bg-zinc-800',
-              'text-muted-foreground hover:text-foreground',
-              'backdrop-blur-sm'
-            )}
-            onClick={() => setWrapLines(!wrapLines)}
-            title={wrapLines ? 'Disable line wrap' : 'Enable line wrap'}
-          >
-            <WrapText
-              className={cn('h-3 w-3 mr-1', wrapLines && 'text-blue-500')}
-            />
-            <span className="text-xs">Wrap</span>
-          </Button>
+          {!disableWrapToggle && (
+            <Button
+              size="sm"
+              variant="ghost"
+              className={cn(
+                'h-7 px-2',
+                'bg-background/80 dark:bg-zinc-800/50',
+                'hover:bg-background dark:hover:bg-zinc-800',
+                'text-muted-foreground hover:text-foreground',
+                'backdrop-blur-sm'
+              )}
+              onClick={() => setWrapLines(!wrapLines)}
+              title={wrapLines ? 'Disable line wrap' : 'Enable line wrap'}
+            >
+              <WrapText
+                className={cn('h-3 w-3 mr-1', wrapLines && 'text-blue-500')}
+              />
+              <span className="text-xs">Wrap</span>
+            </Button>
+          )}
           {showCopy && (
             <Button
               size="sm"

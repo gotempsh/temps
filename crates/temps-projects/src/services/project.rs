@@ -1325,15 +1325,49 @@ impl ProjectService {
         project: &temps_entities::projects::Model,
         _environment: &temps_entities::environments::Model,
     ) -> Result<(), ProjectError> {
+        // Fetch the latest commit from the git provider if connection exists
+        let commit_sha = if let Some(connection_id) = project.git_provider_connection_id {
+            match self
+                .git_provider_manager
+                .get_branch_latest_commit(
+                    connection_id,
+                    &project.repo_owner,
+                    &project.repo_name,
+                    &project.main_branch,
+                )
+                .await
+            {
+                Ok(commit) => {
+                    info!(
+                        "Fetched latest commit for project {}: {} - {}",
+                        project.id, commit.sha, commit.message
+                    );
+                    commit.sha
+                }
+                Err(e) => {
+                    // Log error but don't fail - fall back to a generic commit
+                    tracing::warn!(
+                        "Failed to fetch latest commit for project {}: {}. Using fallback.",
+                        project.id,
+                        e
+                    );
+                    "HEAD".to_string()
+                }
+            }
+        } else {
+            // No git provider connection, use fallback
+            "HEAD".to_string()
+        };
+
         // Create a GitPushEvent job to trigger the initial deployment
         // The deployment service's job processor will handle creating the pipeline and deployment
         let git_push_job = temps_core::GitPushEventJob {
             owner: project.repo_owner.clone(),
             repo: project.repo_name.clone(),
             branch: Some(project.main_branch.clone()),
-            tag: None,                     // No tag for initial deployment
-            commit: "initial".to_string(), // Placeholder commit for initial deployment
-            project_id: project.id,        // Include project_id
+            tag: None, // No tag for initial deployment
+            commit: commit_sha.clone(),
+            project_id: project.id, // Include project_id
         };
 
         self.queue_service
@@ -1342,11 +1376,12 @@ impl ProjectService {
             .map_err(|e| ProjectError::Other(format!("Failed to queue deployment job: {}", e)))?;
 
         info!(
-            "Queued GitPushEvent job for initial deployment of project {} (owner: {}, repo: {}, branch: {})",
+            "Queued GitPushEvent job for initial deployment of project {} (owner: {}, repo: {}, branch: {}, commit: {})",
             project.id,
             &project.repo_owner,
             &project.repo_name,
-            project.main_branch
+            project.main_branch,
+            commit_sha
         );
 
         Ok(())

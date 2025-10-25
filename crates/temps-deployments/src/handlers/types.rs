@@ -355,6 +355,13 @@ pub struct ContainerLogsQuery {
     pub tail: Option<String>,
     /// Optional container name to get logs from (if deployment has multiple containers)
     pub container_name: Option<String>,
+    /// Include timestamps in log output (default: false)
+    #[serde(default = "default_timestamps")]
+    pub timestamps: bool,
+}
+
+fn default_timestamps() -> bool {
+    false
 }
 
 #[derive(Deserialize, ToSchema)]

@@ -89,6 +89,7 @@ impl DeploymentService {
         end_date: Option<i64>,
         tail: Option<String>,
         container_name: Option<String>,
+        timestamps: bool,
     ) -> Result<impl Stream<Item = Result<String, std::io::Error>>, DeploymentError> {
         use temps_entities::{deployment_containers, projects};
         let project = projects::Entity::find_by_id(project_id)
@@ -147,6 +148,7 @@ impl DeploymentService {
                         chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
                     }),
                     tail,
+                    timestamps,
                 },
             )
             .await
@@ -169,6 +171,7 @@ impl DeploymentService {
         start_date: Option<i64>,
         end_date: Option<i64>,
         tail: Option<String>,
+        timestamps: bool,
     ) -> Result<impl Stream<Item = Result<String, std::io::Error>>, DeploymentError> {
         use temps_entities::{deployment_containers, projects};
 
@@ -226,6 +229,7 @@ impl DeploymentService {
                         chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
                     }),
                     tail,
+                    timestamps,
                 },
             )
             .await

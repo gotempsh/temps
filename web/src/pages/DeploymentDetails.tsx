@@ -25,6 +25,8 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
+  ChevronDown,
+  ChevronUp,
   Clock,
   GitBranch,
   GitCommit,
@@ -45,6 +47,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
   const { deploymentId } = useParams()
   const { setBreadcrumbs } = useBreadcrumbs()
   const [isRedeployModalOpen, setIsRedeployModalOpen] = useState(false)
+  const [isCommitMessageExpanded, setIsCommitMessageExpanded] = useState(false)
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const {
@@ -433,8 +436,32 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
 
             {/* Commit Message - Separate line if exists */}
             {deployment.commit_message && (
-              <div className="text-sm text-muted-foreground italic border-l-2 border-muted pl-3 mt-2">
-                &ldquo;{deployment.commit_message}&rdquo;
+              <div className="flex items-start gap-2 mt-2">
+                <div className="flex-1 text-sm text-muted-foreground italic border-l-2 border-muted pl-3">
+                  <div
+                    className={
+                      isCommitMessageExpanded
+                        ? ''
+                        : 'line-clamp-1 overflow-hidden text-ellipsis'
+                    }
+                  >
+                    &ldquo;{deployment.commit_message}&rdquo;
+                  </div>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 w-6 p-0 shrink-0"
+                  onClick={() =>
+                    setIsCommitMessageExpanded(!isCommitMessageExpanded)
+                  }
+                >
+                  {isCommitMessageExpanded ? (
+                    <ChevronUp className="h-3.5 w-3.5" />
+                  ) : (
+                    <ChevronDown className="h-3.5 w-3.5" />
+                  )}
+                </Button>
               </div>
             )}
           </div>

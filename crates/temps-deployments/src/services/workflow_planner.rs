@@ -475,6 +475,11 @@ impl WorkflowPlanner {
             exposed_port, image_name
         );
 
+        // Add PORT to environment variables explicitly
+        // This tells the application which port to listen on inside the container
+        let mut deploy_env_vars = env_vars.clone();
+        deploy_env_vars.insert("PORT".to_string(), exposed_port.to_string());
+
         jobs.push(JobDefinition {
             job_id: "deploy_container".to_string(),
             job_type: "DeployImageJob".to_string(),
@@ -484,7 +489,7 @@ impl WorkflowPlanner {
             job_config: Some(serde_json::json!({
                 "port": exposed_port,
                 "replicas": 1,
-                "environment_variables": env_vars,
+                "environment_variables": deploy_env_vars,
                 "image_name": image_name
             })),
             required_for_completion: true, // Core deployment job

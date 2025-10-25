@@ -470,10 +470,8 @@ impl DeployImageJob {
             disk_limit_mb: None,
         };
 
-        // Add PORT environment variable to the container
-        // This tells the application which port to listen on inside the container
-        let mut environment_vars = self.config.environment_variables.clone();
-        environment_vars.insert("PORT".to_string(), container_port.to_string());
+        // Use environment variables from config (PORT and HOST already included from workflow planner)
+        let environment_vars = self.config.environment_variables.clone();
 
         let deploy_request = DeployRequest {
             image_name: image_output.image_tag.clone(),
