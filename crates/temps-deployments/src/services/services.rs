@@ -15,6 +15,14 @@ use crate::services::types::{
 };
 use crate::UpdateDeploymentSettingsRequest;
 
+/// Parameters for container log retrieval
+pub struct ContainerLogParams {
+    pub start_date: Option<i64>,
+    pub end_date: Option<i64>,
+    pub tail: Option<String>,
+    pub timestamps: bool,
+}
+
 #[derive(Error, Debug)]
 pub enum DeploymentError {
     #[error("Database connection error: {0}")]
@@ -85,11 +93,8 @@ impl DeploymentService {
         &self,
         project_id: i32,
         environment_id: i32,
-        start_date: Option<i64>,
-        end_date: Option<i64>,
-        tail: Option<String>,
         container_name: Option<String>,
-        timestamps: bool,
+        params: ContainerLogParams,
     ) -> Result<impl Stream<Item = Result<String, std::io::Error>>, DeploymentError> {
         use temps_entities::{deployment_containers, projects};
         let project = projects::Entity::find_by_id(project_id)
@@ -141,14 +146,14 @@ impl DeploymentService {
             .get_container_logs(
                 &container_id,
                 temps_logs::docker_logs::ContainerLogOptions {
-                    start_date: start_date.map(|ts| {
+                    start_date: params.start_date.map(|ts| {
                         chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
                     }),
-                    end_date: end_date.map(|ts| {
+                    end_date: params.end_date.map(|ts| {
                         chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
                     }),
-                    tail,
-                    timestamps,
+                    tail: params.tail,
+                    timestamps: params.timestamps,
                 },
             )
             .await
@@ -168,10 +173,7 @@ impl DeploymentService {
         project_id: i32,
         environment_id: i32,
         container_id: String,
-        start_date: Option<i64>,
-        end_date: Option<i64>,
-        tail: Option<String>,
-        timestamps: bool,
+        params: ContainerLogParams,
     ) -> Result<impl Stream<Item = Result<String, std::io::Error>>, DeploymentError> {
         use temps_entities::{deployment_containers, projects};
 
@@ -222,14 +224,14 @@ impl DeploymentService {
             .get_container_logs(
                 &container_id,
                 temps_logs::docker_logs::ContainerLogOptions {
-                    start_date: start_date.map(|ts| {
+                    start_date: params.start_date.map(|ts| {
                         chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
                     }),
-                    end_date: end_date.map(|ts| {
+                    end_date: params.end_date.map(|ts| {
                         chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
                     }),
-                    tail,
-                    timestamps,
+                    tail: params.tail,
+                    timestamps: params.timestamps,
                 },
             )
             .await

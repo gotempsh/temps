@@ -7,7 +7,9 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import {
   Select,
   SelectContent,
@@ -64,6 +66,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [tail, setTail] = useState<number>(1000)
   const [autoScroll, setAutoScroll] = useState(true)
+  const [showTimestamps, setShowTimestamps] = useState(false)
   const parentRef = useRef<HTMLDivElement>(null)
   const matchRefs = useRef<HTMLSpanElement[]>([])
   const wsRef = useRef<WebSocket | null>(null)
@@ -155,6 +158,8 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
       if (tail) {
         params.append('tail', tail.toString())
       }
+      // Add timestamps parameter
+      params.append('timestamps', showTimestamps.toString())
 
       // Use container-specific endpoint (selectedContainer is guaranteed by the guard above)
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -307,6 +312,8 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     if (tail) {
       params.append('tail', tail.toString())
     }
+    // Add timestamps parameter
+    params.append('timestamps', showTimestamps.toString())
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const wsUrl = `${protocol}//${window.location.host}/api/projects/${project.id}/environments/${selectedTarget}/containers/${selectedContainer}/logs?${params.toString()}`
@@ -389,7 +396,15 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
       setConnectionStatus('permanent_error')
       setErrorMessage('Failed to establish connection')
     }
-  }, [project.id, selectedTarget, selectedContainer, startDate, endDate, tail])
+  }, [
+    project.id,
+    selectedTarget,
+    selectedContainer,
+    startDate,
+    endDate,
+    tail,
+    showTimestamps,
+  ])
 
   // Update search functionality
   const scrollToMatch = (index: number, matches: number) => {
@@ -522,7 +537,22 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
               onValueChange={(value) => setSelectedContainer(value)}
             >
               <SelectTrigger className="w-full sm:w-[250px]">
-                <SelectValue placeholder="Select container" />
+                <SelectValue placeholder="Select container">
+                  {selectedContainer && containersData?.containers && (
+                    <div className="flex items-center gap-2 overflow-hidden">
+                      <span className="truncate">
+                        {
+                          containersData.containers.find(
+                            (c) => c.container_id === selectedContainer
+                          )?.container_name
+                        }
+                      </span>
+                      <span className="text-xs text-muted-foreground shrink-0">
+                        {selectedContainer.substring(0, 12)}
+                      </span>
+                    </div>
+                  )}
+                </SelectValue>
               </SelectTrigger>
               <SelectContent>
                 {containersData?.containers?.map((container) => (
@@ -531,7 +561,9 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                     value={container.container_id}
                   >
                     <div className="flex flex-col items-start text-left">
-                      <span>{container.container_name}</span>
+                      <span className="truncate max-w-[200px]">
+                        {container.container_name}
+                      </span>
                       <span className="text-xs text-muted-foreground">
                         {container.container_id.substring(0, 12)}
                       </span>
@@ -549,6 +581,22 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                 onChange={(e) => handleSearch(e.target.value)}
                 className="pl-9 w-full"
               />
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="show-timestamps"
+                checked={showTimestamps}
+                onCheckedChange={(checked) =>
+                  setShowTimestamps(checked === true)
+                }
+              />
+              <Label
+                htmlFor="show-timestamps"
+                className="text-sm font-normal cursor-pointer"
+              >
+                Show timestamps
+              </Label>
             </div>
           </div>
 

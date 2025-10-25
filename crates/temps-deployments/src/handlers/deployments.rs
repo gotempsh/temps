@@ -599,22 +599,21 @@ pub async fn get_container_logs_by_id(
         handle_container_logs_socket(
             socket,
             state,
-            project_id,
-            environment_id,
-            container_id,
-            query.start_date,
-            query.end_date,
-            query.tail,
-            query.timestamps,
+            ContainerLogParams {
+                project_id,
+                environment_id,
+                container_id,
+                start_date: query.start_date,
+                end_date: query.end_date,
+                tail: query.tail,
+                timestamps: query.timestamps,
+            },
         )
     }))
 }
 
 /// Handle WebSocket connection for container log streaming
-#[allow(clippy::too_many_arguments)]
-async fn handle_container_logs_socket(
-    mut socket: WebSocket,
-    state: Arc<AppState>,
+struct ContainerLogParams {
     project_id: i32,
     environment_id: i32,
     container_id: String,
@@ -622,23 +621,31 @@ async fn handle_container_logs_socket(
     end_date: Option<i64>,
     tail: Option<String>,
     timestamps: bool,
+}
+
+async fn handle_container_logs_socket(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    params: ContainerLogParams,
 ) {
     debug!(
         "WebSocket connection established for container {} logs",
-        container_id
+        params.container_id
     );
 
     // Get the log stream from the deployment service
     let log_stream = match state
         .deployment_service
         .get_container_logs_by_id(
-            project_id,
-            environment_id,
-            container_id.clone(),
-            start_date,
-            end_date,
-            tail,
-            timestamps,
+            params.project_id,
+            params.environment_id,
+            params.container_id.clone(),
+            crate::services::services::ContainerLogParams {
+                start_date: params.start_date,
+                end_date: params.end_date,
+                tail: params.tail,
+                timestamps: params.timestamps,
+            },
         )
         .await
     {
@@ -687,7 +694,7 @@ async fn handle_container_logs_socket(
 
     debug!(
         "WebSocket connection closed for container {} logs",
-        container_id
+        params.container_id
     );
     let _ = socket.close().await;
 }
@@ -733,22 +740,21 @@ pub async fn get_container_logs(
         handle_filtered_container_logs_socket(
             socket,
             state,
-            project_id,
-            environment_id,
-            query.start_date,
-            query.end_date,
-            query.tail,
-            query.container_name,
-            query.timestamps,
+            FilteredContainerLogParams {
+                project_id,
+                environment_id,
+                start_date: query.start_date,
+                end_date: query.end_date,
+                tail: query.tail,
+                container_name: query.container_name,
+                timestamps: query.timestamps,
+            },
         )
     }))
 }
 
 /// Handle WebSocket connection for filtered container log streaming
-#[allow(clippy::too_many_arguments)]
-async fn handle_filtered_container_logs_socket(
-    mut socket: WebSocket,
-    state: Arc<AppState>,
+struct FilteredContainerLogParams {
     project_id: i32,
     environment_id: i32,
     start_date: Option<i64>,
@@ -756,23 +762,31 @@ async fn handle_filtered_container_logs_socket(
     tail: Option<String>,
     container_name: Option<String>,
     timestamps: bool,
+}
+
+async fn handle_filtered_container_logs_socket(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    params: FilteredContainerLogParams,
 ) {
     debug!(
         "WebSocket connection established for environment {} container logs",
-        environment_id
+        params.environment_id
     );
 
     // Get the log stream from the deployment service
     let log_stream = match state
         .deployment_service
         .get_filtered_container_logs(
-            project_id,
-            environment_id,
-            start_date,
-            end_date,
-            tail,
-            container_name,
-            timestamps,
+            params.project_id,
+            params.environment_id,
+            params.container_name,
+            crate::services::services::ContainerLogParams {
+                start_date: params.start_date,
+                end_date: params.end_date,
+                tail: params.tail,
+                timestamps: params.timestamps,
+            },
         )
         .await
     {
@@ -821,7 +835,7 @@ async fn handle_filtered_container_logs_socket(
 
     debug!(
         "WebSocket connection closed for environment {} container logs",
-        environment_id
+        params.environment_id
     );
     let _ = socket.close().await;
 }

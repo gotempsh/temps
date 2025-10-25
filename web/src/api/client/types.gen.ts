@@ -449,6 +449,10 @@ export type ContainerLogsQuery = {
     end_date?: number | null;
     start_date?: number | null;
     tail?: string | null;
+    /**
+     * Include timestamps in log output (default: false)
+     */
+    timestamps?: boolean;
 };
 
 export type CreateApiKeyRequest = {
@@ -749,6 +753,55 @@ export type CustomDomainResponse = {
     status: string;
     status_code?: number | null;
     updated_at: number;
+};
+
+/**
+ * Deployment configuration shared between projects and environments
+ *
+ * This configuration can be set at the project level (as defaults) and
+ * overridden at the environment level for specific deployments.
+ *
+ * Note: Environment variables are managed separately and are not part of this config.
+ */
+export type DeploymentConfig = {
+    /**
+     * Enable automatic deployments on git push
+     */
+    automaticDeploy?: boolean;
+    /**
+     * CPU limit in millicores (e.g., 2000 = 2 CPUs)
+     */
+    cpuLimit?: number | null;
+    /**
+     * CPU request in millicores (e.g., 100 = 0.1 CPU, 1000 = 1 CPU)
+     */
+    cpuRequest?: number | null;
+    /**
+     * Port exposed by the container
+     * If not specified, will be auto-detected from Docker image or default to 3000
+     */
+    exposedPort?: number | null;
+    /**
+     * Memory limit in megabytes (e.g., 512 = 512MB)
+     */
+    memoryLimit?: number | null;
+    /**
+     * Memory request in megabytes (e.g., 128 = 128MB)
+     */
+    memoryRequest?: number | null;
+    /**
+     * Enable performance metrics collection (speed insights)
+     */
+    performanceMetricsEnabled?: boolean;
+    /**
+     * Number of replicas/instances to run
+     * Defaults to 1 replica
+     */
+    replicas?: number;
+    /**
+     * Enable session recording for analytics
+     */
+    sessionRecordingEnabled?: boolean;
 };
 
 /**
@@ -1187,21 +1240,13 @@ export type EnvironmentInfo = {
 
 export type EnvironmentResponse = {
     branch?: string | null;
-    cpu_limit?: number | null;
-    cpu_request?: number | null;
     created_at: number;
     current_deployment_id?: number | null;
-    /**
-     * Port exposed by the container (overrides project-level port for this environment)
-     */
-    exposed_port?: number | null;
+    deployment_config?: null | DeploymentConfig;
     id: number;
     main_url: string;
-    memory_limit?: number | null;
-    memory_request?: number | null;
     name: string;
     project_id: number;
-    replicas?: number | null;
     slug: string;
     updated_at: number;
 };
@@ -2588,19 +2633,17 @@ export type ProjectQuery = {
 };
 
 export type ProjectResponse = {
-    automatic_deploy: boolean;
-    cpu_limit?: number | null;
-    cpu_request?: number | null;
     created_at: number;
+    /**
+     * Deployment configuration (resources, autoscaling, features)
+     */
+    deployment_config: DeploymentConfig;
     directory: string;
     git_provider_connection_id?: number | null;
     id: number;
     last_deployment?: number | null;
     main_branch: string;
-    memory_limit?: number | null;
-    memory_request?: number | null;
     name: string;
-    performance_metrics_enabled: boolean;
     preset?: string | null;
     repo_name?: string | null;
     repo_owner?: string | null;
@@ -11539,6 +11582,10 @@ export type GetContainerLogsData = {
          * Optional container name (defaults to first/primary container)
          */
         container_name?: string;
+        /**
+         * Include timestamps in log output (default: false)
+         */
+        timestamps?: boolean;
     };
     url: '/projects/{project_id}/environments/{environment_id}/container-logs';
 };
@@ -11627,6 +11674,10 @@ export type GetContainerLogsByIdData = {
          * Number of lines to tail (or 'all')
          */
         tail?: string;
+        /**
+         * Include timestamps in log output (default: false)
+         */
+        timestamps?: boolean;
     };
     url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/logs';
 };
