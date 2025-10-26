@@ -340,6 +340,10 @@ mod tests {
         // Structured log should create the file
         log_service.log_info(log_id, "First line").await.unwrap();
 
+        // Verify file was created
+        let log_path = log_service.structured_service.get_log_path(log_id);
+        assert!(log_path.exists());
+
         // Verify content was written using structured logs
         let logs = log_service.get_structured_logs(log_id).await.unwrap();
         assert_eq!(logs.len(), 1);

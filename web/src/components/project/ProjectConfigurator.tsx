@@ -2,6 +2,7 @@ import {
   createProjectMutation,
   getRepositoryBranchesOptions,
   getRepositoryPresetLiveOptions,
+  listPresetsOptions,
   listServicesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
@@ -234,6 +235,11 @@ export function ProjectConfigurator({
     ...listServicesOptions({}),
   })
 
+  // Fetch all available presets to get default ports
+  const { data: allPresetsData } = useQuery({
+    ...listPresetsOptions({}),
+  })
+
   // Fetch branches if not provided
   const { data: branchesData } = useQuery({
     ...getRepositoryBranchesOptions({
@@ -355,6 +361,34 @@ export function ProjectConfigurator({
       }
     }
   }, [effectiveBranches, repository.default_branch, form])
+
+  // Watch preset changes to update port automatically
+  const selectedPreset = useWatch({
+    control: form.control,
+    name: 'preset',
+  })
+
+  // Auto-update port based on selected preset
+  useEffect(() => {
+    if (!selectedPreset || !allPresetsData?.presets) {
+      return
+    }
+
+    // Extract preset name from "preset::path" format
+    const [presetName] = selectedPreset.split('::')
+
+    // Find the matching preset to get its default port
+    const matchingPreset = allPresetsData.presets.find(
+      (p) => p.slug === presetName
+    )
+
+    if (matchingPreset && matchingPreset.default_port !== null && matchingPreset.default_port !== undefined) {
+      form.setValue('port', matchingPreset.default_port, {
+        shouldValidate: true,
+        shouldDirty: false, // Don't mark as dirty when auto-setting
+      })
+    }
+  }, [selectedPreset, allPresetsData, form])
 
   // Environment variable management
   const addEnvironmentVariable = () => {
