@@ -25,7 +25,10 @@ use super::{ExternalService, ServiceConfig, ServiceType};
 /// Input configuration for creating an S3/MinIO service
 /// This is what users provide when creating the service
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[schemars(title = "S3/MinIO Configuration", description = "Configuration for S3-compatible storage service (MinIO)")]
+#[schemars(
+    title = "S3/MinIO Configuration",
+    description = "Configuration for S3-compatible storage service (MinIO)"
+)]
 pub struct S3InputConfig {
     /// S3/MinIO port (auto-assigned if not provided)
     #[schemars(example = "example_port")]

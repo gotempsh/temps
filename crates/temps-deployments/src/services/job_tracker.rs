@@ -203,9 +203,7 @@ impl JobTracker for DeploymentJobTracker {
                 ],
             ))
             .await
-            .map_err(|e| {
-                WorkflowError::Other(format!("Failed to cancel pending jobs: {}", e))
-            })?
+            .map_err(|e| WorkflowError::Other(format!("Failed to cancel pending jobs: {}", e)))?
             .rows_affected();
 
         if affected_rows > 0 {

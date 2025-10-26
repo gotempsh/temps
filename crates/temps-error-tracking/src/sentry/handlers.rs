@@ -334,7 +334,7 @@ mod tests {
     async fn create_test_context() -> TestContext {
         use sea_orm::ActiveModelTrait;
         use sea_orm::Set;
-        use temps_entities::{projects, types::ProjectType};
+        use temps_entities::projects;
         use uuid::Uuid;
 
         // Create a test database with migrations

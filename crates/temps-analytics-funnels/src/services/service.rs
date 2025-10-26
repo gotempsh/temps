@@ -768,8 +768,7 @@ mod tests {
     use super::*;
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{
-        deployments, environments, events, projects, types::ProjectType,
-        upstream_config::UpstreamList,
+        deployments, environments, events, projects, upstream_config::UpstreamList,
     };
 
     async fn create_test_project(db: Arc<DatabaseConnection>) -> (i32, i32, i32) {

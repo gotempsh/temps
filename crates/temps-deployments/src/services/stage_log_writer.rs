@@ -26,9 +26,16 @@ impl DeploymentStageLogWriter {
     fn detect_log_level(message: &str) -> LogLevel {
         if message.contains("✅") || message.contains("Complete") || message.contains("success") {
             LogLevel::Success
-        } else if message.contains("❌") || message.contains("Failed") || message.contains("Error") || message.contains("error") {
+        } else if message.contains("❌")
+            || message.contains("Failed")
+            || message.contains("Error")
+            || message.contains("error")
+        {
             LogLevel::Error
-        } else if message.contains("⏳") || message.contains("Waiting") || message.contains("warning") {
+        } else if message.contains("⏳")
+            || message.contains("Waiting")
+            || message.contains("warning")
+        {
             LogLevel::Warning
         } else {
             LogLevel::Info
@@ -72,10 +79,7 @@ mod tests {
         assert_eq!(writer.stage_id(), 123);
 
         // Test writing logs (file will be created automatically)
-        writer
-            .write_log("Test message".to_string())
-            .await
-            .unwrap();
+        writer.write_log("Test message".to_string()).await.unwrap();
         writer
             .write_logs(vec!["Line 1".to_string(), "Line 2".to_string()])
             .await

@@ -14,8 +14,8 @@ mod mod_rs {
 // Re-export main types for easy access
 pub use {
     all_presets, detect_node_framework, detect_preset_from_files, get_preset_by_slug,
-    DockerfileWithArgs, JavaPreset, NixpacksPreset, NixpacksProvider, NodeFramework, PackageManager, Preset,
-    PresetConfig, ProjectType,
+    DockerfileWithArgs, JavaPreset, NixpacksPreset, NixpacksProvider, NodeFramework,
+    PackageManager, Preset, PresetConfig, ProjectType,
 };
 
 #[cfg(test)]
@@ -104,10 +104,16 @@ mod tests {
     #[test]
     fn test_no_preset_for_random_files() {
         // Random files should NOT auto-detect any preset
-        let files = vec!["some-random-file.txt".to_string(), "src/main.rs".to_string()];
+        let files = vec![
+            "some-random-file.txt".to_string(),
+            "src/main.rs".to_string(),
+        ];
         let preset = detect_preset_from_files(&files);
 
-        assert!(preset.is_none(), "Random files should not auto-detect a preset");
+        assert!(
+            preset.is_none(),
+            "Random files should not auto-detect a preset"
+        );
     }
 
     #[test]
@@ -131,7 +137,10 @@ mod tests {
 
     #[test]
     fn test_detect_java_gradle_preset() {
-        let files = vec!["build.gradle".to_string(), "src/main/java/Main.java".to_string()];
+        let files = vec![
+            "build.gradle".to_string(),
+            "src/main/java/Main.java".to_string(),
+        ];
         let preset = detect_preset_from_files(&files);
 
         assert!(preset.is_some());
@@ -140,7 +149,10 @@ mod tests {
 
     #[test]
     fn test_detect_java_gradle_kts_preset() {
-        let files = vec!["build.gradle.kts".to_string(), "src/main/kotlin/Main.kt".to_string()];
+        let files = vec![
+            "build.gradle.kts".to_string(),
+            "src/main/kotlin/Main.kt".to_string(),
+        ];
         let preset = detect_preset_from_files(&files);
 
         assert!(preset.is_some());
@@ -235,10 +247,7 @@ mod tests {
 
     #[test]
     fn test_detect_presets_from_file_tree_dockerfile_priority() {
-        let files = vec![
-            "Dockerfile".to_string(),
-            "next.config.js".to_string(),
-        ];
+        let files = vec!["Dockerfile".to_string(), "next.config.js".to_string()];
         let presets = detect_presets_from_file_tree(&files);
 
         // Dockerfile has higher priority
@@ -248,10 +257,7 @@ mod tests {
 
     #[test]
     fn test_detect_presets_from_file_tree_nixpacks_with_config() {
-        let files = vec![
-            "nixpacks.toml".to_string(),
-            "main.py".to_string(),
-        ];
+        let files = vec!["nixpacks.toml".to_string(), "main.py".to_string()];
         let presets = detect_presets_from_file_tree(&files);
 
         assert_eq!(presets.len(), 1);
@@ -421,7 +427,11 @@ mod tests {
         assert_eq!(get_preset_by_slug("python").unwrap().default_port(), 8000);
         assert_eq!(get_preset_by_slug("vite").unwrap().default_port(), 5173);
         assert_eq!(get_preset_by_slug("nextjs").unwrap().default_port(), 3000); // Default
-        assert_eq!(get_preset_by_slug("docusaurus").unwrap().default_port(), 3000); // Default
-        assert_eq!(get_preset_by_slug("rsbuild").unwrap().default_port(), 3000); // Default
+        assert_eq!(
+            get_preset_by_slug("docusaurus").unwrap().default_port(),
+            3000
+        ); // Default
+        assert_eq!(get_preset_by_slug("rsbuild").unwrap().default_port(), 3000);
+        // Default
     }
 }

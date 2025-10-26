@@ -708,10 +708,16 @@ pub async fn update_project_deployment_config(
         updated_fields.insert("automatic_deploy".to_string(), "updated".to_string());
     }
     if config.performance_metrics_enabled.is_some() {
-        updated_fields.insert("performance_metrics_enabled".to_string(), "updated".to_string());
+        updated_fields.insert(
+            "performance_metrics_enabled".to_string(),
+            "updated".to_string(),
+        );
     }
     if config.session_recording_enabled.is_some() {
-        updated_fields.insert("session_recording_enabled".to_string(), "updated".to_string());
+        updated_fields.insert(
+            "session_recording_enabled".to_string(),
+            "updated".to_string(),
+        );
     }
     if config.replicas.is_some() {
         updated_fields.insert("replicas".to_string(), "updated".to_string());
@@ -933,11 +939,7 @@ pub async fn list_presets(RequireAuth(_auth): RequireAuth) -> Result<impl IntoRe
                     "static",
                 ),
                 Preset::Rsbuild => ("Rsbuild", "Fast Rspack-based build tool", "static"),
-                Preset::Python => (
-                    "Python",
-                    "Python web applications and services",
-                    "server",
-                ),
+                Preset::Python => ("Python", "Python web applications and services", "server"),
                 Preset::FastApi => (
                     "FastAPI",
                     "Modern, fast web framework for building APIs with Python",
@@ -989,11 +991,7 @@ pub async fn list_presets(RequireAuth(_auth): RequireAuth) -> Result<impl IntoRe
                     "JavaScript runtime built on Chrome's V8 engine",
                     "server",
                 ),
-                Preset::Java => (
-                    "Java",
-                    "Java web applications and services",
-                    "server",
-                ),
+                Preset::Java => ("Java", "Java web applications and services", "server"),
             };
 
             // Generate relative icon URL

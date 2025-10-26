@@ -1453,11 +1453,19 @@ mod tests {
 
         // Pre-populate container logs with structured logs
         log_service
-            .append_structured_log(container_id, temps_logs::LogLevel::Info, "Container log line 1")
+            .append_structured_log(
+                container_id,
+                temps_logs::LogLevel::Info,
+                "Container log line 1",
+            )
             .await
             .expect("Failed to write container log");
         log_service
-            .append_structured_log(container_id, temps_logs::LogLevel::Info, "Container log line 2")
+            .append_structured_log(
+                container_id,
+                temps_logs::LogLevel::Info,
+                "Container log line 2",
+            )
             .await
             .expect("Failed to write container log");
 
@@ -1722,11 +1730,19 @@ mod tests {
 
         // Pre-populate logs for both containers with structured logs
         log_service
-            .append_structured_log(container1_id, temps_logs::LogLevel::Info, "Web container log 1")
+            .append_structured_log(
+                container1_id,
+                temps_logs::LogLevel::Info,
+                "Web container log 1",
+            )
             .await
             .expect("Failed to write container 1 log");
         log_service
-            .append_structured_log(container2_id, temps_logs::LogLevel::Info, "DB container log 1")
+            .append_structured_log(
+                container2_id,
+                temps_logs::LogLevel::Info,
+                "DB container log 1",
+            )
             .await
             .expect("Failed to write container 2 log");
 

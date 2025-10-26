@@ -109,7 +109,11 @@ impl StructuredLogService {
     }
 
     /// Append a log entry to a JSONL file
-    pub async fn append_log(&self, log_id: &str, mut entry: LogEntry) -> Result<(), std::io::Error> {
+    pub async fn append_log(
+        &self,
+        log_id: &str,
+        mut entry: LogEntry,
+    ) -> Result<(), std::io::Error> {
         let log_path = self.get_log_path(log_id);
 
         // Ensure parent directory exists
@@ -261,12 +265,18 @@ mod tests {
             .unwrap();
 
         service
-            .append_log("test", LogEntry::new(LogLevel::Success, "Container created"))
+            .append_log(
+                "test",
+                LogEntry::new(LogLevel::Success, "Container created"),
+            )
             .await
             .unwrap();
 
         service
-            .append_log("test", LogEntry::new(LogLevel::Warning, "Waiting for ready"))
+            .append_log(
+                "test",
+                LogEntry::new(LogLevel::Warning, "Waiting for ready"),
+            )
             .await
             .unwrap();
 
@@ -294,22 +304,34 @@ mod tests {
 
         // Create test logs
         service
-            .append_log("search_test", LogEntry::new(LogLevel::Info, "Deploying container image"))
+            .append_log(
+                "search_test",
+                LogEntry::new(LogLevel::Info, "Deploying container image"),
+            )
             .await
             .unwrap();
 
         service
-            .append_log("search_test", LogEntry::new(LogLevel::Success, "Container is running"))
+            .append_log(
+                "search_test",
+                LogEntry::new(LogLevel::Success, "Container is running"),
+            )
             .await
             .unwrap();
 
         service
-            .append_log("search_test", LogEntry::new(LogLevel::Error, "Container failed to start"))
+            .append_log(
+                "search_test",
+                LogEntry::new(LogLevel::Error, "Container failed to start"),
+            )
             .await
             .unwrap();
 
         // Search for "container" (case-insensitive)
-        let results = service.search_logs("search_test", "container").await.unwrap();
+        let results = service
+            .search_logs("search_test", "container")
+            .await
+            .unwrap();
 
         assert_eq!(results.len(), 3); // All 3 contain "container"
 
@@ -326,7 +348,10 @@ mod tests {
         assert_eq!(results[0].level, LogLevel::Error);
 
         // Case insensitive search
-        let results = service.search_logs("search_test", "DEPLOYING").await.unwrap();
+        let results = service
+            .search_logs("search_test", "DEPLOYING")
+            .await
+            .unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message, "Deploying container image");
@@ -339,44 +364,71 @@ mod tests {
 
         // Create mixed level logs
         service
-            .append_log("filter_test", LogEntry::new(LogLevel::Info, "Info message 1"))
+            .append_log(
+                "filter_test",
+                LogEntry::new(LogLevel::Info, "Info message 1"),
+            )
             .await
             .unwrap();
 
         service
-            .append_log("filter_test", LogEntry::new(LogLevel::Success, "Success message"))
+            .append_log(
+                "filter_test",
+                LogEntry::new(LogLevel::Success, "Success message"),
+            )
             .await
             .unwrap();
 
         service
-            .append_log("filter_test", LogEntry::new(LogLevel::Info, "Info message 2"))
+            .append_log(
+                "filter_test",
+                LogEntry::new(LogLevel::Info, "Info message 2"),
+            )
             .await
             .unwrap();
 
         service
-            .append_log("filter_test", LogEntry::new(LogLevel::Error, "Error message"))
+            .append_log(
+                "filter_test",
+                LogEntry::new(LogLevel::Error, "Error message"),
+            )
             .await
             .unwrap();
 
         service
-            .append_log("filter_test", LogEntry::new(LogLevel::Warning, "Warning message"))
+            .append_log(
+                "filter_test",
+                LogEntry::new(LogLevel::Warning, "Warning message"),
+            )
             .await
             .unwrap();
 
         // Filter by Info
-        let info_logs = service.filter_by_level("filter_test", LogLevel::Info).await.unwrap();
+        let info_logs = service
+            .filter_by_level("filter_test", LogLevel::Info)
+            .await
+            .unwrap();
         assert_eq!(info_logs.len(), 2);
 
         // Filter by Success
-        let success_logs = service.filter_by_level("filter_test", LogLevel::Success).await.unwrap();
+        let success_logs = service
+            .filter_by_level("filter_test", LogLevel::Success)
+            .await
+            .unwrap();
         assert_eq!(success_logs.len(), 1);
 
         // Filter by Error
-        let error_logs = service.filter_by_level("filter_test", LogLevel::Error).await.unwrap();
+        let error_logs = service
+            .filter_by_level("filter_test", LogLevel::Error)
+            .await
+            .unwrap();
         assert_eq!(error_logs.len(), 1);
 
         // Filter by Warning
-        let warning_logs = service.filter_by_level("filter_test", LogLevel::Warning).await.unwrap();
+        let warning_logs = service
+            .filter_by_level("filter_test", LogLevel::Warning)
+            .await
+            .unwrap();
         assert_eq!(warning_logs.len(), 1);
     }
 
@@ -391,8 +443,8 @@ mod tests {
             "status": "healthy"
         });
 
-        let entry = LogEntry::new(LogLevel::Info, "Container deployed")
-            .with_metadata(metadata.clone());
+        let entry =
+            LogEntry::new(LogLevel::Info, "Container deployed").with_metadata(metadata.clone());
 
         service.append_log("metadata_test", entry).await.unwrap();
 
@@ -413,17 +465,32 @@ mod tests {
 
         // Simulate the deployment log from your screenshot
         service
-            .append_log("deploy", LogEntry::new(LogLevel::Info, "Deploying container image..."))
+            .append_log(
+                "deploy",
+                LogEntry::new(LogLevel::Info, "Deploying container image..."),
+            )
             .await
             .unwrap();
 
         service
-            .append_log("deploy", LogEntry::new(LogLevel::Info, "Detected EXPOSE directive in image: port 3000"))
+            .append_log(
+                "deploy",
+                LogEntry::new(
+                    LogLevel::Info,
+                    "Detected EXPOSE directive in image: port 3000",
+                ),
+            )
             .await
             .unwrap();
 
         service
-            .append_log("deploy", LogEntry::new(LogLevel::Info, "Detected EXPOSE directive in container: port 3000"))
+            .append_log(
+                "deploy",
+                LogEntry::new(
+                    LogLevel::Info,
+                    "Detected EXPOSE directive in container: port 3000",
+                ),
+            )
             .await
             .unwrap();
 
@@ -433,22 +500,34 @@ mod tests {
             .unwrap();
 
         service
-            .append_log("deploy", LogEntry::new(LogLevel::Warning, "Waiting for container to start..."))
+            .append_log(
+                "deploy",
+                LogEntry::new(LogLevel::Warning, "Waiting for container to start..."),
+            )
             .await
             .unwrap();
 
         service
-            .append_log("deploy", LogEntry::new(LogLevel::Success, "Container is running"))
+            .append_log(
+                "deploy",
+                LogEntry::new(LogLevel::Success, "Container is running"),
+            )
             .await
             .unwrap();
 
         service
-            .append_log("deploy", LogEntry::new(LogLevel::Warning, "Waiting for application to be ready..."))
+            .append_log(
+                "deploy",
+                LogEntry::new(LogLevel::Warning, "Waiting for application to be ready..."),
+            )
             .await
             .unwrap();
 
         service
-            .append_log("deploy", LogEntry::new(LogLevel::Info, "Health check URL: http://localhost:56521/"))
+            .append_log(
+                "deploy",
+                LogEntry::new(LogLevel::Info, "Health check URL: http://localhost:56521/"),
+            )
             .await
             .unwrap();
 
@@ -458,12 +537,24 @@ mod tests {
             .unwrap();
 
         service
-            .append_log("deploy", LogEntry::new(LogLevel::Success, "Connectivity check passed - server responding with status 200 OK (1/2)"))
+            .append_log(
+                "deploy",
+                LogEntry::new(
+                    LogLevel::Success,
+                    "Connectivity check passed - server responding with status 200 OK (1/2)",
+                ),
+            )
             .await
             .unwrap();
 
         service
-            .append_log("deploy", LogEntry::new(LogLevel::Success, "Connectivity check passed - server responding with status 200 OK (2/2)"))
+            .append_log(
+                "deploy",
+                LogEntry::new(
+                    LogLevel::Success,
+                    "Connectivity check passed - server responding with status 200 OK (2/2)",
+                ),
+            )
             .await
             .unwrap();
 
@@ -482,10 +573,16 @@ mod tests {
         assert_eq!(localhost_results.len(), 2); // Health check URL + error message
 
         // Filter by level
-        let successes = service.filter_by_level("deploy", LogLevel::Success).await.unwrap();
+        let successes = service
+            .filter_by_level("deploy", LogLevel::Success)
+            .await
+            .unwrap();
         assert_eq!(successes.len(), 4);
 
-        let errors = service.filter_by_level("deploy", LogLevel::Error).await.unwrap();
+        let errors = service
+            .filter_by_level("deploy", LogLevel::Error)
+            .await
+            .unwrap();
         assert_eq!(errors.len(), 1);
     }
 }

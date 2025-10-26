@@ -84,11 +84,27 @@ impl MarkDeploymentCompleteJob {
 
     /// Detect log level from message content
     fn detect_log_level(message: &str) -> LogLevel {
-        if message.contains("✅") || message.contains("🎉") || message.contains("Complete") || message.contains("success") {
+        if message.contains("✅")
+            || message.contains("🎉")
+            || message.contains("Complete")
+            || message.contains("success")
+        {
             LogLevel::Success
-        } else if message.contains("❌") || message.contains("⚠️") || message.contains("Failed") || message.contains("Error") || message.contains("error") {
+        } else if message.contains("❌")
+            || message.contains("⚠️")
+            || message.contains("Failed")
+            || message.contains("Error")
+            || message.contains("error")
+        {
             LogLevel::Error
-        } else if message.contains("⏳") || message.contains("🔄") || message.contains("🛑") || message.contains("Waiting") || message.contains("warning") || message.contains("Checking") || message.contains("Cancelling") {
+        } else if message.contains("⏳")
+            || message.contains("🔄")
+            || message.contains("🛑")
+            || message.contains("Waiting")
+            || message.contains("warning")
+            || message.contains("Checking")
+            || message.contains("Cancelling")
+        {
             LogLevel::Warning
         } else {
             LogLevel::Info
@@ -130,7 +146,9 @@ impl MarkDeploymentCompleteJob {
         }
 
         // Extract static_dir_location from deploy_static job output
-        if let Ok(Some(static_dir)) = context.get_output::<String>("deploy_static", "static_dir_location") {
+        if let Ok(Some(static_dir)) =
+            context.get_output::<String>("deploy_static", "static_dir_location")
+        {
             debug!("Setting deployment static_dir_location to: {}", static_dir);
             self.log(format!("📁 Static files location: {}", static_dir))
                 .await?;
@@ -182,7 +200,9 @@ impl MarkDeploymentCompleteJob {
                         .ok()
                         .flatten()
                         .map(|name| format!("{}-{}", name, index + 1))
-                        .unwrap_or_else(|| format!("container-{}-{}", self.deployment_id, index + 1))
+                        .unwrap_or_else(|| {
+                            format!("container-{}-{}", self.deployment_id, index + 1)
+                        })
                 } else {
                     // Single replica: use original name
                     context
@@ -321,10 +341,12 @@ impl MarkDeploymentCompleteJob {
         let previous_deployments = match deployments::Entity::find()
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
             .filter(deployments::Column::Id.ne(self.deployment_id))
-            .filter(
-                deployments::Column::State
-                    .is_in(vec!["pending", "running", "built", "completed"]),
-            )
+            .filter(deployments::Column::State.is_in(vec![
+                "pending",
+                "running",
+                "built",
+                "completed",
+            ]))
             .all(self.db.as_ref())
             .await
         {
@@ -397,16 +419,23 @@ impl MarkDeploymentCompleteJob {
                 }
 
                 // Remove container from Docker
-                match self.container_deployer.remove_container(&container_id).await {
+                match self
+                    .container_deployer
+                    .remove_container(&container_id)
+                    .await
+                {
                     Ok(_) => {
                         self.log(format!("Removed container {}", container_id))
                             .await
                             .ok();
                     }
                     Err(e) => {
-                        self.log(format!("Failed to remove container {}: {}", container_id, e))
-                            .await
-                            .ok();
+                        self.log(format!(
+                            "Failed to remove container {}: {}",
+                            container_id, e
+                        ))
+                        .await
+                        .ok();
                     }
                 }
 
@@ -562,7 +591,10 @@ impl MarkDeploymentCompleteJobBuilder {
         self
     }
 
-    pub fn container_deployer(mut self, container_deployer: Arc<dyn temps_deployer::ContainerDeployer>) -> Self {
+    pub fn container_deployer(
+        mut self,
+        container_deployer: Arc<dyn temps_deployer::ContainerDeployer>,
+    ) -> Self {
         self.container_deployer = Some(container_deployer);
         self
     }

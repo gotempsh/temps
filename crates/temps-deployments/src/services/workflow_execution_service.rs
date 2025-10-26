@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use temps_core::{WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor};
 use temps_database::DbConnection;
-use temps_deployer::{ContainerDeployer, ImageBuilder, static_deployer::StaticDeployer};
+use temps_deployer::{static_deployer::StaticDeployer, ContainerDeployer, ImageBuilder};
 use temps_entities::{deployment_jobs, deployments, environments, projects};
 use temps_git::GitProviderManagerTrait;
 use temps_logs::LogService;
@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::jobs::{
     BuildImageJobBuilder, ConfigureCronsJobBuilder, CronConfigService, DeployImageJobBuilder,
-    DeploymentTarget, DeployStaticJob, DownloadRepoBuilder,
+    DeployStaticJob, DeploymentTarget, DownloadRepoBuilder,
 };
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
@@ -182,9 +182,7 @@ impl WorkflowExecutionService {
 
                 // NOW teardown previous deployment for zero-downtime deployment
                 // This happens AFTER the new deployment is fully running
-                info!(
-                    "Checking for previous deployments to teardown after successful deployment"
-                );
+                info!("Checking for previous deployments to teardown after successful deployment");
                 match self
                     .teardown_previous_deployment(
                         deployment.project_id,
@@ -830,10 +828,7 @@ impl WorkflowExecutionService {
 
         active_deployment.update(self.db.as_ref()).await?;
 
-        info!(
-            "Updated deployment {} with workflow outputs",
-            deployment_id
-        );
+        info!("Updated deployment {} with workflow outputs", deployment_id);
         Ok(())
     }
 
@@ -1195,7 +1190,10 @@ mod tests {
         async fn deploy(
             &self,
             _request: temps_deployer::static_deployer::StaticDeployRequest,
-        ) -> Result<temps_deployer::static_deployer::StaticDeployResult, temps_deployer::static_deployer::StaticDeployError> {
+        ) -> Result<
+            temps_deployer::static_deployer::StaticDeployResult,
+            temps_deployer::static_deployer::StaticDeployError,
+        > {
             Ok(temps_deployer::static_deployer::StaticDeployResult {
                 storage_path: "/tmp/test-deployment".to_string(),
                 file_count: 10,
@@ -1209,7 +1207,10 @@ mod tests {
             _project_slug: &str,
             _environment_slug: &str,
             _deployment_slug: &str,
-        ) -> Result<temps_deployer::static_deployer::StaticDeploymentInfo, temps_deployer::static_deployer::StaticDeployError> {
+        ) -> Result<
+            temps_deployer::static_deployer::StaticDeploymentInfo,
+            temps_deployer::static_deployer::StaticDeployError,
+        > {
             Ok(temps_deployer::static_deployer::StaticDeploymentInfo {
                 deployment_slug: "test-deployment".to_string(),
                 storage_path: std::path::PathBuf::from("/tmp/test-deployment"),
@@ -1224,7 +1225,10 @@ mod tests {
             _project_slug: &str,
             _environment_slug: &str,
             _deployment_slug: &str,
-        ) -> Result<Vec<temps_deployer::static_deployer::FileInfo>, temps_deployer::static_deployer::StaticDeployError> {
+        ) -> Result<
+            Vec<temps_deployer::static_deployer::FileInfo>,
+            temps_deployer::static_deployer::StaticDeployError,
+        > {
             Ok(vec![])
         }
 

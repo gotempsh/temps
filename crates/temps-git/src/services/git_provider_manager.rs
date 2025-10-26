@@ -2297,15 +2297,15 @@ impl GitProviderManager {
         let target_branch = branch.unwrap_or_else(|| repository.default_branch.clone());
 
         // Get preset cache and extract data for the specific branch
-        let preset_data = repository
-            .preset
-            .as_ref()
-            .and_then(|json_cache| {
-                // Deserialize Json to RepositoryPresetCache
-                let cache: repositories::RepositoryPresetCache =
-                    serde_json::from_value(json_cache.clone()).ok()?;
-                cache.branches.get(&target_branch).map(|branch_data| json!(branch_data))
-            });
+        let preset_data = repository.preset.as_ref().and_then(|json_cache| {
+            // Deserialize Json to RepositoryPresetCache
+            let cache: repositories::RepositoryPresetCache =
+                serde_json::from_value(json_cache.clone()).ok()?;
+            cache
+                .branches
+                .get(&target_branch)
+                .map(|branch_data| json!(branch_data))
+        });
 
         Ok(preset_data)
     }
@@ -2395,8 +2395,12 @@ impl GitProviderManager {
         );
 
         // Serialize cache to Json for database storage
-        let preset_json = serde_json::to_value(&preset_cache)
-            .map_err(|e| GitProviderManagerError::InvalidConfiguration(format!("Failed to serialize preset cache: {}", e)))?;
+        let preset_json = serde_json::to_value(&preset_cache).map_err(|e| {
+            GitProviderManagerError::InvalidConfiguration(format!(
+                "Failed to serialize preset cache: {}",
+                e
+            ))
+        })?;
 
         // Update repository with new cache
         let mut repo_update: repositories::ActiveModel = repository.clone().into();
@@ -2422,10 +2426,7 @@ impl GitProviderManager {
             .into_iter()
             .map(|preset| {
                 // Parse preset slug to get metadata from entity enum
-                let preset_enum = preset
-                    .slug
-                    .parse::<temps_entities::preset::Preset>()
-                    .ok();
+                let preset_enum = preset.slug.parse::<temps_entities::preset::Preset>().ok();
 
                 let exposed_port = preset_enum
                     .as_ref()

@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod e2e_static_tests {
     use anyhow::Result;
-    use sea_orm::ActiveValue::Set;
     use sea_orm::ActiveModelTrait;
+    use sea_orm::ActiveValue::Set;
     use std::fs as std_fs;
     use std::io::Write;
     use temps_database::test_utils::TestDatabase;
@@ -22,8 +22,8 @@ mod e2e_static_tests {
 
         // Step 2: Create static directory with files
         println!("\n📂 Step 2: Creating static files directory");
-        let temp_dir = std::env::temp_dir()
-            .join(format!("temps-e2e-test-{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("temps-e2e-test-{}", uuid::Uuid::new_v4()));
         std_fs::create_dir_all(&temp_dir)?;
         std_fs::create_dir_all(temp_dir.join("assets"))?;
         println!("   📁 Created: {}", temp_dir.display());
@@ -62,10 +62,8 @@ mod e2e_static_tests {
 
         // Step 4: Update deployment with static_dir_location
         println!("\n⚙️  Step 4: Configuring static deployment");
-        let mut deployment_active: temps_entities::deployments::ActiveModel =
-            deployment.into();
-        deployment_active.static_dir_location =
-            Set(Some(temp_dir.to_string_lossy().to_string()));
+        let mut deployment_active: temps_entities::deployments::ActiveModel = deployment.into();
+        deployment_active.static_dir_location = Set(Some(temp_dir.to_string_lossy().to_string()));
         deployment_active.state = Set("deployed".to_string());
         let deployment = deployment_active.update(db.as_ref()).await?;
         println!(
@@ -84,8 +82,8 @@ mod e2e_static_tests {
         let static_location = deployment.static_dir_location.as_ref().unwrap();
 
         // Test 1: Root path -> index.html
-        let index_content = tokio::fs::read_to_string(format!("{}/index.html", static_location))
-            .await?;
+        let index_content =
+            tokio::fs::read_to_string(format!("{}/index.html", static_location)).await?;
         assert!(index_content.contains("<title>Vite App</title>"));
         println!("   ✅ GET / → index.html ({}  bytes)", index_content.len());
 

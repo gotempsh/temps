@@ -12,9 +12,7 @@ impl MigrationTrait for Migration {
                 Table::alter()
                     .table(Alias::new("external_services"))
                     .add_column(
-                        ColumnDef::new(Alias::new("config"))
-                            .text()
-                            .null(), // Nullable for existing rows
+                        ColumnDef::new(Alias::new("config")).text().null(), // Nullable for existing rows
                     )
                     .to_owned(),
             )
@@ -22,7 +20,11 @@ impl MigrationTrait for Migration {
 
         // Drop external_service_params table (no longer needed)
         manager
-            .drop_table(Table::drop().table(Alias::new("external_service_params")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("external_service_params"))
+                    .to_owned(),
+            )
             .await?;
 
         Ok(())

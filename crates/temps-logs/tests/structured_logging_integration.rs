@@ -2,8 +2,8 @@
 //!
 //! Demonstrates how existing code can use structured logging with minimal changes
 
-use temps_logs::{LogLevel, LogService};
 use tempfile::TempDir;
+use temps_logs::{LogLevel, LogService};
 
 #[tokio::test]
 async fn test_structured_logging_api() {
@@ -57,7 +57,10 @@ async fn test_new_structured_logging_api() {
         .unwrap();
 
     service
-        .log_success("deploy-456", "Connectivity check passed - server responding with status 200 OK")
+        .log_success(
+            "deploy-456",
+            "Connectivity check passed - server responding with status 200 OK",
+        )
         .await
         .unwrap();
 
@@ -85,23 +88,56 @@ async fn test_search_functionality() {
     let service = LogService::new(temp_dir.path().to_path_buf());
 
     // Simulate deployment log from your screenshot
-    service.log_info("search-test", "Deploying container image...").await.unwrap();
-    service.log_info("search-test", "Detected EXPOSE directive in image: port 3000").await.unwrap();
-    service.log_success("search-test", "Container is running").await.unwrap();
-    service.log_info("search-test", "Health check URL: http://localhost:56521/").await.unwrap();
-    service.log_error("search-test", "Connectivity check failed (error sending request)").await.unwrap();
-    service.log_success("search-test", "Connectivity check passed").await.unwrap();
+    service
+        .log_info("search-test", "Deploying container image...")
+        .await
+        .unwrap();
+    service
+        .log_info(
+            "search-test",
+            "Detected EXPOSE directive in image: port 3000",
+        )
+        .await
+        .unwrap();
+    service
+        .log_success("search-test", "Container is running")
+        .await
+        .unwrap();
+    service
+        .log_info("search-test", "Health check URL: http://localhost:56521/")
+        .await
+        .unwrap();
+    service
+        .log_error(
+            "search-test",
+            "Connectivity check failed (error sending request)",
+        )
+        .await
+        .unwrap();
+    service
+        .log_success("search-test", "Connectivity check passed")
+        .await
+        .unwrap();
 
     // Search for "container"
-    let results = service.search_structured_logs("search-test", "container").await.unwrap();
+    let results = service
+        .search_structured_logs("search-test", "container")
+        .await
+        .unwrap();
     assert_eq!(results.len(), 2); // "Deploying container", "Container is running"
 
     // Search for "check"
-    let results = service.search_structured_logs("search-test", "check").await.unwrap();
+    let results = service
+        .search_structured_logs("search-test", "check")
+        .await
+        .unwrap();
     assert_eq!(results.len(), 3); // Health check, failed check, passed check
 
     // Search for "failed"
-    let results = service.search_structured_logs("search-test", "failed").await.unwrap();
+    let results = service
+        .search_structured_logs("search-test", "failed")
+        .await
+        .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].level, LogLevel::Error);
 }
@@ -113,9 +149,15 @@ async fn test_filter_by_level() {
 
     // Create mixed-level logs
     service.log_info("filter-test", "Info 1").await.unwrap();
-    service.log_success("filter-test", "Success 1").await.unwrap();
+    service
+        .log_success("filter-test", "Success 1")
+        .await
+        .unwrap();
     service.log_error("filter-test", "Error 1").await.unwrap();
-    service.log_warning("filter-test", "Warning 1").await.unwrap();
+    service
+        .log_warning("filter-test", "Warning 1")
+        .await
+        .unwrap();
     service.log_info("filter-test", "Info 2").await.unwrap();
     service.log_error("filter-test", "Error 2").await.unwrap();
 
@@ -201,18 +243,42 @@ async fn test_real_world_deployment_scenario() {
     let log_id = "deployment-789";
 
     // Simulate a real deployment workflow (like your screenshot)
-    service.log_info(log_id, "🚀 Deploying container image...").await.unwrap();
-    service.log_info(log_id, "Detected EXPOSE directive in image: port 3000").await.unwrap();
-    service.log_info(log_id, "Detected EXPOSE directive in container: port 3000").await.unwrap();
+    service
+        .log_info(log_id, "🚀 Deploying container image...")
+        .await
+        .unwrap();
+    service
+        .log_info(log_id, "Detected EXPOSE directive in image: port 3000")
+        .await
+        .unwrap();
+    service
+        .log_info(log_id, "Detected EXPOSE directive in container: port 3000")
+        .await
+        .unwrap();
 
     let deployment_id = "1e6b4d9dc408dd4cd2859be27f4b7e1162ce4ce7b3d1ec99203ec8f4fe71e6cc57";
-    service.log_success(log_id, format!("Deployment created: {}", deployment_id)).await.unwrap();
+    service
+        .log_success(log_id, format!("Deployment created: {}", deployment_id))
+        .await
+        .unwrap();
 
-    service.log_warning(log_id, "⏳ Waiting for container to start...").await.unwrap();
-    service.log_success(log_id, "✓ Container is running").await.unwrap();
-    service.log_warning(log_id, "⏳ Waiting for application to be ready...").await.unwrap();
+    service
+        .log_warning(log_id, "⏳ Waiting for container to start...")
+        .await
+        .unwrap();
+    service
+        .log_success(log_id, "✓ Container is running")
+        .await
+        .unwrap();
+    service
+        .log_warning(log_id, "⏳ Waiting for application to be ready...")
+        .await
+        .unwrap();
 
-    service.log_info(log_id, "Health check URL: http://localhost:56521/").await.unwrap();
+    service
+        .log_info(log_id, "Health check URL: http://localhost:56521/")
+        .await
+        .unwrap();
     service
         .log_error(
             log_id,
@@ -221,24 +287,45 @@ async fn test_real_world_deployment_scenario() {
         .await
         .unwrap();
 
-    service.log_success(log_id, "Connectivity check passed - server responding with status 200 OK (1/2)").await.unwrap();
-    service.log_success(log_id, "Connectivity check passed - server responding with status 200 OK (2/2)").await.unwrap();
+    service
+        .log_success(
+            log_id,
+            "Connectivity check passed - server responding with status 200 OK (1/2)",
+        )
+        .await
+        .unwrap();
+    service
+        .log_success(
+            log_id,
+            "Connectivity check passed - server responding with status 200 OK (2/2)",
+        )
+        .await
+        .unwrap();
 
     // Read all logs
     let logs = service.get_structured_logs(log_id).await.unwrap();
     assert_eq!(logs.len(), 11);
 
     // Search for connectivity issues
-    let connectivity_logs = service.search_structured_logs(log_id, "connectivity").await.unwrap();
+    let connectivity_logs = service
+        .search_structured_logs(log_id, "connectivity")
+        .await
+        .unwrap();
     assert_eq!(connectivity_logs.len(), 3);
 
     // Filter errors
-    let errors = service.filter_structured_logs_by_level(log_id, LogLevel::Error).await.unwrap();
+    let errors = service
+        .filter_structured_logs_by_level(log_id, LogLevel::Error)
+        .await
+        .unwrap();
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message.contains("failed"));
 
     // Filter successes
-    let successes = service.filter_structured_logs_by_level(log_id, LogLevel::Success).await.unwrap();
+    let successes = service
+        .filter_structured_logs_by_level(log_id, LogLevel::Success)
+        .await
+        .unwrap();
     assert_eq!(successes.len(), 4);
 
     // Backend returns JSON - frontend will handle rendering

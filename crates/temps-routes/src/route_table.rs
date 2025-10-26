@@ -899,18 +899,24 @@ mod tests {
     #[test]
     fn test_backend_type_upstream() {
         let backend = BackendType::Upstream {
-            addresses: vec![
-                "127.0.0.1:8080".to_string(),
-                "127.0.0.1:8081".to_string(),
-            ],
+            addresses: vec!["127.0.0.1:8080".to_string(), "127.0.0.1:8081".to_string()],
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
         };
 
         assert!(!backend.is_static());
         assert_eq!(backend.static_dir(), None);
-        assert_eq!(backend.get_backend_addr(), Some("127.0.0.1:8080".to_string()));
-        assert_eq!(backend.get_backend_addr(), Some("127.0.0.1:8081".to_string()));
-        assert_eq!(backend.get_backend_addr(), Some("127.0.0.1:8080".to_string())); // Wraps
+        assert_eq!(
+            backend.get_backend_addr(),
+            Some("127.0.0.1:8080".to_string())
+        );
+        assert_eq!(
+            backend.get_backend_addr(),
+            Some("127.0.0.1:8081".to_string())
+        );
+        assert_eq!(
+            backend.get_backend_addr(),
+            Some("127.0.0.1:8080".to_string())
+        ); // Wraps
     }
 
     #[test]
@@ -933,7 +939,10 @@ mod tests {
 
         assert!(!backend.is_static());
         // Should return fallback address for empty upstream list
-        assert_eq!(backend.get_backend_addr(), Some("127.0.0.1:8080".to_string()));
+        assert_eq!(
+            backend.get_backend_addr(),
+            Some("127.0.0.1:8080".to_string())
+        );
     }
 
     #[test]
@@ -944,9 +953,18 @@ mod tests {
         };
 
         // Should always return the same address for single upstream
-        assert_eq!(backend.get_backend_addr(), Some("192.168.1.100:3000".to_string()));
-        assert_eq!(backend.get_backend_addr(), Some("192.168.1.100:3000".to_string()));
-        assert_eq!(backend.get_backend_addr(), Some("192.168.1.100:3000".to_string()));
+        assert_eq!(
+            backend.get_backend_addr(),
+            Some("192.168.1.100:3000".to_string())
+        );
+        assert_eq!(
+            backend.get_backend_addr(),
+            Some("192.168.1.100:3000".to_string())
+        );
+        assert_eq!(
+            backend.get_backend_addr(),
+            Some("192.168.1.100:3000".to_string())
+        );
     }
 
     #[test]

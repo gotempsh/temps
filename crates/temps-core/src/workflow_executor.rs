@@ -125,9 +125,15 @@ impl WorkflowExecutor {
 
                 // Cancel all pending jobs via job tracker
                 if let Some(ref tracker) = self.job_tracker {
-                    warn!("🧹 Cancelling all pending jobs in workflow {}", config.workflow_run_id);
+                    warn!(
+                        "🧹 Cancelling all pending jobs in workflow {}",
+                        config.workflow_run_id
+                    );
                     if let Err(e) = tracker
-                        .cancel_pending_jobs(&config.workflow_run_id, "Workflow cancelled by user".to_string())
+                        .cancel_pending_jobs(
+                            &config.workflow_run_id,
+                            "Workflow cancelled by user".to_string(),
+                        )
                         .await
                     {
                         error!("Failed to cancel pending jobs: {}", e);
@@ -231,10 +237,16 @@ impl WorkflowExecutor {
                                 let cancel_reason = format!(
                                     "Required job '{}' failed: {}",
                                     job_id,
-                                    result.message.as_ref().unwrap_or(&"Unknown error".to_string())
+                                    result
+                                        .message
+                                        .as_ref()
+                                        .unwrap_or(&"Unknown error".to_string())
                                 );
 
-                                if let Err(e) = tracker.cancel_pending_jobs(&config.workflow_run_id, cancel_reason).await {
+                                if let Err(e) = tracker
+                                    .cancel_pending_jobs(&config.workflow_run_id, cancel_reason)
+                                    .await
+                                {
                                     error!("Failed to cancel pending jobs: {}", e);
                                 } else {
                                     info!("Cancelled all pending jobs due to required job failure");
@@ -506,10 +518,19 @@ impl WorkflowExecutor {
                             }
 
                             // Call cleanup if job was cancelled or failed
-                            if matches!(job_result.status, crate::JobStatus::Failure | crate::JobStatus::Cancelled) {
-                                warn!("🧹 Calling cleanup for job '{}' due to {:?} status", job_id_clone, job_result.status);
+                            if matches!(
+                                job_result.status,
+                                crate::JobStatus::Failure | crate::JobStatus::Cancelled
+                            ) {
+                                warn!(
+                                    "🧹 Calling cleanup for job '{}' due to {:?} status",
+                                    job_id_clone, job_result.status
+                                );
                                 if let Err(cleanup_err) = job.cleanup(&job_result.context).await {
-                                    error!("Failed to cleanup job '{}': {}", job_id_clone, cleanup_err);
+                                    error!(
+                                        "Failed to cleanup job '{}': {}",
+                                        job_id_clone, cleanup_err
+                                    );
                                 }
                             }
 
@@ -521,7 +542,10 @@ impl WorkflowExecutor {
 
                             // Log the error to the job's context so it appears in the job logs
                             if let Err(log_err) = error_context.log(&error_msg).await {
-                                error!("Failed to log error for job '{}': {}", job_id_clone, log_err);
+                                error!(
+                                    "Failed to log error for job '{}': {}",
+                                    job_id_clone, log_err
+                                );
                             }
 
                             // Call cleanup on job failure

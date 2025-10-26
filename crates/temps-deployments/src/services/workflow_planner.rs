@@ -285,10 +285,7 @@ impl WorkflowPlanner {
             };
 
             let created_job = job_record.insert(self.db.as_ref()).await?;
-            debug!(
-                "Created job: {} ({})",
-                created_job.name, created_job.job_id
-            );
+            debug!("Created job: {} ({})", created_job.name, created_job.job_id);
             created_jobs.push(created_job);
         }
 
@@ -491,7 +488,10 @@ impl WorkflowPlanner {
             "deploy_static".to_string()
         } else {
             // Container deployment path: BuildImageJob + DeployImageJob
-            debug!("🐳 Using container deployment for preset {}", project.preset);
+            debug!(
+                "🐳 Using container deployment for preset {}",
+                project.preset
+            );
 
             // Convert environment variables to build args
             let mut build_args_map = serde_json::Map::new();
@@ -534,7 +534,10 @@ impl WorkflowPlanner {
                 .resolve_exposed_port(environment, project, Some(&image_name))
                 .await;
 
-            debug!("📡 Container will expose port {} (image: {})", exposed_port, image_name);
+            debug!(
+                "📡 Container will expose port {} (image: {})",
+                exposed_port, image_name
+            );
 
             let mut deploy_env_vars = env_vars.clone();
             deploy_env_vars.insert("PORT".to_string(), exposed_port.to_string());
@@ -604,7 +607,9 @@ impl WorkflowPlanner {
                 })),
                 required_for_completion: false, // Post-deployment job - not required for deployment success
             });
-            debug!("Added configure_crons job to workflow (runs after deployment is marked complete)");
+            debug!(
+                "Added configure_crons job to workflow (runs after deployment is marked complete)"
+            );
         } else {
             debug!("Skipping configure_crons job - no git info available");
         }
@@ -631,11 +636,7 @@ impl WorkflowPlanner {
             debug!("Skipping screenshot job - screenshots are disabled in config");
         }
 
-        info!(
-            "Planned {} jobs for project {}",
-            jobs.len(),
-            project.name
-        );
+        info!("Planned {} jobs for project {}", jobs.len(), project.name);
         Ok(jobs)
     }
 }

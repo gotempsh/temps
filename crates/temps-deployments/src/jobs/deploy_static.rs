@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
-use temps_deployer::static_deployer::{StaticDeployer, StaticDeployRequest};
+use temps_deployer::static_deployer::{StaticDeployRequest, StaticDeployer};
 use temps_deployer::ImageBuilder;
 use temps_logs::{LogLevel, LogService};
 
@@ -132,11 +132,7 @@ impl DeployStaticJob {
 
     /// Log an error and return a WorkflowError
     /// This ensures all errors are logged before being returned
-    async fn log_and_fail(
-        &self,
-        context: &WorkflowContext,
-        message: String,
-    ) -> WorkflowError {
+    async fn log_and_fail(&self, context: &WorkflowContext, message: String) -> WorkflowError {
         // Log the error (ignore logging errors since we're already failing)
         let _ = self.log(context, message.clone()).await;
         WorkflowError::JobExecutionFailed(message)
@@ -187,34 +183,43 @@ impl WorkflowTask for DeployStaticJob {
         // Create temporary directory to extract files
         let temp_dir = std::env::temp_dir().join(format!("temps-static-{}", uuid::Uuid::new_v4()));
         if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
-            return Err(self.log_and_fail(
-                &context,
-                format!("❌ Failed to create temp directory: {}", e),
-            ).await);
+            return Err(self
+                .log_and_fail(
+                    &context,
+                    format!("❌ Failed to create temp directory: {}", e),
+                )
+                .await);
         }
 
         self.log(
             &context,
-            format!("📂 Extracting from {} to {}", self.static_output_dir, temp_dir.display()),
+            format!(
+                "📂 Extracting from {} to {}",
+                self.static_output_dir,
+                temp_dir.display()
+            ),
         )
         .await?;
 
         // Extract static files from the container image
-        if let Err(e) = self.image_builder
+        if let Err(e) = self
+            .image_builder
             .extract_from_image(&image_tag, &self.static_output_dir, &temp_dir)
             .await
         {
-            return Err(self.log_and_fail(
-                &context,
-                format!("❌ Failed to extract files from container path '{}': {}", self.static_output_dir, e),
-            ).await);
+            return Err(self
+                .log_and_fail(
+                    &context,
+                    format!(
+                        "❌ Failed to extract files from container path '{}': {}",
+                        self.static_output_dir, e
+                    ),
+                )
+                .await);
         }
 
-        self.log(
-            &context,
-            "✅ Files extracted successfully".to_string(),
-        )
-        .await?;
+        self.log(&context, "✅ Files extracted successfully".to_string())
+            .await?;
 
         // Create deploy request
         let request = StaticDeployRequest {
@@ -228,18 +233,14 @@ impl WorkflowTask for DeployStaticJob {
         let result = match self.static_deployer.deploy(request).await {
             Ok(result) => result,
             Err(e) => {
-                return Err(self.log_and_fail(
-                    &context,
-                    format!("❌ Failed to deploy static files: {}", e),
-                ).await);
+                return Err(self
+                    .log_and_fail(&context, format!("❌ Failed to deploy static files: {}", e))
+                    .await);
             }
         };
 
-        self.log(
-            &context,
-            format!("📍 Deployed to: {}", result.storage_path),
-        )
-        .await?;
+        self.log(&context, format!("📍 Deployed to: {}", result.storage_path))
+            .await?;
 
         // Clean up temporary directory
         if let Err(e) = tokio::fs::remove_dir_all(&temp_dir).await {
@@ -337,7 +338,11 @@ mod tests {
             unimplemented!("Not needed for static deployment tests")
         }
 
-        async fn import_image(&self, _image_path: PathBuf, _tag: &str) -> Result<String, BuilderError> {
+        async fn import_image(
+            &self,
+            _image_path: PathBuf,
+            _tag: &str,
+        ) -> Result<String, BuilderError> {
             unimplemented!("Not needed for static deployment tests")
         }
 
@@ -505,6 +510,10 @@ mod tests {
 
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("static_output_dir"), "Expected error about static_output_dir, got: {}", error_msg);
+        assert!(
+            error_msg.contains("static_output_dir"),
+            "Expected error about static_output_dir, got: {}",
+            error_msg
+        );
     }
 }

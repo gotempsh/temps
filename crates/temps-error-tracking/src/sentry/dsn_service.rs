@@ -419,7 +419,6 @@ mod tests {
     }
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
-        use temps_entities::types::ProjectType;
         use uuid::Uuid;
 
         let unique_slug = format!("test-project-{}", Uuid::new_v4());

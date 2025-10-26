@@ -130,11 +130,11 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     }
 
     fn dirs_to_upload(&self) -> Vec<String> {
-        vec!["dist".to_string()]
+        vec!["/app/dist".to_string()]
     }
 
     fn static_output_dir(&self) -> Option<String> {
-        Some("dist".to_string())
+        Some("/app/dist".to_string())
     }
 }
 

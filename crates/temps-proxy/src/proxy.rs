@@ -605,10 +605,8 @@ impl LoadBalancer {
 
     /// Check if a request path should be logged (HTML pages only, skip static assets)
     fn should_log_static_request(path: &str) -> bool {
-        path == "/"
-            || path.ends_with(".html")
-            || path.ends_with(".htm")
-            || !path.contains('.') // SPA routes without extension
+        path == "/" || path.ends_with(".html") || path.ends_with(".htm") || !path.contains('.')
+        // SPA routes without extension
     }
 
     /// Create and spawn proxy log for static file serving
@@ -859,9 +857,15 @@ impl LoadBalancer {
 
                 // Add cache headers
                 if Self::is_cacheable_static_asset(requested_path) {
-                    resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
+                    resp.insert_header(
+                        header::CACHE_CONTROL,
+                        "public, max-age=31536000, immutable",
+                    )?;
                 } else {
-                    resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
+                    resp.insert_header(
+                        header::CACHE_CONTROL,
+                        "public, max-age=0, must-revalidate",
+                    )?;
                 }
 
                 session.write_response_header(Box::new(resp), false).await?;

@@ -6,7 +6,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use temps_core::{Job, JobReceiver};
 use temps_database::DbConnection;
-use temps_entities::{deployments, prelude::{DeploymentConfigSnapshot, DeploymentMetadata, GitPushEvent}, types::PipelineStatus};
+use temps_entities::{
+    deployments,
+    prelude::{DeploymentConfigSnapshot, DeploymentMetadata, GitPushEvent},
+    types::PipelineStatus,
+};
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug)]
@@ -255,91 +259,88 @@ impl JobProcessorService {
 
 // Extracted free function for testing
 async fn process_git_push_event(
-        workflow_planner: Arc<WorkflowPlanner>,
-        workflow_executor: Arc<WorkflowExecutionService>,
-        db: Arc<DbConnection>,
-        git_provider_manager: Arc<temps_git::GitProviderManager>,
-        job: temps_core::GitPushEventJob,
-    ) {
-        info!(
-            "🔥 Processing GitPushEvent job for owner: {}, repo: {}, branch: {:?}",
-            job.owner, job.repo, job.branch
-        );
-        debug!(
-            "GitPushEvent details - owner: {}, repo: {}, branch: {:?}, tag: {:?}, commit: {}",
-            job.owner, job.repo, job.branch, job.tag, job.commit
-        );
+    workflow_planner: Arc<WorkflowPlanner>,
+    workflow_executor: Arc<WorkflowExecutionService>,
+    db: Arc<DbConnection>,
+    git_provider_manager: Arc<temps_git::GitProviderManager>,
+    job: temps_core::GitPushEventJob,
+) {
+    info!(
+        "🔥 Processing GitPushEvent job for owner: {}, repo: {}, branch: {:?}",
+        job.owner, job.repo, job.branch
+    );
+    debug!(
+        "GitPushEvent details - owner: {}, repo: {}, branch: {:?}, tag: {:?}, commit: {}",
+        job.owner, job.repo, job.branch, job.tag, job.commit
+    );
 
-        // Find the project matching this git repository
-        let project = match temps_entities::projects::Entity::find()
-            .filter(temps_entities::projects::Column::Id.eq(job.project_id))
-            .one(db.as_ref())
-            .await
-        {
-            Ok(Some(project)) => project,
-            Ok(None) => {
-                warn!("No project found for repository {}/{}", job.owner, job.repo);
-                return;
-            }
-            Err(e) => {
-                error!(
-                    "Database error while finding project for {}/{}: {}",
-                    job.owner, job.repo, e
-                );
-                return;
-            }
-        };
+    // Find the project matching this git repository
+    let project = match temps_entities::projects::Entity::find()
+        .filter(temps_entities::projects::Column::Id.eq(job.project_id))
+        .one(db.as_ref())
+        .await
+    {
+        Ok(Some(project)) => project,
+        Ok(None) => {
+            warn!("No project found for repository {}/{}", job.owner, job.repo);
+            return;
+        }
+        Err(e) => {
+            error!(
+                "Database error while finding project for {}/{}: {}",
+                job.owner, job.repo, e
+            );
+            return;
+        }
+    };
 
-        // Find the default environment for this project (usually 'production' or the first one)
-        let environment = match temps_entities::environments::Entity::find()
-            .filter(temps_entities::environments::Column::ProjectId.eq(project.id))
-            .one(db.as_ref())
-            .await
-        {
-            Ok(Some(environment)) => environment,
-            Ok(None) => {
-                error!("No environment found for project {}", project.id);
-                return;
-            }
-            Err(e) => {
-                error!(
-                    "Database error while finding environment for project {}: {}",
-                    project.id, e
-                );
-                return;
-            }
-        };
+    // Find the default environment for this project (usually 'production' or the first one)
+    let environment = match temps_entities::environments::Entity::find()
+        .filter(temps_entities::environments::Column::ProjectId.eq(project.id))
+        .one(db.as_ref())
+        .await
+    {
+        Ok(Some(environment)) => environment,
+        Ok(None) => {
+            error!("No environment found for project {}", project.id);
+            return;
+        }
+        Err(e) => {
+            error!(
+                "Database error while finding environment for project {}: {}",
+                project.id, e
+            );
+            return;
+        }
+    };
 
-        // Create deployment record directly (no more pipeline)
-        // Note: Previous deployment teardown happens AFTER this deployment succeeds (zero-downtime)
-        use chrono::Utc;
+    // Create deployment record directly (no more pipeline)
+    // Note: Previous deployment teardown happens AFTER this deployment succeeds (zero-downtime)
+    use chrono::Utc;
 
-        // Get the next deployment number for this project
-        use sea_orm::{EntityTrait, PaginatorTrait};
-        let paginator = deployments::Entity::find()
-            .filter(deployments::Column::ProjectId.eq(project.id))
-            .paginate(db.as_ref(), 1);
+    // Get the next deployment number for this project
+    use sea_orm::{EntityTrait, PaginatorTrait};
+    let paginator = deployments::Entity::find()
+        .filter(deployments::Column::ProjectId.eq(project.id))
+        .paginate(db.as_ref(), 1);
 
-        let deployment_count = match paginator.num_items().await {
-            Ok(count) => count,
-            Err(e) => {
-                error!(
-                    "Failed to count deployments for project {}: {}",
-                    project.id, e
-                );
-                return;
-            }
-        };
-        let deployment_number = deployment_count + 1;
+    let deployment_count = match paginator.num_items().await {
+        Ok(count) => count,
+        Err(e) => {
+            error!(
+                "Failed to count deployments for project {}: {}",
+                project.id, e
+            );
+            return;
+        }
+    };
+    let deployment_number = deployment_count + 1;
 
-        // Fetch commit information from Git provider
-        let commit_info = match JobProcessorService::fetch_commit_info(&git_provider_manager, &project, &job).await
-        {
+    // Fetch commit information from Git provider
+    let commit_info =
+        match JobProcessorService::fetch_commit_info(&git_provider_manager, &project, &job).await {
             Ok(info) => {
-                info!(
-                    "Fetched commit info: {} by {}",
-                    info.message, info.author
-                );
+                info!("Fetched commit info: {} by {}", info.message, info.author);
                 Some(info)
             }
             Err(e) => {
@@ -348,185 +349,189 @@ async fn process_git_push_event(
             }
         };
 
-        // Generate URL as {project_slug}-{deployment_number}
-        let env_slug = format!("{}-{}", project.slug, deployment_number);
+    // Generate URL as {project_slug}-{deployment_number}
+    let env_slug = format!("{}-{}", project.slug, deployment_number);
 
-        // Get the effective deployment configuration by merging project and environment configs
-        let merged_config = if let Some(project_config) = &project.deployment_config {
-            if let Some(env_config) = &environment.deployment_config {
-                Some(project_config.merge(env_config))
-            } else {
-                Some(project_config.clone())
-            }
+    // Get the effective deployment configuration by merging project and environment configs
+    let merged_config = if let Some(project_config) = &project.deployment_config {
+        if let Some(env_config) = &environment.deployment_config {
+            Some(project_config.merge(env_config))
         } else {
-            environment.deployment_config.clone()
-        };
+            Some(project_config.clone())
+        }
+    } else {
+        environment.deployment_config.clone()
+    };
 
-        // Create deployment config snapshot
-        // Note: Environment variables will be populated during workflow execution
-        // We store an empty map here and the workflow will update it with actual values
-        let deployment_config_snapshot = merged_config.map(|config| {
-            DeploymentConfigSnapshot::from_config(&config, HashMap::new())
-        });
+    // Create deployment config snapshot
+    // Note: Environment variables will be populated during workflow execution
+    // We store an empty map here and the workflow will update it with actual values
+    let deployment_config_snapshot =
+        merged_config.map(|config| DeploymentConfigSnapshot::from_config(&config, HashMap::new()));
 
-        // Create typed deployment metadata
-        let deployment_metadata = DeploymentMetadata {
-            git_push_event: Some(GitPushEvent {
-                owner: job.owner.clone(),
-                repo: job.repo.clone(),
-                branch: job.branch.clone().unwrap_or_default(),
-                commit: job.commit.clone(),
-            }),
-            ..Default::default()
-        };
+    // Create typed deployment metadata
+    let deployment_metadata = DeploymentMetadata {
+        git_push_event: Some(GitPushEvent {
+            owner: job.owner.clone(),
+            repo: job.repo.clone(),
+            branch: job.branch.clone().unwrap_or_default(),
+            commit: job.commit.clone(),
+        }),
+        ..Default::default()
+    };
 
-        let new_deployment = deployments::ActiveModel {
-            id: sea_orm::NotSet,
-            project_id: sea_orm::Set(project.id),
-            environment_id: sea_orm::Set(environment.id),
-            slug: sea_orm::Set(env_slug),
-            state: sea_orm::Set("pending".to_string()),
-            metadata: sea_orm::Set(Some(deployment_metadata)),
-            branch_ref: sea_orm::Set(job.branch.clone()),
-            tag_ref: sea_orm::Set(job.tag.clone()),
-            commit_sha: sea_orm::Set(Some(job.commit.clone())),
-            commit_message: sea_orm::Set(commit_info.as_ref().map(|c| c.message.clone())),
-            commit_author: sea_orm::Set(commit_info.as_ref().map(|c| c.author.clone())),
-            started_at: sea_orm::Set(None),
-            finished_at: sea_orm::Set(None),
-            context_vars: sea_orm::Set(Some(serde_json::json!({
-                "trigger": "git_push",
-                "source": "webhook"
-            }))),
-            deploying_at: sea_orm::Set(None),
-            ready_at: sea_orm::Set(None),
-            static_dir_location: sea_orm::Set(None),
-            screenshot_location: sea_orm::Set(None),
-            image_name: sea_orm::Set(None),
-            cancelled_reason: sea_orm::Set(None),
-            commit_json: sea_orm::Set(commit_info.as_ref().map(|c| c.commit_json.clone())),
-            deployment_config: sea_orm::Set(deployment_config_snapshot),
-            created_at: sea_orm::Set(Utc::now()),
-            updated_at: sea_orm::Set(Utc::now()),
-        };
+    let new_deployment = deployments::ActiveModel {
+        id: sea_orm::NotSet,
+        project_id: sea_orm::Set(project.id),
+        environment_id: sea_orm::Set(environment.id),
+        slug: sea_orm::Set(env_slug),
+        state: sea_orm::Set("pending".to_string()),
+        metadata: sea_orm::Set(Some(deployment_metadata)),
+        branch_ref: sea_orm::Set(job.branch.clone()),
+        tag_ref: sea_orm::Set(job.tag.clone()),
+        commit_sha: sea_orm::Set(Some(job.commit.clone())),
+        commit_message: sea_orm::Set(commit_info.as_ref().map(|c| c.message.clone())),
+        commit_author: sea_orm::Set(commit_info.as_ref().map(|c| c.author.clone())),
+        started_at: sea_orm::Set(None),
+        finished_at: sea_orm::Set(None),
+        context_vars: sea_orm::Set(Some(serde_json::json!({
+            "trigger": "git_push",
+            "source": "webhook"
+        }))),
+        deploying_at: sea_orm::Set(None),
+        ready_at: sea_orm::Set(None),
+        static_dir_location: sea_orm::Set(None),
+        screenshot_location: sea_orm::Set(None),
+        image_name: sea_orm::Set(None),
+        cancelled_reason: sea_orm::Set(None),
+        commit_json: sea_orm::Set(commit_info.as_ref().map(|c| c.commit_json.clone())),
+        deployment_config: sea_orm::Set(deployment_config_snapshot),
+        created_at: sea_orm::Set(Utc::now()),
+        updated_at: sea_orm::Set(Utc::now()),
+    };
 
-        let deployment = match new_deployment.insert(db.as_ref()).await {
-            Ok(deployment) => deployment,
-            Err(e) => {
-                error!(
-                    "Failed to create deployment for project {}: {}",
-                    project.id, e
-                );
-                return;
-            }
-        };
-
-        info!(
-            "Created deployment {} for project {} from GitPushEvent",
-            deployment.id, project.id
-        );
-
-        // Update project's last_deployment timestamp
-        let mut active_project: temps_entities::projects::ActiveModel = project.clone().into();
-        active_project.last_deployment = sea_orm::Set(Some(Utc::now()));
-        if let Err(e) = active_project.update(db.as_ref()).await {
+    let deployment = match new_deployment.insert(db.as_ref()).await {
+        Ok(deployment) => deployment,
+        Err(e) => {
             error!(
-                "Failed to update last_deployment for project {}: {}",
+                "Failed to create deployment for project {}: {}",
                 project.id, e
             );
-        } else {
-            debug!(
-                "Updated last_deployment timestamp for project {}",
-                project.id
-            );
+            return;
         }
+    };
 
-        // Create jobs for this deployment using the workflow planner
-        let create_jobs_result = workflow_planner.create_deployment_jobs(deployment.id).await;
-        let deployment_id = deployment.id; // Extract deployment_id before match
+    info!(
+        "Created deployment {} for project {} from GitPushEvent",
+        deployment.id, project.id
+    );
 
-        // Handle result immediately
-        match create_jobs_result {
-            Ok(created_jobs) => {
-                let job_count = created_jobs.len();
-                info!(
-                    "Created {} jobs for deployment {} from GitPushEvent",
-                    job_count, deployment_id
-                );
+    // Update project's last_deployment timestamp
+    let mut active_project: temps_entities::projects::ActiveModel = project.clone().into();
+    active_project.last_deployment = sea_orm::Set(Some(Utc::now()));
+    if let Err(e) = active_project.update(db.as_ref()).await {
+        error!(
+            "Failed to update last_deployment for project {}: {}",
+            project.id, e
+        );
+    } else {
+        debug!(
+            "Updated last_deployment timestamp for project {}",
+            project.id
+        );
+    }
 
-                // Update deployment status to Running before executing workflow
-                match JobProcessorService::update_deployment_status(&db, deployment_id, PipelineStatus::Running)
-                    .await
-                {
-                    Ok(_) => info!("Updated deployment {} status to Running", deployment_id),
-                    Err(e) => {
-                        error!("Failed to update deployment status to Running: {}", e);
-                        return;
-                    }
+    // Create jobs for this deployment using the workflow planner
+    let create_jobs_result = workflow_planner.create_deployment_jobs(deployment.id).await;
+    let deployment_id = deployment.id; // Extract deployment_id before match
+
+    // Handle result immediately
+    match create_jobs_result {
+        Ok(created_jobs) => {
+            let job_count = created_jobs.len();
+            info!(
+                "Created {} jobs for deployment {} from GitPushEvent",
+                job_count, deployment_id
+            );
+
+            // Update deployment status to Running before executing workflow
+            match JobProcessorService::update_deployment_status(
+                &db,
+                deployment_id,
+                PipelineStatus::Running,
+            )
+            .await
+            {
+                Ok(_) => info!("Updated deployment {} status to Running", deployment_id),
+                Err(e) => {
+                    error!("Failed to update deployment status to Running: {}", e);
+                    return;
                 }
+            }
 
-                // Execute the workflow
-                info!("Executing workflow for deployment {}", deployment_id);
-                match workflow_executor
-                    .execute_deployment_workflow(deployment_id)
-                    .await
-                {
-                    Ok(_) => {
-                        info!(
-                            "Workflow execution completed for deployment {}",
-                            deployment_id
-                        );
-                    }
-                    Err(e) => {
-                        let error_message = format!("{}", e);
-                        error!(
-                            "Workflow execution failed for deployment {}: {}",
-                            deployment_id, error_message
-                        );
+            // Execute the workflow
+            info!("Executing workflow for deployment {}", deployment_id);
+            match workflow_executor
+                .execute_deployment_workflow(deployment_id)
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        "Workflow execution completed for deployment {}",
+                        deployment_id
+                    );
+                }
+                Err(e) => {
+                    let error_message = format!("{}", e);
+                    error!(
+                        "Workflow execution failed for deployment {}: {}",
+                        deployment_id, error_message
+                    );
 
-                        // Mark deployment as failed with error message
-                        if let Err(update_err) = JobProcessorService::update_deployment_status_with_message(
+                    // Mark deployment as failed with error message
+                    if let Err(update_err) =
+                        JobProcessorService::update_deployment_status_with_message(
                             &db,
                             deployment_id,
                             PipelineStatus::Failed,
                             Some(error_message),
                         )
                         .await
-                        {
-                            error!("Failed to update deployment status: {}", update_err);
-                        } else {
-                            debug!("Updated deployment {} status to failed", deployment_id);
-                        }
+                    {
+                        error!("Failed to update deployment status: {}", update_err);
+                    } else {
+                        debug!("Updated deployment {} status to failed", deployment_id);
                     }
                 }
             }
-            Err(job_error) => {
-                // Convert error to string immediately to avoid Send issues
-                let error_message = format!("{}", job_error);
-                // Drop the error explicitly before any await
-                std::mem::drop(job_error);
+        }
+        Err(job_error) => {
+            // Convert error to string immediately to avoid Send issues
+            let error_message = format!("{}", job_error);
+            // Drop the error explicitly before any await
+            std::mem::drop(job_error);
 
-                error!(
-                    "Failed to create jobs for deployment {}: {}",
-                    deployment_id, error_message
-                );
+            error!(
+                "Failed to create jobs for deployment {}: {}",
+                deployment_id, error_message
+            );
 
-                // Mark deployment as failed with error message
-                if let Err(update_err) = JobProcessorService::update_deployment_status_with_message(
-                    &db,
-                    deployment_id,
-                    PipelineStatus::Failed,
-                    Some(error_message),
-                )
-                .await
-                {
-                    error!("Failed to update deployment status: {}", update_err);
-                } else {
-                    debug!("Updated deployment {} status to failed", deployment_id);
-                }
+            // Mark deployment as failed with error message
+            if let Err(update_err) = JobProcessorService::update_deployment_status_with_message(
+                &db,
+                deployment_id,
+                PipelineStatus::Failed,
+                Some(error_message),
+            )
+            .await
+            {
+                error!("Failed to update deployment status: {}", update_err);
+            } else {
+                debug!("Updated deployment {} status to failed", deployment_id);
             }
         }
     }
+}
 
 #[cfg(test)]
 mod tests {

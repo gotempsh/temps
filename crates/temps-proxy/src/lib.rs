@@ -23,6 +23,8 @@ pub use handler::*;
 pub use temps_routes::{CachedPeerTable, RouteInfo, RouteTableListener};
 
 #[cfg(test)]
+pub mod e2e_static_test;
+#[cfg(test)]
 pub mod integration_test;
 #[cfg(test)]
 pub mod proxy_test;
@@ -30,8 +32,6 @@ pub mod proxy_test;
 pub mod test_utils;
 #[cfg(test)]
 pub mod tests;
-#[cfg(test)]
-pub mod e2e_static_test;
 
 // Re-export main types and functions
 pub use config::*;

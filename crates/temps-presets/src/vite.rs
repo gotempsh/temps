@@ -114,9 +114,9 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     }
 
     fn dirs_to_upload(&self) -> Vec<String> {
-        vec!["dist".to_string()]
-    }
+        vec!["/usr/share/nginx/html".to_string()]
 
+    }
     fn default_port(&self) -> u16 {
         5173 // Vite dev server default port
     }

@@ -23,7 +23,10 @@ const REDIS_IMAGE: &str = "redis:7.4.1-alpine";
 /// Input configuration for creating a Redis service
 /// This is what users provide when creating the service
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[schemars(title = "Redis Configuration", description = "Configuration for Redis service")]
+#[schemars(
+    title = "Redis Configuration",
+    description = "Configuration for Redis service"
+)]
 pub struct RedisInputConfig {
     /// Redis host address
     #[serde(default = "default_host")]

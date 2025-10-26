@@ -483,7 +483,9 @@ impl WorkloadImporter for DockerImporter {
             QueryFilter,
         };
         use std::time::Instant;
-        use temps_entities::{deployment_containers, deployments, environments, prelude::DeploymentMetadata, projects};
+        use temps_entities::{
+            deployment_containers, deployments, environments, prelude::DeploymentMetadata, projects,
+        };
 
         let start_time = Instant::now();
         info!(

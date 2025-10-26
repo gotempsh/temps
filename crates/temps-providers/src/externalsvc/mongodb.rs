@@ -1,4 +1,4 @@
-use anyhow::{Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use bollard::exec::CreateExecOptions;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
@@ -25,7 +25,10 @@ use super::{ExternalService, RuntimeEnvVar, ServiceConfig, ServiceType};
 /// Input configuration for creating a MongoDB service
 /// This is what users provide when creating the service
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[schemars(title = "MongoDB Configuration", description = "Configuration for MongoDB service")]
+#[schemars(
+    title = "MongoDB Configuration",
+    description = "Configuration for MongoDB service"
+)]
 pub struct MongodbInputConfig {
     /// MongoDB host address
     #[serde(default = "default_host")]
@@ -166,7 +169,6 @@ fn default_version() -> String {
     "8.0".to_string()
 }
 
-
 fn is_port_available(port: u16) -> bool {
     TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
@@ -219,9 +221,11 @@ impl MongodbService {
 
         info!("Created MongoDB volume: {}", volume_name);
 
-        let env_vars = [format!("MONGO_INITDB_ROOT_USERNAME={}", config.username),
+        let env_vars = [
+            format!("MONGO_INITDB_ROOT_USERNAME={}", config.username),
             format!("MONGO_INITDB_ROOT_PASSWORD={}", config.password),
-            format!("MONGO_INITDB_DATABASE={}", config.database)];
+            format!("MONGO_INITDB_DATABASE={}", config.database),
+        ];
 
         let mut container_labels = HashMap::new();
         container_labels.insert("temps.service".to_string(), "mongodb".to_string());
@@ -1078,10 +1082,19 @@ mod tests {
         let schema_obj = schema.as_object().expect("Schema should be an object");
 
         // Check for schema metadata
-        assert!(schema_obj.contains_key("$schema"), "Should have $schema field");
+        assert!(
+            schema_obj.contains_key("$schema"),
+            "Should have $schema field"
+        );
         assert!(schema_obj.contains_key("title"), "Should have title field");
-        assert!(schema_obj.contains_key("description"), "Should have description field");
-        assert!(schema_obj.contains_key("properties"), "Should have properties field");
+        assert!(
+            schema_obj.contains_key("description"),
+            "Should have description field"
+        );
+        assert!(
+            schema_obj.contains_key("properties"),
+            "Should have properties field"
+        );
 
         // Verify title and description
         assert_eq!(
@@ -1097,7 +1110,9 @@ mod tests {
             .expect("Properties should be an object");
 
         // Check for expected fields
-        let expected_fields = vec!["host", "port", "database", "username", "password", "image", "version"];
+        let expected_fields = vec![
+            "host", "port", "database", "username", "password", "image", "version",
+        ];
         for field in &expected_fields {
             assert!(
                 properties.contains_key(*field),
@@ -1111,7 +1126,10 @@ mod tests {
             .get("host")
             .and_then(|v| v.as_object())
             .expect("host field should be an object");
-        assert_eq!(host_field.get("default").and_then(|v| v.as_str()), Some("localhost"));
+        assert_eq!(
+            host_field.get("default").and_then(|v| v.as_str()),
+            Some("localhost")
+        );
 
         // Verify password field description
         let password_field = properties

@@ -153,9 +153,16 @@ impl DownloadRepoJob {
     fn detect_log_level(message: &str) -> LogLevel {
         if message.contains("✅") || message.contains("Complete") || message.contains("success") {
             LogLevel::Success
-        } else if message.contains("❌") || message.contains("Failed") || message.contains("Error") || message.contains("error") {
+        } else if message.contains("❌")
+            || message.contains("Failed")
+            || message.contains("Error")
+            || message.contains("error")
+        {
             LogLevel::Error
-        } else if message.contains("⏳") || message.contains("Waiting") || message.contains("warning") {
+        } else if message.contains("⏳")
+            || message.contains("Waiting")
+            || message.contains("warning")
+        {
             LogLevel::Warning
         } else {
             LogLevel::Info
@@ -237,11 +244,8 @@ impl DownloadRepoJob {
             )));
         }
 
-        self.log(
-            context,
-            "Successfully cloned public repository".to_string(),
-        )
-        .await?;
+        self.log(context, "Successfully cloned public repository".to_string())
+            .await?;
 
         Ok(())
     }

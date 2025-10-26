@@ -268,15 +268,51 @@ impl ProjectResponse {
             last_deployment: project.last_deployment.map(|d| d.timestamp_millis()),
             git_provider_connection_id: project.git_provider_connection_id,
             deployment_config: DeploymentConfig {
-                cpu_request: project.deployment_config.clone().map(|c| c.cpu_request).unwrap_or(None),
-                cpu_limit: project.deployment_config.clone().map(|c| c.cpu_limit).unwrap_or(None),
-                memory_request: project.deployment_config.clone().map(|c| c.memory_request).unwrap_or(None),
-                memory_limit: project.deployment_config.clone().map(|c| c.memory_limit).unwrap_or(None),
-                exposed_port: project.deployment_config.clone().map(|c| c.exposed_port).unwrap_or(None), // Not exposed in old Project struct
-                automatic_deploy: project.deployment_config.clone().map(|c| c.automatic_deploy).unwrap_or(false),
-                performance_metrics_enabled: project.deployment_config.clone().map(|c| c.performance_metrics_enabled).unwrap_or(false),
-                session_recording_enabled: project.deployment_config.clone().map(|c| c.session_recording_enabled).unwrap_or(false), // Default for old projects
-                replicas: project.deployment_config.clone().map(|c| c.replicas).unwrap_or(1), // Default
+                cpu_request: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.cpu_request)
+                    .unwrap_or(None),
+                cpu_limit: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.cpu_limit)
+                    .unwrap_or(None),
+                memory_request: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.memory_request)
+                    .unwrap_or(None),
+                memory_limit: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.memory_limit)
+                    .unwrap_or(None),
+                exposed_port: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.exposed_port)
+                    .unwrap_or(None), // Not exposed in old Project struct
+                automatic_deploy: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.automatic_deploy)
+                    .unwrap_or(false),
+                performance_metrics_enabled: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.performance_metrics_enabled)
+                    .unwrap_or(false),
+                session_recording_enabled: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.session_recording_enabled)
+                    .unwrap_or(false), // Default for old projects
+                replicas: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.replicas)
+                    .unwrap_or(1), // Default
             },
         }
     }

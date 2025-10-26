@@ -159,10 +159,7 @@ pub mod proxy_tests {
         )
         .expect("Failed to create test ServerConfig");
 
-        Arc::new(temps_config::ConfigService::new(
-            Arc::new(config),
-            db,
-        ))
+        Arc::new(temps_config::ConfigService::new(Arc::new(config), db))
     }
 
     fn create_mock_ip_service(
@@ -614,7 +611,10 @@ pub mod proxy_tests {
 
         // Test 4: Verify Docusaurus preset supports static deployment
         let docusaurus_preset = temps_presets::get_preset_by_slug("docusaurus");
-        assert!(docusaurus_preset.is_some(), "Docusaurus preset should exist");
+        assert!(
+            docusaurus_preset.is_some(),
+            "Docusaurus preset should exist"
+        );
         let docusaurus_static_output = docusaurus_preset.unwrap().static_output_dir();
         assert!(
             docusaurus_static_output.is_some(),
@@ -928,12 +928,12 @@ pub mod proxy_tests {
     /// Test that ProjectContextResolver correctly identifies static deployments via RouteInfo
     #[tokio::test]
     async fn test_project_context_resolver_static_detection() -> Result<()> {
-        use temps_entities::{deployments, environments, projects};
+        use sea_orm::{ActiveModelTrait, Set};
+        use std::fs as std_fs;
         use temps_entities::deployments::DeploymentMetadata;
         use temps_entities::preset::Preset;
         use temps_entities::upstream_config::UpstreamList;
-        use sea_orm::{ActiveModelTrait, Set};
-        use std::fs as std_fs;
+        use temps_entities::{deployments, environments, projects};
 
         println!("\n🧪 Testing ProjectContextResolver static deployment detection");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -942,7 +942,8 @@ pub mod proxy_tests {
         let db = test_db.db.clone();
 
         // Create temporary directory for static files
-        let temp_dir = std::env::temp_dir().join(format!("temps-test-static-{}", uuid::Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("temps-test-static-{}", uuid::Uuid::new_v4()));
         std_fs::create_dir_all(&temp_dir)?;
 
         // Create a test file
@@ -996,17 +997,29 @@ pub mod proxy_tests {
 
         println!("\n✅ Test data created:");
         println!("   Project: {} (id: {})", project.name, project.id);
-        println!("   Environment: {} (id: {})", environment.name, environment.id);
+        println!(
+            "   Environment: {} (id: {})",
+            environment.name, environment.id
+        );
         println!("   Deployment: {} (id: {})", deployment.slug, deployment.id);
-        println!("   Static dir: {}", deployment.static_dir_location.as_ref().unwrap());
+        println!(
+            "   Static dir: {}",
+            deployment.static_dir_location.as_ref().unwrap()
+        );
 
         // Test 1: Verify route is loaded in route table
         println!("\n🧪 Test 1: Verify route is loaded with static backend");
         let route_info = route_table.get_route("static-test.example.com");
-        assert!(route_info.is_some(), "Route should be loaded in route table");
+        assert!(
+            route_info.is_some(),
+            "Route should be loaded in route table"
+        );
 
         let route_info = route_info.unwrap();
-        assert!(route_info.is_static(), "Route should be identified as static");
+        assert!(
+            route_info.is_static(),
+            "Route should be identified as static"
+        );
         assert_eq!(
             route_info.static_dir(),
             Some(temp_dir.to_string_lossy().as_ref()),
@@ -1019,14 +1032,22 @@ pub mod proxy_tests {
         // Test 2: Verify ProjectContextResolver uses RouteInfo API
         println!("\n🧪 Test 2: Verify ProjectContextResolver.is_static_deployment()");
         let resolver = ProjectContextResolverImpl::new(route_table.clone());
-        let is_static = resolver.is_static_deployment("static-test.example.com").await;
-        assert!(is_static, "ProjectContextResolver should identify deployment as static");
+        let is_static = resolver
+            .is_static_deployment("static-test.example.com")
+            .await;
+        assert!(
+            is_static,
+            "ProjectContextResolver should identify deployment as static"
+        );
         println!("   ✅ is_static_deployment() returns true");
 
         // Test 3: Verify ProjectContextResolver.get_static_path()
         println!("\n🧪 Test 3: Verify ProjectContextResolver.get_static_path()");
         let static_path = resolver.get_static_path("static-test.example.com").await;
-        assert!(static_path.is_some(), "get_static_path() should return Some for static deployment");
+        assert!(
+            static_path.is_some(),
+            "get_static_path() should return Some for static deployment"
+        );
         assert_eq!(
             static_path.unwrap(),
             temp_dir.to_string_lossy().to_string(),
@@ -1036,10 +1057,18 @@ pub mod proxy_tests {
 
         // Test 4: Verify non-static deployment returns false
         println!("\n🧪 Test 4: Verify non-existent host returns false");
-        let is_static_nonexistent = resolver.is_static_deployment("nonexistent.example.com").await;
-        assert!(!is_static_nonexistent, "Non-existent host should not be static");
+        let is_static_nonexistent = resolver
+            .is_static_deployment("nonexistent.example.com")
+            .await;
+        assert!(
+            !is_static_nonexistent,
+            "Non-existent host should not be static"
+        );
         let static_path_nonexistent = resolver.get_static_path("nonexistent.example.com").await;
-        assert!(static_path_nonexistent.is_none(), "Non-existent host should return None for static path");
+        assert!(
+            static_path_nonexistent.is_none(),
+            "Non-existent host should return None for static path"
+        );
         println!("   ✅ Non-existent host correctly returns false/None");
 
         println!("\n🎉 All ProjectContextResolver static detection tests passed!");
@@ -1054,12 +1083,12 @@ pub mod proxy_tests {
     /// Test that container deployments are NOT identified as static
     #[tokio::test]
     async fn test_project_context_resolver_container_deployment() -> Result<()> {
-        use temps_entities::{deployments, environments, projects, deployment_containers};
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_core::chrono::Utc;
         use temps_entities::deployments::DeploymentMetadata;
         use temps_entities::preset::Preset;
         use temps_entities::upstream_config::UpstreamList;
-        use sea_orm::{ActiveModelTrait, Set};
-        use temps_core::chrono::Utc;
+        use temps_entities::{deployment_containers, deployments, environments, projects};
 
         println!("\n🧪 Testing ProjectContextResolver container deployment detection");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -1135,12 +1164,25 @@ pub mod proxy_tests {
         // Test 1: Verify route is loaded with upstream backend
         println!("\n🧪 Test 1: Verify route is loaded with upstream backend");
         let route_info = route_table.get_route("container-test.example.com");
-        assert!(route_info.is_some(), "Route should be loaded in route table");
+        assert!(
+            route_info.is_some(),
+            "Route should be loaded in route table"
+        );
 
         let route_info = route_info.unwrap();
-        assert!(!route_info.is_static(), "Route should NOT be identified as static");
-        assert!(route_info.static_dir().is_none(), "Static directory should be None for container deployment");
-        assert_eq!(route_info.get_backend_addr(), "127.0.0.1:8080", "Should return container address");
+        assert!(
+            !route_info.is_static(),
+            "Route should NOT be identified as static"
+        );
+        assert!(
+            route_info.static_dir().is_none(),
+            "Static directory should be None for container deployment"
+        );
+        assert_eq!(
+            route_info.get_backend_addr(),
+            "127.0.0.1:8080",
+            "Should return container address"
+        );
         println!("   ✅ Route loaded with BackendType::Upstream");
         println!("   ✅ is_static() returns false");
         println!("   ✅ static_dir() returns None");
@@ -1149,14 +1191,22 @@ pub mod proxy_tests {
         // Test 2: Verify ProjectContextResolver identifies as non-static
         println!("\n🧪 Test 2: Verify ProjectContextResolver.is_static_deployment()");
         let resolver = ProjectContextResolverImpl::new(route_table.clone());
-        let is_static = resolver.is_static_deployment("container-test.example.com").await;
-        assert!(!is_static, "ProjectContextResolver should NOT identify container deployment as static");
+        let is_static = resolver
+            .is_static_deployment("container-test.example.com")
+            .await;
+        assert!(
+            !is_static,
+            "ProjectContextResolver should NOT identify container deployment as static"
+        );
         println!("   ✅ is_static_deployment() returns false");
 
         // Test 3: Verify get_static_path returns None
         println!("\n🧪 Test 3: Verify ProjectContextResolver.get_static_path()");
         let static_path = resolver.get_static_path("container-test.example.com").await;
-        assert!(static_path.is_none(), "get_static_path() should return None for container deployment");
+        assert!(
+            static_path.is_none(),
+            "get_static_path() should return None for container deployment"
+        );
         println!("   ✅ get_static_path() returns None");
 
         println!("\n🎉 All container deployment tests passed!");

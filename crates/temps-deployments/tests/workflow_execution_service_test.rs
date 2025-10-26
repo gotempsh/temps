@@ -337,7 +337,10 @@ async fn test_workflow_execution_service_with_real_jobs() {
         async fn deploy(
             &self,
             _request: temps_deployer::static_deployer::StaticDeployRequest,
-        ) -> Result<temps_deployer::static_deployer::StaticDeployResult, temps_deployer::static_deployer::StaticDeployError> {
+        ) -> Result<
+            temps_deployer::static_deployer::StaticDeployResult,
+            temps_deployer::static_deployer::StaticDeployError,
+        > {
             Ok(temps_deployer::static_deployer::StaticDeployResult {
                 storage_path: "/tmp/test-deployment".to_string(),
                 file_count: 10,
@@ -351,7 +354,10 @@ async fn test_workflow_execution_service_with_real_jobs() {
             _project_slug: &str,
             _environment_slug: &str,
             _deployment_slug: &str,
-        ) -> Result<temps_deployer::static_deployer::StaticDeploymentInfo, temps_deployer::static_deployer::StaticDeployError> {
+        ) -> Result<
+            temps_deployer::static_deployer::StaticDeploymentInfo,
+            temps_deployer::static_deployer::StaticDeployError,
+        > {
             Ok(temps_deployer::static_deployer::StaticDeploymentInfo {
                 deployment_slug: "test-deployment".to_string(),
                 storage_path: PathBuf::from("/tmp/test-deployment"),
@@ -366,7 +372,10 @@ async fn test_workflow_execution_service_with_real_jobs() {
             _project_slug: &str,
             _environment_slug: &str,
             _deployment_slug: &str,
-        ) -> Result<Vec<temps_deployer::static_deployer::FileInfo>, temps_deployer::static_deployer::StaticDeployError> {
+        ) -> Result<
+            Vec<temps_deployer::static_deployer::FileInfo>,
+            temps_deployer::static_deployer::StaticDeployError,
+        > {
             Ok(vec![])
         }
 
@@ -379,7 +388,8 @@ async fn test_workflow_execution_service_with_real_jobs() {
             Ok(())
         }
     }
-    let static_deployer: Arc<dyn temps_deployer::static_deployer::StaticDeployer> = Arc::new(MockStaticDeployer);
+    let static_deployer: Arc<dyn temps_deployer::static_deployer::StaticDeployer> =
+        Arc::new(MockStaticDeployer);
 
     // Create screenshot service for test
     let screenshot_service = Arc::new(

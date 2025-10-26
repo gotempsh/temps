@@ -378,8 +378,14 @@ mod tests {
         assert_eq!(snapshot.memory_limit, Some(512));
         assert_eq!(snapshot.exposed_port, Some(3000));
         assert_eq!(snapshot.environment_variables.len(), 2);
-        assert_eq!(snapshot.environment_variables.get("NODE_ENV"), Some(&"production".to_string()));
-        assert_eq!(snapshot.environment_variables.get("DB_HOST"), Some(&"localhost".to_string()));
+        assert_eq!(
+            snapshot.environment_variables.get("NODE_ENV"),
+            Some(&"production".to_string())
+        );
+        assert_eq!(
+            snapshot.environment_variables.get("DB_HOST"),
+            Some(&"localhost".to_string())
+        );
         assert!(snapshot.automatic_deploy);
         assert_eq!(snapshot.replicas, 2);
     }

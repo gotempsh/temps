@@ -67,7 +67,6 @@ pub struct DeploymentMetadata {
     pub labels: Vec<String>,
 }
 
-
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "deployments")]
 pub struct Model {

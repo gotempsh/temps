@@ -117,7 +117,6 @@ type ListFilesFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Vec<FileInfo>, StaticDeployError>> + Send + 'a>,
 >;
 
-
 impl FilesystemStaticDeployer {
     pub fn new(base_dir: PathBuf) -> Self {
         Self { base_dir }
@@ -142,10 +141,7 @@ impl FilesystemStaticDeployer {
     }
 
     /// Recursively copy directory contents
-    fn copy_dir_recursive<'a>(
-        source: &'a PathBuf,
-        dest: &'a PathBuf,
-    ) -> CopyDirFuture<'a> {
+    fn copy_dir_recursive<'a>(source: &'a PathBuf, dest: &'a PathBuf) -> CopyDirFuture<'a> {
         Box::pin(async move {
             let mut file_count = 0u32;
             let mut total_size = 0u64;
@@ -206,10 +202,7 @@ impl FilesystemStaticDeployer {
     }
 
     /// Recursively list files in a directory
-    fn list_files_recursive<'a>(
-        path: &'a PathBuf,
-        base_path: &'a PathBuf,
-    ) -> ListFilesFuture<'a> {
+    fn list_files_recursive<'a>(path: &'a PathBuf, base_path: &'a PathBuf) -> ListFilesFuture<'a> {
         Box::pin(async move {
             let mut files = Vec::new();
 
@@ -286,14 +279,12 @@ impl StaticDeployer for FilesystemStaticDeployer {
         // Security: Store ONLY the relative path (without base_dir prefix)
         // This ensures the proxy always joins with the configured base directory,
         // preventing potential security issues from absolute paths in the database
-        let relative_storage_path = storage_path
-            .strip_prefix(&self.base_dir)
-            .map_err(|e| {
-                StaticDeployError::InvalidPath(format!(
-                    "Storage path does not start with base_dir: {}",
-                    e
-                ))
-            })?;
+        let relative_storage_path = storage_path.strip_prefix(&self.base_dir).map_err(|e| {
+            StaticDeployError::InvalidPath(format!(
+                "Storage path does not start with base_dir: {}",
+                e
+            ))
+        })?;
 
         Ok(StaticDeployResult {
             storage_path: relative_storage_path.to_string_lossy().to_string(),
@@ -362,7 +353,10 @@ impl StaticDeployer for FilesystemStaticDeployer {
         }
 
         let storage_path = deployment_path.ok_or_else(|| {
-            StaticDeployError::DeploymentFailed(format!("Deployment not found: {}", deployment_slug))
+            StaticDeployError::DeploymentFailed(format!(
+                "Deployment not found: {}",
+                deployment_slug
+            ))
         })?;
 
         // Calculate file count and total size
@@ -397,9 +391,9 @@ impl StaticDeployer for FilesystemStaticDeployer {
         environment_slug: &str,
         deployment_slug: &str,
     ) -> Result<Vec<FileInfo>, StaticDeployError> {
-        let deployment_info =
-            self.get_deployment(project_slug, environment_slug, deployment_slug)
-                .await?;
+        let deployment_info = self
+            .get_deployment(project_slug, environment_slug, deployment_slug)
+            .await?;
 
         Self::list_files_recursive(&deployment_info.storage_path, &deployment_info.storage_path)
             .await
@@ -411,9 +405,9 @@ impl StaticDeployer for FilesystemStaticDeployer {
         environment_slug: &str,
         deployment_slug: &str,
     ) -> Result<(), StaticDeployError> {
-        let deployment_info =
-            self.get_deployment(project_slug, environment_slug, deployment_slug)
-                .await?;
+        let deployment_info = self
+            .get_deployment(project_slug, environment_slug, deployment_slug)
+            .await?;
 
         fs::remove_dir_all(&deployment_info.storage_path).await?;
 
@@ -550,7 +544,10 @@ mod tests {
         deployer.deploy(request).await.unwrap();
 
         // List files
-        let files = deployer.list_files("test", "prod", "deploy-1").await.unwrap();
+        let files = deployer
+            .list_files("test", "prod", "deploy-1")
+            .await
+            .unwrap();
 
         // Should have: index.html, assets/ (dir), assets/app.js
         assert!(files.len() >= 2);

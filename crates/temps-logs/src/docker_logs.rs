@@ -32,7 +32,7 @@ pub struct ContainerLogOptions {
     pub start_date: Option<UtcDateTime>,
     pub end_date: Option<UtcDateTime>,
     pub tail: Option<String>, // "all" or number of lines
-    pub timestamps: bool,      // Include timestamps in log output
+    pub timestamps: bool,     // Include timestamps in log output
 }
 impl DockerLogService {
     pub fn new(docker: Arc<Docker>) -> Self {
@@ -255,6 +255,7 @@ mod tests {
                 start_date: None,
                 end_date: None,
                 tail: Some("10".to_string()),
+                timestamps: true,
             };
             let result = docker_service
                 .get_container_logs("non-existent-container-12345", options)

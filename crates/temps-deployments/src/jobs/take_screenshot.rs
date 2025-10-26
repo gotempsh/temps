@@ -85,9 +85,18 @@ impl TakeScreenshotJob {
 
     /// Detect log level from message content
     fn detect_log_level(message: &str) -> LogLevel {
-        if message.contains("✅") || message.contains("💾") || message.contains("Complete") || message.contains("success") || message.contains("captured") {
+        if message.contains("✅")
+            || message.contains("💾")
+            || message.contains("Complete")
+            || message.contains("success")
+            || message.contains("captured")
+        {
             LogLevel::Success
-        } else if message.contains("❌") || message.contains("Failed") || message.contains("Error") || message.contains("error") {
+        } else if message.contains("❌")
+            || message.contains("Failed")
+            || message.contains("Error")
+            || message.contains("error")
+        {
             LogLevel::Error
         } else {
             LogLevel::Info

@@ -22,7 +22,10 @@ use super::{ExternalService, RuntimeEnvVar, ServiceConfig, ServiceType};
 /// Input configuration for creating a PostgreSQL service
 /// This is what users provide when creating the service
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[schemars(title = "PostgreSQL Configuration", description = "Configuration for PostgreSQL service")]
+#[schemars(
+    title = "PostgreSQL Configuration",
+    description = "Configuration for PostgreSQL service"
+)]
 pub struct PostgresInputConfig {
     /// PostgreSQL host address
     #[serde(default = "default_host")]
@@ -50,7 +53,10 @@ pub struct PostgresInputConfig {
 
     /// Maximum number of connections
     #[serde(default = "default_max_connections")]
-    #[schemars(example = "example_max_connections", default = "default_max_connections")]
+    #[schemars(
+        example = "example_max_connections",
+        default = "default_max_connections"
+    )]
     pub max_connections: u32,
 
     /// SSL mode (disable, allow, prefer, require)
@@ -190,8 +196,9 @@ impl PostgresService {
 
     fn get_postgres_config(&self, service_config: ServiceConfig) -> Result<PostgresConfig> {
         // Parse input config and transform to runtime config
-        let input_config: PostgresInputConfig = serde_json::from_value(service_config.parameters)
-            .map_err(|e| anyhow::anyhow!("Failed to parse PostgreSQL configuration: {}", e))?;
+        let input_config: PostgresInputConfig =
+            serde_json::from_value(service_config.parameters)
+                .map_err(|e| anyhow::anyhow!("Failed to parse PostgreSQL configuration: {}", e))?;
 
         Ok(PostgresConfig::from(input_config))
     }
@@ -649,7 +656,8 @@ impl ExternalService for PostgresService {
         *self.config.write().await = Some(postgres_config.clone());
 
         // Create Docker container
-        self.create_container(&self.docker, &postgres_config).await?;
+        self.create_container(&self.docker, &postgres_config)
+            .await?;
 
         // Serialize the full runtime config to save to database
         // This ensures auto-generated values (password, port) are persisted

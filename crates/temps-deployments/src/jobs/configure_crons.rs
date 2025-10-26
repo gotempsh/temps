@@ -139,7 +139,11 @@ impl ConfigureCronsJob {
     fn detect_log_level(message: &str) -> LogLevel {
         if message.contains("✅") || message.contains("Complete") || message.contains("success") {
             LogLevel::Success
-        } else if message.contains("❌") || message.contains("Failed") || message.contains("Error") || message.contains("error") {
+        } else if message.contains("❌")
+            || message.contains("Failed")
+            || message.contains("Error")
+            || message.contains("error")
+        {
             LogLevel::Error
         } else {
             LogLevel::Info
@@ -178,8 +182,7 @@ impl ConfigureCronsJob {
 
     /// Configure cron jobs based on repository configuration
     async fn configure_crons(&self, repo_output: &RepositoryOutput) -> Result<(), WorkflowError> {
-        self.log("Starting cron configuration".to_string())
-            .await?;
+        self.log("Starting cron configuration".to_string()).await?;
 
         // Load project to get directory
         let project = projects::Entity::find_by_id(self.project_id)
@@ -197,8 +200,7 @@ impl ConfigureCronsJob {
         {
             Some(config) => config,
             None => {
-                self.log("No cron configuration needed".to_string())
-                    .await?;
+                self.log("No cron configuration needed".to_string()).await?;
                 return Ok(());
             }
         };

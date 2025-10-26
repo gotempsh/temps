@@ -92,7 +92,8 @@ impl TempsPlugin for DeploymentsPlugin {
                 context.require_service::<temps_screenshots::ScreenshotService>();
 
             // Get static deployer (required)
-            let static_deployer = context.require_service::<dyn temps_deployer::static_deployer::StaticDeployer>();
+            let static_deployer =
+                context.require_service::<dyn temps_deployer::static_deployer::StaticDeployer>();
 
             // Create WorkflowExecutionService
             let workflow_execution_service = Arc::new(WorkflowExecutionService::new(

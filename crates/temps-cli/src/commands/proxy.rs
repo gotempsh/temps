@@ -1,8 +1,8 @@
 use clap::Args;
-use temps_config::ServerConfig;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use temps_config::ServerConfig;
 use temps_core::CookieCrypto;
 use temps_database::DbConnection;
 use temps_proxy::ProxyShutdownSignal;

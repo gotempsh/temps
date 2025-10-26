@@ -714,7 +714,10 @@ impl PerformanceService {
 
     /// Check if performance metrics exist for a project
     pub async fn has_metrics(&self, project_id: i32) -> Result<bool, PerformanceError> {
-        info!("Checking if performance metrics exist for project: {}", project_id);
+        info!(
+            "Checking if performance metrics exist for project: {}",
+            project_id
+        );
 
         let count = performance_metrics::Entity::find()
             .filter(performance_metrics::Column::ProjectId.eq(project_id))

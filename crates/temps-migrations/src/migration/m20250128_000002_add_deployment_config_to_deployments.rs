@@ -12,9 +12,7 @@ impl MigrationTrait for Migration {
                 Table::alter()
                     .table(Deployments::Table)
                     .add_column_if_not_exists(
-                        ColumnDef::new(Deployments::DeploymentConfig)
-                            .json()
-                            .null(),
+                        ColumnDef::new(Deployments::DeploymentConfig).json().null(),
                     )
                     .to_owned(),
             )

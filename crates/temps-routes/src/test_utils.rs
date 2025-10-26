@@ -4,11 +4,11 @@ use sea_orm::*;
 use std::sync::Arc;
 use temps_core::chrono::Utc;
 use temps_database::DbConnection;
+use temps_entities::deployments::DeploymentMetadata;
 use temps_entities::{
     custom_routes, deployment_containers, deployments, environments, project_custom_domains,
     projects, upstream_config::UpstreamList,
 };
-use temps_entities::deployments::DeploymentMetadata;
 
 /// Test database mock operations for route table tests
 pub struct TestDBMockOperations {

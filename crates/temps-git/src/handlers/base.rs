@@ -215,14 +215,17 @@ fn convert_preset_json(cache: Option<sea_orm::JsonValue>) -> Option<Vec<ProjectP
                 .branches
                 .into_values()
                 .flat_map(|branch_data| {
-                    branch_data.presets.into_iter().map(|p| ProjectPresetResponse {
-                        path: p.path,
-                        preset: p.preset,
-                        preset_label: p.preset_label,
-                        exposed_port: p.exposed_port.map(|port| port as i32),
-                        icon_url: p.icon_url,
-                        project_type: p.project_type,
-                    })
+                    branch_data
+                        .presets
+                        .into_iter()
+                        .map(|p| ProjectPresetResponse {
+                            path: p.path,
+                            preset: p.preset,
+                            preset_label: p.preset_label,
+                            exposed_port: p.exposed_port.map(|port| port as i32),
+                            icon_url: p.icon_url,
+                            project_type: p.project_type,
+                        })
                 })
                 .collect(),
         )
