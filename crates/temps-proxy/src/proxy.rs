@@ -1124,6 +1124,53 @@ impl ProxyHttp for LoadBalancer {
                     if served {
                         debug!("Served static file: {}", ctx.path);
                         ctx.routing_status = "static_file".to_string();
+
+                        // Create proxy log for successful static file serving
+                        let proxy_log_service = self.proxy_log_service.clone();
+                        let proxy_log_request = CreateProxyLogRequest {
+                            method: ctx.method.clone(),
+                            path: ctx.path.clone(),
+                            query_string: ctx.query_string.clone(),
+                            host: ctx.host.clone(),
+                            status_code: 200,
+                            response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
+                            request_source: "proxy".to_string(),
+                            is_system_request: ctx.path.starts_with(ROUTE_PREFIX_TEMPS),
+                            routing_status: "static_file".to_string(),
+                            project_id: ctx.project.as_ref().map(|p| p.id),
+                            environment_id: ctx.environment.as_ref().map(|e| e.id),
+                            deployment_id: ctx.deployment.as_ref().map(|d| d.id),
+                            container_id: None, // Static files don't have containers
+                            upstream_host: Some(format!("static://{}", static_dir)),
+                            error_message: None,
+                            client_ip: ctx.ip_address.clone(),
+                            user_agent: Some(ctx.user_agent.clone()),
+                            referrer: ctx.referrer.clone(),
+                            request_id: ctx.request_id.clone(),
+                            ip_geolocation_id: None,
+                            browser: None,
+                            browser_version: None,
+                            operating_system: None,
+                            device_type: None,
+                            is_bot: None,
+                            bot_name: None,
+                            request_size_bytes: None,
+                            response_size_bytes: None, // Could be added if we track file size
+                            cache_status: None,
+                            request_headers: ctx
+                                .request_headers
+                                .as_ref()
+                                .and_then(|h| serde_json::to_value(h).ok()),
+                            response_headers: None,
+                        };
+
+                        // Spawn async task to avoid blocking
+                        tokio::spawn(async move {
+                            if let Err(e) = proxy_log_service.create(proxy_log_request).await {
+                                warn!("Failed to create proxy log for static file: {:?}", e);
+                            }
+                        });
+
                         return Ok(true); // Request handled
                     } else {
                         // Static file not found - return 404 instead of falling through
@@ -1143,6 +1190,52 @@ impl ProxyHttp for LoadBalancer {
                                 true,
                             )
                             .await?;
+
+                        // Create proxy log for 404 static file
+                        let proxy_log_service = self.proxy_log_service.clone();
+                        let proxy_log_request = CreateProxyLogRequest {
+                            method: ctx.method.clone(),
+                            path: ctx.path.clone(),
+                            query_string: ctx.query_string.clone(),
+                            host: ctx.host.clone(),
+                            status_code: 404,
+                            response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
+                            request_source: "proxy".to_string(),
+                            is_system_request: ctx.path.starts_with(ROUTE_PREFIX_TEMPS),
+                            routing_status: "static_file_not_found".to_string(),
+                            project_id: ctx.project.as_ref().map(|p| p.id),
+                            environment_id: ctx.environment.as_ref().map(|e| e.id),
+                            deployment_id: ctx.deployment.as_ref().map(|d| d.id),
+                            container_id: None,
+                            upstream_host: Some(format!("static://{}", static_dir)),
+                            error_message: Some("Static file not found".to_string()),
+                            client_ip: ctx.ip_address.clone(),
+                            user_agent: Some(ctx.user_agent.clone()),
+                            referrer: ctx.referrer.clone(),
+                            request_id: ctx.request_id.clone(),
+                            ip_geolocation_id: None,
+                            browser: None,
+                            browser_version: None,
+                            operating_system: None,
+                            device_type: None,
+                            is_bot: None,
+                            bot_name: None,
+                            request_size_bytes: None,
+                            response_size_bytes: Some(b"<html><body><h1>404 - File Not Found</h1></body></html>".len() as i64),
+                            cache_status: None,
+                            request_headers: ctx
+                                .request_headers
+                                .as_ref()
+                                .and_then(|h| serde_json::to_value(h).ok()),
+                            response_headers: None,
+                        };
+
+                        tokio::spawn(async move {
+                            if let Err(e) = proxy_log_service.create(proxy_log_request).await {
+                                warn!("Failed to create proxy log for 404 static file: {:?}", e);
+                            }
+                        });
+
                         return Ok(true); // Request handled with 404
                     }
                 }
@@ -1164,6 +1257,53 @@ impl ProxyHttp for LoadBalancer {
                             true,
                         )
                         .await?;
+
+                    // Create proxy log for 500 error
+                    let proxy_log_service = self.proxy_log_service.clone();
+                    let error_msg = format!("Static directory error: {}", e);
+                    let proxy_log_request = CreateProxyLogRequest {
+                        method: ctx.method.clone(),
+                        path: ctx.path.clone(),
+                        query_string: ctx.query_string.clone(),
+                        host: ctx.host.clone(),
+                        status_code: 500,
+                        response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
+                        request_source: "proxy".to_string(),
+                        is_system_request: ctx.path.starts_with(ROUTE_PREFIX_TEMPS),
+                        routing_status: "static_directory_error".to_string(),
+                        project_id: ctx.project.as_ref().map(|p| p.id),
+                        environment_id: ctx.environment.as_ref().map(|e| e.id),
+                        deployment_id: ctx.deployment.as_ref().map(|d| d.id),
+                        container_id: None,
+                        upstream_host: Some(format!("static://{}", static_dir)),
+                        error_message: Some(error_msg),
+                        client_ip: ctx.ip_address.clone(),
+                        user_agent: Some(ctx.user_agent.clone()),
+                        referrer: ctx.referrer.clone(),
+                        request_id: ctx.request_id.clone(),
+                        ip_geolocation_id: None,
+                        browser: None,
+                        browser_version: None,
+                        operating_system: None,
+                        device_type: None,
+                        is_bot: None,
+                        bot_name: None,
+                        request_size_bytes: None,
+                        response_size_bytes: Some(b"<html><body><h1>500 - Static Directory Error</h1><p>The static files directory could not be accessed.</p></body></html>".len() as i64),
+                        cache_status: None,
+                        request_headers: ctx
+                            .request_headers
+                            .as_ref()
+                            .and_then(|h| serde_json::to_value(h).ok()),
+                        response_headers: None,
+                    };
+
+                    tokio::spawn(async move {
+                        if let Err(e) = proxy_log_service.create(proxy_log_request).await {
+                            warn!("Failed to create proxy log for static directory error: {:?}", e);
+                        }
+                    });
+
                     return Ok(true); // Request handled with error response
                 }
             }

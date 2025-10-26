@@ -21,7 +21,7 @@ mod integration_tests {
             .await
             .unwrap();
         let server_config = ProxyConfig::default();
-        let config = Arc::new(ServerConfig::default());
+        let config = crate::proxy_test::proxy_tests::create_test_config_service(test_db.db.clone());
         // Create route table and load routes
         let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
         route_table.load_routes().await?;
@@ -72,7 +72,7 @@ mod integration_tests {
         // Create route table and load routes
         let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
         route_table.load_routes().await?;
-        let config = Arc::new(ServerConfig::default());
+        let config = crate::proxy_test::proxy_tests::create_test_config_service(test_db.db.clone());
         let proxy_service = create_proxy_service(
             test_db.db.clone(),
             server_config,
@@ -106,7 +106,7 @@ mod integration_tests {
             .await
             .unwrap();
         let server_config = ProxyConfig::default();
-        let config = Arc::new(ServerConfig::default());
+        let config = crate::proxy_test::proxy_tests::create_test_config_service(test_db.db.clone());
         // Create test project
         let (project, environment, deployment) = test_db.create_test_project().await?;
 
@@ -153,7 +153,7 @@ mod integration_tests {
             .await
             .unwrap();
         let server_config = ProxyConfig::default();
-        let config = Arc::new(ServerConfig::default());
+        let config = crate::proxy_test::proxy_tests::create_test_config_service(test_db.db.clone());
         // Create route table and load routes
         let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
         route_table.load_routes().await?;
@@ -207,7 +207,7 @@ mod integration_tests {
             .await
             .unwrap();
         let server_config = ProxyConfig::default();
-        let config = Arc::new(ServerConfig::default());
+        let config = crate::proxy_test::proxy_tests::create_test_config_service(test_db.db.clone());
         // Create route table and load routes
         let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
         route_table.load_routes().await?;

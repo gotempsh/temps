@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod proxy_tests {
+pub mod proxy_tests {
     use crate::config::ProxyConfig;
     use crate::proxy::LoadBalancer as ProxyLoadBalancer;
     use crate::services::*;
@@ -147,7 +147,7 @@ mod proxy_tests {
         )
     }
 
-    fn create_test_config_service(
+    pub fn create_test_config_service(
         db: Arc<sea_orm::DatabaseConnection>,
     ) -> Arc<temps_config::ConfigService> {
         // Create test ServerConfig with minimal required fields
