@@ -33,7 +33,7 @@ utoipa = { workspace = true }
 flate2 = { workspace = true }
 
 # Nixpacks integration
-nixpacks = "1.40.0"
+nixpacks = "1.41.0"
 
 [dev-dependencies]
 tempfile = { workspace = true }

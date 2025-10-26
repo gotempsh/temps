@@ -1,6 +1,6 @@
 use anyhow::Result;
-use trust_dns_resolver::config::*;
-use trust_dns_resolver::TokioAsyncResolver;
+use hickory_resolver::config::*;
+use hickory_resolver::TokioAsyncResolver;
 
 /// Result of a DNS A record lookup
 #[derive(Debug, Clone)]

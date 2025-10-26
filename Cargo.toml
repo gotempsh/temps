@@ -193,7 +193,7 @@ cron = "0.15.0"
 # ============================================================================
 # String & URL Utilities
 # ============================================================================
-url = "2.5.0"
+url = "2.5.4"
 urlencoding = "2.1"
 slug = "0.1.6"
 regex = "1.11"
@@ -227,7 +227,10 @@ woothee = "0.13.0"
 # ============================================================================
 # Testing
 # ============================================================================
-testcontainers = { git = "https://github.com/testcontainers/testcontainers-rs", rev = "5ea0d04" }
+# Using git version for security fixes:
+# - Uses astral-tokio-tar instead of vulnerable tokio-tar (RUSTSEC-2025-0111)
+# - Compatible with bollard 0.19.x
+testcontainers = { git = "https://github.com/testcontainers/testcontainers-rs", rev = "9b65b29" }
 
 
 [profile.release]
@@ -242,3 +245,18 @@ codegen-units = 256
 
 [profile.dev.package."*"]
 opt-level = 2      # Optimize dependencies
+
+# ============================================================================
+# Dependency Overrides - Security Fixes
+# ============================================================================
+# Note: protobuf 2.28.0 vulnerability (RUSTSEC-2024-0437) comes from pingora → prometheus
+# The issue will be resolved when pingora updates its prometheus dependency
+# For now, we accept this risk as:
+# 1. protobuf is used internally by Prometheus metrics collection
+# 2. The vulnerability requires attacker-controlled protobuf messages
+# 3. We don't expose protobuf parsing to untrusted inputs
+#
+# RSA timing attack (RUSTSEC-2023-0071 - Marvin Attack):
+# - No patch available yet from the rsa crate
+# - Used transitively, not directly exposed to untrusted input
+# - Monitoring for updates
