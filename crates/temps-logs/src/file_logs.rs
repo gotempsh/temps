@@ -287,17 +287,18 @@ mod tests {
         let log_service = LogService::new(temp_dir.path().to_path_buf());
 
         let log_id = "test-append";
-        log_service.create_log_path(log_id).await.unwrap();
 
         // Append some content using structured logging
         log_service.log_info(log_id, "First line").await.unwrap();
         log_service.log_info(log_id, "Second line").await.unwrap();
 
-        // Read back the content - should have structured JSONL format
-        let content = log_service.get_log_content(log_id).await.unwrap();
-        assert!(content.contains("First line"));
-        assert!(content.contains("Second line"));
-        assert!(content.contains("\"level\":\"info\""));
+        // Read back the structured logs
+        let logs = log_service.get_structured_logs(log_id).await.unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].message, "First line");
+        assert_eq!(logs[1].message, "Second line");
+        assert!(matches!(logs[0].level, LogLevel::Info));
+        assert!(matches!(logs[1].level, LogLevel::Info));
     }
 
     #[tokio::test]
@@ -339,10 +340,11 @@ mod tests {
         // Structured log should create the file
         log_service.log_info(log_id, "First line").await.unwrap();
 
-        // Verify content was written (this also confirms file was created)
-        let content = log_service.get_log_content(log_id).await.unwrap();
-        assert!(content.contains("First line"));
-        assert!(content.contains("\"level\":\"info\""));
+        // Verify content was written using structured logs
+        let logs = log_service.get_structured_logs(log_id).await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].message, "First line");
+        assert!(matches!(logs[0].level, LogLevel::Info));
     }
 
     #[tokio::test]
@@ -376,12 +378,13 @@ mod tests {
                 .unwrap();
         }
 
-        let content = log_service.get_log_content(log_id).await.unwrap();
-        // Verify all lines are present in structured format
-        for i in 1..=5 {
-            assert!(content.contains(&format!("Line {}", i)));
+        // Read back the structured logs
+        let logs = log_service.get_structured_logs(log_id).await.unwrap();
+        assert_eq!(logs.len(), 5);
+        for (i, log) in logs.iter().enumerate() {
+            assert_eq!(log.message, format!("Line {}", i + 1));
+            assert!(matches!(log.level, LogLevel::Info));
         }
-        assert!(content.contains("\"level\":\"info\""));
     }
 
     #[tokio::test]
@@ -390,11 +393,6 @@ mod tests {
         let log_service = LogService::new(temp_dir.path().to_path_buf());
 
         let log_id = "test-with-dashes_and_underscores";
-        let log_path = log_service.get_log_path(log_id);
-
-        assert!(log_path
-            .to_string_lossy()
-            .contains("test-with-dashes_and_underscores.log"));
 
         // Should be able to write to it using structured logging
         log_service
@@ -402,9 +400,11 @@ mod tests {
             .await
             .unwrap();
 
-        let content = log_service.get_log_content(log_id).await.unwrap();
-        assert!(content.contains("Content with special chars"));
-        assert!(content.contains("\"level\":\"info\""));
+        // Read back the structured logs
+        let logs = log_service.get_structured_logs(log_id).await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].message, "Content with special chars");
+        assert!(matches!(logs[0].level, LogLevel::Info));
     }
 
     #[tokio::test]
