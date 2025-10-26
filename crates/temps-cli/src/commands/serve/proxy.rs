@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use temps_config::ServerConfig;
 use temps_core::CookieCrypto;
 use temps_database::DbConnection;
 use temps_proxy::ProxyShutdownSignal;
@@ -14,13 +15,13 @@ pub fn start_proxy_server(
     db: Arc<DbConnection>,
     address: String,
     tls_address: Option<String>,
-    console_address: String,
     cookie_crypto: Arc<CookieCrypto>,
     encryption_service: Arc<temps_core::EncryptionService>,
-    data_dir: PathBuf,
     database_url: String,
     route_table: Arc<temps_proxy::CachedPeerTable>,
+    config: Arc<ServerConfig>,
 ) -> anyhow::Result<()> {
+    let console_address = config.console_address.clone();
     // Create tokio runtime to fetch preview_domain from config service
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -66,7 +67,7 @@ pub fn start_proxy_server(
     let shutdown_signal = Box::new(CtrlCShutdownSignal::new(
         Duration::from_secs(30),
         db.clone(),
-        data_dir.clone(),
+        config.data_dir.clone(),
     )) as Box<dyn ProxyShutdownSignal>;
 
     match temps_proxy::setup_proxy_server(
@@ -76,6 +77,7 @@ pub fn start_proxy_server(
         encryption_service,
         route_table,
         shutdown_signal,
+        config.clone(),
     ) {
         Ok(_) => {
             info!("Proxy server exited");

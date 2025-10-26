@@ -71,7 +71,7 @@ impl TestDBMockOperations {
             environment_id: Set(environment.id),
             slug: Set("http://localhost:8080".to_string()),
             state: Set("running".to_string()),
-            metadata: Set(None),
+            metadata: Set(Some(temps_entities::deployments::DeploymentMetadata::default())),
             ..Default::default()
         };
         let deployment = deployment.insert(self.db.as_ref()).await?;

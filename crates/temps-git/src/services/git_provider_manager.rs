@@ -24,12 +24,14 @@ use octocrab::params::apps::CreateInstallationAccessToken;
 use octocrab::Octocrab;
 use reqwest::Url;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProjectPresetDomain {
     pub path: String,
     pub preset: String,
     pub preset_label: String,
     pub exposed_port: Option<u16>,
+    pub icon_url: Option<String>,
+    pub project_type: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2269,13 +2271,16 @@ impl GitProviderManager {
         }
     }
 
-    /// Get repository preset from database
+    /// Get repository preset from database by branch
+    /// If branch is not specified, uses the repository's default branch
     pub async fn get_repository_preset(
         &self,
         connection_id: i32,
         owner: &str,
         repo: &str,
+        branch: Option<String>,
     ) -> Result<Option<serde_json::Value>, GitProviderManagerError> {
+        // Find repository
         let repository = repositories::Entity::find()
             .filter(repositories::Column::GitProviderConnectionId.eq(connection_id))
             .filter(repositories::Column::Owner.eq(owner))
@@ -2283,7 +2288,26 @@ impl GitProviderManager {
             .one(self.db.as_ref())
             .await?;
 
-        Ok(repository.and_then(|r| r.preset))
+        let repository = match repository {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        // Use provided branch or fall back to default branch
+        let target_branch = branch.unwrap_or_else(|| repository.default_branch.clone());
+
+        // Get preset cache and extract data for the specific branch
+        let preset_data = repository
+            .preset
+            .as_ref()
+            .and_then(|json_cache| {
+                // Deserialize Json to RepositoryPresetCache
+                let cache: repositories::RepositoryPresetCache =
+                    serde_json::from_value(json_cache.clone()).ok()?;
+                cache.branches.get(&target_branch).map(|branch_data| json!(branch_data))
+            });
+
+        Ok(preset_data)
     }
 
     /// Calculate repository preset in real-time without storing it
@@ -2336,23 +2360,47 @@ impl GitProviderManager {
         // Detect presets in root and subdirectories
         let presets = self.detect_presets_in_directories(&files).await;
 
-        // Cache presets in database as JSON
-        let preset_json = if presets.is_empty() {
-            None
-        } else {
-            Some(json!(presets
-                .iter()
-                .map(|p| json!({
-                    "path": p.path,
-                    "preset": p.preset,
-                    "preset_label": p.preset_label,
-                }))
-                .collect::<Vec<_>>()))
-        };
+        // Cache presets in repositories.preset as HashMap<branch, preset_data>
+        let calculated_at = chrono::Utc::now();
 
-        // Update repository with cached presets
+        // Get existing preset cache or create new one
+        let mut preset_cache: repositories::RepositoryPresetCache = repository
+            .preset
+            .as_ref()
+            .and_then(|json| serde_json::from_value(json.clone()).ok())
+            .unwrap_or_else(|| repositories::RepositoryPresetCache {
+                branches: std::collections::HashMap::new(),
+            });
+
+        // Convert ProjectPresetDomain to PresetInfo
+        let preset_infos: Vec<repositories::PresetInfo> = presets
+            .iter()
+            .map(|p| repositories::PresetInfo {
+                path: p.path.clone(),
+                preset: p.preset.clone(),
+                preset_label: p.preset_label.clone(),
+                exposed_port: p.exposed_port,
+                icon_url: p.icon_url.clone(),
+                project_type: p.project_type.clone(),
+            })
+            .collect();
+
+        // Update cache for this branch
+        preset_cache.branches.insert(
+            target_branch.clone(),
+            repositories::BranchPresetData {
+                presets: preset_infos,
+                calculated_at,
+            },
+        );
+
+        // Serialize cache to Json for database storage
+        let preset_json = serde_json::to_value(&preset_cache)
+            .map_err(|e| GitProviderManagerError::InvalidConfiguration(format!("Failed to serialize preset cache: {}", e)))?;
+
+        // Update repository with new cache
         let mut repo_update: repositories::ActiveModel = repository.clone().into();
-        repo_update.preset = Set(preset_json.clone());
+        repo_update.preset = Set(Some(preset_json));
         repo_update.update(self.db.as_ref()).await?;
 
         Ok(RepositoryPresetDomain {
@@ -2360,7 +2408,7 @@ impl GitProviderManager {
             owner: repository.owner,
             name: repository.name,
             presets,
-            calculated_at: chrono::Utc::now(),
+            calculated_at,
         })
     }
 
@@ -2373,19 +2421,34 @@ impl GitProviderManager {
         detected_presets
             .into_iter()
             .map(|preset| {
-                // Parse preset slug to get exposed port from entity enum
-                let exposed_port = preset
+                // Parse preset slug to get metadata from entity enum
+                let preset_enum = preset
                     .slug
                     .parse::<temps_entities::preset::Preset>()
-                    .ok()
+                    .ok();
+
+                let exposed_port = preset_enum
+                    .as_ref()
                     .and_then(|p| p.exposed_port())
                     .or(preset.exposed_port);
+
+                let icon_url = preset_enum
+                    .as_ref()
+                    .and_then(|p| p.icon_url())
+                    .map(|s| s.to_string());
+
+                let project_type = preset_enum
+                    .as_ref()
+                    .map(|p| p.project_type().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
 
                 ProjectPresetDomain {
                     path: preset.path,
                     preset: preset.slug,
                     preset_label: preset.label,
                     exposed_port,
+                    icon_url,
+                    project_type,
                 }
             })
             .collect()

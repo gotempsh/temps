@@ -655,7 +655,7 @@ pub async fn update_git_settings(
         (status = 500, description = "Internal server error")
     ),
     params(
-        ("project_id" = String, Path, description = "Project ID or slug")
+        ("project_id" = i32, Path, description = "Project ID")
     ),
     security(
         ("bearer_auth" = [])
@@ -663,7 +663,7 @@ pub async fn update_git_settings(
 )]
 pub async fn update_project_deployment_config(
     State(state): State<Arc<AppState>>,
-    Path(project_id): Path<String>,
+    Path(project_id): Path<i32>,
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
     Json(config): Json<UpdateDeploymentConfigRequest>,
@@ -674,7 +674,7 @@ pub async fn update_project_deployment_config(
 
     let updated_project = state
         .project_service
-        .update_project_deployment_config(&project_id, config.clone())
+        .update_project_deployment_config(project_id, config.clone())
         .await
         .map_err(|e| {
             error!("Error updating deployment config: {:?}", e);
@@ -999,12 +999,16 @@ pub async fn list_presets(RequireAuth(_auth): RequireAuth) -> Result<impl IntoRe
             // Generate relative icon URL
             let icon_url = format!("/presets/{}.svg", slug);
 
+            // Get default port from the preset enum
+            let default_port = preset.exposed_port();
+
             super::types::PresetResponse {
                 slug,
                 label: label.to_string(),
                 icon_url,
                 project_type: project_type.to_string(),
                 description: description.to_string(),
+                default_port,
             }
         })
         .collect();

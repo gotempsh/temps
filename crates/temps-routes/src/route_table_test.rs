@@ -421,7 +421,7 @@ mod route_table_tests {
             environment_id: Set(environment.id),
             slug: Set("http://localhost:9001".to_string()),
             state: Set("completed".to_string()),
-            metadata: Set(None),
+            metadata: Set(Some(temps_entities::deployments::DeploymentMetadata::default())),
             ..Default::default()
         };
         let deployment2 = deployment2.insert(test_db.db.as_ref()).await?;

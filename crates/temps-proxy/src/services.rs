@@ -340,12 +340,9 @@ impl ProjectContextResolver for ProjectContextResolverImpl {
     }
 
     async fn is_static_deployment(&self, host: &str) -> bool {
-        // Use cached project model from route table for O(1) lookup
+        // Use route_info.is_static() to check if backend is static directory
         if let Some(route_info) = self.route_table.get_route(host) {
-            if let Some(project) = route_info.project {
-                // Check if the preset is Static
-                return project.preset == temps_entities::preset::Preset::Static;
-            }
+            return route_info.is_static();
         }
         false
     }
@@ -358,9 +355,10 @@ impl ProjectContextResolver for ProjectContextResolverImpl {
         Some((redirect_to, status_code))
     }
 
-    async fn get_static_path(&self, _host: &str) -> Option<String> {
-        // Implementation would return static file path
-        None
+    async fn get_static_path(&self, host: &str) -> Option<String> {
+        // Use route_info.static_dir() to get static directory path
+        let route_info = self.route_table.get_route(host)?;
+        route_info.static_dir().map(|s| s.to_string())
     }
 }
 

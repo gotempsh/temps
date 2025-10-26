@@ -229,6 +229,19 @@ pub trait Preset: fmt::Display + Send + Sync {
     }
     fn dirs_to_upload(&self) -> Vec<String>;
     fn slug(&self) -> String;
+
+    /// Returns the default exposed port for this preset
+    /// This is the port the application listens on inside the container
+    fn default_port(&self) -> u16 {
+        3000 // Default port for most web applications
+    }
+
+    /// Returns the static output directory for presets that can be deployed as static files
+    /// Returns None for presets that require a runtime server
+    /// For static-capable presets (Vite, React, etc.), returns Some("dist"), Some("build"), etc.
+    fn static_output_dir(&self) -> Option<String> {
+        None // Default: requires runtime server
+    }
 }
 
 pub fn all_presets() -> Vec<Box<dyn Preset>> {

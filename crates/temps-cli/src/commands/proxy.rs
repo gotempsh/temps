@@ -1,4 +1,5 @@
 use clap::Args;
+use temps_config::ServerConfig;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,7 +168,7 @@ impl ProxyCommand {
             self.console_address.clone(),
             cookie_crypto,
             encryption_service,
-            serve_config.data_dir.clone(),
+            serve_config.clone(),
         )
     }
 
@@ -180,8 +181,9 @@ impl ProxyCommand {
         console_address: Option<String>,
         cookie_crypto: Arc<CookieCrypto>,
         encryption_service: Arc<temps_core::EncryptionService>,
-        data_dir: PathBuf,
+        config: Arc<ServerConfig>,
     ) -> anyhow::Result<()> {
+        let data_dir = config.data_dir.clone();
         let console_address = console_address
             .ok_or_else(|| anyhow::anyhow!("Console address is required for proxy server"))?;
 
@@ -245,6 +247,7 @@ impl ProxyCommand {
             encryption_service,
             route_table,
             shutdown_signal,
+            config.clone(),
         ) {
             Ok(_) => {
                 info!("Proxy server exited");

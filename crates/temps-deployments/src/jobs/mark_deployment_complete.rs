@@ -129,65 +129,117 @@ impl MarkDeploymentCompleteJob {
             active_deployment.image_name = Set(Some(image_tag));
         }
 
-        // Extract container info from deploy job output and create deployment_container record
-        if let Ok(Some(container_id)) =
-            context.get_output::<String>("deploy_container", "container_id")
-        {
-            let container_name = context
-                .get_output::<String>("deploy_container", "container_name")
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| format!("container-{}", self.deployment_id));
+        // Extract static_dir_location from deploy_static job output
+        if let Ok(Some(static_dir)) = context.get_output::<String>("deploy_static", "static_dir_location") {
+            debug!("Setting deployment static_dir_location to: {}", static_dir);
+            self.log(format!("📁 Static files location: {}", static_dir))
+                .await?;
+            active_deployment.static_dir_location = Set(Some(static_dir));
+        }
 
+        // Extract container info from deploy job output and create deployment_container records
+        // Try to get container_ids array first (for multi-replica deployments)
+        let container_ids = context
+            .get_output::<Vec<String>>("deploy_container", "container_ids")
+            .ok()
+            .flatten()
+            .or_else(|| {
+                // Fallback to single container_id for backward compatibility
+                context
+                    .get_output::<String>("deploy_container", "container_id")
+                    .ok()
+                    .flatten()
+                    .map(|id| vec![id])
+            });
+
+        let host_ports = context
+            .get_output::<Vec<u16>>("deploy_container", "host_ports")
+            .ok()
+            .flatten()
+            .or_else(|| {
+                // Fallback to single host_port for backward compatibility
+                context
+                    .get_output::<u16>("deploy_container", "host_port")
+                    .ok()
+                    .flatten()
+                    .map(|port| vec![port])
+            });
+
+        if let Some(container_ids) = container_ids {
+            let now = chrono::Utc::now();
             let container_port = context
                 .get_output::<i32>("deploy_container", "container_port")
                 .ok()
                 .flatten()
                 .unwrap_or(8080);
 
-            let host_port = context
-                .get_output::<i32>("deploy_container", "host_port")
-                .ok()
-                .flatten();
+            // Create a deployment_container record for each container
+            for (index, container_id) in container_ids.iter().enumerate() {
+                let container_name = if container_ids.len() > 1 {
+                    // Multi-replica: append index to name
+                    context
+                        .get_output::<String>("deploy_container", "container_name")
+                        .ok()
+                        .flatten()
+                        .map(|name| format!("{}-{}", name, index + 1))
+                        .unwrap_or_else(|| format!("container-{}-{}", self.deployment_id, index + 1))
+                } else {
+                    // Single replica: use original name
+                    context
+                        .get_output::<String>("deploy_container", "container_name")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| format!("container-{}", self.deployment_id))
+                };
 
-            let now = chrono::Utc::now();
+                let host_port = host_ports
+                    .as_ref()
+                    .and_then(|ports| ports.get(index).map(|&p| p as i32));
 
-            // Create deployment_container record
-            let deployment_container = deployment_containers::ActiveModel {
-                deployment_id: Set(self.deployment_id),
-                container_id: Set(container_id.clone()),
-                container_name: Set(container_name.clone()),
-                container_port: Set(container_port),
-                host_port: Set(host_port),
-                image_name: Set(match &active_deployment.image_name {
-                    sea_orm::ActiveValue::Set(v) => v.clone(),
-                    sea_orm::ActiveValue::Unchanged(v) => v.clone(),
-                    _ => None,
-                }),
-                status: Set(Some("running".to_string())),
-                created_at: Set(now),
-                deployed_at: Set(now),
-                ready_at: Set(Some(now)),
-                deleted_at: Set(None),
-                ..Default::default()
-            };
+                // Create deployment_container record
+                let deployment_container = deployment_containers::ActiveModel {
+                    deployment_id: Set(self.deployment_id),
+                    container_id: Set(container_id.clone()),
+                    container_name: Set(container_name.clone()),
+                    container_port: Set(container_port),
+                    host_port: Set(host_port),
+                    image_name: Set(match &active_deployment.image_name {
+                        sea_orm::ActiveValue::Set(v) => v.clone(),
+                        sea_orm::ActiveValue::Unchanged(v) => v.clone(),
+                        _ => None,
+                    }),
+                    status: Set(Some("running".to_string())),
+                    created_at: Set(now),
+                    deployed_at: Set(now),
+                    ready_at: Set(Some(now)),
+                    deleted_at: Set(None),
+                    ..Default::default()
+                };
 
-            deployment_container
-                .insert(self.db.as_ref())
-                .await
-                .map_err(|e| {
-                    WorkflowError::JobExecutionFailed(format!(
-                        "Failed to create deployment_container: {}",
-                        e
-                    ))
-                })?;
+                deployment_container
+                    .insert(self.db.as_ref())
+                    .await
+                    .map_err(|e| {
+                        WorkflowError::JobExecutionFailed(format!(
+                            "Failed to create deployment_container: {}",
+                            e
+                        ))
+                    })?;
 
-            info!(
-                "Created deployment_container record for container {}",
-                container_id
-            );
-            self.log(format!("Container {} registered", container_id))
+                info!(
+                    "Created deployment_container record for container {} (replica {}/{})",
+                    container_id,
+                    index + 1,
+                    container_ids.len()
+                );
+                self.log(format!(
+                    "Container {} registered (replica {}/{})",
+                    container_id,
+                    index + 1,
+                    container_ids.len()
+                ))
                 .await?;
+            }
         }
 
         // Update deployment status to completed

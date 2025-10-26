@@ -85,6 +85,10 @@ impl Preset for JavaPreset {
     fn slug(&self) -> String {
         "java".to_string()
     }
+
+    fn default_port(&self) -> u16 {
+        8080 // Spring Boot and most Java web servers default port
+    }
 }
 
 impl fmt::Display for JavaPreset {
@@ -159,5 +163,11 @@ mod tests {
         // When no build file exists, default to Maven
         assert_eq!(preset.install_command(temp_dir.path()), "mvn clean install -DskipTests");
         assert_eq!(preset.build_command(temp_dir.path()), "mvn package -DskipTests");
+    }
+
+    #[test]
+    fn test_java_default_port() {
+        let preset = JavaPreset::new();
+        assert_eq!(preset.default_port(), 8080);
     }
 }

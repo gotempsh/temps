@@ -2,7 +2,44 @@ use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use temps_core::DBDateTime;
+
+/// Branch-specific preset data
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchPresetData {
+    /// List of detected presets in the repository
+    pub presets: Vec<PresetInfo>,
+    /// Timestamp when presets were calculated
+    pub calculated_at: DBDateTime,
+}
+
+/// Information about a detected preset
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresetInfo {
+    /// Path within the repository (e.g., "./", "apps/web")
+    pub path: String,
+    /// Preset slug (e.g., "nextjs", "vite")
+    pub preset: String,
+    /// Human-readable preset label (e.g., "Next.js", "Vite")
+    pub preset_label: String,
+    /// Exposed port for the preset
+    pub exposed_port: Option<u16>,
+    /// Icon URL for the preset
+    pub icon_url: Option<String>,
+    /// Project type category (e.g., "frontend", "backend", "fullstack")
+    pub project_type: String,
+}
+
+/// Repository preset cache structure
+/// Maps branch names to their preset data
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryPresetCache {
+    #[serde(flatten)]
+    pub branches: HashMap<String, BranchPresetData>,
+}
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "repositories")]
 pub struct Model {
@@ -30,8 +67,8 @@ pub struct Model {
     pub installation_id: Option<i32>,
     pub clone_url: Option<String>, // HTTPS clone URL
     pub ssh_url: Option<String>,   // SSH clone URL
-    #[sea_orm(column_type = "JsonBinary")]
-    pub preset: Option<Json>, // Stores preset cache as JSON array
+    /// Stores preset cache as HashMap<branch, BranchPresetData>
+    pub preset: Option<Json>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

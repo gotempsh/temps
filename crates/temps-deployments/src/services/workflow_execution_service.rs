@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use temps_core::{WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor};
 use temps_database::DbConnection;
-use temps_deployer::{ContainerDeployer, ImageBuilder};
+use temps_deployer::{ContainerDeployer, ImageBuilder, static_deployer::StaticDeployer};
 use temps_entities::{deployment_jobs, deployments, environments, projects};
 use temps_git::GitProviderManagerTrait;
 use temps_logs::LogService;
@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::jobs::{
     BuildImageJobBuilder, ConfigureCronsJobBuilder, CronConfigService, DeployImageJobBuilder,
-    DeploymentTarget, DownloadRepoBuilder,
+    DeploymentTarget, DeployStaticJob, DownloadRepoBuilder,
 };
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
@@ -26,6 +26,7 @@ pub struct WorkflowExecutionService {
     git_provider: Arc<dyn GitProviderManagerTrait>,
     image_builder: Arc<dyn ImageBuilder>,
     container_deployer: Arc<dyn ContainerDeployer>,
+    static_deployer: Arc<dyn StaticDeployer>,
     log_service: Arc<LogService>,
     cron_service: Arc<dyn CronConfigService>,
     config_service: Arc<temps_config::ConfigService>,
@@ -39,6 +40,7 @@ impl WorkflowExecutionService {
         git_provider: Arc<dyn GitProviderManagerTrait>,
         image_builder: Arc<dyn ImageBuilder>,
         container_deployer: Arc<dyn ContainerDeployer>,
+        static_deployer: Arc<dyn StaticDeployer>,
         log_service: Arc<LogService>,
         cron_service: Arc<dyn CronConfigService>,
         config_service: Arc<temps_config::ConfigService>,
@@ -49,6 +51,7 @@ impl WorkflowExecutionService {
             git_provider,
             image_builder,
             container_deployer,
+            static_deployer,
             log_service,
             cron_service,
             config_service,
@@ -447,11 +450,17 @@ impl WorkflowExecutionService {
 
                 let port = config.get("port").and_then(|v| v.as_i64()).unwrap_or(3000) as u16;
 
-                // Get replicas from environment deployment_config, fallback to config, then default to 1
+                // Get replicas with priority: environment > project > job config > default (1)
                 let replicas = environment
                     .deployment_config
                     .as_ref()
                     .map(|c| c.replicas as u32)
+                    .or_else(|| {
+                        project
+                            .deployment_config
+                            .as_ref()
+                            .map(|c| c.replicas as u32)
+                    })
                     .or_else(|| {
                         config
                             .get("replicas")
@@ -460,7 +469,12 @@ impl WorkflowExecutionService {
                     })
                     .unwrap_or(1);
 
-                debug!("🔢 Deploying with {} replicas from environment", replicas);
+                debug!(
+                    "🔢 Deploying with {} replicas (env: {:?}, project: {:?})",
+                    replicas,
+                    environment.deployment_config.as_ref().map(|c| c.replicas),
+                    project.deployment_config.as_ref().map(|c| c.replicas)
+                );
 
                 // Get environment variables from job config (gathered during planning phase)
                 let env_variables = config
@@ -607,8 +621,62 @@ impl WorkflowExecutionService {
                 Ok(Arc::new(job))
             }
 
+            "DeployStaticJob" => {
+                let config = db_job.job_config.as_ref().ok_or_else(|| {
+                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
+                })?;
+
+                // Get dependencies to find the build job (DeployStaticJob depends on BuildImageJob)
+                let dependencies: Vec<String> = db_job
+                    .dependencies
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+
+                let build_job_id = dependencies
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "build_image".to_string());
+
+                // Get static output directory from config (path inside container after build)
+                // This is typically "/app/dist" or "/app/build" depending on the framework
+                let static_output_dir = config
+                    .get("static_output_dir")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/app/dist")
+                    .to_string();
+
+                debug!(
+                    "📦 DeployStaticJob will extract files from container path: {}",
+                    static_output_dir
+                );
+
+                // Fetch deployment to get slugs
+                let deployment = deployments::Entity::find_by_id(db_job.deployment_id)
+                    .one(self.db.as_ref())
+                    .await?
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::DeploymentNotFound(db_job.deployment_id)
+                    })?;
+
+                let job = DeployStaticJob::new(
+                    db_job.job_id.clone(),
+                    build_job_id,
+                    static_output_dir,
+                    project.slug.clone(),
+                    environment.slug.clone(),
+                    deployment.slug.clone(),
+                    self.static_deployer.clone(),
+                    self.image_builder.clone(),
+                )
+                .with_log_id(db_job.log_id.clone())
+                .with_log_service(self.log_service.clone());
+
+                Ok(Arc::new(job))
+            }
+
             // Unsupported job types - log warning but don't fail the entire workflow
-            "HealthCheckJob" | "DeployBasicJob" | "BuildStaticJob" | "DeployStaticJob" => {
+            "HealthCheckJob" | "DeployBasicJob" | "BuildStaticJob" => {
                 warn!(
                     "Skipping unsupported job type: {} (not yet implemented)",
                     db_job.job_type
@@ -1120,6 +1188,56 @@ mod tests {
         should_fail: bool,
     }
 
+    struct MockStaticDeployer;
+
+    #[async_trait]
+    impl temps_deployer::static_deployer::StaticDeployer for MockStaticDeployer {
+        async fn deploy(
+            &self,
+            _request: temps_deployer::static_deployer::StaticDeployRequest,
+        ) -> Result<temps_deployer::static_deployer::StaticDeployResult, temps_deployer::static_deployer::StaticDeployError> {
+            Ok(temps_deployer::static_deployer::StaticDeployResult {
+                storage_path: "/tmp/test-deployment".to_string(),
+                file_count: 10,
+                total_size_bytes: 1024,
+                deployed_at: Utc::now(),
+            })
+        }
+
+        async fn get_deployment(
+            &self,
+            _project_slug: &str,
+            _environment_slug: &str,
+            _deployment_slug: &str,
+        ) -> Result<temps_deployer::static_deployer::StaticDeploymentInfo, temps_deployer::static_deployer::StaticDeployError> {
+            Ok(temps_deployer::static_deployer::StaticDeploymentInfo {
+                deployment_slug: "test-deployment".to_string(),
+                storage_path: std::path::PathBuf::from("/tmp/test-deployment"),
+                deployed_at: Utc::now(),
+                file_count: 10,
+                total_size_bytes: 1024,
+            })
+        }
+
+        async fn list_files(
+            &self,
+            _project_slug: &str,
+            _environment_slug: &str,
+            _deployment_slug: &str,
+        ) -> Result<Vec<temps_deployer::static_deployer::FileInfo>, temps_deployer::static_deployer::StaticDeployError> {
+            Ok(vec![])
+        }
+
+        async fn remove(
+            &self,
+            _project_slug: &str,
+            _environment_slug: &str,
+            _deployment_slug: &str,
+        ) -> Result<(), temps_deployer::static_deployer::StaticDeployError> {
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl ContainerDeployer for MockContainerDeployer {
         async fn deploy_container(
@@ -1289,6 +1407,7 @@ mod tests {
         let git_provider = Arc::new(MockGitProvider);
         let image_builder = Arc::new(MockImageBuilder { should_fail: false });
         let container_deployer = Arc::new(MockContainerDeployer { should_fail: false });
+        let static_deployer = Arc::new(MockStaticDeployer);
         let log_service = Arc::new(LogService::new(std::env::temp_dir()));
         let cron_service =
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
@@ -1299,6 +1418,7 @@ mod tests {
             git_provider,
             image_builder,
             container_deployer,
+            static_deployer,
             log_service,
             cron_service,
             config_service,
@@ -1320,6 +1440,7 @@ mod tests {
         let git_provider = Arc::new(MockGitProvider);
         let image_builder = Arc::new(MockImageBuilder { should_fail: false });
         let container_deployer = Arc::new(MockContainerDeployer { should_fail: false });
+        let static_deployer = Arc::new(MockStaticDeployer);
         let log_service = Arc::new(LogService::new(std::env::temp_dir()));
         let cron_service =
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
@@ -1330,6 +1451,7 @@ mod tests {
             git_provider,
             image_builder,
             container_deployer,
+            static_deployer,
             log_service,
             cron_service,
             config_service,
@@ -1416,6 +1538,7 @@ mod tests {
         let git_provider = Arc::new(MockGitProvider);
         let image_builder = Arc::new(MockImageBuilder { should_fail: false });
         let container_deployer = Arc::new(MockContainerDeployer { should_fail: false });
+        let static_deployer = Arc::new(MockStaticDeployer);
         let log_service = Arc::new(LogService::new(std::env::temp_dir()));
         let cron_service =
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
@@ -1426,6 +1549,7 @@ mod tests {
             git_provider,
             image_builder,
             container_deployer,
+            static_deployer,
             log_service,
             cron_service,
             config_service,

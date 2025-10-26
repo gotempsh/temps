@@ -201,9 +201,32 @@ pub struct ProviderDeletionCheckResponse {
     pub message: String,
 }
 
-// Helper function to convert JSON preset cache to Vec<ProjectPresetResponse>
-fn convert_preset_json(json: Option<serde_json::Value>) -> Option<Vec<ProjectPresetResponse>> {
-    json.and_then(|value| serde_json::from_value::<Vec<ProjectPresetResponse>>(value).ok())
+// Helper function to convert preset cache to Vec<ProjectPresetResponse>
+// This flattens all presets from all branches into a single list
+fn convert_preset_json(cache: Option<sea_orm::JsonValue>) -> Option<Vec<ProjectPresetResponse>> {
+    cache.and_then(|json| {
+        // Deserialize Json to RepositoryPresetCache
+        let cache: temps_entities::repositories::RepositoryPresetCache =
+            serde_json::from_value(json).ok()?;
+
+        // Flatten all presets from all branches into a single list
+        Some(
+            cache
+                .branches
+                .into_values()
+                .flat_map(|branch_data| {
+                    branch_data.presets.into_iter().map(|p| ProjectPresetResponse {
+                        path: p.path,
+                        preset: p.preset,
+                        preset_label: p.preset_label,
+                        exposed_port: p.exposed_port.map(|port| port as i32),
+                        icon_url: p.icon_url,
+                        project_type: p.project_type,
+                    })
+                })
+                .collect(),
+        )
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -263,12 +286,17 @@ pub struct RepositorySyncResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectPresetResponse {
     pub path: String,
     pub preset: String,
     pub preset_label: String,
     /// Default exposed port for this preset (e.g., 3000 for Next.js, 8000 for FastAPI)
-    pub exposed_port: Option<u16>,
+    pub exposed_port: Option<i32>,
+    /// Icon URL for the preset
+    pub icon_url: Option<String>,
+    /// Project type category (e.g., "frontend", "backend", "fullstack")
+    pub project_type: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -986,7 +1014,9 @@ pub async fn get_repository_preset_by_name(
                     path: p.path,
                     preset: p.preset,
                     preset_label: p.preset_label,
-                    exposed_port: p.exposed_port,
+                    exposed_port: p.exposed_port.map(|port| port as i32),
+                    icon_url: p.icon_url,
+                    project_type: p.project_type,
                 })
                 .collect(),
             calculated_at: preset_result.calculated_at,
@@ -1717,7 +1747,9 @@ pub async fn get_repository_preset_live(
                     path: p.path,
                     preset: p.preset,
                     preset_label: p.preset_label,
-                    exposed_port: p.exposed_port,
+                    exposed_port: p.exposed_port.map(|port| port as i32),
+                    icon_url: p.icon_url,
+                    project_type: p.project_type,
                 })
                 .collect(),
             calculated_at: preset_result.calculated_at,

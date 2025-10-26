@@ -15,6 +15,7 @@ use pingora_openssl::ssl::NameType;
 use pingora_openssl::x509::X509;
 use pingora_proxy::http_proxy_service;
 use std::sync::Arc;
+use temps_config::ServerConfig;
 use temps_core::plugin::{ServiceRegistrationContext, TempsPlugin};
 use temps_database::DbConnection;
 use temps_routes::CachedPeerTable;
@@ -106,12 +107,22 @@ impl TlsAccept for DynamicCertLoader {
 }
 
 /// Setup plugin system and register all necessary services for the proxy
-async fn setup_proxy_plugins(db: Arc<DbConnection>) -> Result<ServiceRegistrationContext> {
+async fn setup_proxy_plugins(
+    db: Arc<DbConnection>,
+    config: Arc<ServerConfig>,
+) -> Result<ServiceRegistrationContext> {
     // Create registration context - it will create its own registry
     let context = ServiceRegistrationContext::new();
 
     // Register core services that plugins depend on
     context.register_service(db.clone());
+
+    // Register ConfigPlugin for configuration services
+    let config_plugin = Box::new(temps_config::ConfigPlugin::new(config.clone()));
+    config_plugin
+        .register_services(&context)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to register ConfigPlugin: {}", e))?;
 
     // Register GeoPlugin for IP geolocation
     let geo_plugin = temps_geo::GeoPlugin::new();
@@ -158,9 +169,11 @@ pub fn setup_proxy_server(
     encryption_service: Arc<temps_core::EncryptionService>,
     route_table: Arc<CachedPeerTable>,
     shutdown_signal: Box<dyn ProxyShutdownSignal>,
+    config: Arc<ServerConfig>,
 ) -> Result<()> {
     // Setup plugin system (async operation in sync context)
-    let context = tokio::runtime::Runtime::new()?.block_on(setup_proxy_plugins(db.clone()))?;
+    let context = tokio::runtime::Runtime::new()?
+        .block_on(setup_proxy_plugins(db.clone(), config.clone()))?;
 
     // Create service implementations
     let lb_service = Arc::new(LbService::new(db.clone()));
@@ -170,8 +183,9 @@ pub fn setup_proxy_server(
         route_table.clone(),
     )) as Arc<dyn UpstreamResolver>;
 
-    // Get IP service from plugin registry
+    // Get services from plugin registry
     let ip_service = context.require_service::<temps_geo::IpAddressService>();
+    let config_service = context.require_service::<temps_config::ConfigService>();
 
     let request_logger = Arc::new(RequestLoggerImpl::new(
         LoggingConfig::default(),
@@ -208,6 +222,7 @@ pub fn setup_proxy_server(
         session_manager,
         crypto,
         db.clone(),
+        config_service,
     );
 
     // Setup Pingora server
@@ -265,9 +280,11 @@ pub fn create_proxy_service(
     proxy_config: ProxyConfig,
     crypto: Arc<temps_core::CookieCrypto>,
     route_table: Arc<CachedPeerTable>,
+    config: Arc<ServerConfig>,
 ) -> Result<LoadBalancer> {
     // Setup plugin system (async operation in sync context)
-    let context = tokio::runtime::Runtime::new()?.block_on(setup_proxy_plugins(db.clone()))?;
+    let context = tokio::runtime::Runtime::new()?
+        .block_on(setup_proxy_plugins(db.clone(), config.clone()))?;
 
     // Create service implementations
     let lb_service = Arc::new(LbService::new(db.clone()));
@@ -277,8 +294,9 @@ pub fn create_proxy_service(
         route_table.clone(),
     )) as Arc<dyn UpstreamResolver>;
 
-    // Get IP service from plugin registry
+    // Get services from plugin registry
     let ip_service = context.require_service::<temps_geo::IpAddressService>();
+    let config_service = context.require_service::<temps_config::ConfigService>();
 
     let request_logger = Arc::new(RequestLoggerImpl::new(
         LoggingConfig::default(),
@@ -313,6 +331,7 @@ pub fn create_proxy_service(
         session_manager,
         crypto,
         db,
+        config_service,
     );
 
     Ok(lb)

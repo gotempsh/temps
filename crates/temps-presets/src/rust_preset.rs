@@ -71,6 +71,10 @@ impl Preset for RustPreset {
     fn slug(&self) -> String {
         "rust".to_string()
     }
+
+    fn default_port(&self) -> u16 {
+        8080 // Common Rust web server port (Actix, Rocket, Axum, etc.)
+    }
 }
 
 impl fmt::Display for RustPreset {

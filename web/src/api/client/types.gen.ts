@@ -2532,6 +2532,10 @@ export type PresetConfigSchema = DockerfilePresetConfig | NixpacksPresetConfig |
 
 export type PresetResponse = {
     /**
+     * Default port the application listens on (None for static sites)
+     */
+    default_port?: number | null;
+    /**
      * Description of what this preset does
      */
     description: string;
@@ -3821,15 +3825,15 @@ export type UpdateCustomDomainRequest = {
 };
 
 export type UpdateDeploymentConfigRequest = {
-    automatic_deploy?: boolean | null;
-    cpu_limit?: number | null;
-    cpu_request?: number | null;
-    exposed_port?: number | null;
-    memory_limit?: number | null;
-    memory_request?: number | null;
-    performance_metrics_enabled?: boolean | null;
+    automaticDeploy?: boolean | null;
+    cpuLimit?: number | null;
+    cpuRequest?: number | null;
+    exposedPort?: number | null;
+    memoryLimit?: number | null;
+    memoryRequest?: number | null;
+    performanceMetricsEnabled?: boolean | null;
     replicas?: number | null;
-    session_recording_enabled?: boolean | null;
+    sessionRecordingEnabled?: boolean | null;
 };
 
 export type UpdateEmailProviderRequest = {
@@ -10470,9 +10474,9 @@ export type UpdateProjectDeploymentConfigData = {
     body: UpdateDeploymentConfigRequest;
     path: {
         /**
-         * Project ID or slug
+         * Project ID
          */
-        project_id: string;
+        project_id: number;
     };
     query?: never;
     url: '/projects/{project_id}/deployment-config';

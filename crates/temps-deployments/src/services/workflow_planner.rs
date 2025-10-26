@@ -411,7 +411,17 @@ impl WorkflowPlanner {
             debug!("Skipping download_repo job - no git info available");
         }
 
-        // Job 2: Build container image
+        // Check if this preset supports static deployment using temps-presets
+        // Get the preset instance and check if it has a static output directory
+        let preset_instance = temps_presets::get_preset_by_slug(project.preset.as_str());
+        let static_output_dir = preset_instance.as_ref().and_then(|p| p.static_output_dir());
+
+        debug!(
+            "Preset {} static output directory: {:?}",
+            project.preset, static_output_dir
+        );
+
+        // Job 2: Build container image (skip for static deployments)
         // The BuildImageJob will generate Dockerfile from preset if it doesn't exist
         // Depends on download_repo only if git info is available
         let build_dependencies = if has_git_info {
@@ -420,84 +430,146 @@ impl WorkflowPlanner {
             vec![]
         };
 
-        // Convert environment variables to build args
-        // This ensures env vars are available during the Docker build process
-        let mut build_args_map = serde_json::Map::new();
-        for (key, value) in &env_vars {
-            build_args_map.insert(key.clone(), serde_json::Value::String(value.clone()));
-        }
+        // Determine deployment strategy: Static or Container
+        let deploy_job_id = if let Some(output_dir) = static_output_dir {
+            // Static deployment path: BuildImageJob + DeployStaticJob
+            debug!("📦 Using static deployment for preset {}", project.preset);
+            debug!("📂 Static output directory: {}", output_dir);
 
-        // Parse preset_config if present (for Dockerfile preset)
-        let mut dockerfile_path = "Dockerfile".to_string();
-        let mut build_context = project.directory.clone();
-
-        // Extract dockerfile_path and build_context from preset_config (only relevant for Dockerfile preset)
-        if let Some(temps_entities::preset::PresetConfig::Dockerfile(dockerfile_config)) =
-            &project.preset_config
-        {
-            if let Some(custom_dockerfile) = &dockerfile_config.dockerfile_path {
-                dockerfile_path = custom_dockerfile.clone();
+            // Convert environment variables to build args
+            let mut build_args_map = serde_json::Map::new();
+            for (key, value) in &env_vars {
+                build_args_map.insert(key.clone(), serde_json::Value::String(value.clone()));
             }
-            if let Some(custom_context) = &dockerfile_config.build_context {
-                build_context = custom_context.clone();
+
+            // Parse preset_config if present (for Dockerfile preset)
+            let mut dockerfile_path = "Dockerfile".to_string();
+            let mut build_context = project.directory.clone();
+
+            if let Some(temps_entities::preset::PresetConfig::Dockerfile(dockerfile_config)) =
+                &project.preset_config
+            {
+                if let Some(custom_dockerfile) = &dockerfile_config.dockerfile_path {
+                    dockerfile_path = custom_dockerfile.clone();
+                }
+                if let Some(custom_context) = &dockerfile_config.build_context {
+                    build_context = custom_context.clone();
+                }
             }
-        }
 
-        jobs.push(JobDefinition {
-            job_id: "build_image".to_string(),
-            job_type: "BuildImageJob".to_string(),
-            name: "Build Container Image".to_string(),
-            description: Some("Build Docker image from source code".to_string()),
-            dependencies: build_dependencies,
-            job_config: Some(serde_json::json!({
-                "dockerfile_path": dockerfile_path,
-                "build_args": build_args_map,
-                "build_context": build_context
-            })),
-            required_for_completion: true, // Core deployment job
-        });
+            // Job 2: Build image (for static deployments, this builds the static files inside container)
+            jobs.push(JobDefinition {
+                job_id: "build_image".to_string(),
+                job_type: "BuildImageJob".to_string(),
+                name: "Build Container Image".to_string(),
+                description: Some("Build Docker image and compile static files".to_string()),
+                dependencies: build_dependencies.clone(),
+                job_config: Some(serde_json::json!({
+                    "dockerfile_path": dockerfile_path,
+                    "build_args": build_args_map,
+                    "build_context": build_context
+                })),
+                required_for_completion: true,
+            });
 
-        // Job 3: Deploy container
-        // Determine which port to expose using the resolution hierarchy:
-        // image EXPOSE directive > environment.exposed_port > project.exposed_port > default 3000
+            // Job 3: Deploy static files (extracts from built image and deploys to filesystem)
+            jobs.push(JobDefinition {
+                job_id: "deploy_static".to_string(),
+                job_type: "DeployStaticJob".to_string(),
+                name: "Deploy Static Files".to_string(),
+                description: Some("Extract and deploy static files from container".to_string()),
+                dependencies: vec!["build_image".to_string()],
+                job_config: Some(serde_json::json!({
+                    "static_output_dir": output_dir,  // Path inside container (e.g., "/app/dist")
+                    "project_slug": project.slug,
+                    "environment_slug": environment.slug,
+                    "deployment_slug": deployment.slug
+                })),
+                required_for_completion: true,
+            });
 
-        // Build the image name that will be created by the build job
-        // Format: temps-{project_slug}:{deployment_id}
-        let image_name = format!("temps-{}:{}", project.slug, deployment.id);
+            "deploy_static".to_string()
+        } else {
+            // Container deployment path: BuildImageJob + DeployImageJob
+            debug!("🐳 Using container deployment for preset {}", project.preset);
 
-        // Resolve the port to expose
-        let exposed_port = self
-            .resolve_exposed_port(environment, project, Some(&image_name))
-            .await;
+            // Convert environment variables to build args
+            let mut build_args_map = serde_json::Map::new();
+            for (key, value) in &env_vars {
+                build_args_map.insert(key.clone(), serde_json::Value::String(value.clone()));
+            }
 
-        debug!(
-            "📡 Container will expose port {} (image: {})",
-            exposed_port, image_name
-        );
+            // Parse preset_config if present (for Dockerfile preset)
+            let mut dockerfile_path = "Dockerfile".to_string();
+            let mut build_context = project.directory.clone();
 
-        // Add PORT to environment variables explicitly
-        // This tells the application which port to listen on inside the container
-        let mut deploy_env_vars = env_vars.clone();
-        deploy_env_vars.insert("PORT".to_string(), exposed_port.to_string());
+            if let Some(temps_entities::preset::PresetConfig::Dockerfile(dockerfile_config)) =
+                &project.preset_config
+            {
+                if let Some(custom_dockerfile) = &dockerfile_config.dockerfile_path {
+                    dockerfile_path = custom_dockerfile.clone();
+                }
+                if let Some(custom_context) = &dockerfile_config.build_context {
+                    build_context = custom_context.clone();
+                }
+            }
 
-        jobs.push(JobDefinition {
-            job_id: "deploy_container".to_string(),
-            job_type: "DeployImageJob".to_string(),
-            name: "Deploy Container".to_string(),
-            description: Some("Deploy the built container image".to_string()),
-            dependencies: vec!["build_image".to_string()],
-            job_config: Some(serde_json::json!({
-                "port": exposed_port,
-                "replicas": 1,
-                "environment_variables": deploy_env_vars,
-                "image_name": image_name
-            })),
-            required_for_completion: true, // Core deployment job
-        });
+            jobs.push(JobDefinition {
+                job_id: "build_image".to_string(),
+                job_type: "BuildImageJob".to_string(),
+                name: "Build Container Image".to_string(),
+                description: Some("Build Docker image from source code".to_string()),
+                dependencies: build_dependencies.clone(),
+                job_config: Some(serde_json::json!({
+                    "dockerfile_path": dockerfile_path,
+                    "build_args": build_args_map,
+                    "build_context": build_context
+                })),
+                required_for_completion: true,
+            });
+
+            // Deploy container
+            let image_name = format!("temps-{}:{}", project.slug, deployment.id);
+            let exposed_port = self
+                .resolve_exposed_port(environment, project, Some(&image_name))
+                .await;
+
+            debug!("📡 Container will expose port {} (image: {})", exposed_port, image_name);
+
+            let mut deploy_env_vars = env_vars.clone();
+            deploy_env_vars.insert("PORT".to_string(), exposed_port.to_string());
+
+            let replicas = environment
+                .deployment_config
+                .as_ref()
+                .map(|c| c.replicas)
+                .or_else(|| project.deployment_config.as_ref().map(|c| c.replicas))
+                .unwrap_or(1);
+
+            debug!("🔢 Planning deployment with {} replicas", replicas);
+
+            jobs.push(JobDefinition {
+                job_id: "deploy_container".to_string(),
+                job_type: "DeployImageJob".to_string(),
+                name: "Deploy Container".to_string(),
+                description: Some("Deploy the built container image".to_string()),
+                dependencies: vec!["build_image".to_string()],
+                job_config: Some(serde_json::json!({
+                    "port": exposed_port,
+                    "replicas": replicas,
+                    "environment_variables": deploy_env_vars,
+                    "image_name": image_name
+                })),
+                required_for_completion: true,
+            });
+
+            "deploy_container".to_string()
+        };
 
         // Job 4: Mark deployment as complete
         // This synthetic job marks the deployment as "Completed" and updates environment routing
         // It acts as a barrier between core deployment jobs and optional post-deployment jobs
+        // Depends on either deploy_static or deploy_container depending on deployment strategy
         jobs.push(JobDefinition {
             job_id: "mark_deployment_complete".to_string(),
             job_type: "MarkDeploymentCompleteJob".to_string(),
@@ -505,7 +577,7 @@ impl WorkflowPlanner {
             description: Some(
                 "Mark deployment as complete and update environment routing".to_string(),
             ),
-            dependencies: vec!["deploy_container".to_string()],
+            dependencies: vec![deploy_job_id],
             job_config: Some(serde_json::json!({
                 "deployment_id": deployment.id
             })),

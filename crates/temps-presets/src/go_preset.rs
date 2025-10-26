@@ -71,6 +71,10 @@ impl Preset for GoPreset {
     fn slug(&self) -> String {
         "go".to_string()
     }
+
+    fn default_port(&self) -> u16 {
+        8080 // Common Go web server port
+    }
 }
 
 impl fmt::Display for GoPreset {

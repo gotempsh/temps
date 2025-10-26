@@ -7,7 +7,7 @@ use temps_core::plugin::{
 };
 use utoipa::openapi::OpenApi;
 
-use crate::{docker::DockerRuntime, ContainerDeployer};
+use crate::{docker::DockerRuntime, static_deployer::{FilesystemStaticDeployer, StaticDeployer}, ContainerDeployer};
 
 /// Deployer Plugin for managing container deployment operations
 pub struct DeployerPlugin;
@@ -131,6 +131,13 @@ impl TempsPlugin for DeployerPlugin {
             // Register as ImageBuilder trait
             let image_builder: Arc<dyn crate::ImageBuilder> = docker_runtime;
             context.register_service(image_builder);
+
+            // Create and register StaticDeployer
+            let config_service = context.require_service::<temps_config::ConfigService>();
+            let static_files_dir = config_service.get_server_config().data_dir.join("static");
+            let filesystem_static_deployer = Arc::new(FilesystemStaticDeployer::new(static_files_dir));
+            let static_deployer: Arc<dyn StaticDeployer> = filesystem_static_deployer;
+            context.register_service(static_deployer);
 
             tracing::debug!("Deployer plugin services registered successfully");
             Ok(())

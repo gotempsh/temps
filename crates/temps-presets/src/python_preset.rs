@@ -73,6 +73,10 @@ impl Preset for PythonPreset {
     fn slug(&self) -> String {
         "python".to_string()
     }
+
+    fn default_port(&self) -> u16 {
+        8000 // FastAPI, Django, and most Python web frameworks default port
+    }
 }
 
 impl fmt::Display for PythonPreset {

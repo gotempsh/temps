@@ -282,6 +282,80 @@ impl Preset {
         }
     }
 
+    /// Get the icon URL for this preset (logo or framework icon)
+    pub fn icon_url(&self) -> Option<&'static str> {
+        match self {
+            // Node.js frameworks
+            Preset::NextJs => Some("https://cdn.simpleicons.org/nextdotjs/000000"),
+            Preset::Vite => Some("https://cdn.simpleicons.org/vite/646CFF"),
+            Preset::Astro => Some("https://cdn.simpleicons.org/astro/FF5D01"),
+            Preset::Nuxt => Some("https://cdn.simpleicons.org/nuxtdotjs/00DC82"),
+            Preset::Remix => Some("https://cdn.simpleicons.org/remix/000000"),
+            Preset::SvelteKit => Some("https://cdn.simpleicons.org/svelte/FF3E00"),
+            Preset::SolidStart => Some("https://cdn.simpleicons.org/solid/2C4F7C"),
+            Preset::Angular => Some("https://cdn.simpleicons.org/angular/DD0031"),
+            Preset::Vue => Some("https://cdn.simpleicons.org/vuedotjs/4FC08D"),
+            Preset::React => Some("https://cdn.simpleicons.org/react/61DAFB"),
+            Preset::Docusaurus => Some("https://cdn.simpleicons.org/docusaurus/3ECC5F"),
+            Preset::Rsbuild => Some("https://cdn.simpleicons.org/rsbuild/FFC700"),
+            Preset::NodeJs => Some("https://cdn.simpleicons.org/nodedotjs/339933"),
+
+            // Python frameworks
+            Preset::Python => Some("https://cdn.simpleicons.org/python/3776AB"),
+            Preset::FastApi => Some("https://cdn.simpleicons.org/fastapi/009688"),
+            Preset::Flask => Some("https://cdn.simpleicons.org/flask/000000"),
+            Preset::Django => Some("https://cdn.simpleicons.org/django/092E20"),
+
+            // Ruby frameworks
+            Preset::Rails => Some("https://cdn.simpleicons.org/rubyonrails/CC0000"),
+
+            // Go
+            Preset::Go => Some("https://cdn.simpleicons.org/go/00ADD8"),
+
+            // Rust
+            Preset::Rust => Some("https://cdn.simpleicons.org/rust/000000"),
+
+            // Java
+            Preset::Java => Some("https://cdn.simpleicons.org/openjdk/437291"),
+
+            // PHP frameworks
+            Preset::Laravel => Some("https://cdn.simpleicons.org/laravel/FF2D20"),
+
+            // Generic presets
+            Preset::Dockerfile => Some("https://cdn.simpleicons.org/docker/2496ED"),
+            Preset::Nixpacks => None, // No specific icon
+            Preset::Static => Some("https://cdn.simpleicons.org/html5/E34F26"),
+        }
+    }
+
+    /// Get the project type category for this preset
+    pub fn project_type(&self) -> &'static str {
+        match self {
+            // Frontend frameworks
+            Preset::NextJs | Preset::Nuxt | Preset::SvelteKit | Preset::SolidStart => "fullstack",
+            Preset::Vite
+            | Preset::Astro
+            | Preset::Remix
+            | Preset::Angular
+            | Preset::Vue
+            | Preset::React
+            | Preset::Docusaurus
+            | Preset::Rsbuild => "frontend",
+
+            // Backend frameworks
+            Preset::FastApi | Preset::Flask | Preset::Django | Preset::Rails | Preset::Laravel => {
+                "backend"
+            }
+
+            // Runtime/language presets
+            Preset::Python | Preset::Go | Preset::Rust | Preset::Java | Preset::NodeJs => "runtime",
+
+            // Generic presets
+            Preset::Dockerfile | Preset::Nixpacks => "container",
+            Preset::Static => "static",
+        }
+    }
+
     /// List all available presets
     pub fn all() -> Vec<Preset> {
         vec![

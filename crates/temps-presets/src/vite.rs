@@ -116,6 +116,14 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
     fn dirs_to_upload(&self) -> Vec<String> {
         vec!["dist".to_string()]
     }
+
+    fn default_port(&self) -> u16 {
+        5173 // Vite dev server default port
+    }
+
+    fn static_output_dir(&self) -> Option<String> {
+        Some("/usr/share/nginx/html".to_string())
+    }
 }
 
 impl std::fmt::Display for Vite {

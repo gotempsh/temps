@@ -60,6 +60,7 @@ const deploymentConfigSchema = z.object({
   memoryRequest: z.string().optional(),
   memoryLimit: z.string().optional(),
   replicas: z.string().optional(),
+  port: z.string().optional(),
   automaticDeploy: z.boolean(),
   performanceMetricsEnabled: z.boolean(),
   sessionRecordingEnabled: z.boolean(),
@@ -94,13 +95,16 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   const deploymentForm = useForm<DeploymentConfigFormValues>({
     resolver: zodResolver(deploymentConfigSchema),
     defaultValues: {
-      cpuRequest: project?.cpu_request?.toString() ?? '',
-      cpuLimit: project?.cpu_limit?.toString() ?? '',
-      memoryRequest: project?.memory_request?.toString() ?? '',
-      memoryLimit: project?.memory_limit?.toString() ?? '',
-      replicas: '',
-      automaticDeploy: project?.automatic_deploy ?? false,
-      performanceMetricsEnabled: project?.performance_metrics_enabled ?? false,
+      cpuRequest: project?.deployment_config?.cpuRequest?.toString() ?? '',
+      cpuLimit: project?.deployment_config?.cpuLimit?.toString() ?? '',
+      memoryRequest:
+        project?.deployment_config?.memoryRequest?.toString() ?? '',
+      memoryLimit: project?.deployment_config?.memoryLimit?.toString() ?? '',
+      replicas: project?.deployment_config?.replicas?.toString() ?? '',
+      port: project?.deployment_config?.exposedPort?.toString() ?? '',
+      automaticDeploy: project?.deployment_config?.automaticDeploy ?? false,
+      performanceMetricsEnabled:
+        project?.deployment_config?.performanceMetricsEnabled ?? false,
       sessionRecordingEnabled: false,
     },
   })
@@ -110,7 +114,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
 
     await toast.promise(
       updateProjectSettings.mutateAsync({
-        path: { project_id: project.id!.toString() },
+        path: { project_id: project.id! },
         body: {
           slug: values.name,
         },
@@ -132,21 +136,21 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
 
     await toast.promise(
       updateDeploymentConfig.mutateAsync({
-        path: { project_id: project.id!.toString() },
+        path: { project_id: project.id! },
         body: {
-          cpu_request:
+          cpuRequest:
             values.cpuRequest && values.cpuRequest.trim() !== ''
               ? parseInt(values.cpuRequest)
               : null,
-          cpu_limit:
+          cpuLimit:
             values.cpuLimit && values.cpuLimit.trim() !== ''
               ? parseInt(values.cpuLimit)
               : null,
-          memory_request:
+          memoryRequest:
             values.memoryRequest && values.memoryRequest.trim() !== ''
               ? parseInt(values.memoryRequest)
               : null,
-          memory_limit:
+          memoryLimit:
             values.memoryLimit && values.memoryLimit.trim() !== ''
               ? parseInt(values.memoryLimit)
               : null,
@@ -154,9 +158,13 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
             values.replicas && values.replicas.trim() !== ''
               ? parseInt(values.replicas)
               : null,
-          automatic_deploy: values.automaticDeploy,
-          performance_metrics_enabled: values.performanceMetricsEnabled,
-          session_recording_enabled: values.sessionRecordingEnabled,
+          exposedPort:
+            values.port && values.port.trim() !== ''
+              ? parseInt(values.port)
+              : null,
+          automaticDeploy: values.automaticDeploy,
+          performanceMetricsEnabled: values.performanceMetricsEnabled,
+          sessionRecordingEnabled: values.sessionRecordingEnabled,
         },
       }),
       {
@@ -181,12 +189,12 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
     try {
       await toast.promise(
         deleteProjectMutationM.mutateAsync({
-          path: { id: project?.id! as number },
+          path: { id: project.id! },
         }),
         {
           loading: 'Deleting project...',
           success: () => {
-            navigate(`/projects`, {})
+            navigate('/projects')
             return 'Project deleted'
           },
           error: 'Failed to delete project',
@@ -267,8 +275,8 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
             <CardHeader>
               <CardTitle>Default Deployment Configuration</CardTitle>
               <CardDescription>
-                Configure default resource limits and deployment settings for all
-                environments. These can be overridden per environment.
+                Configure default resource limits and deployment settings for
+                all environments. These can be overridden per environment.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-6">
@@ -380,6 +388,28 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                       </FormItem>
                     )}
                   />
+
+                  <FormField
+                    control={deploymentForm.control}
+                    name="port"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Default Port</FormLabel>
+                        <FormControl>
+                          <Input
+                            {...field}
+                            type="number"
+                            min="1"
+                            max="65535"
+                            placeholder="e.g., 3000"
+                          />
+                        </FormControl>
+                        <FormDescription className="text-muted-foreground">
+                          Default port your application listens on
+                        </FormDescription>
+                      </FormItem>
+                    )}
+                  />
                 </div>
               </div>
 
@@ -396,8 +426,8 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                           Automatic Deployments
                         </FormLabel>
                         <FormDescription>
-                          Automatically deploy when changes are pushed to the main
-                          branch
+                          Automatically deploy when changes are pushed to the
+                          main branch
                         </FormDescription>
                       </div>
                       <FormControl>

@@ -2108,9 +2108,12 @@ mod tests {
                 deployment.project_id,
                 environment.id,
                 "invalid-container-id".to_string(),
-                None,
-                None,
-                None,
+                ContainerLogParams {
+                    start_date: None,
+                    end_date: None,
+                    tail: None,
+                    timestamps: false,
+                },
             )
             .await;
 

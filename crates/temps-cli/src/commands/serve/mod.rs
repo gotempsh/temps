@@ -117,12 +117,11 @@ impl ServeCommand {
             db,
             self.address.clone(),
             self.tls_address.clone(),
-            serve_config.console_address.clone(),
             cookie_crypto.clone(),
             encryption_service.clone(),
-            serve_config.data_dir.clone(),
             self.database_url.clone(),
             route_table,
+            serve_config.clone(),
         )
     }
 }

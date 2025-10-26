@@ -35,7 +35,9 @@ pub use super::project_custom_domains::Entity as ProjectCustomDomains;
 pub use super::project_services::Entity as ProjectServices;
 pub use super::projects::Entity as Projects;
 pub use super::proxy_logs::Entity as ProxyLogs;
-pub use super::repositories::Entity as Repositories;
+pub use super::repositories::{
+    BranchPresetData, Entity as Repositories, PresetInfo, RepositoryPresetCache,
+};
 pub use super::request_logs::Entity as RequestLogs;
 pub use super::request_sessions::Entity as RequestSessions;
 pub use super::roles::Entity as Roles;

@@ -13,8 +13,8 @@ use serde::Serialize;
 use super::types::{
     CreateProjectRequest, Project, ProjectError, ProjectStatistics, UpdateDeploymentSettingsRequest,
 };
-use crate::handlers::UpdateDeploymentConfigRequest;
 use super::{EnvVarService, EnvVarWithEnvironments};
+use crate::handlers::UpdateDeploymentConfigRequest;
 use temps_presets::get_preset_by_slug;
 // Placeholder functions - these should be implemented properly or imported from other services
 
@@ -1079,29 +1079,16 @@ impl ProjectService {
     /// Update deployment configuration for a project
     pub async fn update_project_deployment_config(
         &self,
-        project_id_or_slug: &str,
+        project_id: i32,
         config: UpdateDeploymentConfigRequest,
     ) -> Result<Project, ProjectError> {
         // Find project by ID or slug
-        let project = if let Ok(project_id_int) = project_id_or_slug.parse::<i32>() {
-            projects::Entity::find_by_id(project_id_int)
-                .one(self.db.as_ref())
-                .await?
-                .ok_or_else(|| {
-                    ProjectError::NotFound(format!("Project with id {} not found", project_id_int))
-                })?
-        } else {
-            projects::Entity::find()
-                .filter(projects::Column::Slug.eq(project_id_or_slug))
-                .one(self.db.as_ref())
-                .await?
-                .ok_or_else(|| {
-                    ProjectError::NotFound(format!(
-                        "Project with slug {} not found",
-                        project_id_or_slug
-                    ))
-                })?
-        };
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                ProjectError::NotFound(format!("Project with id {} not found", project_id))
+            })?;
 
         // Get existing deployment config or create default
         let mut deployment_config = project.deployment_config.clone().unwrap_or_default();
@@ -1136,9 +1123,9 @@ impl ProjectService {
         }
 
         // Validate the deployment config
-        deployment_config.validate().map_err(|e| {
-            ProjectError::InvalidInput(format!("Invalid deployment config: {}", e))
-        })?;
+        deployment_config
+            .validate()
+            .map_err(|e| ProjectError::InvalidInput(format!("Invalid deployment config: {}", e)))?;
 
         // Update the project
         let mut active_project: projects::ActiveModel = project.clone().into();
@@ -1217,7 +1204,7 @@ impl ProjectService {
 
     pub fn map_db_project_to_project(db_project: projects::Model) -> Project {
         // Extract deployment config fields
-        let deployment_config = db_project.deployment_config.as_ref();
+        let deployment_config = db_project.deployment_config.clone();
 
         // Convert preset enum to string for backwards compatibility
         let preset_str = format!("{:?}", db_project.preset).to_lowercase();
@@ -1234,13 +1221,15 @@ impl ProjectService {
             created_at: db_project.created_at,
             updated_at: db_project.updated_at,
             automatic_deploy: deployment_config
+                .clone()
                 .map(|c| c.automatic_deploy)
                 .unwrap_or(false),
-            cpu_request: deployment_config.and_then(|c| c.cpu_request),
-            cpu_limit: deployment_config.and_then(|c| c.cpu_limit),
-            memory_request: deployment_config.and_then(|c| c.memory_request),
-            memory_limit: deployment_config.and_then(|c| c.memory_limit),
+            cpu_request: deployment_config.clone().and_then(|c| c.cpu_request),
+            cpu_limit: deployment_config.clone().and_then(|c| c.cpu_limit),
+            memory_request: deployment_config.clone().and_then(|c| c.memory_request),
+            memory_limit: deployment_config.clone().and_then(|c| c.memory_limit),
             performance_metrics_enabled: deployment_config
+                .clone()
                 .map(|c| c.performance_metrics_enabled)
                 .unwrap_or(false),
             last_deployment: db_project.last_deployment,
@@ -1255,6 +1244,7 @@ impl ProjectService {
             git_url: db_project.git_url,
             git_provider_connection_id: db_project.git_provider_connection_id,
             is_on_demand: false, // Deprecated field, default to false
+            deployment_config: deployment_config.clone(),
         }
     }
 

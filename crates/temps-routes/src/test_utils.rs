@@ -8,6 +8,7 @@ use temps_entities::{
     custom_routes, deployment_containers, deployments, environments, project_custom_domains,
     projects, upstream_config::UpstreamList,
 };
+use temps_entities::deployments::DeploymentMetadata;
 
 /// Test database mock operations for route table tests
 pub struct TestDBMockOperations {
@@ -74,7 +75,7 @@ impl TestDBMockOperations {
             environment_id: Set(environment.id),
             slug: Set("http://localhost:8080".to_string()),
             state: Set("completed".to_string()),
-            metadata: Set(None),
+            metadata: Set(Some(DeploymentMetadata::default())), // Required NOT NULL field
             ..Default::default()
         };
         let deployment = deployment.insert(self.db.as_ref()).await?;

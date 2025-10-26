@@ -13,13 +13,67 @@ use std::sync::Arc;
 use temps_entities::{deployments, environments, projects};
 use tracing::{debug, error, info, warn};
 
+/// Backend type for a route
+#[derive(Clone, Debug)]
+pub enum BackendType {
+    /// Proxy to backend addresses (containers)
+    Upstream {
+        /// Backend addresses for load balancing (e.g., ["127.0.0.1:8080", "127.0.0.1:8081"])
+        addresses: Vec<String>,
+        /// Round-robin counter for load balancing
+        round_robin_counter: Arc<AtomicUsize>,
+    },
+    /// Serve static files from a directory
+    StaticDir {
+        /// Path to the static files directory
+        path: String,
+    },
+}
+
+impl BackendType {
+    /// Get the next backend address using round-robin load balancing
+    /// Returns None for StaticDir backends
+    pub fn get_backend_addr(&self) -> Option<String> {
+        match self {
+            BackendType::Upstream {
+                addresses,
+                round_robin_counter,
+            } => {
+                if addresses.is_empty() {
+                    return Some("127.0.0.1:8080".to_string()); // Fallback
+                }
+
+                if addresses.len() == 1 {
+                    return Some(addresses[0].clone());
+                }
+
+                // Round-robin load balancing
+                let index = round_robin_counter.fetch_add(1, Ordering::Relaxed) % addresses.len();
+                Some(addresses[index].clone())
+            }
+            BackendType::StaticDir { .. } => None,
+        }
+    }
+
+    /// Check if this is a static directory backend
+    pub fn is_static(&self) -> bool {
+        matches!(self, BackendType::StaticDir { .. })
+    }
+
+    /// Get the static directory path if this is a StaticDir backend
+    pub fn static_dir(&self) -> Option<&str> {
+        match self {
+            BackendType::StaticDir { path } => Some(path),
+            _ => None,
+        }
+    }
+}
+
 /// Route information for a single host with cached models
 #[derive(Clone, Debug)]
 pub struct RouteInfo {
-    /// Backend addresses for load balancing (e.g., ["127.0.0.1:8080", "127.0.0.1:8081"])
-    pub backend_addrs: Vec<String>,
-    /// Round-robin counter for load balancing
-    pub round_robin_counter: Arc<AtomicUsize>,
+    /// Backend type (upstream addresses or static directory)
+    pub backend: BackendType,
     /// Optional redirect URL for project custom domains
     pub redirect_to: Option<String>,
     /// Optional status code for redirects
@@ -34,19 +88,21 @@ pub struct RouteInfo {
 
 impl RouteInfo {
     /// Get the next backend address using round-robin load balancing
+    /// Returns fallback address if this is a static directory backend
     pub fn get_backend_addr(&self) -> String {
-        if self.backend_addrs.is_empty() {
-            return "127.0.0.1:8080".to_string(); // Fallback
-        }
+        self.backend
+            .get_backend_addr()
+            .unwrap_or_else(|| "127.0.0.1:8080".to_string())
+    }
 
-        if self.backend_addrs.len() == 1 {
-            return self.backend_addrs[0].clone();
-        }
+    /// Check if this route serves static files
+    pub fn is_static(&self) -> bool {
+        self.backend.is_static()
+    }
 
-        // Round-robin load balancing
-        let index =
-            self.round_robin_counter.fetch_add(1, Ordering::Relaxed) % self.backend_addrs.len();
-        self.backend_addrs[index].clone()
+    /// Get the static directory path if this is a static deployment
+    pub fn static_dir(&self) -> Option<&str> {
+        self.backend.static_dir()
     }
 }
 
@@ -141,44 +197,67 @@ impl CachedPeerTable {
                             .await
                             .unwrap_or_default();
 
-                        if !containers.is_empty() {
-                            // Fetch project if not cached
-                            if !projects_cache.contains_key(&environment.project_id) {
-                                if let Ok(Some(proj)) =
-                                    projects::Entity::find_by_id(environment.project_id)
-                                        .one(self.db.as_ref())
-                                        .await
-                                {
-                                    projects_cache.insert(proj.id, Arc::new(proj));
-                                }
+                        // Fetch project if not cached
+                        if !projects_cache.contains_key(&environment.project_id) {
+                            if let Ok(Some(proj)) =
+                                projects::Entity::find_by_id(environment.project_id)
+                                    .one(self.db.as_ref())
+                                    .await
+                            {
+                                projects_cache.insert(proj.id, Arc::new(proj));
                             }
+                        }
 
-                            let project = projects_cache.get(&environment.project_id);
+                        let project = projects_cache.get(&environment.project_id);
 
-                            // Build backend addresses from all containers
+                        // Determine backend type: static directory or upstream containers
+                        let backend = if let Some(static_dir) = &deployment.static_dir_location {
+                            // Static deployment - serve from directory
+                            BackendType::StaticDir {
+                                path: static_dir.clone(),
+                            }
+                        } else if !containers.is_empty() {
+                            // Container deployment - proxy to containers
                             let backend_addrs: Vec<String> = containers
                                 .iter()
                                 .map(|c| {
                                     format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port))
                                 })
                                 .collect();
+                            BackendType::Upstream {
+                                addresses: backend_addrs,
+                                round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                            }
+                        } else {
+                            // No backend available, skip this route
+                            continue;
+                        };
 
-                            routes.insert(
-                                env_domain.domain.clone(),
-                                RouteInfo {
-                                    backend_addrs: backend_addrs.clone(),
-                                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                                    redirect_to: None,
-                                    status_code: None,
-                                    project: project.cloned(),
-                                    environment: Some(Arc::clone(environment)),
-                                    deployment: Some(Arc::clone(deployment)),
-                                },
-                            );
-                            debug!(
-                                "Loaded environment domain route: {} -> {:?} ({} containers, project={}, env={}, deploy={})",
-                                env_domain.domain, backend_addrs, backend_addrs.len(), environment.project_id, environment.id, deployment_id
-                            );
+                        routes.insert(
+                            env_domain.domain.clone(),
+                            RouteInfo {
+                                backend: backend.clone(),
+                                redirect_to: None,
+                                status_code: None,
+                                project: project.cloned(),
+                                environment: Some(Arc::clone(environment)),
+                                deployment: Some(Arc::clone(deployment)),
+                            },
+                        );
+
+                        match &backend {
+                            BackendType::Upstream { addresses, .. } => {
+                                debug!(
+                                    "Loaded environment domain route: {} -> {:?} ({} containers, project={}, env={}, deploy={})",
+                                    env_domain.domain, addresses, addresses.len(), environment.project_id, environment.id, deployment_id
+                                );
+                            }
+                            BackendType::StaticDir { path } => {
+                                debug!(
+                                    "Loaded environment domain route (static): {} -> {} (project={}, env={}, deploy={})",
+                                    env_domain.domain, path, environment.project_id, environment.id, deployment_id
+                                );
+                            }
                         }
                     }
                 }
@@ -197,12 +276,14 @@ impl CachedPeerTable {
         );
 
         for custom_route in custom_routes_data {
-            let backend = format!("{}:{}", custom_route.host, custom_route.port);
+            let backend_addr = format!("{}:{}", custom_route.host, custom_route.port);
             routes.insert(
                 custom_route.domain.clone(),
                 RouteInfo {
-                    backend_addrs: vec![backend.clone()],
-                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                    backend: BackendType::Upstream {
+                        addresses: vec![backend_addr.clone()],
+                        round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                    },
                     redirect_to: None,
                     status_code: None,
                     project: None, // Custom routes don't have project context
@@ -212,7 +293,7 @@ impl CachedPeerTable {
             );
             debug!(
                 "Loaded custom route: {} -> {}",
-                custom_route.domain, backend
+                custom_route.domain, backend_addr
             );
         }
 
@@ -261,50 +342,73 @@ impl CachedPeerTable {
                             .await
                             .unwrap_or_default();
 
-                        if !containers.is_empty() {
-                            // Fetch project if not cached
-                            if !projects_cache.contains_key(&custom_domain.project_id) {
-                                if let Ok(Some(proj)) =
-                                    projects::Entity::find_by_id(custom_domain.project_id)
-                                        .one(self.db.as_ref())
-                                        .await
-                                {
-                                    projects_cache.insert(proj.id, Arc::new(proj));
-                                }
+                        // Fetch project if not cached
+                        if !projects_cache.contains_key(&custom_domain.project_id) {
+                            if let Ok(Some(proj)) =
+                                projects::Entity::find_by_id(custom_domain.project_id)
+                                    .one(self.db.as_ref())
+                                    .await
+                            {
+                                projects_cache.insert(proj.id, Arc::new(proj));
                             }
+                        }
 
-                            let project = projects_cache.get(&custom_domain.project_id);
+                        let project = projects_cache.get(&custom_domain.project_id);
 
-                            // Build backend addresses from all containers
+                        // Determine backend type: static directory or upstream containers
+                        let backend = if let Some(static_dir) = &deployment.static_dir_location {
+                            // Static deployment - serve from directory
+                            BackendType::StaticDir {
+                                path: static_dir.clone(),
+                            }
+                        } else if !containers.is_empty() {
+                            // Container deployment - proxy to containers
                             let backend_addrs: Vec<String> = containers
                                 .iter()
                                 .map(|c| {
                                     format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port))
                                 })
                                 .collect();
+                            BackendType::Upstream {
+                                addresses: backend_addrs,
+                                round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                            }
+                        } else {
+                            // No backend available, skip this route
+                            continue;
+                        };
 
-                            routes.insert(
-                                custom_domain.domain.clone(),
-                                RouteInfo {
-                                    backend_addrs: backend_addrs.clone(),
-                                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                                    redirect_to: custom_domain.redirect_to.clone(),
-                                    status_code: custom_domain.status_code,
-                                    project: project.cloned(),
-                                    environment: Some(Arc::clone(environment)),
-                                    deployment: Some(Arc::clone(deployment)),
-                                },
+                        routes.insert(
+                            custom_domain.domain.clone(),
+                            RouteInfo {
+                                backend: backend.clone(),
+                                redirect_to: custom_domain.redirect_to.clone(),
+                                status_code: custom_domain.status_code,
+                                project: project.cloned(),
+                                environment: Some(Arc::clone(environment)),
+                                deployment: Some(Arc::clone(deployment)),
+                            },
+                        );
+
+                        if let Some(ref redirect) = custom_domain.redirect_to {
+                            debug!(
+                                "Loaded custom domain with redirect: {} -> {} (status: {:?})",
+                                custom_domain.domain, redirect, custom_domain.status_code
                             );
-                            if let Some(ref redirect) = custom_domain.redirect_to {
-                                debug!(
-                                    "Loaded custom domain with redirect: {} -> {} (status: {:?})",
-                                    custom_domain.domain, redirect, custom_domain.status_code
-                                );
-                            } else {
-                                debug!(
-                                    "Loaded custom domain route: {} -> {:?} ({} containers, project={}, env={}, deploy={})",
-                                    custom_domain.domain, backend_addrs, backend_addrs.len(), custom_domain.project_id, environment.id, deployment_id
-                                );
+                        } else {
+                            match &backend {
+                                BackendType::Upstream { addresses, .. } => {
+                                    debug!(
+                                        "Loaded custom domain route: {} -> {:?} ({} containers, project={}, env={}, deploy={})",
+                                        custom_domain.domain, addresses, addresses.len(), custom_domain.project_id, environment.id, deployment_id
+                                    );
+                                }
+                                BackendType::StaticDir { path } => {
+                                    debug!(
+                                        "Loaded custom domain route (static): {} -> {} (project={}, env={}, deploy={})",
+                                        custom_domain.domain, path, custom_domain.project_id, environment.id, deployment_id
+                                    );
+                                }
                             }
                         }
                     }
@@ -356,67 +460,98 @@ impl CachedPeerTable {
                         .await
                         .unwrap_or_default();
 
-                    if !containers.is_empty() {
-                        // Fetch project if not cached
-                        if !projects_cache.contains_key(&env.project_id) {
-                            if let Ok(Some(proj)) = projects::Entity::find_by_id(env.project_id)
-                                .one(self.db.as_ref())
-                                .await
-                            {
-                                projects_cache.insert(proj.id, Arc::new(proj));
-                            }
+                    // Fetch project if not cached
+                    if !projects_cache.contains_key(&env.project_id) {
+                        if let Ok(Some(proj)) = projects::Entity::find_by_id(env.project_id)
+                            .one(self.db.as_ref())
+                            .await
+                        {
+                            projects_cache.insert(proj.id, Arc::new(proj));
                         }
+                    }
 
-                        let project = projects_cache.get(&env.project_id);
-                        let environment = environments_cache.get(&env.id);
+                    let project = projects_cache.get(&env.project_id);
+                    let environment = environments_cache.get(&env.id);
 
-                        // Build backend addresses from all containers
+                    // Determine backend type: static directory or upstream containers
+                    let backend = if let Some(static_dir) = &deployment.static_dir_location {
+                        // Static deployment - serve from directory
+                        BackendType::StaticDir {
+                            path: static_dir.clone(),
+                        }
+                    } else if !containers.is_empty() {
+                        // Container deployment - proxy to containers
                         let backend_addrs: Vec<String> = containers
                             .iter()
                             .map(|c| {
                                 format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port))
                             })
                             .collect();
-
-                        // Add route with main_url as-is
-                        if !routes.contains_key(main_url) {
-                            routes.insert(
-                                main_url.clone(),
-                                RouteInfo {
-                                    backend_addrs: backend_addrs.clone(),
-                                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                                    redirect_to: None,
-                                    status_code: None,
-                                    project: project.cloned(),
-                                    environment: environment.cloned(),
-                                    deployment: Some(Arc::clone(deployment)),
-                                },
-                            );
-                            debug!(
-                                "Loaded environment route: {} -> {:?} ({} containers, project={}, env={}, deploy={})",
-                                main_url, backend_addrs, backend_addrs.len(), env.project_id, env.id, deployment_id
-                            );
+                        BackendType::Upstream {
+                            addresses: backend_addrs,
+                            round_robin_counter: Arc::new(AtomicUsize::new(0)),
                         }
+                    } else {
+                        // No backend available, skip this route
+                        continue;
+                    };
 
-                        // Also add route with preview_domain suffix if configured
-                        let full_domain = format!("{}.{}", main_url, preview_domain);
-                        if !routes.contains_key(&full_domain) {
-                            routes.insert(
-                                full_domain.clone(),
-                                RouteInfo {
-                                    backend_addrs: backend_addrs.clone(),
-                                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                                    redirect_to: None,
-                                    status_code: None,
-                                    project: project.cloned(),
-                                    environment: environment.cloned(),
-                                    deployment: Some(Arc::clone(deployment)),
-                                },
-                            );
-                            debug!(
-                                    "Loaded environment route with preview domain: {} -> {:?} ({} containers, project={}, env={}, deploy={})",
-                                    full_domain, backend_addrs, backend_addrs.len(), env.project_id, env.id, deployment_id
+                    // Add route with main_url as-is
+                    if !routes.contains_key(main_url) {
+                        routes.insert(
+                            main_url.clone(),
+                            RouteInfo {
+                                backend: backend.clone(),
+                                redirect_to: None,
+                                status_code: None,
+                                project: project.cloned(),
+                                environment: environment.cloned(),
+                                deployment: Some(Arc::clone(deployment)),
+                            },
+                        );
+                        match &backend {
+                            BackendType::Upstream { addresses, .. } => {
+                                debug!(
+                                    "Loaded environment route: {} -> {:?} ({} containers, project={}, env={}, deploy={})",
+                                    main_url, addresses, addresses.len(), env.project_id, env.id, deployment_id
                                 );
+                            }
+                            BackendType::StaticDir { path } => {
+                                debug!(
+                                    "Loaded environment route (static): {} -> {} (project={}, env={}, deploy={})",
+                                    main_url, path, env.project_id, env.id, deployment_id
+                                );
+                            }
+                        }
+                    }
+
+                    // Also add route with preview_domain suffix if configured
+                    let full_domain = format!("{}.{}", main_url, preview_domain);
+                    if !routes.contains_key(&full_domain) {
+                        routes.insert(
+                            full_domain.clone(),
+                            RouteInfo {
+                                backend: backend.clone(),
+                                redirect_to: None,
+                                status_code: None,
+                                project: project.cloned(),
+                                environment: environment.cloned(),
+                                deployment: Some(Arc::clone(deployment)),
+                            },
+                        );
+                        match &backend {
+                            BackendType::Upstream { addresses, .. } => {
+                                debug!(
+                                    "Loaded environment route with preview domain: {} -> {:?} ({} containers, project={}, env={}, deploy={})",
+                                    full_domain, addresses, addresses.len(), env.project_id, env.id, deployment_id
+                                );
+                            }
+                            BackendType::StaticDir { path } => {
+                                debug!(
+                                    "Loaded environment route with preview domain (static): {} -> {} (project={}, env={}, deploy={})",
+                                    full_domain, path, env.project_id, env.id, deployment_id
+                                );
+                            }
                         }
                     }
                 }
@@ -484,36 +619,58 @@ impl CachedPeerTable {
                         .await
                         .unwrap_or_default();
 
-                    if !containers.is_empty() {
-                        // Build backend addresses from all containers
+                    // Determine backend type: static directory or upstream containers
+                    let backend = if let Some(static_dir) = &deployment.static_dir_location {
+                        // Static deployment - serve from directory
+                        BackendType::StaticDir {
+                            path: static_dir.clone(),
+                        }
+                    } else if !containers.is_empty() {
+                        // Container deployment - proxy to containers
                         let backend_addrs: Vec<String> = containers
                             .iter()
                             .map(|c| {
                                 format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port))
                             })
                             .collect();
+                        BackendType::Upstream {
+                            addresses: backend_addrs,
+                            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+                        }
+                    } else {
+                        // No backend available, skip this route
+                        continue;
+                    };
 
-                        // Generate a fallback route using environment ID if no other routes exist
-                        // This ensures every active deployment is accessible
-                        let fallback_domain = format!("{}.{}", deployment.slug, preview_domain);
+                    // Generate a fallback route using deployment slug if no other routes exist
+                    // This ensures every active deployment is accessible
+                    let fallback_domain = format!("{}.{}", deployment.slug, preview_domain);
 
-                        if !routes.contains_key(&fallback_domain) {
-                            routes.insert(
-                                fallback_domain.clone(),
-                                RouteInfo {
-                                    backend_addrs: backend_addrs.clone(),
-                                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                                    redirect_to: None,
-                                    status_code: None,
-                                    project: Some(Arc::clone(project)),
-                                    environment: Some(Arc::clone(environment)),
-                                    deployment: Some(Arc::clone(deployment)),
-                                },
-                            );
-                            debug!(
-                                "Loaded fallback route for active deployment: {} -> {:?} ({} containers, project={}, env={}, deploy={})",
-                                fallback_domain, backend_addrs, backend_addrs.len(), env.project_id, env.id, deployment_id
-                            );
+                    if !routes.contains_key(&fallback_domain) {
+                        routes.insert(
+                            fallback_domain.clone(),
+                            RouteInfo {
+                                backend: backend.clone(),
+                                redirect_to: None,
+                                status_code: None,
+                                project: Some(Arc::clone(project)),
+                                environment: Some(Arc::clone(environment)),
+                                deployment: Some(Arc::clone(deployment)),
+                            },
+                        );
+                        match &backend {
+                            BackendType::Upstream { addresses, .. } => {
+                                debug!(
+                                    "Loaded fallback route for active deployment: {} -> {:?} ({} containers, project={}, env={}, deploy={})",
+                                    fallback_domain, addresses, addresses.len(), env.project_id, env.id, deployment_id
+                                );
+                            }
+                            BackendType::StaticDir { path } => {
+                                debug!(
+                                    "Loaded fallback route for active deployment (static): {} -> {} (project={}, env={}, deploy={})",
+                                    fallback_domain, path, env.project_id, env.id, deployment_id
+                                );
+                            }
                         }
                     }
                 }
@@ -638,8 +795,10 @@ mod tests {
     #[test]
     fn test_route_info_creation() {
         let route = RouteInfo {
-            backend_addrs: vec!["127.0.0.1:8080".to_string()],
-            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            backend: BackendType::Upstream {
+                addresses: vec!["127.0.0.1:8080".to_string()],
+                round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            },
             redirect_to: None,
             status_code: None,
             project: None,
@@ -648,6 +807,7 @@ mod tests {
         };
 
         assert_eq!(route.get_backend_addr(), "127.0.0.1:8080");
+        assert!(!route.is_static());
         assert!(route.project.is_none());
         assert!(route.environment.is_none());
         assert!(route.deployment.is_none());
@@ -657,8 +817,10 @@ mod tests {
     #[test]
     fn test_route_info_with_redirect() {
         let route = RouteInfo {
-            backend_addrs: vec!["127.0.0.1:8080".to_string()],
-            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            backend: BackendType::Upstream {
+                addresses: vec!["127.0.0.1:8080".to_string()],
+                round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            },
             redirect_to: Some("https://example.com".to_string()),
             status_code: Some(301),
             project: None,
@@ -673,8 +835,10 @@ mod tests {
     #[test]
     fn test_route_info_custom_route() {
         let route = RouteInfo {
-            backend_addrs: vec!["192.168.1.100:3000".to_string()],
-            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            backend: BackendType::Upstream {
+                addresses: vec!["192.168.1.100:3000".to_string()],
+                round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            },
             redirect_to: None,
             status_code: None,
             project: None,
@@ -683,6 +847,7 @@ mod tests {
         };
 
         assert_eq!(route.get_backend_addr(), "192.168.1.100:3000");
+        assert!(!route.is_static());
         assert!(route.project.is_none());
         assert!(route.environment.is_none());
         assert!(route.deployment.is_none());
@@ -691,12 +856,14 @@ mod tests {
     #[test]
     fn test_route_info_load_balancing() {
         let route = RouteInfo {
-            backend_addrs: vec![
-                "127.0.0.1:8080".to_string(),
-                "127.0.0.1:8081".to_string(),
-                "127.0.0.1:8082".to_string(),
-            ],
-            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            backend: BackendType::Upstream {
+                addresses: vec![
+                    "127.0.0.1:8080".to_string(),
+                    "127.0.0.1:8081".to_string(),
+                    "127.0.0.1:8082".to_string(),
+                ],
+                round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            },
             redirect_to: None,
             status_code: None,
             project: None,
@@ -709,5 +876,115 @@ mod tests {
         assert_eq!(route.get_backend_addr(), "127.0.0.1:8081");
         assert_eq!(route.get_backend_addr(), "127.0.0.1:8082");
         assert_eq!(route.get_backend_addr(), "127.0.0.1:8080"); // Wraps around
+    }
+
+    #[test]
+    fn test_route_info_static_backend() {
+        let route = RouteInfo {
+            backend: BackendType::StaticDir {
+                path: "/var/www/static".to_string(),
+            },
+            redirect_to: None,
+            status_code: None,
+            project: None,
+            environment: None,
+            deployment: None,
+        };
+
+        assert!(route.is_static());
+        assert_eq!(route.static_dir(), Some("/var/www/static"));
+        assert_eq!(route.get_backend_addr(), "127.0.0.1:8080"); // Fallback for static
+    }
+
+    #[test]
+    fn test_backend_type_upstream() {
+        let backend = BackendType::Upstream {
+            addresses: vec![
+                "127.0.0.1:8080".to_string(),
+                "127.0.0.1:8081".to_string(),
+            ],
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+        };
+
+        assert!(!backend.is_static());
+        assert_eq!(backend.static_dir(), None);
+        assert_eq!(backend.get_backend_addr(), Some("127.0.0.1:8080".to_string()));
+        assert_eq!(backend.get_backend_addr(), Some("127.0.0.1:8081".to_string()));
+        assert_eq!(backend.get_backend_addr(), Some("127.0.0.1:8080".to_string())); // Wraps
+    }
+
+    #[test]
+    fn test_backend_type_static_dir() {
+        let backend = BackendType::StaticDir {
+            path: "/opt/static-files".to_string(),
+        };
+
+        assert!(backend.is_static());
+        assert_eq!(backend.static_dir(), Some("/opt/static-files"));
+        assert_eq!(backend.get_backend_addr(), None); // No backend addr for static
+    }
+
+    #[test]
+    fn test_backend_type_upstream_empty_addresses() {
+        let backend = BackendType::Upstream {
+            addresses: vec![],
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+        };
+
+        assert!(!backend.is_static());
+        // Should return fallback address for empty upstream list
+        assert_eq!(backend.get_backend_addr(), Some("127.0.0.1:8080".to_string()));
+    }
+
+    #[test]
+    fn test_backend_type_upstream_single_address() {
+        let backend = BackendType::Upstream {
+            addresses: vec!["192.168.1.100:3000".to_string()],
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+        };
+
+        // Should always return the same address for single upstream
+        assert_eq!(backend.get_backend_addr(), Some("192.168.1.100:3000".to_string()));
+        assert_eq!(backend.get_backend_addr(), Some("192.168.1.100:3000".to_string()));
+        assert_eq!(backend.get_backend_addr(), Some("192.168.1.100:3000".to_string()));
+    }
+
+    #[test]
+    fn test_route_info_methods_with_static_backend() {
+        let route = RouteInfo {
+            backend: BackendType::StaticDir {
+                path: "/srv/static".to_string(),
+            },
+            redirect_to: None,
+            status_code: None,
+            project: None,
+            environment: None,
+            deployment: None,
+        };
+
+        // Test all convenience methods
+        assert!(route.is_static());
+        assert_eq!(route.static_dir(), Some("/srv/static"));
+        assert_eq!(route.get_backend_addr(), "127.0.0.1:8080"); // Fallback
+    }
+
+    #[test]
+    fn test_route_info_methods_with_upstream_backend() {
+        let route = RouteInfo {
+            backend: BackendType::Upstream {
+                addresses: vec!["10.0.0.1:9000".to_string()],
+                round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            },
+            redirect_to: None,
+            status_code: None,
+            project: None,
+            environment: None,
+            deployment: None,
+        };
+
+        // Test all convenience methods
+        assert!(!route.is_static());
+        assert_eq!(route.static_dir(), None);
+        assert_eq!(route.get_backend_addr(), "10.0.0.1:9000");
     }
 }

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use axum::http::header;
 use bytes::Bytes;
 use cookie::Cookie;
+use pingora::http::StatusCode;
 use pingora::Error;
 use pingora_core::{
     upstreams::peer::{HttpPeer, Peer},
@@ -76,6 +77,7 @@ pub struct LoadBalancer {
     session_manager: Arc<dyn SessionManager>,
     crypto: Arc<temps_core::CookieCrypto>,
     db: Arc<DbConnection>,
+    config_service: Arc<temps_config::ConfigService>,
 }
 
 impl LoadBalancer {
@@ -89,6 +91,7 @@ impl LoadBalancer {
         session_manager: Arc<dyn SessionManager>,
         crypto: Arc<temps_core::CookieCrypto>,
         db: Arc<DbConnection>,
+        config_service: Arc<temps_config::ConfigService>,
     ) -> Self {
         Self {
             upstream_resolver,
@@ -99,6 +102,7 @@ impl LoadBalancer {
             session_manager,
             crypto,
             db,
+            config_service,
         }
     }
 
@@ -654,6 +658,164 @@ impl LoadBalancer {
             .insert_header("X-Response-Time", format!("{}ms", duration.as_millis()))?;
         Ok(())
     }
+
+    /// Serve a static file from the filesystem
+    /// Returns Ok(true) if file was served, Ok(false) if file not found, Err on error
+    async fn serve_static_file(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        static_dir: &str,
+    ) -> Result<bool> {
+        use tokio::fs;
+        use std::path::PathBuf;
+
+        let mut requested_path = ctx.path.trim_start_matches('/');
+
+        // Handle root path -> index.html
+        if requested_path.is_empty() {
+            requested_path = "index.html";
+        }
+
+        // Security: ALWAYS join with base static directory
+        // Never trust absolute paths from database - always enforce that static files
+        // must be within the configured static directory to prevent path traversal
+        let static_dir_path = PathBuf::from(static_dir);
+
+        // Strip leading slash if present (treat all paths as relative)
+        let relative_static_dir = static_dir_path
+            .strip_prefix("/")
+            .unwrap_or(&static_dir_path);
+
+        // Always join with base static directory from config
+        let absolute_static_dir = self.config_service.static_dir().join(relative_static_dir);
+
+        let file_path = absolute_static_dir.join(requested_path);
+
+        // Security check: ensure the resolved path is still within static_dir
+        let canonical_static_dir = fs::canonicalize(&absolute_static_dir).await.map_err(|e| {
+            Error::because(
+                pingora::ErrorType::FileOpenError,
+                format!("Failed to canonicalize static dir: {}", e),
+                e,
+            )
+        })?;
+
+        // Try to canonicalize the file path, but handle the case where it doesn't exist
+        let canonical_file_path = match fs::canonicalize(&file_path).await {
+            Ok(path) => path,
+            Err(_) => {
+                // File doesn't exist - try with index.html for SPA routing
+                if !requested_path.contains('.') {
+                    // Likely a SPA route, serve index.html
+                    let index_path = absolute_static_dir.join("index.html");
+                    match fs::canonicalize(&index_path).await {
+                        Ok(path) => path,
+                        Err(_) => return Ok(false), // No index.html, file not found
+                    }
+                } else {
+                    return Ok(false); // File not found
+                }
+            }
+        };
+
+        // Ensure the file is within the static directory (prevent path traversal)
+        if !canonical_file_path.starts_with(&canonical_static_dir) {
+            warn!(
+                "Path traversal attempt detected: {} -> {}",
+                requested_path,
+                canonical_file_path.display()
+            );
+            return Ok(false);
+        }
+
+        // Check if it's a directory -> serve index.html
+        let final_path = if canonical_file_path.is_dir() {
+            canonical_file_path.join("index.html")
+        } else {
+            canonical_file_path
+        };
+
+        // Read the file
+        let file_content = fs::read(&final_path).await.map_err(|e| {
+            Error::because(
+                pingora::ErrorType::FileOpenError,
+                format!("Failed to read file: {}", e),
+                e,
+            )
+        })?;
+
+        // Infer content type
+        let content_type = Self::infer_content_type(
+            final_path
+                .to_str()
+                .unwrap_or("index.html")
+        );
+
+        // Build response
+        let mut resp = ResponseHeader::build(200, None)?;
+        resp.insert_header(header::CONTENT_TYPE, content_type)?;
+        resp.insert_header(header::CONTENT_LENGTH, file_content.len().to_string())?;
+        resp.insert_header("X-Request-ID", &ctx.request_id)?;
+
+        // Add cache headers for static assets
+        if Self::is_cacheable_static_asset(requested_path) {
+            resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
+        } else {
+            resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
+        }
+
+        // Write response
+        session.write_response_header(Box::new(resp), false).await?;
+        session
+            .write_response_body(Some(Bytes::from(file_content)), true)
+            .await?;
+
+        Ok(true)
+    }
+
+    /// Infer content type from file extension
+    pub fn infer_content_type(file_path: &str) -> &'static str {
+        let extension = std::path::Path::new(file_path)
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("");
+
+        match extension.to_lowercase().as_str() {
+            "html" => "text/html; charset=utf-8",
+            "css" => "text/css; charset=utf-8",
+            "js" | "mjs" | "cjs" => "application/javascript; charset=utf-8",
+            "json" => "application/json; charset=utf-8",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "svg" => "image/svg+xml",
+            "webp" => "image/webp",
+            "ico" => "image/x-icon",
+            "woff" => "font/woff",
+            "woff2" => "font/woff2",
+            "ttf" => "font/ttf",
+            "eot" => "application/vnd.ms-fontobject",
+            "pdf" => "application/pdf",
+            "txt" | "log" => "text/plain; charset=utf-8",
+            "xml" => "application/xml; charset=utf-8",
+            "zip" => "application/zip",
+            _ => "application/octet-stream",
+        }
+    }
+
+    /// Check if a file should have long-term caching headers
+    pub fn is_cacheable_static_asset(path: &str) -> bool {
+        let cacheable_patterns = [
+            "/assets/",
+            "/static/",
+            "/_next/static/",
+            ".chunk.",
+            ".hash.",
+        ];
+
+        cacheable_patterns.iter().any(|pattern| path.contains(pattern))
+    }
 }
 
 #[async_trait]
@@ -949,16 +1111,63 @@ impl ProxyHttp for LoadBalancer {
             return Ok(true);
         }
 
-        // if self.project_context_resolver.is_static_deployment(&ctx.host).await {
-        //     if let Some(static_path) = self.project_context_resolver.get_static_path(&ctx.host).await {
-        //         // Handle static file serving (simplified)
-        //         let file_path = format!("{}{}", static_path, ctx.path);
-        //         debug!("Serving static file: {}", file_path);
+        // Check if this is a static deployment using route table
+        if let Some(static_dir) = self.project_context_resolver.get_static_path(&ctx.host).await {
+            debug!(
+                "Static deployment detected for {}: {}",
+                ctx.host, static_dir
+            );
 
-        //         // For now, just return false to continue with normal proxy flow
-        //         // In a real implementation, you'd read and serve the static file here
-        //     }
-        // }
+            // Serve static file
+            match self.serve_static_file(session, ctx, &static_dir).await {
+                Ok(served) => {
+                    if served {
+                        debug!("Served static file: {}", ctx.path);
+                        ctx.routing_status = "static_file".to_string();
+                        return Ok(true); // Request handled
+                    } else {
+                        // Static file not found - return 404 instead of falling through
+                        error!(
+                            "Static file not found: {} (static dir: {})",
+                            ctx.path, static_dir
+                        );
+                        let mut resp = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
+                        resp.insert_header(header::CONTENT_TYPE, "text/html")?;
+                        session.write_response_header(Box::new(resp), false).await?;
+                        session
+                            .write_response_body(
+                                Some(bytes::Bytes::from(
+                                    b"<html><body><h1>404 - File Not Found</h1></body></html>"
+                                        .to_vec(),
+                                )),
+                                true,
+                            )
+                            .await?;
+                        return Ok(true); // Request handled with 404
+                    }
+                }
+                Err(e) => {
+                    // Static directory error (doesn't exist, permissions, etc.) - return 500
+                    error!(
+                        "Failed to serve static file {} from {}: {}",
+                        ctx.path, static_dir, e
+                    );
+                    let mut resp = ResponseHeader::build(StatusCode::INTERNAL_SERVER_ERROR, None)?;
+                    resp.insert_header(header::CONTENT_TYPE, "text/html")?;
+                    session.write_response_header(Box::new(resp), false).await?;
+                    session
+                        .write_response_body(
+                            Some(bytes::Bytes::from(
+                                b"<html><body><h1>500 - Static Directory Error</h1><p>The static files directory could not be accessed.</p></body></html>"
+                                    .to_vec(),
+                            )),
+                            true,
+                        )
+                        .await?;
+                    return Ok(true); // Request handled with error response
+                }
+            }
+        }
 
         Ok(false)
     }

@@ -411,4 +411,17 @@ mod tests {
         assert!(preset.is_some());
         assert_eq!(preset.unwrap().slug(), "docusaurus");
     }
+
+    #[test]
+    fn test_preset_default_ports() {
+        // Test that presets return expected default ports
+        assert_eq!(get_preset_by_slug("java").unwrap().default_port(), 8080);
+        assert_eq!(get_preset_by_slug("go").unwrap().default_port(), 8080);
+        assert_eq!(get_preset_by_slug("rust").unwrap().default_port(), 8080);
+        assert_eq!(get_preset_by_slug("python").unwrap().default_port(), 8000);
+        assert_eq!(get_preset_by_slug("vite").unwrap().default_port(), 5173);
+        assert_eq!(get_preset_by_slug("nextjs").unwrap().default_port(), 3000); // Default
+        assert_eq!(get_preset_by_slug("docusaurus").unwrap().default_port(), 3000); // Default
+        assert_eq!(get_preset_by_slug("rsbuild").unwrap().default_port(), 3000); // Default
+    }
 }

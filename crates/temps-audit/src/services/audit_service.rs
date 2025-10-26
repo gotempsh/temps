@@ -37,7 +37,7 @@ impl AuditService {
             Some(ip_address) => match self.ip_service.get_or_create_ip(&ip_address).await {
                 Ok(ip_address) => Some(ip_address.id),
                 Err(err) => {
-                    warn!("Error getting ip address: {}", err);
+                    warn!("Error getting ip address {:?}: {}", ip_address, err);
                     None
                 }
             },

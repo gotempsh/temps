@@ -21,7 +21,7 @@ mod integration_tests {
             .await
             .unwrap();
         let server_config = ProxyConfig::default();
-
+        let config = Arc::new(ServerConfig::default());
         // Create route table and load routes
         let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
         route_table.load_routes().await?;
@@ -32,6 +32,7 @@ mod integration_tests {
             server_config,
             create_crypto_cookie_crypto(),
             route_table,
+            config,
         )?;
 
         // Verify the proxy service was created successfully
@@ -71,12 +72,13 @@ mod integration_tests {
         // Create route table and load routes
         let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
         route_table.load_routes().await?;
-
+        let config = Arc::new(ServerConfig::default());
         let proxy_service = create_proxy_service(
             test_db.db.clone(),
             server_config,
             create_crypto_cookie_crypto(),
             route_table,
+            config,
         )?;
 
         // Test custom route resolution
@@ -104,7 +106,7 @@ mod integration_tests {
             .await
             .unwrap();
         let server_config = ProxyConfig::default();
-
+        let config = Arc::new(ServerConfig::default());
         // Create test project
         let (project, environment, deployment) = test_db.create_test_project().await?;
 
@@ -117,6 +119,7 @@ mod integration_tests {
             server_config,
             create_crypto_cookie_crypto(),
             route_table,
+            config,
         )?;
 
         // Test project context resolution
@@ -150,7 +153,7 @@ mod integration_tests {
             .await
             .unwrap();
         let server_config = ProxyConfig::default();
-
+        let config = Arc::new(ServerConfig::default());
         // Create route table and load routes
         let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
         route_table.load_routes().await?;
@@ -160,6 +163,7 @@ mod integration_tests {
             server_config,
             create_crypto_cookie_crypto(),
             route_table,
+            config,
         )?;
 
         // Test visitor tracking decisions
@@ -203,7 +207,7 @@ mod integration_tests {
             .await
             .unwrap();
         let server_config = ProxyConfig::default();
-
+        let config = Arc::new(ServerConfig::default());
         // Create route table and load routes
         let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
         route_table.load_routes().await?;
@@ -213,6 +217,7 @@ mod integration_tests {
             server_config,
             create_crypto_cookie_crypto(),
             route_table,
+            config,
         )?;
 
         // Create test visitor

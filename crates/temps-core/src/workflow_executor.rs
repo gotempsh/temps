@@ -516,7 +516,13 @@ impl WorkflowExecutor {
                             (job_id_clone, job_result)
                         }
                         Err(e) => {
+                            let error_msg = format!("❌ Job failed: {}", e);
                             error!("❌ Job '{}' failed: {}", job_id_clone, e);
+
+                            // Log the error to the job's context so it appears in the job logs
+                            if let Err(log_err) = error_context.log(&error_msg).await {
+                                error!("Failed to log error for job '{}': {}", job_id_clone, log_err);
+                            }
 
                             // Call cleanup on job failure
                             warn!("🧹 Calling cleanup for failed job '{}'", job_id_clone);

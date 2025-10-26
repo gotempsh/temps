@@ -20,6 +20,7 @@ pub type LogCallback =
 
 pub mod docker;
 pub mod plugin;
+pub mod static_deployer;
 
 #[derive(Error, Debug)]
 pub enum BuilderError {

@@ -330,6 +330,57 @@ async fn test_workflow_execution_service_with_real_jobs() {
     }
     let cron_config_service: Arc<dyn CronConfigService> = Arc::new(MockCronConfigService);
 
+    // Create StaticDeployer (mock implementation)
+    struct MockStaticDeployer;
+    #[async_trait]
+    impl temps_deployer::static_deployer::StaticDeployer for MockStaticDeployer {
+        async fn deploy(
+            &self,
+            _request: temps_deployer::static_deployer::StaticDeployRequest,
+        ) -> Result<temps_deployer::static_deployer::StaticDeployResult, temps_deployer::static_deployer::StaticDeployError> {
+            Ok(temps_deployer::static_deployer::StaticDeployResult {
+                storage_path: "/tmp/test-deployment".to_string(),
+                file_count: 10,
+                total_size_bytes: 1024,
+                deployed_at: Utc::now(),
+            })
+        }
+
+        async fn get_deployment(
+            &self,
+            _project_slug: &str,
+            _environment_slug: &str,
+            _deployment_slug: &str,
+        ) -> Result<temps_deployer::static_deployer::StaticDeploymentInfo, temps_deployer::static_deployer::StaticDeployError> {
+            Ok(temps_deployer::static_deployer::StaticDeploymentInfo {
+                deployment_slug: "test-deployment".to_string(),
+                storage_path: PathBuf::from("/tmp/test-deployment"),
+                deployed_at: Utc::now(),
+                file_count: 10,
+                total_size_bytes: 1024,
+            })
+        }
+
+        async fn list_files(
+            &self,
+            _project_slug: &str,
+            _environment_slug: &str,
+            _deployment_slug: &str,
+        ) -> Result<Vec<temps_deployer::static_deployer::FileInfo>, temps_deployer::static_deployer::StaticDeployError> {
+            Ok(vec![])
+        }
+
+        async fn remove(
+            &self,
+            _project_slug: &str,
+            _environment_slug: &str,
+            _deployment_slug: &str,
+        ) -> Result<(), temps_deployer::static_deployer::StaticDeployError> {
+            Ok(())
+        }
+    }
+    let static_deployer: Arc<dyn temps_deployer::static_deployer::StaticDeployer> = Arc::new(MockStaticDeployer);
+
     // Create screenshot service for test
     let screenshot_service = Arc::new(
         ScreenshotService::new(config_service.clone())
@@ -343,6 +394,7 @@ async fn test_workflow_execution_service_with_real_jobs() {
         git_provider,
         image_builder,
         container_deployer,
+        static_deployer,
         log_service,
         cron_config_service,
         config_service.clone(),
