@@ -60,6 +60,7 @@ impl std::fmt::Debug for DeployStaticJob {
 }
 
 impl DeployStaticJob {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         job_id: String,
         build_job_id: String,
@@ -211,7 +212,7 @@ impl WorkflowTask for DeployStaticJob {
 
         self.log(
             &context,
-            format!("✅ Files extracted successfully"),
+            "✅ Files extracted successfully".to_string(),
         )
         .await?;
 

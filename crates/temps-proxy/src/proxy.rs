@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use axum::http::header;
 use bytes::Bytes;
 use cookie::Cookie;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use pingora::http::StatusCode;
 use pingora::Error;
 use pingora_core::{
@@ -14,6 +16,7 @@ use pingora_http::ResponseHeader;
 use pingora_proxy::{FailToProxy, ProxyHttp, Session as PingoraSession};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 use temps_database::DbConnection;
@@ -281,78 +284,9 @@ impl LoadBalancer {
 
         upstream_response.insert_header("Referrer-Policy", "strict-origin-when-cross-origin")?;
 
-        // Set visitor cookie using the trait
-        if let Some(visitor_id) = &ctx.visitor_id {
-            let has_valid_visitor_cookie = session
-                .req_header()
-                .headers
-                .get_all("Cookie")
-                .iter()
-                .filter_map(|cookie_header| cookie_header.to_str().ok())
-                .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
-                .any(|cookie| {
-                    cookie.name() == VISITOR_ID_COOKIE_NAME
-                        && self.crypto.decrypt(cookie.value()).is_ok()
-                });
-
-            if !has_valid_visitor_cookie {
-                let visitor = Visitor {
-                    visitor_id: visitor_id.clone(),
-                    visitor_id_i32: ctx.visitor_id_i32.unwrap_or(0),
-                    is_crawler: false, // We'd need to track this properly
-                    crawler_name: None,
-                };
-
-                let is_https = self.is_https_request(session);
-                let visitor_cookie = match self
-                    .visitor_manager
-                    .generate_visitor_cookie(&visitor, is_https)
-                    .await
-                {
-                    Ok(cookie) => cookie,
-                    Err(e) => {
-                        error!("Failed to generate visitor cookie: {:?}", e);
-                        return Err(Error::new_str("Failed to generate visitor cookie"));
-                    }
-                };
-                upstream_response.append_header("Set-Cookie", visitor_cookie)?;
-            }
-        }
-
-        // Set session cookie using the trait
-        if let Some(session_id) = &ctx.session_id {
-            let has_session_cookie = session
-                .req_header()
-                .headers
-                .get_all("Cookie")
-                .iter()
-                .filter_map(|cookie_header| cookie_header.to_str().ok())
-                .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
-                .any(|cookie| cookie.name() == SESSION_ID_COOKIE_NAME);
-
-            if !has_session_cookie || ctx.is_new_session {
-                let session_obj = crate::traits::Session {
-                    session_id: session_id.clone(),
-                    session_id_i32: ctx.session_id_i32.unwrap_or(0),
-                    visitor_id_i32: ctx.visitor_id_i32.unwrap_or(0),
-                    is_new_session: ctx.is_new_session,
-                };
-
-                let is_https = self.is_https_request(session);
-                let session_cookie = match self
-                    .session_manager
-                    .generate_session_cookie(&session_obj, is_https)
-                    .await
-                {
-                    Ok(cookie) => cookie,
-                    Err(e) => {
-                        error!("Failed to generate session cookie: {:?}", e);
-                        return Err(Error::new_str("Failed to generate session cookie"));
-                    }
-                };
-                upstream_response.append_header("Set-Cookie", session_cookie)?;
-            }
-        }
+        // Set visitor and session cookies
+        self.set_tracking_cookies(session, upstream_response, ctx)
+            .await?;
 
         // Capture response headers before logging
         let response_headers: HashMap<String, String> = upstream_response
@@ -604,12 +538,22 @@ impl LoadBalancer {
                     .and_then(|h| serde_json::to_value(h).ok()),
             };
 
-            // Spawn async task to avoid blocking the response
-            tokio::spawn(async move {
-                if let Err(e) = proxy_log_service.create(proxy_log_request).await {
-                    warn!("Failed to create proxy log: {:?}", e);
-                }
-            });
+            // Only log HTML pages (skip static assets like .js, .css, .svg, etc.)
+            let should_log = ctx
+                .response_headers
+                .as_ref()
+                .and_then(|h| h.get("content-type"))
+                .map(|ct| ct.starts_with("text/html"))
+                .unwrap_or(false);
+
+            if should_log {
+                // Spawn async task to avoid blocking the response
+                tokio::spawn(async move {
+                    if let Err(e) = proxy_log_service.create(proxy_log_request).await {
+                        warn!("Failed to create proxy log: {:?}", e);
+                    }
+                });
+            }
         }
 
         Ok(())
@@ -659,6 +603,158 @@ impl LoadBalancer {
         Ok(())
     }
 
+    /// Check if a request path should be logged (HTML pages only, skip static assets)
+    fn should_log_static_request(path: &str) -> bool {
+        path == "/"
+            || path.ends_with(".html")
+            || path.ends_with(".htm")
+            || !path.contains('.') // SPA routes without extension
+    }
+
+    /// Create and spawn proxy log for static file serving
+    fn log_static_request(
+        &self,
+        ctx: &ProxyContext,
+        status_code: i16,
+        routing_status: &str,
+        static_dir: &str,
+        error_message: Option<String>,
+        response_size: Option<i64>,
+    ) {
+        // Only log HTML pages (skip .js, .css, .svg, etc.)
+        if !Self::should_log_static_request(&ctx.path) {
+            return;
+        }
+
+        let proxy_log_service = self.proxy_log_service.clone();
+        let proxy_log_request = CreateProxyLogRequest {
+            method: ctx.method.clone(),
+            path: ctx.path.clone(),
+            query_string: ctx.query_string.clone(),
+            host: ctx.host.clone(),
+            status_code,
+            response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
+            request_source: "proxy".to_string(),
+            is_system_request: ctx.path.starts_with(ROUTE_PREFIX_TEMPS),
+            routing_status: routing_status.to_string(),
+            project_id: ctx.project.as_ref().map(|p| p.id),
+            environment_id: ctx.environment.as_ref().map(|e| e.id),
+            deployment_id: ctx.deployment.as_ref().map(|d| d.id),
+            container_id: None,
+            upstream_host: Some(format!("static://{}", static_dir)),
+            error_message,
+            client_ip: ctx.ip_address.clone(),
+            user_agent: Some(ctx.user_agent.clone()),
+            referrer: ctx.referrer.clone(),
+            request_id: ctx.request_id.clone(),
+            ip_geolocation_id: None,
+            browser: None,
+            browser_version: None,
+            operating_system: None,
+            device_type: None,
+            is_bot: None,
+            bot_name: None,
+            request_size_bytes: None,
+            response_size_bytes: response_size,
+            cache_status: None,
+            request_headers: ctx
+                .request_headers
+                .as_ref()
+                .and_then(|h| serde_json::to_value(h).ok()),
+            response_headers: None,
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = proxy_log_service.create(proxy_log_request).await {
+                warn!("Failed to create proxy log for static file: {:?}", e);
+            }
+        });
+    }
+
+    /// Set visitor and session cookies on the response
+    /// This can be called from both finalize_response and early_request_filter (for static files)
+    async fn set_tracking_cookies(
+        &self,
+        session: &mut PingoraSession,
+        response: &mut ResponseHeader,
+        ctx: &ProxyContext,
+    ) -> Result<()> {
+        // Set visitor cookie using the trait
+        if let Some(visitor_id) = &ctx.visitor_id {
+            let has_valid_visitor_cookie = session
+                .req_header()
+                .headers
+                .get_all("Cookie")
+                .iter()
+                .filter_map(|cookie_header| cookie_header.to_str().ok())
+                .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
+                .any(|cookie| {
+                    cookie.name() == VISITOR_ID_COOKIE_NAME
+                        && self.crypto.decrypt(cookie.value()).is_ok()
+                });
+
+            if !has_valid_visitor_cookie {
+                let visitor = Visitor {
+                    visitor_id: visitor_id.clone(),
+                    visitor_id_i32: ctx.visitor_id_i32.unwrap_or(0),
+                    is_crawler: false, // We'd need to track this properly
+                    crawler_name: None,
+                };
+
+                let is_https = self.is_https_request(session);
+                let visitor_cookie = match self
+                    .visitor_manager
+                    .generate_visitor_cookie(&visitor, is_https)
+                    .await
+                {
+                    Ok(cookie) => cookie,
+                    Err(e) => {
+                        error!("Failed to generate visitor cookie: {:?}", e);
+                        return Err(Error::new_str("Failed to generate visitor cookie"));
+                    }
+                };
+                response.append_header("Set-Cookie", visitor_cookie)?;
+            }
+        }
+
+        // Set session cookie using the trait
+        if let Some(session_id) = &ctx.session_id {
+            let has_session_cookie = session
+                .req_header()
+                .headers
+                .get_all("Cookie")
+                .iter()
+                .filter_map(|cookie_header| cookie_header.to_str().ok())
+                .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
+                .any(|cookie| cookie.name() == SESSION_ID_COOKIE_NAME);
+
+            if !has_session_cookie || ctx.is_new_session {
+                let session_obj = crate::traits::Session {
+                    session_id: session_id.clone(),
+                    session_id_i32: ctx.session_id_i32.unwrap_or(0),
+                    visitor_id_i32: ctx.visitor_id_i32.unwrap_or(0),
+                    is_new_session: ctx.is_new_session,
+                };
+
+                let is_https = self.is_https_request(session);
+                let session_cookie = match self
+                    .session_manager
+                    .generate_session_cookie(&session_obj, is_https)
+                    .await
+                {
+                    Ok(cookie) => cookie,
+                    Err(e) => {
+                        error!("Failed to generate session cookie: {:?}", e);
+                        return Err(Error::new_str("Failed to generate session cookie"));
+                    }
+                };
+                response.append_header("Set-Cookie", session_cookie)?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Serve a static file from the filesystem
     /// Returns Ok(true) if file was served, Ok(false) if file not found, Err on error
     async fn serve_static_file(
@@ -667,8 +763,8 @@ impl LoadBalancer {
         ctx: &mut ProxyContext,
         static_dir: &str,
     ) -> Result<bool> {
-        use tokio::fs;
         use std::path::PathBuf;
+        use tokio::fs;
 
         let mut requested_path = ctx.path.trim_start_matches('/');
 
@@ -745,18 +841,88 @@ impl LoadBalancer {
             )
         })?;
 
+        // Generate ETag for cache validation
+        let etag = Self::generate_etag(&file_content);
+
+        // Check If-None-Match header for 304 Not Modified response
+        if let Some(if_none_match) = session
+            .req_header()
+            .headers
+            .get("if-none-match")
+            .and_then(|v| v.to_str().ok())
+        {
+            if if_none_match == etag {
+                debug!("ETag match - returning 304 Not Modified for: {}", ctx.path);
+                let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
+                resp.insert_header("ETag", &etag)?;
+                resp.insert_header("X-Request-ID", &ctx.request_id)?;
+
+                // Add cache headers
+                if Self::is_cacheable_static_asset(requested_path) {
+                    resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
+                } else {
+                    resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
+                }
+
+                session.write_response_header(Box::new(resp), false).await?;
+                session.write_response_body(None, true).await?;
+                return Ok(true);
+            }
+        }
+
         // Infer content type
-        let content_type = Self::infer_content_type(
-            final_path
-                .to_str()
-                .unwrap_or("index.html")
-        );
+        let content_type = Self::infer_content_type(final_path.to_str().unwrap_or("index.html"));
+
+        // Check if we should compress the content
+        let client_accepts_gzip = Self::accepts_gzip(session);
+        let should_compress =
+            client_accepts_gzip && Self::should_compress_content(content_type, file_content.len());
+
+        // Compress content if appropriate
+        let (final_content, is_compressed) = if should_compress {
+            match Self::compress_gzip(&file_content) {
+                Ok(compressed) => {
+                    // Only use compression if it actually reduces size
+                    if compressed.len() < file_content.len() {
+                        debug!(
+                            "Compressed {} from {} to {} bytes ({:.1}% reduction)",
+                            ctx.path,
+                            file_content.len(),
+                            compressed.len(),
+                            (1.0 - (compressed.len() as f64 / file_content.len() as f64)) * 100.0
+                        );
+                        (compressed, true)
+                    } else {
+                        debug!(
+                            "Skipping compression for {} - compressed size ({}) >= original ({})",
+                            ctx.path,
+                            compressed.len(),
+                            file_content.len()
+                        );
+                        (file_content, false)
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to compress {}: {:?}", ctx.path, e);
+                    (file_content, false)
+                }
+            }
+        } else {
+            (file_content, false)
+        };
 
         // Build response
         let mut resp = ResponseHeader::build(200, None)?;
         resp.insert_header(header::CONTENT_TYPE, content_type)?;
-        resp.insert_header(header::CONTENT_LENGTH, file_content.len().to_string())?;
+        resp.insert_header(header::CONTENT_LENGTH, final_content.len().to_string())?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
+        resp.insert_header("ETag", &etag)?;
+
+        // Add compression header if compressed
+        if is_compressed {
+            resp.insert_header("Content-Encoding", "gzip")?;
+            resp.insert_header("Vary", "Accept-Encoding")?;
+        }
 
         // Add cache headers for static assets
         if Self::is_cacheable_static_asset(requested_path) {
@@ -765,10 +931,13 @@ impl LoadBalancer {
             resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
         }
 
+        // Set visitor and session tracking cookies for static file responses
+        self.set_tracking_cookies(session, &mut resp, ctx).await?;
+
         // Write response
         session.write_response_header(Box::new(resp), false).await?;
         session
-            .write_response_body(Some(Bytes::from(file_content)), true)
+            .write_response_body(Some(Bytes::from(final_content)), true)
             .await?;
 
         Ok(true)
@@ -814,7 +983,68 @@ impl LoadBalancer {
             ".hash.",
         ];
 
-        cacheable_patterns.iter().any(|pattern| path.contains(pattern))
+        cacheable_patterns
+            .iter()
+            .any(|pattern| path.contains(pattern))
+    }
+
+    /// Generate ETag from file content using SHA-256 hash
+    fn generate_etag(content: &[u8]) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        let hash = hasher.finish();
+        format!("W/\"{:x}\"", hash)
+    }
+
+    /// Check if content should be compressed based on Content-Type
+    fn should_compress_content(content_type: &str, content_length: usize) -> bool {
+        // Don't compress if content is too small (overhead not worth it)
+        if content_length < 1024 {
+            return false;
+        }
+
+        // Compress text-based content types
+        let compressible_types = [
+            "text/html",
+            "text/css",
+            "text/javascript",
+            "text/plain",
+            "text/xml",
+            "application/javascript",
+            "application/json",
+            "application/xml",
+            "application/x-javascript",
+            "image/svg+xml",
+        ];
+
+        compressible_types
+            .iter()
+            .any(|ct| content_type.starts_with(ct))
+    }
+
+    /// Compress content using gzip
+    fn compress_gzip(content: &[u8]) -> Result<Vec<u8>> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(content)
+            .map_err(|_| Error::new_str("Failed to compress content"))?;
+        encoder
+            .finish()
+            .map_err(|_| Error::new_str("Failed to finish compression"))
+    }
+
+    /// Check if client accepts gzip encoding
+    fn accepts_gzip(session: &PingoraSession) -> bool {
+        session
+            .req_header()
+            .headers
+            .get("accept-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(|ae| ae.contains("gzip"))
+            .unwrap_or(false)
     }
 }
 
@@ -993,31 +1223,6 @@ impl ProxyHttp for LoadBalancer {
             "Incoming request"
         );
 
-        // Handle CORS preflight OPTIONS requests
-        if ctx.method == "OPTIONS" {
-            debug!(
-                request_id = %ctx.request_id,
-                host = %ctx.host,
-                path = %ctx.path,
-                "Handling CORS preflight OPTIONS request"
-            );
-
-            let mut resp = ResponseHeader::build(200, None)?;
-            resp.insert_header("Access-Control-Allow-Origin", "*")?;
-            resp.insert_header(
-                "Access-Control-Allow-Methods",
-                "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-            )?;
-            resp.insert_header(
-                "Access-Control-Allow-Headers",
-                "Content-Type, Authorization, X-Requested-With, X-Request-ID",
-            )?;
-            resp.insert_header("Access-Control-Max-Age", "86400")?; // 24 hours
-
-            session.write_response_header(Box::new(resp), true).await?;
-            return Ok(true);
-        }
-
         // Store encrypted cookie values for later processing
         ctx.request_visitor_cookie = session
             .req_header()
@@ -1112,7 +1317,11 @@ impl ProxyHttp for LoadBalancer {
         }
 
         // Check if this is a static deployment using route table
-        if let Some(static_dir) = self.project_context_resolver.get_static_path(&ctx.host).await {
+        if let Some(static_dir) = self
+            .project_context_resolver
+            .get_static_path(&ctx.host)
+            .await
+        {
             debug!(
                 "Static deployment detected for {}: {}",
                 ctx.host, static_dir
@@ -1125,51 +1334,8 @@ impl ProxyHttp for LoadBalancer {
                         debug!("Served static file: {}", ctx.path);
                         ctx.routing_status = "static_file".to_string();
 
-                        // Create proxy log for successful static file serving
-                        let proxy_log_service = self.proxy_log_service.clone();
-                        let proxy_log_request = CreateProxyLogRequest {
-                            method: ctx.method.clone(),
-                            path: ctx.path.clone(),
-                            query_string: ctx.query_string.clone(),
-                            host: ctx.host.clone(),
-                            status_code: 200,
-                            response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
-                            request_source: "proxy".to_string(),
-                            is_system_request: ctx.path.starts_with(ROUTE_PREFIX_TEMPS),
-                            routing_status: "static_file".to_string(),
-                            project_id: ctx.project.as_ref().map(|p| p.id),
-                            environment_id: ctx.environment.as_ref().map(|e| e.id),
-                            deployment_id: ctx.deployment.as_ref().map(|d| d.id),
-                            container_id: None, // Static files don't have containers
-                            upstream_host: Some(format!("static://{}", static_dir)),
-                            error_message: None,
-                            client_ip: ctx.ip_address.clone(),
-                            user_agent: Some(ctx.user_agent.clone()),
-                            referrer: ctx.referrer.clone(),
-                            request_id: ctx.request_id.clone(),
-                            ip_geolocation_id: None,
-                            browser: None,
-                            browser_version: None,
-                            operating_system: None,
-                            device_type: None,
-                            is_bot: None,
-                            bot_name: None,
-                            request_size_bytes: None,
-                            response_size_bytes: None, // Could be added if we track file size
-                            cache_status: None,
-                            request_headers: ctx
-                                .request_headers
-                                .as_ref()
-                                .and_then(|h| serde_json::to_value(h).ok()),
-                            response_headers: None,
-                        };
-
-                        // Spawn async task to avoid blocking
-                        tokio::spawn(async move {
-                            if let Err(e) = proxy_log_service.create(proxy_log_request).await {
-                                warn!("Failed to create proxy log for static file: {:?}", e);
-                            }
-                        });
+                        // Log successful static file serving (HTML only)
+                        self.log_static_request(ctx, 200, "static_file", &static_dir, None, None);
 
                         return Ok(true); // Request handled
                     } else {
@@ -1180,6 +1346,10 @@ impl ProxyHttp for LoadBalancer {
                         );
                         let mut resp = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
                         resp.insert_header(header::CONTENT_TYPE, "text/html")?;
+
+                        // Set tracking cookies for 404 response
+                        self.set_tracking_cookies(session, &mut resp, ctx).await?;
+
                         session.write_response_header(Box::new(resp), false).await?;
                         session
                             .write_response_body(
@@ -1191,50 +1361,18 @@ impl ProxyHttp for LoadBalancer {
                             )
                             .await?;
 
-                        // Create proxy log for 404 static file
-                        let proxy_log_service = self.proxy_log_service.clone();
-                        let proxy_log_request = CreateProxyLogRequest {
-                            method: ctx.method.clone(),
-                            path: ctx.path.clone(),
-                            query_string: ctx.query_string.clone(),
-                            host: ctx.host.clone(),
-                            status_code: 404,
-                            response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
-                            request_source: "proxy".to_string(),
-                            is_system_request: ctx.path.starts_with(ROUTE_PREFIX_TEMPS),
-                            routing_status: "static_file_not_found".to_string(),
-                            project_id: ctx.project.as_ref().map(|p| p.id),
-                            environment_id: ctx.environment.as_ref().map(|e| e.id),
-                            deployment_id: ctx.deployment.as_ref().map(|d| d.id),
-                            container_id: None,
-                            upstream_host: Some(format!("static://{}", static_dir)),
-                            error_message: Some("Static file not found".to_string()),
-                            client_ip: ctx.ip_address.clone(),
-                            user_agent: Some(ctx.user_agent.clone()),
-                            referrer: ctx.referrer.clone(),
-                            request_id: ctx.request_id.clone(),
-                            ip_geolocation_id: None,
-                            browser: None,
-                            browser_version: None,
-                            operating_system: None,
-                            device_type: None,
-                            is_bot: None,
-                            bot_name: None,
-                            request_size_bytes: None,
-                            response_size_bytes: Some(b"<html><body><h1>404 - File Not Found</h1></body></html>".len() as i64),
-                            cache_status: None,
-                            request_headers: ctx
-                                .request_headers
-                                .as_ref()
-                                .and_then(|h| serde_json::to_value(h).ok()),
-                            response_headers: None,
-                        };
-
-                        tokio::spawn(async move {
-                            if let Err(e) = proxy_log_service.create(proxy_log_request).await {
-                                warn!("Failed to create proxy log for 404 static file: {:?}", e);
-                            }
-                        });
+                        // Log 404 static file not found (HTML only)
+                        self.log_static_request(
+                            ctx,
+                            404,
+                            "static_file_not_found",
+                            &static_dir,
+                            Some("Static file not found".to_string()),
+                            Some(
+                                b"<html><body><h1>404 - File Not Found</h1></body></html>".len()
+                                    as i64,
+                            ),
+                        );
 
                         return Ok(true); // Request handled with 404
                     }
@@ -1247,6 +1385,10 @@ impl ProxyHttp for LoadBalancer {
                     );
                     let mut resp = ResponseHeader::build(StatusCode::INTERNAL_SERVER_ERROR, None)?;
                     resp.insert_header(header::CONTENT_TYPE, "text/html")?;
+
+                    // Set tracking cookies for 500 response
+                    self.set_tracking_cookies(session, &mut resp, ctx).await?;
+
                     session.write_response_header(Box::new(resp), false).await?;
                     session
                         .write_response_body(
@@ -1258,51 +1400,19 @@ impl ProxyHttp for LoadBalancer {
                         )
                         .await?;
 
-                    // Create proxy log for 500 error
-                    let proxy_log_service = self.proxy_log_service.clone();
+                    // Log 500 static directory error (HTML only)
                     let error_msg = format!("Static directory error: {}", e);
-                    let proxy_log_request = CreateProxyLogRequest {
-                        method: ctx.method.clone(),
-                        path: ctx.path.clone(),
-                        query_string: ctx.query_string.clone(),
-                        host: ctx.host.clone(),
-                        status_code: 500,
-                        response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
-                        request_source: "proxy".to_string(),
-                        is_system_request: ctx.path.starts_with(ROUTE_PREFIX_TEMPS),
-                        routing_status: "static_directory_error".to_string(),
-                        project_id: ctx.project.as_ref().map(|p| p.id),
-                        environment_id: ctx.environment.as_ref().map(|e| e.id),
-                        deployment_id: ctx.deployment.as_ref().map(|d| d.id),
-                        container_id: None,
-                        upstream_host: Some(format!("static://{}", static_dir)),
-                        error_message: Some(error_msg),
-                        client_ip: ctx.ip_address.clone(),
-                        user_agent: Some(ctx.user_agent.clone()),
-                        referrer: ctx.referrer.clone(),
-                        request_id: ctx.request_id.clone(),
-                        ip_geolocation_id: None,
-                        browser: None,
-                        browser_version: None,
-                        operating_system: None,
-                        device_type: None,
-                        is_bot: None,
-                        bot_name: None,
-                        request_size_bytes: None,
-                        response_size_bytes: Some(b"<html><body><h1>500 - Static Directory Error</h1><p>The static files directory could not be accessed.</p></body></html>".len() as i64),
-                        cache_status: None,
-                        request_headers: ctx
-                            .request_headers
-                            .as_ref()
-                            .and_then(|h| serde_json::to_value(h).ok()),
-                        response_headers: None,
-                    };
-
-                    tokio::spawn(async move {
-                        if let Err(e) = proxy_log_service.create(proxy_log_request).await {
-                            warn!("Failed to create proxy log for static directory error: {:?}", e);
-                        }
-                    });
+                    self.log_static_request(
+                        ctx,
+                        500,
+                        "static_directory_error",
+                        &static_dir,
+                        Some(error_msg),
+                        Some(
+                            b"<html><body><h1>500 - Static Directory Error</h1><p>The static files directory could not be accessed.</p></body></html>"
+                                .len() as i64,
+                        ),
+                    );
 
                     return Ok(true); // Request handled with error response
                 }

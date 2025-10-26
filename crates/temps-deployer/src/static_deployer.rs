@@ -108,6 +108,16 @@ pub struct FilesystemStaticDeployer {
     base_dir: PathBuf,
 }
 
+// Type aliases to simplify complex async return types
+type CopyDirFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(u32, u64), StaticDeployError>> + Send + 'a>,
+>;
+
+type ListFilesFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<FileInfo>, StaticDeployError>> + Send + 'a>,
+>;
+
+
 impl FilesystemStaticDeployer {
     pub fn new(base_dir: PathBuf) -> Self {
         Self { base_dir }
@@ -135,9 +145,7 @@ impl FilesystemStaticDeployer {
     fn copy_dir_recursive<'a>(
         source: &'a PathBuf,
         dest: &'a PathBuf,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(u32, u64), StaticDeployError>> + Send + 'a>,
-    > {
+    ) -> CopyDirFuture<'a> {
         Box::pin(async move {
             let mut file_count = 0u32;
             let mut total_size = 0u64;
@@ -201,9 +209,7 @@ impl FilesystemStaticDeployer {
     fn list_files_recursive<'a>(
         path: &'a PathBuf,
         base_path: &'a PathBuf,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<FileInfo>, StaticDeployError>> + Send + 'a>,
-    > {
+    ) -> ListFilesFuture<'a> {
         Box::pin(async move {
             let mut files = Vec::new();
 
@@ -373,7 +379,7 @@ impl StaticDeployer for FilesystemStaticDeployer {
         let deployed_at = metadata
             .created()
             .or_else(|_| metadata.modified())
-            .map(|t| chrono::DateTime::from(t))
+            .map(chrono::DateTime::from)
             .unwrap_or_else(|_| Utc::now());
 
         Ok(StaticDeploymentInfo {

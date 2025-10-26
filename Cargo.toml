@@ -143,7 +143,7 @@ schemars = { version = "0.8", features = ["preserve_order"] }
 argon2 = "0.5"
 aes-gcm = "0.10.3"
 totp-rs = "5.7.0"
-sha2 = "0.10"
+sha2 = "0.10.9"
 base64 = "0.22"
 hex = "0.4.3"
 
@@ -164,6 +164,7 @@ rustls = { version = "0.23", default-features = false, features = [
 pingora = { version = "0.6.0" }
 pingora-core = { version = "0.6.0", features = ["openssl"] }
 pingora-proxy = { version = "0.6.0" }
+prometheus = "0.14"
 
 # ============================================================================
 # External Service Integrations
@@ -249,14 +250,25 @@ opt-level = 2      # Optimize dependencies
 # ============================================================================
 # Dependency Overrides - Security Fixes
 # ============================================================================
-# Note: protobuf 2.28.0 vulnerability (RUSTSEC-2024-0437) comes from pingora → prometheus
-# The issue will be resolved when pingora updates its prometheus dependency
-# For now, we accept this risk as:
-# 1. protobuf is used internally by Prometheus metrics collection
-# 2. The vulnerability requires attacker-controlled protobuf messages
-# 3. We don't expose protobuf parsing to untrusted inputs
+# Known vulnerabilities from transitive dependencies:
 #
-# RSA timing attack (RUSTSEC-2023-0071 - Marvin Attack):
-# - No patch available yet from the rsa crate
-# - Used transitively, not directly exposed to untrusted input
-# - Monitoring for updates
+# 1. CVE-2025-53605: Protobuf 2.28.0 (MEDIUM severity)
+#    - Path: pingora → prometheus 0.13.4 → protobuf 2.28.0
+#    - Fix: Requires prometheus to upgrade to 0.14+ (which uses protobuf 3.7.2+)
+#    - Status: Waiting for pingora to update prometheus dependency
+#    - Mitigation: protobuf is used internally by Prometheus metrics, not exposed to untrusted input
+#
+# 2. GHSA-mc8h-8q98-g5hr: remove_dir_all 0.5.3 (LOW severity)
+#    - Path: nixpacks → tempdir → remove_dir_all 0.5.3
+#    - Fix: Requires nixpacks to update to use tempfile instead of deprecated tempdir
+#    - Status: Tracked in nixpacks repository
+#    - Mitigation: TOCTOU race condition, low impact in our usage
+#
+# 3. GHSA-g98v-hv3f-hcfr: atty 0.2.14 (LOW severity)
+#    - Path: pingora-core → clap 3.2.25 → atty 0.2.14
+#    - Fix: Requires pingora to update to clap 4.x (which doesn't use atty)
+#    - Status: Waiting for pingora to update clap dependency
+#    - Mitigation: Unaligned read issue, minimal security impact
+#
+# All of these are transitive dependencies from third-party crates that we cannot
+# directly patch without forking. Monitoring upstream for updates.

@@ -1,3 +1,8 @@
+// Note: Deprecation warnings from generic-array 0.14.x are expected
+// These will be resolved when aes-gcm upgrades to 0.11.0 (currently in RC)
+// which uses generic-array 1.x
+#![allow(deprecated)]
+
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     Aes256Gcm, Key, Nonce,
@@ -62,15 +67,14 @@ impl CookieCrypto {
             ));
         }
 
-        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-        let cipher = Aes256Gcm::new(key);
+        // Use the new API that doesn't allocate - just use the reference
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
         Ok(Self { cipher })
     }
 
     /// Creates a new CookieCrypto from a raw 32-byte array (for backward compatibility)
     pub fn from_bytes(secret_key: &[u8; 32]) -> Self {
-        let key = Key::<Aes256Gcm>::from_slice(secret_key);
-        let cipher = Aes256Gcm::new(key);
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(secret_key));
         Self { cipher }
     }
 
@@ -102,11 +106,10 @@ impl CookieCrypto {
 
         // Split nonce and ciphertext
         let (nonce_bytes, ciphertext) = combined.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
 
         let plaintext = self
             .cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
             .map_err(|e| CryptoError::DecryptionError(e.to_string()))?;
 
         String::from_utf8(plaintext).map_err(|_| CryptoError::InvalidFormat)

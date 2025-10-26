@@ -1,3 +1,8 @@
+// Note: Deprecation warnings from generic-array 0.14.x are expected
+// These will be resolved when aes-gcm upgrades to 0.11.0 (currently in RC)
+// which uses generic-array 1.x
+#![allow(deprecated)]
+
 use aes_gcm::{
     aead::{Aead, KeyInit},
     AeadCore, Aes256Gcm, Nonce,
@@ -84,11 +89,10 @@ impl EncryptionService {
         }
 
         let (nonce_bytes, ciphertext) = data.split_at(NONCE_LENGTH);
-        let nonce = Nonce::from_slice(nonce_bytes);
         let cipher = Aes256Gcm::new(self.master_key.as_slice().into());
 
         let plaintext = cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
             .map_err(|e| anyhow::anyhow!("Error decrypting {} with error: {}", encoded_data, e))?;
 
         Ok(plaintext)
