@@ -25,25 +25,17 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // Constants
-pub const VISITOR_ID_COOKIE_PREFIX: &str = "_temps_visitor_id";
-pub const SESSION_ID_COOKIE_PREFIX: &str = "_temps_sid";
+pub const VISITOR_ID_COOKIE: &str = "_temps_visitor_id";
+pub const SESSION_ID_COOKIE: &str = "_temps_sid";
 pub const ROUTE_PREFIX_TEMPS: &str = "/api/_temps";
 
 // Helper functions for project-scoped cookie names
-fn get_visitor_cookie_name(project_id: Option<i32>) -> String {
-    if let Some(pid) = project_id {
-        format!("{}_p{}", VISITOR_ID_COOKIE_PREFIX, pid)
-    } else {
-        VISITOR_ID_COOKIE_PREFIX.to_string()
-    }
+fn get_visitor_cookie_name(_project_id: Option<i32>) -> String {
+    VISITOR_ID_COOKIE.to_string()
 }
 
-fn get_session_cookie_name(project_id: Option<i32>) -> String {
-    if let Some(pid) = project_id {
-        format!("{}_p{}", SESSION_ID_COOKIE_PREFIX, pid)
-    } else {
-        SESSION_ID_COOKIE_PREFIX.to_string()
-    }
+fn get_session_cookie_name(_project_id: Option<i32>) -> String {
+    SESSION_ID_COOKIE.to_string()
 }
 pub const SERVER_NAME: &[u8; 5] = b"Temps";
 pub const LB_SEED: u64 = 42;

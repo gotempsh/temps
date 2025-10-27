@@ -294,10 +294,10 @@ sudo mv temps /usr/local/bin/temps
 temps --version
 ```
 
-##### Homebrew (Coming Soon)
+##### Homebrew
 
 ```bash
-brew tap gotempsh/temps
+brew tap gotempsh/tap
 brew install temps
 ```
 

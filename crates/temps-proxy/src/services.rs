@@ -14,25 +14,17 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 const ROUTE_PREFIX_TEMPS: &str = "/api/_temps";
-const VISITOR_ID_COOKIE_PREFIX: &str = "_temps_visitor_id";
-const SESSION_ID_COOKIE_PREFIX: &str = "_temps_sid";
+const VISITOR_ID_COOKIE: &str = "_temps_visitor_id";
+const SESSION_ID_COOKIE: &str = "_temps_sid";
 
 /// Generate project-scoped cookie name for visitor
-fn get_visitor_cookie_name(project_id: Option<i32>) -> String {
-    if let Some(pid) = project_id {
-        format!("{}_p{}", VISITOR_ID_COOKIE_PREFIX, pid)
-    } else {
-        VISITOR_ID_COOKIE_PREFIX.to_string()
-    }
+fn get_visitor_cookie_name(_project_id: Option<i32>) -> String {
+    VISITOR_ID_COOKIE.to_string()
 }
 
 /// Generate project-scoped cookie name for session
-fn get_session_cookie_name(project_id: Option<i32>) -> String {
-    if let Some(pid) = project_id {
-        format!("{}_p{}", SESSION_ID_COOKIE_PREFIX, pid)
-    } else {
-        SESSION_ID_COOKIE_PREFIX.to_string()
-    }
+fn get_session_cookie_name(_project_id: Option<i32>) -> String {
+    SESSION_ID_COOKIE.to_string()
 }
 
 /// Implementation of UpstreamResolver trait

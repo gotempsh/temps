@@ -41,12 +41,16 @@ interface EnvironmentVariableRowProps {
   variable: EnvironmentVariableResponse
   project: ProjectResponse
   refetchEnvVariables: () => void
+  isSelected: boolean
+  onSelect: (id: number) => void
 }
 
 function EnvironmentVariableRow({
   variable,
   project,
   refetchEnvVariables,
+  isSelected,
+  onSelect,
 }: EnvironmentVariableRowProps) {
   const [isVisible, setIsVisible] = useState(false)
   const [isEditing, setIsEditing] = useState(false)
@@ -153,18 +157,24 @@ function EnvironmentVariableRow({
 
   return (
     <>
-      <div className="py-4 flex items-center justify-between">
-        <div className="space-y-1">
-          <p className="font-medium">{variable.key}</p>
-          <div className="flex gap-2">
-            {variable.environments.map((env) => (
-              <span
-                key={env.name}
-                className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
-              >
-                {env.name}
-              </span>
-            ))}
+      <div className="py-4 flex items-center justify-between gap-4">
+        <div className="flex items-center gap-3 flex-1">
+          <Checkbox
+            checked={isSelected}
+            onCheckedChange={() => onSelect(variable.id)}
+          />
+          <div className="space-y-1 flex-1">
+            <p className="font-medium">{variable.key}</p>
+            <div className="flex gap-2">
+              {variable.environments.map((env) => (
+                <span
+                  key={env.name}
+                  className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
+                >
+                  {env.name}
+                </span>
+              ))}
+            </div>
           </div>
         </div>
         <div className="flex gap-2">
@@ -902,6 +912,10 @@ export function EnvironmentVariablesSettings({
 }: EnvironmentVariablesSettingsProps) {
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
   const [isImportDialogOpen, setIsImportDialogOpen] = useState(false)
+  const [selectedVariables, setSelectedVariables] = useState<Set<number>>(
+    new Set()
+  )
+  const [isBulkDeleteDialogOpen, setIsBulkDeleteDialogOpen] = useState(false)
   const queryClient = useQueryClient()
 
   const {
@@ -997,11 +1011,77 @@ export function EnvironmentVariablesSettings({
     }),
   })
 
+  const deleteMutation = useMutation({
+    ...deleteEnvironmentVariableMutation(),
+    meta: {
+      errorTitle: 'Failed to delete environment variable',
+    },
+  })
+
+  const handleSelectVariable = (id: number) => {
+    setSelectedVariables((prev) => {
+      const newSet = new Set(prev)
+      if (newSet.has(id)) {
+        newSet.delete(id)
+      } else {
+        newSet.add(id)
+      }
+      return newSet
+    })
+  }
+
+  const handleSelectAll = () => {
+    if (selectedVariables.size === (envVariables?.length ?? 0)) {
+      setSelectedVariables(new Set())
+    } else {
+      setSelectedVariables(
+        new Set((envVariables ?? []).map((v) => v.id))
+      )
+    }
+  }
+
+  const handleBulkDelete = async () => {
+    let successCount = 0
+    let errorCount = 0
+
+    for (const varId of selectedVariables) {
+      try {
+        await deleteMutation.mutateAsync({
+          path: {
+            project_id: project.id,
+            var_id: varId,
+          },
+        })
+        successCount++
+      } catch {
+        errorCount++
+      }
+    }
+
+    if (successCount > 0) {
+      toast.success(
+        `Successfully deleted ${successCount} variable${successCount !== 1 ? 's' : ''}`
+      )
+    }
+    if (errorCount > 0) {
+      toast.error(
+        `Failed to delete ${errorCount} variable${errorCount !== 1 ? 's' : ''}`
+      )
+    }
+
+    setSelectedVariables(new Set())
+    setIsBulkDeleteDialogOpen(false)
+    queryClient.invalidateQueries({ queryKey: ['environmentVariables'] })
+    refetch()
+  }
+
   if (isLoading) {
     return <EnvironmentVariablesLoadingState />
   }
 
   const hasVariables = (envVariables?.length ?? 0) > 0
+  const selectedCount = selectedVariables.size
+  const allSelected = selectedCount === (envVariables?.length ?? 0) && hasVariables
 
   return (
     <div className="space-y-6">
@@ -1018,6 +1098,14 @@ export function EnvironmentVariablesSettings({
           </div>
           {hasVariables && (
             <div className="flex gap-2">
+              {selectedCount > 0 && (
+                <Button
+                  variant="destructive"
+                  onClick={() => setIsBulkDeleteDialogOpen(true)}
+                >
+                  Delete {selectedCount} Variable{selectedCount !== 1 ? 's' : ''}
+                </Button>
+              )}
               <Button
                 variant="outline"
                 onClick={() => setIsImportDialogOpen(true)}
@@ -1061,16 +1149,31 @@ export function EnvironmentVariablesSettings({
               </div>
             </EmptyPlaceholder>
           ) : (
-            <div className="divide-y divide-border">
-              {(envVariables ?? []).map((variable) => (
-                <EnvironmentVariableRow
-                  key={variable.id}
-                  variable={variable}
-                  project={project}
-                  refetchEnvVariables={() => refetch()}
+            <>
+              <div className="flex items-center gap-3 py-3 border-b">
+                <Checkbox
+                  checked={allSelected}
+                  onCheckedChange={handleSelectAll}
                 />
-              ))}
-            </div>
+                <span className="text-sm font-medium">
+                  {selectedCount > 0
+                    ? `${selectedCount} of ${envVariables?.length ?? 0} selected`
+                    : 'Select all'}
+                </span>
+              </div>
+              <div className="divide-y divide-border">
+                {(envVariables ?? []).map((variable) => (
+                  <EnvironmentVariableRow
+                    key={variable.id}
+                    variable={variable}
+                    project={project}
+                    refetchEnvVariables={() => refetch()}
+                    isSelected={selectedVariables.has(variable.id)}
+                    onSelect={handleSelectVariable}
+                  />
+                ))}
+              </div>
+            </>
           )}
         </div>
       </div>
@@ -1088,6 +1191,62 @@ export function EnvironmentVariablesSettings({
         allEnvironments={allEnvironments ?? []}
         existingKeys={existingKeys}
       />
+
+      <AlertDialog
+        open={isBulkDeleteDialogOpen}
+        onOpenChange={setIsBulkDeleteDialogOpen}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete Multiple Variables</AlertDialogTitle>
+            <AlertDialogDescription className="space-y-3">
+              <p>
+                Are you sure you want to delete {selectedCount} environment
+                variable{selectedCount !== 1 ? 's' : ''}? This action cannot be
+                undone.
+              </p>
+              {selectedCount > 0 && (
+                <div className="space-y-2">
+                  <p className="text-sm font-medium text-foreground">
+                    Variables to be deleted:
+                  </p>
+                  <div className="max-h-[200px] overflow-auto border rounded-md p-3 space-y-1">
+                    {(envVariables ?? [])
+                      .filter((v) => selectedVariables.has(v.id))
+                      .map((v) => (
+                        <div
+                          key={v.id}
+                          className="text-sm font-mono flex items-center justify-between"
+                        >
+                          <span>{v.key}</span>
+                          <div className="flex gap-1">
+                            {v.environments.map((env) => (
+                              <span
+                                key={env.name}
+                                className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-secondary text-secondary-foreground"
+                              >
+                                {env.name}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                </div>
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleBulkDelete}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              Delete {selectedCount} Variable{selectedCount !== 1 ? 's' : ''}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }
