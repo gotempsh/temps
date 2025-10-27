@@ -1795,6 +1795,8 @@ mod tests {
         let _project = projects::ActiveModel {
             id: Set(1),
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-project".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             directory: Set("/".to_string()),
             main_branch: Set("main".to_string()),
             slug: Set("test-project".to_string()),
@@ -1827,7 +1829,9 @@ mod tests {
             environment_id: Set(1),
             slug: Set("test-deployment".to_string()),
             state: Set("ready".to_string()),
-            metadata: Set(None),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             ..Default::default()
         }
         .insert(db.as_ref())

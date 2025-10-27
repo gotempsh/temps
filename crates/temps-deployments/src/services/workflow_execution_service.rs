@@ -1379,7 +1379,9 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("test-deployment".to_string()),
             state: Set("pending".to_string()),
-            metadata: Set(None),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()

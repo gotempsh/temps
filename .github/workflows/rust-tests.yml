@@ -113,7 +113,7 @@ jobs:
           echo "TimescaleDB is ready!"
 
       - name: Run all workspace tests
-        run: cargo test --workspace --all-features
+        run: cargo test --no-fail-fast --workspace --all-features
         env:
           RUST_BACKTRACE: 1
           CARGO_INCREMENTAL: 0

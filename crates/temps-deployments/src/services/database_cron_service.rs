@@ -608,8 +608,11 @@ mod tests {
         let project = projects::ActiveModel {
             name: Set("test-project".to_string()),
             slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             directory: Set("test-directory".to_string()),
             main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
             ..Default::default()
         };
         let project = project.insert(db).await?;

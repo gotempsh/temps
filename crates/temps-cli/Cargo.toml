@@ -69,3 +69,6 @@ async-trait = { workspace = true }
 sea-orm = { workspace = true }
 include_dir = "0.7"
 mime_guess = "2.0"
+
+[build-dependencies]
+chrono = { workspace = true }

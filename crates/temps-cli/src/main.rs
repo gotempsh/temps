@@ -10,7 +10,12 @@ use commands::{ProxyCommand, ResetPasswordCommand, ServeCommand};
 use tracing_subscriber::{layer::SubscriberExt, Layer};
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version = env!("TEMPS_VERSION"),
+    about,
+    long_about = None
+)]
 struct Cli {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info", env = "TEMPS_LOG_LEVEL", global = true)]

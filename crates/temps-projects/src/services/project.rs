@@ -1600,6 +1600,8 @@ mod tests {
         let project = temps_entities::projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             directory: Set("test-project".to_string()),
             git_provider_connection_id: Set(None),
             main_branch: Set("main".to_string()),
@@ -1662,6 +1664,8 @@ mod tests {
         let project = temps_entities::projects::ActiveModel {
             name: Set("Settings Test Project".to_string()),
             slug: Set("settings-test-project".to_string()),
+            repo_name: Set("settings-test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             directory: Set("settings-test-project".to_string()),
             git_provider_connection_id: Set(None),
             main_branch: Set("main".to_string()),
@@ -1716,6 +1720,8 @@ mod tests {
         let project = temps_entities::projects::ActiveModel {
             name: Set("Event Data Test".to_string()),
             slug: Set("event-data-test".to_string()),
+            repo_name: Set("event-data-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             directory: Set("event-data-test".to_string()),
             git_provider_connection_id: Set(None),
             main_branch: Set("main".to_string()),

@@ -66,26 +66,30 @@ jobs:
         run: strip target/release/temps
 
       - name: Rename binary
-        run: cp target/release/temps temps-linux-amd64
+        run: cp target/release/temps temps
+
+      - name: Create tarball
+        run: |
+          tar -czf temps-linux-amd64.tar.gz temps
+          ls -lh temps-linux-amd64.tar.gz
 
       - name: Generate checksum
         run: |
-          sha256sum temps-linux-amd64 > temps-linux-amd64.sha256
-          cat temps-linux-amd64.sha256
+          sha256sum temps-linux-amd64.tar.gz > temps-linux-amd64.tar.gz.sha256
+          cat temps-linux-amd64.tar.gz.sha256
 
       - name: Get binary info
         run: |
-          ls -lh temps-linux-amd64
-          file temps-linux-amd64
-          ./temps-linux-amd64 --version || echo "Note: Binary may require runtime dependencies"
+          file temps
+          ./temps --version || echo "Note: Binary may require runtime dependencies"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: temps-linux-amd64
           path: |
-            temps-linux-amd64
-            temps-linux-amd64.sha256
+            temps-linux-amd64.tar.gz
+            temps-linux-amd64.tar.gz.sha256
 
   build-darwin-amd64:
     name: Build macOS AMD64
@@ -134,26 +138,30 @@ jobs:
         run: strip target/x86_64-apple-darwin/release/temps
 
       - name: Rename binary
-        run: cp target/x86_64-apple-darwin/release/temps temps-darwin-amd64
+        run: cp target/x86_64-apple-darwin/release/temps temps
+
+      - name: Create tarball
+        run: |
+          tar -czf temps-darwin-amd64.tar.gz temps
+          ls -lh temps-darwin-amd64.tar.gz
 
       - name: Generate checksum
         run: |
-          shasum -a 256 temps-darwin-amd64 > temps-darwin-amd64.sha256
-          cat temps-darwin-amd64.sha256
+          shasum -a 256 temps-darwin-amd64.tar.gz > temps-darwin-amd64.tar.gz.sha256
+          cat temps-darwin-amd64.tar.gz.sha256
 
       - name: Get binary info
         run: |
-          ls -lh temps-darwin-amd64
-          file temps-darwin-amd64
-          ./temps-darwin-amd64 --version || echo "Note: Binary may require runtime dependencies"
+          file temps
+          ./temps --version || echo "Note: Binary may require runtime dependencies"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: temps-darwin-amd64
           path: |
-            temps-darwin-amd64
-            temps-darwin-amd64.sha256
+            temps-darwin-amd64.tar.gz
+            temps-darwin-amd64.tar.gz.sha256
 
   build-darwin-arm64:
     name: Build macOS ARM64
@@ -202,26 +210,30 @@ jobs:
         run: strip target/aarch64-apple-darwin/release/temps
 
       - name: Rename binary
-        run: cp target/aarch64-apple-darwin/release/temps temps-darwin-arm64
+        run: cp target/aarch64-apple-darwin/release/temps temps
+
+      - name: Create tarball
+        run: |
+          tar -czf temps-darwin-arm64.tar.gz temps
+          ls -lh temps-darwin-arm64.tar.gz
 
       - name: Generate checksum
         run: |
-          shasum -a 256 temps-darwin-arm64 > temps-darwin-arm64.sha256
-          cat temps-darwin-arm64.sha256
+          shasum -a 256 temps-darwin-arm64.tar.gz > temps-darwin-arm64.tar.gz.sha256
+          cat temps-darwin-arm64.tar.gz.sha256
 
       - name: Get binary info
         run: |
-          ls -lh temps-darwin-arm64
-          file temps-darwin-arm64
-          ./temps-darwin-arm64 --version || echo "Note: Binary may require runtime dependencies"
+          file temps
+          ./temps --version || echo "Note: Binary may require runtime dependencies"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: temps-darwin-arm64
           path: |
-            temps-darwin-arm64
-            temps-darwin-arm64.sha256
+            temps-darwin-arm64.tar.gz
+            temps-darwin-arm64.tar.gz.sha256
 
   create-release:
     name: Create Release
@@ -249,9 +261,9 @@ jobs:
       - name: Create combined checksums file
         run: |
           cd release
-          cat temps-linux-amd64.sha256 > checksums.txt
-          cat temps-darwin-amd64.sha256 >> checksums.txt
-          cat temps-darwin-arm64.sha256 >> checksums.txt
+          cat temps-linux-amd64.tar.gz.sha256 > checksums.txt
+          cat temps-darwin-amd64.tar.gz.sha256 >> checksums.txt
+          cat temps-darwin-arm64.tar.gz.sha256 >> checksums.txt
           echo "Combined checksums:"
           cat checksums.txt
 
@@ -263,9 +275,9 @@ jobs:
       - name: Generate Homebrew formula
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"
-          SHA256_LINUX_AMD64=$(awk '{print $1}' release/temps-linux-amd64.sha256)
-          SHA256_DARWIN_AMD64=$(awk '{print $1}' release/temps-darwin-amd64.sha256)
-          SHA256_DARWIN_ARM64=$(awk '{print $1}' release/temps-darwin-arm64.sha256)
+          SHA256_LINUX_AMD64=$(awk '{print $1}' release/temps-linux-amd64.tar.gz.sha256)
+          SHA256_DARWIN_AMD64=$(awk '{print $1}' release/temps-darwin-amd64.tar.gz.sha256)
+          SHA256_DARWIN_ARM64=$(awk '{print $1}' release/temps-darwin-arm64.tar.gz.sha256)
 
           echo "Generating Homebrew formula for version $VERSION"
           echo "Linux AMD64 SHA256: $SHA256_LINUX_AMD64"
@@ -315,13 +327,13 @@ jobs:
           #### Linux AMD64
           ```bash
           # Download
-          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-linux-amd64
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-linux-amd64.tar.gz
 
-          # Make executable
-          chmod +x temps-linux-amd64
+          # Extract
+          tar -xzf temps-linux-amd64.tar.gz
 
           # Move to PATH
-          sudo mv temps-linux-amd64 /usr/local/bin/temps
+          sudo mv temps /usr/local/bin/temps
 
           # Verify
           temps --version
@@ -330,13 +342,13 @@ jobs:
           #### macOS AMD64 (Intel)
           ```bash
           # Download
-          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-darwin-amd64
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-darwin-amd64.tar.gz
 
-          # Make executable
-          chmod +x temps-darwin-amd64
+          # Extract
+          tar -xzf temps-darwin-amd64.tar.gz
 
           # Move to PATH
-          sudo mv temps-darwin-amd64 /usr/local/bin/temps
+          sudo mv temps /usr/local/bin/temps
 
           # Verify
           temps --version
@@ -345,13 +357,13 @@ jobs:
           #### macOS ARM64 (Apple Silicon)
           ```bash
           # Download
-          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-darwin-arm64
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-darwin-arm64.tar.gz
 
-          # Make executable
-          chmod +x temps-darwin-arm64
+          # Extract
+          tar -xzf temps-darwin-arm64.tar.gz
 
           # Move to PATH
-          sudo mv temps-darwin-arm64 /usr/local/bin/temps
+          sudo mv temps /usr/local/bin/temps
 
           # Verify
           temps --version
@@ -389,12 +401,12 @@ jobs:
             --title "${{ github.ref_name }}" \
             --notes-file release/release-notes.md \
             $PRERELEASE_FLAG \
-            release/temps-linux-amd64 \
-            release/temps-linux-amd64.sha256 \
-            release/temps-darwin-amd64 \
-            release/temps-darwin-amd64.sha256 \
-            release/temps-darwin-arm64 \
-            release/temps-darwin-arm64.sha256 \
+            release/temps-linux-amd64.tar.gz \
+            release/temps-linux-amd64.tar.gz.sha256 \
+            release/temps-darwin-amd64.tar.gz \
+            release/temps-darwin-amd64.tar.gz.sha256 \
+            release/temps-darwin-arm64.tar.gz \
+            release/temps-darwin-arm64.tar.gz.sha256 \
             release/checksums.txt \
             release/install.sh \
             release/temps.rb

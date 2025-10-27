@@ -819,7 +819,9 @@ mod tests {
             commit_message: Set(Some("Test commit".to_string())),
             slug: Set("http://test.temps.localhost".to_string()),
             state: Set("active".to_string()),
-            metadata: Set(None),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()

@@ -24,18 +24,22 @@
 # 1. Start PostgreSQL with TimescaleDB (one-time setup, runs on port 15432 to avoid conflicts)
 docker run -d \
   --name temps-postgres \
+  -e POSTGRES_USER=postgres \
   -e POSTGRES_PASSWORD=temps \
   -e POSTGRES_DB=temps \
   -p 15432:5432 \
   timescale/timescaledb-ha:pg16
 
-# 2. Download and install Temps
-curl -LO https://github.com/gotempsh/temps/releases/latest/download/temps-linux-amd64
-chmod +x temps-linux-amd64
-sudo mv temps-linux-amd64 /usr/local/bin/temps
+# 2. Install Temps with one command
+curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash
+
+# Restart your shell or source your profile
+source ~/.zshrc  # or ~/.bashrc
 
 # 3. Start Temps
-temps serve --database-url postgresql://postgres:temps@localhost:15432/temps
+temps serve \
+  --address 0.0.0.0:8080 \
+  --database-url postgresql://postgres:temps@localhost:15432/temps
 
 # 4. Open http://localhost:8080 in your browser
 
@@ -222,36 +226,79 @@ Temps is your **self-hosted deployment platform** that makes it effortless to de
 
 ### Installation
 
-#### Linux AMD64
+#### Quick Install (Recommended)
+
+Install Temps with a single command using our install script:
 
 ```bash
-# Download the latest release
-curl -LO https://github.com/gotempsh/temps/releases/latest/download/temps-linux-amd64
+# Install latest version
+curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash
 
-# Make it executable
-chmod +x temps-linux-amd64
+# Or install a specific version
+curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s v0.1.0
+```
+
+The installer will:
+- Automatically detect your platform (Linux/macOS, AMD64/ARM64)
+- Download and extract the appropriate binary
+- Install to `~/.temps/bin/`
+- Add to your PATH in your shell config
+
+After installation, restart your shell or run:
+```bash
+source ~/.zshrc  # or ~/.bashrc
+temps --version
+```
+
+#### Manual Installation
+
+##### Linux AMD64
+
+```bash
+# Download and extract
+curl -LO https://github.com/gotempsh/temps/releases/latest/download/temps-linux-amd64.tar.gz
+tar -xzf temps-linux-amd64.tar.gz
 
 # Move to your PATH
-sudo mv temps-linux-amd64 /usr/local/bin/temps
+sudo mv temps /usr/local/bin/temps
 
 # Verify installation
 temps --version
 ```
 
-#### macOS
+##### macOS (Intel)
 
 ```bash
-# Download the latest release
-curl -LO https://github.com/gotempsh/temps/releases/latest/download/temps-macos-amd64
-
-# Make it executable
-chmod +x temps-macos-amd64
+# Download and extract
+curl -LO https://github.com/gotempsh/temps/releases/latest/download/temps-darwin-amd64.tar.gz
+tar -xzf temps-darwin-amd64.tar.gz
 
 # Move to your PATH
-sudo mv temps-macos-amd64 /usr/local/bin/temps
+sudo mv temps /usr/local/bin/temps
 
 # Verify installation
 temps --version
+```
+
+##### macOS (Apple Silicon)
+
+```bash
+# Download and extract
+curl -LO https://github.com/gotempsh/temps/releases/latest/download/temps-darwin-arm64.tar.gz
+tar -xzf temps-darwin-arm64.tar.gz
+
+# Move to your PATH
+sudo mv temps /usr/local/bin/temps
+
+# Verify installation
+temps --version
+```
+
+##### Homebrew (Coming Soon)
+
+```bash
+brew tap gotempsh/temps
+brew install temps
 ```
 
 #### Build from Source
@@ -336,30 +383,62 @@ psql temps -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
 
 ### Running Temps
 
+#### Complete Setup Example
+
+Here's a complete example to get Temps running from scratch:
+
 ```bash
-# If using Docker database (port 15432):
+# 1. Start TimescaleDB (if not already running)
+docker run -d \
+  --name temps-postgres \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=temps \
+  -e POSTGRES_DB=temps \
+  -p 15432:5432 \
+  timescale/timescaledb-ha:pg16
+
+# Verify database is running
+docker ps | grep temps-postgres
+
+# 2. Install Temps (if not already installed)
+curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash
+
+# 3. Start Temps server
 temps serve \
   --address 0.0.0.0:8080 \
   --database-url postgresql://postgres:temps@localhost:15432/temps
+```
 
-# If using native PostgreSQL (port 5432):
+#### Alternative: Using Environment Variables
+
+```bash
+# Set environment variables
+export TEMPS_ADDRESS=0.0.0.0:8080
+export TEMPS_DATABASE_URL=postgresql://postgres:temps@localhost:15432/temps
+
+# Start server
+temps serve
+```
+
+#### If Using Native PostgreSQL (Port 5432)
+
+```bash
 temps serve \
   --address 0.0.0.0:8080 \
   --database-url postgresql://postgres:password@localhost:5432/temps
-
-# Or use environment variables:
-export TEMPS_ADDRESS=0.0.0.0:8080
-export TEMPS_DATABASE_URL=postgresql://postgres:temps@localhost:15432/temps
-temps serve
 ```
 
 The web interface will be available at `http://localhost:8080`
 
-On first run, Temps will:
+#### First Run
+
+On first run, Temps will automatically:
 1. Create data directory at `~/.temps`
-2. Generate encryption keys and secrets
-3. Run database migrations
+2. Generate encryption keys and auth secrets
+3. Run all database migrations
 4. Create the default admin user
+
+**First login credentials will be displayed in the console output.** Save them securely!
 
 ### First Login
 

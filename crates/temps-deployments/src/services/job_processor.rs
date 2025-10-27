@@ -615,7 +615,9 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("test-deployment-123".to_string()),
             state: Set("pending".to_string()),
-            metadata: Set(None),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -780,7 +782,9 @@ mod tests {
             environment_id: Set(environment_id),
             slug: Set("test-deployment".to_string()),
             state: Set("pending".to_string()),
-            metadata: Set(None),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -849,13 +853,13 @@ mod tests {
             dsn_service,
         ));
 
-        // Create project without git info
+        // Create project without git info (empty repo_owner and repo_name)
         use temps_entities::{environments, projects};
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project-no-git".to_string()),
-            repo_owner: Set("test-owner".to_string()),
-            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("".to_string()), // Empty - no git info
+            repo_name: Set("".to_string()),  // Empty - no git info
             main_branch: Set("main".to_string()),
 
             git_provider_connection_id: Set(None),
@@ -887,7 +891,9 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("test-deployment".to_string()),
             state: Set("pending".to_string()),
-            metadata: Set(None),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -956,7 +962,9 @@ mod tests {
             environment_id: Set(environment_id),
             slug: Set("test-deployment".to_string()),
             state: Set("pending".to_string()),
-            metadata: Set(None),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()

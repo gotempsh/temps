@@ -87,9 +87,28 @@ github_repo="$GITHUB/davidviejo/temps"
 exe_name=temps
 
 if [[ $# = 0 ]]; then
-    temps_uri=$github_repo/releases/latest/download/temps-$target
+    # Fetch the latest release tag from GitHub API
+    info "Fetching latest release version..."
+
+    # Temporarily disable pipefail to handle API errors gracefully
+    set +e
+    temps_tag=$(curl --silent "https://api.github.com/repos/davidviejo/temps/releases/latest" |
+                grep '"tag_name":' |
+                sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null)
+    set -e
+
+    if [[ -z "$temps_tag" ]]; then
+        echo ""
+        error "No releases found. Please specify a version explicitly:
+    curl -fsSL https://raw.githubusercontent.com/davidviejo/temps/main/scripts/install.sh | bash -s v0.1.0
+
+Or check available versions at: https://github.com/davidviejo/temps/releases"
+    fi
+
+    info "Latest version: $temps_tag"
+    temps_uri=$github_repo/releases/download/$temps_tag/temps-$target.tar.gz
 else
-    temps_uri=$github_repo/releases/download/$1/temps-$target
+    temps_uri=$github_repo/releases/download/$1/temps-$target.tar.gz
 fi
 
 install_env=TEMPS_INSTALL
@@ -106,8 +125,18 @@ fi
 
 info "Downloading temps from $temps_uri..."
 
-curl --fail --location --progress-bar --output "$exe" "$temps_uri" ||
+tarball="$install_dir/temps-$target.tar.gz"
+
+curl --fail --location --progress-bar --output "$tarball" "$temps_uri" ||
     error "Failed to download temps from \"$temps_uri\""
+
+info "Extracting temps..."
+
+tar -xzf "$tarball" -C "$bin_dir" ||
+    error "Failed to extract temps"
+
+rm "$tarball" ||
+    warning "Failed to remove temporary tarball"
 
 chmod +x "$exe" ||
     error 'Failed to set permissions on temps executable'

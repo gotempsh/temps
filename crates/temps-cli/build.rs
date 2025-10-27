@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    // Set git version information
+    set_git_version_info();
+
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let dist_dir = manifest_dir.join("dist");
 
@@ -49,6 +52,77 @@ fn main() {
     println!("cargo:rerun-if-env-changed=FORCE_WEB_BUILD");
 
     build_web(&web_dir, &dist_dir);
+}
+
+fn set_git_version_info() {
+    // Get git commit hash
+    let commit_hash = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+        .trim()
+        .to_string();
+
+    // Get git tag (if on a tag)
+    let git_tag = Command::new("git")
+        .args(["describe", "--tags", "--exact-match"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .map(|s| s.trim().to_string());
+
+    // Get the most recent tag
+    let latest_tag = Command::new("git")
+        .args(["describe", "--tags", "--abbrev=0"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string()));
+
+    // Get build timestamp
+    let build_time = chrono::Utc::now()
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
+
+    // Build version string
+    let version = if let Some(tag) = git_tag {
+        // On a tag: use tag + commit + build time
+        format!("{} ({}) built {}", tag, commit_hash, build_time)
+    } else {
+        // Not on a tag: use latest tag + commit + build time
+        format!("{}-{} built {}", latest_tag, commit_hash, build_time)
+    };
+
+    // Set environment variables for the binary to use
+    println!("cargo:rustc-env=TEMPS_VERSION={}", version);
+    println!("cargo:rustc-env=GIT_COMMIT={}", commit_hash);
+    println!("cargo:rustc-env=GIT_TAG={}", latest_tag);
+    println!("cargo:rustc-env=BUILD_TIME={}", build_time);
+
+    // Rerun if git state changes
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    println!("cargo:rerun-if-changed=../.git/refs");
 }
 
 fn build_web(web_dir: &std::path::Path, dist_dir: &std::path::Path) {

@@ -1448,6 +1448,7 @@ mod tests {
             slug: Set("test-project".to_string()),
             repo_owner: Set("test-owner".to_string()),
             repo_name: Set("test-repo".to_string()),
+            main_branch: Set("main".to_string()),
             git_provider_connection_id: Set(Some(1)),
             preset: Set(Preset::NextJs),
             directory: Set("/".to_string()),
@@ -1482,7 +1483,9 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("test-deployment-123".to_string()),
             state: Set("deployed".to_string()),
-            metadata: Set(None),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             image_name: Set(Some("nginx:latest".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -1735,7 +1738,9 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("current-deployment-456".to_string()),
             state: Set("deployed".to_string()),
-            metadata: Set(None),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             image_name: Set(Some("nginx:current".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -1811,7 +1816,9 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("deployment2-456".to_string()),
             state: Set("deployed".to_string()),
-            metadata: Set(None),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -2182,7 +2189,9 @@ mod tests {
         let project = projects::ActiveModel {
             name: Set("Static Site".to_string()),
             slug: Set("static-site".to_string()),
-            preset: Set(Preset::NextJs),
+            repo_name: Set("static-site-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            preset: Set(Preset::Static), // Static preset doesn't require a server
             main_branch: Set("main".to_string()),
             directory: Set("/".to_string()),
             created_at: Set(Utc::now()),

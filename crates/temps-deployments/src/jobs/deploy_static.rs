@@ -415,7 +415,7 @@ mod tests {
         drop(file2);
 
         // Create deployer and mock image builder
-        let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir));
+        let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir.clone()));
         let image_builder = Arc::new(MockImageBuilder {
             extract_dir: built_files_dir,
         });
@@ -465,10 +465,24 @@ mod tests {
         assert!(static_dir.contains("production"));
         assert!(static_dir.contains("deploy-123"));
 
-        // Verify files exist
-        let storage_path = PathBuf::from(&static_dir);
-        assert!(storage_path.join("index.html").exists());
-        assert!(storage_path.join("assets/app.js").exists());
+        // The storage_path returned is relative to base_dir (security feature)
+        // Need to reconstruct full path for verification
+        let full_storage_path = base_dir.join(&static_dir);
+        assert!(
+            full_storage_path.exists(),
+            "Storage path does not exist: {:?}",
+            full_storage_path
+        );
+        assert!(
+            full_storage_path.join("index.html").exists(),
+            "index.html not found in {:?}",
+            full_storage_path
+        );
+        assert!(
+            full_storage_path.join("assets/app.js").exists(),
+            "assets/app.js not found in {:?}",
+            full_storage_path
+        );
     }
 
     #[tokio::test]
