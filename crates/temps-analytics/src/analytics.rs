@@ -258,6 +258,7 @@ impl Analytics for AnalyticsService {
                 SELECT
                     v.id,
                     v.visitor_id,
+                    v.user_agent,
                     MIN(e.timestamp) as first_seen,
                     MAX(e.timestamp) as last_seen,
                     COUNT(DISTINCT e.session_id) as session_count,
@@ -269,11 +270,12 @@ impl Analytics for AnalyticsService {
                 INNER JOIN events e ON v.id = e.visitor_id
                 LEFT JOIN ip_geolocations ig ON e.ip_geolocation_id = ig.id
                 WHERE {}
-                GROUP BY v.id, v.visitor_id
+                GROUP BY v.id, v.visitor_id, v.user_agent
             )
             SELECT
                 id,
                 visitor_id,
+                user_agent,
                 first_seen,
                 last_seen,
                 session_count,
@@ -299,6 +301,7 @@ impl Analytics for AnalyticsService {
         struct VisitorResult {
             id: i32,
             visitor_id: String,
+            user_agent: Option<String>,
             first_seen: UtcDateTime,
             last_seen: UtcDateTime,
             session_count: i64,
@@ -324,9 +327,9 @@ impl Analytics for AnalyticsService {
             .map(|r| crate::types::responses::VisitorInfo {
                 id: r.id,
                 visitor_id: r.visitor_id,
+                user_agent: r.user_agent,
                 first_seen: r.first_seen,
                 last_seen: r.last_seen,
-                user_agent: None, // Would need to fetch from request logs
                 location: r.country.clone(),
                 is_crawler: false, // Would need to fetch from events
                 crawler_name: None,

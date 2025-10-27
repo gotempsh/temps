@@ -793,13 +793,14 @@ WHERE project_id = $1
         }
 
         // Determine aggregation based on level
-        let (count_expr, null_check) = match aggregation_level {
-            AggregationLevel::Events => ("COUNT(*)", ""),
+        // Use FILTER clause instead of WHERE to allow time_bucket_gapfill to work correctly
+        let count_expr = match aggregation_level {
+            AggregationLevel::Events => "COUNT(*)".to_string(),
             AggregationLevel::Sessions => {
-                ("COUNT(DISTINCT session_id)", " AND session_id IS NOT NULL")
+                "COUNT(DISTINCT session_id) FILTER (WHERE session_id IS NOT NULL)".to_string()
             }
             AggregationLevel::Visitors => {
-                ("COUNT(DISTINCT visitor_id)", " AND visitor_id IS NOT NULL")
+                "COUNT(DISTINCT visitor_id) FILTER (WHERE visitor_id IS NOT NULL)".to_string()
             }
         };
 
@@ -814,7 +815,7 @@ WHERE project_id = $1
                     time_bucket_gapfill('1 hour', timestamp, ${}::timestamptz, ${}::timestamptz) as bucket,
                     COALESCE({}, 0) as count
                 FROM events
-                WHERE {}{}
+                WHERE {}
                 GROUP BY bucket
             ) sub
             ORDER BY bucket ASC
@@ -822,8 +823,7 @@ WHERE project_id = $1
             param_index,
             param_index + 1,
             count_expr,
-            where_clause,
-            null_check
+            where_clause
         );
 
         // Add start_date and end_date again for time_bucket_gapfill parameters
