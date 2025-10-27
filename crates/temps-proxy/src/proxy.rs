@@ -25,9 +25,26 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // Constants
-pub const VISITOR_ID_COOKIE_NAME: &str = "_temps_visitor_id";
-pub const SESSION_ID_COOKIE_NAME: &str = "_temps_sid";
+pub const VISITOR_ID_COOKIE_PREFIX: &str = "_temps_visitor_id";
+pub const SESSION_ID_COOKIE_PREFIX: &str = "_temps_sid";
 pub const ROUTE_PREFIX_TEMPS: &str = "/api/_temps";
+
+// Helper functions for project-scoped cookie names
+fn get_visitor_cookie_name(project_id: Option<i32>) -> String {
+    if let Some(pid) = project_id {
+        format!("{}_p{}", VISITOR_ID_COOKIE_PREFIX, pid)
+    } else {
+        VISITOR_ID_COOKIE_PREFIX.to_string()
+    }
+}
+
+fn get_session_cookie_name(project_id: Option<i32>) -> String {
+    if let Some(pid) = project_id {
+        format!("{}_p{}", SESSION_ID_COOKIE_PREFIX, pid)
+    } else {
+        SESSION_ID_COOKIE_PREFIX.to_string()
+    }
+}
 pub const SERVER_NAME: &[u8; 5] = b"Temps";
 pub const LB_SEED: u64 = 42;
 pub const MAX_WEBHOOK_BODY_SIZE: usize = 16 * 1024;
@@ -68,6 +85,23 @@ pub struct ProxyContext {
     pub error_message: Option<String>,
     pub upstream_host: Option<String>,
     pub container_id: Option<String>,
+}
+
+impl ProxyContext {
+    /// Build a ProjectContext from the individual fields if all are present
+    fn get_project_context(&self) -> Option<ProjectContext> {
+        if let (Some(project), Some(environment), Some(deployment)) =
+            (&self.project, &self.environment, &self.deployment)
+        {
+            Some(ProjectContext {
+                project: project.clone(),
+                environment: environment.clone(),
+                deployment: deployment.clone(),
+            })
+        } else {
+            None
+        }
+    }
 }
 
 /// Main load balancer proxy implementation using traits
@@ -679,6 +713,9 @@ impl LoadBalancer {
     ) -> Result<()> {
         // Set visitor cookie using the trait
         if let Some(visitor_id) = &ctx.visitor_id {
+            let project_id = ctx.project.as_ref().map(|p| p.id);
+            let expected_cookie_name = get_visitor_cookie_name(project_id);
+
             let has_valid_visitor_cookie = session
                 .req_header()
                 .headers
@@ -687,7 +724,7 @@ impl LoadBalancer {
                 .filter_map(|cookie_header| cookie_header.to_str().ok())
                 .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
                 .any(|cookie| {
-                    cookie.name() == VISITOR_ID_COOKIE_NAME
+                    cookie.name() == expected_cookie_name
                         && self.crypto.decrypt(cookie.value()).is_ok()
                 });
 
@@ -702,7 +739,7 @@ impl LoadBalancer {
                 let is_https = self.is_https_request(session);
                 let visitor_cookie = match self
                     .visitor_manager
-                    .generate_visitor_cookie(&visitor, is_https)
+                    .generate_visitor_cookie(&visitor, is_https, ctx.get_project_context().as_ref())
                     .await
                 {
                     Ok(cookie) => cookie,
@@ -716,38 +753,29 @@ impl LoadBalancer {
         }
 
         // Set session cookie using the trait
+        // IMPORTANT: Always regenerate the cookie to refresh the max_age expiration time
+        // This prevents the cookie from expiring after 30 minutes even though the session is still active
         if let Some(session_id) = &ctx.session_id {
-            let has_session_cookie = session
-                .req_header()
-                .headers
-                .get_all("Cookie")
-                .iter()
-                .filter_map(|cookie_header| cookie_header.to_str().ok())
-                .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
-                .any(|cookie| cookie.name() == SESSION_ID_COOKIE_NAME);
+            let session_obj = crate::traits::Session {
+                session_id: session_id.clone(),
+                session_id_i32: ctx.session_id_i32.unwrap_or(0),
+                visitor_id_i32: ctx.visitor_id_i32.unwrap_or(0),
+                is_new_session: ctx.is_new_session,
+            };
 
-            if !has_session_cookie || ctx.is_new_session {
-                let session_obj = crate::traits::Session {
-                    session_id: session_id.clone(),
-                    session_id_i32: ctx.session_id_i32.unwrap_or(0),
-                    visitor_id_i32: ctx.visitor_id_i32.unwrap_or(0),
-                    is_new_session: ctx.is_new_session,
-                };
-
-                let is_https = self.is_https_request(session);
-                let session_cookie = match self
-                    .session_manager
-                    .generate_session_cookie(&session_obj, is_https)
-                    .await
-                {
-                    Ok(cookie) => cookie,
-                    Err(e) => {
-                        error!("Failed to generate session cookie: {:?}", e);
-                        return Err(Error::new_str("Failed to generate session cookie"));
-                    }
-                };
-                response.append_header("Set-Cookie", session_cookie)?;
-            }
+            let is_https = self.is_https_request(session);
+            let session_cookie = match self
+                .session_manager
+                .generate_session_cookie(&session_obj, is_https, ctx.get_project_context().as_ref())
+                .await
+            {
+                Ok(cookie) => cookie,
+                Err(e) => {
+                    error!("Failed to generate session cookie: {:?}", e);
+                    return Err(Error::new_str("Failed to generate session cookie"));
+                }
+            };
+            response.append_header("Set-Cookie", session_cookie)?;
         }
 
         Ok(())
@@ -1228,6 +1256,11 @@ impl ProxyHttp for LoadBalancer {
         );
 
         // Store encrypted cookie values for later processing
+        // Use project-scoped cookie names if project context is available
+        let project_id = ctx.project.as_ref().map(|p| p.id);
+        let visitor_cookie_name = get_visitor_cookie_name(project_id);
+        let session_cookie_name = get_session_cookie_name(project_id);
+
         ctx.request_visitor_cookie = session
             .req_header()
             .headers
@@ -1235,7 +1268,7 @@ impl ProxyHttp for LoadBalancer {
             .iter()
             .filter_map(|cookie_header| cookie_header.to_str().ok())
             .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
-            .find(|cookie| cookie.name() == VISITOR_ID_COOKIE_NAME)
+            .find(|cookie| cookie.name() == visitor_cookie_name)
             .map(|cookie| cookie.value().to_string());
 
         ctx.request_session_cookie = session
@@ -1245,7 +1278,7 @@ impl ProxyHttp for LoadBalancer {
             .iter()
             .filter_map(|cookie_header| cookie_header.to_str().ok())
             .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
-            .find(|cookie| cookie.name() == SESSION_ID_COOKIE_NAME)
+            .find(|cookie| cookie.name() == session_cookie_name)
             .map(|cookie| cookie.value().to_string());
 
         // Get IP from the connection

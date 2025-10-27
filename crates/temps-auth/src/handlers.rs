@@ -26,7 +26,7 @@ use std::sync::Arc;
 pub use temps_core::AuditContext;
 use temps_core::RequestMetadata;
 use temps_entities::types::RoleType;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::types::{
@@ -1147,6 +1147,13 @@ async fn create_user(
         create_req.username,
         create_req.email.clone().unwrap_or("no email".to_string())
     );
+
+    // Debug: Check if password was provided
+    if create_req.password.is_some() {
+        debug!("Password provided for new user (will be hashed)");
+    } else {
+        warn!("No password provided for new user - user will not be able to login with password!");
+    }
 
     // Convert role strings to RoleTypes
     let roles: Vec<RoleType> = create_req

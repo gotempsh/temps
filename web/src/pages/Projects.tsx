@@ -10,12 +10,13 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery } from '@tanstack/react-query'
 import { Plus, FolderPlus, GitBranch, Upload } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 
 const ITEMS_PER_PAGE = 8
 
 export function Projects() {
   const { setBreadcrumbs } = useBreadcrumbs()
+  const navigate = useNavigate()
   const [page, setPage] = useState(1)
 
   const { data: projectsData, isLoading } = useQuery({
@@ -35,6 +36,33 @@ export function Projects() {
   useEffect(() => {
     setBreadcrumbs([{ label: 'Projects' }])
   }, [setBreadcrumbs])
+
+  // Keyboard shortcut: N to create new project
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Check if user is typing in an input field
+      const target = e.target as HTMLElement
+      const isTyping =
+        target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable
+
+      if (
+        !isTyping &&
+        e.key.toLowerCase() === 'n' &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !e.shiftKey
+      ) {
+        e.preventDefault()
+        navigate('/projects/new')
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [navigate])
 
   usePageTitle('Projects')
 

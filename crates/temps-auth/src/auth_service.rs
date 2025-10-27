@@ -14,8 +14,7 @@ use std::sync::Arc;
 use temps_core::notifications::DynNotificationService;
 use thiserror::Error;
 use totp_rs::Secret;
-use tracing::error;
-use tracing::info;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 const DEFAULT_EXTERNAL_URL: &str = "http://localhost:8000";
 #[derive(Serialize)]
@@ -324,23 +323,53 @@ impl AuthService {
             .filter(temps_entities::users::Column::Email.eq(request.email.to_lowercase()))
             .one(self.db.as_ref())
             .await?
-            .ok_or(UserAuthError::InvalidCredentials)?;
+            .ok_or_else(|| {
+                warn!("Login attempt for non-existent email: {}", request.email);
+                UserAuthError::InvalidCredentials
+            })?;
 
         // Check if user has a password (might be GitHub-only user)
-        let password_hash = user
-            .password_hash
-            .as_ref()
-            .ok_or(UserAuthError::InvalidCredentials)?;
+        let password_hash = user.password_hash.as_ref().ok_or_else(|| {
+            warn!("Login attempt for user {} with no password hash", user.id);
+            UserAuthError::InvalidCredentials
+        })?;
 
-        // Verify password
-        let parsed_hash = argon2::password_hash::PasswordHash::new(password_hash)
-            .map_err(|_| UserAuthError::InvalidCredentials)?;
+        // Verify password - support both Argon2 and bcrypt for backwards compatibility
+        let password_valid = if password_hash.starts_with("$argon2") {
+            // Argon2 hash
+            debug!("Verifying Argon2 password for user {}", user.id);
+            let parsed_hash =
+                argon2::password_hash::PasswordHash::new(password_hash).map_err(|e| {
+                    error!("Failed to parse Argon2 hash for user {}: {}", user.id, e);
+                    UserAuthError::InvalidCredentials
+                })?;
 
-        let argon2 = argon2::Argon2::default();
-        argon2
-            .verify_password(request.password.as_bytes(), &parsed_hash)
-            .map_err(|_| UserAuthError::InvalidCredentials)?;
+            let argon2 = argon2::Argon2::default();
+            argon2
+                .verify_password(request.password.as_bytes(), &parsed_hash)
+                .is_ok()
+        } else if password_hash.starts_with("$2b$") || password_hash.starts_with("$2a$") {
+            // bcrypt hash (legacy support)
+            warn!(
+                "User {} still has bcrypt hash - consider password reset to upgrade to Argon2",
+                user.id
+            );
+            bcrypt::verify(&request.password, password_hash).unwrap_or(false)
+        } else {
+            error!(
+                "User {} has unknown password hash format: {}",
+                user.id,
+                &password_hash[..20]
+            );
+            false
+        };
 
+        if !password_valid {
+            warn!("Invalid password attempt for user {}", user.id);
+            return Err(UserAuthError::InvalidCredentials);
+        }
+
+        debug!("Successful login for user {}", user.id);
         Ok(user)
     }
 

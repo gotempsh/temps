@@ -225,13 +225,17 @@ pub fn setup_proxy_server(
         config_service,
     );
 
-    // Setup Pingora server
+    // Setup Pingora server with explicit configuration
+    // Disable upgrade mode to avoid "Console API failed to start: channel closed" error
     let opt = Opt {
-        daemon: false,
-        ..Default::default()
+        upgrade: false,   // Don't try to upgrade from old process
+        daemon: false,    // Don't daemonize (systemd handles this)
+        nocapture: false, // Not running under cargo test
+        test: false,      // Not in test mode
+        conf: None,       // No config file path
     };
 
-    let mut server = pingora_core::server::Server::new(opt)?;
+    let mut server = pingora_core::server::Server::new(Some(opt))?;
     server.bootstrap();
 
     // Create HTTP proxy service

@@ -146,6 +146,7 @@ pub trait VisitorManager: Send + Sync {
         &self,
         visitor: &Visitor,
         is_https: bool,
+        context: Option<&ProjectContext>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>; // Returns Set-Cookie header value
 
     /// Check if visitor tracking should be enabled for this request
@@ -178,6 +179,7 @@ pub trait SessionManager: Send + Sync {
         &self,
         session: &Session,
         is_https: bool,
+        context: Option<&ProjectContext>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>; // Returns Set-Cookie header value
 
     /// Extend session expiry time

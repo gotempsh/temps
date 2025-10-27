@@ -193,7 +193,7 @@ export function UsersManagement({
         username: data.name,
         email: data.email,
         roles: [data.role],
-        // password: data.password,
+        password: data.password,
       },
     })
   }

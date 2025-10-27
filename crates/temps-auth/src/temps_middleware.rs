@@ -143,6 +143,7 @@ impl AuthMiddleware {
                         crate::permissions::Role::User
                     };
                     user = Some(session_user.clone());
+
                     Some(crate::context::AuthContext::new_session(
                         session_user,
                         user_role,
@@ -236,6 +237,7 @@ impl AuthMiddleware {
             }
         }
 
+        // Run the next middleware/handler
         Ok(next.run(req).await)
     }
 

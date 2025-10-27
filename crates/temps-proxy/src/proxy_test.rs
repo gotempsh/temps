@@ -397,7 +397,7 @@ pub mod proxy_tests {
         // Test visitor cookie generation
         let cookie = convert_send_sync_error(
             visitor_manager
-                .generate_visitor_cookie(&visitor, false)
+                .generate_visitor_cookie(&visitor, false, None)
                 .await,
         )?;
         assert!(cookie.contains("_temps_visitor_id"));
@@ -453,7 +453,7 @@ pub mod proxy_tests {
         // Test session cookie generation
         let cookie = convert_send_sync_error(
             session_manager
-                .generate_session_cookie(&session, true)
+                .generate_session_cookie(&session, true, None)
                 .await,
         )?;
         assert!(cookie.contains("_temps_sid"));

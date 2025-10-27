@@ -243,7 +243,7 @@ mod integration_tests {
         // Test visitor cookie generation
         let visitor_cookie = proxy_service
             .visitor_manager()
-            .generate_visitor_cookie(&visitor, false)
+            .generate_visitor_cookie(&visitor, false, None)
             .await
             .map_err(|e| format!("Failed to generate visitor cookie: {:?}", e))?;
         assert!(visitor_cookie.contains("_temps_visitor_id"));
@@ -260,7 +260,7 @@ mod integration_tests {
 
         let session_cookie = proxy_service
             .session_manager()
-            .generate_session_cookie(&session, false)
+            .generate_session_cookie(&session, false, None)
             .await
             .map_err(|e| format!("Failed to generate session cookie: {:?}", e))?;
         assert!(session_cookie.contains("_temps_sid"));

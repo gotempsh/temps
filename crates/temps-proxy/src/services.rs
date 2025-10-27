@@ -14,8 +14,26 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 const ROUTE_PREFIX_TEMPS: &str = "/api/_temps";
-const VISITOR_ID_COOKIE_NAME: &str = "_temps_visitor_id";
-const SESSION_ID_COOKIE_NAME: &str = "_temps_sid";
+const VISITOR_ID_COOKIE_PREFIX: &str = "_temps_visitor_id";
+const SESSION_ID_COOKIE_PREFIX: &str = "_temps_sid";
+
+/// Generate project-scoped cookie name for visitor
+fn get_visitor_cookie_name(project_id: Option<i32>) -> String {
+    if let Some(pid) = project_id {
+        format!("{}_p{}", VISITOR_ID_COOKIE_PREFIX, pid)
+    } else {
+        VISITOR_ID_COOKIE_PREFIX.to_string()
+    }
+}
+
+/// Generate project-scoped cookie name for session
+fn get_session_cookie_name(project_id: Option<i32>) -> String {
+    if let Some(pid) = project_id {
+        format!("{}_p{}", SESSION_ID_COOKIE_PREFIX, pid)
+    } else {
+        SESSION_ID_COOKIE_PREFIX.to_string()
+    }
+}
 
 /// Implementation of UpstreamResolver trait
 pub struct UpstreamResolverImpl {
@@ -472,16 +490,31 @@ impl VisitorManager for VisitorManagerImpl {
         &self,
         visitor: &Visitor,
         is_https: bool,
+        context: Option<&ProjectContext>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let encrypted_visitor_id = self.crypto.encrypt(&visitor.visitor_id)?;
-        let cookie = Cookie::build((VISITOR_ID_COOKIE_NAME, encrypted_visitor_id))
+        let project_id = context.map(|c| c.project.id);
+        let cookie_name = get_visitor_cookie_name(project_id);
+        let mut cookie_builder = Cookie::build((cookie_name, encrypted_visitor_id))
             .path("/")
             .max_age(cookie::time::Duration::days(
                 self.config.visitor_max_age_days,
             ))
             .http_only(self.config.http_only)
-            .secure(is_https && self.config.secure)
-            .build();
+            .secure(is_https && self.config.secure);
+
+        // Add SameSite attribute if configured
+        if let Some(ref same_site_value) = self.config.same_site {
+            let same_site = match same_site_value.to_lowercase().as_str() {
+                "strict" => cookie::SameSite::Strict,
+                "lax" => cookie::SameSite::Lax,
+                "none" => cookie::SameSite::None,
+                _ => cookie::SameSite::Lax, // Default to Lax
+            };
+            cookie_builder = cookie_builder.same_site(same_site);
+        }
+
+        let cookie = cookie_builder.build();
         Ok(cookie.to_string())
     }
 
@@ -644,16 +677,31 @@ impl SessionManager for SessionManagerImpl {
         &self,
         session: &Session,
         is_https: bool,
+        context: Option<&ProjectContext>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let encrypted_session_id = self.crypto.encrypt(&session.session_id)?;
-        let cookie = Cookie::build((SESSION_ID_COOKIE_NAME, encrypted_session_id))
+        let project_id = context.map(|c| c.project.id);
+        let cookie_name = get_session_cookie_name(project_id);
+        let mut cookie_builder = Cookie::build((cookie_name, encrypted_session_id))
             .path("/")
             .max_age(cookie::time::Duration::minutes(
                 self.config.session_max_age_minutes,
             ))
             .http_only(self.config.http_only)
-            .secure(is_https && self.config.secure)
-            .build();
+            .secure(is_https && self.config.secure);
+
+        // Add SameSite attribute if configured
+        if let Some(ref same_site_value) = self.config.same_site {
+            let same_site = match same_site_value.to_lowercase().as_str() {
+                "strict" => cookie::SameSite::Strict,
+                "lax" => cookie::SameSite::Lax,
+                "none" => cookie::SameSite::None,
+                _ => cookie::SameSite::Lax, // Default to Lax
+            };
+            cookie_builder = cookie_builder.same_site(same_site);
+        }
+
+        let cookie = cookie_builder.build();
         Ok(cookie.to_string())
     }
 
@@ -1108,7 +1156,7 @@ mod tests {
 
         // Generate encrypted cookie
         let cookie = session_manager
-            .generate_session_cookie(&session1, false)
+            .generate_session_cookie(&session1, false, None)
             .await
             .unwrap();
 
@@ -1186,7 +1234,7 @@ mod tests {
 
         // Generate cookie
         let cookie = session_manager
-            .generate_session_cookie(&session1, false)
+            .generate_session_cookie(&session1, false, None)
             .await
             .unwrap();
 
@@ -1317,7 +1365,7 @@ mod tests {
 
         // Generate cookie
         let cookie = session_manager
-            .generate_session_cookie(&session, false)
+            .generate_session_cookie(&session, false, None)
             .await
             .unwrap();
 
@@ -1397,7 +1445,7 @@ mod tests {
 
         // Generate cookie
         let cookie = session_manager
-            .generate_session_cookie(&session1, false)
+            .generate_session_cookie(&session1, false, None)
             .await
             .unwrap();
 

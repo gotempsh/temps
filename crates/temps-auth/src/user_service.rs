@@ -12,7 +12,7 @@ use temps_core::UtcDateTime;
 use temps_entities::types::RoleType;
 use thiserror::Error;
 use totp_rs::{Algorithm, Secret, TOTP};
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 // First add the custom error type at the top of the file
 #[derive(Error, Debug)]
@@ -379,12 +379,29 @@ impl UserService {
     ) -> anyhow::Result<UserWithRoles, UserServiceError> {
         let now = Utc::now();
 
-        // Hash password if provided
+        // Hash password if provided using Argon2 (same as auth_service for consistency)
         let password_hash = if let Some(pwd) = password {
-            Some(bcrypt::hash(pwd, bcrypt::DEFAULT_COST).map_err(|e| {
-                UserServiceError::Internal(format!("Failed to hash password: {}", e))
-            })?)
+            debug!("Hashing password with Argon2 for user: {}", username);
+            use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+
+            let salt = SaltString::generate(&mut OsRng);
+            let argon2 = argon2::Argon2::default();
+            let hash = argon2
+                .hash_password(pwd.as_bytes(), &salt)
+                .map_err(|e| {
+                    error!(
+                        "Failed to hash password with Argon2 for user {}: {}",
+                        username, e
+                    );
+                    UserServiceError::Internal(format!("Failed to hash password: {}", e))
+                })?
+                .to_string();
+            Some(hash)
         } else {
+            warn!(
+                "No password provided for user: {} - password_hash will be NULL",
+                username
+            );
             None
         };
 
