@@ -74,6 +74,12 @@ pub enum ExternalServiceError {
     #[error("Failed to delete service {id}: {reason}")]
     DeletionFailed { id: i32, reason: String },
 
+    #[error("Cannot delete service {service_id}: still linked to {project_count} project(s)")]
+    ServiceHasLinkedProjects {
+        service_id: i32,
+        project_count: usize,
+    },
+
     #[error("Environment variable '{var_name}' not found for service {service_id}")]
     EnvironmentVariableNotFound { service_id: i32, var_name: String },
 
@@ -479,6 +485,19 @@ impl ExternalServiceManager {
             }
         })?;
 
+        // Safety check: Verify no projects are linked to this service
+        let linked_projects = project_services::Entity::find()
+            .filter(project_services::Column::ServiceId.eq(service_id))
+            .all(self.db.as_ref())
+            .await?;
+
+        if !linked_projects.is_empty() {
+            return Err(ExternalServiceError::ServiceHasLinkedProjects {
+                service_id,
+                project_count: linked_projects.len(),
+            });
+        }
+
         let service_instance =
             self.create_service_instance(service.name.clone(), service_type_enum);
 
@@ -486,7 +505,7 @@ impl ExternalServiceManager {
         self.db
             .transaction::<_, (), ExternalServiceError>(|txn| {
                 Box::pin(async move {
-                    // Delete project links
+                    // Delete project links (should be empty due to check above)
                     project_services::Entity::delete_many()
                         .filter(project_services::Column::ServiceId.eq(service_id))
                         .exec(txn)

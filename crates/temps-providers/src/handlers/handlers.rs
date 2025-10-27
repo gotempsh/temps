@@ -415,6 +415,7 @@ async fn update_service(
     tag = "External Services",
     responses(
         (status = 204, description = "Service deleted successfully"),
+        (status = 400, description = "Cannot delete: service is still linked to projects"),
         (status = 404, description = "Service not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -455,12 +456,20 @@ async fn delete_service(
 
                     Ok(StatusCode::NO_CONTENT)
                 }
-                Err(e) => match e.to_string().as_str() {
-                    "Service not found" => Err(not_found().detail("Service not found").build()),
-                    _ => Err(internal_server_error()
-                        .detail(format!("Failed to delete service: {}", e))
-                        .build()),
-                },
+                Err(e) => {
+                    // Check for specific error types
+                    let error_str = e.to_string();
+                    if error_str.contains("Service not found") {
+                        Err(not_found().detail("Service not found").build())
+                    } else if error_str.contains("still linked to") {
+                        // Return 400 Bad Request with detailed message about linked projects
+                        Err(bad_request().detail(error_str).build())
+                    } else {
+                        Err(internal_server_error()
+                            .detail(format!("Failed to delete service: {}", e))
+                            .build())
+                    }
+                }
             }
         }
         Err(e) => Err(internal_server_error()

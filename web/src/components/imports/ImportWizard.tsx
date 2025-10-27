@@ -15,6 +15,8 @@ import type {
 } from '@/api/client/types.gen'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
 import { RepositorySelector } from '@/components/repository/RepositorySelector'
+import { FrameworkSelector } from '@/components/project/FrameworkSelector'
+import { MaskedValue, shouldMaskValue } from '@/components/ui/masked-value'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -27,13 +29,6 @@ import {
 } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
@@ -138,12 +133,16 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
     ...listSourcesOptions({}),
   })
 
-  // Fetch repository presets when repository is selected
+  // Fetch repository presets when repository and branch are selected
   const { data: presetData, isLoading: presetLoading } = useQuery({
     ...getRepositoryPresetLiveOptions({
       path: { repository_id: selectedRepository?.id || 0 },
+      query: { branch: selectedBranch || undefined },
     }),
-    enabled: !!selectedRepository?.id && currentStep === 'configure-project',
+    enabled:
+      !!selectedRepository?.id &&
+      !!selectedBranch &&
+      currentStep === 'configure-project',
   })
 
   // Fetch branches when repository is selected
@@ -182,16 +181,16 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
     }
   }, [presetData])
 
-  // Auto-set preset and directory when preset data loads
+  // Auto-set preset and directory when preset data loads or branch changes
   useEffect(() => {
-    if (defaultPresetValue && !selectedPreset) {
+    if (defaultPresetValue) {
       const timeoutId = setTimeout(() => {
         setSelectedPreset(defaultPresetValue.value)
         setRootDirectory(defaultPresetValue.rootDir)
       }, 0)
       return () => clearTimeout(timeoutId)
     }
-  }, [defaultPresetValue, selectedPreset])
+  }, [defaultPresetValue, selectedBranch])
 
   // Auto-set default branch when branches load
   useEffect(() => {
@@ -817,107 +816,89 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
               </AlertDescription>
             </Alert>
 
-            {/* Project Name */}
+            {/* Single Card for All Configuration */}
             <Card>
-              <CardHeader>
-                <CardTitle className="text-base">Project Name</CardTitle>
-                <CardDescription>Enter a name for your project</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <Input
-                  value={projectName}
-                  onChange={(e) => setProjectName(e.target.value)}
-                  placeholder="my-awesome-project"
-                  autoFocus
-                />
-              </CardContent>
-            </Card>
+              <CardContent className="pt-6 space-y-6">
+                {/* Project Name */}
+                <div className="space-y-2">
+                  <Label className="text-base font-semibold">Project Name</Label>
+                  <p className="text-sm text-muted-foreground">
+                    Enter a name for your project
+                  </p>
+                  <Input
+                    value={projectName}
+                    onChange={(e) => setProjectName(e.target.value)}
+                    placeholder="my-awesome-project"
+                    autoFocus
+                  />
+                </div>
 
-            {/* Framework Preset */}
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-base">Framework Preset</CardTitle>
-                <CardDescription>
-                  Configure the project type based on the detected framework
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                {presetLoading ? (
-                  <Skeleton className="h-10 w-full" />
-                ) : (
-                  <div className="space-y-4">
-                    <div>
-                      <Label>Framework Preset</Label>
-                      <Select
-                        value={selectedPreset}
-                        onValueChange={handlePresetChange}
-                      >
-                        <SelectTrigger className="mt-2">
-                          <SelectValue placeholder="Select a framework preset" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {presetData?.presets?.map(
-                            (preset: any, index: number) => (
-                              <SelectItem
-                                key={`${index}-${preset.preset}`}
-                                value={`${preset.preset}::${preset.path || './'}`}
-                              >
-                                <div className="flex flex-col">
-                                  <span>
-                                    {preset.preset_label || preset.preset}
-                                  </span>
-                                  <span className="text-xs text-muted-foreground">
-                                    {preset.path || './'}
-                                  </span>
-                                </div>
-                              </SelectItem>
-                            )
-                          )}
-                          <SelectItem value="custom">Custom</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
+                {/* Branch Selection */}
+                <div className="space-y-2">
+                  <Label className="text-base font-semibold">Branch</Label>
+                  <p className="text-sm text-muted-foreground">
+                    Select the branch to deploy from
+                  </p>
+                  {selectedRepository && selectedConnectionId ? (
+                    <BranchSelector
+                      repoOwner={selectedRepository.owner || ''}
+                      repoName={selectedRepository.name || ''}
+                      connectionId={selectedConnectionId}
+                      defaultBranch={
+                        selectedRepository.default_branch || 'main'
+                      }
+                      value={selectedBranch}
+                      onChange={setSelectedBranch}
+                    />
+                  ) : (
+                    <Input
+                      value={selectedBranch}
+                      onChange={(e) => setSelectedBranch(e.target.value)}
+                      placeholder="main"
+                    />
+                  )}
+                </div>
 
-                    <div>
-                      <Label>Root Directory</Label>
-                      <Input
-                        value={rootDirectory}
-                        onChange={(e) => setRootDirectory(e.target.value)}
-                        placeholder="./"
-                        className="mt-2"
-                        readOnly={selectedPreset !== 'custom'}
+                {/* Framework Preset */}
+                <div className="space-y-2">
+                  <Label className="text-base font-semibold">Framework Preset</Label>
+                  <p className="text-sm text-muted-foreground">
+                    Configure the project type based on the detected framework
+                  </p>
+                  {!selectedBranch ? (
+                    <Alert>
+                      <AlertCircle className="h-4 w-4" />
+                      <AlertDescription>
+                        Please select a branch first to detect framework presets
+                      </AlertDescription>
+                    </Alert>
+                  ) : (
+                    <div className="space-y-4">
+                      <FrameworkSelector
+                        presetData={presetData}
+                        isLoading={presetLoading}
+                        selectedPreset={selectedPreset}
+                        onSelectPreset={handlePresetChange}
                       />
-                      <p className="text-xs text-muted-foreground mt-1">
-                        {selectedPreset !== 'custom'
-                          ? 'Directory is set based on the selected preset'
-                          : 'Enter the root directory for your custom configuration'}
-                      </p>
-                    </div>
 
-                    <div>
-                      <Label>Branch</Label>
-                      {selectedRepository && selectedConnectionId ? (
-                        <BranchSelector
-                          repoOwner={selectedRepository.owner || ''}
-                          repoName={selectedRepository.name || ''}
-                          connectionId={selectedConnectionId}
-                          defaultBranch={
-                            selectedRepository.default_branch || 'main'
-                          }
-                          value={selectedBranch}
-                          onChange={setSelectedBranch}
-                        />
-                      ) : (
+                      <div>
+                        <Label>Root Directory</Label>
                         <Input
-                          value={selectedBranch}
-                          onChange={(e) => setSelectedBranch(e.target.value)}
-                          placeholder="main"
+                          value={rootDirectory}
+                          onChange={(e) => setRootDirectory(e.target.value)}
+                          placeholder="./"
                           className="mt-2"
+                          readOnly={selectedPreset !== 'custom'}
                         />
-                      )}
+                        <p className="text-xs text-muted-foreground mt-1">
+                          {selectedPreset !== 'custom'
+                            ? 'Directory is set based on the selected preset'
+                            : 'Enter the root directory for your custom configuration'}
+                        </p>
+                      </div>
                     </div>
-                  </div>
-                )}
+                  )}
+                </div>
               </CardContent>
             </Card>
           </div>
@@ -1014,25 +995,55 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
                     <Card>
                       <CardHeader>
                         <CardTitle>Environment Variables</CardTitle>
+                        <CardDescription>
+                          {Object.keys(importPlan.plan.deployment.env_vars)
+                            .length}{' '}
+                          environment variable
+                          {Object.keys(importPlan.plan.deployment.env_vars)
+                            .length === 1
+                            ? ''
+                            : 's'}{' '}
+                          detected
+                        </CardDescription>
                       </CardHeader>
                       <CardContent>
                         <div className="space-y-1">
                           {Object.entries(
                             importPlan.plan.deployment.env_vars
-                          ).map(([key, value]) => (
-                            <div
-                              key={key}
-                              className="flex items-center gap-2 text-xs"
-                            >
-                              <code className="px-2 py-1 bg-muted rounded">
-                                {key}
-                              </code>
-                              <span className="text-muted-foreground">=</span>
-                              <code className="px-2 py-1 bg-muted rounded flex-1 truncate">
-                                {String(value)}
-                              </code>
-                            </div>
-                          ))}
+                          ).map(([envKey, envValue]) => {
+                            // Extract the actual key and value from the object structure
+                            let key = envKey
+                            let value = ''
+
+                            if (typeof envValue === 'object' && envValue !== null) {
+                              // If it's an object with 'key' and 'value' properties
+                              const envObj = envValue as any
+                              key = envObj.key || envKey
+                              value = envObj.value || String(envValue)
+                            } else {
+                              value = String(envValue)
+                            }
+
+                            const shouldMask = shouldMaskValue(key)
+
+                            return (
+                              <div
+                                key={key}
+                                className="grid grid-cols-[200px_1fr] gap-2 items-start py-2 border-b last:border-0"
+                              >
+                                <code className="px-2 py-1 bg-muted rounded text-xs font-medium truncate">
+                                  {key}
+                                </code>
+                                {shouldMask ? (
+                                  <MaskedValue value={value} />
+                                ) : (
+                                  <code className="px-2 py-1 bg-muted rounded text-xs break-all">
+                                    {value}
+                                  </code>
+                                )}
+                              </div>
+                            )
+                          })}
                         </div>
                       </CardContent>
                     </Card>
