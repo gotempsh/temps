@@ -2,13 +2,12 @@ import { useQuery } from '@tanstack/react-query'
 import { listDomainsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { DomainsManagement } from '@/components/domains/DomainsManagement'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
 
 export function Domains() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const navigate = useNavigate()
   const {
     data: domains,
     isLoading,
@@ -22,31 +21,7 @@ export function Domains() {
   }, [setBreadcrumbs])
 
   // Keyboard shortcut: N to add new domain
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Check if user is typing in an input field
-      const target = e.target as HTMLElement
-      const isTyping =
-        target.tagName === 'INPUT' ||
-        target.tagName === 'TEXTAREA' ||
-        target.isContentEditable
-
-      if (
-        !isTyping &&
-        e.key.toLowerCase() === 'n' &&
-        !e.metaKey &&
-        !e.ctrlKey &&
-        !e.altKey &&
-        !e.shiftKey
-      ) {
-        e.preventDefault()
-        navigate('/domains/add')
-      }
-    }
-
-    document.addEventListener('keydown', handleKeyDown)
-    return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [navigate])
+  useKeyboardShortcut({ key: 'n', path: '/domains/add' })
 
   usePageTitle('Domains')
 

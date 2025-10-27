@@ -14,6 +14,7 @@ import {
 } from '@/components/ui/card'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
@@ -40,6 +41,9 @@ export function Storage() {
   useEffect(() => {
     setBreadcrumbs([{ label: 'Storage', href: '/storage' }])
   }, [setBreadcrumbs])
+
+  // Keyboard shortcut: N to create new service (navigate to create page)
+  useKeyboardShortcut({ key: 'n', path: '/storage/create' })
 
   usePageTitle('Storage')
 

@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { KbdBadge } from '@/components/ui/kbd-badge'
 import { Plus } from 'lucide-react'
 import { toast } from 'sonner'
 import {
@@ -13,6 +14,7 @@ import {
   type ApiKeyResponse,
 } from '@/api/client'
 import { ApiKeyTable, ApiKeyDeleteModal } from '@/components/api-keys'
+import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 
 export default function ApiKeys() {
   const navigate = useNavigate()
@@ -93,6 +95,9 @@ export default function ApiKeys() {
     navigate('/keys/new')
   }
 
+  // Keyboard shortcut: N to create new API key
+  useKeyboardShortcut({ key: 'n', path: '/keys/new' })
+
   return (
     <div className="container mx-auto py-6 space-y-6">
       {/* Page Header */}
@@ -106,6 +111,7 @@ export default function ApiKeys() {
         <Button onClick={handleCreateClick}>
           <Plus className="mr-2 h-4 w-4" />
           Create API Key
+          <KbdBadge keys="N" className="ml-2" />
         </Button>
       </div>
 

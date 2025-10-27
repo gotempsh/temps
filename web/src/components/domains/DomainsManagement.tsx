@@ -21,6 +21,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { KbdBadge } from '@/components/ui/kbd-badge'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -245,6 +246,7 @@ export function DomainsManagement({
         >
           <Globe className="mr-2 h-4 w-4" />
           {canCreateDomains ? 'Add Domain' : 'Managed by Cloudflare'}
+          {canCreateDomains && <KbdBadge keys="N" className="ml-2" />}
         </Button>
       </div>
 

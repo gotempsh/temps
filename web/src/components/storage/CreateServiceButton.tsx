@@ -5,6 +5,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { KbdBadge } from '@/components/ui/kbd-badge'
 import { Plus, ChevronDown, Loader2 } from 'lucide-react'
 import { ProviderMetadata } from '@/api/client/types.gen'
 import { getProvidersMetadataOptions } from '@/api/client/@tanstack/react-query.gen'
@@ -28,6 +29,7 @@ export function CreateServiceButton({ onSuccess }: { onSuccess?: () => void }) {
             <Plus className="h-4 w-4" />
           )}
           Create Service
+          <KbdBadge keys="N" className="ml-1" />
           <ChevronDown className="h-4 w-4 ml-1" />
         </Button>
       </DropdownMenuTrigger>

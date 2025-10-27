@@ -4,6 +4,7 @@ import { getHourlyVisitsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
+import { KbdBadge } from '@/components/ui/kbd-badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useQuery } from '@tanstack/react-query'
@@ -15,9 +16,10 @@ import { VisitorSparkline } from './VisitorSparkline'
 
 interface ProjectCardProps {
   project: ProjectResponse
+  shortcutNumber?: number
 }
 
-export function ProjectCard({ project }: ProjectCardProps) {
+export function ProjectCard({ project, shortcutNumber }: ProjectCardProps) {
   // State for hover effect
   const [isHovering, setIsHovering] = useState(false)
 
@@ -80,6 +82,9 @@ export function ProjectCard({ project }: ProjectCardProps) {
                 )}
               </div>
             </div>
+            {shortcutNumber !== undefined && (
+              <KbdBadge keys={['⌃', shortcutNumber.toString()]} />
+            )}
           </div>
 
           {/* Analytics Section */}

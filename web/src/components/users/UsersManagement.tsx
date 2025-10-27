@@ -21,6 +21,7 @@ import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { KbdBadge } from '@/components/ui/kbd-badge'
 import {
   Dialog,
   DialogContent,
@@ -262,6 +263,7 @@ export function UsersManagement({
             <Button>
               <UserPlus className="mr-2 h-4 w-4" />
               Add User
+              <KbdBadge keys="N" className="ml-2" />
             </Button>
           </DialogTrigger>
           <DialogContent className="sm:max-w-[425px]">
