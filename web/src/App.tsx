@@ -71,11 +71,6 @@ const AddDomain = lazy(() =>
 const DomainDetail = lazy(() =>
   import('./pages/DomainDetail').then((m) => ({ default: m.DomainDetail }))
 )
-const DomainProvisioning = lazy(() =>
-  import('./pages/DomainProvisioning').then((m) => ({
-    default: m.DomainProvisioning,
-  }))
-)
 const Backups = lazy(() =>
   import('./pages/Backups').then((m) => ({ default: m.Backups }))
 )
@@ -299,10 +294,6 @@ const AppContent = () => {
                                   <Route
                                     path="/domains/:id"
                                     element={<DomainDetail />}
-                                  />
-                                  <Route
-                                    path="/domains/provisioning"
-                                    element={<DomainProvisioning />}
                                   />
                                   <Route
                                     path="/backups"
