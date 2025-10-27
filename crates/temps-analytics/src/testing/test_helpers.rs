@@ -71,11 +71,17 @@ impl AnalyticsTestHelper {
         let _ = test_environment.insert(self.db.as_ref()).await; // Ignore if exists
 
         // Insert test deployment
+        use temps_entities::deployments::DeploymentMetadata;
         let test_deployment = deployments::ActiveModel {
             id: Set(1),
             environment_id: Set(1),
             project_id: Set(1),
             state: Set("deployed".to_string()),
+            slug: Set("test-deployment".to_string()),
+            metadata: Set(Some(DeploymentMetadata {
+                builder: Some("test".to_string()),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let _ = test_deployment.insert(self.db.as_ref()).await; // Ignore if exists

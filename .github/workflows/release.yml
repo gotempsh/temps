@@ -1,13 +1,10 @@
 name: Release
 
 on:
-  workflow_dispatch:
-  # push:
-  #   tags:
-  #     - "v*.*.*"
-  #     - "v*.*.*-*"
-
-
+  push:
+    tags:
+      - "v*.*.*"
+      - "v*.*.*-*"
 
 env:
   CARGO_TERM_COLOR: always
@@ -284,104 +281,125 @@ jobs:
           echo "Generated formula:"
           cat release/temps.rb
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          draft: false
-          prerelease: ${{ contains(github.ref, '-') }}
-          generate_release_notes: false
-          fail_on_unmatched_files: true
-          make_latest: ${{ !contains(github.ref, '-') }}
-          overwrite_files: false
-          files: |
-            release/temps-linux-amd64
-            release/temps-linux-amd64.sha256
-            release/temps-darwin-amd64
-            release/temps-darwin-amd64.sha256
-            release/temps-darwin-arm64
-            release/temps-darwin-arm64.sha256
-            release/checksums.txt
-            release/install.sh
+      - name: Create release notes file
+        run: |
+          cat > release/release-notes.md << 'EOF'
+          ## Changes
+
+          See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref }}/CHANGELOG.md) for details.
+
+          ## Installation
+
+          ### Quick Install (Recommended)
+
+          **macOS, Linux, and WSL:**
+          ```bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/install.sh | bash
+          ```
+
+          ### Homebrew (macOS and Linux)
+
+          ```bash
+          # Download formula
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps.rb -o /tmp/temps.rb
+
+          # Install
+          brew install /tmp/temps.rb
+
+          # Verify
+          temps --version
+          ```
+
+          ### Manual Installation
+
+          #### Linux AMD64
+          ```bash
+          # Download
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-linux-amd64
+
+          # Make executable
+          chmod +x temps-linux-amd64
+
+          # Move to PATH
+          sudo mv temps-linux-amd64 /usr/local/bin/temps
+
+          # Verify
+          temps --version
+          ```
+
+          #### macOS AMD64 (Intel)
+          ```bash
+          # Download
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-darwin-amd64
+
+          # Make executable
+          chmod +x temps-darwin-amd64
+
+          # Move to PATH
+          sudo mv temps-darwin-amd64 /usr/local/bin/temps
+
+          # Verify
+          temps --version
+          ```
+
+          #### macOS ARM64 (Apple Silicon)
+          ```bash
+          # Download
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-darwin-arm64
+
+          # Make executable
+          chmod +x temps-darwin-arm64
+
+          # Move to PATH
+          sudo mv temps-darwin-arm64 /usr/local/bin/temps
+
+          # Verify
+          temps --version
+          ```
+
+          ### Checksums
+          ```bash
+          # Download checksums
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/checksums.txt
+
+          # Verify checksum (Linux/macOS)
+          sha256sum -c checksums.txt --ignore-missing
+          ```
+          EOF
+
+          echo "Release notes created:"
+          cat release/release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Creating release ${{ github.ref_name }}..."
+
+          # Determine if this is a prerelease
+          if [[ "${{ github.ref_name }}" == *"-"* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+            echo "This is a pre-release"
+          else
+            PRERELEASE_FLAG="--latest"
+            echo "This is a stable release"
+          fi
+
+          gh release create ${{ github.ref_name }} \
+            --title "${{ github.ref_name }}" \
+            --notes-file release/release-notes.md \
+            $PRERELEASE_FLAG \
+            release/temps-linux-amd64 \
+            release/temps-linux-amd64.sha256 \
+            release/temps-darwin-amd64 \
+            release/temps-darwin-amd64.sha256 \
+            release/temps-darwin-arm64 \
+            release/temps-darwin-arm64.sha256 \
+            release/checksums.txt \
+            release/install.sh \
             release/temps.rb
-          body: |
-            ## Changes
 
-            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref }}/CHANGELOG.md) for details.
-
-            ## Installation
-
-            ### Quick Install (Recommended)
-
-            **macOS, Linux, and WSL:**
-            ```bash
-            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/install.sh | bash
-            ```
-
-            ### Homebrew (macOS and Linux)
-
-            ```bash
-            # Download formula
-            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps.rb -o /tmp/temps.rb
-
-            # Install
-            brew install /tmp/temps.rb
-
-            # Verify
-            temps --version
-            ```
-
-            ### Manual Installation
-
-            #### Linux AMD64
-            ```bash
-            # Download
-            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-linux-amd64
-
-            # Make executable
-            chmod +x temps-linux-amd64
-
-            # Move to PATH
-            sudo mv temps-linux-amd64 /usr/local/bin/temps
-
-            # Verify
-            temps --version
-            ```
-
-            #### macOS AMD64 (Intel)
-            ```bash
-            # Download
-            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-darwin-amd64
-
-            # Make executable
-            chmod +x temps-darwin-amd64
-
-            # Move to PATH
-            sudo mv temps-darwin-amd64 /usr/local/bin/temps
-
-            # Verify
-            temps --version
-            ```
-
-            #### macOS ARM64 (Apple Silicon)
-            ```bash
-            # Download
-            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-darwin-arm64
-
-            # Make executable
-            chmod +x temps-darwin-arm64
-
-            # Move to PATH
-            sudo mv temps-darwin-arm64 /usr/local/bin/temps
-
-            # Verify
-            temps --version
-            ```
-
-            ### Checksums
-            ```bash
-            # Download checksums
-            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/checksums.txt
-
-            # Verify checksum (Linux/macOS)
-            sha256sum -c checksums.txt --ignore-missing
-            ```
+          echo ""
+          echo "✓ Release ${{ github.ref_name }} created successfully!"
+          echo ""
+          echo "View release at: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"

@@ -132,6 +132,7 @@ impl AnalyticsTestUtils {
         let test_environment = test_environment.insert(db).await?; // Ignore if exists
 
         // Insert test deployment
+        use temps_entities::deployments::DeploymentMetadata;
         let test_deployment = deployments::ActiveModel {
             environment_id: Set(test_environment.id),
             project_id: Set(test_project.id),
@@ -139,7 +140,10 @@ impl AnalyticsTestUtils {
             slug: Set("https://deployment.example.com".to_string()),
             created_at: Set(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
             updated_at: Set(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
-            metadata: Set(None),
+            metadata: Set(Some(DeploymentMetadata {
+                builder: Some("test".to_string()),
+                ..Default::default()
+            })),
             deploying_at: Set(None),
             ready_at: Set(None),
             static_dir_location: Set(None),
