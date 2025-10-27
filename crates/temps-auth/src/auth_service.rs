@@ -104,9 +104,10 @@ impl AuthService {
             .ok_or_else(|| AuthError::NotFound("Session not found".to_string()))?;
 
         let user = temps_entities::users::Entity::find_by_id(session.user_id)
+            .filter(temps_entities::users::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| AuthError::NotFound("User not found".to_string()))?;
+            .ok_or_else(|| AuthError::NotFound("User not found or deleted".to_string()))?;
 
         Ok(user)
     }
@@ -318,13 +319,17 @@ impl AuthService {
         &self,
         request: LoginRequest,
     ) -> Result<temps_entities::users::Model, UserAuthError> {
-        // Find user by email
+        // Find user by email, excluding soft-deleted users
         let user = temps_entities::users::Entity::find()
             .filter(temps_entities::users::Column::Email.eq(request.email.to_lowercase()))
+            .filter(temps_entities::users::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| {
-                warn!("Login attempt for non-existent email: {}", request.email);
+                warn!(
+                    "Login attempt for non-existent or deleted email: {}",
+                    request.email
+                );
                 UserAuthError::InvalidCredentials
             })?;
 

@@ -24,7 +24,6 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { TimeAgo } from '@/components/utils/TimeAgo'
@@ -47,6 +46,7 @@ import { EnvironmentResourcesCard } from './EnvironmentResourcesCard'
 
 interface EnvironmentDetailProps {
   project: ProjectResponse
+  environmentId?: number // Optional: if not provided, will use useParams
 }
 
 function EnvironmentDetailSkeleton() {
@@ -204,11 +204,19 @@ function CurrentDeployment({
   )
 }
 
-export function EnvironmentDetail({ project }: EnvironmentDetailProps) {
-  const { environmentId } = useParams<{ environmentId: string }>()
+export function EnvironmentDetail({
+  project,
+  environmentId: propEnvironmentId,
+}: EnvironmentDetailProps) {
+  const { environmentId: paramEnvironmentId } = useParams<{
+    environmentId: string
+  }>()
   const [newDomain, setNewDomain] = useState('')
   const [domainError, setDomainError] = useState<string | null>(null)
   const queryClient = useQueryClient()
+
+  // Use prop if provided, otherwise use URL param
+  const environmentId = propEnvironmentId ?? Number(paramEnvironmentId)
 
   const {
     data: environment,
@@ -234,7 +242,7 @@ export function EnvironmentDetail({ project }: EnvironmentDetailProps) {
       },
     }),
     select: (data) =>
-      data.filter((v) => v.environments.some((e) => e.name === environmentId)),
+      data.filter((v) => v.environments.some((e) => e.id === environmentId)),
   })
 
   const {

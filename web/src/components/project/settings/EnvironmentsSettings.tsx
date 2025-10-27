@@ -4,10 +4,11 @@ import {
   getEnvironmentsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { ChevronRight, Layers } from 'lucide-react'
+import { Layers } from 'lucide-react'
 import { useState } from 'react'
-import { Link, Route, Routes } from 'react-router-dom'
+import { useSearchParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import { CreateEnvironmentDialog } from './environments/CreateEnvironmentDialog'
 import { EnvironmentDetail } from './environments/EnvironmentDetail'
@@ -17,7 +18,9 @@ interface EnvironmentsSettingsProps {
   project: ProjectResponse
 }
 
-function EnvironmentsList({ project }: EnvironmentsSettingsProps) {
+export function EnvironmentsSettings({ project }: EnvironmentsSettingsProps) {
+  const [searchParams, setSearchParams] = useSearchParams()
+
   const {
     data: environments,
     refetch,
@@ -36,7 +39,17 @@ function EnvironmentsList({ project }: EnvironmentsSettingsProps) {
       errorTitle: 'Failed to create environment',
     },
   })
+
   const [open, setOpen] = useState(false)
+
+  // Get initial selected tab from query param or first environment
+  const envIdParam = searchParams.get('env')
+  const initialValue = envIdParam ?? environments?.[0]?.id.toString()
+
+  // Handle tab change - update query param
+  const handleTabChange = (value: string) => {
+    setSearchParams({ env: value })
+  }
 
   const handleCreateEnvironment = async ({
     name,
@@ -85,6 +98,7 @@ function EnvironmentsList({ project }: EnvironmentsSettingsProps) {
 
   const hasEnvironments = (environments?.length ?? 0) > 0
 
+  // Show the list view with tabs
   return (
     <div className="space-y-6">
       <div>
@@ -124,41 +138,42 @@ function EnvironmentsList({ project }: EnvironmentsSettingsProps) {
               />
             </EmptyPlaceholder>
           ) : (
-            <div className="rounded-md border">
-              <div className="divide-y">
+            <Tabs
+              value={initialValue}
+              onValueChange={handleTabChange}
+              className="w-full"
+            >
+              <TabsList className="w-full justify-start border-b rounded-none h-auto p-0 bg-transparent">
                 {environments?.map((env) => (
-                  <Link
+                  <TabsTrigger
                     key={env.id}
-                    to={`${env.id}`}
-                    className="flex items-center justify-between p-4 hover:bg-muted/50 transition-colors"
+                    value={env.id.toString()}
+                    className="data-[state=active]:border-b-2 data-[state=active]:border-primary rounded-none px-4 py-3"
                   >
-                    <div className="space-y-1">
-                      <p className="font-medium leading-none">{env.name}</p>
-                      <p className="text-sm text-muted-foreground">
-                        Branch: {env.branch}
-                      </p>
+                    <div className="flex flex-col items-start gap-1">
+                      <span className="font-medium">{env.name}</span>
+                      <span className="text-xs text-muted-foreground">
+                        {env.branch}
+                      </span>
                     </div>
-                    <ChevronRight className="h-4 w-4 text-muted-foreground" />
-                  </Link>
+                  </TabsTrigger>
                 ))}
-              </div>
-            </div>
+              </TabsList>
+
+              {environments?.map((env) => (
+                <TabsContent
+                  key={env.id}
+                  value={env.id.toString()}
+                  className="mt-6"
+                >
+                  <EnvironmentDetail project={project} environmentId={env.id} />
+                </TabsContent>
+              ))}
+            </Tabs>
           )}
         </div>
       </div>
     </div>
-  )
-}
-
-export function EnvironmentsSettings({ project }: EnvironmentsSettingsProps) {
-  return (
-    <Routes>
-      <Route index element={<EnvironmentsList project={project} />} />
-      <Route
-        path=":environmentId"
-        element={<EnvironmentDetail project={project} />}
-      />
-    </Routes>
   )
 }
 

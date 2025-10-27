@@ -401,11 +401,12 @@ impl ApiKeyService {
             }
         }
 
-        // Get user
+        // Get user, excluding soft-deleted users
         let user = users::Entity::find_by_id(api_key_model.user_id)
+            .filter(users::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ApiKeyServiceError::NotFound("User not found".to_string()))?;
+            .ok_or_else(|| ApiKeyServiceError::NotFound("User not found or deleted".to_string()))?;
 
         // Parse role or permissions based on role_type
         let (role, permissions) = if api_key_model.role_type == "custom" {

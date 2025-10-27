@@ -465,14 +465,21 @@ impl UserService {
             return Err(UserServiceError::AlreadyDeleted(user_id));
         }
 
-        // Soft delete the user by setting deleted_at
+        // Soft delete the user by setting deleted_at and changing email to prevent duplicates
         let now = Utc::now();
+        let unix_epoch = now.timestamp();
+        let deleted_email = format!("deleted_{}_{}", unix_epoch, user.email);
+
         let mut user_update: temps_entities::users::ActiveModel = user.into();
         user_update.deleted_at = Set(Some(now));
+        user_update.email = Set(deleted_email);
 
         let deleted_user = user_update.update(self.db.as_ref()).await?;
 
-        info!("Soft deleted user with id: {}", user_id);
+        info!(
+            "Soft deleted user with id: {}, email changed to prevent duplicates",
+            user_id
+        );
         Ok(deleted_user)
     }
 
