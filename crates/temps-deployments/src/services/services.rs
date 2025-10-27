@@ -970,26 +970,45 @@ impl DeploymentService {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
 
         let base_domain = settings.preview_domain;
+        let domain = format!("{}-{}.{}", project_slug, environment_slug, base_domain);
 
-        // Determine protocol - use https if external_url is configured, otherwise http
-        let protocol = if let Some(ref url) = settings.external_url {
+        // Determine protocol and port from external_url if set, otherwise default to http
+        let (protocol, port) = if let Some(ref url) = settings.external_url {
             if let Ok(parsed_url) = url::Url::parse(url) {
-                match parsed_url.scheme() {
+                let scheme = match parsed_url.scheme() {
                     "https" => "https",
                     "http" => "http",
                     _ => "http",
-                }
+                };
+                (scheme, parsed_url.port())
             } else {
-                "http"
+                // Fallback for malformed URLs - detect protocol from prefix
+                let protocol = if url.starts_with("https://") {
+                    "https"
+                } else {
+                    "http"
+                };
+                (protocol, None)
             }
         } else {
-            "http"
+            ("http", None)
         };
-        // New format: <protocol>://<project_slug>-<env_slug>.<preview_domain>
-        Ok(format!(
-            "{}://{}-{}.{}",
-            protocol, project_slug, environment_slug, base_domain
-        ))
+
+        // Construct the URL with port if present
+        // Only include port if it's non-standard (not 443 for https, not 80 for http)
+        let url = if let Some(port) = port {
+            let is_standard_port =
+                (protocol == "https" && port == 443) || (protocol == "http" && port == 80);
+            if is_standard_port {
+                format!("{}://{}", protocol, domain)
+            } else {
+                format!("{}://{}:{}", protocol, domain, port)
+            }
+        } else {
+            format!("{}://{}", protocol, domain)
+        };
+
+        Ok(url)
     }
 
     async fn map_db_deployment_to_deployment(
