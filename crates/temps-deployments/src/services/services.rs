@@ -922,21 +922,44 @@ impl DeploymentService {
 
         let base_domain = settings.preview_domain;
         let domain = format!("{}.{}", deployment_slug, base_domain);
-        let protocol = if let Some(ref url) = settings.external_url {
+
+        // Determine protocol and port from external_url if set, otherwise default to http
+        let (protocol, port) = if let Some(ref url) = settings.external_url {
             if let Ok(parsed_url) = url::Url::parse(url) {
-                match parsed_url.scheme() {
+                let scheme = match parsed_url.scheme() {
                     "https" => "https",
                     "http" => "http",
                     _ => "http",
-                }
+                };
+                (scheme, parsed_url.port())
             } else {
-                "http"
+                // Fallback for malformed URLs - detect protocol from prefix
+                let protocol = if url.starts_with("https://") {
+                    "https"
+                } else {
+                    "http"
+                };
+                (protocol, None)
             }
         } else {
-            "http"
+            ("http", None)
         };
 
-        Ok(format!("{}://{}", protocol, domain))
+        // Construct the URL with port if present
+        // Only include port if it's non-standard (not 443 for https, not 80 for http)
+        let url = if let Some(port) = port {
+            let is_standard_port =
+                (protocol == "https" && port == 443) || (protocol == "http" && port == 80);
+            if is_standard_port {
+                format!("{}://{}", protocol, domain)
+            } else {
+                format!("{}://{}:{}", protocol, domain, port)
+            }
+        } else {
+            format!("{}://{}", protocol, domain)
+        };
+
+        Ok(url)
     }
 
     async fn compute_environment_url(
