@@ -64,46 +64,55 @@ jobs:
           echo "Release files:"
           ls -lh release/
 
-      - name: Check if release exists and delete
-        id: check_release
-        continue-on-error: true
+      - name: Create release notes file
+        run: |
+          cat > release/release-notes.md << 'EOF'
+          ## Test Release
+
+          This is a test release with dummy binaries for testing the release workflow.
+
+          **⚠️ Do not use these binaries - they are not functional!**
+
+          To create a real release, push a tag like `v0.1.0` (without `test-` prefix).
+
+          ## Quick Install (Test Only)
+
+          ```bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/install.sh | bash
+          ```
+
+          ## Files Included
+          - temps-linux-amd64 (dummy binary)
+          - temps-darwin-amd64 (dummy binary)
+          - temps-darwin-arm64 (dummy binary)
+          - install.sh (real install script)
+          - temps.rb (Homebrew formula)
+          - checksums.txt (SHA256 checksums)
+          EOF
+
+          echo "Release notes:"
+          cat release/release-notes.md
+
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view ${{ github.ref_name }} >/dev/null 2>&1; then
-            echo "release_exists=true" >> $GITHUB_OUTPUT
-            echo "Release ${{ github.ref_name }} exists, will delete..."
-            gh release delete ${{ github.ref_name }} --yes --cleanup-tag
-            sleep 3
-          else
-            echo "release_exists=false" >> $GITHUB_OUTPUT
-            echo "No existing release found"
-          fi
+          echo "Creating release ${{ github.ref_name }}..."
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          draft: false
-          prerelease: true
-          generate_release_notes: false
-          fail_on_unmatched_files: true
-          files: |
-            release/temps-linux-amd64
-            release/temps-linux-amd64.sha256
-            release/temps-darwin-amd64
-            release/temps-darwin-amd64.sha256
-            release/temps-darwin-arm64
-            release/temps-darwin-arm64.sha256
-            release/checksums.txt
-            release/install.sh
+          gh release create ${{ github.ref_name }} \
+            --title "${{ github.ref_name }}" \
+            --notes-file release/release-notes.md \
+            --prerelease \
+            release/temps-linux-amd64 \
+            release/temps-linux-amd64.sha256 \
+            release/temps-darwin-amd64 \
+            release/temps-darwin-amd64.sha256 \
+            release/temps-darwin-arm64 \
+            release/temps-darwin-arm64.sha256 \
+            release/checksums.txt \
+            release/install.sh \
             release/temps.rb
-          body: |
-            ## Test Release
 
-            This is a test release with dummy binaries for testing the release workflow.
-
-            **Do not use these binaries - they are not functional!**
-
-            To create a real release, push a tag like `v0.1.0` (without `test-` prefix).
+          echo "✓ Release created successfully!"
+          echo ""
+          echo "View release at: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
