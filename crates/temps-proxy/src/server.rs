@@ -251,12 +251,18 @@ pub fn setup_proxy_server(
         let tls_callbacks: Box<dyn TlsAccept + Send + Sync> =
             Box::new(DynamicCertLoader { cert_loader });
 
-        // Create TLS settings with dynamic certificate callback
-        let tls_settings = TlsSettings::with_callbacks(tls_callbacks)
+        // Create TLS settings with dynamic certificate callback and HTTP/2 support
+        let mut tls_settings = TlsSettings::with_callbacks(tls_callbacks)
             .map_err(|e| anyhow::anyhow!("Failed to create TLS settings: {}", e))?;
 
+        // Enable HTTP/2 via ALPN (Application-Layer Protocol Negotiation)
+        tls_settings.enable_h2();
+
         proxy_service.add_tls_with_settings(tls_address, None, tls_settings);
-        debug!("TLS listener configured on {}", tls_address);
+        debug!(
+            "TLS listener configured on {} with HTTP/2 support",
+            tls_address
+        );
     }
 
     server.add_service(proxy_service);

@@ -166,9 +166,12 @@ mod integration_tests {
         let slug = format!("test-project-{}", nanos);
         let project = projects::ActiveModel {
             name: Set(format!("Test Project {}", nanos)),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set(slug.clone()),
             directory: Set(format!("/test-{}", nanos)),
             main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Nixpacks),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -250,6 +253,8 @@ mod integration_tests {
         let project_slug = format!("test-project-{}", nanos);
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set(project_slug.clone()),
             preset: Set(Preset::NextJs),
             directory: Set(format!("/test-{}", nanos)),
@@ -313,6 +318,8 @@ mod integration_tests {
         let project_slug = format!("test-project-{}", nanos);
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set(project_slug.clone()),
             preset: Set(Preset::NextJs),
             directory: Set(format!("/test-{}", nanos)),
@@ -529,6 +536,8 @@ mod integration_tests {
         // Create a project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("test-project".to_string()),
             preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
@@ -569,6 +578,8 @@ mod integration_tests {
         // Create a project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("test-project".to_string()),
             preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
@@ -622,6 +633,8 @@ mod integration_tests {
         // Create a project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("test-project".to_string()),
             preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
@@ -707,6 +720,8 @@ mod integration_tests {
         // Create a project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("test-project".to_string()),
             preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
@@ -807,6 +822,8 @@ mod integration_tests {
         // Create a project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("test-project".to_string()),
             preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
@@ -875,6 +892,8 @@ mod integration_tests {
         // Create a project
         let project = projects::ActiveModel {
             name: Set("Multi-Env Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("multi-env".to_string()),
             preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
@@ -990,6 +1009,8 @@ mod integration_tests {
         // Create a project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("test-project".to_string()),
             preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
@@ -1030,7 +1051,9 @@ mod integration_tests {
             branch_ref: Set(Some("main".to_string())),
             slug: Set("test-deployment".to_string()),
             state: Set("deployed".to_string()),
-            metadata: Set(None),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()

@@ -597,7 +597,7 @@ pub mod proxy_tests {
             vite_static_output.is_some(),
             "Vite preset should support static deployment"
         );
-        assert_eq!(vite_static_output.unwrap(), "dist");
+        assert_eq!(vite_static_output.unwrap(), "/usr/share/nginx/html");
 
         // Test 3: Verify Rsbuild preset supports static deployment
         let rsbuild_preset = temps_presets::get_preset_by_slug("rsbuild");
@@ -607,7 +607,7 @@ pub mod proxy_tests {
             rsbuild_static_output.is_some(),
             "Rsbuild preset should support static deployment"
         );
-        assert_eq!(rsbuild_static_output.unwrap(), "dist");
+        assert_eq!(rsbuild_static_output.unwrap(), "/app/dist");
 
         // Test 4: Verify Docusaurus preset supports static deployment
         let docusaurus_preset = temps_presets::get_preset_by_slug("docusaurus");
@@ -620,7 +620,7 @@ pub mod proxy_tests {
             docusaurus_static_output.is_some(),
             "Docusaurus preset should support static deployment"
         );
-        assert_eq!(docusaurus_static_output.unwrap(), "build");
+        assert_eq!(docusaurus_static_output.unwrap(), "/app/build");
 
         // Test 5: Verify NextJS preset does NOT support static deployment (SSR/server-based)
         let nextjs_preset = temps_presets::get_preset_by_slug("nextjs");

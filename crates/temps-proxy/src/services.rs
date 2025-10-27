@@ -745,6 +745,8 @@ mod tests {
         // Create test project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("test-project".to_string()),
             directory: Set("/".to_string()),
             main_branch: Set("main".to_string()),
@@ -770,7 +772,9 @@ mod tests {
             project_id: Set(project.id),
             environment_id: Set(environment.id),
             slug: Set("test-deployment".to_string()),
-            metadata: Set(None),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             state: Set("completed".to_string()),
             ..Default::default()
         };
