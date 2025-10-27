@@ -1,14 +1,20 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
-      - 'v*.*.*-*'
+  workflow_dispatch:
+  # push:
+  #   tags:
+  #     - "v*.*.*"
+  #     - "v*.*.*-*"
+
+
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
 
 jobs:
   build-linux-amd64:
@@ -278,17 +284,6 @@ jobs:
           echo "Generated formula:"
           cat release/temps.rb
 
-      - name: Delete existing release if exists
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view ${{ github.ref_name }} > /dev/null 2>&1; then
-            echo "Deleting existing release ${{ github.ref_name }}"
-            gh release delete ${{ github.ref_name }} --yes
-          else
-            echo "No existing release to delete"
-          fi
-
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -297,6 +292,7 @@ jobs:
           generate_release_notes: false
           fail_on_unmatched_files: true
           make_latest: ${{ !contains(github.ref, '-') }}
+          overwrite_files: false
           files: |
             release/temps-linux-amd64
             release/temps-linux-amd64.sha256
