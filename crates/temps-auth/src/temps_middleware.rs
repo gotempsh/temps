@@ -249,7 +249,8 @@ impl AuthMiddleware {
     ) -> Option<String> {
         use cookie::Cookie;
 
-        if let Some(cookie_header) = headers.get("cookie") {
+        // Iterate through ALL cookie headers (there can be multiple)
+        for cookie_header in headers.get_all("cookie") {
             if let Ok(cookie_str) = cookie_header.to_str() {
                 // Parse cookies and find the "session" cookie for user authentication
                 for cookie in Cookie::split_parse(cookie_str).filter_map(Result::ok) {

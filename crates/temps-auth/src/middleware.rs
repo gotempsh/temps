@@ -175,7 +175,8 @@ fn extract_session_from_cookies(
     headers: &HeaderMap,
     crypto: &CookieCrypto,
 ) -> Result<Option<String>, AuthError> {
-    if let Some(cookie_header) = headers.get("cookie") {
+    // Iterate through ALL cookie headers (there can be multiple)
+    for cookie_header in headers.get_all("cookie") {
         if let Ok(cookie_str) = cookie_header.to_str() {
             // Parse cookies and find the encrypted session cookie
             for cookie in Cookie::split_parse(cookie_str).filter_map(Result::ok) {

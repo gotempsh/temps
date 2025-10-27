@@ -1296,6 +1296,16 @@ impl ProxyHttp for LoadBalancer {
             .insert_header("X-Forwarded-For", client_ip)?;
         ctx.ip_address = Some(client_ip.to_string());
 
+        // Add X-Forwarded-Proto header to indicate the original protocol (HTTP/HTTPS)
+        let proto = if self.is_https_request(session) {
+            "https"
+        } else {
+            "http"
+        };
+        session
+            .req_header_mut()
+            .insert_header("X-Forwarded-Proto", proto)?;
+
         ctx.referrer = session
             .req_header()
             .headers

@@ -34,7 +34,6 @@ totp-rs = { workspace = true }
 base32 = "0.5.1"
 sha2 = { workspace = true }
 qrcode = "0.14.1"
-bcrypt = "0.16.0"
 image = "0.25.6"
 base64 = { workspace = true }
 urlencoding = { workspace = true }

@@ -334,9 +334,9 @@ impl AuthService {
             UserAuthError::InvalidCredentials
         })?;
 
-        // Verify password - support both Argon2 and bcrypt for backwards compatibility
+        // Verify password - only Argon2 is supported
         let password_valid = if password_hash.starts_with("$argon2") {
-            // Argon2 hash
+            // Argon2 hash (only supported format)
             debug!("Verifying Argon2 password for user {}", user.id);
             let parsed_hash =
                 argon2::password_hash::PasswordHash::new(password_hash).map_err(|e| {
@@ -348,18 +348,12 @@ impl AuthService {
             argon2
                 .verify_password(request.password.as_bytes(), &parsed_hash)
                 .is_ok()
-        } else if password_hash.starts_with("$2b$") || password_hash.starts_with("$2a$") {
-            // bcrypt hash (legacy support)
-            warn!(
-                "User {} still has bcrypt hash - consider password reset to upgrade to Argon2",
-                user.id
-            );
-            bcrypt::verify(&request.password, password_hash).unwrap_or(false)
         } else {
+            // Only Argon2 is supported - all other hash formats are rejected
             error!(
-                "User {} has unknown password hash format: {}",
+                "User {} has unsupported password hash format (only Argon2 is supported): {}",
                 user.id,
-                &password_hash[..20]
+                &password_hash[..std::cmp::min(20, password_hash.len())]
             );
             false
         };

@@ -588,13 +588,21 @@ impl UserService {
             })
             .collect();
 
-        // Hash recovery codes before storing
+        // Hash recovery codes before storing using Argon2id
+        use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+        use argon2::Argon2;
+
+        let argon2 = Argon2::default();
         let hashed_recovery_codes: Vec<String> = recovery_codes
             .iter()
             .map(|code| {
-                bcrypt::hash(code, bcrypt::DEFAULT_COST).map_err(|e| {
-                    UserServiceError::Mfa(format!("Failed to hash recovery code: {}", e))
-                })
+                let salt = SaltString::generate(&mut OsRng);
+                argon2
+                    .hash_password(code.as_bytes(), &salt)
+                    .map(|hash| hash.to_string())
+                    .map_err(|e| {
+                        UserServiceError::Mfa(format!("Failed to hash recovery code: {}", e))
+                    })
             })
             .collect::<Result<Vec<String>, UserServiceError>>()?;
 
@@ -720,11 +728,23 @@ impl UserService {
             // Clone hashed_codes for later use
             let hashed_codes_clone = hashed_codes.clone();
 
-            // First check if the code matches any recovery code
+            // First check if the code matches any recovery code using Argon2id
+            use argon2::password_hash::{PasswordHash, PasswordVerifier};
+            use argon2::Argon2;
+
+            let argon2 = Argon2::default();
             for hashed_code in hashed_codes {
-                if bcrypt::verify(code, &hashed_code).map_err(|e| {
-                    UserServiceError::Encryption(format!("Failed to verify recovery code: {}", e))
-                })? {
+                let parsed_hash = PasswordHash::new(&hashed_code).map_err(|e| {
+                    UserServiceError::Encryption(format!(
+                        "Failed to parse recovery code hash: {}",
+                        e
+                    ))
+                })?;
+
+                if argon2
+                    .verify_password(code.as_bytes(), &parsed_hash)
+                    .is_ok()
+                {
                     // Remove used recovery code using the cloned vector
                     let new_codes: Vec<String> = hashed_codes_clone
                         .into_iter()
