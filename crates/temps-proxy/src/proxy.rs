@@ -1366,70 +1366,88 @@ impl ProxyHttp for LoadBalancer {
                 ctx.host, static_dir
             );
 
-            // Serve static file
-            match self.serve_static_file(session, ctx, &static_dir).await {
-                Ok(served) => {
-                    if served {
-                        debug!("Served static file: {}", ctx.path);
-                        ctx.routing_status = "static_file".to_string();
+            // IMPORTANT: Skip static file serving for /api/_temps/* paths
+            // These must ALWAYS be proxied to the console address (admin API)
+            if !ctx.path.starts_with("/api/_temps/") {
+                // Create visitor and session BEFORE serving static file
+                // This ensures tracking cookies are set for HTML pages
+                if let Err(e) = self.ensure_visitor_session(ctx).await {
+                    error!("Failed to ensure visitor session for static file: {:?}", e);
+                    // Continue serving the file even if visitor/session creation fails
+                }
 
-                        // Log successful static file serving (HTML only)
-                        self.log_static_request(ctx, 200, "static_file", &static_dir, None, None);
+                // Serve static file
+                match self.serve_static_file(session, ctx, &static_dir).await {
+                    Ok(served) => {
+                        if served {
+                            debug!("Served static file: {}", ctx.path);
+                            ctx.routing_status = "static_file".to_string();
 
-                        return Ok(true); // Request handled
-                    } else {
-                        // Static file not found - return 404 instead of falling through
+                            // Log successful static file serving (HTML only)
+                            self.log_static_request(
+                                ctx,
+                                200,
+                                "static_file",
+                                &static_dir,
+                                None,
+                                None,
+                            );
+
+                            return Ok(true); // Request handled
+                        } else {
+                            // Static file not found - return 404 instead of falling through
+                            error!(
+                                "Static file not found: {} (static dir: {})",
+                                ctx.path, static_dir
+                            );
+                            let mut resp = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
+                            resp.insert_header(header::CONTENT_TYPE, "text/html")?;
+
+                            // Set tracking cookies for 404 response
+                            self.set_tracking_cookies(session, &mut resp, ctx).await?;
+
+                            session.write_response_header(Box::new(resp), false).await?;
+                            session
+                                .write_response_body(
+                                    Some(bytes::Bytes::from(
+                                        b"<html><body><h1>404 - File Not Found</h1></body></html>"
+                                            .to_vec(),
+                                    )),
+                                    true,
+                                )
+                                .await?;
+
+                            // Log 404 static file not found (HTML only)
+                            self.log_static_request(
+                                ctx,
+                                404,
+                                "static_file_not_found",
+                                &static_dir,
+                                Some("Static file not found".to_string()),
+                                Some(
+                                    b"<html><body><h1>404 - File Not Found</h1></body></html>".len()
+                                        as i64,
+                                ),
+                            );
+
+                            return Ok(true); // Request handled with 404
+                        }
+                    }
+                    Err(e) => {
+                        // Static directory error (doesn't exist, permissions, etc.) - return 500
                         error!(
-                            "Static file not found: {} (static dir: {})",
-                            ctx.path, static_dir
+                            "Failed to serve static file {} from {}: {}",
+                            ctx.path, static_dir, e
                         );
-                        let mut resp = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
+                        let mut resp =
+                            ResponseHeader::build(StatusCode::INTERNAL_SERVER_ERROR, None)?;
                         resp.insert_header(header::CONTENT_TYPE, "text/html")?;
 
-                        // Set tracking cookies for 404 response
+                        // Set tracking cookies for 500 response
                         self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
                         session.write_response_header(Box::new(resp), false).await?;
                         session
-                            .write_response_body(
-                                Some(bytes::Bytes::from(
-                                    b"<html><body><h1>404 - File Not Found</h1></body></html>"
-                                        .to_vec(),
-                                )),
-                                true,
-                            )
-                            .await?;
-
-                        // Log 404 static file not found (HTML only)
-                        self.log_static_request(
-                            ctx,
-                            404,
-                            "static_file_not_found",
-                            &static_dir,
-                            Some("Static file not found".to_string()),
-                            Some(
-                                b"<html><body><h1>404 - File Not Found</h1></body></html>".len()
-                                    as i64,
-                            ),
-                        );
-
-                        return Ok(true); // Request handled with 404
-                    }
-                }
-                Err(e) => {
-                    // Static directory error (doesn't exist, permissions, etc.) - return 500
-                    error!(
-                        "Failed to serve static file {} from {}: {}",
-                        ctx.path, static_dir, e
-                    );
-                    let mut resp = ResponseHeader::build(StatusCode::INTERNAL_SERVER_ERROR, None)?;
-                    resp.insert_header(header::CONTENT_TYPE, "text/html")?;
-
-                    // Set tracking cookies for 500 response
-                    self.set_tracking_cookies(session, &mut resp, ctx).await?;
-
-                    session.write_response_header(Box::new(resp), false).await?;
-                    session
                         .write_response_body(
                             Some(bytes::Bytes::from(
                                 b"<html><body><h1>500 - Static Directory Error</h1><p>The static files directory could not be accessed.</p></body></html>"
@@ -1439,9 +1457,9 @@ impl ProxyHttp for LoadBalancer {
                         )
                         .await?;
 
-                    // Log 500 static directory error (HTML only)
-                    let error_msg = format!("Static directory error: {}", e);
-                    self.log_static_request(
+                        // Log 500 static directory error (HTML only)
+                        let error_msg = format!("Static directory error: {}", e);
+                        self.log_static_request(
                         ctx,
                         500,
                         "static_directory_error",
@@ -1453,9 +1471,12 @@ impl ProxyHttp for LoadBalancer {
                         ),
                     );
 
-                    return Ok(true); // Request handled with error response
+                        return Ok(true); // Request handled with error response
+                    }
                 }
             }
+            // If we reach here and path starts with /api/_temps/,
+            // fall through to normal proxying logic (will be proxied to console)
         }
 
         Ok(false)

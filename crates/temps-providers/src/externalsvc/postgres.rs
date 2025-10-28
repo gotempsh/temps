@@ -63,6 +63,11 @@ pub struct PostgresInputConfig {
     #[serde(default = "default_ssl_mode")]
     #[schemars(example = "example_ssl_mode", default = "default_ssl_mode_string")]
     pub ssl_mode: Option<String>,
+
+    /// Docker image to use (defaults to postgres:17-alpine, supports timescaledb/timescaledb-ha:pg17)
+    #[serde(default = "default_docker_image")]
+    #[schemars(example = "example_docker_image", default = "default_docker_image")]
+    pub docker_image: Option<String>,
 }
 
 /// Internal runtime configuration for PostgreSQL service
@@ -76,6 +81,7 @@ pub struct PostgresConfig {
     pub password: String,
     pub max_connections: u32,
     pub ssl_mode: Option<String>,
+    pub docker_image: String,
 }
 
 impl From<PostgresInputConfig> for PostgresConfig {
@@ -92,6 +98,9 @@ impl From<PostgresInputConfig> for PostgresConfig {
             password: input.password.unwrap_or_else(generate_password),
             max_connections: input.max_connections,
             ssl_mode: input.ssl_mode,
+            docker_image: input
+                .docker_image
+                .unwrap_or_else(|| "postgres:17-alpine".to_string()),
         }
     }
 }
@@ -140,6 +149,10 @@ fn default_ssl_mode_string() -> String {
     "disable".to_string()
 }
 
+fn default_docker_image() -> Option<String> {
+    Some("postgres:17-alpine".to_string())
+}
+
 // Schema example functions
 fn example_host() -> &'static str {
     "localhost"
@@ -169,6 +182,10 @@ fn example_ssl_mode() -> &'static str {
     "disable"
 }
 
+fn example_docker_image() -> &'static str {
+    "postgres:17-alpine"
+}
+
 fn is_port_available(port: u16) -> bool {
     TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
@@ -182,8 +199,6 @@ pub struct PostgresService {
     config: Arc<RwLock<Option<PostgresConfig>>>,
     docker: Arc<Docker>,
 }
-
-const IMAGE: &str = "postgres:17.2-alpine";
 
 impl PostgresService {
     pub fn new(name: String, docker: Arc<Docker>) -> Self {
@@ -208,13 +223,13 @@ impl PostgresService {
 
     async fn create_container(&self, docker: &Docker, config: &PostgresConfig) -> Result<()> {
         // Pull image first
-        info!("Pulling PostgreSQL image {}", IMAGE);
+        info!("Pulling PostgreSQL image {}", config.docker_image);
 
         // Parse image name and tag
-        let (image_name, tag) = if let Some((name, tag)) = IMAGE.split_once(':') {
+        let (image_name, tag) = if let Some((name, tag)) = config.docker_image.split_once(':') {
             (name.to_string(), tag.to_string())
         } else {
-            (IMAGE.to_string(), "latest".to_string())
+            (config.docker_image.clone(), "latest".to_string())
         };
 
         docker
@@ -305,7 +320,7 @@ impl PostgresService {
             )])),
         });
         let container_config = bollard::models::ContainerCreateBody {
-            image: Some(IMAGE.to_string()),
+            image: Some(config.docker_image.clone()),
             exposed_ports: Some(HashMap::from([("5432/tcp".to_string(), HashMap::new())])),
             env: Some(env_vars.iter().map(|s| s.to_string()).collect()),
             labels: Some(container_labels),
@@ -1009,5 +1024,51 @@ impl ExternalService for PostgresService {
 
         info!("PostgreSQL restore completed successfully");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_postgres_input_config_default_values() {
+        let config = PostgresInputConfig {
+            host: default_host(),
+            port: None,
+            database: default_database(),
+            username: default_username(),
+            password: None,
+            max_connections: default_max_connections(),
+            ssl_mode: default_ssl_mode(),
+            docker_image: None,
+        };
+
+        let runtime_config: PostgresConfig = config.into();
+
+        assert_eq!(runtime_config.host, "localhost");
+        assert_eq!(runtime_config.database, "postgres");
+        assert_eq!(runtime_config.username, "postgres");
+        assert_eq!(runtime_config.max_connections, 100);
+        assert_eq!(runtime_config.docker_image, "postgres:17-alpine");
+        assert!(runtime_config.password.len() >= 16); // Auto-generated password
+    }
+
+    #[test]
+    fn test_postgres_input_config_custom_docker_image() {
+        let config = PostgresInputConfig {
+            host: "localhost".to_string(),
+            port: Some("5432".to_string()),
+            database: "mydb".to_string(),
+            username: "myuser".to_string(),
+            password: Some("mypass".to_string()),
+            max_connections: 50,
+            ssl_mode: Some("disable".to_string()),
+            docker_image: Some("timescale/timescaledb-ha:pg17".to_string()),
+        };
+
+        let runtime_config: PostgresConfig = config.into();
+
+        assert_eq!(runtime_config.docker_image, "timescale/timescaledb-ha:pg17");
     }
 }

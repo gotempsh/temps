@@ -36,6 +36,7 @@ import { toast } from 'sonner'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
 import { Checkbox } from '@/components/ui/checkbox'
+import { KbdBadge } from '@/components/ui/kbd-badge'
 
 interface EnvironmentVariableRowProps {
   variable: EnvironmentVariableResponse
@@ -1083,6 +1084,34 @@ export function EnvironmentVariablesSettings({
   const selectedCount = selectedVariables.size
   const allSelected = selectedCount === (envVariables?.length ?? 0) && hasVariables
 
+  // Keyboard shortcut to add new variable (N key)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Check if the key is 'N' and no input/textarea is focused
+      if (
+        e.key === 'n' &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.shiftKey &&
+        !e.altKey
+      ) {
+        const target = e.target as HTMLElement
+        // Only trigger if not typing in an input/textarea
+        if (
+          target.tagName !== 'INPUT' &&
+          target.tagName !== 'TEXTAREA' &&
+          !target.isContentEditable
+        ) {
+          e.preventDefault()
+          setIsAddDialogOpen(true)
+        }
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [])
+
   return (
     <div className="space-y-6">
       <div>
@@ -1116,6 +1145,7 @@ export function EnvironmentVariablesSettings({
               <Button onClick={() => setIsAddDialogOpen(true)}>
                 <Plus className="h-4 w-4 mr-2" />
                 Add Variable
+                <KbdBadge keys={['N']} className="ml-2" />
               </Button>
             </div>
           )}
@@ -1145,6 +1175,7 @@ export function EnvironmentVariablesSettings({
                 <Button onClick={() => setIsAddDialogOpen(true)}>
                   <Plus className="h-4 w-4 mr-2" />
                   Add Variable
+                  <KbdBadge keys={['N']} className="ml-2" />
                 </Button>
               </div>
             </EmptyPlaceholder>

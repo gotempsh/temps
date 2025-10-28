@@ -1107,32 +1107,6 @@ export default function RootLayout({
     </html>
   );
 }`,
-      apiRouteCode: `// app/api/_temps/[...path]/route.ts
-import { NextRequest, NextResponse } from 'next/server';
-
-export async function POST(request: NextRequest) {
-  const body = await request.json();
-
-  // Forward analytics events to Temps API
-  const response = await fetch(\`\${process.env.NEXT_PUBLIC_TEMPS_API_URL}/api/analytics/\${process.env.NEXT_PUBLIC_PROJECT_SLUG}/events\`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': \`Bearer \${process.env.TEMPS_API_KEY}\`,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    return NextResponse.json({ error: 'Failed to send analytics' }, { status: response.status });
-  }
-
-  return NextResponse.json({ success: true });
-}
-
-export async function GET(request: NextRequest) {
-  return NextResponse.json({ status: 'ok' });
-}`,
       envExample: `# .env.local
 TEMPS_API_KEY=your_api_key_here # Get this from your Temps dashboard
 NEXT_PUBLIC_PROJECT_SLUG=${project.slug}
@@ -1214,8 +1188,6 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
     </TempsAnalyticsProvider>
   </React.StrictMode>,
 )`,
-      apiRouteCode: null,
-      envExample: null,
     },
     {
       id: 'react',
@@ -1241,8 +1213,6 @@ root.render(
     </TempsAnalyticsProvider>
   </React.StrictMode>
 );`,
-      apiRouteCode: null,
-      envExample: null,
     },
     {
       id: 'remix',
@@ -1280,37 +1250,6 @@ export default function App() {
     </html>
   );
 }`,
-      apiRouteCode: `// app/routes/api._temps.$.tsx
-import { json } from "@remix-run/node";
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-
-export async function loader({ request }: LoaderFunctionArgs) {
-  return json({ status: 'ok' });
-}
-
-export async function action({ request }: ActionFunctionArgs) {
-  const body = await request.json();
-
-  // Forward analytics events to Temps API
-  const response = await fetch(\`\${process.env.NEXT_PUBLIC_TEMPS_API_URL}/api/analytics/\${process.env.NEXT_PUBLIC_PROJECT_SLUG}/events\`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': \`Bearer \${process.env.TEMPS_API_KEY}\`,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    return json({ error: 'Failed to send analytics' }, { status: response.status });
-  }
-
-  return json({ success: true });
-}`,
-      envExample: `# .env
-TEMPS_API_KEY=your_api_key_here # Get this from your Temps dashboard
-NEXT_PUBLIC_PROJECT_SLUG=${project.slug}
-NEXT_PUBLIC_TEMPS_API_URL=https://your-temps-instance.com`,
     },
   ]
 
@@ -1505,66 +1444,6 @@ NEXT_PUBLIC_TEMPS_API_URL=https://your-temps-instance.com`,
               />
             </div>
           </div>
-
-          {/* Step 3: API Route (for Next.js/Remix) */}
-          {selectedFrameworkData.apiRouteCode && (
-            <div className="space-y-3">
-              <div className="flex items-center gap-2">
-                <span className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs text-primary-foreground">
-                  3
-                </span>
-                <h4 className="font-medium">Create the API route</h4>
-              </div>
-              <div className="relative ml-8">
-                <div className="flex items-center gap-2 mb-2">
-                  <FileCode className="h-4 w-4 text-muted-foreground" />
-                  <span className="text-sm text-muted-foreground">
-                    Create a new API route to handle analytics:
-                  </span>
-                </div>
-                <CodeBlock
-                  language={
-                    selectedFrameworkData.id.includes('next')
-                      ? 'typescript'
-                      : 'javascript'
-                  }
-                  code={selectedFrameworkData.apiRouteCode}
-                  title={
-                    selectedFrameworkData.id.includes('next')
-                      ? selectedFrameworkData.id === 'nextjs-app'
-                        ? 'app/api/_temps/[...path]/route.ts'
-                        : 'pages/api/_temps/[...path].ts'
-                      : 'API Route'
-                  }
-                />
-              </div>
-            </div>
-          )}
-
-          {/* Step 4: Environment Variables */}
-          {selectedFrameworkData.envExample && (
-            <div className="space-y-3">
-              <div className="flex items-center gap-2">
-                <span className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs text-primary-foreground">
-                  {selectedFrameworkData.apiRouteCode ? '4' : '3'}
-                </span>
-                <h4 className="font-medium">Add environment variables</h4>
-              </div>
-              <div className="relative ml-8">
-                <div className="flex items-center gap-2 mb-2">
-                  <FileCode className="h-4 w-4 text-muted-foreground" />
-                  <span className="text-sm text-muted-foreground">
-                    Add to your environment file:
-                  </span>
-                </div>
-                <CodeBlock
-                  language="bash"
-                  code={selectedFrameworkData.envExample}
-                  title=".env.local"
-                />
-              </div>
-            </div>
-          )}
         </CardContent>
       </Card>
 
