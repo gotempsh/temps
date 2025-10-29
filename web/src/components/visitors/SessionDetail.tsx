@@ -431,7 +431,7 @@ export function SessionDetail({
                 Request Logs ({sessionLogs?.total_count || 0})
               </TabsTrigger>
               <TabsTrigger value="events">
-                Events ({sessionEvents?.total_events || 0})
+                Events ({sessionEvents?.total_count || 0})
               </TabsTrigger>
             </TabsList>
 
@@ -715,9 +715,9 @@ export function SessionDetail({
                             Showing {(eventsPage - 1) * eventsLimit + 1} to{' '}
                             {Math.min(
                               eventsPage * eventsLimit,
-                              sessionEvents.total_events
+                              sessionEvents.total_count
                             )}{' '}
-                            of {sessionEvents.total_events} events
+                            of {sessionEvents.total_count} events
                           </div>
                           <div className="flex items-center gap-2">
                             <Button

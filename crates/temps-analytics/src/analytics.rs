@@ -1003,6 +1003,7 @@ impl Analytics for AnalyticsService {
         session_id: i32,
         project_id: i32,
         environment_id: Option<i32>,
+        visitor_id: Option<i32>,
         start_date: Option<UtcDateTime>,
         end_date: Option<UtcDateTime>,
         limit: Option<i32>,
@@ -1020,33 +1021,31 @@ impl Analytics for AnalyticsService {
         let limit_val = limit.unwrap_or(100).min(1000) as u64;
         let offset_val = offset.unwrap_or(0) as u64;
 
-        // Build query with filters
-        let mut query = temps_entities::request_logs::Entity::find()
-            .filter(temps_entities::request_logs::Column::SessionId.eq(request_session.id))
-            .filter(temps_entities::request_logs::Column::ProjectId.eq(project_id));
+        // Build query with filters using proxy_logs
+        let mut query = temps_entities::proxy_logs::Entity::find()
+            .filter(temps_entities::proxy_logs::Column::SessionId.eq(request_session.id))
+            .filter(temps_entities::proxy_logs::Column::ProjectId.eq(project_id));
 
         if let Some(env_id) = environment_id {
-            query = query.filter(temps_entities::request_logs::Column::EnvironmentId.eq(env_id));
+            query = query.filter(temps_entities::proxy_logs::Column::EnvironmentId.eq(env_id));
+        }
+
+        if let Some(vis_id) = visitor_id {
+            query = query.filter(temps_entities::proxy_logs::Column::VisitorId.eq(vis_id));
         }
 
         if let Some(start) = start_date {
-            query = query.filter(
-                temps_entities::request_logs::Column::StartedAt
-                    .gte(start.format("%Y-%m-%d %H:%M:%S").to_string()),
-            );
+            query = query.filter(temps_entities::proxy_logs::Column::Timestamp.gte(start));
         }
 
         if let Some(end) = end_date {
-            query = query.filter(
-                temps_entities::request_logs::Column::StartedAt
-                    .lte(end.format("%Y-%m-%d %H:%M:%S").to_string()),
-            );
+            query = query.filter(temps_entities::proxy_logs::Column::Timestamp.lte(end));
         }
 
         // Apply ordering
         query = match sort_order.as_deref() {
-            Some("asc") => query.order_by_asc(temps_entities::request_logs::Column::StartedAt),
-            _ => query.order_by_desc(temps_entities::request_logs::Column::StartedAt),
+            Some("asc") => query.order_by_asc(temps_entities::proxy_logs::Column::Timestamp),
+            _ => query.order_by_desc(temps_entities::proxy_logs::Column::Timestamp),
         };
 
         // Get total count
@@ -1072,14 +1071,18 @@ impl Analytics for AnalyticsService {
             .map(|r| crate::types::responses::SessionRequestLog {
                 id: r.id,
                 method: r.method,
-                path: r.request_path,
-                status_code: r.status_code as i16,
-                response_time_ms: r.elapsed_time,
-                created_at: r.started_at.parse().unwrap_or_default(),
-                user_agent: Some(r.user_agent),
+                path: r.path,
+                status_code: r.status_code,
+                response_time_ms: r.response_time_ms,
+                created_at: r.timestamp,
+                user_agent: r.user_agent,
                 referrer: r.referrer,
-                response_headers: r.headers,
-                request_headers: r.request_headers,
+                response_headers: r
+                    .response_headers
+                    .and_then(|v| serde_json::to_string(&v).ok()),
+                request_headers: r
+                    .request_headers
+                    .and_then(|v| serde_json::to_string(&v).ok()),
             })
             .collect();
 

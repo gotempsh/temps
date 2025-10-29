@@ -34,7 +34,6 @@ pub mod project_services;
 pub mod projects;
 pub mod proxy_logs;
 pub mod repositories;
-pub mod request_logs;
 pub mod request_sessions;
 pub mod roles;
 pub mod s3_sources;

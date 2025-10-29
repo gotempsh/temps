@@ -3,7 +3,7 @@ use sea_orm::*;
 use std::sync::Arc;
 use temps_database::DbConnection;
 use temps_entities::{
-    custom_routes, deployments, environments, project_custom_domains, projects, request_logs,
+    custom_routes, deployments, environments, project_custom_domains, projects, proxy_logs,
     upstream_config::UpstreamList, visitor,
 };
 
@@ -136,7 +136,7 @@ impl TestDBMockOperations {
     /// Clean up all test data
     pub async fn cleanup(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Delete in reverse dependency order
-        let _ = request_logs::Entity::delete_many()
+        let _ = proxy_logs::Entity::delete_many()
             .exec(self.db.as_ref())
             .await;
         let _ = visitor::Entity::delete_many().exec(self.db.as_ref()).await;

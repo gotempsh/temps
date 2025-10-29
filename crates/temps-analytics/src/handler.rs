@@ -543,6 +543,7 @@ pub async fn get_session_logs(
             session_id,
             project_id,
             query.environment_id,
+            query.visitor_id,
             query.start_date.map(|d| d.into()),
             query.end_date.map(|d| d.into()),
             query.limit,

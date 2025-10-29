@@ -516,7 +516,7 @@ impl ProjectService {
             environment_domains, environments, project_custom_domains, project_services, projects,
         };
 
-        // NOTE: We're NOT deleting analytics_events, visitor, traces, logs, request_logs, or performance_metrics
+        // NOTE: We're NOT deleting analytics_events, visitor, traces, logs, proxy_logs, or performance_metrics
         // These are kept for historical/audit purposes and can be very large tables
         info!("Keeping analytics data, visitor data, traces, and logs for historical purposes");
 

@@ -150,6 +150,7 @@ pub struct SessionEventsQuery {
 pub struct SessionLogsQuery {
     pub project_id: i32,
     pub environment_id: Option<i32>,
+    pub visitor_id: Option<i32>,
     pub start_date: Option<DateTime>,
     pub end_date: Option<DateTime>,
     pub limit: Option<i32>,

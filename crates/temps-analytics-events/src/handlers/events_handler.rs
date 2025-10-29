@@ -1,11 +1,11 @@
 use crate::services::AnalyticsEventsService;
 use crate::types::{
     ActiveVisitorsQuery, ActiveVisitorsResponse, AggregatedBucketsResponse, AggregationLevel,
-    EventCount, EventMetricsPayload, EventTimeline, EventTimelineQuery, EventTypeBreakdown,
-    EventTypeBreakdownQuery, EventsCountQuery, HasEventsQuery, HasEventsResponse,
-    HourlyVisitsQuery, PropertyBreakdownQuery, PropertyBreakdownResponse, PropertyColumn,
-    PropertyTimelineQuery, PropertyTimelineResponse, SessionEventsQuery, SessionEventsResponse,
-    UniqueCountsQuery, UniqueCountsResponse,
+    AnalyticsSessionEventsResponse, EventCount, EventMetricsPayload, EventTimeline,
+    EventTimelineQuery, EventTypeBreakdown, EventTypeBreakdownQuery, EventsCountQuery,
+    HasEventsQuery, HasEventsResponse, HourlyVisitsQuery, PropertyBreakdownQuery,
+    PropertyBreakdownResponse, PropertyColumn, PropertyTimelineQuery, PropertyTimelineResponse,
+    SessionEventsQuery, UniqueCountsQuery, UniqueCountsResponse,
 };
 use axum::Extension;
 use axum::{
@@ -92,7 +92,7 @@ pub async fn get_events_count(
         ("environment_id" = Option<i32>, Query, description = "Filter by environment ID")
     ),
     responses(
-        (status = 200, description = "Successfully retrieved session events", body = SessionEventsResponse),
+        (status = 200, description = "Successfully retrieved session events", body = AnalyticsSessionEventsResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Session not found"),
         (status = 500, description = "Internal server error")
@@ -107,7 +107,7 @@ pub async fn get_session_events(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
     Query(query): Query<SessionEventsQuery>,
-) -> Result<Json<SessionEventsResponse>, Problem> {
+) -> Result<Json<AnalyticsSessionEventsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
 
     let events_response = state
@@ -845,7 +845,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             ActiveVisitorsQuery,
             HourlyVisitsQuery,
             EventMetricsPayload,
-            SessionEventsResponse,
+            AnalyticsSessionEventsResponse,
             SessionEventsQuery,
             HasEventsResponse,
             HasEventsQuery,

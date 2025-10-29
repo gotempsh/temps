@@ -38,7 +38,6 @@ pub use super::proxy_logs::Entity as ProxyLogs;
 pub use super::repositories::{
     BranchPresetData, Entity as Repositories, PresetInfo, RepositoryPresetCache,
 };
-pub use super::request_logs::Entity as RequestLogs;
 pub use super::request_sessions::Entity as RequestSessions;
 pub use super::roles::Entity as Roles;
 pub use super::s3_sources::Entity as S3Sources;

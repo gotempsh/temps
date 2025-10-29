@@ -97,6 +97,7 @@ pub trait Analytics: Send + Sync {
         session_id: i32,
         project_id: i32,
         environment_id: Option<i32>,
+        visitor_id: Option<i32>,
         start_date: Option<UtcDateTime>,
         end_date: Option<UtcDateTime>,
         limit: Option<i32>,

@@ -257,6 +257,103 @@ impl JobProcessorService {
     }
 }
 
+/// Find environment matching the branch, or create/use preview environment
+async fn find_or_create_environment_for_branch(
+    db: Arc<DbConnection>,
+    project: &temps_entities::projects::Model,
+    branch: Option<&str>,
+) -> Result<temps_entities::environments::Model, String> {
+    use temps_entities::environments;
+
+    // If no branch specified, find first environment
+    let Some(branch_name) = branch else {
+        return environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .filter(environments::Column::DeletedAt.is_null())
+            .one(db.as_ref())
+            .await
+            .map_err(|e| format!("Database error finding environment: {}", e))?
+            .ok_or_else(|| "No environment found for project".to_string());
+    };
+
+    info!(
+        "Looking for environment matching branch '{}' for project {}",
+        branch_name, project.id
+    );
+
+    // Try to find environment with matching branch
+    if let Some(matched_env) = environments::Entity::find()
+        .filter(environments::Column::ProjectId.eq(project.id))
+        .filter(environments::Column::Branch.eq(branch_name))
+        .filter(environments::Column::DeletedAt.is_null())
+        .one(db.as_ref())
+        .await
+        .map_err(|e| format!("Database error finding branch environment: {}", e))?
+    {
+        info!(
+            "Found environment '{}' matching branch '{}'",
+            matched_env.name, branch_name
+        );
+        return Ok(matched_env);
+    }
+
+    info!(
+        "No environment matches branch '{}', looking for preview environment",
+        branch_name
+    );
+
+    // No exact match, try to find preview environment
+    if let Some(preview_env) = environments::Entity::find()
+        .filter(environments::Column::ProjectId.eq(project.id))
+        .filter(environments::Column::Name.eq("preview"))
+        .filter(environments::Column::DeletedAt.is_null())
+        .one(db.as_ref())
+        .await
+        .map_err(|e| format!("Database error finding preview environment: {}", e))?
+    {
+        info!(
+            "Using existing preview environment for branch '{}'",
+            branch_name
+        );
+        return Ok(preview_env);
+    }
+
+    // No preview environment exists, create one
+    info!("Creating preview environment for project {}", project.id);
+
+    use chrono::Utc;
+    use temps_entities::upstream_config::UpstreamList;
+
+    let preview_env = environments::ActiveModel {
+        name: Set("preview".to_string()),
+        slug: Set(format!("{}-preview", project.slug)),
+        subdomain: Set(format!("{}-preview", project.slug)),
+        host: Set(format!("{}-preview.temps.dev", project.slug)),
+        branch: Set(None), // No specific branch - matches all unmatched branches
+        project_id: Set(project.id),
+        upstreams: Set(UpstreamList::default()),
+        deployment_config: Set(None), // Inherits from project
+        current_deployment_id: Set(None),
+        last_deployment: Set(None),
+        created_at: Set(Utc::now()),
+        updated_at: Set(Utc::now()),
+        deleted_at: Set(None),
+        ..Default::default()
+    };
+
+    let created_env = preview_env
+        .insert(db.as_ref())
+        .await
+        .map_err(|e| format!("Failed to create preview environment: {}", e))?;
+
+    info!(
+        "Created preview environment '{}' for project {}",
+        created_env.name, project.id
+    );
+
+    Ok(created_env)
+}
+
 // Extracted free function for testing
 async fn process_git_push_event(
     workflow_planner: Arc<WorkflowPlanner>,
@@ -294,25 +391,20 @@ async fn process_git_push_event(
         }
     };
 
-    // Find the default environment for this project (usually 'production' or the first one)
-    let environment = match temps_entities::environments::Entity::find()
-        .filter(temps_entities::environments::Column::ProjectId.eq(project.id))
-        .one(db.as_ref())
-        .await
-    {
-        Ok(Some(environment)) => environment,
-        Ok(None) => {
-            error!("No environment found for project {}", project.id);
-            return;
-        }
-        Err(e) => {
-            error!(
-                "Database error while finding environment for project {}: {}",
-                project.id, e
-            );
-            return;
-        }
-    };
+    // Find environment matching the branch, or fallback to preview environment
+    let environment =
+        match find_or_create_environment_for_branch(db.clone(), &project, job.branch.as_deref())
+            .await
+        {
+            Ok(env) => env,
+            Err(e) => {
+                error!(
+                    "Failed to find or create environment for project {}: {}",
+                    project.id, e
+                );
+                return;
+            }
+        };
 
     // Create deployment record directly (no more pipeline)
     // Note: Previous deployment teardown happens AFTER this deployment succeeds (zero-downtime)
@@ -349,8 +441,22 @@ async fn process_git_push_event(
             }
         };
 
-    // Generate URL as {project_slug}-{deployment_number}
-    let env_slug = format!("{}-{}", project.slug, deployment_number);
+    // Generate URL/slug based on environment type
+    let env_slug = if environment.name == "preview" {
+        // For preview deployments, include branch name in slug for unique URLs
+        let sanitized_branch = job
+            .branch
+            .as_ref()
+            .map(|b| b.replace(['/', '_', '.'], "-").to_lowercase())
+            .unwrap_or_else(|| "unknown".to_string());
+        format!(
+            "{}-{}-{}",
+            project.slug, sanitized_branch, deployment_number
+        )
+    } else {
+        // For named environments (production, staging, etc.), use standard format
+        format!("{}-{}", project.slug, deployment_number)
+    };
 
     // Get the effective deployment configuration by merging project and environment configs
     let merged_config = if let Some(project_config) = &project.deployment_config {
@@ -990,6 +1096,430 @@ mod tests {
         let updated_job = updated_job.update(db.as_ref()).await?;
 
         assert_eq!(updated_job.status, JobStatus::Running);
+
+        Ok(())
+    }
+
+    /// Test that a branch with an exact environment match uses that environment
+    #[tokio::test]
+    async fn test_find_environment_with_exact_branch_match(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Create test project
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Branch Match Test".to_string()),
+            slug: Set("branch-match-test".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            git_provider_connection_id: Set(Some(1)),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            deleted_at: Set(None),
+            is_deleted: Set(false),
+            is_public_repo: Set(false),
+            git_url: Set(None),
+            main_branch: Set("main".to_string()),
+            ..Default::default()
+        };
+        let project = project.insert(db.as_ref()).await?;
+
+        // Create environment with specific branch
+        let production_env = temps_entities::environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("production.example.com".to_string()),
+            branch: Set(Some("main".to_string())), // Matches "main" branch
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("production.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let production_env = production_env.insert(db.as_ref()).await?;
+
+        // Test finding environment for "main" branch
+        let found_env =
+            find_or_create_environment_for_branch(db.clone(), &project, Some("main")).await?;
+
+        assert_eq!(found_env.id, production_env.id);
+        assert_eq!(found_env.name, "Production");
+        assert_eq!(found_env.branch, Some("main".to_string()));
+
+        Ok(())
+    }
+
+    /// Test that a branch without a match uses existing preview environment
+    #[tokio::test]
+    async fn test_find_environment_uses_existing_preview() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Create test project
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Existing Preview Test".to_string()),
+            slug: Set("existing-preview-test".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            git_provider_connection_id: Set(Some(1)),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            deleted_at: Set(None),
+            is_deleted: Set(false),
+            is_public_repo: Set(false),
+            git_url: Set(None),
+            main_branch: Set("main".to_string()),
+            ..Default::default()
+        };
+        let project = project.insert(db.as_ref()).await?;
+
+        // Create production environment with branch
+        let _production_env = temps_entities::environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("production.example.com".to_string()),
+            branch: Set(Some("main".to_string())),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("production.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let _production_env = _production_env.insert(db.as_ref()).await?;
+
+        // Create preview environment
+        let preview_env = temps_entities::environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("preview".to_string()),
+            slug: Set("existing-preview-test-preview".to_string()),
+            host: Set("existing-preview-test-preview.temps.dev".to_string()),
+            branch: Set(None), // No specific branch
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("existing-preview-test-preview".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let preview_env = preview_env.insert(db.as_ref()).await?;
+
+        // Test finding environment for "feature-auth" branch (no exact match)
+        let found_env =
+            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-auth"))
+                .await?;
+
+        assert_eq!(found_env.id, preview_env.id);
+        assert_eq!(found_env.name, "preview");
+        assert_eq!(found_env.branch, None); // Preview has no specific branch
+
+        Ok(())
+    }
+
+    /// Test that preview environment is auto-created when it doesn't exist
+    #[tokio::test]
+    async fn test_find_environment_creates_preview_when_missing(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Create test project
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Auto Create Preview Test".to_string()),
+            slug: Set("auto-create-preview-test".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            git_provider_connection_id: Set(Some(1)),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            deleted_at: Set(None),
+            is_deleted: Set(false),
+            is_public_repo: Set(false),
+            git_url: Set(None),
+            main_branch: Set("main".to_string()),
+            ..Default::default()
+        };
+        let project = project.insert(db.as_ref()).await?;
+
+        // Create only production environment (no preview)
+        let _production_env = temps_entities::environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("production.example.com".to_string()),
+            branch: Set(Some("main".to_string())),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("production.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let _production_env = _production_env.insert(db.as_ref()).await?;
+
+        // Verify no preview environment exists
+        let preview_before = temps_entities::environments::Entity::find()
+            .filter(temps_entities::environments::Column::ProjectId.eq(project.id))
+            .filter(temps_entities::environments::Column::Name.eq("preview"))
+            .one(db.as_ref())
+            .await?;
+        assert!(preview_before.is_none(), "Preview should not exist yet");
+
+        // Test finding environment for "feature-xyz" branch (should create preview)
+        let found_env =
+            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-xyz"))
+                .await?;
+
+        // Verify preview environment was created
+        assert_eq!(found_env.name, "preview");
+        assert_eq!(found_env.slug, "auto-create-preview-test-preview");
+        assert_eq!(found_env.subdomain, "auto-create-preview-test-preview");
+        assert_eq!(found_env.host, "auto-create-preview-test-preview.temps.dev");
+        assert_eq!(found_env.branch, None); // No specific branch
+        assert_eq!(found_env.project_id, project.id);
+
+        // Verify preview environment persisted in database
+        let preview_after = temps_entities::environments::Entity::find()
+            .filter(temps_entities::environments::Column::ProjectId.eq(project.id))
+            .filter(temps_entities::environments::Column::Name.eq("preview"))
+            .one(db.as_ref())
+            .await?;
+        assert!(preview_after.is_some(), "Preview should exist now");
+
+        Ok(())
+    }
+
+    /// Test that multiple branches without matches all use the same preview environment
+    #[tokio::test]
+    async fn test_multiple_branches_share_preview_environment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Create test project
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Multi Branch Preview Test".to_string()),
+            slug: Set("multi-branch-preview-test".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            git_provider_connection_id: Set(Some(1)),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            deleted_at: Set(None),
+            is_deleted: Set(false),
+            is_public_repo: Set(false),
+            git_url: Set(None),
+            main_branch: Set("main".to_string()),
+            ..Default::default()
+        };
+        let project = project.insert(db.as_ref()).await?;
+
+        // Create production environment
+        let _production_env = temps_entities::environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("production.example.com".to_string()),
+            branch: Set(Some("main".to_string())),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("production.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let _production_env = _production_env.insert(db.as_ref()).await?;
+
+        // Find environment for first feature branch (creates preview)
+        let env1 =
+            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-auth"))
+                .await?;
+
+        // Find environment for second feature branch (reuses preview)
+        let env2 =
+            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-payments"))
+                .await?;
+
+        // Find environment for third feature branch (reuses preview)
+        let env3 =
+            find_or_create_environment_for_branch(db.clone(), &project, Some("bugfix-login"))
+                .await?;
+
+        // All three should return the same preview environment
+        assert_eq!(env1.id, env2.id);
+        assert_eq!(env2.id, env3.id);
+        assert_eq!(env1.name, "preview");
+
+        // Verify only one preview environment was created
+        let all_preview_envs = temps_entities::environments::Entity::find()
+            .filter(temps_entities::environments::Column::ProjectId.eq(project.id))
+            .filter(temps_entities::environments::Column::Name.eq("preview"))
+            .all(db.as_ref())
+            .await?;
+        assert_eq!(
+            all_preview_envs.len(),
+            1,
+            "Should only have one preview environment"
+        );
+
+        Ok(())
+    }
+
+    /// Test that when no branch is provided, first environment is used
+    #[tokio::test]
+    async fn test_find_environment_no_branch_uses_first() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Create test project
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("No Branch Test".to_string()),
+            slug: Set("no-branch-test".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            git_provider_connection_id: Set(Some(1)),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            deleted_at: Set(None),
+            is_deleted: Set(false),
+            is_public_repo: Set(false),
+            git_url: Set(None),
+            main_branch: Set("main".to_string()),
+            ..Default::default()
+        };
+        let project = project.insert(db.as_ref()).await?;
+
+        // Create multiple environments
+        let env1 = temps_entities::environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("production.example.com".to_string()),
+            branch: Set(Some("main".to_string())),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("production.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let env1 = env1.insert(db.as_ref()).await?;
+
+        let _env2 = temps_entities::environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Staging".to_string()),
+            slug: Set("staging".to_string()),
+            host: Set("staging.example.com".to_string()),
+            branch: Set(Some("develop".to_string())),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("staging.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let _env2 = _env2.insert(db.as_ref()).await?;
+
+        // Test finding environment with no branch specified
+        let found_env = find_or_create_environment_for_branch(db.clone(), &project, None).await?;
+
+        // Should return first environment (by database order)
+        assert_eq!(found_env.id, env1.id);
+
+        Ok(())
+    }
+
+    /// Test that deleted environments are ignored
+    #[tokio::test]
+    async fn test_find_environment_ignores_deleted_environments(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Create test project
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Deleted Env Test".to_string()),
+            slug: Set("deleted-env-test".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            git_provider_connection_id: Set(Some(1)),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            deleted_at: Set(None),
+            is_deleted: Set(false),
+            is_public_repo: Set(false),
+            git_url: Set(None),
+            main_branch: Set("main".to_string()),
+            ..Default::default()
+        };
+        let project = project.insert(db.as_ref()).await?;
+
+        // Create deleted preview environment
+        let deleted_preview = temps_entities::environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("preview".to_string()),
+            slug: Set("deleted-env-test-preview".to_string()),
+            host: Set("deleted-env-test-preview.temps.dev".to_string()),
+            branch: Set(None),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("deleted-env-test-preview".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            deleted_at: Set(Some(Utc::now())), // Mark as deleted
+            ..Default::default()
+        };
+        let _deleted_preview = deleted_preview.insert(db.as_ref()).await?;
+
+        // Create active production environment
+        let _production_env = temps_entities::environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Production".to_string()),
+            slug: Set("production".to_string()),
+            host: Set("production.example.com".to_string()),
+            branch: Set(Some("main".to_string())),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("production.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            deleted_at: Set(None),
+            ..Default::default()
+        };
+        let _production_env = _production_env.insert(db.as_ref()).await?;
+
+        // Test finding environment for feature branch
+        // Should create NEW preview (ignore deleted one)
+        let found_env =
+            find_or_create_environment_for_branch(db.clone(), &project, Some("feature-test"))
+                .await?;
+
+        assert_eq!(found_env.name, "preview");
+        assert!(
+            found_env.deleted_at.is_none(),
+            "Preview should not be deleted"
+        );
+
+        // Verify two preview environments exist (one deleted, one active)
+        let all_preview_envs = temps_entities::environments::Entity::find()
+            .filter(temps_entities::environments::Column::ProjectId.eq(project.id))
+            .filter(temps_entities::environments::Column::Name.eq("preview"))
+            .all(db.as_ref())
+            .await?;
+        assert_eq!(
+            all_preview_envs.len(),
+            2,
+            "Should have two preview environments (one deleted, one active)"
+        );
 
         Ok(())
     }

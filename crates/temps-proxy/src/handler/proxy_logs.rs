@@ -22,6 +22,10 @@ pub struct ProxyLogsQuery {
     pub environment_id: Option<i32>,
     /// Filter by deployment ID
     pub deployment_id: Option<i32>,
+    /// Filter by session ID
+    pub session_id: Option<i32>,
+    /// Filter by visitor ID
+    pub visitor_id: Option<i32>,
 
     // Date range filters
     /// Start date for filtering (ISO 8601 format)

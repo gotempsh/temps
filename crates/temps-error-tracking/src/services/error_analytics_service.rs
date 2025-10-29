@@ -320,19 +320,17 @@ impl ErrorAnalyticsService {
             0.0
         };
 
-        // Calculate total requests and error rate from request logs
-        // Note: request_logs.started_at and finished_at are stored as strings in ISO format
-        // We use raw SQL for timestamp comparison to cast string to timestamptz
+        // Calculate total requests and error rate from proxy logs
         let total_requests_sql = if let Some(env_id) = environment_id {
             Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 r#"
                     SELECT COUNT(*) as count
-                    FROM request_logs
+                    FROM proxy_logs
                     WHERE project_id = $1
                         AND environment_id = $2
-                        AND started_at::timestamptz >= $3
-                        AND started_at::timestamptz <= $4
+                        AND timestamp >= $3
+                        AND timestamp <= $4
                 "#,
                 vec![
                     project_id.into(),
@@ -346,10 +344,10 @@ impl ErrorAnalyticsService {
                 DatabaseBackend::Postgres,
                 r#"
                     SELECT COUNT(*) as count
-                    FROM request_logs
+                    FROM proxy_logs
                     WHERE project_id = $1
-                        AND started_at::timestamptz >= $2
-                        AND started_at::timestamptz <= $3
+                        AND timestamp >= $2
+                        AND timestamp <= $3
                 "#,
                 vec![project_id.into(), start_time.into(), end_time.into()],
             )

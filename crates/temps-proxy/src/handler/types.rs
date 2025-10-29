@@ -4,21 +4,13 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::service::lb_service::LbService;
-use crate::service::request_log_service::RequestLogService;
 
 pub struct AppState {
     pub lb_service: Arc<LbService>,
-    pub request_log_service: Arc<RequestLogService>,
 }
 
-pub fn create_lb_app_state(
-    lb_service: Arc<LbService>,
-    request_log_service: Arc<RequestLogService>,
-) -> Arc<AppState> {
-    Arc::new(AppState {
-        lb_service,
-        request_log_service,
-    })
+pub fn create_lb_app_state(lb_service: Arc<LbService>) -> Arc<AppState> {
+    Arc::new(AppState { lb_service })
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

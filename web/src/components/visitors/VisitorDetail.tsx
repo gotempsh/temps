@@ -686,13 +686,10 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                       <TableHead>Session ID</TableHead>
                       <TableHead>Started</TableHead>
                       <TableHead>Duration</TableHead>
-                      <TableHead>Pages Viewed</TableHead>
-                      <TableHead>Events</TableHead>
-                      <TableHead>Recording Status</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {sessionReplays.sessions.map((session: any) => (
+                    {sessionReplays.sessions.map((session) => (
                       <TableRow
                         key={session.id}
                         className="cursor-pointer hover:bg-muted/50"
@@ -712,25 +709,6 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                         </TableCell>
                         <TableCell className="text-sm">
                           {formatDuration(session.duration || 0)}
-                        </TableCell>
-                        <TableCell className="text-sm">
-                          {session.page_count || 0}
-                        </TableCell>
-                        <TableCell className="text-sm">
-                          {session.event_count || 0}
-                        </TableCell>
-                        <TableCell>
-                          {session.event_count > 0 ? (
-                            <Badge
-                              variant="success"
-                              className="flex items-center gap-1 w-fit"
-                            >
-                              <PlayCircle className="h-3 w-3" />
-                              Available
-                            </Badge>
-                          ) : (
-                            <Badge variant="secondary">Not Recorded</Badge>
-                          )}
                         </TableCell>
                       </TableRow>
                     ))}

@@ -420,10 +420,8 @@ impl PerformanceService {
             params.push(dep_id.into());
         }
 
-        // Add path filter for non-path grouping to exclude static files
-        if !matches!(group_by, GroupBy::Path) {
-            where_conditions.push("rl.is_static_file = false".to_string());
-        }
+        // Note: proxy_logs doesn't have is_static_file field
+        // Removed static file filter as it's not available in proxy_logs
 
         // Optimized query using TimescaleDB features with flexible grouping
         let query = format!(
@@ -437,12 +435,12 @@ impl PerformanceService {
                 AVG(pm.ttfb) as ttfb,
                 COUNT(*) as events
             FROM performance_metrics pm
-            LEFT JOIN request_logs rl ON (
-                pm.project_id = rl.project_id AND
-                pm.session_id = rl.session_id AND
-                ABS(EXTRACT(EPOCH FROM (pm.recorded_at - rl.started_at::timestamp))) <= 300
+            LEFT JOIN proxy_logs pl ON (
+                pm.project_id = pl.project_id AND
+                pm.session_id = pl.session_id AND
+                ABS(EXTRACT(EPOCH FROM (pm.recorded_at - pl.timestamp))) <= 300
             )
-            LEFT JOIN ip_geolocations ig ON rl.ip_address = ig.ip_address
+            LEFT JOIN ip_geolocations ig ON pl.client_ip = ig.ip_address
             WHERE {}
             GROUP BY {}
             HAVING COUNT(*) >= 1

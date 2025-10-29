@@ -536,6 +536,8 @@ impl LoadBalancer {
                 project_id: ctx.project.as_ref().map(|p| p.id),
                 environment_id: ctx.environment.as_ref().map(|e| e.id),
                 deployment_id: ctx.deployment.as_ref().map(|d| d.id),
+                session_id: ctx.session_id_i32,
+                visitor_id: ctx.visitor_id_i32,
                 container_id: ctx.container_id.clone(),
                 upstream_host: ctx.upstream_host.clone(),
                 error_message: ctx.error_message.clone(),
@@ -664,6 +666,8 @@ impl LoadBalancer {
             project_id: ctx.project.as_ref().map(|p| p.id),
             environment_id: ctx.environment.as_ref().map(|e| e.id),
             deployment_id: ctx.deployment.as_ref().map(|d| d.id),
+            session_id: ctx.session_id_i32,
+            visitor_id: ctx.visitor_id_i32,
             container_id: None,
             upstream_host: Some(format!("static://{}", static_dir)),
             error_message,
@@ -887,6 +891,10 @@ impl LoadBalancer {
                         "public, max-age=0, must-revalidate",
                     )?;
                 }
+
+                // CRITICAL: Set tracking cookies even for 304 responses to keep sessions alive
+                // Without this, visitors won't get cookies on cached root URLs (/) and events will fail
+                self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
                 session.write_response_header(Box::new(resp), false).await?;
                 session.write_response_body(None, true).await?;
@@ -1791,6 +1799,8 @@ impl ProxyHttp for LoadBalancer {
                 project_id: ctx.project.as_ref().map(|p| p.id),
                 environment_id: ctx.environment.as_ref().map(|e| e.id),
                 deployment_id: ctx.deployment.as_ref().map(|d| d.id),
+                session_id: ctx.session_id_i32,
+                visitor_id: ctx.visitor_id_i32,
                 container_id: None,
                 upstream_host: None,
                 error_message: ctx.error_message.clone(),

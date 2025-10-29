@@ -4,9 +4,9 @@ use temps_core::{DBDateTime, UtcDateTime};
 use thiserror::Error;
 
 use crate::types::{
-    AggregationLevel, EventCount, EventTimeline, EventTypeBreakdown, PropertyBreakdownItem,
-    PropertyBreakdownResponse, PropertyTimelineItem, PropertyTimelineResponse, SessionEvent,
-    SessionEventsResponse, UniqueCountsResponse,
+    AggregationLevel, AnalyticsSessionEventsResponse, EventCount, EventTimeline,
+    EventTypeBreakdown, PropertyBreakdownItem, PropertyBreakdownResponse, PropertyTimelineItem,
+    PropertyTimelineResponse, SessionEvent, UniqueCountsResponse,
 };
 
 #[derive(Debug, Error)]
@@ -146,7 +146,7 @@ impl AnalyticsEventsService {
         session_id: String,
         project_id: i32,
         environment_id: Option<i32>,
-    ) -> Result<Option<SessionEventsResponse>, EventsError> {
+    ) -> Result<Option<AnalyticsSessionEventsResponse>, EventsError> {
         // Build WHERE conditions with parameterized queries
         let mut where_conditions =
             vec!["session_id = $1".to_string(), "project_id = $2".to_string()];
@@ -214,7 +214,7 @@ impl AnalyticsEventsService {
 
         let total_events = events.len();
 
-        Ok(Some(SessionEventsResponse {
+        Ok(Some(AnalyticsSessionEventsResponse {
             session_id,
             events,
             total_events,

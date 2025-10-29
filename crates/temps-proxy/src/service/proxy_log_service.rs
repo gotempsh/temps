@@ -33,6 +33,8 @@ pub struct ProxyLogResponse {
     pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
+    pub session_id: Option<i32>,
+    pub visitor_id: Option<i32>,
     pub container_id: Option<String>,
     pub upstream_host: Option<String>,
     pub error_message: Option<String>,
@@ -69,6 +71,8 @@ impl From<proxy_logs::Model> for ProxyLogResponse {
             project_id: model.project_id,
             environment_id: model.environment_id,
             deployment_id: model.deployment_id,
+            session_id: model.session_id,
+            visitor_id: model.visitor_id,
             container_id: model.container_id,
             upstream_host: model.upstream_host,
             error_message: model.error_message,
@@ -105,6 +109,8 @@ pub struct CreateProxyLogRequest {
     pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
+    pub session_id: Option<i32>,
+    pub visitor_id: Option<i32>,
     pub container_id: Option<String>,
     pub upstream_host: Option<String>,
     pub error_message: Option<String>,
@@ -195,6 +201,8 @@ impl ProxyLogService {
             project_id: Set(request.project_id),
             environment_id: Set(request.environment_id),
             deployment_id: Set(request.deployment_id),
+            session_id: Set(request.session_id),
+            visitor_id: Set(request.visitor_id),
             container_id: Set(request.container_id),
             upstream_host: Set(request.upstream_host),
             error_message: Set(request.error_message),
@@ -242,6 +250,12 @@ impl ProxyLogService {
         }
         if let Some(did) = filters.deployment_id {
             query = query.filter(proxy_logs::Column::DeploymentId.eq(did));
+        }
+        if let Some(sid) = filters.session_id {
+            query = query.filter(proxy_logs::Column::SessionId.eq(sid));
+        }
+        if let Some(vid) = filters.visitor_id {
+            query = query.filter(proxy_logs::Column::VisitorId.eq(vid));
         }
 
         // Date range filters
@@ -402,6 +416,8 @@ impl ProxyLogService {
             project_id,
             environment_id,
             deployment_id: None,
+            session_id: None,
+            visitor_id: None,
             start_date: None,
             end_date: None,
             method: None,

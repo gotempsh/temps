@@ -108,6 +108,12 @@ export type AnalyticsMetrics = {
     views_per_visit: number;
 };
 
+export type AnalyticsSessionEventsResponse = {
+    events: Array<SessionEvent>;
+    session_id: string;
+    total_events: number;
+};
+
 export type ApiKeyListResponse = {
     api_keys: Array<ApiKeyResponse>;
     total: number;
@@ -2625,10 +2631,18 @@ export type ProjectPresetResponse = {
     /**
      * Default exposed port for this preset (e.g., 3000 for Next.js, 8000 for FastAPI)
      */
-    exposed_port?: number | null;
+    exposedPort?: number | null;
+    /**
+     * Icon URL for the preset
+     */
+    iconUrl?: string | null;
     path: string;
     preset: string;
-    preset_label: string;
+    presetLabel: string;
+    /**
+     * Project type category (e.g., "frontend", "backend", "fullstack")
+     */
+    projectType: string;
 };
 
 export type ProjectQuery = {
@@ -3246,8 +3260,10 @@ export type SessionEventsQuery = {
 
 export type SessionEventsResponse = {
     events: Array<SessionEvent>;
-    session_id: string;
-    total_events: number;
+    limit: number;
+    offset: number;
+    session_id: number;
+    total_count: number;
 };
 
 export type SessionLogsQuery = {
@@ -7208,6 +7224,10 @@ export type DeleteServiceData = {
 };
 
 export type DeleteServiceErrors = {
+    /**
+     * Cannot delete: service is still linked to projects
+     */
+    400: unknown;
     /**
      * Service not found
      */
@@ -13946,7 +13966,7 @@ export type GetSessionEvents2Responses = {
     /**
      * Successfully retrieved session events
      */
-    200: SessionEventsResponse;
+    200: AnalyticsSessionEventsResponse;
 };
 
 export type GetSessionEvents2Response = GetSessionEvents2Responses[keyof GetSessionEvents2Responses];
