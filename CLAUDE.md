@@ -2274,6 +2274,144 @@ function formatEventData(data: unknown): string {
 <pre>{formatEventData(event.data)}</pre>
 ```
 
+#### CRITICAL: NO Hooks After Early Returns
+
+**🚫 ABSOLUTELY FORBIDDEN: NEVER call hooks after early return statements.**
+
+This violates React's Rules of Hooks and causes the error: **"Rendered more hooks than during the previous render" (React Error #310)**
+
+**React's Rules of Hooks:**
+- Hooks must be called in the **exact same order** on every render
+- Hooks must be called at the **top level** of the component
+- Hooks must **NOT** be called inside conditions, loops, or after early returns
+
+**Why this is CRITICAL:**
+- When you return early, hooks after the return are skipped in some renders but not others
+- This creates a variable number of hooks between renders
+- React relies on the order of hook calls to maintain state correctly
+- Violating this rule causes React Error #310 and component crashes
+
+**Examples:**
+
+```tsx
+// ❌ CRITICALLY BAD - Hook called after early return
+function MyComponent() {
+  const [data, setData] = useState(null)
+  const { isLoading } = useQuery({ ... })
+
+  if (isLoading) {
+    return <Spinner />  // Early return
+  }
+
+  // ❌ ERROR! This useEffect is called after the early return
+  // When isLoading=true, useEffect is skipped
+  // When isLoading=false, useEffect is called
+  // This creates variable number of hooks → React Error #310
+  useEffect(() => {
+    console.log('Data loaded')
+  }, [data])
+
+  return <div>{data}</div>
+}
+
+// ✅ CORRECT - All hooks called before early return
+function MyComponent() {
+  const [data, setData] = useState(null)
+  const { isLoading } = useQuery({ ... })
+
+  // ✅ CORRECT - useEffect called BEFORE early return
+  useEffect(() => {
+    console.log('Data loaded')
+  }, [data])
+
+  if (isLoading) {
+    return <Spinner />  // Early return is now safe
+  }
+
+  return <div>{data}</div>
+}
+```
+
+```tsx
+// ❌ CRITICALLY BAD - Multiple violations
+function UserProfile({ userId }: { userId: string }) {
+  const [user, setUser] = useState(null)
+
+  if (!userId) {
+    return <div>No user ID provided</div>
+  }
+
+  // ❌ ERROR! Hook called after conditional return
+  const { data } = useQuery({
+    queryKey: ['user', userId],
+    queryFn: () => fetchUser(userId),
+  })
+
+  // ❌ ERROR! Another hook after conditional return
+  useEffect(() => {
+    setUser(data)
+  }, [data])
+
+  return <div>{user?.name}</div>
+}
+
+// ✅ CORRECT - All hooks before any returns
+function UserProfile({ userId }: { userId: string }) {
+  const [user, setUser] = useState(null)
+
+  // ✅ CORRECT - All hooks called first
+  const { data } = useQuery({
+    queryKey: ['user', userId],
+    queryFn: () => fetchUser(userId),
+    enabled: !!userId,  // Use 'enabled' to conditionally execute query
+  })
+
+  useEffect(() => {
+    setUser(data)
+  }, [data])
+
+  // Early returns AFTER all hooks
+  if (!userId) {
+    return <div>No user ID provided</div>
+  }
+
+  return <div>{user?.name}</div>
+}
+```
+
+**Common Patterns to Avoid:**
+
+```tsx
+// ❌ BAD PATTERNS
+
+// Pattern 1: Hook after loading check
+if (isLoading) return <Spinner />
+useEffect(() => { ... }, [])  // ❌ Skipped when loading
+
+// Pattern 2: Hook after null check
+if (!data) return null
+const derived = useMemo(() => processData(data), [data])  // ❌ Skipped when no data
+
+// Pattern 3: Hook after error check
+if (error) return <Error />
+const mutation = useMutation({ ... })  // ❌ Skipped when error
+
+// Pattern 4: Hook after permission check
+if (!hasPermission) return <Unauthorized />
+const [value, setValue] = useState('')  // ❌ Skipped without permission
+```
+
+**Checklist for Every Component:**
+1. ✅ All `useState`, `useEffect`, `useMemo`, `useCallback`, `useQuery`, `useMutation` called first
+2. ✅ No early returns before all hooks
+3. ✅ No conditional hook calls
+4. ✅ No hooks inside if statements, loops, or functions
+
+**If you need conditional logic:**
+- Use conditional parameters inside hooks (e.g., `enabled` in useQuery)
+- Use conditional JSX in the return statement
+- Extract conditional logic to separate components
+
 #### Use Mutation/Query States Instead of Manual State Variables
 
 **ALWAYS use the built-in state from React Query mutations and queries** (`isPending`, `isLoading`, `isError`, etc.) instead of managing loading states manually with `useState`.
