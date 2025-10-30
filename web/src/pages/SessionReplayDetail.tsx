@@ -296,6 +296,34 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
     }
   }
 
+  // Helper function to format event data preview
+  const formatEventDataPreview = (eventData: any): string => {
+    // Check for meta event with href
+    if (isMetaEventData(eventData)) {
+      if (eventData.href) return eventData.href
+    }
+
+    // Check for incremental snapshot with source
+    if (isIncrementalSnapshotData(eventData)) {
+      if (eventData.source !== undefined) {
+        return INCREMENTAL_TYPES[
+          eventData.source as keyof typeof INCREMENTAL_TYPES
+        ]
+      }
+    }
+
+    // Fallback to JSON stringify
+    const str = JSON.stringify(eventData)
+    return str.length > 50 ? str.slice(0, 50) + '...' : str
+  }
+
+  // Helper function to format full event data
+  const formatEventData = (data: unknown): string => {
+    return typeof data === 'object' && data !== null
+      ? JSON.stringify(data, null, 2)
+      : String(data)
+  }
+
   return (
     <div className="container max-w-full py-6">
       <div className="mb-4 flex items-center justify-between">
@@ -430,30 +458,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
                               </div>
                               {firstEventData && (
                                 <div className="text-xs text-muted-foreground mt-1 font-mono truncate">
-                                  {(() => {
-                                    // Check for meta event with href
-                                    if (isMetaEventData(firstEventData)) {
-                                      if (firstEventData.href)
-                                        return firstEventData.href
-                                    }
-
-                                    // Check for incremental snapshot with source
-                                    if (
-                                      isIncrementalSnapshotData(firstEventData)
-                                    ) {
-                                      if (firstEventData.source !== undefined) {
-                                        return INCREMENTAL_TYPES[
-                                          firstEventData.source as keyof typeof INCREMENTAL_TYPES
-                                        ]
-                                      }
-                                    }
-
-                                    // Fallback to JSON stringify
-                                    const str = JSON.stringify(firstEventData)
-                                    return str.length > 50
-                                      ? str.slice(0, 50) + '...'
-                                      : str
-                                  })()}
+                                  {formatEventDataPreview(firstEventData)}
                                 </div>
                               )}
                             </div>
@@ -462,14 +467,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
                           {isSelected && firstEventData && (
                             <div className="mt-3 ml-[60px] p-2 bg-muted/30 rounded-md">
                               <pre className="text-xs overflow-x-auto">
-                                {(() => {
-                                  const data = firstEventData
-                                  const formattedData: string =
-                                    typeof data === 'object' && data !== null
-                                      ? JSON.stringify(data, null, 2)
-                                      : String(data)
-                                  return formattedData
-                                })()}
+                                {formatEventData(firstEventData)}
                               </pre>
                             </div>
                           )}

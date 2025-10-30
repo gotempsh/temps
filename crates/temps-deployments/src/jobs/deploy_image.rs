@@ -1248,7 +1248,7 @@ mod tests {
 
         let target = DeploymentTarget::Docker {
             registry_url: "local".to_string(),
-            network: Some("temps-network".to_string()),
+            network: Some(temps_core::NETWORK_NAME.to_string()),
         };
 
         // Create job with 2 replicas

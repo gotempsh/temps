@@ -509,7 +509,7 @@ impl WorkflowExecutionService {
                     .build_job_id(build_job_id)
                     .target(DeploymentTarget::Docker {
                         registry_url: "local".to_string(),
-                        network: Some("temps-network".to_string()),
+                        network: Some(temps_core::NETWORK_NAME.to_string()),
                     })
                     .service_name(deployment.slug.clone())
                     .namespace("default".to_string())

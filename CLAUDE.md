@@ -2117,13 +2117,22 @@ const syncMutation = useMutation({
 
 ### React Component Best Practices
 
-#### Avoid IFEs (Immediately Invoked Function Expressions) in JSX
+#### CRITICAL: NO IFEs (Immediately Invoked Function Expressions) in JSX
 
-**NEVER use auto-callable functions (IFEs) in React components.** Instead, extract logic into separate components, helper functions, or use proper React patterns.
+**🚫 ABSOLUTELY FORBIDDEN: NEVER use auto-callable functions (IFEs) in React components under ANY circumstances.**
 
-**Why?**
+IFEs violate React's rules of hooks and cause the error: **"Rendered more hooks than during the previous render" (React Error #310)**
+
+Instead, ALWAYS extract logic into:
+- Separate helper functions (preferred for simple logic)
+- Separate components (preferred for complex JSX)
+- useMemo/useCallback hooks (for expensive computations)
+
+**Why IFEs are FORBIDDEN:**
+- **Violates React's rules of hooks** - Can cause variable number of hooks between renders
+- **Causes React Error #310** - "Rendered more hooks than during the previous render"
 - Reduces code readability and maintainability
-- Makes components harder to test
+- Makes components impossible to test properly
 - Hides logic that should be in reusable components or helper functions
 - Creates unnecessary complexity in JSX
 
@@ -2252,21 +2261,17 @@ function EventList({ events }) {
 }
 ```
 
-**When IFEs are acceptable:**
-- Simple type casting that TypeScript requires (but prefer helper functions)
-- Very simple transformations that don't warrant a separate function (1-2 lines max)
+**There are NO exceptions to this rule. ALL IFEs must be replaced with helper functions or separate components.**
 
 ```tsx
-// Acceptable for simple type casting (but still prefer helper functions)
-<pre>
-  {(() => {
-    const data = event.data
-    const formatted: string = typeof data === 'object' && data !== null
-      ? JSON.stringify(data, null, 2)
-      : String(data)
-    return formatted
-  })()}
-</pre>
+// ✅ CORRECT - Even for "simple" type casting, use a helper function
+function formatEventData(data: unknown): string {
+  return typeof data === 'object' && data !== null
+    ? JSON.stringify(data, null, 2)
+    : String(data)
+}
+
+<pre>{formatEventData(event.data)}</pre>
 ```
 
 #### Use Mutation/Query States Instead of Manual State Variables

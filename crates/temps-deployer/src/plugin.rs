@@ -122,7 +122,7 @@ impl TempsPlugin for DeployerPlugin {
             let docker_runtime = Arc::new(DockerRuntime::new(
                 docker.clone(),
                 use_buildkit,
-                "temps-network".to_string(), // network_name
+                temps_core::NETWORK_NAME.to_string(),
             ));
 
             // Register the concrete service

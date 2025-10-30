@@ -183,6 +183,24 @@ const CustomTooltip = ({
   )
 }
 
+// Helper component to display score status
+interface ScoreStatusProps {
+  status: {
+    label: string
+    icon: React.ComponentType<{ className?: string }>
+    color: string
+  }
+}
+
+function ScoreStatus({ status }: ScoreStatusProps) {
+  return (
+    <div className="flex items-center gap-2">
+      <status.icon className={cn('h-4 w-4', status.color)} />
+      <span className={cn('font-medium', status.color)}>{status.label}</span>
+    </div>
+  )
+}
+
 interface ProjectSpeedInsightsProps {
   project: ProjectResponse
 }
@@ -697,19 +715,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
                     />
                   </div>
                   <div className="space-y-2">
-                    {(() => {
-                      const status = getScoreStatus(score)
-                      return (
-                        <div className="flex items-center gap-2">
-                          <status.icon
-                            className={cn('h-4 w-4', status.color)}
-                          />
-                          <span className={cn('font-medium', status.color)}>
-                            {status.label}
-                          </span>
-                        </div>
-                      )
-                    })()}
+                    <ScoreStatus status={getScoreStatus(score)} />
                     <p className="text-sm text-muted-foreground">
                       {score >= 90
                         ? 'Excellent performance'

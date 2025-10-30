@@ -209,6 +209,24 @@ export default function ProxyLogsList({
     }
   }
 
+  // Helper function to generate pagination button numbers
+  const getPaginationPages = (currentPage: number, totalPages: number) => {
+    const pageNumbers = []
+    const maxButtons = 5
+    let startPage = Math.max(1, currentPage - Math.floor(maxButtons / 2))
+    const endPage = Math.min(totalPages, startPage + maxButtons - 1)
+
+    if (endPage - startPage < maxButtons - 1) {
+      startPage = Math.max(1, endPage - maxButtons + 1)
+    }
+
+    for (let i = startPage; i <= endPage; i++) {
+      pageNumbers.push(i)
+    }
+
+    return pageNumbers
+  }
+
   return (
     <div className="space-y-4">
       <Card className="p-4">
@@ -469,38 +487,17 @@ export default function ProxyLogsList({
                   Previous
                 </Button>
                 <div className="flex items-center gap-1">
-                  {(() => {
-                    const pageNumbers = []
-                    const maxButtons = 5
-                    let startPage = Math.max(
-                      1,
-                      page - Math.floor(maxButtons / 2)
-                    )
-                    const endPage = Math.min(
-                      totalPages,
-                      startPage + maxButtons - 1
-                    )
-
-                    if (endPage - startPage < maxButtons - 1) {
-                      startPage = Math.max(1, endPage - maxButtons + 1)
-                    }
-
-                    for (let i = startPage; i <= endPage; i++) {
-                      pageNumbers.push(i)
-                    }
-
-                    return pageNumbers.map((pageNum) => (
-                      <Button
-                        key={pageNum}
-                        variant={pageNum === page ? 'default' : 'outline'}
-                        size="sm"
-                        onClick={() => setPage(pageNum)}
-                        className="w-10"
-                      >
-                        {pageNum}
-                      </Button>
-                    ))
-                  })()}
+                  {getPaginationPages(page, totalPages).map((pageNum) => (
+                    <Button
+                      key={pageNum}
+                      variant={pageNum === page ? 'default' : 'outline'}
+                      size="sm"
+                      onClick={() => setPage(pageNum)}
+                      className="w-10"
+                    >
+                      {pageNum}
+                    </Button>
+                  ))}
                 </div>
                 <Button
                   variant="outline"

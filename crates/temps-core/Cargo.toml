@@ -34,5 +34,6 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
+once_cell = { workspace = true }
 
 # Internal dependencies - only core dependencies to avoid cycles

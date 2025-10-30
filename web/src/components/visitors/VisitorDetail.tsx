@@ -135,6 +135,24 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
     setPage(1) // Reset to first page when limit changes
   }
 
+  // Helper function to generate pagination button numbers
+  const getPaginationPages = (currentPage: number, totalPages: number) => {
+    const pageNumbers = []
+    const maxButtons = 5
+    let startPage = Math.max(1, currentPage - Math.floor(maxButtons / 2))
+    const endPage = Math.min(totalPages, startPage + maxButtons - 1)
+
+    if (endPage - startPage < maxButtons - 1) {
+      startPage = Math.max(1, endPage - maxButtons + 1)
+    }
+
+    for (let i = startPage; i <= endPage; i++) {
+      pageNumbers.push(i)
+    }
+
+    return pageNumbers
+  }
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -559,27 +577,8 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                           Previous
                         </Button>
                         <div className="flex items-center gap-1">
-                          {(() => {
-                            const pageNumbers = []
-                            const maxButtons = 5
-                            let startPage = Math.max(
-                              1,
-                              page - Math.floor(maxButtons / 2)
-                            )
-                            const endPage = Math.min(
-                              totalPages,
-                              startPage + maxButtons - 1
-                            )
-
-                            if (endPage - startPage < maxButtons - 1) {
-                              startPage = Math.max(1, endPage - maxButtons + 1)
-                            }
-
-                            for (let i = startPage; i <= endPage; i++) {
-                              pageNumbers.push(i)
-                            }
-
-                            return pageNumbers.map((pageNum) => (
+                          {getPaginationPages(page, totalPages).map(
+                            (pageNum) => (
                               <Button
                                 key={pageNum}
                                 variant={
@@ -591,8 +590,8 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                               >
                                 {pageNum}
                               </Button>
-                            ))
-                          })()}
+                            )
+                          )}
                         </div>
                         <Button
                           variant="outline"
