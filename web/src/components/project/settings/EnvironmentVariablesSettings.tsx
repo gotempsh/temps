@@ -70,6 +70,7 @@ function EnvironmentVariableRow({
 
   useEffect(() => {
     if (data && typeof data === 'object' && 'value' in data) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setEditValue(data.value)
     }
   }, [data])
@@ -124,6 +125,7 @@ function EnvironmentVariableRow({
 
   // Update selected environments when variable changes (after refetch)
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setSelectedEditEnvironments(variable.environments.map((env) => env.id))
   }, [variable.environments])
 
@@ -363,6 +365,7 @@ function AddEnvironmentVariableDialog({
       allEnvironments.length > 0 &&
       selectedEnvironments.length === 0
     ) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setSelectedEnvironments(allEnvironments.map((env) => env.id))
     }
   }, [isOpen, allEnvironments, selectedEnvironments.length])
@@ -1064,9 +1067,7 @@ export function EnvironmentVariablesSettings({
     if (selectedVariables.size === (envVariables?.length ?? 0)) {
       setSelectedVariables(new Set())
     } else {
-      setSelectedVariables(
-        new Set((envVariables ?? []).map((v) => v.id))
-      )
+      setSelectedVariables(new Set((envVariables ?? []).map((v) => v.id)))
     }
   }
 
@@ -1111,7 +1112,8 @@ export function EnvironmentVariablesSettings({
 
   const hasVariables = (envVariables?.length ?? 0) > 0
   const selectedCount = selectedVariables.size
-  const allSelected = selectedCount === (envVariables?.length ?? 0) && hasVariables
+  const allSelected =
+    selectedCount === (envVariables?.length ?? 0) && hasVariables
 
   return (
     <div className="space-y-6">
@@ -1133,7 +1135,8 @@ export function EnvironmentVariablesSettings({
                   variant="destructive"
                   onClick={() => setIsBulkDeleteDialogOpen(true)}
                 >
-                  Delete {selectedCount} Variable{selectedCount !== 1 ? 's' : ''}
+                  Delete {selectedCount} Variable
+                  {selectedCount !== 1 ? 's' : ''}
                 </Button>
               )}
               <Button

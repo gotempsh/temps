@@ -480,8 +480,9 @@ impl WorkflowExecutionService {
                     .and_then(|v| serde_json::from_value::<HashMap<String, String>>(v.clone()).ok())
                     .unwrap_or_default();
                 debug!(
-                    "🌍 Using {} environment variables for deployment (from job config)",
-                    env_variables.len()
+                    "🌍 Using {} environment variables for deployment (from job config): {}",
+                    env_variables.len(),
+                    env_variables.keys().cloned().collect::<Vec<_>>().join(", ")
                 );
 
                 // Get dependencies to find the build job

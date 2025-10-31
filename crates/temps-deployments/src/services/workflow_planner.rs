@@ -24,7 +24,7 @@ pub struct JobDefinition {
 pub struct WorkflowPlanner {
     db: Arc<DatabaseConnection>,
     log_service: Arc<LogService>,
-    external_service_manager: Option<Arc<temps_providers::ExternalServiceManager>>,
+    external_service_manager: Arc<temps_providers::ExternalServiceManager>,
     config_service: Arc<temps_config::ConfigService>,
     dsn_service: Arc<temps_error_tracking::DSNService>,
 }
@@ -40,7 +40,7 @@ impl WorkflowPlanner {
         Self {
             db,
             log_service,
-            external_service_manager: Some(external_service_manager),
+            external_service_manager,
             config_service,
             dsn_service,
         }
@@ -109,40 +109,38 @@ impl WorkflowPlanner {
         );
 
         // Get runtime environment variables from each external service
-        if let Some(ref service_manager) = self.external_service_manager {
-            for project_service in project_services_list {
-                debug!(
-                    "Fetching runtime env vars for service ID {} (project: {}, environment: {})",
-                    project_service.service_id, project.id, environment.id
-                );
+        for project_service in project_services_list {
+            debug!(
+                "Fetching runtime env vars for service ID {} (project: {}, environment: {})",
+                project_service.service_id, project.id, environment.id
+            );
 
-                match service_manager
-                    .get_runtime_env_vars(project_service.service_id, project.id, environment.id)
-                    .await
-                {
-                    Ok(service_env_vars) => {
-                        debug!(
-                            "Got {} env vars from service {}",
-                            service_env_vars.len(),
-                            project_service.service_id
-                        );
-                        // Merge service env vars into the main map
-                        env_vars_map.extend(service_env_vars);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to get runtime env vars for service {}: {:?}",
-                            project_service.service_id, e
-                        );
-                    }
+            match self
+                .external_service_manager
+                .get_runtime_env_vars(project_service.service_id, project.id, environment.id)
+                .await
+            {
+                Ok(service_env_vars) => {
+                    debug!(
+                        "Got {} env vars from service {}: {}",
+                        service_env_vars.len(),
+                        project_service.service_id,
+                        service_env_vars
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    // Merge service env vars into the main map
+                    env_vars_map.extend(service_env_vars);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to get runtime env vars for service {}: {:?}",
+                        project_service.service_id, e
+                    );
                 }
             }
-        } else if !project_services_list.is_empty() {
-            warn!(
-                "Project has {} external services but ExternalServiceManager is not available. \
-                External service environment variables will NOT be included in deployment.",
-                project_services_list.len()
-            );
         }
 
         // 3. Get or create Sentry DSN for error tracking
@@ -194,8 +192,9 @@ impl WorkflowPlanner {
         }
 
         info!(
-            "Gathered {} total environment variables for deployment",
-            env_vars_map.len()
+            "Gathered {} total environment variables for deployment: {}",
+            env_vars_map.len(),
+            env_vars_map.keys().cloned().collect::<Vec<_>>().join(", ")
         );
         Ok(env_vars_map)
     }

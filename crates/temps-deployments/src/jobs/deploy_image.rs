@@ -581,6 +581,16 @@ impl DeployImageJob {
         // Use environment variables from config (PORT and HOST already included from workflow planner)
         let environment_vars = self.config.environment_variables.clone();
 
+        tracing::info!(
+            "🌍 Deploying container with {} environment variables: {}",
+            environment_vars.len(),
+            environment_vars
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
         // Create unique container name for each replica
         let container_name = if self.config.replicas > 1 {
             format!("{}-{}", self.config.service_name, replica_index + 1)

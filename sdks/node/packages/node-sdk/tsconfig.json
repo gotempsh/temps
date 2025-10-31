@@ -1,0 +1,34 @@
+{
+  "compilerOptions": {
+    // Enable latest features
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleDetection": "force",
+    "jsx": "react-jsx",
+    "allowJs": true,
+
+    // Bundler mode
+    "moduleResolution": "bundler",
+    "verbatimModuleSyntax": true,
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+
+    // Best practices
+    "strict": true,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
+
+    // Some stricter flags (disabled by default)
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noPropertyAccessFromIndexSignature": false,
+
+    // Declaration files
+    "declaration": true,
+    "declarationMap": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "scripts", "**/*.test.ts", "**/*.spec.ts", "vitest.config.ts"]
+}
