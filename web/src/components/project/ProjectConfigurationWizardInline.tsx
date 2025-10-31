@@ -1018,19 +1018,18 @@ export function ProjectConfigurationWizardInline({
       </Form>
 
       {/* Create Service Dialog */}
-      {selectedServiceType && (
-        <CreateServiceDialog
-          open={isCreateServiceDialogOpen}
-          onOpenChange={(open) => {
-            setIsCreateServiceDialogOpen(open)
-            if (!open) {
-              setSelectedServiceType(null)
-            }
-          }}
-          serviceType={selectedServiceType}
-          onSuccess={handleServiceCreated}
-        />
-      )}
+      {/* IMPORTANT: Always render the dialog (don't conditionally mount) to prevent hooks violations */}
+      <CreateServiceDialog
+        open={isCreateServiceDialogOpen && !!selectedServiceType}
+        onOpenChange={(open) => {
+          setIsCreateServiceDialogOpen(open)
+          if (!open) {
+            setSelectedServiceType(null)
+          }
+        }}
+        serviceType={selectedServiceType || 'postgres'}
+        onSuccess={handleServiceCreated}
+      />
     </div>
   )
 }

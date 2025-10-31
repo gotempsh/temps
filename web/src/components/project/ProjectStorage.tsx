@@ -41,6 +41,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
 import { CopyButton } from '../ui/copy-button'
+import { TimeAgo } from '@/components/utils/TimeAgo'
 
 function ServiceCard({
   service,
@@ -104,8 +105,16 @@ function ServiceCard({
                   </CollapsibleTrigger>
                 )}
               </CardTitle>
-              <CardDescription className="flex items-center gap-2">
+              <CardDescription className="flex items-center gap-2 flex-wrap">
                 <span>{service.service_type}</span>
+                {service.created_at && (
+                  <>
+                    <span>•</span>
+                    <span className="text-xs">
+                      Created <TimeAgo date={service.created_at} />
+                    </span>
+                  </>
+                )}
                 <span>•</span>
                 <Badge variant={isLinked ? 'default' : 'secondary'}>
                   {isLinked ? 'Linked' : 'Available'}

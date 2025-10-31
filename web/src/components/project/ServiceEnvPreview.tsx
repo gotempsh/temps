@@ -12,8 +12,7 @@ import {
 } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { ChevronDown, ChevronRight, Eye, EyeOff, Loader2 } from 'lucide-react'
-import { cn } from '@/lib/utils'
-import { CopyButton } from '../ui/copy-button'
+import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
 
 interface ServiceEnvPreviewProps {
   serviceId: number
@@ -55,8 +54,6 @@ export function ServiceEnvPreview({
       setShowPreview(true) // Auto-show preview when expanding
     }
   }
-
-  const envVarCount = envVars ? Object.keys(envVars).length : 0
 
   return (
     <Collapsible open={isOpen} onOpenChange={setIsOpen}>
@@ -140,49 +137,19 @@ export function ServiceEnvPreview({
             )}
 
             {envVars && showPreview && (
-              <div className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <p className="text-xs text-muted-foreground">
-                    {envVarCount} environment variable
-                    {envVarCount !== 1 ? 's' : ''} available
-                  </p>
-                  <div className="flex items-center gap-2">
-                    <CopyButton
-                      value={Object.entries(envVars)
-                        .map(([key, value]) => `${key}=${value}`)
-                        .join('\n')}
-                    />
-                    <Badge variant="secondary" className="text-xs">
-                      Masked Preview
-                    </Badge>
-                  </div>
-                </div>
-
-                {/* Code block style display */}
-                <div className="relative">
-                  <pre
-                    className={cn(
-                      'bg-muted/30 border rounded-md p-3 text-xs font-mono',
-                      'max-h-40 overflow-y-auto overflow-x-auto',
-                      'whitespace-pre-wrap break-all'
-                    )}
-                  >
-                    {Object.entries(envVars).map(([key, value], index) => (
-                      <span key={key}>
-                        <span className="text-primary font-medium">{key}</span>
-                        <span className="text-muted-foreground">=</span>
-                        <span className="text-foreground">{value}</span>
-                        {index < Object.entries(envVars).length - 1 ? '\n' : ''}
-                      </span>
-                    ))}
-                  </pre>
-                </div>
-
-                <p className="text-xs text-muted-foreground text-center">
+              <>
+                <EnvVariablesDisplay
+                  variables={envVars}
+                  showCopy={true}
+                  showMaskToggle={true}
+                  defaultMasked={true}
+                  maxHeight="10rem"
+                />
+                <p className="text-xs text-muted-foreground text-center mt-3">
                   These variables will be automatically available in your
                   deployed application
                 </p>
-              </div>
+              </>
             )}
           </CardContent>
         </CollapsibleContent>

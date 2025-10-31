@@ -79,7 +79,7 @@ pub struct PostgresConfig {
     pub database: String,
     pub username: String,
     pub password: String,
-    pub max_connections: u32,
+    pub max_connections: String,
     pub ssl_mode: Option<String>,
     pub docker_image: String,
 }
@@ -96,7 +96,7 @@ impl From<PostgresInputConfig> for PostgresConfig {
             database: input.database,
             username: input.username,
             password: input.password.unwrap_or_else(generate_password),
-            max_connections: input.max_connections,
+            max_connections: input.max_connections.to_string(),
             ssl_mode: input.ssl_mode,
             docker_image: input
                 .docker_image
@@ -211,11 +211,9 @@ impl PostgresService {
 
     fn get_postgres_config(&self, service_config: ServiceConfig) -> Result<PostgresConfig> {
         // Parse input config and transform to runtime config
-        let input_config: PostgresInputConfig =
-            serde_json::from_value(service_config.parameters)
-                .map_err(|e| anyhow::anyhow!("Failed to parse PostgreSQL configuration: {}", e))?;
-
-        Ok(PostgresConfig::from(input_config))
+        let input_config: PostgresConfig = serde_json::from_value(service_config.parameters)
+            .map_err(|e| anyhow::anyhow!("Failed to parse PostgreSQL configuration: {}", e))?;
+        Ok(input_config)
     }
     fn get_container_name(&self) -> String {
         format!("postgres-{}", self.name)
@@ -404,7 +402,7 @@ impl PostgresService {
     async fn create_database(&self, service_config: ServiceConfig, name: &str) -> Result<()> {
         let config: PostgresConfig = self.get_postgres_config(service_config)?;
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(config.max_connections)
+            .max_connections(config.max_connections.parse::<u32>()?)
             .connect(&format!(
                 "postgres://{}:{}@{}:{}/postgres",
                 config.username, config.password, config.host, config.port
@@ -1049,7 +1047,7 @@ mod tests {
         assert_eq!(runtime_config.host, "localhost");
         assert_eq!(runtime_config.database, "postgres");
         assert_eq!(runtime_config.username, "postgres");
-        assert_eq!(runtime_config.max_connections, 100);
+        assert_eq!(runtime_config.max_connections, "100");
         assert_eq!(runtime_config.docker_image, "postgres:17-alpine");
         assert!(runtime_config.password.len() >= 16); // Auto-generated password
     }

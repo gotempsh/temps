@@ -351,13 +351,31 @@ impl ExternalServiceManager {
             .await
             .map_err(ExternalServiceError::from)?;
 
-        // Initialize the service
-        self.initialize_service(service.id).await.map_err(|e| {
-            ExternalServiceError::InitializationFailed {
+        // Initialize the service - if this fails, delete the service record to maintain consistency
+        let init_result = self.initialize_service(service.id).await;
+        if let Err(e) = init_result {
+            // Initialization failed - clean up the database record
+            error!(
+                "Service initialization failed for service {}: {}. Rolling back database record.",
+                service.id, e
+            );
+
+            // Delete the service record
+            if let Err(delete_err) = external_services::Entity::delete_by_id(service.id)
+                .exec(self.db.as_ref())
+                .await
+            {
+                error!(
+                    "Failed to clean up service {} after initialization failure: {}",
+                    service.id, delete_err
+                );
+            }
+
+            return Err(ExternalServiceError::InitializationFailed {
                 id: service.id,
                 reason: e.to_string(),
-            }
-        })?;
+            });
+        }
 
         self.get_service_info(service.id).await
     }
@@ -1873,6 +1891,77 @@ mod tests {
         assert!(!ExternalServiceManager::is_sensitive_variable("username"));
         assert!(!ExternalServiceManager::is_sensitive_variable("port"));
         assert!(!ExternalServiceManager::is_sensitive_variable("host"));
+    }
+
+    #[tokio::test]
+    async fn test_create_service_with_invalid_params_rolls_back() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        // Create a Redis service with invalid port (email address)
+        let mut params = HashMap::new();
+        params.insert(
+            "port".to_string(),
+            JsonValue::String("dviejo@kfs.es".to_string()), // Invalid port
+        );
+        params.insert(
+            "host".to_string(),
+            JsonValue::String("localhost".to_string()),
+        );
+
+        let request = CreateExternalServiceRequest {
+            name: "invalid-redis".to_string(),
+            service_type: ServiceType::Redis,
+            version: Some("7".to_string()),
+            parameters: params,
+        };
+
+        // Attempt to create the service - should fail
+        let result = manager.create_service(request).await;
+        assert!(
+            result.is_err(),
+            "Expected service creation to fail with invalid port"
+        );
+
+        // Verify the error is an initialization failure
+        match result.unwrap_err() {
+            ExternalServiceError::InitializationFailed { id, reason } => {
+                // Verify the error message contains information about the invalid port
+                assert!(
+                    reason.contains("invalid port") || reason.contains("port specification"),
+                    "Expected error about invalid port, got: {}",
+                    reason
+                );
+
+                // Most importantly: verify the service record was NOT left in the database
+                let service_check = manager.get_service(id).await;
+                assert!(
+                    service_check.is_err(),
+                    "Service record should not exist after failed initialization"
+                );
+
+                // Verify it's specifically a "not found" error
+                match service_check.unwrap_err() {
+                    ExternalServiceError::ServiceNotFound { .. } => {
+                        // This is what we expect - service was properly cleaned up
+                    }
+                    other => panic!(
+                        "Expected ServiceNotFound error, got different error: {:?}",
+                        other
+                    ),
+                }
+            }
+            other => panic!(
+                "Expected InitializationFailed error, got different error: {:?}",
+                other
+            ),
+        }
+
+        // Double-check: list all services and verify our failed service is not there
+        let all_services = manager.list_services().await.unwrap();
+        assert!(
+            !all_services.iter().any(|s| s.name == "invalid-redis"),
+            "Failed service should not appear in service list"
+        );
     }
 
     #[tokio::test]

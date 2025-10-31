@@ -17,10 +17,10 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery } from '@tanstack/react-query'
-import { format } from 'date-fns'
 import { ArrowRight, RefreshCcw } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { TimeAgo } from '@/components/utils/TimeAgo'
 
 export function Storage() {
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -157,8 +157,7 @@ export function Storage() {
                       <span>{service.service_type}</span>
                       <span>•</span>
                       <span>
-                        Created{' '}
-                        {format(new Date(service.created_at), 'MMM d, yyyy')}
+                        Created <TimeAgo date={service.created_at} />
                       </span>
                     </CardDescription>
                   </div>

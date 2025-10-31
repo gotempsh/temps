@@ -2412,6 +2412,135 @@ const [value, setValue] = useState('')  // ❌ Skipped without permission
 - Use conditional JSX in the return statement
 - Extract conditional logic to separate components
 
+#### CRITICAL: NO Conditional Component Mounting for Components with Hooks
+
+**🚫 NEVER conditionally mount/unmount components that contain hooks (especially dialogs, modals, forms).**
+
+**Problem:** When you conditionally render a component with `{condition && <Component />}`, the component is **mounted and unmounted** each time the condition changes. This destroys all internal hooks state (useState, useForm, useQuery, etc.) and can cause errors when the component remounts.
+
+**Solution:** Always render the component and control its visibility through props (like `open` for dialogs).
+
+**Examples:**
+
+```tsx
+// ❌ CRITICALLY BAD - Conditionally mounting dialog component
+function MyWizard() {
+  const [selectedType, setSelectedType] = useState<string | null>(null)
+  const [isDialogOpen, setIsDialogOpen] = useState(false)
+
+  return (
+    <div>
+      <Button onClick={() => {
+        setSelectedType('postgres')
+        setIsDialogOpen(true)
+      }}>
+        Create Service
+      </Button>
+
+      {/* ❌ ERROR! Dialog unmounts when selectedType changes to null */}
+      {/* All form state, hooks are destroyed on unmount */}
+      {selectedType && (
+        <CreateServiceDialog
+          open={isDialogOpen}
+          serviceType={selectedType}
+          onOpenChange={setIsDialogOpen}
+        />
+      )}
+    </div>
+  )
+}
+
+// ✅ CORRECT - Always mounted, control visibility with open prop
+function MyWizard() {
+  const [selectedType, setSelectedType] = useState<string | null>(null)
+  const [isDialogOpen, setIsDialogOpen] = useState(false)
+
+  return (
+    <div>
+      <Button onClick={() => {
+        setSelectedType('postgres')
+        setIsDialogOpen(true)
+      }}>
+        Create Service
+      </Button>
+
+      {/* ✅ CORRECT - Dialog always mounted, only open state changes */}
+      <CreateServiceDialog
+        open={isDialogOpen && !!selectedType}
+        serviceType={selectedType || 'postgres'}
+        onOpenChange={(open) => {
+          setIsDialogOpen(open)
+          if (!open) setSelectedType(null)
+        }}
+      />
+    </div>
+  )
+}
+```
+
+```tsx
+// ❌ BAD - Conditionally mounting form component
+function UserProfile() {
+  const [isEditing, setIsEditing] = useState(false)
+
+  return (
+    <div>
+      {isEditing && <EditUserForm />}  {/* ❌ Unmounts and remounts */}
+    </div>
+  )
+}
+
+// ✅ GOOD - Control visibility with props or CSS
+function UserProfile() {
+  const [isEditing, setIsEditing] = useState(false)
+
+  return (
+    <div>
+      <EditUserForm
+        open={isEditing}
+        onOpenChange={setIsEditing}
+      />
+    </div>
+  )
+}
+
+// ✅ ALSO GOOD - Use conditional rendering only if component is stateless
+function UserProfile() {
+  const [isEditing, setIsEditing] = useState(false)
+
+  return (
+    <div>
+      {isEditing ? (
+        <EditUserForm onClose={() => setIsEditing(false)} />
+      ) : (
+        <ViewUserProfile onEdit={() => setIsEditing(true)} />
+      )}
+    </div>
+  )
+}
+```
+
+**When is conditional mounting safe?**
+- ✅ Stateless presentational components (no hooks, just props → JSX)
+- ✅ Simple components that don't use forms, queries, or complex state
+- ✅ Components that are intentionally designed to reset state on remount
+
+**When you MUST avoid conditional mounting:**
+- ❌ Dialog/Modal components with forms inside
+- ❌ Components using useForm, useQuery, useMutation
+- ❌ Components with complex useState or useEffect logic
+- ❌ Any component where you want to preserve state between visibility changes
+
+**Pattern for Dialogs/Modals:**
+```tsx
+// Always use this pattern for dialogs
+<Dialog open={isOpen && someCondition} onOpenChange={setIsOpen}>
+  <DialogContent>
+    {/* Form content */}
+  </DialogContent>
+</Dialog>
+```
+
 #### Use Mutation/Query States Instead of Manual State Variables
 
 **ALWAYS use the built-in state from React Query mutations and queries** (`isPending`, `isLoading`, `isError`, etc.) instead of managing loading states manually with `useState`.

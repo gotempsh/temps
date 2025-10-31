@@ -22,7 +22,7 @@ export function CreateServiceDialog({
 }: CreateServiceDialogProps) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+      <DialogContent className="max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Create {serviceType} Service</DialogTitle>
         </DialogHeader>

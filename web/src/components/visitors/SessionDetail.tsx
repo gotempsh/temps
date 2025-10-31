@@ -155,8 +155,8 @@ export function SessionDetail({
   }, [sessionLogs, logsLimit])
 
   const eventsTotalPages = React.useMemo(() => {
-    if (!sessionEvents?.total_events) return 0
-    return Math.ceil(sessionEvents.total_events / eventsLimit)
+    if (!sessionEvents?.total_count) return 0
+    return Math.ceil(sessionEvents.total_count / eventsLimit)
   }, [sessionEvents, eventsLimit])
 
   const formatDuration = (seconds: number) => {

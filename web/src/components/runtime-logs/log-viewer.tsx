@@ -91,6 +91,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   })
 
   // Fetch containers for selected environment
+  // IMPORTANT: Always refresh, never use cache
   const { data: containersData } = useQuery({
     ...listContainersOptions({
       path: {
@@ -99,6 +100,10 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
       },
     }),
     enabled: !!selectedTarget,
+    staleTime: 0, // Data is immediately stale
+    gcTime: 0, // Don't cache data (React Query v5)
+    refetchOnMount: 'always', // Always refetch on mount
+    refetchOnWindowFocus: true, // Refetch when window gains focus
   })
 
   // Auto-select first environment when environments are loaded

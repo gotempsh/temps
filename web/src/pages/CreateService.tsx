@@ -11,18 +11,26 @@ import { Button } from '@/components/ui/button'
 import {
   Form,
   FormControl,
+  FormDescription,
   FormField,
   FormItem,
   FormLabel,
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { DynamicForm } from '@/components/forms/DynamicForm'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { customAlphabet } from 'nanoid'
-import { ArrowLeft } from 'lucide-react'
+import { ArrowLeft, Loader2 } from 'lucide-react'
 import { useEffect, useMemo } from 'react'
 import { useForm } from 'react-hook-form'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
@@ -61,7 +69,7 @@ export function CreateService() {
   )
 
   // Fetch parameters for the selected service type
-  const { data: parameters, isLoading: isLoadingParameters } = useQuery({
+  const { data: parametersResponse, isLoading: isLoadingParameters } = useQuery({
     ...getServiceTypeParametersOptions({
       path: {
         service_type: serviceType || '',
@@ -70,22 +78,108 @@ export function CreateService() {
     enabled: !!serviceType,
   })
 
+  // Convert JSON schema to parameters array if needed
+  const parameters = useMemo(() => {
+    if (!parametersResponse) return undefined
+
+    // If it's already an array, return it
+    if (Array.isArray(parametersResponse)) return parametersResponse
+
+    // If it's a JSON schema with 'properties', convert to parameter array
+    if (
+      typeof parametersResponse === 'object' &&
+      parametersResponse !== null &&
+      'properties' in parametersResponse
+    ) {
+      const schema = parametersResponse as {
+        properties: Record<string, any>
+        required?: string[]
+      }
+
+      return Object.entries(schema.properties).map(([key, prop]) => ({
+        name: key,
+        description: prop.description || '',
+        default_value:
+          prop.default !== undefined && prop.default !== null
+            ? String(prop.default)
+            : '',
+        required: schema.required?.includes(key) || false,
+        encrypted:
+          key.toLowerCase().includes('password') ||
+          key.toLowerCase().includes('secret'),
+        validation_pattern: prop.pattern || undefined,
+        type:
+          prop.type === 'integer' ||
+          prop.format === 'uint32' ||
+          prop.format === 'int32'
+            ? 'number'
+            : 'string',
+        choices: prop.enum || undefined,
+      }))
+    }
+
+    return undefined
+  }, [parametersResponse])
+
   // Dynamically create the form schema based on parameters
-  const formSchema = useMemo(
-    () =>
-      z.object({
-        name: z.string().min(1, 'Name is required'),
-        service_type: z.string(),
-        parameters: z.record(z.string(), z.string()),
-      }),
-    []
-  )
+  const formSchema = useMemo(() => {
+    // Build dynamic parameter schema based on loaded parameters
+    const paramSchema: Record<
+      string,
+      z.ZodString | z.ZodOptional<z.ZodString>
+    > = {}
+
+    if (parameters && Array.isArray(parameters)) {
+      parameters.forEach((param) => {
+        if (param && typeof param === 'object' && 'name' in param) {
+          const paramName = param.name as string
+          const isRequired = (param as { required?: boolean }).required || false
+          const validationPattern = (param as { validation_pattern?: string })
+            .validation_pattern
+
+          // Start with base string validation
+          let fieldSchema = z.string()
+
+          // Add pattern validation if provided
+          if (validationPattern) {
+            fieldSchema = fieldSchema.regex(
+              new RegExp(validationPattern),
+              `Invalid format for ${paramName}`
+            )
+          }
+
+          // Make required or optional
+          if (isRequired) {
+            paramSchema[paramName] = fieldSchema.min(
+              1,
+              `${paramName} is required`
+            )
+          } else {
+            paramSchema[paramName] = fieldSchema.optional()
+          }
+        }
+      })
+    }
+
+    return z.object({
+      name: z
+        .string()
+        .min(1, 'Service name is required')
+        .regex(
+          /^[a-z0-9-]+$/,
+          'Name must contain only lowercase letters, numbers, and hyphens'
+        ),
+      service_type: z.string(),
+      parameters: z.object(paramSchema),
+    })
+  }, [parameters])
 
   type FormValues = z.infer<typeof formSchema>
 
   const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
-    mode: 'onSubmit',
+    mode: 'onChange', // Validate on change for immediate feedback
+    reValidateMode: 'onChange', // Revalidate on every change
     defaultValues: {
       name: defaultName,
       service_type: serviceType || '',
@@ -98,7 +192,11 @@ export function CreateService() {
     if (parameters) {
       const defaultParameters = parameters.reduce<Record<string, string>>(
         (acc, param) => {
-          acc[param.name] = param.default_value || ''
+          // Convert "null" string or empty to empty string
+          acc[param.name] =
+            param.default_value && param.default_value !== 'null'
+              ? param.default_value
+              : ''
           return acc
         },
         {}
@@ -119,11 +217,35 @@ export function CreateService() {
   })
 
   const onSubmit = async (values: FormValues) => {
+    // Convert numeric parameters from strings to numbers
+    const processedParameters: Record<string, any> = {}
+
+    if (parameters && Array.isArray(parameters)) {
+      for (const param of parameters) {
+        const value = values.parameters[param.name]
+
+        // For password/encrypted fields, always send empty string even if empty
+        if (param.encrypted) {
+          processedParameters[param.name] = value || ''
+        } else if (value !== undefined && value !== '' && value !== null) {
+          // Convert to number if the parameter type is 'number'
+          if (param.type === 'number') {
+            processedParameters[param.name] = Number(value)
+          } else {
+            processedParameters[param.name] = value
+          }
+        }
+      }
+    } else {
+      // Fallback if parameters is not an array
+      Object.assign(processedParameters, values.parameters)
+    }
+
     await createServiceMut.mutateAsync({
       body: {
         service_type: values.service_type as ServiceTypeRoute,
         name: values.name,
-        parameters: values.parameters as Record<string, string>,
+        parameters: processedParameters,
       },
     })
   }
@@ -263,7 +385,13 @@ export function CreateService() {
                             <Input
                               {...field}
                               value={field.value as string}
-                              type={param.encrypted ? 'password' : 'text'}
+                              type={
+                                param.encrypted
+                                  ? 'password'
+                                  : param.type === 'number'
+                                    ? 'number'
+                                    : 'text'
+                              }
                               required={param.required}
                               pattern={param.validation_pattern || undefined}
                               placeholder={param.default_value || undefined}
@@ -357,7 +485,13 @@ export function CreateService() {
                           <Input
                             {...field}
                             value={field.value as string}
-                            type={param.encrypted ? 'password' : 'text'}
+                            type={
+                              param.encrypted
+                                ? 'password'
+                                : param.type === 'number'
+                                  ? 'number'
+                                  : 'text'
+                            }
                             required={param.required}
                             pattern={param.validation_pattern || undefined}
                             placeholder={param.default_value || undefined}
@@ -384,7 +518,10 @@ export function CreateService() {
               >
                 Cancel
               </Button>
-              <Button type="submit" disabled={createServiceMut.isPending}>
+              <Button
+                type="submit"
+                disabled={createServiceMut.isPending || !form.formState.isValid}
+              >
                 {createServiceMut.isPending ? (
                   <>
                     <Loader2 className="h-4 w-4 mr-2 animate-spin" />
