@@ -142,7 +142,7 @@ export function ProjectOverview({
           <Skeleton className="h-24" />
         ) : visitorError ? (
           <MetricCard
-            title="Visitors last 24 hours"
+            title="Visitors last 24 hours (Unique)"
             icon={<Users />}
             value="Error"
             change=""

@@ -1,12 +1,17 @@
-import express, { type Request, type Response, type NextFunction } from 'express';
-import * as Sentry from '@sentry/node';
-import { createTransport } from '@sentry/core';
+import express, {
+  type Request,
+  type Response,
+  type NextFunction,
+} from "express";
+import * as Sentry from "@sentry/node";
+import { createTransport } from "@sentry/core";
 
 const app = express();
 const port = process.env.PORT ? Number(process.env.PORT) : 3001;
-const DSN_REGEX = /^(?:(\w+):)\/\/(?:(\w+)(?::(\w+)?)?@)([\w.-]+)(?::(\d+))?\/(.+)/;
+const DSN_REGEX =
+  /^(?:(\w+):)\/\/(?:(\w+)(?::(\w+)?)?@)([\w.-]+)(?::(\d+))?\/(.+)/;
 
-const sentryDsn = 'https://b190cf474c1306fc10c8985353021cdd0da418a081f4d85d731854527fd7e7e0@app.tempslocal.kfs.es/1';
+const sentryDsn = process.env.SENTRY_DSN;
 const match = sentryDsn.match(DSN_REGEX);
 if (match) {
   const [, protocol, publicKey, host, projectId] = match;
@@ -26,57 +31,66 @@ function makeFetchTransport(options: any) {
 
     const requestOptions: RequestInit = {
       body: request.body,
-      method: 'POST',
-      referrerPolicy: 'origin',
+      method: "POST",
+      referrerPolicy: "origin",
       headers: options.headers,
       ...options.fetchOptions,
     };
 
-    return fetch(options.url, requestOptions).then(async response => {
-      // Read response body for logging
-      let responseBody = '';
-      try {
-        responseBody = await response.text();
-        // console.log('📥 Response from Sentry API:', {
-        //   status: response.status,
-        //   statusText: response.statusText,
-        //   headers: {
-        //     'x-sentry-rate-limits': response.headers.get('X-Sentry-Rate-Limits'),
-        //     'retry-after': response.headers.get('Retry-After'),
-        //     'content-type': response.headers.get('Content-Type'),
-        //   },
-        //   body: responseBody,
-        //   timestamp: new Date().toISOString(),
-        // });
-      } catch (bodyError) {
-        console.log('📥 Response from Sentry API (no body):', {
-          status: response.status,
-          statusText: response.statusText,
+    return fetch(options.url, requestOptions)
+      .then(async (response) => {
+        // Read response body for logging
+        let responseBody = "";
+        try {
+          responseBody = await response.text();
+          // console.log('📥 Response from Sentry API:', {
+          //   status: response.status,
+          //   statusText: response.statusText,
+          //   headers: {
+          //     'x-sentry-rate-limits': response.headers.get('X-Sentry-Rate-Limits'),
+          //     'retry-after': response.headers.get('Retry-After'),
+          //     'content-type': response.headers.get('Content-Type'),
+          //   },
+          //   body: responseBody,
+          //   timestamp: new Date().toISOString(),
+          // });
+        } catch (bodyError) {
+          console.log("📥 Response from Sentry API (no body):", {
+            status: response.status,
+            statusText: response.statusText,
+            headers: {
+              "x-sentry-rate-limits": response.headers.get(
+                "X-Sentry-Rate-Limits"
+              ),
+              "retry-after": response.headers.get("Retry-After"),
+              "content-type": response.headers.get("Content-Type"),
+            },
+            timestamp: new Date().toISOString(),
+          });
+          console.error(
+            "❌ Error reading response body:",
+            bodyError instanceof Error ? bodyError.message : String(bodyError)
+          );
+        }
+
+        return {
+          statusCode: response.status,
           headers: {
-            'x-sentry-rate-limits': response.headers.get('X-Sentry-Rate-Limits'),
-            'retry-after': response.headers.get('Retry-After'),
-            'content-type': response.headers.get('Content-Type'),
+            "x-sentry-rate-limits": response.headers.get(
+              "X-Sentry-Rate-Limits"
+            ),
+            "retry-after": response.headers.get("Retry-After"),
           },
+        };
+      })
+      .catch((error) => {
+        console.error("❌ Error sending to Sentry API:", {
+          error: error.message,
+          url: options.url,
           timestamp: new Date().toISOString(),
         });
-        console.error('❌ Error reading response body:', bodyError instanceof Error ? bodyError.message : String(bodyError));
-      }
-
-      return {
-        statusCode: response.status,
-        headers: {
-          'x-sentry-rate-limits': response.headers.get('X-Sentry-Rate-Limits'),
-          'retry-after': response.headers.get('Retry-After'),
-        },
-      };
-    }).catch(error => {
-      console.error('❌ Error sending to Sentry API:', {
-        error: error.message,
-        url: options.url,
-        timestamp: new Date().toISOString(),
+        throw error;
       });
-      throw error;
-    });
   }
 
   return createTransport(options, makeRequest);
@@ -107,10 +121,10 @@ Sentry.init({
   autoSessionTracking: true,
 
   // Release Tracking
-  release: 'sentry-example@1.0.0',
+  release: "sentry-example@1.0.0",
 
   // Environment
-  environment: process.env.NODE_ENV || 'development',
+  environment: process.env.NODE_ENV || "development",
 
   // Integrations
   integrations: [
@@ -128,7 +142,7 @@ Sentry.init({
 
   // Before send hook to log what's being sent
   beforeSend: (event: Sentry.Event, hint?: Sentry.EventHint) => {
-    console.log('Sending event to Sentry:', {
+    console.log("Sending event to Sentry:", {
       event_id: event.event_id,
       message: event.message,
       exception: event.exception,
@@ -140,7 +154,7 @@ Sentry.init({
 
   // Before send transaction hook
   beforeSendTransaction: (event, hint) => {
-    console.log('Sending transaction to Sentry:', {
+    console.log("Sending transaction to Sentry:", {
       event_id: event.event_id,
       transaction: (event as any).transaction,
       type: event.type,
@@ -160,22 +174,22 @@ app.use(Sentry.Handlers.requestHandler() as express.RequestHandler);
 app.use(express.json());
 
 // Root route
-app.get('/', (req: Request, res: Response) => {
+app.get("/", (req: Request, res: Response) => {
   res.json({
-    message: 'Sentry Integration Example',
+    message: "Sentry Integration Example",
     routes: {
-      '/': 'This info page',
-      '/test-error': 'Throws a basic error',
-      '/test-warning': 'Sends a warning message',
-      '/test-transaction': 'Creates a performance transaction',
-      '/test-breadcrumb': 'Adds breadcrumbs then errors',
-      '/test-user-context': 'Error with user context',
-      '/test-tags': 'Error with custom tags',
-      '/test-500': 'Returns 500 status',
-      '/debug-sentry': 'Triggers Sentry debug test',
+      "/": "This info page",
+      "/test-error": "Throws a basic error",
+      "/test-warning": "Sends a warning message",
+      "/test-transaction": "Creates a performance transaction",
+      "/test-breadcrumb": "Adds breadcrumbs then errors",
+      "/test-user-context": "Error with user context",
+      "/test-tags": "Error with custom tags",
+      "/test-500": "Returns 500 status",
+      "/debug-sentry": "Triggers Sentry debug test",
     },
     sentry: {
-      dsn: 'http://localhost/1',
+      dsn: "http://localhost/1",
       environment: Sentry.getCurrentHub().getClient()?.getOptions().environment,
       release: Sentry.getCurrentHub().getClient()?.getOptions().release,
     },
@@ -183,30 +197,32 @@ app.get('/', (req: Request, res: Response) => {
 });
 
 // Basic error test
-app.get('/test-error', (req: Request, res: Response) => {
-  console.log('Testing basic error...');
-  throw new Error('Test error from Sentry integration example!');
+app.get("/test-error", (req: Request, res: Response) => {
+  console.log("Testing basic error...");
+  throw new Error("Test error from Sentry integration example!");
 });
 
 // Warning message test
-app.get('/test-warning', (req: Request, res: Response) => {
-  console.log('Sending warning to Sentry...');
-  Sentry.captureMessage('Test warning message', 'warning');
-  res.json({ message: 'Warning sent to Sentry' });
+app.get("/test-warning", (req: Request, res: Response) => {
+  console.log("Sending warning to Sentry...");
+  Sentry.captureMessage("Test warning message", "warning");
+  res.json({ message: "Warning sent to Sentry" });
 });
 
 // Performance transaction test
-app.get('/test-transaction', async (req: Request, res: Response) => {
+app.get("/test-transaction", async (req: Request, res: Response) => {
   const transaction = Sentry.startTransaction({
-    op: 'test-performance',
-    name: 'Test Performance Transaction',
+    op: "test-performance",
+    name: "Test Performance Transaction",
   });
 
-  Sentry.getCurrentHub().configureScope((scope: Sentry.Scope) => scope.setSpan(transaction));
+  Sentry.getCurrentHub().configureScope((scope: Sentry.Scope) =>
+    scope.setSpan(transaction)
+  );
 
   const span1 = transaction.startChild({
-    op: 'db.query',
-    description: 'SELECT * FROM users',
+    op: "db.query",
+    description: "SELECT * FROM users",
   });
 
   // Simulate database query
@@ -214,8 +230,8 @@ app.get('/test-transaction', async (req: Request, res: Response) => {
   span1.finish();
 
   const span2 = transaction.startChild({
-    op: 'http.request',
-    description: 'GET /api/external',
+    op: "http.request",
+    description: "GET /api/external",
   });
 
   // Simulate HTTP request
@@ -224,72 +240,72 @@ app.get('/test-transaction', async (req: Request, res: Response) => {
 
   transaction.finish();
 
-  res.json({ message: 'Performance transaction recorded' });
+  res.json({ message: "Performance transaction recorded" });
 });
 
 // Breadcrumb test
-app.get('/test-breadcrumb', (req: Request, res: Response) => {
-  console.log('Testing breadcrumbs...');
+app.get("/test-breadcrumb", (req: Request, res: Response) => {
+  console.log("Testing breadcrumbs...");
 
   Sentry.addBreadcrumb({
-    message: 'User clicked test-breadcrumb',
-    level: 'info',
-    category: 'user-action',
+    message: "User clicked test-breadcrumb",
+    level: "info",
+    category: "user-action",
     timestamp: Date.now() / 1000,
   });
 
   Sentry.addBreadcrumb({
-    message: 'Loading user data',
-    level: 'info',
-    category: 'data-fetch',
+    message: "Loading user data",
+    level: "info",
+    category: "data-fetch",
     data: {
-      userId: '12345',
-      action: 'fetch',
+      userId: "12345",
+      action: "fetch",
     },
   });
 
   Sentry.addBreadcrumb({
-    message: 'User data validation failed',
-    level: 'warning',
-    category: 'validation',
+    message: "User data validation failed",
+    level: "warning",
+    category: "validation",
   });
 
   // Now throw an error - breadcrumbs will be attached
-  throw new Error('Error after breadcrumbs were added');
+  throw new Error("Error after breadcrumbs were added");
 });
 
 // User context test
-app.get('/test-user-context', (req: Request, res: Response) => {
-  console.log('Testing user context...');
+app.get("/test-user-context", (req: Request, res: Response) => {
+  console.log("Testing user context...");
 
   Sentry.setUser({
-    id: '12345',
-    username: 'testuser',
-    email: 'test@example.com',
+    id: "12345",
+    username: "testuser",
+    email: "test@example.com",
     ip_address: req.ip,
   });
 
-  Sentry.setContext('additional_info', {
-    subscription: 'premium',
-    signup_date: '2024-01-15',
+  Sentry.setContext("additional_info", {
+    subscription: "premium",
+    signup_date: "2024-01-15",
     last_login: new Date().toISOString(),
   });
 
-  throw new Error('Error with user context attached');
+  throw new Error("Error with user context attached");
 });
 
 // Custom tags test
-app.get('/test-tags', (req: Request, res: Response) => {
-  console.log('Testing custom tags...');
+app.get("/test-tags", (req: Request, res: Response) => {
+  console.log("Testing custom tags...");
 
-  Sentry.setTag('module', 'payment');
-  Sentry.setTag('customer_type', 'premium');
-  Sentry.setTag('feature_flag', 'new_checkout_enabled');
-  Sentry.setTag('api_version', 'v2');
+  Sentry.setTag("module", "payment");
+  Sentry.setTag("customer_type", "premium");
+  Sentry.setTag("feature_flag", "new_checkout_enabled");
+  Sentry.setTag("api_version", "v2");
 
-  Sentry.setExtra('request_details', {
-    user_agent: req.get('user-agent'),
-    referer: req.get('referer'),
+  Sentry.setExtra("request_details", {
+    user_agent: req.get("user-agent"),
+    referer: req.get("referer"),
     query_params: req.query,
   });
 
@@ -298,47 +314,47 @@ app.get('/test-tags', (req: Request, res: Response) => {
     code?: string;
     statusCode?: number;
   }
-  const error: CustomError = new Error('Error with custom tags and extra data');
-  error.code = 'PAYMENT_FAILED';
+  const error: CustomError = new Error("Error with custom tags and extra data");
+  error.code = "PAYMENT_FAILED";
   error.statusCode = 402;
 
   throw error;
 });
 
 // Return 500 status without throwing
-app.get('/test-500', (req: Request, res: Response) => {
-  console.log('Returning 500 status...');
+app.get("/test-500", (req: Request, res: Response) => {
+  console.log("Returning 500 status...");
 
   // Log to Sentry without throwing
-  Sentry.captureException(new Error('500 Internal Server Error (handled)'), {
+  Sentry.captureException(new Error("500 Internal Server Error (handled)"), {
     tags: {
       handled: true,
-      endpoint: '/test-500',
+      endpoint: "/test-500",
     },
-    level: 'error',
+    level: "error",
   });
 
   res.status(500).json({
-    error: 'Internal Server Error',
-    message: 'This is a handled 500 error',
+    error: "Internal Server Error",
+    message: "This is a handled 500 error",
   });
 });
 
 // Sentry debug test endpoint
-app.get('/debug-sentry', (req: Request, res: Response) => {
-  console.log('Running Sentry debug test...');
-  Sentry.captureMessage('Sentry debug test message', 'debug');
+app.get("/debug-sentry", (req: Request, res: Response) => {
+  console.log("Running Sentry debug test...");
+  Sentry.captureMessage("Sentry debug test message", "debug");
   res.json({
-    message: 'Debug message sent',
+    message: "Debug message sent",
     sentry_configured: !!Sentry.getCurrentHub().getClient(),
   });
 });
 
 // Health check
-app.get('/health', (req: Request, res: Response) => {
+app.get("/health", (req: Request, res: Response) => {
   const client = Sentry.getCurrentHub().getClient();
   res.json({
-    status: 'ok',
+    status: "ok",
     timestamp: new Date().toISOString(),
     sentry: {
       enabled: !!client,
@@ -366,16 +382,16 @@ app.use(
     res: Response,
     next: NextFunction // eslint-disable-line @typescript-eslint/no-unused-vars
   ) => {
-    console.error('Error caught by Express:', err);
+    console.error("Error caught by Express:", err);
 
     const statusCode = err.statusCode || err.status || 500;
     res.status(statusCode).json({
       error: {
-        message: err.message || 'Internal Server Error',
+        message: err.message || "Internal Server Error",
         status: statusCode,
         timestamp: new Date().toISOString(),
         sentry_id: (res as any).sentry,
-        ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
+        ...(process.env.NODE_ENV === "development" && { stack: err.stack }),
       },
     });
   }
@@ -398,7 +414,7 @@ app.listen(port, () => {
   console.log(`   GET /health             - Health check`);
   console.log(`\n🔍 Sentry configured with:`);
   console.log(`   DSN: http://localhost/1`);
-  console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`   Environment: ${process.env.NODE_ENV || "development"}`);
   console.log(`   Debug: enabled`);
   console.log(`   Traces Sample Rate: 100%`);
   console.log(`   Profiles Sample Rate: 100%\n`);
