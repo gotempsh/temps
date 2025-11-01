@@ -11,7 +11,7 @@ const port = process.env.PORT ? Number(process.env.PORT) : 3001;
 const DSN_REGEX =
   /^(?:(\w+):)\/\/(?:(\w+)(?::(\w+)?)?@)([\w.-]+)(?::(\d+))?\/(.+)/;
 
-const sentryDsn = process.env.SENTRY_DSN;
+const sentryDsn = process.env.SENTRY_DSN as string;
 const match = sentryDsn.match(DSN_REGEX);
 if (match) {
   const [, protocol, publicKey, host, projectId] = match;

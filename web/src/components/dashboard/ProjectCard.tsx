@@ -3,6 +3,7 @@ import { ProjectResponse } from '@/api/client'
 import {
   getHourlyVisitsOptions,
   getLastDeploymentOptions,
+  getUniqueCountsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
@@ -52,10 +53,24 @@ export function ProjectCard({ project, shortcutNumber }: ProjectCardProps) {
     refetchInterval: 1000 * 60, // Refetch every minute for fresh data
   })
 
-  const totalVisitors = useMemo(() => {
-    if (!hourlyVisitorsQuery.data) return 0
-    return hourlyVisitorsQuery.data.reduce((acc, curr) => acc + curr.count, 0)
-  }, [hourlyVisitorsQuery.data])
+  // Get unique visitor count (not sum of hourly counts which includes duplicates)
+  const uniqueVisitorsQuery = useQuery({
+    ...getUniqueCountsOptions({
+      path: { project_id: project.id },
+      query: {
+        start_date: startDate.toISOString(),
+        end_date: endDate.toISOString(),
+        metric: 'visitors',
+      },
+    }),
+    staleTime: 1000 * 60 * 5, // 5 minutes
+    refetchInterval: 1000 * 60, // Refetch every minute
+  })
+
+  const totalVisitors = useMemo(
+    () => uniqueVisitorsQuery.data?.count || 0,
+    [uniqueVisitorsQuery.data]
+  )
 
   // Fetch last deployment to get screenshot (added after existing hooks)
   const { data: lastDeployment } = useQuery({
@@ -120,7 +135,7 @@ export function ProjectCard({ project, shortcutNumber }: ProjectCardProps) {
           </div>
 
           {/* Analytics Section */}
-          {hourlyVisitorsQuery.isLoading ? (
+          {hourlyVisitorsQuery.isLoading || uniqueVisitorsQuery.isLoading ? (
             <>
               <div className="mt-3 flex items-baseline gap-2">
                 <Skeleton className="h-8 w-16" />
@@ -133,7 +148,7 @@ export function ProjectCard({ project, shortcutNumber }: ProjectCardProps) {
                 <Skeleton className="h-full w-full" />
               </div>
             </>
-          ) : hourlyVisitorsQuery.isError ? (
+          ) : hourlyVisitorsQuery.isError || uniqueVisitorsQuery.isError ? (
             <div className="mt-3 flex items-center gap-2 text-sm text-muted-foreground">
               <AlertCircle className="h-4 w-4" />
               <span>Unable to load analytics</span>
