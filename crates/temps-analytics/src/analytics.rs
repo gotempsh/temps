@@ -1089,7 +1089,7 @@ impl Analytics for AnalyticsService {
         Ok(Some(SessionLogsResponse {
             session_id,
             logs,
-            total_count: total_count,
+            total_count: total_count as i64,
             offset: offset_val as i32,
             limit: limit_val as i32,
         }))
