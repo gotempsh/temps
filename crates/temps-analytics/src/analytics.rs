@@ -1089,7 +1089,7 @@ impl Analytics for AnalyticsService {
         Ok(Some(SessionLogsResponse {
             session_id,
             logs,
-            total_count: total_count as i64,
+            total_count: total_count,
             offset: offset_val as i32,
             limit: limit_val as i32,
         }))
@@ -1671,40 +1671,42 @@ WHERE project_id = $1
     ) -> Result<crate::types::responses::GeneralStatsResponse, AnalyticsError> {
         // Query to get overall stats across all projects
         let total_stats_sql = r#"
-            WITH visitor_stats AS (
-                SELECT
-                    COUNT(DISTINCT v.id) as unique_visitors,
-                    COUNT(DISTINCT rs.id) as total_visits,
-                    COUNT(DISTINCT e.id) as total_events
-                FROM visitor v
-                INNER JOIN events e ON v.id = e.visitor_id
-                    AND e.timestamp >= $1 AND e.timestamp <= $2
-                LEFT JOIN request_sessions rs ON v.id = rs.visitor_id
-                    AND rs.started_at >= $1 AND rs.started_at <= $2
-                WHERE v.first_seen >= $1 AND v.last_seen <= $2
-            ),
-            page_views AS (
-                SELECT COUNT(DISTINCT e.visitor_id) as total_page_views
-                FROM events e
-                INNER JOIN visitor v ON e.visitor_id = v.id
-                WHERE e.event_type = 'page_view'
-                AND e.timestamp >= $1 AND e.timestamp <= $2
-            ),
-            project_count AS (
-                SELECT COUNT(*) as total_projects
-                FROM projects p
-            )
+            -- Optimized: avoids join fan-out, uses half-open (>= $1 AND < $2) intervals
+            WITH
+                unique_visitors AS (
+                    SELECT COUNT(DISTINCT e.visitor_id) AS n
+                    FROM events e
+                    WHERE e.timestamp >= $1 AND e.timestamp < $2
+                ),
+                total_visits AS (
+                    SELECT COUNT(*) AS n
+                    FROM request_sessions rs
+                    WHERE rs.started_at >= $1 AND rs.started_at < $2
+                ),
+                total_events AS (
+                    SELECT COUNT(*) AS n
+                    FROM events e
+                    WHERE e.timestamp >= $1 AND e.timestamp < $2
+                ),
+                total_page_views AS (
+                    SELECT COUNT(*) AS n
+                    FROM events e
+                    WHERE e.event_type = 'page_view'
+                      AND e.timestamp >= $1 AND e.timestamp < $2
+                ),
+                total_projects AS (
+                    SELECT COUNT(*) AS n
+                    FROM projects p
+                )
             SELECT
-                vs.unique_visitors,
-                vs.total_visits,
-                pv.total_page_views,
-                vs.total_events,
-                pc.total_projects,
+                unique_visitors.n AS unique_visitors,
+                total_visits.n AS total_visits,
+                total_page_views.n AS total_page_views,
+                total_events.n AS total_events,
+                total_projects.n AS total_projects,
                 0.0::double precision as avg_bounce_rate,
                 0.0::double precision as avg_engagement_rate
-            FROM visitor_stats vs
-            CROSS JOIN page_views pv
-            CROSS JOIN project_count pc
+            FROM unique_visitors, total_visits, total_page_views, total_events, total_projects
         "#;
 
         #[derive(FromQueryResult)]

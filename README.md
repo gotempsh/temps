@@ -22,13 +22,15 @@
 
 ```bash
 # 1. Start PostgreSQL with TimescaleDB (one-time setup, runs on port 15432 to avoid conflicts)
+docker volume create temps-postgres
 docker run -d \
   --name temps-postgres \
+  -v temps-postgres:/var/lib/postgresql/data \
   -e POSTGRES_USER=postgres \
   -e POSTGRES_PASSWORD=temps \
   -e POSTGRES_DB=temps \
-  -p 15432:5432 \
-  timescale/timescaledb-ha:pg16
+  -p 16432:5432 \
+  timescale/timescaledb:latest-pg18
 
 # 2. Install Temps with one command
 curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash
@@ -39,13 +41,11 @@ source ~/.zshrc  # or ~/.bashrc
 # 3. Start Temps
 temps serve \
   --address 0.0.0.0:8080 \
-  --database-url postgresql://postgres:temps@localhost:15432/temps
+  --database-url postgresql://postgres:temps@localhost:16432/temps
 
-# 4. Open http://localhost:8080 in your browser
+# 4. Open http://localhost:8080 in your browser and follow the onboarding
 
-# 5. Connect GitHub/GitLab → Select repository → Click "Deploy"
-
-# ✅ Your app is now live with:
+# 5. After completing the onboarding, your app is now live with:
 #    • HTTPS (automatic TLS)
 #    • Analytics
 #    • Error tracking
