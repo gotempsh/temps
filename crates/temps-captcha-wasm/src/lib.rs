@@ -217,36 +217,40 @@ mod tests {
 
     #[test]
     fn test_verify_solution() {
-        // Test verification with a known solution
-        // This is a weak difficulty for testing purposes
-        let challenge = "test_challenge";
-        let difficulty = 2; // Very low difficulty for testing
+        // Test verification with realistic difficulty (matches production: difficulty=20)
+        // This test takes ~0.5-1.5 seconds to run, simulating actual PoW computation
+        let challenge = "test_challenge_realistic_pow";
+        let difficulty = 20; // Production difficulty: ~1M hash attempts
 
         // Find a solution
         let mut nonce = 0u64;
+        let start = std::time::Instant::now();
         loop {
             let hash = compute_hash(challenge, nonce);
             if has_leading_zero_bits(&hash, difficulty) {
+                let elapsed = start.elapsed();
+                println!("✅ PoW solution found in {:?}", elapsed);
+
                 // Found a solution, verify it
                 let result = verify_solution(challenge.to_string(), nonce.to_string(), difficulty);
-                assert!(result);
+                assert!(result, "Solution verification should pass");
 
                 // Verify with wrong difficulty fails
                 let result_wrong_diff =
                     verify_solution(challenge.to_string(), nonce.to_string(), difficulty + 1);
-                assert!(!result_wrong_diff);
+                assert!(!result_wrong_diff, "Wrong difficulty should fail");
 
                 // Verify with wrong nonce fails
                 let result_wrong_nonce =
                     verify_solution(challenge.to_string(), (nonce + 1).to_string(), difficulty);
-                assert!(!result_wrong_nonce);
+                assert!(!result_wrong_nonce, "Wrong nonce should fail");
 
                 break;
             }
             nonce += 1;
             assert!(
-                nonce < 10000,
-                "Should find solution quickly with difficulty=2"
+                nonce < 5_000_000,
+                "Should find solution within 5M attempts for difficulty=20"
             );
         }
     }
