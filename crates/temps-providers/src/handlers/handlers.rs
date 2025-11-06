@@ -26,6 +26,7 @@ use crate::handlers::types::{
     CreateExternalServiceRequest, EnvironmentVariableInfo, ExternalServiceDetails,
     ExternalServiceInfo, LinkServiceRequest, ProjectServiceInfo, ProviderMetadata,
     ServiceParameter, ServiceTypeInfo, ServiceTypeRoute, UpdateExternalServiceRequest,
+    UpgradeExternalServiceRequest,
 };
 use temps_core::AuditContext;
 use temps_core::RequestMetadata;
@@ -118,6 +119,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/external-services/{id}/health", get(check_health))
         .route("/external-services/{id}/start", post(start_service))
         .route("/external-services/{id}/stop", post(stop_service))
+        .route("/external-services/{id}/upgrade", post(upgrade_service))
         .route(
             "/external-services/{id}/projects",
             post(link_service_to_project),
@@ -353,6 +355,7 @@ async fn update_service(
     let service_config = crate::services::UpdateExternalServiceRequest {
         parameters: request.parameters.clone(),
         name: None,
+        docker_image: request.docker_image.clone(),
     };
 
     match app_state
@@ -403,6 +406,72 @@ async fn update_service(
             }
             _ => Err(internal_server_error()
                 .detail(format!("Failed to update service: {}", e))
+                .build()),
+        },
+    }
+}
+
+/// Upgrade external service to new Docker image with data migration
+/// This endpoint uses service-specific upgrade procedures (e.g., pg_upgrade for PostgreSQL)
+#[utoipa::path(
+    post,
+    path = "/external-services/{id}/upgrade",
+    tag = "External Services",
+    request_body = UpgradeExternalServiceRequest,
+    responses(
+        (status = 200, description = "Service upgraded successfully", body = ExternalServiceInfo),
+        (status = 400, description = "Invalid request or upgrade not supported"),
+        (status = 404, description = "Service not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "External service ID")
+    )
+)]
+async fn upgrade_service(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<UpgradeExternalServiceRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesWrite);
+
+    match app_state
+        .external_service_manager
+        .upgrade_service(id, request.docker_image.clone())
+        .await
+    {
+        Ok(service) => {
+            // Create audit log
+            let audit = ExternalServiceUpdatedAudit {
+                context: AuditContext {
+                    user_id: auth.user_id(),
+                    ip_address: Some(metadata.ip_address.clone()),
+                    user_agent: metadata.user_agent.clone(),
+                },
+                service_id: service.id,
+                name: service.name.clone(),
+                service_type: service.service_type.to_string(),
+                updated_parameters: HashMap::from([(
+                    "docker_image".to_string(),
+                    request.docker_image,
+                )]),
+            };
+
+            if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+                error!("Failed to create audit log: {}", e);
+            }
+
+            Ok((StatusCode::OK, Json(service)))
+        }
+        Err(e) => match e.to_string().as_str() {
+            "Service not found" => Err(not_found().detail("Service not found").build()),
+            msg if msg.contains("Upgrade not implemented") => {
+                Err(bad_request().detail(msg).build())
+            }
+            _ => Err(internal_server_error()
+                .detail(format!("Failed to upgrade service: {}", e))
                 .build()),
         },
     }
@@ -1057,6 +1126,7 @@ async fn get_service_preview_environment_variables_masked(
         get_service,
         create_service,
         update_service,
+        upgrade_service,
         delete_service,
         start_service,
         stop_service,
@@ -1080,6 +1150,7 @@ async fn get_service_preview_environment_variables_masked(
         ExternalServiceInfo,
         CreateExternalServiceRequest,
         UpdateExternalServiceRequest,
+        UpgradeExternalServiceRequest,
         LinkServiceRequest,
         ProjectServiceInfo,
         EnvironmentVariableInfo,

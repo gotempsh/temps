@@ -141,7 +141,9 @@ export type AppSettings = {
     external_url?: string | null;
     letsencrypt?: LetsEncryptSettings;
     preview_domain?: string;
+    rate_limiting?: RateLimitSettings;
     screenshots?: ScreenshotSettings;
+    security_headers?: SecurityHeadersSettings;
 };
 
 /**
@@ -152,7 +154,9 @@ export type AppSettingsResponse = {
     external_url?: string | null;
     letsencrypt: LetsEncryptSettings;
     preview_domain: string;
+    rate_limiting: RateLimitSettings;
     screenshots: ScreenshotSettings;
+    security_headers: SecurityHeadersSettings;
 };
 
 export type AssignRoleRequest = {
@@ -354,6 +358,25 @@ export type BuildConfiguration = {
      * Target stage (for multi-stage builds)
      */
     target?: string | null;
+};
+
+/**
+ * Challenge configuration (future feature)
+ * For CAPTCHA, JS challenges, proof-of-work, etc.
+ */
+export type ChallengeConfig = {
+    /**
+     * Challenge type: "captcha", "js_challenge", "proof_of_work"
+     */
+    challengeType: string;
+    /**
+     * Challenge difficulty level (1-10)
+     */
+    difficulty: number;
+    /**
+     * Paths that require challenges
+     */
+    protectedPaths?: Array<string>;
 };
 
 export type ChallengeError = {
@@ -572,6 +595,24 @@ export type CreateIncidentRequest = {
     monitor_id?: number | null;
     severity: string;
     title: string;
+};
+
+/**
+ * Request to create an IP access control rule
+ */
+export type CreateIpAccessControlRequest = {
+    /**
+     * Action to take: "block" or "allow"
+     */
+    action: string;
+    /**
+     * IP address in CIDR notation (e.g., "192.168.1.1" or "10.0.0.0/24")
+     */
+    ip_address: string;
+    /**
+     * Optional reason for the action
+     */
+    reason?: string | null;
 };
 
 export type CreateMonitorRequest = {
@@ -804,6 +845,7 @@ export type DeploymentConfig = {
      * Defaults to 1 replica
      */
     replicas?: number;
+    security?: null | SecurityConfig;
     /**
      * Enable session recording for analytics
      */
@@ -1635,6 +1677,20 @@ export type GeoLocationResponse = {
     timezone?: string | null;
 };
 
+/**
+ * Geographic restrictions configuration (future feature)
+ */
+export type GeoRestrictionsConfig = {
+    /**
+     * Allow traffic only from specific countries
+     */
+    allowedCountries?: Array<string>;
+    /**
+     * Block traffic from specific countries (ISO 3166-1 alpha-2 codes)
+     */
+    blockedCountries?: Array<string>;
+};
+
 export type GetDeploymentsParams = {
     environment_id?: number | null;
     page?: number | null;
@@ -2028,6 +2084,29 @@ export type InitAuthResponse = {
     session_token: string;
 };
 
+/**
+ * Query parameters for listing IP access control rules
+ */
+export type IpAccessControlQuery = {
+    /**
+     * Filter by action ("block" or "allow")
+     */
+    action?: string | null;
+};
+
+/**
+ * Response model for IP access control rules
+ */
+export type IpAccessControlResponse = {
+    action: string;
+    created_at: string;
+    created_by?: number | null;
+    id: number;
+    ip_address: string;
+    reason?: string | null;
+    updated_at: string;
+};
+
 export type LetsEncryptSettings = {
     email?: string | null;
     environment?: string;
@@ -2335,7 +2414,6 @@ export type PageSessionStats = {
     page_path: string;
     total_page_views: number;
     total_sessions: number;
-    total_time_seconds: number;
 };
 
 export type PageSessionStatsQuery = {
@@ -2651,6 +2729,10 @@ export type ProjectQuery = {
 };
 
 export type ProjectResponse = {
+    /**
+     * Attack mode - when enabled, requires CAPTCHA verification for all project environments
+     */
+    attack_mode: boolean;
     created_at: number;
     /**
      * Deployment configuration (resources, autoscaling, features)
@@ -2874,10 +2956,12 @@ export type ProxyLogResponse = {
     response_size_bytes?: number | null;
     response_time_ms?: number | null;
     routing_status: string;
+    session_id?: number | null;
     status_code: number;
     timestamp: string;
     upstream_host?: string | null;
     user_agent?: string | null;
+    visitor_id?: number | null;
 };
 
 /**
@@ -2889,6 +2973,36 @@ export type ProxyLogsPaginatedResponse = {
     page_size: number;
     total: number;
     total_pages: number;
+};
+
+/**
+ * Rate limiting configuration (subset of global RateLimitSettings)
+ */
+export type RateLimitConfig = {
+    /**
+     * Blacklist specific IPs for this project/environment
+     */
+    blacklistIps?: Array<string>;
+    /**
+     * Override rate limit per hour
+     */
+    maxRequestsPerHour?: number | null;
+    /**
+     * Override rate limit per minute
+     */
+    maxRequestsPerMinute?: number | null;
+    /**
+     * Whitelist specific IPs for this project/environment
+     */
+    whitelistIps?: Array<string>;
+};
+
+export type RateLimitSettings = {
+    blacklist_ips?: Array<string>;
+    enabled?: boolean;
+    max_requests_per_hour?: number;
+    max_requests_per_minute?: number;
+    whitelist_ips?: Array<string>;
 };
 
 export type ReferrerCount = {
@@ -2965,95 +3079,6 @@ export type RepositorySyncResponse = {
     repositories: Array<RepositoryResponse>;
     synced_at: string;
     total_count: number;
-};
-
-/**
- * Response model for request logs - includes all fields from request_logs entity
- */
-export type RequestLogResponse = {
-    branch?: string | null;
-    browser?: string | null;
-    browser_version?: string | null;
-    commit?: string | null;
-    crawler_name?: string | null;
-    date: string;
-    deployment_id: number;
-    elapsed_time?: number | null;
-    environment_id: number;
-    finished_at: string;
-    headers?: string | null;
-    host: string;
-    id: number;
-    ip_address?: string | null;
-    ip_address_id?: number | null;
-    is_crawler: boolean;
-    is_entry_page: boolean;
-    is_mobile: boolean;
-    is_static_file?: boolean | null;
-    level: string;
-    message: string;
-    method: string;
-    operating_system?: string | null;
-    project_id: number;
-    referrer?: string | null;
-    request_headers?: string | null;
-    request_id: string;
-    request_path: string;
-    session_id?: number | null;
-    started_at: string;
-    status_code: number;
-    user_agent: string;
-    visitor_id?: number | null;
-};
-
-export type RequestLogsQuery = {
-    /**
-     * Deployment ID (optional)
-     */
-    deployment_id?: number | null;
-    /**
-     * End date filter (milliseconds since epoch)
-     */
-    end_date?: number | null;
-    /**
-     * Environment ID (optional)
-     */
-    environment_id?: number | null;
-    /**
-     * Page size/limit (default: 20, max: 100)
-     */
-    limit?: number | null;
-    /**
-     * HTTP method filter (optional, e.g., GET, POST, PUT, DELETE)
-     */
-    method?: string | null;
-    /**
-     * Offset for pagination (auto-calculated from page if not provided)
-     */
-    offset?: number | null;
-    /**
-     * Page number (default: 1)
-     */
-    page?: number | null;
-    /**
-     * Project ID (optional - if not provided, returns all system logs)
-     */
-    project_id?: number | null;
-    /**
-     * Start date filter (milliseconds since epoch)
-     */
-    start_date?: number | null;
-    /**
-     * HTTP status code filter (optional)
-     */
-    status_code?: number | null;
-};
-
-export type RequestLogsResponse = {
-    logs: Array<RequestLogResponse>;
-    page: number;
-    page_size: number;
-    total: number;
 };
 
 export type ResetPasswordRequest = {
@@ -3160,6 +3185,71 @@ export type ScreenshotSettings = {
     enabled?: boolean;
     provider?: string;
     url?: string;
+};
+
+/**
+ * Security configuration for projects and environments
+ *
+ * This configuration can be set at three levels:
+ * 1. Global (in settings table) - applies to all projects
+ * 2. Project level - overrides global settings for specific project
+ * 3. Environment level - overrides project settings for specific environment
+ *
+ * The inheritance chain: Environment > Project > Global
+ */
+export type SecurityConfig = {
+    /**
+     * Attack mode configuration (future: "off", "challenge", "block")
+     * Placeholder for DDoS protection, bot detection, etc.
+     */
+    attackMode?: string | null;
+    challengeConfig?: null | ChallengeConfig;
+    /**
+     * Enable/disable security features at this level
+     * If None, inherits from parent level
+     */
+    enabled?: boolean | null;
+    geoRestrictions?: null | GeoRestrictionsConfig;
+    headers?: null | SecurityHeadersConfig;
+    rateLimiting?: null | RateLimitConfig;
+};
+
+/**
+ * Security headers configuration (subset of global SecurityHeadersSettings)
+ */
+export type SecurityHeadersConfig = {
+    /**
+     * Custom CSP (only used if preset is "custom")
+     */
+    contentSecurityPolicy?: string | null;
+    /**
+     * Use a preset: "strict", "moderate", "permissive", "disabled", "custom"
+     */
+    preset?: string | null;
+    /**
+     * Referrer-Policy override
+     */
+    referrerPolicy?: string | null;
+    /**
+     * HSTS override
+     */
+    strictTransportSecurity?: string | null;
+    /**
+     * X-Frame-Options override
+     */
+    xFrameOptions?: string | null;
+};
+
+export type SecurityHeadersSettings = {
+    content_security_policy?: string | null;
+    enabled?: boolean;
+    permissions_policy?: string | null;
+    preset?: string;
+    referrer_policy?: string;
+    strict_transport_security?: string;
+    x_content_type_options?: string;
+    x_frame_options?: string;
+    x_xss_protection?: string;
 };
 
 export type SentryEventRequest = {
@@ -3274,6 +3364,7 @@ export type SessionLogsQuery = {
     project_id: number;
     sort_order?: string | null;
     start_date?: string | null;
+    visitor_id?: number | null;
 };
 
 export type SessionLogsResponse = {
@@ -3849,6 +3940,7 @@ export type UpdateDeploymentConfigRequest = {
     memoryRequest?: number | null;
     performanceMetricsEnabled?: boolean | null;
     replicas?: number | null;
+    security?: null | SecurityConfig;
     sessionRecordingEnabled?: boolean | null;
 };
 
@@ -3859,6 +3951,10 @@ export type UpdateEmailProviderRequest = {
 };
 
 export type UpdateEnvironmentSettingsRequest = {
+    /**
+     * Enable/disable attack mode (CAPTCHA protection) for this environment
+     */
+    attack_mode?: boolean | null;
     /**
      * Enable/disable automatic deployments for this environment
      */
@@ -3883,6 +3979,7 @@ export type UpdateEnvironmentSettingsRequest = {
      */
     performance_metrics_enabled?: boolean | null;
     replicas?: number | null;
+    security?: null | SecurityConfig;
     /**
      * Enable/disable session recording
      */
@@ -3895,6 +3992,11 @@ export type UpdateErrorGroupRequest = {
 };
 
 export type UpdateExternalServiceRequest = {
+    /**
+     * Docker image to use for the service (e.g., "postgres:17-alpine", "timescale/timescaledb-ha:pg17")
+     * When provided, the service will be recreated with the new image while preserving data
+     */
+    docker_image?: string | null;
     parameters: {
         [key: string]: unknown;
     };
@@ -3914,11 +4016,33 @@ export type UpdateIncidentStatusRequest = {
     status: string;
 };
 
+/**
+ * Request to update an IP access control rule
+ */
+export type UpdateIpAccessControlRequest = {
+    /**
+     * Optional new action
+     */
+    action?: string | null;
+    /**
+     * Optional new IP address
+     */
+    ip_address?: string | null;
+    /**
+     * Optional new reason
+     */
+    reason?: string | null;
+};
+
 export type UpdatePreferencesRequest = {
     preferences: NotificationPreferencesResponse;
 };
 
 export type UpdateProjectSettingsRequest = {
+    /**
+     * Enable/disable attack mode (CAPTCHA protection) for all project environments
+     */
+    attack_mode?: boolean | null;
     directory?: string | null;
     git_provider_connection_id?: number | null;
     main_branch?: string | null;
@@ -4022,6 +4146,14 @@ export type UpdateTokenResponse = {
 export type UpdateUserRequest = {
     email?: string | null;
     name?: string | null;
+};
+
+export type UpgradeExternalServiceRequest = {
+    /**
+     * Docker image to upgrade to (e.g., "postgres:17-alpine")
+     * This will trigger pg_upgrade for PostgreSQL or equivalent upgrade procedures for other services
+     */
+    docker_image: string;
 };
 
 export type UptimeDataPoint = {
@@ -4188,7 +4320,6 @@ export type VisitorDetails = {
     total_events: number;
     total_page_views: number;
     total_sessions: number;
-    total_time_seconds: number;
     user_agent?: string | null;
     visitor_id: string;
 };
@@ -4203,7 +4334,6 @@ export type VisitorInfo = {
     location?: string | null;
     page_views: number;
     sessions_count: number;
-    total_time_seconds: number;
     unique_pages: number;
     user_agent?: string | null;
     visitor_id: string;
@@ -4251,7 +4381,6 @@ export type VisitorStats = {
     total_events: number;
     total_page_views: number;
     total_sessions: number;
-    total_time_seconds: number;
     visitor_id: number;
 };
 
@@ -7625,6 +7754,42 @@ export type StopServiceResponses = {
 
 export type StopServiceResponse = StopServiceResponses[keyof StopServiceResponses];
 
+export type UpgradeServiceData = {
+    body: UpgradeExternalServiceRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/upgrade';
+};
+
+export type UpgradeServiceErrors = {
+    /**
+     * Invalid request or upgrade not supported
+     */
+    400: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpgradeServiceResponses = {
+    /**
+     * Service upgraded successfully
+     */
+    200: ExternalServiceInfo;
+};
+
+export type UpgradeServiceResponse = UpgradeServiceResponses[keyof UpgradeServiceResponses];
+
 export type GetFileData = {
     body?: never;
     path: {
@@ -8753,6 +8918,191 @@ export type GetIncidentUpdatesResponses = {
 };
 
 export type GetIncidentUpdatesResponse = GetIncidentUpdatesResponses[keyof GetIncidentUpdatesResponses];
+
+export type ListIpAccessControlData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter by action ("block" or "allow")
+         */
+        action?: string | null;
+    };
+    url: '/ip-access-control';
+};
+
+export type ListIpAccessControlErrors = {
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListIpAccessControlResponses = {
+    /**
+     * List of IP access control rules
+     */
+    200: Array<IpAccessControlResponse>;
+};
+
+export type ListIpAccessControlResponse = ListIpAccessControlResponses[keyof ListIpAccessControlResponses];
+
+export type CreateIpAccessControlData = {
+    body: CreateIpAccessControlRequest;
+    path?: never;
+    query?: never;
+    url: '/ip-access-control';
+};
+
+export type CreateIpAccessControlErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Duplicate IP address
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateIpAccessControlResponses = {
+    /**
+     * IP access control rule created
+     */
+    201: IpAccessControlResponse;
+};
+
+export type CreateIpAccessControlResponse = CreateIpAccessControlResponses[keyof CreateIpAccessControlResponses];
+
+export type CheckIpBlockedData = {
+    body?: never;
+    path: {
+        /**
+         * IP address to check
+         */
+        ip: string;
+    };
+    query?: never;
+    url: '/ip-access-control/check/{ip}';
+};
+
+export type CheckIpBlockedErrors = {
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CheckIpBlockedResponses = {
+    /**
+     * IP block status
+     */
+    200: unknown;
+};
+
+export type DeleteIpAccessControlData = {
+    body?: never;
+    path: {
+        /**
+         * IP access control rule ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/ip-access-control/{id}';
+};
+
+export type DeleteIpAccessControlErrors = {
+    /**
+     * IP access control rule not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteIpAccessControlResponses = {
+    /**
+     * IP access control rule deleted
+     */
+    204: void;
+};
+
+export type DeleteIpAccessControlResponse = DeleteIpAccessControlResponses[keyof DeleteIpAccessControlResponses];
+
+export type GetIpAccessControlData = {
+    body?: never;
+    path: {
+        /**
+         * IP access control rule ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/ip-access-control/{id}';
+};
+
+export type GetIpAccessControlErrors = {
+    /**
+     * IP access control rule not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetIpAccessControlResponses = {
+    /**
+     * IP access control rule details
+     */
+    200: IpAccessControlResponse;
+};
+
+export type GetIpAccessControlResponse = GetIpAccessControlResponses[keyof GetIpAccessControlResponses];
+
+export type UpdateIpAccessControlData = {
+    body: UpdateIpAccessControlRequest;
+    path: {
+        /**
+         * IP access control rule ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/ip-access-control/{id}';
+};
+
+export type UpdateIpAccessControlErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * IP access control rule not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateIpAccessControlResponses = {
+    /**
+     * IP access control rule updated
+     */
+    200: IpAccessControlResponse;
+};
+
+export type UpdateIpAccessControlResponse = UpdateIpAccessControlResponses[keyof UpdateIpAccessControlResponses];
 
 export type ListRoutesData = {
     body?: never;
@@ -13086,6 +13436,14 @@ export type GetProxyLogsData = {
          */
         deployment_id?: number | null;
         /**
+         * Filter by session ID
+         */
+        session_id?: number | null;
+        /**
+         * Filter by visitor ID
+         */
+        visitor_id?: number | null;
+        /**
          * Start date for filtering (ISO 8601 format)
          */
         start_date?: string | null;
@@ -14752,111 +15110,6 @@ export type GetAuditLogResponses = {
 };
 
 export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
-
-export type GetRequestLogsData = {
-    body?: never;
-    path?: never;
-    query?: {
-        /**
-         * Project ID (optional - if not provided, returns all system logs)
-         */
-        project_id?: number;
-        /**
-         * Environment ID (optional)
-         */
-        environment_id?: number;
-        /**
-         * Deployment ID (optional)
-         */
-        deployment_id?: number;
-        /**
-         * HTTP status code filter (optional)
-         */
-        status_code?: number;
-        /**
-         * HTTP method filter (optional)
-         */
-        method?: string;
-        /**
-         * Start date filter in milliseconds since epoch (optional)
-         */
-        start_date?: number;
-        /**
-         * End date filter in milliseconds since epoch (optional)
-         */
-        end_date?: number;
-        /**
-         * Page number (default: 1)
-         */
-        page?: number;
-        /**
-         * Page size/limit (default: 20, max: 100)
-         */
-        limit?: number;
-        /**
-         * Offset for pagination (auto-calculated from page if not provided)
-         */
-        offset?: number;
-    };
-    url: 'request-logs';
-};
-
-export type GetRequestLogsErrors = {
-    /**
-     * Invalid query parameters
-     */
-    400: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type GetRequestLogsResponses = {
-    /**
-     * List of request logs
-     */
-    200: RequestLogsResponse;
-};
-
-export type GetRequestLogsResponse = GetRequestLogsResponses[keyof GetRequestLogsResponses];
-
-export type GetRequestLogByIdData = {
-    body?: never;
-    path: {
-        /**
-         * Request log ID
-         */
-        id: number;
-    };
-    query?: {
-        /**
-         * Project ID (optional - if not provided, searches all system logs)
-         */
-        project_id?: number;
-    };
-    url: 'request-logs/{id}';
-};
-
-export type GetRequestLogByIdErrors = {
-    /**
-     * Request log not found
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type GetRequestLogByIdResponses = {
-    /**
-     * Request log found
-     */
-    200: RequestLogResponse;
-};
-
-export type GetRequestLogByIdResponse = GetRequestLogByIdResponses[keyof GetRequestLogByIdResponses];
 
 export type ClientOptions = {
     baseUrl: `${string}://${string}/api` | (string & {});

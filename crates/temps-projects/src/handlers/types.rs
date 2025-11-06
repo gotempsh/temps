@@ -243,6 +243,8 @@ pub struct ProjectResponse {
     pub git_provider_connection_id: Option<i32>,
     /// Deployment configuration (resources, autoscaling, features)
     pub deployment_config: DeploymentConfig,
+    /// Attack mode - when enabled, requires CAPTCHA verification for all project environments
+    pub attack_mode: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -267,6 +269,7 @@ impl ProjectResponse {
             updated_at: project.updated_at.timestamp_millis(),
             last_deployment: project.last_deployment.map(|d| d.timestamp_millis()),
             git_provider_connection_id: project.git_provider_connection_id,
+            attack_mode: project.attack_mode,
             deployment_config: DeploymentConfig {
                 cpu_request: project
                     .deployment_config
@@ -313,6 +316,7 @@ impl ProjectResponse {
                     .clone()
                     .map(|c| c.replicas)
                     .unwrap_or(1), // Default
+                security: project.deployment_config.clone().and_then(|c| c.security),
             },
         }
     }
@@ -423,6 +427,7 @@ pub struct UpdateDeploymentConfigRequest {
     pub performance_metrics_enabled: Option<bool>,
     pub session_recording_enabled: Option<bool>,
     pub replicas: Option<i32>,
+    pub security: Option<temps_entities::deployment_config::SecurityConfig>,
 }
 
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
@@ -434,6 +439,8 @@ pub struct UpdateProjectSettingsRequest {
     pub repo_name: Option<String>,
     pub preset: Option<String>,
     pub directory: Option<String>,
+    /// Enable/disable attack mode (CAPTCHA protection) for all project environments
+    pub attack_mode: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

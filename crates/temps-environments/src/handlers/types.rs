@@ -133,6 +133,9 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// Enable/disable session recording
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_recording_enabled: Option<bool>,
+    /// Security configuration for this environment (overrides project-level settings)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<temps_entities::deployment_config::SecurityConfig>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

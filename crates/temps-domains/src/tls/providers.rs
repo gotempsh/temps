@@ -61,6 +61,11 @@ impl LetsEncryptProvider {
     }
 
     fn get_acme_url(&self) -> String {
+        // Allow custom ACME directory URL for testing (e.g., Pebble)
+        if let Ok(custom_url) = std::env::var("ACME_DIRECTORY_URL") {
+            return custom_url;
+        }
+
         if self.environment == "production" {
             instant_acme::LetsEncrypt::Production.url().to_string()
         } else {

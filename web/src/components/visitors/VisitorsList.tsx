@@ -28,7 +28,6 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   Globe,
-  Clock,
   MousePointer,
   Bug,
   Users as UserIcon,
@@ -82,14 +81,6 @@ export function VisitorsList({ project }: VisitorsListProps) {
       },
     }),
   })
-
-  const formatDuration = (seconds: number) => {
-    if (seconds < 60) return `${Math.round(seconds)}s`
-    const minutes = Math.floor(seconds / 60)
-    if (minutes < 60) return `${minutes}m`
-    const hours = Math.floor(minutes / 60)
-    return `${hours}h ${minutes % 60}m`
-  }
 
   const totalPages = React.useMemo(() => {
     if (!data) return 0
@@ -178,7 +169,6 @@ export function VisitorsList({ project }: VisitorsListProps) {
                     <TableHead>User Agent</TableHead>
                     <TableHead>Sessions</TableHead>
                     <TableHead>Page Views</TableHead>
-                    <TableHead>Total Time</TableHead>
                     <TableHead>First Seen</TableHead>
                     <TableHead>Last Seen</TableHead>
                   </TableRow>
@@ -252,14 +242,6 @@ export function VisitorsList({ project }: VisitorsListProps) {
                         <div className="flex items-center gap-1">
                           <MousePointer className="h-3 w-3 text-muted-foreground" />
                           <span className="text-sm">{visitor.page_views}</span>
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex items-center gap-1">
-                          <Clock className="h-3 w-3 text-muted-foreground" />
-                          <span className="text-sm">
-                            {formatDuration(visitor.total_time_seconds)}
-                          </span>
                         </div>
                       </TableCell>
                       <TableCell className="text-sm text-muted-foreground">

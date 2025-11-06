@@ -162,6 +162,7 @@ impl pingora::server::ShutdownSignalWatch for ShutdownSignalBridge {
 }
 
 /// Setup and configure the proxy server with all services
+#[allow(clippy::too_many_arguments)]
 pub fn setup_proxy_server(
     db: Arc<DbConnection>,
     proxy_config: ProxyConfig,
@@ -198,6 +199,14 @@ pub fn setup_proxy_server(
         ip_service.clone(),
     ));
 
+    let ip_access_control_service = Arc::new(
+        crate::service::ip_access_control_service::IpAccessControlService::new(db.clone()),
+    );
+
+    let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
+        db.clone(),
+    ));
+
     let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
         as Arc<dyn ProjectContextResolver>;
 
@@ -223,6 +232,8 @@ pub fn setup_proxy_server(
         crypto,
         db.clone(),
         config_service,
+        ip_access_control_service,
+        challenge_service,
     );
 
     // Setup Pingora server with explicit configuration
@@ -319,6 +330,14 @@ pub fn create_proxy_service(
         ip_service.clone(),
     ));
 
+    let ip_access_control_service = Arc::new(
+        crate::service::ip_access_control_service::IpAccessControlService::new(db.clone()),
+    );
+
+    let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
+        db.clone(),
+    ));
+
     let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
         as Arc<dyn ProjectContextResolver>;
 
@@ -342,6 +361,8 @@ pub fn create_proxy_service(
         crypto,
         db,
         config_service,
+        ip_access_control_service,
+        challenge_service,
     );
 
     Ok(lb)

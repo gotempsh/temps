@@ -56,7 +56,6 @@ pub struct VisitorInfo {
     pub crawler_name: Option<String>,
     pub sessions_count: i64,
     pub page_views: i64,
-    pub total_time_seconds: i64,
 }
 
 #[derive(Debug, Serialize)]

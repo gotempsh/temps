@@ -16,6 +16,24 @@
 
 ---
 
+## 📦 Installation
+
+Get Temps running in seconds:
+
+**macOS (Recommended):**
+```bash
+brew tap gotempsh/tap && brew install temps
+```
+
+**Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash
+```
+
+**Or [see more installation options](#-installation) below.**
+
+---
+
 ## ⚡ Quick Start
 
 **Deploy your first app in 60 seconds:**
@@ -33,7 +51,12 @@ docker run -d \
   timescale/timescaledb:latest-pg18
 
 # 2. Install Temps with one command
+# Option A: Using curl (recommended for Linux)
 curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash
+
+# Option B: Using Homebrew (macOS)
+# brew tap gotempsh/tap
+# brew install temps
 
 # Restart your shell or source your profile
 source ~/.zshrc  # or ~/.bashrc
@@ -294,11 +317,22 @@ sudo mv temps /usr/local/bin/temps
 temps --version
 ```
 
-##### Homebrew
+##### Homebrew (macOS)
+
+Homebrew provides the easiest installation on macOS:
 
 ```bash
+# Add the Temps tap
 brew tap gotempsh/tap
+
+# Install Temps
 brew install temps
+
+# Verify installation
+temps --version
+
+# (Optional) Upgrade to latest version
+brew upgrade temps
 ```
 
 #### Build from Source

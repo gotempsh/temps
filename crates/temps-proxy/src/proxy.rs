@@ -1,4 +1,7 @@
+use crate::service::challenge_service::ChallengeService;
+use crate::service::ip_access_control_service::IpAccessControlService;
 use crate::service::proxy_log_service::{CreateProxyLogRequest, ProxyLogService};
+use crate::tls_fingerprint;
 use crate::traits::*;
 use async_trait::async_trait;
 use axum::http::header;
@@ -77,6 +80,9 @@ pub struct ProxyContext {
     pub error_message: Option<String>,
     pub upstream_host: Option<String>,
     pub container_id: Option<String>,
+    pub tls_fingerprint: Option<String>,
+    pub tls_version: Option<String>,
+    pub tls_cipher: Option<String>,
 }
 
 impl ProxyContext {
@@ -107,6 +113,8 @@ pub struct LoadBalancer {
     crypto: Arc<temps_core::CookieCrypto>,
     db: Arc<DbConnection>,
     config_service: Arc<temps_config::ConfigService>,
+    ip_access_control_service: Arc<IpAccessControlService>,
+    challenge_service: Arc<ChallengeService>,
 }
 
 impl LoadBalancer {
@@ -121,6 +129,8 @@ impl LoadBalancer {
         crypto: Arc<temps_core::CookieCrypto>,
         db: Arc<DbConnection>,
         config_service: Arc<temps_config::ConfigService>,
+        ip_access_control_service: Arc<IpAccessControlService>,
+        challenge_service: Arc<ChallengeService>,
     ) -> Self {
         Self {
             upstream_resolver,
@@ -132,6 +142,8 @@ impl LoadBalancer {
             crypto,
             db,
             config_service,
+            ip_access_control_service,
+            challenge_service,
         }
     }
 
@@ -191,6 +203,93 @@ impl LoadBalancer {
         // This ensures we match against domain names in the route table correctly
         let host = host_with_port.split(':').next().unwrap_or(&host_with_port);
         Ok(host.to_string())
+    }
+
+    /// Extract comprehensive TLS fingerprint with client characteristics
+    ///
+    /// Returns a fingerprint including:
+    /// - TLS version and cipher (from TLS handshake)
+    /// - Client IP address
+    /// - User-Agent header
+    ///
+    /// This creates a unique identifier per person/device, ensuring
+    /// each different visitor gets a different fingerprint.
+    fn extract_tls_info(&self, session: &PingoraSession, ctx: &mut ProxyContext) {
+        // Access SSL digest from the downstream session's digest
+        // digest() returns Option<&Digest>, and Digest contains ssl_digest: Option<Arc<SslDigest>>
+        if let Some(digest) = session.downstream_session.digest() {
+            if let Some(ssl_digest) = &digest.ssl_digest {
+                // Compute comprehensive fingerprint with IP and user agent
+                if let Some(fingerprint) =
+                    tls_fingerprint::compute_comprehensive_fingerprint_from_arc(
+                        ssl_digest,
+                        ctx.ip_address.as_deref(),
+                        &ctx.user_agent,
+                    )
+                {
+                    ctx.tls_fingerprint = Some(fingerprint.clone());
+
+                    debug!(
+                        "Extracted comprehensive fingerprint: {} (IP: {}, UA: {}) for request_id={}",
+                        fingerprint,
+                        ctx.ip_address.as_ref().unwrap_or(&"unknown".to_string()),
+                        ctx.user_agent,
+                        ctx.request_id
+                    );
+                }
+
+                // Extract TLS version and cipher for logging
+                ctx.tls_version = Some(ssl_digest.version.to_string());
+                ctx.tls_cipher = Some(ssl_digest.cipher.to_string());
+
+                debug!(
+                    "TLS connection: {} with cipher {} for request_id={}",
+                    ssl_digest.version, ssl_digest.cipher, ctx.request_id
+                );
+            } else {
+                debug!(
+                    "No SSL digest available in Digest for request_id={}",
+                    ctx.request_id
+                );
+            }
+        } else {
+            debug!(
+                "No digest available from downstream_session for request_id={}",
+                ctx.request_id
+            );
+        }
+    }
+
+    /// Generate HTML for CAPTCHA challenge page
+    fn generate_challenge_html(
+        project_name: &str,
+        environment_id: i32,
+        ip_address: &str,
+        identifier: &str,
+        identifier_type: &str,
+    ) -> String {
+        // Generate a random challenge (32 hex characters)
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let bytes: Vec<u8> = (0..16).map(|_| rng.gen()).collect();
+        let challenge = hex::encode(bytes);
+
+        // Difficulty: 20 leading zero bits (~1 million attempts)
+        // Typical solutions take ~2-5 seconds on modern browsers
+        let difficulty = 20;
+
+        // Load HTML template from file
+        const CHALLENGE_HTML: &str = include_str!("../captcha/challenge.html");
+
+        // Replace placeholders
+        CHALLENGE_HTML
+            .replace("{{PROJECT_NAME}}", project_name)
+            .replace("{{ENVIRONMENT_ID}}", &environment_id.to_string())
+            .replace("{{IP_ADDRESS}}", ip_address)
+            .replace("{{CHALLENGE}}", &challenge)
+            .replace("{{DIFFICULTY}}", &difficulty.to_string())
+            .replace("{{IDENTIFIER}}", identifier)
+            .replace("{{IDENTIFIER_TYPE}}", identifier_type)
     }
 
     async fn ensure_visitor_session(&self, ctx: &mut ProxyContext) -> Result<()> {
@@ -308,7 +407,8 @@ impl LoadBalancer {
             upstream_response.insert_header("X-Deployment-ID", deployment.id.to_string())?;
         }
 
-        upstream_response.insert_header("Referrer-Policy", "strict-origin-when-cross-origin")?;
+        // Apply security headers from settings
+        self.apply_security_headers(upstream_response).await?;
 
         // Set visitor and session cookies
         self.set_tracking_cookies(session, upstream_response, ctx)
@@ -325,6 +425,87 @@ impl LoadBalancer {
         self.log_request(session, upstream_response, ctx).await?;
         self.add_response_timing(upstream_response, ctx)?;
 
+        Ok(())
+    }
+
+    /// Apply security headers from global settings
+    async fn apply_security_headers(&self, response: &mut ResponseHeader) -> Result<()> {
+        // Get settings from config service
+        let settings = match self.config_service.get_settings().await {
+            Ok(settings) => settings,
+            Err(e) => {
+                warn!("Failed to get settings for security headers: {}", e);
+                return Ok(()); // Don't fail the request if we can't get settings
+            }
+        };
+
+        let headers = &settings.security_headers;
+
+        // Skip if security headers are disabled
+        if !headers.enabled {
+            debug!("Security headers are disabled in settings");
+            return Ok(());
+        }
+
+        // Apply Content-Security-Policy
+        if let Some(ref csp) = headers.content_security_policy {
+            if !csp.is_empty() {
+                if let Err(e) = response.insert_header("Content-Security-Policy", csp) {
+                    warn!("Failed to set Content-Security-Policy header: {}", e);
+                }
+            }
+        }
+
+        // Apply X-Frame-Options
+        if !headers.x_frame_options.is_empty() {
+            if let Err(e) = response.insert_header("X-Frame-Options", &headers.x_frame_options) {
+                warn!("Failed to set X-Frame-Options header: {}", e);
+            }
+        }
+
+        // Apply X-Content-Type-Options
+        if !headers.x_content_type_options.is_empty() {
+            if let Err(e) =
+                response.insert_header("X-Content-Type-Options", &headers.x_content_type_options)
+            {
+                warn!("Failed to set X-Content-Type-Options header: {}", e);
+            }
+        }
+
+        // Apply X-XSS-Protection
+        if !headers.x_xss_protection.is_empty() {
+            if let Err(e) = response.insert_header("X-XSS-Protection", &headers.x_xss_protection) {
+                warn!("Failed to set X-XSS-Protection header: {}", e);
+            }
+        }
+
+        // Apply Strict-Transport-Security
+        if !headers.strict_transport_security.is_empty() {
+            if let Err(e) = response.insert_header(
+                "Strict-Transport-Security",
+                &headers.strict_transport_security,
+            ) {
+                warn!("Failed to set Strict-Transport-Security header: {}", e);
+            }
+        }
+
+        // Apply Referrer-Policy
+        if !headers.referrer_policy.is_empty() {
+            if let Err(e) = response.insert_header("Referrer-Policy", &headers.referrer_policy) {
+                warn!("Failed to set Referrer-Policy header: {}", e);
+            }
+        }
+
+        // Apply Permissions-Policy
+        if let Some(ref permissions) = headers.permissions_policy {
+            if !permissions.is_empty() {
+                if let Err(e) = response.insert_header("Permissions-Policy", permissions) {
+                    warn!("Failed to set Permissions-Policy header: {}", e);
+                }
+            }
+        }
+
+        debug!("Applied security headers (preset: {})", headers.preset);
         Ok(())
     }
 
@@ -975,6 +1156,50 @@ impl LoadBalancer {
         Ok(true)
     }
 
+    /// Serve embedded WASM files for CAPTCHA solver
+    /// Returns Ok(true) if file was served, Ok(false) if path doesn't match
+    async fn serve_wasm_file(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+    ) -> Result<bool> {
+        // Check if this is a WASM file request (use actual wasm-bindgen generated filenames)
+        if ctx.path == "/api/__temps/temps_captcha_wasm.js" {
+            let content = include_str!("../../temps-captcha-wasm/pkg/temps_captcha_wasm.js");
+            let mut resp = ResponseHeader::build(StatusCode::OK, None)?;
+            resp.insert_header(
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            )?;
+            resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
+            resp.insert_header("X-Request-ID", &ctx.request_id)?;
+
+            session.write_response_header(Box::new(resp), false).await?;
+            session
+                .write_response_body(Some(Bytes::from(content.as_bytes().to_vec())), true)
+                .await?;
+
+            debug!("Served WASM JavaScript bindings: {}", ctx.path);
+            return Ok(true);
+        } else if ctx.path == "/api/__temps/temps_captcha_wasm_bg.wasm" {
+            let content = include_bytes!("../../temps-captcha-wasm/pkg/temps_captcha_wasm_bg.wasm");
+            let mut resp = ResponseHeader::build(StatusCode::OK, None)?;
+            resp.insert_header(header::CONTENT_TYPE, "application/wasm")?;
+            resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
+            resp.insert_header("X-Request-ID", &ctx.request_id)?;
+
+            session.write_response_header(Box::new(resp), false).await?;
+            session
+                .write_response_body(Some(Bytes::from(content.to_vec())), true)
+                .await?;
+
+            debug!("Served WASM binary module: {}", ctx.path);
+            return Ok(true);
+        }
+
+        Ok(false) // Not a WASM file request
+    }
+
     /// Infer content type from file extension
     pub fn infer_content_type(file_path: &str) -> &'static str {
         let extension = std::path::Path::new(file_path)
@@ -1119,6 +1344,9 @@ impl ProxyHttp for LoadBalancer {
             error_message: None,
             upstream_host: None,
             container_id: None,
+            tls_fingerprint: None,
+            tls_version: None,
+            tls_cipher: None,
         }
     }
 
@@ -1127,6 +1355,71 @@ impl ProxyHttp for LoadBalancer {
         session: &mut PingoraSession,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        // Extract client IP address FIRST (needed for comprehensive TLS fingerprinting)
+        let client_ip = session
+            .client_addr()
+            .map(|addr| {
+                let addr_str = addr.to_string();
+                addr_str.split(':').next().unwrap_or("unknown").to_string()
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        ctx.ip_address = Some(client_ip.clone());
+
+        // Extract user-agent FIRST (needed for comprehensive TLS fingerprinting)
+        ctx.user_agent = session
+            .req_header()
+            .headers
+            .get("user-agent")
+            .map(|h| h.to_str().unwrap_or_default().to_string())
+            .unwrap_or_default();
+
+        // Extract TLS fingerprint AFTER IP and user-agent are set
+        self.extract_tls_info(session, ctx);
+
+        // Get the request path early to check if this is a CAPTCHA/WASM request
+        let path = session.req_header().uri.path();
+
+        // WASM files must bypass IP access control since they're needed for challenge solving
+        let is_wasm_request = path.starts_with("/api/__temps/temps_captcha_wasm");
+
+        // Check if IP is blocked - this happens at infrastructure level before any processing
+        // WASM routes bypass this check since they're needed for challenge solving
+        if !is_wasm_request {
+            match self.ip_access_control_service.is_blocked(&client_ip).await {
+                Ok(is_blocked) => {
+                    if is_blocked {
+                        warn!("Blocked request from IP: {}", client_ip);
+
+                        // Return 403 Forbidden immediately
+                        let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
+                        response.insert_header("Content-Type", "text/plain")?;
+                        response.insert_header("X-Blocked-Reason", "IP address blocked")?;
+
+                        session
+                            .write_response_header(Box::new(response), true)
+                            .await?;
+                        session
+                            .write_response_body(
+                                Some(Bytes::from("Access denied: IP address blocked")),
+                                true,
+                            )
+                            .await?;
+
+                        // Return error to stop request processing
+                        return Err(Error::because(
+                            pingora::ErrorType::HTTPStatus(403),
+                            "IP address blocked",
+                            pingora_core::Error::new(pingora::ErrorType::HTTPStatus(403)),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    // Log error but don't block request if IP check fails
+                    error!("Failed to check IP access control for {}: {}", client_ip, e);
+                }
+            }
+        }
+
         // Check if client accepts SSE (Server-Sent Events)
         let accepts_sse = session
             .req_header()
@@ -1193,6 +1486,13 @@ impl ProxyHttp for LoadBalancer {
             .map(|h| h.to_str().unwrap_or_default().to_string())
             .unwrap_or_default();
 
+        // Extract client IP address early (needed for attack mode checks)
+        if let Some(addr) = session.client_addr() {
+            let addr_str = addr.to_string();
+            let client_ip = addr_str.split(':').next().unwrap_or_default();
+            ctx.ip_address = Some(client_ip.to_string());
+        }
+
         // Resolve project context early to set routing status for all requests
         let project_context = self
             .project_context_resolver
@@ -1204,8 +1504,134 @@ impl ProxyHttp for LoadBalancer {
             ctx.environment = Some(project_ctx.environment.clone());
             ctx.deployment = Some(project_ctx.deployment.clone());
             ctx.routing_status = "routed".to_string();
+
+            // Check if this is a CAPTCHA endpoint - allow these to bypass attack mode
+            // This includes:
+            // - /api/_temps/captcha/* - Challenge verification endpoints
+            // - /api/__temps/temps_captcha_wasm.js - WASM JavaScript bindings
+            // - /api/__temps/temps_captcha_wasm_bg.wasm - WASM binary module
+            let is_captcha_endpoint = ctx.path.starts_with("/api/_temps/captcha")
+                || ctx.path.starts_with("/api/__temps/temps_captcha_wasm");
+
+            // Check if attack mode is enabled (project-wide setting)
+            if !is_captcha_endpoint && project_ctx.project.attack_mode {
+                // Attack mode REQUIRES HTTPS for JA4 fingerprinting
+                // Reject HTTP connections to prevent bot bypass
+                debug!(
+                    "Attack mode enabled for environment {}, fingerprint: {:?}, user_agent: {}",
+                    project_ctx.environment.id, ctx.tls_fingerprint, ctx.user_agent
+                );
+
+                let (identifier_type, identifier) = if let Some(ref fingerprint) =
+                    ctx.tls_fingerprint
+                {
+                    ("ja4", fingerprint.as_str())
+                } else {
+                    // No TLS fingerprint means HTTP connection - reject it
+                    info!(
+                        "Attack mode: HTTPS required for environment {} (HTTP request from {})",
+                        project_ctx.environment.id,
+                        ctx.ip_address.as_ref().unwrap_or(&"unknown".to_string())
+                    );
+
+                    // Return 426 Upgrade Required
+                    let mut response =
+                        ResponseHeader::build(StatusCode::from_u16(426).unwrap(), None)?;
+                    response.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    response.insert_header("Upgrade", "TLS/1.2, TLS/1.3")?;
+                    response.insert_header("Connection", "Upgrade")?;
+
+                    session
+                        .write_response_header(Box::new(response), true)
+                        .await?;
+
+                    let html = format!(
+                        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTTPS Required</title>
+    <style>
+        body {{ font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }}
+        .container {{ background: white; border-radius: 16px; padding: 40px; max-width: 500px; text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }}
+        h1 {{ color: #1a202c; margin-bottom: 16px; }}
+        p {{ color: #4a5568; line-height: 1.6; }}
+        .icon {{ font-size: 64px; margin-bottom: 16px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">🔒</div>
+        <h1>HTTPS Required</h1>
+        <p>This site requires a secure connection (HTTPS) for enhanced security and bot protection.</p>
+        <p>Please use <strong>https://</strong> instead of http://</p>
+    </div>
+</body>
+</html>"#
+                    );
+
+                    session
+                        .write_response_body(Some(Bytes::from(html)), true)
+                        .await?;
+
+                    return Err(Error::because(
+                        pingora::ErrorType::HTTPStatus(426),
+                        "HTTPS required in attack mode",
+                        pingora_core::Error::new(pingora::ErrorType::HTTPStatus(426)),
+                    ));
+                };
+
+                let is_challenge_completed = self
+                    .challenge_service
+                    .is_challenge_completed(project_ctx.environment.id, identifier, identifier_type)
+                    .await
+                    .unwrap_or(false);
+
+                if !is_challenge_completed {
+                    info!(
+                        "Attack mode: Challenge required for {} {} on environment {}",
+                        identifier_type, identifier, project_ctx.environment.id
+                    );
+
+                    // Return 403 with HTML challenge page
+                    let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
+                    response.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                    response.insert_header("X-Challenge-Required", "true")?;
+
+                    session
+                        .write_response_header(Box::new(response), true)
+                        .await?;
+
+                    // Generate HTML challenge page
+                    let html = Self::generate_challenge_html(
+                        &project_ctx.project.name,
+                        project_ctx.environment.id,
+                        ctx.ip_address.as_ref().unwrap_or(&"unknown".to_string()),
+                        identifier,
+                        identifier_type,
+                    );
+
+                    session
+                        .write_response_body(Some(Bytes::from(html)), true)
+                        .await?;
+
+                    // Return error to stop request processing
+                    return Err(Error::because(
+                        pingora::ErrorType::HTTPStatus(403),
+                        "Challenge required",
+                        pingora_core::Error::new(pingora::ErrorType::HTTPStatus(403)),
+                    ));
+                }
+            }
         } else {
             ctx.routing_status = "no_project".to_string();
+        }
+
+        // Serve embedded WASM files for CAPTCHA solver (must come before general request handling)
+        if let Ok(true) = self.serve_wasm_file(session, ctx).await {
+            ctx.routing_status = "captcha_wasm".to_string();
+            return Ok(true); // Request handled
         }
 
         // Check if this host should redirect
@@ -1282,19 +1708,12 @@ impl ProxyHttp for LoadBalancer {
             .map(|cookie| cookie.value().to_string());
 
         // Get IP from the connection
-        let socket_ip = match session.client_addr() {
-            Some(addr) => addr.clone(),
-            None => {
-                error!("Failed to get client address");
-                return Err(Error::new_str("Failed to get client address"));
-            }
-        };
-        let socket_ip_str = socket_ip.to_string();
-        let client_ip = socket_ip_str.split(":").next().unwrap_or_default();
-        session
-            .req_header_mut()
-            .insert_header("X-Forwarded-For", client_ip)?;
-        ctx.ip_address = Some(client_ip.to_string());
+        // Add X-Forwarded-For header with client IP (already extracted in request_filter)
+        if let Some(ref ip) = ctx.ip_address {
+            session
+                .req_header_mut()
+                .insert_header("X-Forwarded-For", ip.as_str())?;
+        }
 
         // Add X-Forwarded-Proto header to indicate the original protocol (HTTP/HTTPS)
         let proto = if self.is_https_request(session) {

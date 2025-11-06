@@ -1318,4 +1318,328 @@ mod tests {
             _ => panic!("Expected Failed status"),
         }
     }
+
+    // ============================================================================
+    // Pebble Integration Tests (require Docker)
+    // ============================================================================
+
+    use crate::tls::providers::LetsEncryptProvider;
+    use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+
+    /// Test HTTP-01 challenge flow with Pebble ACME server
+    /// Requires Docker to be running
+    ///
+    /// Note: This test is ignored by default because it requires additional setup:
+    /// 1. Pebble uses self-signed certificates that instant-acme cannot validate
+    /// 2. To run this test, you need to configure system trust for Pebble's CA cert
+    /// 3. Or modify instant-acme to skip TLS verification (not recommended)
+    ///
+    /// For full integration testing with real validation:
+    /// 1. Start pebble-challtestsrv for DNS resolution
+    /// 2. Run an HTTP server on port 80 serving .well-known/acme-challenge/<token>
+    /// 3. Configure DNS to resolve test domains to the challenge server
+    ///
+    /// To run: cargo test --lib -p temps-domains test_http01_with_pebble -- --ignored
+    #[tokio::test]
+    #[ignore = "Requires Pebble CA certificate trust setup"]
+    async fn test_http01_with_pebble() {
+        // Start Pebble container with validation always passing (for testing)
+        let container = GenericImage::new("letsencrypt/pebble", "latest")
+            .with_env_var("PEBBLE_VA_ALWAYS_VALID", "1")
+            .with_env_var("PEBBLE_VA_NOSLEEP", "1")
+            .start()
+            .await
+            .expect("Failed to start Pebble container");
+
+        // Get the mapped port for ACME endpoint
+        let acme_port = container
+            .get_host_port_ipv4(14000)
+            .await
+            .expect("Failed to get Pebble port");
+
+        // Wait for Pebble to be ready
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        // Setup test environment
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password("test"));
+        let repo = Arc::new(DefaultCertificateRepository::new(db, encryption_service));
+
+        // Configure provider to use Pebble
+        std::env::set_var(
+            "ACME_DIRECTORY_URL",
+            format!("https://localhost:{}/dir", acme_port),
+        );
+        std::env::set_var("LETSENCRYPT_MODE", "staging");
+
+        let provider = Arc::new(LetsEncryptProvider::new(repo.clone()));
+
+        let test_domain = "test.example.com";
+        let test_email = "test@example.com";
+
+        // Step 1: Provision - initiates HTTP-01 challenge
+        let result = provider
+            .provision(test_domain, ChallengeType::Http01, test_email)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Provision should succeed: {:?}",
+            result.as_ref().err()
+        );
+        let challenge_data = match result.unwrap() {
+            ProvisioningResult::Challenge(challenge) => {
+                assert_eq!(challenge.challenge_type, ChallengeType::Http01);
+                assert!(!challenge.token.is_empty());
+                assert!(!challenge.key_authorization.is_empty());
+                challenge
+            }
+            _ => panic!("Expected challenge result"),
+        };
+
+        // Step 2: Complete challenge - in real scenario, the token would be served via HTTP
+        // For testing with PEBBLE_VA_ALWAYS_VALID=1, Pebble will accept without checking
+        let cert_result = provider
+            .complete_challenge(test_domain, &challenge_data, test_email)
+            .await;
+
+        assert!(cert_result.is_ok(), "Challenge completion should succeed");
+        let certificate = cert_result.unwrap();
+
+        // Verify certificate was issued
+        assert_eq!(certificate.domain, test_domain);
+        assert!(!certificate.certificate_pem.is_empty());
+        assert!(!certificate.private_key_pem.is_empty());
+        assert_eq!(certificate.status, CertificateStatus::Active);
+        assert_eq!(certificate.verification_method, "http-01");
+
+        // Cleanup
+        std::mem::drop(container);
+        println!("✅ HTTP-01 Pebble integration test passed!");
+        println!("   - Certificate issued for: {}", test_domain);
+        println!("   - Status: {:?}", certificate.status);
+    }
+
+    /// Test DNS-01 challenge for wildcard domains with Pebble
+    /// Requires Docker to be running
+    ///
+    /// Note: This test is ignored by default because it requires additional setup:
+    /// 1. Pebble uses self-signed certificates that instant-acme cannot validate
+    /// 2. For full DNS validation testing, you need pebble-challtestsrv
+    ///
+    /// To run: cargo test --lib -p temps-domains test_dns01_wildcard_with_pebble -- --ignored
+    #[tokio::test]
+    #[ignore = "Requires Pebble CA certificate trust setup"]
+    async fn test_dns01_wildcard_with_pebble() {
+        // Start Pebble container with validation always passing
+        let container = GenericImage::new("letsencrypt/pebble", "latest")
+            .with_env_var("PEBBLE_VA_ALWAYS_VALID", "1")
+            .with_env_var("PEBBLE_VA_NOSLEEP", "1")
+            .start()
+            .await
+            .expect("Failed to start Pebble container");
+
+        let acme_port = container
+            .get_host_port_ipv4(14000)
+            .await
+            .expect("Failed to get Pebble port");
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        // Setup
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password("test"));
+        let repo = Arc::new(DefaultCertificateRepository::new(db, encryption_service));
+
+        std::env::set_var(
+            "ACME_DIRECTORY_URL",
+            format!("https://localhost:{}/dir", acme_port),
+        );
+
+        let provider = Arc::new(LetsEncryptProvider::new(repo));
+
+        let wildcard_domain = "*.wildcard.example.com";
+        let test_email = "test@example.com";
+
+        // Step 1: Provision wildcard certificate (must use DNS-01)
+        let result = provider
+            .provision(wildcard_domain, ChallengeType::Dns01, test_email)
+            .await;
+
+        assert!(result.is_ok(), "Provision should succeed");
+        let challenge_data = match result.unwrap() {
+            ProvisioningResult::Challenge(challenge) => {
+                assert_eq!(challenge.challenge_type, ChallengeType::Dns01);
+                assert!(!challenge.dns_txt_records.is_empty());
+
+                // Verify DNS TXT record format
+                for record in &challenge.dns_txt_records {
+                    assert!(record.name.starts_with("_acme-challenge."));
+                    assert!(!record.value.is_empty());
+                }
+                challenge
+            }
+            _ => panic!("Expected challenge result"),
+        };
+
+        // Step 2: Complete challenge - in real scenario, DNS TXT records would be published
+        // For testing with PEBBLE_VA_ALWAYS_VALID=1, Pebble will accept without checking
+        let cert_result = provider
+            .complete_challenge(wildcard_domain, &challenge_data, test_email)
+            .await;
+
+        assert!(cert_result.is_ok(), "Challenge completion should succeed");
+        let certificate = cert_result.unwrap();
+
+        // Verify wildcard certificate was issued
+        assert_eq!(certificate.domain, wildcard_domain);
+        assert!(!certificate.certificate_pem.is_empty());
+        assert!(!certificate.private_key_pem.is_empty());
+        assert_eq!(certificate.status, CertificateStatus::Active);
+        assert_eq!(certificate.verification_method, "dns-01");
+        assert!(certificate.is_wildcard);
+
+        // Cleanup
+        std::mem::drop(container);
+        println!("✅ DNS-01 wildcard Pebble integration test passed!");
+        println!("   - Wildcard certificate issued for: {}", wildcard_domain);
+        println!("   - Status: {:?}", certificate.status);
+    }
+
+    /// Test that HTTP-01 is rejected for wildcard domains
+    /// Requires Docker to be running
+    ///
+    /// Validates that the provider correctly rejects HTTP-01 challenges for wildcard domains
+    /// since RFC 8555 requires DNS-01 for wildcards.
+    ///
+    /// Note: This test is ignored by default because it requires Pebble CA certificate trust setup.
+    /// To run: cargo test --lib -p temps-domains test_http01_rejected_for_wildcard_with_pebble -- --ignored
+    #[tokio::test]
+    #[ignore = "Requires Pebble CA certificate trust setup"]
+    async fn test_http01_rejected_for_wildcard_with_pebble() {
+        let container = GenericImage::new("letsencrypt/pebble", "latest")
+            .with_env_var("PEBBLE_VA_ALWAYS_VALID", "1")
+            .with_env_var("PEBBLE_VA_NOSLEEP", "1")
+            .start()
+            .await
+            .expect("Failed to start Pebble container");
+
+        let acme_port = container
+            .get_host_port_ipv4(14000)
+            .await
+            .expect("Failed to get Pebble port");
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password("test"));
+        let repo = Arc::new(DefaultCertificateRepository::new(db, encryption_service));
+
+        std::env::set_var(
+            "ACME_DIRECTORY_URL",
+            format!("https://localhost:{}/dir", acme_port),
+        );
+
+        let provider = Arc::new(LetsEncryptProvider::new(repo));
+
+        let wildcard_domain = "*.blocked.example.com";
+        let test_email = "test@example.com";
+
+        // Try HTTP-01 with wildcard (should be rejected by our validation)
+        let result = provider
+            .provision(wildcard_domain, ChallengeType::Http01, test_email)
+            .await;
+
+        assert!(result.is_err(), "HTTP-01 should be rejected for wildcards");
+        let error = result.unwrap_err();
+        let error_msg = error.to_string();
+        assert!(
+            error_msg.contains("wildcard") || error_msg.contains("DNS-01"),
+            "Error should mention wildcard or DNS-01, got: {}",
+            error_msg
+        );
+
+        std::mem::drop(container);
+        println!("✅ HTTP-01 wildcard rejection test passed!");
+        println!("   - Correctly rejected HTTP-01 for wildcard domain");
+    }
+
+    /// Test certificate expiration and renewal detection
+    #[tokio::test]
+    async fn test_certificate_expiration_and_renewal() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password("test"));
+        let repo = Arc::new(DefaultCertificateRepository::new(db, encryption_service));
+        let provider = Arc::new(MockCertificateProvider::new());
+        let service = TlsService::new(repo.clone(), provider);
+
+        // Create certificate expiring soon
+        let expiring_cert = Certificate {
+            id: 1,
+            domain: "expiring.example.com".to_string(),
+            certificate_pem: "cert".to_string(),
+            private_key_pem: "key".to_string(),
+            expiration_time: chrono::Utc::now() + chrono::Duration::days(15),
+            last_renewed: None,
+            is_wildcard: false,
+            verification_method: "http-01".to_string(),
+            status: CertificateStatus::Active,
+        };
+
+        repo.save_certificate(expiring_cert.clone()).await.unwrap();
+
+        // Check if renewal is needed
+        let needs_renewal = service.needs_renewal(&expiring_cert.domain).await.unwrap();
+        assert!(needs_renewal, "Certificate should need renewal");
+
+        // Find expiring certificates
+        let expiring = repo.find_expiring_certificates(30).await.unwrap();
+        assert_eq!(expiring.len(), 1);
+        assert_eq!(expiring[0].domain, "expiring.example.com");
+
+        println!("✅ Certificate expiration detection test passed!");
+    }
+
+    /// Test ACME account persistence across sessions
+    #[tokio::test]
+    async fn test_acme_account_persistence() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password("test"));
+        let repo = Arc::new(DefaultCertificateRepository::new(db, encryption_service));
+
+        let account = AcmeAccount {
+            email: "persist@example.com".to_string(),
+            environment: "staging".to_string(),
+            credentials: r#"{"id":"account123","key":"secret"}"#.to_string(),
+            created_at: chrono::Utc::now(),
+        };
+
+        // Save account
+        repo.save_acme_account(account.clone()).await.unwrap();
+
+        // Retrieve account
+        let retrieved = repo
+            .find_acme_account("persist@example.com", "staging")
+            .await
+            .unwrap()
+            .expect("Account should exist");
+
+        assert_eq!(retrieved.email, account.email);
+        assert_eq!(retrieved.environment, account.environment);
+        assert!(retrieved.credentials.contains("account123"));
+
+        // Different environment should not exist
+        let not_found = repo
+            .find_acme_account("persist@example.com", "production")
+            .await
+            .unwrap();
+        assert!(not_found.is_none());
+
+        println!("✅ ACME account persistence test passed!");
+    }
 }

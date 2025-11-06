@@ -234,7 +234,7 @@ const AppContent = () => {
                                 // Example: Sentry.captureException(error, { contexts: { react: { componentStack: errorInfo.componentStack } } })
                               }}
                             >
-                              <div className="py-2 px-0 sm:p-4">
+                              <div className="h-full overflow-y-auto py-2 px-0 sm:p-4">
                                 <Routes>
                                   <Route
                                     path="/"

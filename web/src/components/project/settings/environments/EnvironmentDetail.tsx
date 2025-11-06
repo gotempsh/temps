@@ -43,6 +43,7 @@ import { Link, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import { EnvironmentGitConfigCard } from './EnvironmentGitConfigCard'
 import { EnvironmentResourcesCard } from './EnvironmentResourcesCard'
+import { EnvironmentSecurityCard } from './EnvironmentSecurityCard'
 
 interface EnvironmentDetailProps {
   project: ProjectResponse
@@ -511,6 +512,13 @@ export function EnvironmentDetail({
         }}
       />
       <EnvironmentResourcesCard
+        project={project}
+        environment={environment}
+        onUpdate={() => {
+          queryClient.invalidateQueries({ queryKey: ['environment'] })
+        }}
+      />
+      <EnvironmentSecurityCard
         project={project}
         environment={environment}
         onUpdate={() => {

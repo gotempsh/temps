@@ -10,7 +10,10 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::{
     handler::handler::LbApiDoc,
-    service::{lb_service::LbService, proxy_log_service::ProxyLogService},
+    service::{
+        challenge_service::ChallengeService, ip_access_control_service::IpAccessControlService,
+        lb_service::LbService, proxy_log_service::ProxyLogService,
+    },
 };
 
 pub struct ProxyPlugin;
@@ -45,9 +48,17 @@ impl TempsPlugin for ProxyPlugin {
             // Create Proxy Log service with IP service for enrichment
             let proxy_log_service = Arc::new(ProxyLogService::new(db.clone(), ip_service));
 
+            // Create IP Access Control service
+            let ip_access_control_service = Arc::new(IpAccessControlService::new(db.clone()));
+
+            // Create Challenge service for CAPTCHA
+            let challenge_service = Arc::new(ChallengeService::new(db.clone()));
+
             // Register the services for other plugins to use
             context.register_service(lb_service);
             context.register_service(proxy_log_service);
+            context.register_service(ip_access_control_service);
+            context.register_service(challenge_service);
 
             tracing::debug!("Proxy plugin services registered successfully");
             Ok(())
@@ -58,24 +69,42 @@ impl TempsPlugin for ProxyPlugin {
         // Get the required services from the service registry
         let lb_service = context.get_service::<LbService>()?;
         let proxy_log_service = context.get_service::<ProxyLogService>()?;
+        let ip_access_control_service = context.get_service::<IpAccessControlService>()?;
+        let challenge_service = context.get_service::<ChallengeService>()?;
+        let db = context.get_service::<DbConnection>()?;
 
         // Create the app state directly
         let app_state = Arc::new(crate::handler::types::AppState { lb_service });
 
+        // Create CAPTCHA state
+        let captcha_state = Arc::new(crate::handler::captcha::CaptchaState {
+            db: db.clone(),
+            challenge_service: challenge_service.clone(),
+        });
+
         // Configure routes with the app state
         let router = crate::handler::handler::configure_routes()
             .with_state(app_state)
-            .merge(crate::handler::proxy_logs::create_routes().with_state(proxy_log_service));
+            .merge(crate::handler::proxy_logs::create_routes().with_state(proxy_log_service))
+            .merge(
+                crate::handler::ip_access_control::create_routes()
+                    .with_state(ip_access_control_service),
+            )
+            .merge(crate::handler::captcha::create_routes().with_state(captcha_state));
 
         Some(PluginRoutes::new(router))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        // Merge the OpenAPI specs from LB and Proxy Logs APIs
+        // Merge the OpenAPI specs from LB, Proxy Logs, and IP Access Control APIs
         let lb_spec = LbApiDoc::openapi();
         let proxy_logs_spec = crate::handler::proxy_logs::openapi();
+        let ip_access_control_spec = crate::handler::ip_access_control::openapi();
 
-        let merged = temps_core::openapi::merge_openapi_schemas(lb_spec, vec![proxy_logs_spec]);
+        let merged = temps_core::openapi::merge_openapi_schemas(
+            lb_spec,
+            vec![proxy_logs_spec, ip_access_control_spec],
+        );
 
         Some(merged)
     }
@@ -153,24 +182,33 @@ mod tests {
 
         // Create mock services and register them in the service registry
         let test_db = TestDatabase::new().await.unwrap();
-        let lb_service = Arc::new(LbService::new(test_db.connection_arc().clone()));
+        let db_connection = test_db.connection_arc().clone();
+
+        let lb_service = Arc::new(LbService::new(db_connection.clone()));
 
         // Create a mock GeoIP service and IP service for proxy_log_service
         let geo_ip_service = Arc::new(temps_geo::GeoIpService::Mock(
             temps_geo::MockGeoIpService::new(),
         ));
         let ip_service = Arc::new(temps_geo::IpAddressService::new(
-            test_db.connection_arc().clone(),
+            db_connection.clone(),
             geo_ip_service,
         ));
-        let proxy_log_service = Arc::new(ProxyLogService::new(
-            test_db.connection_arc().clone(),
-            ip_service,
-        ));
+        let proxy_log_service = Arc::new(ProxyLogService::new(db_connection.clone(), ip_service));
 
-        // Register services in the service registry
+        // Create IP Access Control service
+        let ip_access_control_service =
+            Arc::new(IpAccessControlService::new(db_connection.clone()));
+
+        // Create Challenge service
+        let challenge_service = Arc::new(ChallengeService::new(db_connection.clone()));
+
+        // Register all services in the service registry
+        service_registry.register(db_connection);
         service_registry.register(lb_service);
         service_registry.register(proxy_log_service);
+        service_registry.register(ip_access_control_service);
+        service_registry.register(challenge_service);
 
         let plugin_context = PluginContext::new(service_registry, state_registry);
         let plugin = ProxyPlugin::new();

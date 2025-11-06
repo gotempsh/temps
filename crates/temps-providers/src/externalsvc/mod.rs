@@ -209,4 +209,18 @@ pub trait ExternalService: Send + Sync {
     ) -> Result<()> {
         Err(anyhow::anyhow!("Restore not implemented for this service"))
     }
+
+    /// Upgrade the service to a new version/image with data migration
+    /// This method handles version-specific upgrade logic (e.g., pg_upgrade for PostgreSQL)
+    ///
+    /// # Arguments
+    /// * `old_config` - Configuration of the current running service
+    /// * `new_config` - Configuration with the new version/image
+    ///
+    /// # Returns
+    /// * `Ok(())` if upgrade successful
+    /// * `Err(...)` if upgrade failed or not supported
+    async fn upgrade(&self, _old_config: ServiceConfig, _new_config: ServiceConfig) -> Result<()> {
+        Err(anyhow::anyhow!("Upgrade not implemented for this service"))
+    }
 }

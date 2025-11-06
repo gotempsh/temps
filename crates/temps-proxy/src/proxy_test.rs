@@ -262,6 +262,18 @@ pub mod proxy_tests {
         // Create config service for static file serving
         let config_service = create_test_config_service(test_db.db.clone());
 
+        // Create IP access control service
+        let ip_access_control_service = Arc::new(
+            crate::service::ip_access_control_service::IpAccessControlService::new(
+                test_db.db.clone(),
+            ),
+        );
+
+        // Create challenge service
+        let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
+            test_db.db.clone(),
+        ));
+
         let lb = ProxyLoadBalancer::new(
             upstream_resolver,
             request_logger,
@@ -272,6 +284,8 @@ pub mod proxy_tests {
             crypto,
             test_db.db.clone(),
             config_service,
+            ip_access_control_service,
+            challenge_service,
         );
 
         // Test that the LoadBalancer can resolve the upstream
@@ -742,6 +756,16 @@ pub mod proxy_tests {
         // Create config service for static file serving
         let config_service = create_test_config_service(db.clone());
 
+        // Create IP access control service
+        let ip_access_control_service = Arc::new(
+            crate::service::ip_access_control_service::IpAccessControlService::new(db.clone()),
+        );
+
+        // Create challenge service
+        let challenge_service = Arc::new(
+            crate::service::challenge_service::ChallengeService::new(db.clone()),
+        );
+
         let lb = ProxyLoadBalancer::new(
             upstream_resolver,
             request_logger,
@@ -752,6 +776,8 @@ pub mod proxy_tests {
             crypto,
             db.clone(),
             config_service,
+            ip_access_control_service,
+            challenge_service,
         );
 
         // Test 1: Verify static_dir_location is set

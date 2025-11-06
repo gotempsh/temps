@@ -32,7 +32,10 @@ pub use utils::*;
 
 // Re-export external dependencies
 pub use anyhow;
-pub use app_settings::{AppSettings, DnsProviderSettings, LetsEncryptSettings, ScreenshotSettings};
+pub use app_settings::{
+    AppSettings, DnsProviderSettings, LetsEncryptSettings, RateLimitSettings, ScreenshotSettings,
+    SecurityHeadersSettings,
+};
 pub use async_trait;
 pub use chrono;
 pub use cookie_crypto::{CookieCrypto, CryptoError};

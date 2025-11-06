@@ -10,6 +10,7 @@ pub struct EnvironmentSettingsUpdatedFields {
     pub memory_limit: Option<i32>,
     pub branch: Option<String>,
     pub replicas: Option<i32>,
+    pub security_updated: bool,
 }
 
 // Add these new audit structs after the other audit structs

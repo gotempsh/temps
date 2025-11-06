@@ -174,6 +174,7 @@ impl ProjectService {
             performance_metrics_enabled: false, // Default to false
             session_recording_enabled: false,
             replicas: 1, // Default replicas
+            security: None,
         });
 
         let project = projects::ActiveModel {
@@ -669,6 +670,7 @@ impl ProjectService {
         repo_name: Option<String>,
         preset: Option<String>,
         directory: Option<String>,
+        attack_mode: Option<bool>,
     ) -> Result<Project, ProjectError> {
         // Get the current project
         let mut project = projects::Entity::find_by_id(project_id)
@@ -760,6 +762,22 @@ impl ProjectService {
                 active_project.git_provider_connection_id = Set(None);
                 active_project.update(self.db.as_ref()).await?;
             }
+        }
+
+        // Update attack_mode if provided
+        if let Some(attack_mode_value) = attack_mode {
+            // Reload project to ensure we have the latest state
+            let project = projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ProjectError::NotFound(format!(
+                    "Project {} not found",
+                    project_id
+                )))?;
+
+            let mut active_project: projects::ActiveModel = project.into();
+            active_project.attack_mode = Set(attack_mode_value);
+            active_project.update(self.db.as_ref()).await?;
         }
 
         // Update git-related fields if any are provided
@@ -1121,6 +1139,9 @@ impl ProjectService {
         if let Some(replicas) = config.replicas {
             deployment_config.replicas = replicas;
         }
+        if let Some(security) = config.security {
+            deployment_config.security = Some(security);
+        }
 
         // Validate the deployment config
         deployment_config
@@ -1245,6 +1266,7 @@ impl ProjectService {
             git_provider_connection_id: db_project.git_provider_connection_id,
             is_on_demand: false, // Deprecated field, default to false
             deployment_config: deployment_config.clone(),
+            attack_mode: db_project.attack_mode,
         }
     }
 

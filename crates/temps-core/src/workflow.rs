@@ -27,6 +27,9 @@ pub enum WorkflowError {
     #[error("Workflow was cancelled")]
     WorkflowCancelled,
 
+    #[error("Build was cancelled")]
+    BuildCancelled,
+
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 

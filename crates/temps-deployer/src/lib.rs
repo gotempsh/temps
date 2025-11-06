@@ -27,6 +27,9 @@ pub enum BuilderError {
     #[error("Build failed: {0}")]
     BuildFailed(String),
 
+    #[error("Build cancelled by user")]
+    BuildCancelled,
+
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 

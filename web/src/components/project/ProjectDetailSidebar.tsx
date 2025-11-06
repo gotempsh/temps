@@ -122,6 +122,7 @@ const navItems: NavItem[] = [
       { title: 'Environments', url: 'settings/environments' },
       { title: 'Environment Variables', url: 'settings/environment-variables' },
       { title: 'Git', url: 'settings/git' },
+      { title: 'Security', url: 'settings/security' },
       { title: 'Cron Jobs', url: 'settings/cron-jobs' },
     ],
   },

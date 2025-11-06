@@ -365,6 +365,95 @@ impl BackupService {
         }
     }
 
+    /// Fetches the PostgreSQL version from the database
+    async fn get_postgres_version(&self) -> Result<String> {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        let version_result = self
+            .db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT version()".to_string(),
+            ))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to query PostgreSQL version: {}", e))?
+            .ok_or_else(|| anyhow::anyhow!("No version result returned"))?;
+
+        let version_str: String = version_result
+            .try_get("", "version")
+            .map_err(|e| anyhow::anyhow!("Failed to extract version string: {}", e))?;
+
+        debug!("PostgreSQL version string: {}", version_str);
+        Ok(version_str)
+    }
+
+    /// Parses PostgreSQL version string and returns the major version number
+    /// Example: "PostgreSQL 15.3 on x86_64..." -> "15"
+    fn parse_postgres_version(&self, version_str: &str) -> Result<String> {
+        // Version string format: "PostgreSQL 15.3 on x86_64-pc-linux-gnu..."
+        let parts: Vec<&str> = version_str.split_whitespace().collect();
+
+        if parts.len() < 2 {
+            anyhow::bail!("Invalid PostgreSQL version string format: {}", version_str);
+        }
+
+        let version = parts[1]; // "15.3"
+        let major_version = version
+            .split('.')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Failed to extract major version from: {}", version))?;
+
+        debug!("Extracted PostgreSQL major version: {}", major_version);
+        Ok(major_version.to_string())
+    }
+
+    /// Returns the Docker image tag for the given PostgreSQL major version
+    fn get_postgres_image_tag(&self, major_version: &str) -> String {
+        format!("postgres:{}", major_version)
+    }
+
+    /// Pulls the specified PostgreSQL Docker image
+    async fn pull_postgres_image(&self, image_tag: &str) -> Result<()> {
+        use bollard::query_parameters::CreateImageOptionsBuilder;
+        use bollard::Docker;
+        use futures::stream::StreamExt as FuturesStreamExt;
+
+        info!("Pulling Docker image: {}", image_tag);
+
+        let docker = Docker::connect_with_local_defaults()
+            .map_err(|e| anyhow::anyhow!("Failed to connect to Docker: {}", e))?;
+
+        let parts: Vec<&str> = image_tag.split(':').collect();
+        let (image, tag) = if parts.len() == 2 {
+            (parts[0], parts[1])
+        } else {
+            (image_tag, "latest")
+        };
+
+        let options = CreateImageOptionsBuilder::new()
+            .from_image(image)
+            .tag(tag)
+            .build();
+
+        let mut stream = docker.create_image(Some(options), None, None);
+
+        while let Some(result) = FuturesStreamExt::next(&mut stream).await {
+            match result {
+                Ok(info) => {
+                    if let Some(status) = info.status {
+                        debug!("Docker pull: {}", status);
+                    }
+                }
+                Err(e) => {
+                    anyhow::bail!("Failed to pull Docker image {}: {}", image_tag, e);
+                }
+            }
+        }
+
+        info!("Successfully pulled Docker image: {}", image_tag);
+        Ok(())
+    }
+
     async fn backup_postgres_database(&self, temp_file: &mut NamedTempFile) -> Result<()> {
         use bollard::exec::{CreateExecOptions, StartExecResults};
         use bollard::models::ContainerCreateBody as Config;
@@ -391,6 +480,14 @@ impl BackupService {
         let docker = Docker::connect_with_local_defaults()
             .map_err(|e| anyhow::anyhow!("Failed to connect to Docker: {}", e))?;
 
+        // Get PostgreSQL version from database
+        let version_str = self.get_postgres_version().await?;
+        let major_version = self.parse_postgres_version(&version_str)?;
+        let image_tag = self.get_postgres_image_tag(&major_version);
+
+        // Pull the matching PostgreSQL Docker image
+        self.pull_postgres_image(&image_tag).await?;
+
         // Create a temporary container name
         let container_name = format!("temps-pg-backup-{}", uuid::Uuid::new_v4());
 
@@ -398,10 +495,9 @@ impl BackupService {
         let pgpassword_env = format!("PGPASSWORD={}", password);
         let env_vars = vec![pgpassword_env];
 
-        // Create container config with postgres image (includes pg_dump)
-        // Use postgres:latest to ensure compatibility
+        // Create container config with version-matched postgres image (includes pg_dump)
         let config = Config {
-            image: Some("postgres:latest".to_string()),
+            image: Some(image_tag),
             cmd: Some(vec!["sleep".to_string(), "300".to_string()]), // Keep container alive for exec
             env: Some(env_vars),
             host_config: Some(bollard::models::HostConfig {

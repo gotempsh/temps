@@ -78,6 +78,17 @@ impl ServeCommand {
             }
         });
 
+        // Start the project change listener
+        let project_listener = temps_routes::ProjectChangeListener::new(
+            self.database_url.clone(),
+            route_table.clone(),
+        );
+        rt.spawn(async move {
+            if let Err(e) = project_listener.start_listening().await {
+                tracing::error!("Project change listener failed: {}", e);
+            }
+        });
+
         // Create a channel to wait for console API to be ready
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 

@@ -4,7 +4,7 @@ use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
-use super::deployment_config::DeploymentConfig;
+use super::deployment_config::{DeploymentConfig, SecurityConfig};
 use super::upstream_config::UpstreamList;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
@@ -24,8 +24,9 @@ pub struct Model {
     pub current_deployment_id: Option<i32>,
     pub branch: Option<String>,
     pub deleted_at: Option<DBDateTime>,
-    /// Deployment configuration (CPU, memory, port, analytics, auto-deploy settings)
+    /// Deployment configuration (CPU, memory, port, analytics, auto-deploy settings, security)
     /// These override project-level defaults for this specific environment
+    /// Security settings are in deployment_config.security
     pub deployment_config: Option<DeploymentConfig>,
 }
 
@@ -41,6 +42,35 @@ impl Model {
     ) -> DeploymentConfig {
         let env_config = self.deployment_config.clone().unwrap_or_default();
         project_config.merge(&env_config)
+    }
+
+    /// Get the effective security configuration by merging global, project, and environment configs
+    ///
+    /// The inheritance chain is: Environment > Project > Global
+    /// This allows:
+    /// - Global defaults for all projects
+    /// - Project-specific overrides (from project.deployment_config.security)
+    /// - Environment-specific overrides (from environment.deployment_config.security)
+    pub fn get_effective_security_config(
+        &self,
+        global_config: &SecurityConfig,
+        project_deployment_config: &DeploymentConfig,
+    ) -> SecurityConfig {
+        // Extract security configs from deployment configs
+        let project_security = project_deployment_config
+            .security
+            .as_ref()
+            .cloned()
+            .unwrap_or_default();
+
+        let env_security = self
+            .deployment_config
+            .as_ref()
+            .and_then(|dc| dc.security.clone())
+            .unwrap_or_default();
+
+        // Chain: global -> project -> environment
+        global_config.merge(&project_security).merge(&env_security)
     }
 }
 

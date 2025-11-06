@@ -8,6 +8,222 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
 
+/// Security configuration for projects and environments
+///
+/// This configuration can be set at three levels:
+/// 1. Global (in settings table) - applies to all projects
+/// 2. Project level - overrides global settings for specific project
+/// 3. Environment level - overrides project settings for specific environment
+///
+/// The inheritance chain: Environment > Project > Global
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, FromJsonQueryResult)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityConfig {
+    /// Enable/disable security features at this level
+    /// If None, inherits from parent level
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+
+    /// Security headers configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<SecurityHeadersConfig>,
+
+    /// Rate limiting configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limiting: Option<RateLimitConfig>,
+
+    /// Attack mode configuration (future: "off", "challenge", "block")
+    /// Placeholder for DDoS protection, bot detection, etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attack_mode: Option<String>,
+
+    /// Challenge configuration (future: CAPTCHA, JS challenge, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge_config: Option<ChallengeConfig>,
+
+    /// Geographic restrictions (future: country blocking, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geo_restrictions: Option<GeoRestrictionsConfig>,
+}
+
+/// Security headers configuration (subset of global SecurityHeadersSettings)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, FromJsonQueryResult)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityHeadersConfig {
+    /// Use a preset: "strict", "moderate", "permissive", "disabled", "custom"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+
+    /// Custom CSP (only used if preset is "custom")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_security_policy: Option<String>,
+
+    /// X-Frame-Options override
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_frame_options: Option<String>,
+
+    /// HSTS override
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict_transport_security: Option<String>,
+
+    /// Referrer-Policy override
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub referrer_policy: Option<String>,
+}
+
+/// Rate limiting configuration (subset of global RateLimitSettings)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, FromJsonQueryResult)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitConfig {
+    /// Override rate limit per minute
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_requests_per_minute: Option<u32>,
+
+    /// Override rate limit per hour
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_requests_per_hour: Option<u32>,
+
+    /// Whitelist specific IPs for this project/environment
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub whitelist_ips: Vec<String>,
+
+    /// Blacklist specific IPs for this project/environment
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blacklist_ips: Vec<String>,
+}
+
+/// Challenge configuration (future feature)
+/// For CAPTCHA, JS challenges, proof-of-work, etc.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, FromJsonQueryResult)]
+#[serde(rename_all = "camelCase")]
+pub struct ChallengeConfig {
+    /// Challenge type: "captcha", "js_challenge", "proof_of_work"
+    pub challenge_type: String,
+
+    /// Challenge difficulty level (1-10)
+    pub difficulty: u8,
+
+    /// Paths that require challenges
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected_paths: Vec<String>,
+}
+
+/// Geographic restrictions configuration (future feature)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, FromJsonQueryResult)]
+#[serde(rename_all = "camelCase")]
+pub struct GeoRestrictionsConfig {
+    /// Block traffic from specific countries (ISO 3166-1 alpha-2 codes)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_countries: Vec<String>,
+
+    /// Allow traffic only from specific countries
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_countries: Vec<String>,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            headers: None,
+            rate_limiting: None,
+            attack_mode: None,
+            challenge_config: None,
+            geo_restrictions: None,
+        }
+    }
+}
+
+impl SecurityConfig {
+    /// Create a new security configuration with default values
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Merge this config with another, preferring values from `other`
+    ///
+    /// This is used for inheritance chain: Environment > Project > Global
+    /// When resolving effective security config, call: global.merge(&project).merge(&environment)
+    pub fn merge(&self, other: &SecurityConfig) -> SecurityConfig {
+        SecurityConfig {
+            enabled: other.enabled.or(self.enabled),
+            headers: match (&self.headers, &other.headers) {
+                (Some(base), Some(override_headers)) => Some(base.merge(override_headers)),
+                (Some(base), None) => Some(base.clone()),
+                (None, Some(override_headers)) => Some(override_headers.clone()),
+                (None, None) => None,
+            },
+            rate_limiting: match (&self.rate_limiting, &other.rate_limiting) {
+                (Some(base), Some(override_rl)) => Some(base.merge(override_rl)),
+                (Some(base), None) => Some(base.clone()),
+                (None, Some(override_rl)) => Some(override_rl.clone()),
+                (None, None) => None,
+            },
+            attack_mode: other
+                .attack_mode
+                .clone()
+                .or_else(|| self.attack_mode.clone()),
+            challenge_config: other
+                .challenge_config
+                .clone()
+                .or_else(|| self.challenge_config.clone()),
+            geo_restrictions: other
+                .geo_restrictions
+                .clone()
+                .or_else(|| self.geo_restrictions.clone()),
+        }
+    }
+}
+
+impl SecurityHeadersConfig {
+    /// Merge headers config, preferring values from `other`
+    fn merge(&self, other: &SecurityHeadersConfig) -> SecurityHeadersConfig {
+        SecurityHeadersConfig {
+            preset: other.preset.clone().or_else(|| self.preset.clone()),
+            content_security_policy: other
+                .content_security_policy
+                .clone()
+                .or_else(|| self.content_security_policy.clone()),
+            x_frame_options: other
+                .x_frame_options
+                .clone()
+                .or_else(|| self.x_frame_options.clone()),
+            strict_transport_security: other
+                .strict_transport_security
+                .clone()
+                .or_else(|| self.strict_transport_security.clone()),
+            referrer_policy: other
+                .referrer_policy
+                .clone()
+                .or_else(|| self.referrer_policy.clone()),
+        }
+    }
+}
+
+impl RateLimitConfig {
+    /// Merge rate limit config, preferring values from `other`
+    fn merge(&self, other: &RateLimitConfig) -> RateLimitConfig {
+        let mut merged_whitelist = self.whitelist_ips.clone();
+        merged_whitelist.extend(other.whitelist_ips.clone());
+        merged_whitelist.sort();
+        merged_whitelist.dedup();
+
+        let mut merged_blacklist = self.blacklist_ips.clone();
+        merged_blacklist.extend(other.blacklist_ips.clone());
+        merged_blacklist.sort();
+        merged_blacklist.dedup();
+
+        RateLimitConfig {
+            max_requests_per_minute: other
+                .max_requests_per_minute
+                .or(self.max_requests_per_minute),
+            max_requests_per_hour: other.max_requests_per_hour.or(self.max_requests_per_hour),
+            whitelist_ips: merged_whitelist,
+            blacklist_ips: merged_blacklist,
+        }
+    }
+}
+
 /// Deployment configuration shared between projects and environments
 ///
 /// This configuration can be set at the project level (as defaults) and
@@ -54,6 +270,11 @@ pub struct DeploymentConfig {
     /// Defaults to 1 replica
     #[serde(default = "default_replicas")]
     pub replicas: i32,
+
+    /// Security configuration (headers, rate limiting, attack mode, etc.)
+    /// These settings inherit and override from parent level (Environment > Project > Global)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<SecurityConfig>,
 }
 
 /// Deployment configuration snapshot for deployments
@@ -120,6 +341,7 @@ impl Default for DeploymentConfig {
             performance_metrics_enabled: false,
             session_recording_enabled: false,
             replicas: 1,
+            security: None,
         }
     }
 }
@@ -168,6 +390,13 @@ impl DeploymentConfig {
                 other.replicas
             } else {
                 self.replicas
+            },
+            // Merge security configurations
+            security: match (&self.security, &other.security) {
+                (Some(base), Some(override_security)) => Some(base.merge(override_security)),
+                (Some(base), None) => Some(base.clone()),
+                (None, Some(override_security)) => Some(override_security.clone()),
+                (None, None) => None,
             },
         }
     }

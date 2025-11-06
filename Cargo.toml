@@ -39,6 +39,7 @@ members = [
     "crates/temps-import-types",
     "crates/temps-import",
     "crates/temps-import-docker",
+    "crates/temps-captcha-wasm",
 ]
 
 [workspace.package]

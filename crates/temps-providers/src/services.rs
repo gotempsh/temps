@@ -132,6 +132,9 @@ pub struct CreateExternalServiceRequest {
 pub struct UpdateExternalServiceRequest {
     pub name: Option<String>,
     pub parameters: HashMap<String, serde_json::Value>,
+    /// Docker image to use for the service (e.g., "postgres:17-alpine", "timescale/timescaledb-ha:pg17")
+    /// When provided, the service container will be recreated with the new image
+    pub docker_image: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -448,6 +451,102 @@ impl ExternalServiceManager {
         })
     }
 
+    pub async fn upgrade_service(
+        &self,
+        service_id: i32,
+        new_docker_image: String,
+    ) -> Result<ExternalServiceInfo, ExternalServiceError> {
+        info!(
+            "Upgrading service {} to Docker image {}",
+            service_id, new_docker_image
+        );
+
+        let service = self.get_service(service_id).await?;
+        let old_parameters = self.get_service_parameters(service_id).await?;
+
+        // Get old configuration
+        let old_config = ServiceConfig {
+            name: service.name.clone(),
+            service_type: ServiceType::from_str(&service.service_type).map_err(|_| {
+                ExternalServiceError::InvalidServiceType {
+                    id: service_id,
+                    service_type: service.service_type.clone(),
+                }
+            })?,
+            version: service.version.clone(),
+            parameters: serde_json::to_value(&old_parameters).map_err(|e| {
+                ExternalServiceError::InternalError {
+                    reason: format!("Failed to serialize old parameters: {}", e),
+                }
+            })?,
+        };
+
+        // Create new configuration with updated Docker image
+        let mut new_parameters = old_parameters.clone();
+        new_parameters.insert(
+            "docker_image".to_string(),
+            serde_json::Value::String(new_docker_image.clone()),
+        );
+
+        let new_config = ServiceConfig {
+            name: service.name.clone(),
+            service_type: ServiceType::from_str(&service.service_type).map_err(|_| {
+                ExternalServiceError::InvalidServiceType {
+                    id: service_id,
+                    service_type: service.service_type.clone(),
+                }
+            })?,
+            version: service.version.clone(),
+            parameters: serde_json::to_value(&new_parameters).map_err(|e| {
+                ExternalServiceError::InternalError {
+                    reason: format!("Failed to serialize new parameters: {}", e),
+                }
+            })?,
+        };
+
+        // Create service instance
+        let service_type_enum = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service_id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+        let service_instance =
+            self.create_service_instance(service.name.clone(), service_type_enum);
+
+        // Call the upgrade method on the service instance
+        service_instance
+            .upgrade(old_config, new_config.clone())
+            .await
+            .map_err(|e| ExternalServiceError::InitializationFailed {
+                id: service_id,
+                reason: format!("Upgrade failed: {}", e),
+            })?;
+
+        // Update the service configuration in the database with the new Docker image
+        let config_json = serde_json::to_string(&new_parameters).map_err(|e| {
+            ExternalServiceError::InternalError {
+                reason: format!("Failed to serialize config to JSON: {}", e),
+            }
+        })?;
+
+        let encrypted_config = self
+            .encryption_service
+            .encrypt_string(&config_json)
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to encrypt config: {}", e),
+            })?;
+
+        // Update service config in database
+        let mut service_update: external_services::ActiveModel = service.clone().into();
+        service_update.config = Set(Some(encrypted_config));
+        service_update.status = Set("running".to_string());
+        service_update.updated_at = Set(Utc::now());
+        service_update.update(self.db.as_ref()).await?;
+
+        self.get_service_info(service_id).await
+    }
+
     pub async fn update_service(
         &self,
         service_id: i32,
@@ -467,8 +566,21 @@ impl ExternalServiceManager {
             service_update.update(self.db.as_ref()).await?;
         }
 
+        // Merge docker_image into parameters if provided
+        let mut merged_parameters = request.parameters.clone();
+        if let Some(docker_image) = request.docker_image {
+            info!(
+                "Updating service {} with new Docker image: {}",
+                service_id, docker_image
+            );
+            merged_parameters.insert(
+                "docker_image".to_string(),
+                serde_json::Value::String(docker_image),
+            );
+        }
+
         // Serialize parameters to JSON and encrypt
-        let config_json = serde_json::to_string(&request.parameters).map_err(|e| {
+        let config_json = serde_json::to_string(&merged_parameters).map_err(|e| {
             ExternalServiceError::InternalError {
                 reason: format!("Failed to serialize config to JSON: {}", e),
             }
@@ -487,7 +599,7 @@ impl ExternalServiceManager {
         service_update.updated_at = Set(Utc::now());
         service_update.update(self.db.as_ref()).await?;
 
-        // Reinitialize the service
+        // Reinitialize the service (this will stop, remove, and recreate the container with new image)
         self.initialize_service(service_id).await?;
 
         self.get_service_info(service_id).await
@@ -665,6 +777,13 @@ impl ExternalServiceManager {
                 }
             })?,
         };
+
+        // Stop existing container if running (important for upgrades)
+        info!("Stopping existing container for service {}", service_id);
+        if let Err(e) = service_instance.stop().await {
+            // Log but don't fail - container might not exist yet
+            info!("Could not stop container (may not exist): {}", e);
+        }
 
         // Initialize the service
         let inferred_params = service_instance.init(config).await.map_err(|e| {
@@ -1593,6 +1712,7 @@ mod tests {
         let update_request = UpdateExternalServiceRequest {
             name: Some("test-update-renamed".to_string()),
             parameters: new_params,
+            docker_image: None,
         };
 
         let updated_service = manager.update_service(service_id, update_request).await;
@@ -1891,6 +2011,118 @@ mod tests {
         assert!(!ExternalServiceManager::is_sensitive_variable("username"));
         assert!(!ExternalServiceManager::is_sensitive_variable("port"));
         assert!(!ExternalServiceManager::is_sensitive_variable("host"));
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_postgres_image_parameter_update() {
+        // This test verifies that the docker_image parameter can be updated
+        // Note: Actual container startup may fail for major version upgrades (16->17)
+        // due to data format incompatibility, which requires pg_upgrade or dump/restore
+        let (manager, _test_db) = setup_test_manager().await;
+        let random_unused_port = get_unused_port();
+
+        // Step 1: Create a PostgreSQL service with postgres:16-alpine
+        let mut params = HashMap::new();
+        params.insert(
+            "database".to_string(),
+            JsonValue::String("testdb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            JsonValue::String("testuser".to_string()),
+        );
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("testpass".to_string()),
+        );
+        params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
+        params.insert(
+            "host".to_string(),
+            JsonValue::String("localhost".to_string()),
+        );
+        params.insert(
+            "max_connections".to_string(),
+            JsonValue::String("100".to_string()),
+        );
+        params.insert(
+            "docker_image".to_string(),
+            JsonValue::String("postgres:16-alpine".to_string()),
+        );
+
+        let request = CreateExternalServiceRequest {
+            name: "test-postgres-upgrade-params".to_string(),
+            service_type: ServiceType::Postgres,
+            version: Some("16".to_string()),
+            parameters: params,
+        };
+
+        let service = manager
+            .create_service(request)
+            .await
+            .expect("Failed to create PostgreSQL 16 service");
+        let service_id = service.id;
+
+        // Verify initial service configuration
+        let initial_details = manager.get_service_details(service_id).await.unwrap();
+        let initial_params = initial_details.current_parameters.unwrap();
+        assert_eq!(
+            initial_params.get("docker_image").and_then(|v| v.as_str()),
+            Some("postgres:16-alpine"),
+            "Initial docker_image should be postgres:16-alpine"
+        );
+
+        // Step 2: Update docker_image parameter to postgres:17-alpine
+        let mut update_params = HashMap::new();
+        update_params.insert(
+            "database".to_string(),
+            JsonValue::String("testdb".to_string()),
+        );
+        update_params.insert(
+            "username".to_string(),
+            JsonValue::String("testuser".to_string()),
+        );
+        update_params.insert(
+            "password".to_string(),
+            JsonValue::String("testpass".to_string()),
+        );
+        update_params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
+        update_params.insert(
+            "host".to_string(),
+            JsonValue::String("localhost".to_string()),
+        );
+        update_params.insert(
+            "max_connections".to_string(),
+            JsonValue::String("100".to_string()),
+        );
+
+        let update_request = UpdateExternalServiceRequest {
+            name: None,
+            parameters: update_params,
+            docker_image: Some("postgres:17-alpine".to_string()),
+        };
+
+        // Update the service - this will attempt to recreate the container
+        // Note: The update may succeed but the container may not become healthy
+        // due to PostgreSQL version incompatibility
+        let _ = manager.update_service(service_id, update_request).await;
+
+        // Verify the docker_image parameter has been updated in the configuration
+        let updated_details = manager.get_service_details(service_id).await.unwrap();
+        let updated_params = updated_details.current_parameters.unwrap();
+        assert_eq!(
+            updated_params.get("docker_image").and_then(|v| v.as_str()),
+            Some("postgres:17-alpine"),
+            "Docker image parameter should be updated to postgres:17-alpine"
+        );
+
+        // Cleanup - force delete to remove even unhealthy containers
+        let _ = manager.delete_service(service_id).await;
     }
 
     #[tokio::test]

@@ -59,6 +59,7 @@ pub struct Project {
     pub git_provider_connection_id: Option<i32>,
     pub is_on_demand: bool,
     pub deployment_config: Option<temps_entities::prelude::DeploymentConfig>,
+    pub attack_mode: bool,
 }
 
 #[derive(Deserialize)]

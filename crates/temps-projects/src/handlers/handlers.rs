@@ -474,6 +474,7 @@ pub async fn update_project_settings(
             settings.repo_name.clone(),
             settings.preset.clone(),
             settings.directory.clone(),
+            settings.attack_mode,
         )
         .await
         .map_err(Problem::from)?;
@@ -722,6 +723,9 @@ pub async fn update_project_deployment_config(
     if config.replicas.is_some() {
         updated_fields.insert("replicas".to_string(), "updated".to_string());
     }
+    if config.security.is_some() {
+        updated_fields.insert("security".to_string(), "updated".to_string());
+    }
 
     let audit_event = super::audit::DeploymentConfigUpdatedAudit {
         context: audit_context,
@@ -886,126 +890,25 @@ pub async fn get_project_statistics(
 pub async fn list_presets(RequireAuth(_auth): RequireAuth) -> Result<impl IntoResponse, Problem> {
     // No permission check needed - all authenticated users can list presets
 
-    use sea_orm::Iterable;
-    use temps_entities::preset::Preset;
-
-    // Get all preset variants from the enum
-    let presets: Vec<super::types::PresetResponse> = Preset::iter()
+    // Get all presets from temps-presets crate
+    let presets: Vec<super::types::PresetResponse> = temps_presets::all_presets()
+        .into_iter()
         .map(|preset| {
-            let slug = format!("{:?}", preset).to_lowercase();
-
-            let (label, description, project_type) = match preset {
-                Preset::NextJs => (
-                    "Next.js",
-                    "React framework for production with hybrid static & server rendering",
-                    "static",
-                ),
-                Preset::Vite => ("Vite", "Next generation frontend tooling", "static"),
-                Preset::Astro => (
-                    "Astro",
-                    "Build faster websites with less client-side JavaScript",
-                    "static",
-                ),
-                Preset::Nuxt => ("Nuxt", "The Intuitive Vue Framework", "static"),
-                Preset::Remix => (
-                    "Remix",
-                    "Full stack web framework focused on web fundamentals",
-                    "static",
-                ),
-                Preset::SvelteKit => (
-                    "SvelteKit",
-                    "The fastest way to build Svelte apps",
-                    "static",
-                ),
-                Preset::SolidStart => (
-                    "SolidStart",
-                    "Meta-framework for building Solid apps",
-                    "static",
-                ),
-                Preset::Angular => (
-                    "Angular",
-                    "Platform for building mobile and desktop web applications",
-                    "static",
-                ),
-                Preset::Vue => ("Vue", "Progressive JavaScript Framework", "static"),
-                Preset::React => (
-                    "React",
-                    "JavaScript library for building user interfaces",
-                    "static",
-                ),
-                Preset::Docusaurus => (
-                    "Docusaurus",
-                    "Build optimized websites quickly, focus on your content",
-                    "static",
-                ),
-                Preset::Rsbuild => ("Rsbuild", "Fast Rspack-based build tool", "static"),
-                Preset::Python => ("Python", "Python web applications and services", "server"),
-                Preset::FastApi => (
-                    "FastAPI",
-                    "Modern, fast web framework for building APIs with Python",
-                    "server",
-                ),
-                Preset::Flask => (
-                    "Flask",
-                    "Lightweight WSGI web application framework for Python",
-                    "server",
-                ),
-                Preset::Django => ("Django", "High-level Python web framework", "server"),
-                Preset::Rails => (
-                    "Rails",
-                    "Server-side web application framework written in Ruby",
-                    "server",
-                ),
-                Preset::Go => (
-                    "Go",
-                    "Build simple, secure, scalable systems with Go",
-                    "server",
-                ),
-                Preset::Rust => (
-                    "Rust",
-                    "Fast, reliable, and memory-efficient applications",
-                    "server",
-                ),
-                Preset::Laravel => (
-                    "Laravel",
-                    "PHP web application framework with expressive syntax",
-                    "server",
-                ),
-                Preset::Dockerfile => (
-                    "Dockerfile",
-                    "Custom Docker container with your own Dockerfile",
-                    "server",
-                ),
-                Preset::Nixpacks => (
-                    "Nixpacks",
-                    "Auto-detect and build your application",
-                    "server",
-                ),
-                Preset::Static => (
-                    "Static Site",
-                    "Serve static HTML, CSS, and JavaScript files",
-                    "static",
-                ),
-                Preset::NodeJs => (
-                    "Node.js",
-                    "JavaScript runtime built on Chrome's V8 engine",
-                    "server",
-                ),
-                Preset::Java => ("Java", "Java web applications and services", "server"),
-            };
+            let slug = preset.slug();
+            let label = preset.label();
+            let description = preset.description();
+            let project_type = preset.project_type().to_string();
+            let default_port = Some(preset.default_port());
 
             // Generate relative icon URL
             let icon_url = format!("/presets/{}.svg", slug);
 
-            // Get default port from the preset enum
-            let default_port = preset.exposed_port();
-
             super::types::PresetResponse {
                 slug,
-                label: label.to_string(),
+                label,
                 icon_url,
-                project_type: project_type.to_string(),
-                description: description.to_string(),
+                project_type,
+                description,
                 default_port,
             }
         })

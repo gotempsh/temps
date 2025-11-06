@@ -8,6 +8,7 @@ import { EnvironmentsSettings } from './settings/EnvironmentsSettings'
 import { EnvironmentVariablesSettings } from './settings/EnvironmentVariablesSettings'
 import { GeneralSettings } from './settings/GeneralSettings'
 import { GitSettings } from './settings/GitSettings'
+import { ProjectSecuritySettings } from './settings/ProjectSecuritySettings'
 
 interface ProjectSettingsProps {
   project: ProjectResponse
@@ -35,6 +36,12 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
         <Route
           path="git"
           element={<GitSettings project={project} refetch={refetch} />}
+        />
+        <Route
+          path="security"
+          element={
+            <ProjectSecuritySettings project={project} refetch={refetch} />
+          }
         />
         <Route path="cron-jobs">
           <Route index element={<CronJobsSettings project={project} />} />

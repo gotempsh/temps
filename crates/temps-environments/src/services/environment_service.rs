@@ -160,6 +160,7 @@ impl EnvironmentService {
                 performance_metrics_enabled: false,
                 session_recording_enabled: false,
                 replicas: 1,
+                security: None,
             })),
             branch: Set(Some(branch)),
             ..Default::default()
@@ -451,6 +452,9 @@ impl EnvironmentService {
         }
         if let Some(session_recording_enabled) = settings.session_recording_enabled {
             deployment_config.session_recording_enabled = session_recording_enabled;
+        }
+        if let Some(security) = settings.security {
+            deployment_config.security = Some(security);
         }
 
         // Validate the deployment config

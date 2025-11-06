@@ -134,7 +134,6 @@ pub struct VisitorInfo {
     pub crawler_name: Option<String>,
     pub sessions_count: i64,
     pub page_views: i64,
-    pub total_time_seconds: i64,
     pub unique_pages: i64,
     pub browser: Option<String>,
 }
@@ -163,7 +162,6 @@ pub struct VisitorDetails {
     pub total_sessions: i64,
     pub total_page_views: i64,
     pub total_events: i64,
-    pub total_time_seconds: i64,
     pub bounce_rate: f64,
     pub engagement_rate: f64,
     pub custom_data: Option<serde_json::Value>, // User-provided custom data
@@ -189,7 +187,6 @@ pub struct VisitorStats {
     pub total_sessions: i64,
     pub total_page_views: i64,
     pub total_events: i64,
-    pub total_time_seconds: i64,
     pub average_session_duration: f64,
     pub bounce_rate: f64,
     pub engagement_rate: f64,
@@ -314,7 +311,6 @@ pub struct HasAnalyticsEventsResponse {
 pub struct PageSessionStats {
     pub page_path: String,
     pub total_sessions: i64,
-    pub total_time_seconds: f64,
     pub avg_time_seconds: f64,
     pub min_time_seconds: f64,
     pub max_time_seconds: f64,

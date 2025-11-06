@@ -3,6 +3,7 @@ import {
   getProjectBySlugOptions,
   getActiveVisitors2Options,
   getRepositoryByNameOptions,
+  updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import NotFound from '@/components/global/NotFound'
 import { ProjectAnalytics } from '@/components/project/ProjectAnalytics'
@@ -30,7 +31,7 @@ import { DeploymentDetails } from '@/pages/DeploymentDetails'
 import { ErrorEventDetail } from './ErrorEventDetail'
 import { ErrorGroupDetail } from './ErrorGroupDetail'
 import RequestLogs from './RequestLogs'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import {
   Link,
@@ -41,6 +42,10 @@ import {
   useSearchParams,
 } from 'react-router-dom'
 import { Card, CardContent } from '@/components/ui/card'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { ShieldAlert } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { toast } from 'sonner'
 
 export function ProjectDetail() {
   const { slug } = useParams()
@@ -109,6 +114,35 @@ export function ProjectDetail() {
     }),
     enabled: !!project?.repo_owner && !!project?.repo_name,
   })
+
+  // Mutation to disable attack mode
+  const queryClient = useQueryClient()
+  const disableAttackMode = useMutation({
+    ...updateProjectSettingsMutation(),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: getProjectBySlugOptions({
+          path: { slug: slug || '' },
+        }).queryKey,
+      })
+      toast.success('Attack mode disabled successfully')
+      refetch()
+    },
+    onError: (error: any) => {
+      toast.error(
+        error?.message || 'Failed to disable attack mode. Please try again.'
+      )
+    },
+  })
+
+  const handleDisableAttackMode = () => {
+    if (!project) return
+
+    disableAttackMode.mutate({
+      path: { project_id: project.id! },
+      body: { attack_mode: false },
+    })
+  }
 
   useEffect(() => {
     setBreadcrumbs([
@@ -227,7 +261,7 @@ export function ProjectDetail() {
   }
 
   return (
-    <div className="flex h-[calc(100vh-4rem)] w-full overflow-hidden">
+    <div className="flex h-full w-full overflow-hidden">
       <Confetti active={showConfetti} duration={4000} particleCount={100} />
       <ProjectDetailSidebar project={project} />
       <div className="flex flex-1 flex-col overflow-hidden">
@@ -291,6 +325,26 @@ export function ProjectDetail() {
           </div>
         </header>
         <div className="flex-1 overflow-y-auto p-4">
+          {/* Attack Mode Banner */}
+          {(project as any).attack_mode && (
+            <Alert className="mb-4 border-primary bg-primary/10">
+              <ShieldAlert className="h-4 w-4 text-primary" />
+              <AlertDescription className="flex items-center justify-between">
+                <span className="text-foreground">
+                  Attack Mode is enabled for this project
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-primary hover:bg-primary/20"
+                  onClick={handleDisableAttackMode}
+                  disabled={disableAttackMode.isPending}
+                >
+                  {disableAttackMode.isPending ? 'Disabling...' : 'Disable'}
+                </Button>
+              </AlertDescription>
+            </Alert>
+          )}
           <Routes>
             <Route index element={<Navigate to="project" replace />} />
             <Route

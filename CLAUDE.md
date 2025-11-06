@@ -211,6 +211,87 @@ cargo test -p temps-deployments
 cargo test -- --ignored
 ```
 
+### Integration Tests with Pebble (Let's Encrypt ACME)
+
+The `temps-domains` crate includes integration tests that use [Pebble](https://github.com/letsencrypt/pebble), a small ACME test server for testing Let's Encrypt integration.
+
+**Prerequisites:**
+- Docker must be running (testcontainers will automatically start Pebble)
+- **Note**: Pebble tests are marked as `#[ignore]` by default due to TLS certificate requirements (see below)
+
+**Run ACME integration tests:**
+```bash
+# Run all temps-domains tests (excludes Pebble tests marked as ignored)
+cargo test --lib -p temps-domains
+
+# Run ignored Pebble integration tests (requires setup - see below)
+cargo test --lib -p temps-domains test_http01_with_pebble -- --ignored
+cargo test --lib -p temps-domains test_dns01_wildcard_with_pebble -- --ignored
+cargo test --lib -p temps-domains test_http01_rejected_for_wildcard_with_pebble -- --ignored
+
+# Run all tests including ignored ones
+cargo test --lib -p temps-domains -- --ignored
+
+# Run with output to see test progress
+cargo test --lib -p temps-domains -- --nocapture --ignored
+```
+
+**What these tests verify:**
+- ✅ HTTP-01 challenge flow with real ACME server (Pebble)
+- ✅ DNS-01 challenge for wildcard domains (`*.example.com`)
+- ✅ HTTP-01 rejection for wildcard domains (must use DNS-01)
+- ✅ Certificate provisioning and completion
+- ✅ ACME account creation and persistence
+- ✅ Challenge data format and validation
+- ✅ Certificate expiration detection (non-Pebble test, runs by default)
+- ✅ ACME account persistence across sessions (non-Pebble test, runs by default)
+
+**Why Pebble tests are ignored:**
+The Pebble integration tests are marked with `#[ignore]` because Pebble uses self-signed TLS certificates that the `instant-acme` library (via `rustls`) cannot validate by default. This is a common issue with Pebble testing and requires additional setup.
+
+**To run Pebble tests, you have two options:**
+
+1. **Option A: Add Pebble CA to system trust store (Recommended for development)**
+   ```bash
+   # Extract Pebble's CA certificate from the container
+   docker run --rm letsencrypt/pebble cat /test/certs/pebble.minica.pem > pebble-ca.pem
+
+   # macOS: Add to system keychain
+   sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain pebble-ca.pem
+
+   # Linux: Add to ca-certificates
+   sudo cp pebble-ca.pem /usr/local/share/ca-certificates/pebble-ca.crt
+   sudo update-ca-certificates
+
+   # Then run tests
+   cargo test --lib -p temps-domains -- --ignored
+   ```
+
+2. **Option B: Use Let's Encrypt Staging for integration testing**
+
+   For production-like integration testing without Pebble TLS issues, use Let's Encrypt's staging environment:
+   ```bash
+   LETSENCRYPT_MODE=staging cargo test --lib -p temps-domains
+   ```
+
+**How it works:**
+1. Testcontainers automatically pulls and starts the `letsencrypt/pebble` Docker image
+2. Tests configure the ACME client to point to the local Pebble instance via `ACME_DIRECTORY_URL` environment variable
+3. `PEBBLE_VA_ALWAYS_VALID=1` is used to skip actual HTTP/DNS validation challenges
+4. Real ACME protocol flows are executed against Pebble
+5. Tests complete the full challenge flow: `provision()` → `complete_challenge()`
+6. Containers are automatically cleaned up after tests
+
+**Troubleshooting:**
+- **TLS certificate error**: "no native root CA certificates found" → See "Why Pebble tests are ignored" above
+- If tests fail, ensure Docker is running: `docker ps`
+- Pebble startup takes ~3 seconds, tests wait automatically
+- Check Docker logs if Pebble fails to start: `docker logs <container_id>`
+- For full validation testing (not just ACME protocol), you would need:
+  - `pebble-challtestsrv` for DNS resolution
+  - HTTP server on port 80 for HTTP-01 challenges
+  - DNS configuration to resolve test domains
+
 
 ## Workspace Architecture
 

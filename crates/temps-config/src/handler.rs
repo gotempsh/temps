@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
-use temps_core::{problemdetails::Problem, AppSettings, LetsEncryptSettings, ScreenshotSettings};
+use temps_core::{
+    problemdetails::Problem, AppSettings, LetsEncryptSettings, RateLimitSettings,
+    ScreenshotSettings, SecurityHeadersSettings,
+};
 use utoipa::{OpenApi, ToSchema};
 
 pub struct SettingsState {
@@ -38,6 +41,10 @@ pub struct AppSettingsResponse {
 
     // DNS provider settings with masked API key
     pub dns_provider: DnsProviderSettingsMasked,
+
+    // Security settings
+    pub security_headers: SecurityHeadersSettings,
+    pub rate_limiting: RateLimitSettings,
 }
 
 /// DNS provider settings with masked sensitive fields
@@ -62,6 +69,8 @@ impl From<AppSettings> for AppSettingsResponse {
                     .cloudflare_api_key
                     .map(|_| "******".to_string()),
             },
+            security_headers: settings.security_headers,
+            rate_limiting: settings.rate_limiting,
         }
     }
 }

@@ -273,6 +273,12 @@ const projectNavItems: NavigationItem[] = [
     keywords: ['git', 'repository', 'repo', 'source'],
   },
   {
+    title: 'Security',
+    url: 'settings/security',
+    icon: Shield,
+    keywords: ['security', 'headers', 'rate limiting', 'protection'],
+  },
+  {
     title: 'Cron Jobs',
     url: 'settings/cron-jobs',
     icon: Activity,

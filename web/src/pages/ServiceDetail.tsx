@@ -25,6 +25,7 @@ import {
 } from '@/components/ui/dialog'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
 import { ServiceLogo } from '@/components/ui/service-logo'
+import { UpgradeServiceDialog } from '@/components/storage/UpgradeServiceDialog'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -32,6 +33,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   AlertCircle,
   ArrowLeft,
+  ArrowUpCircle,
   Loader2,
   RefreshCcw,
   Trash2,
@@ -45,6 +47,7 @@ export function ServiceDetail() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
+  const [isUpgradeDialogOpen, setIsUpgradeDialogOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const {
@@ -249,6 +252,15 @@ export function ServiceDetail() {
                   : 'Start'}
             </Button>
             <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setIsUpgradeDialogOpen(true)}
+              className="gap-2"
+            >
+              <ArrowUpCircle className="h-4 w-4" />
+              Upgrade
+            </Button>
+            <Button
               variant="ghost"
               size="sm"
               onClick={() => setIsDeleteDialogOpen(true)}
@@ -340,6 +352,15 @@ export function ServiceDetail() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <UpgradeServiceDialog
+        open={isUpgradeDialogOpen}
+        onOpenChange={setIsUpgradeDialogOpen}
+        serviceId={parseInt(id!)}
+        serviceName={service.service.name}
+        currentImage={service.current_parameters?.docker_image || undefined}
+        serviceType={service.service.service_type}
+      />
     </div>
   )
 }

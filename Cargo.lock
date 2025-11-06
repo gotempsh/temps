@@ -572,6 +572,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "auto-future"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c1e7e457ea78e524f48639f551fd79703ac3f2237f5ecccdf4708f8a75ad373"
+
+[[package]]
 name = "auto_generate_cdp"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -939,11 +945,45 @@ dependencies = [
 
 [[package]]
 name = "axum"
+version = "0.7.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
+dependencies = [
+ "async-trait",
+ "axum-core 0.4.5",
+ "bytes",
+ "futures-util",
+ "http 1.3.1",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.7.0",
+ "hyper-util",
+ "itoa",
+ "matchit 0.7.3",
+ "memchr",
+ "mime",
+ "percent-encoding",
+ "pin-project-lite",
+ "rustversion",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tower 0.5.2",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "axum"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a18ed336352031311f4e0b4dd2ff392d4fbb370777c9d18d7fc9d7359f73871"
 dependencies = [
- "axum-core",
+ "axum-core 0.5.5",
  "base64 0.22.1",
  "bytes",
  "form_urlencoded",
@@ -954,7 +994,7 @@ dependencies = [
  "hyper 1.7.0",
  "hyper-util",
  "itoa",
- "matchit",
+ "matchit 0.8.4",
  "memchr",
  "mime",
  "multer",
@@ -969,6 +1009,27 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.28.0",
  "tower 0.5.2",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "axum-core"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09f2bd6146b97ae3359fa0cc6d6b376d9539582c7b4220f041a33ec24c226199"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "http 1.3.1",
+ "http-body 1.0.1",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
+ "rustversion",
+ "sync_wrapper",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -1006,14 +1067,44 @@ dependencies = [
 
 [[package]]
 name = "axum-test"
+version = "16.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63e3a443d2608936a02a222da7b746eb412fede7225b3030b64fe9be99eab8dc"
+dependencies = [
+ "anyhow",
+ "assert-json-diff",
+ "auto-future",
+ "axum 0.7.9",
+ "bytes",
+ "bytesize 1.3.3",
+ "cookie 0.18.1",
+ "http 1.3.1",
+ "http-body-util",
+ "hyper 1.7.0",
+ "hyper-util",
+ "mime",
+ "pretty_assertions",
+ "reserve-port",
+ "rust-multipart-rfc7578_2 0.6.1",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "smallvec",
+ "tokio",
+ "tower 0.5.2",
+ "url",
+]
+
+[[package]]
+name = "axum-test"
 version = "18.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680e88effaafbb28675074f29cda0e984c984bed5eb513085c17caf7de564225"
 dependencies = [
  "anyhow",
- "axum",
+ "axum 0.8.6",
  "bytes",
- "bytesize",
+ "bytesize 2.1.0",
  "cookie 0.18.1",
  "expect-json",
  "http 1.3.1",
@@ -1023,7 +1114,7 @@ dependencies = [
  "mime",
  "pretty_assertions",
  "reserve-port",
- "rust-multipart-rfc7578_2",
+ "rust-multipart-rfc7578_2 0.8.0",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -1506,6 +1597,12 @@ dependencies = [
  "bytes",
  "either",
 ]
+
+[[package]]
+name = "bytesize"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e93abca9e28e0a1b9877922aacb20576e05d4679ffa78c3d6dc22a26a216659"
 
 [[package]]
 name = "bytesize"
@@ -4987,6 +5084,12 @@ dependencies = [
 
 [[package]]
 name = "matchit"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
+
+[[package]]
+name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
@@ -5089,6 +5192,16 @@ checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
 dependencies = [
  "mime",
  "unicase",
+]
+
+[[package]]
+name = "minicov"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f27fe9f1cc3c22e1687f9446c2083c4c5fc7f0bcf1c7a86bdbded14985895b4b"
+dependencies = [
+ "cc",
+ "walkdir",
 ]
 
 [[package]]
@@ -7618,7 +7731,7 @@ version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41ab0892f4938752b34ae47cb53910b1b0921e55e77ddb6e44df666cab17939f"
 dependencies = [
- "axum",
+ "axum 0.8.6",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -7842,6 +7955,22 @@ checksum = "3e0698206bcb8882bf2a9ecb4c1e7785db57ff052297085a6efd4fe42302068a"
 dependencies = [
  "cfg-if",
  "ordered-multimap",
+]
+
+[[package]]
+name = "rust-multipart-rfc7578_2"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03b748410c0afdef2ebbe3685a6a862e2ee937127cdaae623336a459451c8d57"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-util",
+ "http 0.2.12",
+ "mime",
+ "mime_guess",
+ "rand 0.8.5",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -9498,7 +9627,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
+ "axum 0.8.6",
  "axum-macros",
  "chrono",
  "rand 0.8.5",
@@ -9526,7 +9655,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
+ "axum 0.8.6",
  "chrono",
  "sea-orm",
  "serde",
@@ -9553,7 +9682,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
+ "axum 0.8.6",
  "chrono",
  "sea-orm",
  "serde",
@@ -9573,7 +9702,7 @@ name = "temps-analytics-performance"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
+ "axum 0.8.6",
  "chrono",
  "lazy_static",
  "maplit",
@@ -9597,8 +9726,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
- "axum-test",
+ "axum 0.8.6",
+ "axum-test 18.1.0",
  "base64 0.22.1",
  "chrono",
  "flate2",
@@ -9622,7 +9751,7 @@ name = "temps-audit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
+ "axum 0.8.6",
  "chrono",
  "log",
  "sea-orm",
@@ -9645,7 +9774,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "async-trait",
- "axum",
+ "axum 0.8.6",
  "axum-macros",
  "base32",
  "base64 0.22.1",
@@ -9683,7 +9812,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aws-sdk-s3",
- "axum",
+ "axum 0.8.6",
  "bollard",
  "chrono",
  "cron 0.15.0",
@@ -9714,13 +9843,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-captcha-wasm"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.16",
+ "hex",
+ "js-sys",
+ "sha2",
+ "wasm-bindgen",
+ "wasm-bindgen-test",
+]
+
+[[package]]
 name = "temps-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "argon2",
  "async-trait",
- "axum",
+ "axum 0.8.6",
  "bollard",
  "chrono",
  "clap 4.5.50",
@@ -9777,7 +9918,7 @@ name = "temps-config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
+ "axum 0.8.6",
  "base64 0.22.1",
  "chrono",
  "config",
@@ -9808,7 +9949,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "async-trait",
- "axum",
+ "axum 0.8.6",
  "base64 0.22.1",
  "chrono",
  "futures",
@@ -9885,7 +10026,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
+ "axum 0.8.6",
  "axum-macros",
  "bollard",
  "bytes",
@@ -9937,7 +10078,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
+ "axum 0.8.6",
+ "axum-test 16.4.1",
  "base64 0.22.1",
  "chrono",
  "cloudflare",
@@ -9945,6 +10087,7 @@ dependencies = [
  "instant-acme",
  "log",
  "rcgen",
+ "reqwest",
  "rustls 0.23.34",
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",
@@ -9957,12 +10100,14 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-entities",
+ "testcontainers",
  "thiserror 2.0.17",
  "time",
  "tokio",
  "tracing",
  "utoipa",
  "uuid",
+ "webpki-roots 0.26.11",
  "x509-parser 0.18.0",
 ]
 
@@ -9996,7 +10141,7 @@ name = "temps-environments"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
+ "axum 0.8.6",
  "axum-macros",
  "chrono",
  "futures",
@@ -10025,9 +10170,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
+ "axum 0.8.6",
  "axum-macros",
- "axum-test",
+ "axum-test 18.1.0",
  "chrono",
  "debugid",
  "flate2",
@@ -10069,7 +10214,7 @@ name = "temps-geo"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
+ "axum 0.8.6",
  "chrono",
  "log",
  "maxminddb",
@@ -10091,7 +10236,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
+ "axum 0.8.6",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -10133,7 +10278,7 @@ name = "temps-import"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "axum",
+ "axum 0.8.6",
  "chrono",
  "sea-orm",
  "serde",
@@ -10197,7 +10342,7 @@ name = "temps-infra"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
+ "axum 0.8.6",
  "bollard",
  "env_logger 0.11.8",
  "get_if_addrs",
@@ -10283,7 +10428,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
+ "axum 0.8.6",
  "axum-macros",
  "chrono",
  "futures-util",
@@ -10331,7 +10476,7 @@ name = "temps-projects"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
+ "axum 0.8.6",
  "axum-macros",
  "bollard",
  "chrono",
@@ -10369,7 +10514,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aws-sdk-s3",
- "axum",
+ "axum 0.8.6",
  "axum-macros",
  "bollard",
  "bytes",
@@ -10407,12 +10552,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
+ "axum 0.8.6",
  "base64 0.22.1",
  "bytes",
  "chrono",
  "cookie 0.18.1",
  "flate2",
+ "hex",
  "http-body-util",
  "hyper 1.7.0",
  "hyper-util",
@@ -10436,6 +10582,7 @@ dependencies = [
  "sea-orm-migration",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "temp-dir",
  "temps-audit",
@@ -10480,6 +10627,8 @@ dependencies = [
  "parking_lot",
  "sea-orm",
  "sea-orm-migration",
+ "serde",
+ "serde_json",
  "sqlx",
  "temps-core",
  "temps-database",
@@ -10494,7 +10643,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
+ "axum 0.8.6",
  "base64 0.21.7",
  "headless_chrome",
  "mockito",
@@ -10518,7 +10667,7 @@ dependencies = [
 name = "temps-static-files"
 version = "0.1.0"
 dependencies = [
- "axum",
+ "axum 0.8.6",
  "temps-config",
  "temps-core",
  "tokio",
@@ -10532,7 +10681,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
+ "axum 0.8.6",
  "axum-macros",
  "chrono",
  "futures",
@@ -11050,7 +11199,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb7613188ce9f7df5bfe185db26c5814347d110db17920415cf2fbcad85e7203"
 dependencies = [
  "async-trait",
- "axum",
+ "axum 0.8.6",
  "base64 0.22.1",
  "bytes",
  "h2 0.4.12",
@@ -11138,7 +11287,7 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "151b5a3e3c45df17466454bb74e9ecedecc955269bdedbf4d150dfa393b55a36"
 dependencies = [
- "axum-core",
+ "axum-core 0.5.5",
  "cookie 0.18.1",
  "futures-util",
  "http 1.3.1",
@@ -11626,7 +11775,7 @@ version = "9.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d047458f1b5b65237c2f6dc6db136945667f40a7668627b3490b9513a3d43a55"
 dependencies = [
- "axum",
+ "axum 0.8.6",
  "base64 0.22.1",
  "mime_guess",
  "regex",
@@ -11859,6 +12008,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bad67dc8b2a1a6e5448428adec4c3e84c43e561d8c9ee8a9e5aabeb193ec41d1"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-bindgen-test"
+version = "0.3.54"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e381134e148c1062f965a42ed1f5ee933eef2927c3f70d1812158f711d39865"
+dependencies = [
+ "js-sys",
+ "minicov",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test-macro",
+]
+
+[[package]]
+name = "wasm-bindgen-test-macro"
+version = "0.3.54"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b673bca3298fe582aeef8352330ecbad91849f85090805582400850f8270a2e8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.108",
 ]
 
 [[package]]

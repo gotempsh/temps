@@ -13,6 +13,27 @@ import type {
  * Uses the actual backend API endpoints.
  */
 
+// Security settings types (matching backend)
+export interface SecurityHeadersSettings {
+  enabled: boolean
+  preset: string
+  content_security_policy: string | null
+  x_frame_options: string
+  x_content_type_options: string
+  x_xss_protection: string
+  strict_transport_security: string
+  referrer_policy: string
+  permissions_policy: string | null
+}
+
+export interface RateLimitSettings {
+  enabled: boolean
+  max_requests_per_minute: number
+  max_requests_per_hour: number
+  whitelist_ips: string[]
+  blacklist_ips: string[]
+}
+
 // Re-export the types from the API for consistency
 export interface PlatformSettings extends AppSettings {
   dns_provider: DnsProviderSettings
@@ -20,6 +41,9 @@ export interface PlatformSettings extends AppSettings {
   letsencrypt: LetsEncryptSettings
   preview_domain: string
   screenshots: ScreenshotSettings
+  security_headers: SecurityHeadersSettings
+  rate_limiting: RateLimitSettings
+  attack_mode?: boolean
 }
 
 /**
@@ -49,6 +73,26 @@ export async function getPlatformSettings(): Promise<PlatformSettings> {
           provider: 'local',
           url: null,
         },
+        security_headers: response.data.security_headers || {
+          enabled: true,
+          preset: 'moderate',
+          content_security_policy:
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'",
+          x_frame_options: 'SAMEORIGIN',
+          x_content_type_options: 'nosniff',
+          x_xss_protection: '1; mode=block',
+          strict_transport_security: 'max-age=31536000; includeSubDomains',
+          referrer_policy: 'strict-origin-when-cross-origin',
+          permissions_policy: 'geolocation=(), microphone=(), camera=()',
+        },
+        rate_limiting: response.data.rate_limiting || {
+          enabled: false,
+          max_requests_per_minute: 60,
+          max_requests_per_hour: 1000,
+          whitelist_ips: [],
+          blacklist_ips: [],
+        },
+        attack_mode: response.data.attack_mode || false,
       }
 
       // Cache in localStorage for offline access
@@ -96,6 +140,9 @@ export async function updatePlatformSettings(
         letsencrypt: updated.letsencrypt,
         preview_domain: updated.preview_domain,
         screenshots: updated.screenshots,
+        security_headers: updated.security_headers,
+        rate_limiting: updated.rate_limiting,
+        attack_mode: updated.attack_mode,
       },
     })
 
@@ -180,6 +227,26 @@ function getDefaultSettings(): PlatformSettings {
       provider: 'local',
       url: '',
     },
+    security_headers: {
+      enabled: true,
+      preset: 'moderate',
+      content_security_policy:
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'",
+      x_frame_options: 'SAMEORIGIN',
+      x_content_type_options: 'nosniff',
+      x_xss_protection: '1; mode=block',
+      strict_transport_security: 'max-age=31536000; includeSubDomains',
+      referrer_policy: 'strict-origin-when-cross-origin',
+      permissions_policy: 'geolocation=(), microphone=(), camera=()',
+    },
+    rate_limiting: {
+      enabled: false,
+      max_requests_per_minute: 60,
+      max_requests_per_hour: 1000,
+      whitelist_ips: [],
+      blacklist_ips: [],
+    },
+    attack_mode: false,
   }
 }
 

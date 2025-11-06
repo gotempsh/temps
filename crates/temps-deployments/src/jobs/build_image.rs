@@ -8,10 +8,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_core::{
+    JobResult, WorkflowCancellationProvider, WorkflowContext, WorkflowError, WorkflowTask,
+};
 use temps_deployer::{BuildRequest, ImageBuilder};
 use temps_logs::{LogLevel, LogService};
 use temps_presets;
+use tokio::time::{sleep, Duration};
 
 /// Typed output from DownloadRepoJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -622,6 +625,73 @@ impl WorkflowTask for BuildImageJob {
         );
 
         Ok(JobResult::success(context))
+    }
+
+    async fn execute_with_cancellation(
+        &self,
+        context: WorkflowContext,
+        cancellation_provider: &dyn WorkflowCancellationProvider,
+    ) -> Result<JobResult, WorkflowError> {
+        let workflow_run_id = context.workflow_run_id.clone();
+
+        // Check if already cancelled before starting
+        if cancellation_provider.is_cancelled(&workflow_run_id).await? {
+            if let (Some(log_service), Some(log_id)) = (&self.log_service, &self.log_id) {
+                log_service
+                    .log_warning(
+                        log_id,
+                        "Build cancelled before starting - deployment was cancelled by user",
+                    )
+                    .await
+                    .ok();
+            }
+            return Err(WorkflowError::BuildCancelled);
+        }
+
+        // Create cancellation check future that polls every 2 seconds
+        let cancellation_check = async {
+            loop {
+                sleep(Duration::from_secs(2)).await;
+
+                match cancellation_provider.is_cancelled(&workflow_run_id).await {
+                    Ok(true) => {
+                        // Cancellation detected
+                        return;
+                    }
+                    Ok(false) => {
+                        // Continue checking
+                    }
+                    Err(_) => {
+                        // Error checking cancellation - stop polling
+                        break;
+                    }
+                }
+            }
+        };
+
+        // Race between build execution and cancellation detection
+        let build_future = self.execute(context.clone());
+
+        tokio::select! {
+            result = build_future => {
+                // Build completed (success or failure)
+                result
+            }
+            _ = cancellation_check => {
+                // Cancellation detected during build
+                if let (Some(log_service), Some(log_id)) = (&self.log_service, &self.log_id) {
+                    log_service
+                        .log_warning(
+                            log_id,
+                            "🚫 Docker build cancelled by user - stopping image build",
+                        )
+                        .await
+                        .ok();
+                }
+
+                Err(WorkflowError::BuildCancelled)
+            }
+        }
     }
 
     async fn validate_prerequisites(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {

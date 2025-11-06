@@ -234,6 +234,18 @@ impl ProxyCommand {
         info!("Starting route table listener...");
         rt.block_on(async { listener.start_listening().await })?;
 
+        // Start project change listener
+        info!("Starting project change listener...");
+        let project_listener = temps_routes::ProjectChangeListener::new(
+            self.database_url.clone(),
+            route_table.clone(),
+        );
+        rt.spawn(async move {
+            if let Err(e) = project_listener.start_listening().await {
+                tracing::error!("Project change listener failed: {}", e);
+            }
+        });
+
         let shutdown_signal = Box::new(CtrlCShutdownSignal::new(
             Duration::from_secs(30),
             db.clone(),

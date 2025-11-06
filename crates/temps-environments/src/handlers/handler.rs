@@ -512,6 +512,7 @@ pub async fn update_environment_settings(
         memory_limit: settings.memory_limit,
         branch: settings.branch,
         replicas: settings.replicas,
+        security_updated: settings.security.is_some(),
     };
 
     let audit_event = EnvironmentSettingsUpdatedAudit {

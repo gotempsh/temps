@@ -24,8 +24,9 @@ pub struct Model {
     /// Preset-specific configuration (e.g., NextJsConfig with custom build commands)
     /// This is typed based on the preset enum variant
     pub preset_config: Option<PresetConfig>,
-    /// Deployment configuration (CPU, memory, port, analytics, auto-deploy settings)
+    /// Deployment configuration (CPU, memory, port, analytics, auto-deploy settings, security)
     /// These serve as defaults for all environments unless overridden
+    /// Security settings are in deployment_config.security
     pub deployment_config: Option<DeploymentConfig>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
@@ -36,6 +37,8 @@ pub struct Model {
     pub is_public_repo: bool,
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
+    /// Attack mode - when enabled, requires CAPTCHA verification for all visitors
+    pub attack_mode: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

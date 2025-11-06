@@ -35,6 +35,8 @@ pingora-load-balancing = "0.6.0"
 pingora-proxy = "0.6.0"
 pingora-openssl = "0.6.0"
 rand = { workspace = true }
+hex = "0.4"
+sha2 = "0.10"
 serde_json = { workspace = true }
 uuid = { workspace = true }
 mime_guess = "2.0"

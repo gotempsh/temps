@@ -337,7 +337,6 @@ impl Analytics for AnalyticsService {
                 page_views: r.page_views,
                 unique_pages: r.unique_pages,
                 browser: r.browser.clone(),
-                total_time_seconds: 0, // Would need to calculate from sessions
             })
             .collect();
 
@@ -408,7 +407,6 @@ impl Analytics for AnalyticsService {
                 total_sessions,
                 total_page_views,
                 total_events,
-                total_time_seconds,
                 CASE WHEN total_sessions > 0
                      THEN total_time_seconds::float / total_sessions::float
                      ELSE 0 END as average_session_duration,
@@ -428,7 +426,6 @@ impl Analytics for AnalyticsService {
             total_sessions: i64,
             total_page_views: i64,
             total_events: i64,
-            total_time_seconds: i64,
             average_session_duration: f64,
             bounce_rate: f64,
             engagement_rate: f64,
@@ -544,7 +541,6 @@ impl Analytics for AnalyticsService {
                 total_sessions: s.total_sessions,
                 total_page_views: s.total_page_views,
                 total_events: s.total_events,
-                total_time_seconds: s.total_time_seconds,
                 average_session_duration: s.average_session_duration,
                 bounce_rate: s.bounce_rate,
                 engagement_rate: s.engagement_rate,
@@ -586,7 +582,6 @@ impl Analytics for AnalyticsService {
                     COUNT(DISTINCT e.session_id) as total_sessions,
                     COUNT(*) FILTER (WHERE e.event_type = 'page_view') as total_page_views,
                     COUNT(*) as total_events,
-                    COALESCE(SUM(e.time_on_page), 0) as total_time_seconds,
                     COUNT(*) FILTER (WHERE e.is_bounce = true) as bounce_count,
                     COUNT(*) FILTER (WHERE e.event_type NOT IN ('page_view', 'page_leave')) as engagement_count,
                     STRING_AGG(DISTINCT e.user_agent, ', ') as user_agents,
@@ -615,7 +610,6 @@ impl Analytics for AnalyticsService {
                 total_sessions,
                 total_page_views,
                 total_events,
-                COALESCE(total_time_seconds, 0)::bigint as total_time_seconds,
                 CASE WHEN total_sessions > 0
                      THEN bounce_count::float / total_sessions::float * 100
                      ELSE 0 END as bounce_rate,
@@ -641,7 +635,6 @@ impl Analytics for AnalyticsService {
             total_sessions: i64,
             total_page_views: i64,
             total_events: i64,
-            total_time_seconds: i64,
             bounce_rate: f64,
             engagement_rate: f64,
             custom_data: Option<String>,
@@ -669,7 +662,6 @@ impl Analytics for AnalyticsService {
             total_sessions: r.total_sessions,
             total_page_views: r.total_page_views,
             total_events: r.total_events,
-            total_time_seconds: r.total_time_seconds,
             bounce_rate: r.bounce_rate,
             engagement_rate: r.engagement_rate,
             custom_data: r.custom_data.and_then(|s| serde_json::from_str(&s).ok()),
