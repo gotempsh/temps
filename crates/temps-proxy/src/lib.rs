@@ -24,6 +24,10 @@ pub use handler::*;
 pub use temps_routes::{CachedPeerTable, RouteInfo, RouteTableListener};
 
 #[cfg(test)]
+pub mod chunked_integration_test;
+#[cfg(test)]
+pub mod chunked_streaming_test;
+#[cfg(test)]
 pub mod e2e_static_test;
 #[cfg(test)]
 pub mod integration_test;

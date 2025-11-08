@@ -1962,6 +1962,23 @@ impl ProxyHttp for LoadBalancer {
             return Ok(None);
         }
 
+        // For chunked transfer encoding responses, stream immediately without buffering
+        // Check if response uses chunked encoding
+        let is_chunked = ctx
+            .response_headers
+            .as_ref()
+            .and_then(|h| h.get("transfer-encoding"))
+            .map(|te| te.contains("chunked"))
+            .unwrap_or(false);
+
+        if is_chunked {
+            if let Some(chunk) = body {
+                debug!("Streaming chunked response: {} bytes", chunk.len());
+            }
+            // Pass through immediately for proper streaming
+            return Ok(None);
+        }
+
         // For all other responses, pass through without buffering
         Ok(None)
     }
@@ -1985,6 +2002,14 @@ impl ProxyHttp for LoadBalancer {
                 .to_string(),
         );
 
+        // Detect if response uses chunked transfer encoding
+        let is_chunked_response = upstream_response
+            .headers
+            .get("transfer-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(|te| te.contains("chunked"))
+            .unwrap_or(false);
+
         // Handle SSE (Server-Sent Events) special headers
         if ctx.is_sse {
             // Ensure required SSE headers are present for proper streaming
@@ -2005,6 +2030,23 @@ impl ProxyHttp for LoadBalancer {
 
             // Skip visitor tracking and session creation for SSE
             ctx.skip_tracking = true;
+        }
+
+        // Handle chunked transfer encoding responses (not SSE/WebSocket)
+        // These require special buffering disabled to ensure real-time streaming
+        if is_chunked_response && !ctx.is_sse && !ctx.is_websocket {
+            // Disable compression for chunked responses to allow proper streaming
+            session.upstream_compression.adjust_level(0);
+
+            // Set anti-buffering headers to prevent intermediate proxies from buffering
+            upstream_response.insert_header("X-Accel-Buffering", "no")?;
+            upstream_response
+                .insert_header("Cache-Control", "no-cache, no-store, must-revalidate")?;
+
+            debug!(
+                "Chunked transfer encoding detected for path={}, disabling compression and buffering",
+                ctx.path
+            );
         }
 
         // Handle WebSocket upgrade responses
