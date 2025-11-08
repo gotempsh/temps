@@ -77,7 +77,8 @@ export function UpgradeServiceDialog({
     },
     onError: (error: Error) => {
       toast.error('Failed to upgrade service', {
-        description: error.message || 'An unexpected error occurred',
+        description:
+          error.detail || error.message || 'An unexpected error occurred',
       })
     },
   })

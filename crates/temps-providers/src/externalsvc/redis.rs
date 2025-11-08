@@ -41,6 +41,16 @@ pub struct RedisInputConfig {
     #[serde(default, deserialize_with = "deserialize_optional_password")]
     #[schemars(with = "Option<String>", example = "example_password")]
     pub password: Option<String>,
+
+    /// Docker image to use for Redis
+    #[serde(default = "default_image")]
+    #[schemars(example = "example_image", default = "default_image")]
+    pub image: String,
+
+    /// Redis version
+    #[serde(default = "default_version")]
+    #[schemars(example = "example_version", default = "default_version")]
+    pub version: String,
 }
 
 /// Internal runtime configuration for Redis service
@@ -50,6 +60,8 @@ pub struct RedisConfig {
     pub host: String,
     pub port: String,
     pub password: String,
+    pub image: String,
+    pub version: String,
 }
 
 impl From<RedisInputConfig> for RedisConfig {
@@ -62,6 +74,8 @@ impl From<RedisInputConfig> for RedisConfig {
                     .unwrap_or_else(|| "6379".to_string())
             }),
             password: input.password.unwrap_or_else(generate_password),
+            image: input.image,
+            version: input.version,
         }
     }
 }
@@ -101,6 +115,22 @@ fn example_port() -> &'static str {
 
 fn example_password() -> &'static str {
     "your-secure-password"
+}
+
+fn default_image() -> String {
+    "redis".to_string()
+}
+
+fn example_image() -> &'static str {
+    "redis"
+}
+
+fn default_version() -> String {
+    "7-alpine".to_string()
+}
+
+fn example_version() -> &'static str {
+    "7-alpine"
 }
 
 fn is_port_available(port: u16) -> bool {
@@ -500,7 +530,31 @@ impl ExternalService for RedisService {
     fn get_parameter_schema(&self) -> Option<serde_json::Value> {
         // Generate JSON Schema from RedisInputConfig
         let schema = schemars::schema_for!(RedisInputConfig);
-        serde_json::to_value(schema).ok()
+        let mut schema_json = serde_json::to_value(schema).ok()?;
+
+        // Add metadata about which fields are editable
+        if let Some(properties) = schema_json
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
+        {
+            for key in properties.keys().cloned().collect::<Vec<_>>() {
+                // Define which fields should be editable
+                let editable = match key.as_str() {
+                    "host" => false,    // Don't change host after creation
+                    "port" => true,     // Port can be changed
+                    "password" => true, // Password can be updated
+                    "image" => true,    // Image can be upgraded
+                    "version" => true,  // Version can be changed
+                    _ => false,
+                };
+
+                if let Some(prop) = schema_json["properties"][&key].as_object_mut() {
+                    prop.insert("x-editable".to_string(), serde_json::json!(editable));
+                }
+            }
+        }
+
+        Some(schema_json)
     }
 
     fn get_runtime_env_definitions(&self) -> Vec<super::RuntimeEnvVar> {
@@ -957,5 +1011,215 @@ impl ExternalService for RedisService {
 
         info!("Redis restore completed successfully");
         Ok(())
+    }
+
+    fn get_default_docker_image(&self) -> (String, String) {
+        // Return (image_name, version)
+        ("redis".to_string(), "7-alpine".to_string())
+    }
+
+    async fn get_current_docker_image(&self) -> Result<(String, String)> {
+        let container_name = self.get_container_name();
+        let container = self
+            .docker
+            .inspect_container(
+                &container_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await?;
+
+        // Get the image from the container's inspection data
+        if let Some(image) = container.config.and_then(|c| c.image) {
+            // Parse image name and tag from the full image string
+            if let Some((name, tag)) = image.split_once(':') {
+                Ok((name.to_string(), tag.to_string()))
+            } else {
+                Ok((image.clone(), "latest".to_string()))
+            }
+        } else {
+            Err(anyhow::anyhow!(
+                "Failed to get current docker image for Redis container"
+            ))
+        }
+    }
+
+    fn get_default_version(&self) -> String {
+        "7-alpine".to_string()
+    }
+
+    async fn get_current_version(&self) -> Result<String> {
+        let (_, version) = self.get_current_docker_image().await?;
+        Ok(version)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parameter_schema_editable_fields() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = RedisService::new("test-editable".to_string(), docker);
+
+        // Get the parameter schema
+        let schema_opt = service.get_parameter_schema();
+        assert!(schema_opt.is_some(), "Schema should be generated");
+
+        let schema = schema_opt.unwrap();
+        let schema_obj = schema.as_object().expect("Schema should be an object");
+        let properties = schema_obj
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("Properties should be an object");
+
+        // Define expected editable status for each field
+        let editable_status = vec![
+            ("host", false),
+            ("port", true),
+            ("password", true),
+            ("image", true),
+            ("version", true),
+        ];
+
+        for (field_name, should_be_editable) in editable_status {
+            let field = properties
+                .get(field_name)
+                .and_then(|v| v.as_object())
+                .expect(&format!("{} field should exist", field_name));
+
+            let is_editable = field
+                .get("x-editable")
+                .and_then(|v| v.as_bool())
+                .expect(&format!("{} should have x-editable property", field_name));
+
+            assert_eq!(
+                is_editable, should_be_editable,
+                "Field {} editable status should be {}",
+                field_name, should_be_editable
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Docker
+    async fn test_port_change_after_creation() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = RedisService::new("test-port-change".to_string(), docker);
+
+        // Create initial config with a specific port
+        let initial_port = "7543";
+        let config1 = super::ServiceConfig {
+            name: "test-redis".to_string(),
+            service_type: super::ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": initial_port,
+                "password": "redispass123"
+            }),
+        };
+
+        // Initialize service
+        let result = service.init(config1.clone()).await;
+        assert!(result.is_ok(), "Service initialization failed");
+
+        // Verify initial port is set
+        let local_addr = service.get_local_address(config1.clone()).unwrap();
+        assert!(local_addr.contains("7543"), "Initial port should be 7543");
+
+        // Create new config with different port
+        let new_port = "7544";
+        let config2 = super::ServiceConfig {
+            name: "test-redis".to_string(),
+            service_type: super::ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": new_port,
+                "password": "redispass123"
+            }),
+        };
+
+        // Verify new port configuration is recognized
+        let new_local_addr = service.get_local_address(config2).unwrap();
+        assert!(new_local_addr.contains("7544"), "New port should be 7544");
+
+        // Cleanup
+        let _ = service.cleanup().await;
+    }
+
+    #[test]
+    fn test_default_docker_image() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = RedisService::new("test-image".to_string(), docker);
+
+        let (image_name, version) = service.get_default_docker_image();
+        assert_eq!(image_name, "redis", "Default image should be redis");
+        assert_eq!(version, "7-alpine", "Default version should be 7-alpine");
+    }
+
+    #[test]
+    fn test_image_and_version_in_config() {
+        // Test Redis configuration with image and version fields
+        let input_config = RedisInputConfig {
+            host: "localhost".to_string(),
+            port: Some("6379".to_string()),
+            password: Some("mypassword".to_string()),
+            image: "redis".to_string(),
+            version: "7-alpine".to_string(),
+        };
+
+        // Convert to runtime config
+        let runtime_config: RedisConfig = input_config.into();
+
+        // Verify both image and version are preserved
+        assert_eq!(runtime_config.image, "redis");
+        assert_eq!(runtime_config.version, "7-alpine");
+    }
+
+    #[test]
+    fn test_redis_version_upgrade_config() {
+        // Test simulated upgrade from Redis 6 to 7
+        let old_config = super::ServiceConfig {
+            name: "test-redis".to_string(),
+            service_type: super::ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": Some("6379"),
+                "password": "redispass123",
+                "image": "redis",
+                "version": "6-alpine"
+            }),
+        };
+
+        let new_config = super::ServiceConfig {
+            name: "test-redis".to_string(),
+            service_type: super::ServiceType::Redis,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": Some("6379"),
+                "password": "redispass123",
+                "image": "redis",
+                "version": "7-alpine"
+            }),
+        };
+
+        // Verify version upgrade configuration
+        let old_version = old_config
+            .parameters
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let new_version = new_config
+            .parameters
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        assert_eq!(old_version, "6-alpine", "Old version should be 6-alpine");
+        assert_eq!(new_version, "7-alpine", "New version should be 7-alpine");
     }
 }

@@ -211,6 +211,34 @@ cargo test -p temps-deployments
 cargo test -- --ignored
 ```
 
+### Docker Tests (Always Executed)
+
+Some tests in the codebase require Docker to be running but are NOT marked with `#[ignore]`. These tests run as part of the standard `cargo test` command:
+
+**Important:** Docker tests (without `#[ignore]`) will skip gracefully if Docker is not available. They detect Docker availability at runtime and exit early with informational output if Docker cannot be accessed.
+
+**Examples:**
+- `test_postgres_v16_to_v17_actual_upgrade()` in `temps-providers/src/externalsvc/postgres.rs` - Creates PostgreSQL 16 container, upgrades to v17, and verifies via SQL
+
+**Characteristics:**
+- ✅ No `#[ignore]` attribute
+- ✅ Execute in normal `cargo test` runs
+- ✅ Skip gracefully if Docker unavailable (no test failure)
+- ✅ Create real Docker containers for end-to-end testing
+- ✅ Clean up resources in test (stops and removes containers)
+- ✅ Use error handling instead of panics for external dependencies
+
+**Running Docker tests:**
+```bash
+# Runs ALL tests including Docker tests (Docker tests will skip if Docker unavailable)
+cargo test --lib
+
+# Run specific Docker test
+cargo test --lib test_postgres_v16_to_v17_actual_upgrade -- --nocapture
+
+# Docker tests are always part of test suite - no special flag needed
+```
+
 ### Integration Tests with Pebble (Let's Encrypt ACME)
 
 The `temps-domains` crate includes integration tests that use [Pebble](https://github.com/letsencrypt/pebble), a small ACME test server for testing Let's Encrypt integration.

@@ -25,16 +25,18 @@ import {
 } from '@/components/ui/dialog'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
 import { ServiceLogo } from '@/components/ui/service-logo'
+import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { UpgradeServiceDialog } from '@/components/storage/UpgradeServiceDialog'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
   ArrowLeft,
   ArrowUpCircle,
   Loader2,
+  Pencil,
   RefreshCcw,
   Trash2,
 } from 'lucide-react'
@@ -46,8 +48,10 @@ export function ServiceDetail() {
   const { id } = useParams<{ id: string }>()
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
   const [isUpgradeDialogOpen, setIsUpgradeDialogOpen] = useState(false)
+  const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const {
@@ -254,6 +258,15 @@ export function ServiceDetail() {
             <Button
               variant="outline"
               size="sm"
+              onClick={() => setIsEditDialogOpen(true)}
+              className="gap-2"
+            >
+              <Pencil className="h-4 w-4" />
+              Edit
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
               onClick={() => setIsUpgradeDialogOpen(true)}
               className="gap-2"
             >
@@ -279,6 +292,31 @@ export function ServiceDetail() {
         )}
 
         <div className="grid gap-6">
+          {/* Service Configuration Section */}
+          <Card>
+            <CardHeader>
+              <CardTitle>Configuration</CardTitle>
+              <CardDescription>Current service configuration</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {service.current_parameters?.docker_image && (
+                <div className="space-y-2">
+                  <div className="text-sm font-medium">Docker Image</div>
+                  <div className="flex items-center gap-2 rounded-md border border-border bg-muted/50 p-3 font-mono text-sm">
+                    <span className="flex-1 break-all text-foreground">
+                      {service.current_parameters.docker_image}
+                    </span>
+                  </div>
+                </div>
+              )}
+              {!service.current_parameters?.docker_image && (
+                <div className="text-sm text-muted-foreground">
+                  No docker image configured
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
           {/* Environment Variables Section */}
           <Card>
             <CardHeader>
@@ -360,6 +398,20 @@ export function ServiceDetail() {
         serviceName={service.service.name}
         currentImage={service.current_parameters?.docker_image || undefined}
         serviceType={service.service.service_type}
+      />
+
+      <EditServiceDialog
+        open={isEditDialogOpen}
+        onOpenChange={setIsEditDialogOpen}
+        service={service.service}
+        onSuccess={() => {
+          refetch()
+          queryClient.invalidateQueries({
+            queryKey: getServiceOptions({
+              path: { id: parseInt(id!) },
+            }).queryKey,
+          })
+        }}
       />
     </div>
   )

@@ -223,4 +223,30 @@ pub trait ExternalService: Send + Sync {
     async fn upgrade(&self, _old_config: ServiceConfig, _new_config: ServiceConfig) -> Result<()> {
         Err(anyhow::anyhow!("Upgrade not implemented for this service"))
     }
+
+    /// Get the default/recommended Docker image and version for this service
+    /// Returns (image_name, version) tuple
+    fn get_default_docker_image(&self) -> (String, String) {
+        ("".to_string(), "latest".to_string())
+    }
+
+    /// Get the currently running Docker image and version for this service
+    /// Returns (image_name, version) tuple
+    async fn get_current_docker_image(&self) -> Result<(String, String)> {
+        Err(anyhow::anyhow!(
+            "Getting current docker image not implemented for this service"
+        ))
+    }
+
+    /// Get the default/recommended version for this service
+    fn get_default_version(&self) -> String {
+        "latest".to_string()
+    }
+
+    /// Get the currently running version for this service
+    async fn get_current_version(&self) -> Result<String> {
+        Err(anyhow::anyhow!(
+            "Getting current version not implemented for this service"
+        ))
+    }
 }

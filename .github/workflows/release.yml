@@ -33,6 +33,9 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
 
+      - name: Install wasm-pack
+        run: curl https://rustwasm.org/wasm-pack/installer/init.sh -sSf | sh
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -105,6 +108,9 @@ jobs:
         with:
           targets: x86_64-apple-darwin
 
+      - name: Install wasm-pack
+        run: curl https://rustwasm.org/wasm-pack/installer/init.sh -sSf | sh
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -176,6 +182,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.org/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2

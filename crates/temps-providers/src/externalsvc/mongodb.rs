@@ -493,7 +493,33 @@ impl ExternalService for MongodbService {
     fn get_parameter_schema(&self) -> Option<serde_json::Value> {
         // Generate JSON Schema from MongodbInputConfig
         let schema = schemars::schema_for!(MongodbInputConfig);
-        serde_json::to_value(schema).ok()
+        let mut schema_json = serde_json::to_value(schema).ok()?;
+
+        // Add metadata about which fields are editable
+        if let Some(properties) = schema_json
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
+        {
+            for key in properties.keys().cloned().collect::<Vec<_>>() {
+                // Define which fields should be editable
+                let editable = match key.as_str() {
+                    "host" => false,     // Don't change host after creation
+                    "port" => true,      // Port can be changed
+                    "database" => false, // Don't change database name after creation
+                    "username" => false, // Don't change username after creation
+                    "password" => true,  // Password can be updated
+                    "image" => true,     // Image can be upgraded
+                    "version" => true,   // Version can be upgraded
+                    _ => false,
+                };
+
+                if let Some(prop) = schema_json["properties"][&key].as_object_mut() {
+                    prop.insert("x-editable".to_string(), serde_json::json!(editable));
+                }
+            }
+        }
+
+        Some(schema_json)
     }
 
     async fn start(&self) -> Result<()> {
@@ -1015,6 +1041,45 @@ impl ExternalService for MongodbService {
         info!("MongoDB restore completed successfully");
         Ok(())
     }
+
+    fn get_default_docker_image(&self) -> (String, String) {
+        // Return (image_name, version)
+        ("mongo".to_string(), "8.0".to_string())
+    }
+
+    async fn get_current_docker_image(&self) -> Result<(String, String)> {
+        let container_name = self.get_container_name();
+        let container = self
+            .docker
+            .inspect_container(
+                &container_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await?;
+
+        // Get the image from the container's inspection data
+        if let Some(image) = container.config.and_then(|c| c.image) {
+            // Parse image name and tag from the full image string
+            if let Some((name, tag)) = image.split_once(':') {
+                Ok((name.to_string(), tag.to_string()))
+            } else {
+                Ok((image.clone(), "latest".to_string()))
+            }
+        } else {
+            Err(anyhow::anyhow!(
+                "Failed to get current docker image for MongoDB container"
+            ))
+        }
+    }
+
+    fn get_default_version(&self) -> String {
+        "8.0".to_string()
+    }
+
+    async fn get_current_version(&self) -> Result<String> {
+        let (_, version) = self.get_current_docker_image().await?;
+        Ok(version)
+    }
 }
 
 #[cfg(test)]
@@ -1139,5 +1204,142 @@ mod tests {
         let password_desc = password_field.get("description").and_then(|v| v.as_str());
         assert!(password_desc.is_some());
         assert!(password_desc.unwrap().contains("auto-generated"));
+    }
+
+    #[test]
+    fn test_parameter_schema_editable_fields() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = MongodbService::new("test-editable".to_string(), docker);
+
+        // Get the parameter schema
+        let schema_opt = service.get_parameter_schema();
+        assert!(schema_opt.is_some(), "Schema should be generated");
+
+        let schema = schema_opt.unwrap();
+        let schema_obj = schema.as_object().expect("Schema should be an object");
+        let properties = schema_obj
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("Properties should be an object");
+
+        // Define expected editable status for each field
+        let editable_status = vec![
+            ("host", false),
+            ("port", true),
+            ("database", false),
+            ("username", false),
+            ("password", true),
+            ("image", true),
+            ("version", true),
+        ];
+
+        for (field_name, should_be_editable) in editable_status {
+            let field = properties
+                .get(field_name)
+                .and_then(|v| v.as_object())
+                .expect(&format!("{} field should exist", field_name));
+
+            let is_editable = field
+                .get("x-editable")
+                .and_then(|v| v.as_bool())
+                .expect(&format!("{} should have x-editable property", field_name));
+
+            assert_eq!(
+                is_editable, should_be_editable,
+                "Field {} editable status should be {}",
+                field_name, should_be_editable
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_docker_image() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = MongodbService::new("test-image".to_string(), docker);
+
+        let (image_name, version) = service.get_default_docker_image();
+        assert_eq!(image_name, "mongo", "Default image should be mongo");
+        assert_eq!(version, "8.0", "Default version should be 8.0");
+    }
+
+    #[test]
+    fn test_image_and_version_configuration() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let _service = MongodbService::new("test-config".to_string(), docker);
+
+        // Create config with specific image and version
+        let config = ServiceConfig {
+            name: "test-mongo".to_string(),
+            service_type: super::ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": Some("27017"),
+                "database": "testdb",
+                "username": "testuser",
+                "password": "testpass123",
+                "image": "mongo",
+                "version": "8.0"
+            }),
+        };
+
+        // Verify configuration contains image and version
+        assert_eq!(
+            config.parameters.get("image").and_then(|v| v.as_str()),
+            Some("mongo")
+        );
+        assert_eq!(
+            config.parameters.get("version").and_then(|v| v.as_str()),
+            Some("8.0")
+        );
+    }
+
+    #[test]
+    fn test_mongodb_version_upgrade_config() {
+        // Test simulated upgrade from MongoDB 7.0 to 8.0
+        let old_config = ServiceConfig {
+            name: "test-mongo".to_string(),
+            service_type: super::ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": Some("27017"),
+                "database": "testdb",
+                "username": "testuser",
+                "password": "testpass123",
+                "image": "mongo",
+                "version": "7.0"
+            }),
+        };
+
+        let new_config = ServiceConfig {
+            name: "test-mongo".to_string(),
+            service_type: super::ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": Some("27017"),
+                "database": "testdb",
+                "username": "testuser",
+                "password": "testpass123",
+                "image": "mongo",
+                "version": "8.0"
+            }),
+        };
+
+        // Verify version upgrade configuration
+        let old_version = old_config
+            .parameters
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let new_version = new_config
+            .parameters
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        assert_eq!(old_version, "7.0", "Old version should be 7.0");
+        assert_eq!(new_version, "8.0", "New version should be 8.0");
     }
 }

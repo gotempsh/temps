@@ -1485,6 +1485,7 @@ mod tests {
     async fn test_create_postgres_service() {
         let (manager, _test_db) = setup_test_manager().await;
         let random_unused_port = get_unused_port();
+        let service_name = format!("test-postgres-{}", chrono::Utc::now().timestamp_millis());
         let mut params = HashMap::new();
         params.insert(
             "database".to_string(),
@@ -1506,9 +1507,14 @@ mod tests {
             "host".to_string(),
             JsonValue::String("localhost".to_string()),
         );
+        params.insert("max_connections".to_string(), JsonValue::Number(100.into()));
+        params.insert(
+            "docker_image".to_string(),
+            JsonValue::String("postgres:16-alpine".to_string()),
+        );
 
         let request = CreateExternalServiceRequest {
-            name: "test-postgres".to_string(),
+            name: service_name.clone(),
             service_type: ServiceType::Postgres,
             version: Some("16".to_string()),
             parameters: params,
@@ -1522,7 +1528,7 @@ mod tests {
         );
 
         let service = result.unwrap();
-        assert_eq!(service.name, "test-postgres");
+        assert_eq!(service.name, service_name);
         assert_eq!(service.service_type, ServiceType::Postgres);
         assert_eq!(service.version, Some("16".to_string()));
         assert_eq!(service.status, "running");
@@ -1913,6 +1919,11 @@ mod tests {
             "host".to_string(),
             JsonValue::String("localhost".to_string()),
         );
+        params.insert("max_connections".to_string(), JsonValue::Number(100.into()));
+        params.insert(
+            "docker_image".to_string(),
+            JsonValue::String("postgres:16-alpine".to_string()),
+        );
 
         let request = CreateExternalServiceRequest {
             name: "crypto-service".to_string(),
@@ -2043,10 +2054,7 @@ mod tests {
             "host".to_string(),
             JsonValue::String("localhost".to_string()),
         );
-        params.insert(
-            "max_connections".to_string(),
-            JsonValue::String("100".to_string()),
-        );
+        params.insert("max_connections".to_string(), JsonValue::Number(100.into()));
         params.insert(
             "docker_image".to_string(),
             JsonValue::String("postgres:16-alpine".to_string()),
@@ -2096,10 +2104,7 @@ mod tests {
             "host".to_string(),
             JsonValue::String("localhost".to_string()),
         );
-        update_params.insert(
-            "max_connections".to_string(),
-            JsonValue::String("100".to_string()),
-        );
+        update_params.insert("max_connections".to_string(), JsonValue::Number(100.into()));
 
         let update_request = UpdateExternalServiceRequest {
             name: None,

@@ -3,6 +3,7 @@ import { ServiceType } from '@/api/client/types.gen'
 import { CreateServiceButton } from '@/components/storage/CreateServiceButton'
 import { CreateServiceDialog } from '@/components/storage/CreateServiceDialog'
 import { DeleteServiceButton } from '@/components/storage/DeleteServiceButton'
+import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import EmptyStateStorage from '@/components/storage/EmptyStateStorage'
 import { Button } from '@/components/ui/button'
 import {
@@ -17,7 +18,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowRight, RefreshCcw } from 'lucide-react'
+import { ArrowRight, Pencil, RefreshCcw } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { TimeAgo } from '@/components/utils/TimeAgo'
@@ -28,6 +29,8 @@ export function Storage() {
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [selectedServiceType, setSelectedServiceType] =
     useState<ServiceType | null>(null)
+  const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
+  const [selectedService, setSelectedService] = useState<any>(null)
 
   const {
     data: services,
@@ -127,6 +130,24 @@ export function Storage() {
           }}
           serviceType={selectedServiceType!}
         />
+
+        {selectedService && (
+          <EditServiceDialog
+            open={isEditDialogOpen}
+            onOpenChange={(open) => {
+              setIsEditDialogOpen(open)
+              if (!open) {
+                setSelectedService(null)
+              }
+            }}
+            service={selectedService}
+            onSuccess={() => {
+              setIsEditDialogOpen(false)
+              setSelectedService(null)
+              refetch()
+            }}
+          />
+        )}
       </div>
     )
   }
@@ -141,14 +162,13 @@ export function Storage() {
 
         <div className="grid gap-4">
           {services.map((service) => (
-            <Card
-              key={service.id}
-              onClick={() => navigate(`/storage/${service.id}`)}
-              className="cursor-pointer transition-colors hover:bg-muted/50"
-            >
+            <Card key={service.id} className="transition-colors hover:bg-muted/50">
               <CardHeader>
                 <div className="flex items-center justify-between">
-                  <div className="space-y-1">
+                  <div
+                    className="flex-1 cursor-pointer space-y-1"
+                    onClick={() => navigate(`/storage/${service.id}`)}
+                  >
                     <CardTitle className="flex items-center gap-2">
                       <ServiceLogo service={service.service_type} />
                       {service.name}
@@ -161,14 +181,31 @@ export function Storage() {
                       </span>
                     </CardDescription>
                   </div>
-                  <DeleteServiceButton
-                    serviceId={service.id}
-                    serviceName={service.name}
-                    onSuccess={() => refetch()}
-                  />
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setSelectedService(service)
+                        setIsEditDialogOpen(true)
+                      }}
+                      className="h-8 w-8"
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </Button>
+                    <DeleteServiceButton
+                      serviceId={service.id}
+                      serviceName={service.name}
+                      onSuccess={() => refetch()}
+                    />
+                  </div>
                 </div>
               </CardHeader>
-              <CardContent>
+              <CardContent
+                onClick={() => navigate(`/storage/${service.id}`)}
+                className="cursor-pointer"
+              >
                 <div className="flex items-center text-sm text-muted-foreground">
                   View details
                   <ArrowRight className="ml-1 h-4 w-4" />
@@ -177,6 +214,24 @@ export function Storage() {
             </Card>
           ))}
         </div>
+
+        {selectedService && (
+          <EditServiceDialog
+            open={isEditDialogOpen}
+            onOpenChange={(open) => {
+              setIsEditDialogOpen(open)
+              if (!open) {
+                setSelectedService(null)
+              }
+            }}
+            service={selectedService}
+            onSuccess={() => {
+              setIsEditDialogOpen(false)
+              setSelectedService(null)
+              refetch()
+            }}
+          />
+        )}
       </div>
     </div>
   )

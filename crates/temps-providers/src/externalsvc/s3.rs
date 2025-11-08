@@ -53,6 +53,11 @@ pub struct S3InputConfig {
     #[serde(default = "default_region")]
     #[schemars(example = "example_region", default = "default_region")]
     pub region: String,
+
+    /// Docker image to use for MinIO
+    #[serde(default = "default_image")]
+    #[schemars(example = "example_image", default = "default_image")]
+    pub image: String,
 }
 
 /// Internal runtime configuration for S3/MinIO service
@@ -64,6 +69,7 @@ pub struct S3Config {
     pub secret_key: String,
     pub host: String,
     pub region: String,
+    pub image: String,
 }
 
 impl From<S3InputConfig> for S3Config {
@@ -78,6 +84,7 @@ impl From<S3InputConfig> for S3Config {
             secret_key: input.secret_key.unwrap_or_else(default_secret_key),
             host: input.host,
             region: input.region,
+            image: input.image,
         }
     }
 }
@@ -134,6 +141,14 @@ fn example_host() -> &'static str {
 
 fn example_region() -> &'static str {
     "us-east-1"
+}
+
+fn default_image() -> String {
+    "minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()
+}
+
+fn example_image() -> &'static str {
+    "minio/minio:RELEASE.2025-09-07T16-13-09Z"
 }
 
 fn is_port_available(port: u16) -> bool {
@@ -538,7 +553,32 @@ impl ExternalService for S3Service {
     fn get_parameter_schema(&self) -> Option<serde_json::Value> {
         // Generate JSON Schema from S3InputConfig
         let schema = schemars::schema_for!(S3InputConfig);
-        serde_json::to_value(schema).ok()
+        let mut schema_json = serde_json::to_value(schema).ok()?;
+
+        // Add metadata about which fields are editable
+        if let Some(properties) = schema_json
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
+        {
+            for key in properties.keys().cloned().collect::<Vec<_>>() {
+                // Define which fields should be editable
+                let editable = match key.as_str() {
+                    "host" => false,       // Don't change host after creation
+                    "port" => true,        // Port can be changed
+                    "access_key" => false, // Don't change access key after creation
+                    "secret_key" => false, // Don't change secret key after creation
+                    "region" => true,      // Region can be updated
+                    "image" => true,       // Image can be upgraded
+                    _ => false,
+                };
+
+                if let Some(prop) = schema_json["properties"][&key].as_object_mut() {
+                    prop.insert("x-editable".to_string(), serde_json::json!(editable));
+                }
+            }
+        }
+
+        Some(schema_json)
     }
 
     async fn start(&self) -> Result<()> {
@@ -1308,6 +1348,49 @@ impl ExternalService for S3Service {
         info!("S3 restore completed successfully");
         Ok(())
     }
+
+    fn get_default_docker_image(&self) -> (String, String) {
+        // Return (image_name, version)
+        // Default MinIO image and release version
+        (
+            "minio/minio".to_string(),
+            "RELEASE.2025-09-07T16-13-09Z".to_string(),
+        )
+    }
+
+    async fn get_current_docker_image(&self) -> Result<(String, String)> {
+        let container_name = self.get_container_name();
+        let container = self
+            .docker
+            .inspect_container(
+                &container_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await?;
+
+        // Get the image from the container's inspection data
+        if let Some(image) = container.config.and_then(|c| c.image) {
+            // Parse image name and tag from the full image string
+            if let Some((name, tag)) = image.split_once(':') {
+                Ok((name.to_string(), tag.to_string()))
+            } else {
+                Ok((image.clone(), "latest".to_string()))
+            }
+        } else {
+            Err(anyhow::anyhow!(
+                "Failed to get current docker image for S3/MinIO container"
+            ))
+        }
+    }
+
+    fn get_default_version(&self) -> String {
+        "RELEASE.2025-09-07T16-13-09Z".to_string()
+    }
+
+    async fn get_current_version(&self) -> Result<String> {
+        let (_, version) = self.get_current_docker_image().await?;
+        Ok(version)
+    }
 }
 
 fn parse_multiline_json_output(output: &str) -> Result<Vec<serde_json::Value>> {
@@ -1330,4 +1413,146 @@ fn parse_multiline_json_output(output: &str) -> Result<Vec<serde_json::Value>> {
     }
 
     Ok(json_objects)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parameter_schema_editable_fields() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = S3Service::new("test-editable".to_string(), docker);
+
+        // Get the parameter schema
+        let schema_opt = service.get_parameter_schema();
+        assert!(schema_opt.is_some(), "Schema should be generated");
+
+        let schema = schema_opt.unwrap();
+        let schema_obj = schema.as_object().expect("Schema should be an object");
+        let properties = schema_obj
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("Properties should be an object");
+
+        // Define expected editable status for each field
+        let editable_status = vec![
+            ("host", false),
+            ("port", true),
+            ("access_key", false),
+            ("secret_key", false),
+            ("region", true),
+            ("image", true),
+        ];
+
+        for (field_name, should_be_editable) in editable_status {
+            let field = properties
+                .get(field_name)
+                .and_then(|v| v.as_object())
+                .expect(&format!("{} field should exist", field_name));
+
+            let is_editable = field
+                .get("x-editable")
+                .and_then(|v| v.as_bool())
+                .expect(&format!("{} should have x-editable property", field_name));
+
+            assert_eq!(
+                is_editable, should_be_editable,
+                "Field {} editable status should be {}",
+                field_name, should_be_editable
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_docker_image() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = S3Service::new("test-image".to_string(), docker);
+
+        let (image_name, version) = service.get_default_docker_image();
+        assert_eq!(
+            image_name, "minio/minio",
+            "Default image should be minio/minio"
+        );
+        assert!(
+            version.starts_with("RELEASE."),
+            "Default version should be a MinIO release tag"
+        );
+    }
+
+    #[test]
+    fn test_image_field_in_configuration() {
+        // Test S3 configuration with image field
+        let input_config = S3InputConfig {
+            port: Some("9000".to_string()),
+            access_key: Some("minioadmin".to_string()),
+            secret_key: Some("minioadmin".to_string()),
+            host: "localhost".to_string(),
+            region: "us-east-1".to_string(),
+            image: "minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string(),
+        };
+
+        // Convert to runtime config
+        let runtime_config: S3Config = input_config.into();
+
+        // Verify image is preserved
+        assert_eq!(
+            runtime_config.image,
+            "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+        );
+    }
+
+    #[test]
+    fn test_minio_version_upgrade_config() {
+        // Test simulated MinIO image upgrade
+        let old_config = super::ServiceConfig {
+            name: "test-s3".to_string(),
+            service_type: super::ServiceType::S3,
+            version: None,
+            parameters: serde_json::json!({
+                "port": Some("9000"),
+                "access_key": "minioadmin",
+                "secret_key": "minioadmin",
+                "host": "localhost",
+                "region": "us-east-1",
+                "image": "minio/minio:RELEASE.2025-06-01T01-00-00Z"
+            }),
+        };
+
+        let new_config = super::ServiceConfig {
+            name: "test-s3".to_string(),
+            service_type: super::ServiceType::S3,
+            version: None,
+            parameters: serde_json::json!({
+                "port": Some("9000"),
+                "access_key": "minioadmin",
+                "secret_key": "minioadmin",
+                "host": "localhost",
+                "region": "us-east-1",
+                "image": "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+            }),
+        };
+
+        // Verify image upgrade configuration
+        let old_image = old_config
+            .parameters
+            .get("image")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let new_image = new_config
+            .parameters
+            .get("image")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        assert!(
+            old_image.contains("2025-06-01"),
+            "Old image should contain 2025-06-01"
+        );
+        assert!(
+            new_image.contains("2025-09-07"),
+            "New image should contain 2025-09-07"
+        );
+        assert_ne!(old_image, new_image, "Images should be different");
+    }
 }

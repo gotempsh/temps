@@ -57,7 +57,7 @@ impl ErrorProvider for SentryProvider {
         // Process each item in the envelope
         for item in envelope.items() {
             match item {
-                EnvelopeItem::Event(event) | EnvelopeItem::Transaction(event) => {
+                EnvelopeItem::Event(event) => {
                     // Extract event ID first
                     let event_id = event
                         .value()
@@ -103,6 +103,9 @@ impl ErrorProvider for SentryProvider {
                 }
                 EnvelopeItem::Span(_) => {
                     tracing::debug!("Sentry span item (not yet implemented)");
+                }
+                EnvelopeItem::Transaction(_) => {
+                    tracing::debug!("Sentry transaction item (not yet implemented)");
                 }
             }
         }
