@@ -303,7 +303,7 @@ impl LoadBalancer {
             match self.crypto.decrypt(encrypted) {
                 Ok(decrypted) => Some(decrypted),
                 Err(e) => {
-                    info!("Failed to decrypt visitor_id cookie: {}", e);
+                    debug!("Failed to decrypt visitor_id cookie: {}", e);
                     None
                 }
             }
@@ -377,7 +377,7 @@ impl LoadBalancer {
         ctx.session_id_i32 = Some(session.session_id_i32);
         ctx.is_new_session = session.is_new_session;
 
-        // Log visitor info
+        // Log visitor debug
         debug!(
             "HTML request from visitor {} with session {} (new: {}) for project {}",
             visitor.visitor_id,
@@ -407,8 +407,9 @@ impl LoadBalancer {
             upstream_response.insert_header("X-Deployment-ID", deployment.id.to_string())?;
         }
 
-        // Apply security headers from settings
-        self.apply_security_headers(upstream_response).await?;
+        // Apply security headers from project settings or global config
+        self.apply_security_headers(upstream_response, ctx.project.as_deref())
+            .await?;
 
         // Set visitor and session cookies
         self.set_tracking_cookies(session, upstream_response, ctx)
@@ -428,84 +429,134 @@ impl LoadBalancer {
         Ok(())
     }
 
-    /// Apply security headers from global settings
-    async fn apply_security_headers(&self, response: &mut ResponseHeader) -> Result<()> {
-        // Get settings from config service
-        let settings = match self.config_service.get_settings().await {
-            Ok(settings) => settings,
-            Err(e) => {
-                warn!("Failed to get settings for security headers: {}", e);
-                return Ok(()); // Don't fail the request if we can't get settings
+    /// Apply security headers from project settings or global config
+    ///
+    /// Attempts to use project-level security settings first (via temps-routes),
+    /// then falls back to global config service settings if project is unavailable
+    async fn apply_security_headers(
+        &self,
+        response: &mut ResponseHeader,
+        project: Option<&projects::Model>,
+    ) -> Result<()> {
+        use temps_entities::deployment_config::SecurityHeadersConfig;
+
+        // Try to get security headers from project configuration first
+        let headers_config = if let Some(proj) = project {
+            debug!("Applying security headers for project id={}", proj.id);
+            if let Some(ref deploy_config) = proj.deployment_config {
+                if let Some(ref security) = deploy_config.security {
+                    if let Some(ref headers) = security.headers {
+                        debug!(
+                            "Using project-level security headers: preset={:?}",
+                            headers.preset
+                        );
+                        Some(headers.clone())
+                    } else {
+                        debug!("Project has security config but no headers configured");
+                        None
+                    }
+                } else {
+                    debug!("Project has deployment_config but no security config");
+                    None
+                }
+            } else {
+                debug!("Project has no deployment_config");
+                None
             }
+        } else {
+            debug!("No project context available for security headers");
+            None
         };
 
-        let headers = &settings.security_headers;
-
-        // Skip if security headers are disabled
-        if !headers.enabled {
-            debug!("Security headers are disabled in settings");
-            return Ok(());
-        }
-
-        // Apply Content-Security-Policy
-        if let Some(ref csp) = headers.content_security_policy {
-            if !csp.is_empty() {
-                if let Err(e) = response.insert_header("Content-Security-Policy", csp) {
-                    warn!("Failed to set Content-Security-Policy header: {}", e);
+        // If no project-level config, get from global settings
+        let headers_config = if headers_config.is_none() {
+            debug!("No project-level security headers, checking global settings");
+            match self.config_service.get_settings().await {
+                Ok(settings) => {
+                    let headers = &settings.security_headers;
+                    if !headers.enabled {
+                        debug!("Security headers are disabled in global settings");
+                        return Ok(());
+                    }
+                    debug!("Using global security headers: preset={}", headers.preset);
+                    Some(SecurityHeadersConfig {
+                        preset: Some(headers.preset.clone()),
+                        content_security_policy: headers.content_security_policy.clone(),
+                        x_frame_options: Some(headers.x_frame_options.clone()),
+                        strict_transport_security: Some(headers.strict_transport_security.clone()),
+                        referrer_policy: Some(headers.referrer_policy.clone()),
+                    })
+                }
+                Err(e) => {
+                    warn!("Failed to get settings for security headers: {}", e);
+                    return Ok(()); // Don't fail the request if we can't get settings
                 }
             }
-        }
+        } else {
+            headers_config
+        };
 
-        // Apply X-Frame-Options
-        if !headers.x_frame_options.is_empty() {
-            if let Err(e) = response.insert_header("X-Frame-Options", &headers.x_frame_options) {
-                warn!("Failed to set X-Frame-Options header: {}", e);
-            }
-        }
+        // Apply headers from configuration
+        if let Some(config) = headers_config {
+            let mut headers_applied = Vec::new();
 
-        // Apply X-Content-Type-Options
-        if !headers.x_content_type_options.is_empty() {
-            if let Err(e) =
-                response.insert_header("X-Content-Type-Options", &headers.x_content_type_options)
-            {
-                warn!("Failed to set X-Content-Type-Options header: {}", e);
-            }
-        }
-
-        // Apply X-XSS-Protection
-        if !headers.x_xss_protection.is_empty() {
-            if let Err(e) = response.insert_header("X-XSS-Protection", &headers.x_xss_protection) {
-                warn!("Failed to set X-XSS-Protection header: {}", e);
-            }
-        }
-
-        // Apply Strict-Transport-Security
-        if !headers.strict_transport_security.is_empty() {
-            if let Err(e) = response.insert_header(
-                "Strict-Transport-Security",
-                &headers.strict_transport_security,
-            ) {
-                warn!("Failed to set Strict-Transport-Security header: {}", e);
-            }
-        }
-
-        // Apply Referrer-Policy
-        if !headers.referrer_policy.is_empty() {
-            if let Err(e) = response.insert_header("Referrer-Policy", &headers.referrer_policy) {
-                warn!("Failed to set Referrer-Policy header: {}", e);
-            }
-        }
-
-        // Apply Permissions-Policy
-        if let Some(ref permissions) = headers.permissions_policy {
-            if !permissions.is_empty() {
-                if let Err(e) = response.insert_header("Permissions-Policy", permissions) {
-                    warn!("Failed to set Permissions-Policy header: {}", e);
+            // Apply Content-Security-Policy
+            if let Some(ref csp) = config.content_security_policy {
+                if !csp.is_empty() {
+                    if let Err(e) = response.insert_header("Content-Security-Policy", csp) {
+                        warn!("Failed to set Content-Security-Policy header: {}", e);
+                    } else {
+                        headers_applied.push("Content-Security-Policy");
+                    }
                 }
             }
+
+            // Apply X-Frame-Options
+            if let Some(ref x_frame) = config.x_frame_options {
+                if !x_frame.is_empty() {
+                    if let Err(e) = response.insert_header("X-Frame-Options", x_frame) {
+                        warn!("Failed to set X-Frame-Options header: {}", e);
+                    } else {
+                        headers_applied.push("X-Frame-Options");
+                    }
+                }
+            }
+
+            // Apply Strict-Transport-Security
+            if let Some(ref hsts) = config.strict_transport_security {
+                if !hsts.is_empty() {
+                    if let Err(e) = response.insert_header("Strict-Transport-Security", hsts) {
+                        warn!("Failed to set Strict-Transport-Security header: {}", e);
+                    } else {
+                        headers_applied.push("Strict-Transport-Security");
+                    }
+                }
+            }
+
+            // Apply Referrer-Policy
+            if let Some(ref policy) = config.referrer_policy {
+                if !policy.is_empty() {
+                    if let Err(e) = response.insert_header("Referrer-Policy", policy) {
+                        warn!("Failed to set Referrer-Policy header: {}", e);
+                    } else {
+                        headers_applied.push("Referrer-Policy");
+                    }
+                }
+            }
+
+            if headers_applied.is_empty() {
+                debug!("No security headers to apply (all configs empty)");
+            } else {
+                debug!(
+                    "Applied {} security headers: {:?}",
+                    headers_applied.len(),
+                    headers_applied
+                );
+            }
+        } else {
+            debug!("No security headers configuration available");
         }
 
-        debug!("Applied security headers (preset: {})", headers.preset);
         Ok(())
     }
 
@@ -549,7 +600,7 @@ impl LoadBalancer {
 
         if let Some(domain) = domain_record {
             if let Some(key_auth) = domain.http_challenge_key_authorization {
-                info!(
+                debug!(
                     "Found ACME HTTP-01 challenge for domain: {}, returning key authorization",
                     host
                 );
@@ -1428,7 +1479,13 @@ impl ProxyHttp for LoadBalancer {
             .and_then(|v| v.to_str().ok())
             .map(|accept| accept.contains("text/event-stream"))
             .unwrap_or(false);
-
+        let is_chunked = session
+            .req_header()
+            .headers
+            .get("transfer-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(|transfer_encoding| transfer_encoding.to_lowercase().contains("chunked"))
+            .unwrap_or(false);
         // Check if this is a WebSocket upgrade request
         let is_websocket_upgrade = session
             .req_header()
@@ -1438,9 +1495,22 @@ impl ProxyHttp for LoadBalancer {
             .map(|upgrade| upgrade.to_lowercase().contains("websocket"))
             .unwrap_or(false);
 
-        if accepts_sse || is_websocket_upgrade {
-            // Disable compression for SSE/WebSocket - compression requires buffering which breaks streaming
+        // Check if the request path suggests it might return streaming data
+        let req_path = session.req_header().uri.path().to_string();
+        let is_streaming_path = req_path.starts_with("/api/")
+            || req_path.contains("/stream")
+            || req_path.contains("/events")
+            || req_path.contains("/logs")
+            || req_path.contains("/webhook");
+
+        if accepts_sse || is_websocket_upgrade || is_chunked || is_streaming_path {
+            // Disable compression for SSE/WebSocket/streaming paths
+            // compression requires buffering which breaks streaming responses
             session.upstream_compression.adjust_level(0);
+            debug!(
+                "Disabling compression for: sse={}, ws={}, chunked={}, path={}",
+                accepts_sse, is_websocket_upgrade, is_chunked, req_path
+            );
 
             if accepts_sse {
                 ctx.is_sse = true;
@@ -1450,6 +1520,13 @@ impl ProxyHttp for LoadBalancer {
             if is_websocket_upgrade {
                 ctx.is_websocket = true;
                 debug!("WebSocket upgrade detected, disabling compression for streaming");
+            }
+
+            if is_streaming_path {
+                debug!(
+                    "Streaming path detected: {}, disabling compression",
+                    req_path
+                );
             }
         } else {
             // Enable compression for normal requests
@@ -1528,7 +1605,7 @@ impl ProxyHttp for LoadBalancer {
                     ("ja4", fingerprint.as_str())
                 } else {
                     // No TLS fingerprint means HTTP connection - reject it
-                    info!(
+                    debug!(
                         "Attack mode: HTTPS required for environment {} (HTTP request from {})",
                         project_ctx.environment.id,
                         ctx.ip_address.as_ref().unwrap_or(&"unknown".to_string())
@@ -1589,7 +1666,7 @@ impl ProxyHttp for LoadBalancer {
                     .unwrap_or(false);
 
                 if !is_challenge_completed {
-                    info!(
+                    debug!(
                         "Attack mode: Challenge required for {} {} on environment {}",
                         identifier_type, identifier, project_ctx.environment.id
                     );
@@ -1736,7 +1813,7 @@ impl ProxyHttp for LoadBalancer {
             .handle_acme_http_challenge(&ctx.host, &ctx.path)
             .await?
         {
-            info!(
+            debug!(
                 "Serving ACME HTTP-01 challenge response for {}{} (request_id={})",
                 ctx.host, ctx.path, ctx.request_id
             );
@@ -1923,7 +2000,7 @@ impl ProxyHttp for LoadBalancer {
             .iter()
             .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
             .collect();
-        ctx.response_headers = Some(headers_map);
+        ctx.response_headers = Some(headers_map.clone());
 
         // Detect SSE by content-type header from upstream
         let is_sse = upstream_response
@@ -1936,7 +2013,7 @@ impl ProxyHttp for LoadBalancer {
         if is_sse {
             ctx.is_sse = true;
             ctx.skip_tracking = true; // Skip visitor/session tracking for SSE streams
-            debug!("SSE response detected from upstream, marking for special handling");
+            debug!("SSE response detected from upstream");
         }
 
         Ok(())
@@ -1952,34 +2029,15 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
-        // For SSE or WebSocket responses, stream chunks directly without buffering
+        // For SSE or WebSocket responses, pass through immediately without buffering
         if ctx.is_sse || ctx.is_websocket {
             if let Some(chunk) = body {
                 let stream_type = if ctx.is_sse { "SSE" } else { "WebSocket" };
                 debug!("Streaming {} chunk: {} bytes", stream_type, chunk.len());
             }
-            // Pass through immediately without modification
-            return Ok(None);
         }
 
-        // For chunked transfer encoding responses, stream immediately without buffering
-        // Check if response uses chunked encoding
-        let is_chunked = ctx
-            .response_headers
-            .as_ref()
-            .and_then(|h| h.get("transfer-encoding"))
-            .map(|te| te.contains("chunked"))
-            .unwrap_or(false);
-
-        if is_chunked {
-            if let Some(chunk) = body {
-                debug!("Streaming chunked response: {} bytes", chunk.len());
-            }
-            // Pass through immediately for proper streaming
-            return Ok(None);
-        }
-
-        // For all other responses, pass through without buffering
+        // Pass all responses through without buffering
         Ok(None)
     }
 
@@ -2002,13 +2060,32 @@ impl ProxyHttp for LoadBalancer {
                 .to_string(),
         );
 
-        // Detect if response uses chunked transfer encoding
+        // Detect chunked transfer encoding in response
         let is_chunked_response = upstream_response
             .headers
             .get("transfer-encoding")
             .and_then(|v| v.to_str().ok())
             .map(|te| te.contains("chunked"))
             .unwrap_or(false);
+
+        // For chunked responses, ensure Transfer-Encoding is preserved
+        if is_chunked_response {
+            debug!("Chunked transfer encoding response detected - preserving for streaming");
+            debug!(
+                "Current headers before preservation: {:?}",
+                upstream_response.headers.get_all("transfer-encoding")
+            );
+            debug!(
+                "Content-Encoding header: {:?}",
+                upstream_response.headers.get("content-encoding")
+            );
+
+            // Ensure Transfer-Encoding header is present and set to chunked
+            // This tells Pingora and the client that the response is streamed in chunks
+            if !upstream_response.headers.contains_key("transfer-encoding") {
+                upstream_response.insert_header("Transfer-Encoding", "chunked")?;
+            }
+        }
 
         // Handle SSE (Server-Sent Events) special headers
         if ctx.is_sse {
@@ -2023,7 +2100,7 @@ impl ProxyHttp for LoadBalancer {
                 upstream_response.insert_header("X-Accel-Buffering", "no")?;
             }
 
-            info!(
+            debug!(
                 "SSE stream response for path={}, setting streaming headers",
                 ctx.path
             );
@@ -2032,27 +2109,10 @@ impl ProxyHttp for LoadBalancer {
             ctx.skip_tracking = true;
         }
 
-        // Handle chunked transfer encoding responses (not SSE/WebSocket)
-        // These require special buffering disabled to ensure real-time streaming
-        if is_chunked_response && !ctx.is_sse && !ctx.is_websocket {
-            // Disable compression for chunked responses to allow proper streaming
-            session.upstream_compression.adjust_level(0);
-
-            // Set anti-buffering headers to prevent intermediate proxies from buffering
-            upstream_response.insert_header("X-Accel-Buffering", "no")?;
-            upstream_response
-                .insert_header("Cache-Control", "no-cache, no-store, must-revalidate")?;
-
-            debug!(
-                "Chunked transfer encoding detected for path={}, disabling compression and buffering",
-                ctx.path
-            );
-        }
-
         // Handle WebSocket upgrade responses
         if ctx.is_websocket {
             // WebSocket requires specific upgrade headers - don't modify them
-            info!(
+            debug!(
                 "WebSocket upgrade response for path={}, preserving upgrade headers",
                 ctx.path
             );

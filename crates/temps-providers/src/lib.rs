@@ -1,6 +1,7 @@
 //! providers services and utilities
 
 pub mod externalsvc;
+pub mod parameter_strategies;
 pub mod services;
 pub use services::*;
 pub mod plugin;

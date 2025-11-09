@@ -12,7 +12,7 @@ use axum::{
     routing::{delete, get, post},
     Json,
 };
-use futures::stream::StreamExt;
+use futures::stream::{self, StreamExt};
 use futures::SinkExt;
 use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
@@ -20,8 +20,10 @@ use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 
 use crate::handlers::types::{
-    ContainerInfoResponse, ContainerListResponse, ContainerLogsQuery, DeploymentJobResponse,
-    DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
+    ContainerActionResponse, ContainerDetailResponse, ContainerInfoResponse, ContainerListResponse,
+    ContainerLogsQuery, ContainerMetricsResponse, DeploymentJobResponse, DeploymentJobsResponse,
+    DeploymentListResponse, DeploymentResponse, DeploymentStateResponse, EnvVarResponse,
+    ResourceLimitsResponse,
 };
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
@@ -43,7 +45,13 @@ use temps_core::problemdetails::Problem;
         teardown_environment,
         list_containers,
         get_container_logs_by_id,
-        get_container_logs
+        get_container_logs,
+        get_container_detail,
+        stop_container,
+        start_container,
+        restart_container,
+        get_container_metrics,
+        stream_container_metrics
     ),
     components(schemas(
         DeploymentListResponse,
@@ -54,12 +62,18 @@ use temps_core::problemdetails::Problem;
         ContainerLogsQuery,
         GetDeploymentsParams,
         ContainerListResponse,
-        ContainerInfoResponse
+        ContainerInfoResponse,
+        ContainerDetailResponse,
+        EnvVarResponse,
+        ResourceLimitsResponse,
+        ContainerMetricsResponse,
+        ContainerActionResponse
     )),
     info(
         title = "Deployments API",
-        description = "API endpoints for managing deployments and container logs. \
-        Provides comprehensive deployment lifecycle management including rollbacks, pausing/resuming, and real-time log streaming.",
+        description = "API endpoints for managing deployments, containers, and logs. \
+        Provides comprehensive deployment lifecycle management including rollbacks, pausing/resuming, \
+        real-time log streaming, and container management (start/stop/restart).",
         version = "1.0.0"
     )
 )]
@@ -125,6 +139,31 @@ pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
         .route(
             "/projects/{project_id}/environments/{environment_id}/container-logs",
             get(get_container_logs),
+        )
+        // Container management endpoints
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}",
+            get(get_container_detail),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/stop",
+            post(stop_container),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/start",
+            post(start_container),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/restart",
+            post(restart_container),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics",
+            get(get_container_metrics),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/stream",
+            get(stream_container_metrics),
         )
 }
 
@@ -589,7 +628,7 @@ pub async fn get_container_logs_by_id(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
 
-    info!(
+    debug!(
         "WebSocket request for container {} logs in environment {} of project: {}",
         container_id, environment_id, project_id
     );
@@ -730,7 +769,7 @@ pub async fn get_container_logs(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
 
-    info!(
+    debug!(
         "WebSocket request for container logs in environment {} of project: {}",
         environment_id, project_id
     );
@@ -1039,6 +1078,332 @@ async fn handle_job_log_socket(mut socket: WebSocket, state: Arc<AppState>, log_
 
     debug!("WebSocket connection closed for log_id: {}", log_id);
     let _ = socket.close().await;
+}
+
+/// Get detailed information about a specific container
+#[utoipa::path(
+    tag = "Containers",
+    get,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID")
+    ),
+    responses(
+        (status = 200, description = "Container details", body = ContainerDetailResponse),
+        (status = 404, description = "Container not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn get_container_detail(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+
+    let (container, _) = state
+        .deployment_service
+        .get_container_detail(project_id, environment_id, container_id.clone())
+        .await?;
+
+    // Parse environment variables and mask sensitive ones
+    let mut env_vars = vec![];
+    if let Ok(vars) = state
+        .deployment_service
+        .get_container_env_variables(project_id, environment_id, container_id.clone())
+        .await
+    {
+        let sensitive_keys = ["password", "secret", "token", "key", "auth", "api_key"];
+        for (key, value) in vars {
+            let is_masked = sensitive_keys
+                .iter()
+                .any(|&s| key.to_lowercase().contains(s));
+            env_vars.push(crate::handlers::types::EnvVarResponse {
+                key,
+                value: if is_masked { "***".to_string() } else { value },
+                is_masked,
+            });
+        }
+    }
+
+    let response = crate::handlers::types::ContainerDetailResponse {
+        id: container.id,
+        container_id: container.container_id,
+        container_name: container.container_name,
+        image_name: container.image_name.unwrap_or_default(),
+        status: container.status.unwrap_or_default(),
+        deployment_id: container.deployment_id,
+        created_at: container.created_at.to_rfc3339(),
+        deployed_at: container.deployed_at.to_rfc3339(),
+        ready_at: container.ready_at.map(|dt| dt.to_rfc3339()),
+        container_port: container.container_port,
+        host_port: container.host_port,
+        environment_variables: env_vars,
+        resource_limits: None, // Could be populated from deployment config if needed
+    };
+
+    Ok(Json(response).into_response())
+}
+
+/// Stop a specific container
+#[utoipa::path(
+    tag = "Containers",
+    post,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/stop",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID")
+    ),
+    responses(
+        (status = 200, description = "Container stopped successfully", body = ContainerActionResponse),
+        (status = 404, description = "Container not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn stop_container(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsWrite);
+
+    state
+        .deployment_service
+        .stop_container(project_id, environment_id, container_id.clone())
+        .await?;
+
+    let response = crate::handlers::types::ContainerActionResponse {
+        container_id: container_id.clone(),
+        container_name: container_id,
+        action: "stop".to_string(),
+        status: "success".to_string(),
+        message: "Container stopped successfully".to_string(),
+    };
+
+    Ok(Json(response).into_response())
+}
+
+/// Start a container
+#[utoipa::path(
+    tag = "Containers",
+    post,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/start",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID")
+    ),
+    responses(
+        (status = 200, description = "Container started successfully", body = ContainerActionResponse),
+        (status = 404, description = "Container not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn start_container(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsWrite);
+
+    state
+        .deployment_service
+        .start_container(project_id, environment_id, container_id.clone())
+        .await?;
+
+    let response = crate::handlers::types::ContainerActionResponse {
+        container_id: container_id.clone(),
+        container_name: container_id,
+        action: "start".to_string(),
+        status: "success".to_string(),
+        message: "Container started successfully".to_string(),
+    };
+
+    Ok(Json(response).into_response())
+}
+
+/// Restart a container
+#[utoipa::path(
+    tag = "Containers",
+    post,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/restart",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID")
+    ),
+    responses(
+        (status = 200, description = "Container restarted successfully", body = ContainerActionResponse),
+        (status = 404, description = "Container not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn restart_container(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsWrite);
+
+    state
+        .deployment_service
+        .restart_container(project_id, environment_id, container_id.clone())
+        .await?;
+
+    let response = crate::handlers::types::ContainerActionResponse {
+        container_id: container_id.clone(),
+        container_name: container_id,
+        action: "restart".to_string(),
+        status: "success".to_string(),
+        message: "Container restarted successfully".to_string(),
+    };
+
+    Ok(Json(response).into_response())
+}
+
+/// Get metrics/stats for a specific container
+#[utoipa::path(
+    tag = "Containers",
+    get,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID")
+    ),
+    responses(
+        (status = 200, description = "Container metrics retrieved successfully", body = ContainerMetricsResponse),
+        (status = 404, description = "Container not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn get_container_metrics(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+
+    let stats = state
+        .deployment_service
+        .get_container_metrics(project_id, environment_id, container_id.clone())
+        .await?;
+
+    let response = ContainerMetricsResponse {
+        container_id: stats.container_id,
+        container_name: stats.container_name,
+        cpu_percent: stats.cpu_percent,
+        memory_bytes: stats.memory_bytes,
+        memory_limit_bytes: stats.memory_limit_bytes,
+        memory_percent: stats.memory_percent,
+        network_rx_bytes: stats.network_rx_bytes,
+        network_tx_bytes: stats.network_tx_bytes,
+        timestamp: stats.timestamp.to_rfc3339(),
+    };
+
+    Ok(Json(response).into_response())
+}
+
+/// Stream container metrics via Server-Sent Events (SSE)
+#[utoipa::path(
+    tag = "Containers",
+    get,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/stream",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID"),
+        ("interval" = Option<u64>, Query, description = "Update interval in milliseconds (default: 1000)")
+    ),
+    responses(
+        (status = 200, description = "Metrics stream established (Server-Sent Events)"),
+        (status = 404, description = "Container not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn stream_container_metrics(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<
+    axum::response::sse::Sse<
+        impl futures::Stream<Item = Result<axum::response::sse::Event, axum::Error>>,
+    >,
+    Problem,
+> {
+    permission_guard!(auth, EnvironmentsRead);
+
+    let interval_ms = params
+        .get("interval")
+        .and_then(|i| i.parse::<u64>().ok())
+        .unwrap_or(1000); // Default: 1 second
+
+    // Verify container exists and get initial stats
+    let _stats = state
+        .deployment_service
+        .get_container_metrics(project_id, environment_id, container_id.clone())
+        .await?;
+
+    let service = state.deployment_service.clone();
+    let p_id = project_id;
+    let e_id = environment_id;
+    let c_id = container_id.clone();
+    let interval = std::time::Duration::from_millis(interval_ms);
+
+    // Create an SSE stream that polls metrics at regular intervals
+    let sse_stream = {
+        let service = service.clone();
+        let p_id = p_id.clone();
+        let e_id = e_id.clone();
+        let c_id = c_id.clone();
+
+        stream::unfold(tokio::time::interval(interval), move |mut ticker| {
+            let service = service.clone();
+            let p_id = p_id.clone();
+            let e_id = e_id.clone();
+            let c_id = c_id.clone();
+
+            async move {
+                ticker.tick().await;
+
+                let result = service
+                    .get_container_metrics(p_id, e_id, c_id.clone())
+                    .await;
+
+                match result {
+                    Ok(stats) => {
+                        let json = serde_json::json!({
+                            "container_id": stats.container_id,
+                            "container_name": stats.container_name,
+                            "cpu_percent": stats.cpu_percent,
+                            "memory_bytes": stats.memory_bytes,
+                            "memory_limit_bytes": stats.memory_limit_bytes,
+                            "memory_percent": stats.memory_percent,
+                            "network_rx_bytes": stats.network_rx_bytes,
+                            "network_tx_bytes": stats.network_tx_bytes,
+                            "timestamp": stats.timestamp.to_rfc3339(),
+                        });
+
+                        let event = axum::response::sse::Event::default()
+                            .json_data(json)
+                            .unwrap();
+                        Some((Ok(event), ticker))
+                    }
+                    Err(e) => {
+                        error!("Failed to get metrics for container {}: {}", c_id, e);
+                        let event = axum::response::sse::Event::default().comment("error");
+                        Some((Ok(event), ticker))
+                    }
+                }
+            }
+        })
+    };
+
+    Ok(axum::response::sse::Sse::new(sse_stream))
 }
 
 #[cfg(test)]

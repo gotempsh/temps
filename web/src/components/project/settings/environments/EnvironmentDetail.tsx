@@ -218,7 +218,6 @@ export function EnvironmentDetail({
 
   // Use prop if provided, otherwise use URL param
   const environmentId = propEnvironmentId ?? Number(paramEnvironmentId)
-
   const {
     data: environment,
     isLoading: isLoadingEnvironment,
@@ -301,7 +300,6 @@ export function EnvironmentDetail({
         project_id: project.id,
         env_id: Number(environmentId!),
       },
-
       body: {
         domain: newDomain,
         is_primary: false,

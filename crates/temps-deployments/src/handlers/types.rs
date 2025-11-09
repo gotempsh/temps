@@ -563,3 +563,86 @@ pub struct ContainerListResponse {
     pub containers: Vec<ContainerInfoResponse>,
     pub total: usize,
 }
+
+/// Detailed container information with environment variables and metrics
+#[derive(Serialize, ToSchema)]
+pub struct ContainerDetailResponse {
+    pub id: i32,
+    pub container_id: String,
+    pub container_name: String,
+    pub image_name: String,
+    pub status: String,
+    pub deployment_id: i32,
+    #[schema(example = "2025-10-12T12:15:47.609192Z")]
+    pub created_at: String,
+    #[schema(example = "2025-10-12T12:15:47.609192Z")]
+    pub deployed_at: String,
+    #[schema(nullable = true, example = "2025-10-12T12:16:47.609192Z")]
+    pub ready_at: Option<String>,
+    /// Port inside the container
+    pub container_port: i32,
+    /// Port on the host machine
+    #[schema(nullable = true)]
+    pub host_port: Option<i32>,
+    /// Environment variables (sensitive values masked)
+    pub environment_variables: Vec<EnvVarResponse>,
+    /// Resource limits
+    #[schema(nullable = true)]
+    pub resource_limits: Option<ResourceLimitsResponse>,
+}
+
+/// Environment variable with masked sensitive values
+#[derive(Serialize, ToSchema)]
+pub struct EnvVarResponse {
+    pub key: String,
+    pub value: String,
+    /// Whether this is a sensitive/masked value
+    pub is_masked: bool,
+}
+
+/// Container resource limits
+#[derive(Serialize, ToSchema)]
+pub struct ResourceLimitsResponse {
+    #[schema(nullable = true)]
+    pub cpu_request: Option<i32>,
+    #[schema(nullable = true)]
+    pub cpu_limit: Option<i32>,
+    #[schema(nullable = true)]
+    pub memory_request: Option<i32>,
+    #[schema(nullable = true)]
+    pub memory_limit: Option<i32>,
+}
+
+/// Container resource metrics (CPU, memory usage)
+#[derive(Serialize, ToSchema)]
+pub struct ContainerMetricsResponse {
+    pub container_id: String,
+    pub container_name: String,
+    /// CPU usage percentage (0-100)
+    pub cpu_percent: f64,
+    /// Memory usage in bytes
+    pub memory_bytes: u64,
+    /// Memory limit in bytes (if set)
+    #[schema(nullable = true)]
+    pub memory_limit_bytes: Option<u64>,
+    /// Memory usage percentage (0-100) if limit is set
+    #[schema(nullable = true)]
+    pub memory_percent: Option<f64>,
+    /// Network bytes received
+    pub network_rx_bytes: u64,
+    /// Network bytes transmitted
+    pub network_tx_bytes: u64,
+    /// Timestamp of metrics collection
+    #[schema(example = "2025-10-12T12:15:47.609192Z")]
+    pub timestamp: String,
+}
+
+/// Response indicating success of container state change
+#[derive(Serialize, ToSchema)]
+pub struct ContainerActionResponse {
+    pub container_id: String,
+    pub container_name: String,
+    pub action: String,
+    pub status: String,
+    pub message: String,
+}

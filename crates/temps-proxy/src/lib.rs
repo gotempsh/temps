@@ -34,6 +34,8 @@ pub mod integration_test;
 #[cfg(test)]
 pub mod proxy_test;
 #[cfg(test)]
+pub mod streaming_normal_test;
+#[cfg(test)]
 pub mod test_utils;
 #[cfg(test)]
 pub mod tests;

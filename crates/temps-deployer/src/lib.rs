@@ -163,6 +163,27 @@ pub struct ContainerInfo {
     pub environment_vars: HashMap<String, String>,
 }
 
+/// Container performance statistics (CPU, memory, network)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerStats {
+    pub container_id: String,
+    pub container_name: String,
+    /// CPU usage percentage (0-100)
+    pub cpu_percent: f64,
+    /// Memory usage in bytes
+    pub memory_bytes: u64,
+    /// Memory limit in bytes (if set)
+    pub memory_limit_bytes: Option<u64>,
+    /// Memory usage percentage (0-100) if limit is set
+    pub memory_percent: Option<f64>,
+    /// Network bytes received
+    pub network_rx_bytes: u64,
+    /// Network bytes transmitted
+    pub network_tx_bytes: u64,
+    /// Timestamp of metrics collection
+    pub timestamp: UtcDateTime,
+}
+
 /// Configuration for stopping containers
 #[derive(Debug, Clone)]
 pub struct ContainerStopSpec {
@@ -329,6 +350,12 @@ pub trait ContainerDeployer: Send + Sync {
 
     /// Get container information
     async fn get_container_info(&self, container_id: &str) -> Result<ContainerInfo, DeployerError>;
+
+    /// Get container performance metrics (CPU, memory, network)
+    async fn get_container_stats(
+        &self,
+        container_id: &str,
+    ) -> Result<ContainerStats, DeployerError>;
 
     /// List running containers
     async fn list_containers(&self) -> Result<Vec<ContainerInfo>, DeployerError>;

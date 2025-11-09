@@ -7,7 +7,7 @@ use serde_json;
 use std::sync::Arc;
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
 use temps_logs::LogService;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 #[derive(Debug, Clone)]
 pub struct JobDefinition {
     pub job_id: String,
@@ -51,6 +51,10 @@ impl WorkflowPlanner {
     /// 1. Environment variables from the env_vars table for the specific environment (via env_var_environments junction table)
     /// 2. Runtime environment variables from external services linked to the project
     /// 3. Sentry DSN environment variables (SENTRY_DSN and NEXT_PUBLIC_SENTRY_DSN) - auto-generated per project/environment
+    ///
+    /// IMPORTANT: If any external service fails to provide env vars, the entire deployment will fail
+    /// with a meaningful error message. This prevents silent failures where containers would be
+    /// missing critical configuration (e.g., database connection strings).
     async fn gather_environment_variables(
         &self,
         project: &projects::Model,
@@ -108,6 +112,9 @@ impl WorkflowPlanner {
             project.id
         );
 
+        // Track failed services to provide detailed error messages
+        let mut failed_services: Vec<(i32, String)> = Vec::new();
+
         // Get runtime environment variables from each external service
         for project_service in project_services_list {
             debug!(
@@ -135,12 +142,35 @@ impl WorkflowPlanner {
                     env_vars_map.extend(service_env_vars);
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to get runtime env vars for service {}: {:?}",
-                        project_service.service_id, e
+                    // Collect the error - we'll fail the entire deployment if any service fails
+                    let error_msg = format!("{}", e);
+                    failed_services.push((project_service.service_id, error_msg));
+                    tracing::error!(
+                        "Failed to get runtime env vars for service {}: {}",
+                        project_service.service_id,
+                        e
                     );
                 }
             }
+        }
+
+        // CRITICAL: If any external service failed, fail the entire deployment
+        // This prevents silent failures where containers would be missing critical environment variables
+        if !failed_services.is_empty() {
+            let failure_details = failed_services
+                .iter()
+                .map(|(service_id, error)| format!("  • Service ID {}: {}", service_id, error))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let error_message = format!(
+                "Failed to gather environment variables from {} external service(s). \
+                The deployment cannot proceed without all required external services configured:\n{}",
+                failed_services.len(),
+                failure_details
+            );
+
+            return Err(anyhow::anyhow!(error_message));
         }
 
         // 3. Get or create Sentry DSN for error tracking
@@ -174,17 +204,23 @@ impl WorkflowPlanner {
                         env_vars_map.insert("NEXT_PUBLIC_SENTRY_DSN".to_string(), project_dsn.dsn);
                     }
                     Err(e) => {
-                        warn!(
-                            "Failed to get or create DSN for project {} environment {}: {:?}. \
+                        // Warn about Sentry DSN failure but don't fail the deployment
+                        // Sentry is optional for monitoring, not required for app functionality
+                        tracing::error!(
+                            "Failed to get or create DSN for project {} environment {}: {}. \
                             Sentry DSN environment variables will NOT be included.",
-                            project.id, environment.id, e
+                            project.id,
+                            environment.id,
+                            e
                         );
                     }
                 }
             }
             Err(e) => {
-                warn!(
-                    "Failed to get external URL from config: {:?}. \
+                // Warn about external URL failure but don't fail the deployment
+                // Sentry is optional for monitoring, not required for app functionality
+                tracing::error!(
+                    "Failed to get external URL from config: {}. \
                     Sentry DSN environment variables will NOT be included.",
                     e
                 );

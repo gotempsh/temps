@@ -2,6 +2,7 @@ use crate::externalsvc::{
     mongodb::MongodbService, postgres::PostgresService, redis::RedisService, s3::S3Service,
     ExternalService, ServiceConfig, ServiceType,
 };
+use crate::parameter_strategies;
 use crate::types::EnvironmentVariableInfo;
 use anyhow::Result;
 use bollard::Docker;
@@ -268,51 +269,26 @@ impl ExternalServiceManager {
         info!("Creating new external service");
         let service_slug = Self::generate_slug(&request.name);
 
-        // Auto-generate values for optional parameters that have defaults or generation logic
+        // Get the parameter strategy for this service type
+        let strategy = parameter_strategies::get_strategy(&request.service_type.to_string())
+            .ok_or(ExternalServiceError::InvalidServiceType {
+                id: 0,
+                service_type: request.service_type.to_string(),
+            })?;
+
+        // Validate required parameters
+        strategy
+            .validate_for_creation(&request.parameters)
+            .map_err(|reason| ExternalServiceError::ParameterValidationFailed {
+                service_id: 0,
+                reason,
+            })?;
+
+        // Auto-generate missing optional parameters
         let mut parameters = request.parameters.clone();
-
-        // Auto-assign port if not provided or empty
-        let port_empty = parameters
-            .get("port")
-            .and_then(|v| v.as_str())
-            .map(|s| s.is_empty())
-            .unwrap_or(true);
-
-        if port_empty {
-            let default_port = match request.service_type {
-                ServiceType::Mongodb => 27017,
-                ServiceType::Postgres => 5432,
-                ServiceType::Redis => 6379,
-                ServiceType::S3 => 9000,
-            };
-
-            let assigned_port = Self::find_available_port(default_port)
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| default_port.to_string());
-
-            parameters.insert("port".to_string(), serde_json::Value::String(assigned_port));
-        }
-
-        // For MongoDB password, auto-generate if not provided or empty
-        if request.service_type == ServiceType::Mongodb {
-            let password_empty = parameters
-                .get("password")
-                .map(|v| v.as_str().map(|s| s.is_empty()).unwrap_or(true))
-                .unwrap_or(true);
-
-            if password_empty {
-                use rand::{distributions::Alphanumeric, Rng};
-                let generated_password: String = rand::thread_rng()
-                    .sample_iter(&Alphanumeric)
-                    .take(16)
-                    .map(char::from)
-                    .collect();
-                parameters.insert(
-                    "password".to_string(),
-                    serde_json::Value::String(generated_password),
-                );
-            }
-        }
+        strategy
+            .auto_generate_missing(&mut parameters)
+            .map_err(|reason| ExternalServiceError::InternalError { reason })?;
 
         // Serialize parameters to JSON and encrypt
         let config_json = serde_json::to_string(&parameters).map_err(|e| {
@@ -554,33 +530,46 @@ impl ExternalServiceManager {
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
 
-        // Generate new slug if name is being updated
-        if let Some(new_name) = &request.name {
-            let new_slug = Self::generate_slug(new_name);
+        // Get the parameter strategy for this service type
+        let strategy = parameter_strategies::get_strategy(&service.service_type).ok_or(
+            ExternalServiceError::InvalidServiceType {
+                id: service_id,
+                service_type: service.service_type.clone(),
+            },
+        )?;
 
-            // Update the service name and slug
-            let mut service_update: external_services::ActiveModel = service.clone().into();
-            service_update.name = Set(new_name.clone());
-            service_update.slug = Set(Some(new_slug));
-            service_update.updated_at = Set(Utc::now());
-            service_update.update(self.db.as_ref()).await?;
-        }
-
-        // Merge docker_image into parameters if provided
-        let mut merged_parameters = request.parameters.clone();
-        if let Some(docker_image) = request.docker_image {
+        // Prepare update parameters (merge docker_image if provided)
+        let mut update_params = request.parameters.clone();
+        if let Some(docker_image) = &request.docker_image {
             info!(
                 "Updating service {} with new Docker image: {}",
                 service_id, docker_image
             );
-            merged_parameters.insert(
+            update_params.insert(
                 "docker_image".to_string(),
-                serde_json::Value::String(docker_image),
+                serde_json::Value::String(docker_image.clone()),
             );
         }
 
-        // Serialize parameters to JSON and encrypt
-        let config_json = serde_json::to_string(&merged_parameters).map_err(|e| {
+        // Validate that only updateable parameters are being changed
+        strategy
+            .validate_for_update(&update_params)
+            .map_err(|reason| ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason,
+            })?;
+
+        // Get existing parameters and merge updates
+        let mut existing_params = self.get_service_parameters(service_id).await?;
+        strategy
+            .merge_updates(&mut existing_params, update_params)
+            .map_err(|reason| ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason,
+            })?;
+
+        // Serialize and encrypt the merged parameters
+        let config_json = serde_json::to_string(&existing_params).map_err(|e| {
             ExternalServiceError::InternalError {
                 reason: format!("Failed to serialize config to JSON: {}", e),
             }
@@ -594,10 +583,20 @@ impl ExternalServiceManager {
             })?;
 
         // Update service config in database
-        let mut service_update: external_services::ActiveModel = service.into();
+        let mut service_update: external_services::ActiveModel = service.clone().into();
         service_update.config = Set(Some(encrypted_config));
         service_update.updated_at = Set(Utc::now());
         service_update.update(self.db.as_ref()).await?;
+
+        // Update name/slug if provided
+        if let Some(new_name) = &request.name {
+            let new_slug = Self::generate_slug(new_name);
+            let mut name_update: external_services::ActiveModel = service.clone().into();
+            name_update.name = Set(new_name.clone());
+            name_update.slug = Set(Some(new_slug));
+            name_update.updated_at = Set(Utc::now());
+            name_update.update(self.db.as_ref()).await?;
+        }
 
         // Reinitialize the service (this will stop, remove, and recreate the container with new image)
         self.initialize_service(service_id).await?;
@@ -884,12 +883,6 @@ impl ExternalServiceManager {
                 (k.clone(), v_str)
             })
             .collect()
-    }
-
-    /// Find an available port starting from the given port
-    fn find_available_port(start_port: u16) -> Option<u16> {
-        use std::net::TcpListener;
-        (start_port..start_port + 100).find(|&port| TcpListener::bind(("0.0.0.0", port)).is_ok())
     }
 
     pub async fn start_service(
@@ -2251,6 +2244,305 @@ mod tests {
         // Non-sensitive values should not be masked
         assert_eq!(vars.get("POSTGRES_DB"), Some(&"testdb".to_string()));
         assert_eq!(vars.get("POSTGRES_USER"), Some(&"user".to_string()));
+
+        // Cleanup
+        let _ = manager.delete_service(service_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_cannot_update_postgres_username() {
+        let (manager, _test_db) = setup_test_manager().await;
+        let random_unused_port = get_unused_port();
+        let mut params = HashMap::new();
+        params.insert(
+            "database".to_string(),
+            JsonValue::String("testdb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            JsonValue::String("testuser".to_string()),
+        );
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("testpass".to_string()),
+        );
+        params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
+
+        let request = CreateExternalServiceRequest {
+            name: "test-postgres-readonly".to_string(),
+            service_type: ServiceType::Postgres,
+            version: Some("16".to_string()),
+            parameters: params,
+        };
+
+        let service = manager
+            .create_service(request)
+            .await
+            .expect("Failed to create service");
+        let service_id = service.id;
+
+        // Try to update username (readonly parameter)
+        let mut update_params = HashMap::new();
+        update_params.insert(
+            "username".to_string(),
+            JsonValue::String("newuser".to_string()),
+        );
+
+        let update_request = UpdateExternalServiceRequest {
+            name: None,
+            parameters: update_params,
+            docker_image: None,
+        };
+
+        // This should FAIL because username is readonly
+        let result = manager.update_service(service_id, update_request).await;
+        assert!(
+            result.is_err(),
+            "Expected update to fail for readonly parameter"
+        );
+
+        match result.unwrap_err() {
+            ExternalServiceError::ParameterValidationFailed { reason, .. } => {
+                assert!(
+                    reason.contains("username"),
+                    "Error should mention 'username', got: {}",
+                    reason
+                );
+                assert!(
+                    reason.contains("Cannot update"),
+                    "Error should say cannot update"
+                );
+            }
+            other => panic!("Expected ParameterValidationFailed, got: {:?}", other),
+        }
+
+        // Cleanup
+        let _ = manager.delete_service(service_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_cannot_update_postgres_password() {
+        let (manager, _test_db) = setup_test_manager().await;
+        let random_unused_port = get_unused_port();
+        let mut params = HashMap::new();
+        params.insert(
+            "database".to_string(),
+            JsonValue::String("testdb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            JsonValue::String("testuser".to_string()),
+        );
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("testpass".to_string()),
+        );
+        params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
+
+        let request = CreateExternalServiceRequest {
+            name: "test-postgres-pwd".to_string(),
+            service_type: ServiceType::Postgres,
+            version: Some("16".to_string()),
+            parameters: params,
+        };
+
+        let service = manager
+            .create_service(request)
+            .await
+            .expect("Failed to create service");
+        let service_id = service.id;
+
+        // Try to update password (readonly parameter)
+        let mut update_params = HashMap::new();
+        update_params.insert(
+            "password".to_string(),
+            JsonValue::String("wrongpassword".to_string()),
+        );
+
+        let update_request = UpdateExternalServiceRequest {
+            name: None,
+            parameters: update_params,
+            docker_image: None,
+        };
+
+        let result = manager.update_service(service_id, update_request).await;
+        assert!(
+            result.is_err(),
+            "Expected update to fail for readonly password parameter"
+        );
+
+        // Cleanup
+        let _ = manager.delete_service(service_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_cannot_update_postgres_database() {
+        let (manager, _test_db) = setup_test_manager().await;
+        let random_unused_port = get_unused_port();
+        let mut params = HashMap::new();
+        params.insert(
+            "database".to_string(),
+            JsonValue::String("testdb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            JsonValue::String("testuser".to_string()),
+        );
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("testpass".to_string()),
+        );
+        params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
+
+        let request = CreateExternalServiceRequest {
+            name: "test-postgres-db".to_string(),
+            service_type: ServiceType::Postgres,
+            version: Some("16".to_string()),
+            parameters: params,
+        };
+
+        let service = manager
+            .create_service(request)
+            .await
+            .expect("Failed to create service");
+        let service_id = service.id;
+
+        // Try to update database (readonly parameter)
+        let mut update_params = HashMap::new();
+        update_params.insert(
+            "database".to_string(),
+            JsonValue::String("newdb".to_string()),
+        );
+
+        let update_request = UpdateExternalServiceRequest {
+            name: None,
+            parameters: update_params,
+            docker_image: None,
+        };
+
+        let result = manager.update_service(service_id, update_request).await;
+        assert!(
+            result.is_err(),
+            "Expected update to fail for readonly database parameter"
+        );
+
+        // Cleanup
+        let _ = manager.delete_service(service_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_can_update_postgres_docker_image() {
+        let (manager, _test_db) = setup_test_manager().await;
+        let random_unused_port = get_unused_port();
+        let mut params = HashMap::new();
+        params.insert(
+            "database".to_string(),
+            JsonValue::String("testdb".to_string()),
+        );
+        params.insert(
+            "username".to_string(),
+            JsonValue::String("testuser".to_string()),
+        );
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("testpass".to_string()),
+        );
+        params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
+
+        let request = CreateExternalServiceRequest {
+            name: "test-postgres-image".to_string(),
+            service_type: ServiceType::Postgres,
+            version: Some("16".to_string()),
+            parameters: params,
+        };
+
+        let service = manager
+            .create_service(request)
+            .await
+            .expect("Failed to create service");
+        let service_id = service.id;
+
+        // Update docker_image (updateable parameter) - don't include readonly parameters
+        let update_params = HashMap::new(); // Empty parameters - only updating docker_image
+
+        let update_request = UpdateExternalServiceRequest {
+            name: None,
+            parameters: update_params,
+            docker_image: Some("postgres:16-alpine".to_string()),
+        };
+
+        let result = manager.update_service(service_id, update_request).await;
+        assert!(result.is_ok(), "Should be able to update docker_image");
+
+        // Verify the docker_image was updated
+        let details = manager.get_service_details(service_id).await.unwrap();
+        let params = details.current_parameters.unwrap();
+        assert_eq!(
+            params.get("docker_image").and_then(|v| v.as_str()),
+            Some("postgres:16-alpine")
+        );
+
+        // Cleanup
+        let _ = manager.delete_service(service_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_cannot_update_redis_password() {
+        let (manager, _test_db) = setup_test_manager().await;
+        let random_unused_port = get_unused_port();
+        let mut params = HashMap::new();
+        params.insert(
+            "password".to_string(),
+            JsonValue::String("redis_password".to_string()),
+        );
+        params.insert(
+            "port".to_string(),
+            JsonValue::String(random_unused_port.to_string()),
+        );
+
+        let request = CreateExternalServiceRequest {
+            name: "test-redis-pwd".to_string(),
+            service_type: ServiceType::Redis,
+            version: Some("7".to_string()),
+            parameters: params,
+        };
+
+        let service = manager
+            .create_service(request)
+            .await
+            .expect("Failed to create service");
+        let service_id = service.id;
+
+        // Try to update password (readonly parameter for Redis)
+        let mut update_params = HashMap::new();
+        update_params.insert(
+            "password".to_string(),
+            JsonValue::String("new_password".to_string()),
+        );
+
+        let update_request = UpdateExternalServiceRequest {
+            name: None,
+            parameters: update_params,
+            docker_image: None,
+        };
+
+        let result = manager.update_service(service_id, update_request).await;
+        assert!(
+            result.is_err(),
+            "Expected update to fail for readonly password parameter in Redis"
+        );
 
         // Cleanup
         let _ = manager.delete_service(service_id).await;

@@ -548,9 +548,9 @@ impl DeploymentService {
                 project_id
             )));
         }
-        info!("Project found: {:?}", project);
+        debug!("Project found: {:?}", project);
 
-        info!(
+        debug!(
             "Before invoking pipeline service project_id: {}, environment_id: {}",
             project_id, environment_id
         );
@@ -1357,6 +1357,177 @@ impl DeploymentService {
         );
 
         Ok(())
+    }
+
+    /// Get detailed information about a specific container
+    pub async fn get_container_detail(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+    ) -> Result<(deployment_containers::Model, DeploymentEnvironment), DeploymentError> {
+        use temps_entities::environments;
+
+        // Verify environment belongs to project
+        let environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
+
+        // Find the container
+        let container = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::ContainerId.eq(&container_id))
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Container not found".to_string()))?;
+
+        // Verify container belongs to a deployment in this environment
+        let _deployment = deployments::Entity::find_by_id(container.deployment_id)
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
+
+        let env_info = DeploymentEnvironment {
+            id: environment.id,
+            name: environment.name,
+            slug: environment.slug,
+            domains: vec![], // Could be populated if needed
+        };
+
+        Ok((container, env_info))
+    }
+
+    /// Stop a specific container
+    pub async fn stop_container(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+    ) -> Result<(), DeploymentError> {
+        let (container, _) = self
+            .get_container_detail(project_id, environment_id, container_id.clone())
+            .await?;
+
+        // Stop the container via Docker
+        self.deployer
+            .stop_container(&container.container_id)
+            .await
+            .map_err(|e| DeploymentError::Other(format!("Failed to stop container: {}", e)))?;
+
+        // Update container status in database
+        let mut active_container: deployment_containers::ActiveModel = container.into();
+        active_container.status = Set(Some("stopped".to_string()));
+        active_container.update(self.db.as_ref()).await?;
+
+        info!("Successfully stopped container: {}", container_id);
+        Ok(())
+    }
+
+    /// Start a stopped container
+    pub async fn start_container(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+    ) -> Result<(), DeploymentError> {
+        let (container, _) = self
+            .get_container_detail(project_id, environment_id, container_id.clone())
+            .await?;
+
+        // Start the container via Docker
+        self.deployer
+            .start_container(&container.container_id)
+            .await
+            .map_err(|e| DeploymentError::Other(format!("Failed to start container: {}", e)))?;
+
+        // Update container status in database
+        let mut active_container: deployment_containers::ActiveModel = container.into();
+        active_container.status = Set(Some("running".to_string()));
+        active_container.update(self.db.as_ref()).await?;
+
+        info!("Successfully started container: {}", container_id);
+        Ok(())
+    }
+
+    /// Restart a container (stop and then start)
+    pub async fn restart_container(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+    ) -> Result<(), DeploymentError> {
+        let (container, _) = self
+            .get_container_detail(project_id, environment_id, container_id.clone())
+            .await?;
+
+        // Stop the container via Docker
+        self.deployer
+            .stop_container(&container.container_id)
+            .await
+            .map_err(|e| DeploymentError::Other(format!("Failed to stop container: {}", e)))?;
+
+        // Start the container via Docker
+        self.deployer
+            .start_container(&container.container_id)
+            .await
+            .map_err(|e| DeploymentError::Other(format!("Failed to start container: {}", e)))?;
+
+        // Update container status in database
+        let mut active_container: deployment_containers::ActiveModel = container.into();
+        active_container.status = Set(Some("running".to_string()));
+        active_container.update(self.db.as_ref()).await?;
+
+        info!("Successfully restarted container: {}", container_id);
+        Ok(())
+    }
+
+    /// Get container environment variables from Docker
+    pub async fn get_container_env_variables(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+    ) -> Result<Vec<(String, String)>, DeploymentError> {
+        let (container, _) = self
+            .get_container_detail(project_id, environment_id, container_id.clone())
+            .await?;
+
+        // Get container info from Docker which includes environment variables
+        let container_info = self
+            .deployer
+            .get_container_info(&container.container_id)
+            .await
+            .map_err(|e| DeploymentError::Other(format!("Failed to get container info: {}", e)))?;
+
+        // Convert HashMap to Vec of tuples
+        let env_vars: Vec<(String, String)> = container_info.environment_vars.into_iter().collect();
+        Ok(env_vars)
+    }
+
+    /// Get metrics/stats for a specific container
+    pub async fn get_container_metrics(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+    ) -> Result<temps_deployer::ContainerStats, DeploymentError> {
+        let (container, _) = self
+            .get_container_detail(project_id, environment_id, container_id.clone())
+            .await?;
+
+        // Get container stats from Docker
+        let stats = self
+            .deployer
+            .get_container_stats(&container.container_id)
+            .await
+            .map_err(|e| DeploymentError::Other(format!("Failed to get container stats: {}", e)))?;
+
+        debug!("Retrieved metrics for container: {}", container_id);
+        Ok(stats)
     }
 }
 

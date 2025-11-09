@@ -4,7 +4,6 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 import { CronJobDetail } from './settings/CronJobDetail'
 import { CronJobsSettings } from './settings/CronJobsSettings'
 import { DomainsSettings } from './settings/DomainsSettings'
-import { EnvironmentsSettings } from './settings/EnvironmentsSettings'
 import { EnvironmentVariablesSettings } from './settings/EnvironmentVariablesSettings'
 import { GeneralSettings } from './settings/GeneralSettings'
 import { GitSettings } from './settings/GitSettings'
@@ -25,10 +24,6 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
           element={<GeneralSettings project={project} refetch={refetch} />}
         />
         <Route path="domains" element={<DomainsSettings project={project} />} />
-        <Route
-          path="environments/*"
-          element={<EnvironmentsSettings project={project} />}
-        />
         <Route
           path="environment-variables"
           element={<EnvironmentVariablesSettings project={project} />}

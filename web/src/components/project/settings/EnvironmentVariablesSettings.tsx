@@ -44,6 +44,7 @@ interface EnvironmentVariableRowProps {
   refetchEnvVariables: () => void
   isSelected: boolean
   onSelect: (id: number) => void
+  showAllValues: boolean
 }
 
 function EnvironmentVariableRow({
@@ -52,6 +53,7 @@ function EnvironmentVariableRow({
   refetchEnvVariables,
   isSelected,
   onSelect,
+  showAllValues,
 }: EnvironmentVariableRowProps) {
   const [isVisible, setIsVisible] = useState(false)
   const [isEditing, setIsEditing] = useState(false)
@@ -65,7 +67,7 @@ function EnvironmentVariableRow({
         key: variable.key,
       },
     }),
-    enabled: isVisible || isEditing,
+    enabled: isVisible || isEditing || showAllValues,
   })
 
   useEffect(() => {
@@ -74,6 +76,13 @@ function EnvironmentVariableRow({
       setEditValue(data.value)
     }
   }, [data])
+
+  useEffect(() => {
+    setIsVisible(showAllValues)
+    if (showAllValues) {
+      refetch()
+    }
+  }, [showAllValues, refetch])
 
   const dataValue = useMemo(() => data?.value ?? '', [data])
 
@@ -568,6 +577,7 @@ export function EnvironmentVariablesSettings({
     new Set()
   )
   const [isBulkDeleteDialogOpen, setIsBulkDeleteDialogOpen] = useState(false)
+  const [showAllValues, setShowAllValues] = useState(false)
   const queryClient = useQueryClient()
 
   const {
@@ -789,6 +799,23 @@ export function EnvironmentVariablesSettings({
               )}
               <Button
                 variant="outline"
+                onClick={() => setShowAllValues(!showAllValues)}
+                title={showAllValues ? 'Hide all values' : 'Show all values'}
+              >
+                {showAllValues ? (
+                  <>
+                    <EyeOff className="h-4 w-4 mr-2" />
+                    Hide all
+                  </>
+                ) : (
+                  <>
+                    <Eye className="h-4 w-4 mr-2" />
+                    Show all
+                  </>
+                )}
+              </Button>
+              <Button
+                variant="outline"
                 onClick={() => setIsImportDialogOpen(true)}
               >
                 <Upload className="h-4 w-4 mr-2" />
@@ -853,6 +880,7 @@ export function EnvironmentVariablesSettings({
                     refetchEnvVariables={() => refetch()}
                     isSelected={selectedVariables.has(variable.id)}
                     onSelect={handleSelectVariable}
+                    showAllValues={showAllValues}
                   />
                 ))}
               </div>

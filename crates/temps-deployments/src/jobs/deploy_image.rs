@@ -581,7 +581,7 @@ impl DeployImageJob {
         // Use environment variables from config (PORT and HOST already included from workflow planner)
         let environment_vars = self.config.environment_variables.clone();
 
-        tracing::info!(
+        tracing::debug!(
             "🌍 Deploying container with {} environment variables: {}",
             environment_vars.len(),
             environment_vars

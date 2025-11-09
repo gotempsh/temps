@@ -17,6 +17,7 @@ import { ProjectStorage } from '@/components/project/ProjectStorage'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
 import { MonitorDetail } from '@/components/project/MonitorDetail'
 import { ErrorTracking } from '@/components/projects/ErrorTracking'
+import { EnvironmentsTabsView } from './EnvironmentsTabsView'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { buttonVariants } from '@/components/ui/button'
@@ -404,6 +405,10 @@ export function ProjectDetail() {
             <Route
               path="errors/:errorGroupId/event/:eventId"
               element={<ErrorEventDetail project={project} />}
+            />
+            <Route
+              path="environments/*"
+              element={<EnvironmentsTabsView project={project} />}
             />
           </Routes>
         </div>

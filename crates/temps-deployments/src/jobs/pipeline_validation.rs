@@ -129,6 +129,23 @@ impl ContainerDeployer for MockContainerDeployer {
     ) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, DeployerError> {
         Err(DeployerError::Other("Not implemented".to_string()))
     }
+
+    async fn get_container_stats(
+        &self,
+        _container_id: &str,
+    ) -> Result<temps_deployer::ContainerStats, DeployerError> {
+        Ok(temps_deployer::ContainerStats {
+            container_id: "mock_container_123".to_string(),
+            container_name: "mock_container".to_string(),
+            cpu_percent: 0.5,
+            memory_bytes: 104857600,              // 100MB
+            memory_limit_bytes: Some(1073741824), // 1GB
+            memory_percent: Some(9.77),
+            network_rx_bytes: 1024000,
+            network_tx_bytes: 512000,
+            timestamp: chrono::Utc::now(),
+        })
+    }
 }
 
 /// Mock GitProviderManager for pipeline validation

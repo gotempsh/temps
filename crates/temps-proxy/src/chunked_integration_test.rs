@@ -11,6 +11,7 @@ mod chunked_integration_tests {
     use tokio::time::timeout;
 
     /// Simulates a streaming backend that sends chunks slowly
+    #[allow(dead_code)]
     struct StreamingBackend {
         addr: String,
         shutdown_tx: mpsc::Sender<()>,
@@ -111,6 +112,7 @@ mod chunked_integration_tests {
             &self.addr
         }
 
+        #[allow(dead_code)]
         async fn get_chunk_times(&self) -> Vec<(Duration, usize)> {
             let received = self.received_bytes.lock().await;
             let start_time = received

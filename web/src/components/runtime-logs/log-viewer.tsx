@@ -296,6 +296,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     startDate,
     endDate,
     tail,
+    showTimestamps,
   ])
 
   // Shared connectWS function for retry
@@ -369,7 +370,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
         }
       }
 
-      wsRef.current.onerror = (err) => {
+      wsRef.current.onerror = () => {
         // Try to extract more details from the error event
         let errorMessage = 'Connection failed'
         setErrorMessage(errorMessage)

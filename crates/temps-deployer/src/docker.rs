@@ -983,6 +983,106 @@ impl ContainerDeployer for DockerRuntime {
         })
     }
 
+    async fn get_container_stats(
+        &self,
+        container_id: &str,
+    ) -> Result<crate::ContainerStats, DeployerError> {
+        use bollard::query_parameters::StatsOptions;
+
+        // Get container info first to get the name
+        let container_info = self.get_container_info(container_id).await?;
+
+        // Get stats from Docker - stream but take only first stat and close
+        let mut stats_stream = self.docker.stats(
+            container_id,
+            Some(StatsOptions {
+                stream: false,  // Only get one stat, don't stream
+                one_shot: true, // Return immediately after first stat
+            }),
+        );
+
+        // Take the first stat
+        let stats_data = stats_stream
+            .try_next()
+            .await
+            .map_err(|e| DeployerError::Other(format!("Failed to get container stats: {}", e)))?
+            .ok_or_else(|| DeployerError::Other("No stats available".to_string()))?;
+
+        // Extract CPU percentage
+        let cpu_percent = if let (Some(cpu), Some(system)) = (
+            stats_data
+                .cpu_stats
+                .as_ref()
+                .and_then(|cs| cs.cpu_usage.as_ref()),
+            stats_data
+                .cpu_stats
+                .as_ref()
+                .and_then(|cs| cs.system_cpu_usage),
+        ) {
+            let cpu_total = cpu.total_usage.unwrap_or(0);
+            if system > 0 && cpu_total > 0 {
+                let cpu_delta = cpu_total as f64;
+                let system_delta = system as f64;
+                let num_cpus = stats_data
+                    .cpu_stats
+                    .as_ref()
+                    .and_then(|cs| cs.online_cpus)
+                    .unwrap_or(1) as f64;
+                ((cpu_delta / system_delta) * num_cpus * 100.0)
+                    .min(100.0)
+                    .max(0.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        // Extract memory stats
+        let memory_stats = stats_data.memory_stats.as_ref();
+        let memory_bytes = memory_stats.and_then(|ms| ms.usage).unwrap_or(0) as u64;
+        let memory_limit_bytes = memory_stats.and_then(|ms| ms.limit).map(|l| l as u64);
+
+        let memory_percent = if let Some(limit) = memory_limit_bytes {
+            if limit > 0 {
+                Some(
+                    ((memory_bytes as f64 / limit as f64) * 100.0)
+                        .min(100.0)
+                        .max(0.0),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Extract network stats
+        let default_networks = Default::default();
+        let networks_stats = stats_data.networks.as_ref().unwrap_or(&default_networks);
+        let (network_rx_bytes, network_tx_bytes) =
+            if let Some(net_stat) = networks_stats.values().next() {
+                (
+                    net_stat.rx_bytes.unwrap_or(0) as u64,
+                    net_stat.tx_bytes.unwrap_or(0) as u64,
+                )
+            } else {
+                (0, 0)
+            };
+
+        Ok(crate::ContainerStats {
+            container_id: container_info.container_id,
+            container_name: container_info.container_name,
+            cpu_percent,
+            memory_bytes,
+            memory_limit_bytes,
+            memory_percent,
+            network_rx_bytes,
+            network_tx_bytes,
+            timestamp: chrono::Utc::now(),
+        })
+    }
+
     async fn list_containers(&self) -> Result<Vec<ContainerInfo>, DeployerError> {
         let containers = self
             .docker

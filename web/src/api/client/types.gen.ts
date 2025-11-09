@@ -457,6 +457,45 @@ export type ConnectionResponse = {
     user_id?: number | null;
 };
 
+/**
+ * Response indicating success of container state change
+ */
+export type ContainerActionResponse = {
+    action: string;
+    container_id: string;
+    container_name: string;
+    message: string;
+    status: string;
+};
+
+/**
+ * Detailed container information with environment variables and metrics
+ */
+export type ContainerDetailResponse = {
+    container_id: string;
+    container_name: string;
+    /**
+     * Port inside the container
+     */
+    container_port: number;
+    created_at: string;
+    deployed_at: string;
+    deployment_id: number;
+    /**
+     * Environment variables (sensitive values masked)
+     */
+    environment_variables: Array<EnvVarResponse>;
+    /**
+     * Port on the host machine
+     */
+    host_port?: number | null;
+    id: number;
+    image_name: string;
+    ready_at?: string | null;
+    resource_limits?: null | ResourceLimitsResponse;
+    status: string;
+};
+
 export type ContainerInfoResponse = {
     container_id: string;
     container_name: string;
@@ -482,6 +521,42 @@ export type ContainerLogsQuery = {
      * Include timestamps in log output (default: false)
      */
     timestamps?: boolean;
+};
+
+/**
+ * Container resource metrics (CPU, memory usage)
+ */
+export type ContainerMetricsResponse = {
+    container_id: string;
+    container_name: string;
+    /**
+     * CPU usage percentage (0-100)
+     */
+    cpu_percent: number;
+    /**
+     * Memory usage in bytes
+     */
+    memory_bytes: number;
+    /**
+     * Memory limit in bytes (if set)
+     */
+    memory_limit_bytes?: number | null;
+    /**
+     * Memory usage percentage (0-100) if limit is set
+     */
+    memory_percent?: number | null;
+    /**
+     * Network bytes received
+     */
+    network_rx_bytes: number;
+    /**
+     * Network bytes transmitted
+     */
+    network_tx_bytes: number;
+    /**
+     * Timestamp of metrics collection
+     */
+    timestamp: string;
 };
 
 export type CreateApiKeyRequest = {
@@ -1252,6 +1327,18 @@ export type EnrichVisitorResponse = {
     message: string;
     success: boolean;
     visitor_id: string;
+};
+
+/**
+ * Environment variable with masked sensitive values
+ */
+export type EnvVarResponse = {
+    /**
+     * Whether this is a sensitive/masked value
+     */
+    is_masked: boolean;
+    key: string;
+    value: string;
 };
 
 /**
@@ -3109,6 +3196,16 @@ export type ResourceLimits = {
 };
 
 /**
+ * Container resource limits
+ */
+export type ResourceLimitsResponse = {
+    cpu_limit?: number | null;
+    cpu_request?: number | null;
+    memory_limit?: number | null;
+    memory_request?: number | null;
+};
+
+/**
  * Information about a role
  */
 export type RoleInfo = {
@@ -3951,10 +4048,6 @@ export type UpdateEmailProviderRequest = {
 };
 
 export type UpdateEnvironmentSettingsRequest = {
-    /**
-     * Enable/disable attack mode (CAPTCHA protection) for this environment
-     */
-    attack_mode?: boolean | null;
     /**
      * Enable/disable automatic deployments for this environment
      */
@@ -12019,6 +12112,46 @@ export type ListContainersResponses = {
 
 export type ListContainersResponse = ListContainersResponses[keyof ListContainersResponses];
 
+export type GetContainerDetailData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}';
+};
+
+export type GetContainerDetailErrors = {
+    /**
+     * Container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetContainerDetailResponses = {
+    /**
+     * Container details
+     */
+    200: ContainerDetailResponse;
+};
+
+export type GetContainerDetailResponse = GetContainerDetailResponses[keyof GetContainerDetailResponses];
+
 export type GetContainerLogsByIdData = {
     body?: never;
     path: {
@@ -12070,6 +12203,209 @@ export type GetContainerLogsByIdErrors = {
      */
     500: unknown;
 };
+
+export type GetContainerMetricsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics';
+};
+
+export type GetContainerMetricsErrors = {
+    /**
+     * Container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetContainerMetricsResponses = {
+    /**
+     * Container metrics retrieved successfully
+     */
+    200: ContainerMetricsResponse;
+};
+
+export type GetContainerMetricsResponse = GetContainerMetricsResponses[keyof GetContainerMetricsResponses];
+
+export type StreamContainerMetricsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+    };
+    query?: {
+        /**
+         * Update interval in milliseconds (default: 1000)
+         */
+        interval?: number;
+    };
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/stream';
+};
+
+export type StreamContainerMetricsErrors = {
+    /**
+     * Container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type StreamContainerMetricsResponses = {
+    /**
+     * Metrics stream established (Server-Sent Events)
+     */
+    200: unknown;
+};
+
+export type RestartContainerData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/restart';
+};
+
+export type RestartContainerErrors = {
+    /**
+     * Container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RestartContainerResponses = {
+    /**
+     * Container restarted successfully
+     */
+    200: ContainerActionResponse;
+};
+
+export type RestartContainerResponse = RestartContainerResponses[keyof RestartContainerResponses];
+
+export type StartContainerData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/start';
+};
+
+export type StartContainerErrors = {
+    /**
+     * Container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type StartContainerResponses = {
+    /**
+     * Container started successfully
+     */
+    200: ContainerActionResponse;
+};
+
+export type StartContainerResponse = StartContainerResponses[keyof StartContainerResponses];
+
+export type StopContainerData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/stop';
+};
+
+export type StopContainerErrors = {
+    /**
+     * Container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type StopContainerResponses = {
+    /**
+     * Container stopped successfully
+     */
+    200: ContainerActionResponse;
+};
+
+export type StopContainerResponse = StopContainerResponses[keyof StopContainerResponses];
 
 export type GetErrorDashboardStatsData = {
     body?: never;

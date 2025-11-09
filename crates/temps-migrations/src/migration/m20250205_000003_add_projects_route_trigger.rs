@@ -29,16 +29,19 @@ impl MigrationTrait for Migration {
                     -- Routing-relevant fields:
                     --   - is_deleted: Project must be removed from routing when deleted
                     --   - slug: Used in environment preview domain routing (e.g., preview-{slug}.temps.dev)
-                    -- NOT routing-relevant: attack_mode, deployment_config, preset_config, git_url, etc.
+                    --   - deployment_config: Contains security headers and other proxy-relevant settings
+                    -- NOT routing-relevant: attack_mode, preset_config, git_url, etc.
                     IF TG_OP = 'UPDATE' THEN
                         IF (OLD.is_deleted IS DISTINCT FROM NEW.is_deleted)
                            OR (OLD.slug IS DISTINCT FROM NEW.slug)
+                           OR (OLD.deployment_config IS DISTINCT FROM NEW.deployment_config)
                         THEN
                             PERFORM pg_notify('project_route_change', json_build_object(
                                 'action', 'UPDATE',
                                 'project_id', NEW.id,
                                 'is_deleted', NEW.is_deleted,
                                 'slug', NEW.slug,
+                                'deployment_config_changed', (OLD.deployment_config IS DISTINCT FROM NEW.deployment_config),
                                 'timestamp', CURRENT_TIMESTAMP
                             )::text);
                         END IF;

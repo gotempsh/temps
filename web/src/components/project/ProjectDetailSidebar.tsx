@@ -5,10 +5,12 @@ import {
   BarChart3,
   ChevronDown,
   ChevronRight,
+  Container,
   Database,
   FileText,
   GitBranch,
   Home,
+  Layers,
   Monitor,
   ScrollText,
   Settings,
@@ -55,7 +57,8 @@ interface NavItem {
   subItems?: { title: string; url: string }[]
 }
 
-const navItems: NavItem[] = [
+
+const baseNavItems: NavItem[] = [
   {
     title: 'Project',
     url: 'project',
@@ -119,7 +122,6 @@ const navItems: NavItem[] = [
     subItems: [
       { title: 'General', url: 'settings/general' },
       { title: 'Domains', url: 'settings/domains' },
-      { title: 'Environments', url: 'settings/environments' },
       { title: 'Environment Variables', url: 'settings/environment-variables' },
       { title: 'Git', url: 'settings/git' },
       { title: 'Security', url: 'settings/security' },
@@ -142,10 +144,20 @@ export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
     const pathParts = path.split('/')
     const urlParts = url.split('/')
 
-    // Match the exact route structure
-    if (pathParts.length !== urlParts.length + 3) return false // +3 for /projects/{slug}/
+    // Match the exact route structure - account for variable length paths
+    const projectSlugIndex = pathParts.indexOf(project.slug)
+    if (projectSlugIndex === -1) return false
 
-    return pathParts.slice(-urlParts.length).join('/') === url
+    const routeParts = pathParts.slice(projectSlugIndex + 1)
+
+    // For environments/{id}, check if it starts with environments
+    if (url === 'environments') {
+      return routeParts[0] === 'environments'
+    }
+
+    // For exact matching
+    if (routeParts.length !== urlParts.length) return false
+    return routeParts.join('/') === url
   }
 
   const isParentActive = (item: NavItem) => {
@@ -186,6 +198,19 @@ export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
     },
     [project.slug, navigate]
   )
+
+  // Build nav items including environments (without subItems)
+  const navItems: NavItem[] = [
+    ...baseNavItems.slice(0, baseNavItems.length - 1), // All items except Settings
+    // Insert Environments before Settings
+    {
+      title: 'Environments',
+      url: 'environments',
+      icon: Layers,
+      kbd: 'V',
+    },
+    baseNavItems[baseNavItems.length - 1], // Settings (last item)
+  ]
 
   return (
     <div className="hidden md:flex h-full w-56 flex-col border-r bg-background overflow-hidden">
