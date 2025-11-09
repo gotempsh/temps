@@ -1313,6 +1313,23 @@ mod tests {
             })
         }
 
+        async fn get_container_stats(
+            &self,
+            container_id: &str,
+        ) -> Result<temps_deployer::ContainerStats, temps_deployer::DeployerError> {
+            Ok(temps_deployer::ContainerStats {
+                container_id: container_id.to_string(),
+                container_name: "mock-container".to_string(),
+                cpu_percent: 10.5,
+                memory_bytes: 134217728,
+                memory_limit_bytes: Some(1073741824),
+                memory_percent: Some(12.5),
+                network_rx_bytes: 1024000,
+                network_tx_bytes: 512000,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+
         async fn list_containers(
             &self,
         ) -> Result<Vec<temps_deployer::ContainerInfo>, temps_deployer::DeployerError> {

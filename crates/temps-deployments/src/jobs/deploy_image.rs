@@ -1108,8 +1108,8 @@ mod tests {
     use async_trait::async_trait;
 
     use temps_deployer::{
-        ContainerDeployer, ContainerInfo, ContainerStatus as DeployerContainerStatus,
-        DeployRequest, DeployResult, DeployerError,
+        ContainerDeployer, ContainerInfo, ContainerStats,
+        ContainerStatus as DeployerContainerStatus, DeployRequest, DeployResult, DeployerError,
     };
 
     // Mock ContainerDeployer for testing multi-replica deployments
@@ -1195,6 +1195,23 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 ports: vec![],
                 environment_vars: HashMap::new(),
+            })
+        }
+
+        async fn get_container_stats(
+            &self,
+            container_id: &str,
+        ) -> Result<ContainerStats, DeployerError> {
+            Ok(ContainerStats {
+                container_id: container_id.to_string(),
+                container_name: "test_container".to_string(),
+                cpu_percent: 25.0,
+                memory_bytes: 268435456,
+                memory_limit_bytes: Some(2147483648),
+                memory_percent: Some(12.5),
+                network_rx_bytes: 2048000,
+                network_tx_bytes: 1024000,
+                timestamp: chrono::Utc::now(),
             })
         }
 

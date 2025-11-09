@@ -28,6 +28,7 @@ use crate::handlers::types::{
     ServiceParameter, ServiceTypeInfo, ServiceTypeRoute, UpdateExternalServiceRequest,
     UpgradeExternalServiceRequest,
 };
+use crate::services::EnvironmentVariableOptions;
 use temps_core::AuditContext;
 use temps_core::RequestMetadata;
 
@@ -936,12 +937,19 @@ async fn get_service_environment_variables(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
 
+    let options = EnvironmentVariableOptions {
+        include_docker: false,
+        include_runtime: false,
+        mask_sensitive: false,
+        names_only: false,
+    };
+
     match app_state
         .external_service_manager
-        .get_service_environment_variables(id, project_id)
+        .get_environment_variables(id, Some(project_id), None, options)
         .await
     {
-        Ok(variables) => Ok((StatusCode::OK, Json(variables))),
+        Ok(response) => Ok((StatusCode::OK, Json(response.variables))),
         Err(e) => match e.to_string().as_str() {
             "Service not found" | "Project not found" => {
                 Err(not_found().detail(e.to_string()).build())
@@ -1058,12 +1066,22 @@ async fn get_service_preview_environment_variable_names(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
 
+    let options = EnvironmentVariableOptions {
+        include_docker: false,
+        include_runtime: false,
+        mask_sensitive: false,
+        names_only: true,
+    };
+
     match app_state
         .external_service_manager
-        .get_service_preview_environment_variable_names(id)
+        .get_environment_variables(id, None, None, options)
         .await
     {
-        Ok(variable_names) => Ok((StatusCode::OK, Json(variable_names))),
+        Ok(response) => {
+            let variable_names: Vec<String> = response.variables.keys().cloned().collect();
+            Ok((StatusCode::OK, Json(variable_names)))
+        }
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
             _ => Err(internal_server_error()
@@ -1097,12 +1115,19 @@ async fn get_service_preview_environment_variables_masked(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
 
+    let options = EnvironmentVariableOptions {
+        include_docker: false,
+        include_runtime: false,
+        mask_sensitive: true,
+        names_only: false,
+    };
+
     match app_state
         .external_service_manager
-        .get_service_preview_environment_variables_masked(id)
+        .get_environment_variables(id, None, None, options)
         .await
     {
-        Ok(variables) => Ok((StatusCode::OK, Json(variables))),
+        Ok(response) => Ok((StatusCode::OK, Json(response.variables))),
         Err(e) => match e.to_string().as_str() {
             "Service not found" => Err(not_found().detail("Service not found").build()),
             _ => Err(internal_server_error()

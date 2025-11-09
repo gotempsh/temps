@@ -138,6 +138,26 @@ pub struct UpdateExternalServiceRequest {
     pub docker_image: Option<String>,
 }
 
+/// Options for getting environment variables
+#[derive(Debug, Clone, Default)]
+pub struct EnvironmentVariableOptions {
+    /// Include Docker container environment variables
+    pub include_docker: bool,
+    /// Include runtime-provisioned environment variables (requires project_id and environment_id)
+    pub include_runtime: bool,
+    /// Mask sensitive values (password, secret, key, token, etc.)
+    pub mask_sensitive: bool,
+    /// Return only variable names (no values)
+    pub names_only: bool,
+}
+
+/// Response containing environment variables
+#[derive(Debug, Serialize)]
+pub struct EnvironmentVariablesResponse {
+    pub variables: HashMap<String, String>,
+    pub masked: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ExternalServiceDetails {
     pub service: ExternalServiceInfo,
@@ -1349,6 +1369,176 @@ impl ExternalServiceManager {
             service: service_info,
             parameter_schema: service_instance.get_parameter_schema(),
             current_parameters: Some(parameters),
+        })
+    }
+
+    /// Consolidated method for getting environment variables with flexible options
+    ///
+    /// This method replaces 7 separate environment variable methods:
+    /// - get_service_environment_variables()
+    /// - get_runtime_env_vars()
+    /// - get_service_docker_environment_variables()
+    /// - get_service_environment_variable()
+    /// - get_project_service_environment_variables()
+    /// - get_service_preview_environment_variable_names()
+    /// - get_service_preview_environment_variables_masked()
+    pub async fn get_environment_variables(
+        &self,
+        service_id: i32,
+        project_id: Option<i32>,
+        environment_id: Option<i32>,
+        options: EnvironmentVariableOptions,
+    ) -> Result<EnvironmentVariablesResponse, ExternalServiceError> {
+        let service = self.get_service(service_id).await?;
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service_id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+
+        let parameters = self.get_service_parameters(service_id).await?;
+        let params_str = Self::params_to_strings(&parameters);
+        let service_instance =
+            self.create_service_instance(service.name.clone(), service_type.clone());
+
+        let mut all_vars = HashMap::new();
+
+        // Get basic environment variables
+        if !options.include_runtime {
+            // Basic localhost env vars
+            let basic_vars = service_instance
+                .get_environment_variables(&params_str)
+                .map_err(|e| ExternalServiceError::InternalError {
+                    reason: format!("Failed to get environment variables: {}", e),
+                })?;
+            all_vars.extend(basic_vars);
+        }
+
+        // Get Docker-specific variables if requested
+        if options.include_docker {
+            if let (Some(proj_id), Some(_env_id)) = (project_id, environment_id) {
+                // Verify service is linked to project
+                let link_exists = project_services::Entity::find()
+                    .filter(
+                        project_services::Column::ServiceId
+                            .eq(service_id)
+                            .and(project_services::Column::ProjectId.eq(proj_id)),
+                    )
+                    .one(self.db.as_ref())
+                    .await?;
+
+                if link_exists.is_none() {
+                    return Err(ExternalServiceError::ServiceNotLinkedToProject {
+                        service_id,
+                        project_id: proj_id,
+                    });
+                }
+
+                let docker_vars = service_instance
+                    .get_docker_environment_variables(&params_str)
+                    .map_err(|e| ExternalServiceError::InternalError {
+                        reason: format!("Failed to get docker environment variables: {}", e),
+                    })?;
+                all_vars.extend(docker_vars);
+            }
+        }
+
+        // Get runtime variables if requested
+        if options.include_runtime {
+            if let (Some(proj_id), Some(env_id)) = (project_id, environment_id) {
+                // Verify service is linked to project
+                let link_exists = project_services::Entity::find()
+                    .filter(
+                        project_services::Column::ServiceId
+                            .eq(service_id)
+                            .and(project_services::Column::ProjectId.eq(proj_id)),
+                    )
+                    .one(self.db.as_ref())
+                    .await?;
+
+                if link_exists.is_none() {
+                    return Err(ExternalServiceError::ServiceNotLinkedToProject {
+                        service_id,
+                        project_id: proj_id,
+                    });
+                }
+
+                let service_config = ServiceConfig {
+                    name: service.name.clone(),
+                    service_type: service_type.clone(),
+                    version: service.version,
+                    parameters: serde_json::to_value(&parameters).map_err(|e| {
+                        ExternalServiceError::InternalError {
+                            reason: format!("Failed to serialize parameters: {}", e),
+                        }
+                    })?,
+                };
+
+                // Initialize the service to populate its internal config
+                service_instance
+                    .init(service_config.clone())
+                    .await
+                    .map_err(|e| ExternalServiceError::InternalError {
+                        reason: format!("Failed to initialize service: {}", e),
+                    })?;
+
+                // Get project and environment slugs
+                let project = projects::Entity::find_by_id(proj_id)
+                    .one(self.db.as_ref())
+                    .await?
+                    .ok_or(ExternalServiceError::ProjectNotFound { id: proj_id })?;
+
+                let environment = temps_entities::environments::Entity::find_by_id(env_id)
+                    .one(self.db.as_ref())
+                    .await?
+                    .ok_or_else(|| ExternalServiceError::InternalError {
+                        reason: format!("Environment {} not found", env_id),
+                    })?;
+
+                let runtime_vars = service_instance
+                    .get_runtime_env_vars(service_config, &project.slug, &environment.slug)
+                    .await
+                    .map_err(|e| ExternalServiceError::InternalError {
+                        reason: format!("Failed to get runtime environment variables: {}", e),
+                    })?;
+
+                all_vars.extend(runtime_vars);
+            }
+        }
+
+        // Handle names_only option
+        if options.names_only {
+            let names_only: HashMap<String, String> = all_vars
+                .keys()
+                .map(|k| (k.clone(), String::new()))
+                .collect();
+            return Ok(EnvironmentVariablesResponse {
+                variables: names_only,
+                masked: false,
+            });
+        }
+
+        // Handle mask_sensitive option
+        let variables = if options.mask_sensitive {
+            all_vars
+                .into_iter()
+                .map(|(key, value)| {
+                    let masked_value = if Self::is_sensitive_variable(&key) {
+                        "***".to_string()
+                    } else {
+                        value
+                    };
+                    (key, masked_value)
+                })
+                .collect()
+        } else {
+            all_vars
+        };
+
+        Ok(EnvironmentVariablesResponse {
+            variables,
+            masked: options.mask_sensitive,
         })
     }
 

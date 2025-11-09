@@ -440,37 +440,143 @@ impl LoadBalancer {
     ) -> Result<()> {
         use temps_entities::deployment_config::SecurityHeadersConfig;
 
+        // Map preset names to default header values
+        fn get_preset_headers(preset: &str) -> SecurityHeadersConfig {
+            match preset.to_lowercase().as_str() {
+                "strict" => SecurityHeadersConfig {
+                    preset: Some("strict".to_string()),
+                    content_security_policy: Some(
+                        "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'".to_string()
+                    ),
+                    x_frame_options: Some("DENY".to_string()),
+                    strict_transport_security: Some("max-age=31536000; includeSubDomains; preload".to_string()),
+                    referrer_policy: Some("strict-origin-when-cross-origin".to_string()),
+                },
+                "moderate" => SecurityHeadersConfig {
+                    preset: Some("moderate".to_string()),
+                    content_security_policy: Some(
+                        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https:; frame-ancestors 'self'".to_string()
+                    ),
+                    x_frame_options: Some("SAMEORIGIN".to_string()),
+                    strict_transport_security: Some("max-age=31536000; includeSubDomains".to_string()),
+                    referrer_policy: Some("no-referrer-when-downgrade".to_string()),
+                },
+                "permissive" => SecurityHeadersConfig {
+                    preset: Some("permissive".to_string()),
+                    content_security_policy: Some(
+                        "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; font-src 'self' data: https:; connect-src 'self' https:; frame-ancestors *".to_string()
+                    ),
+                    x_frame_options: Some("ALLOW-FROM *".to_string()),
+                    strict_transport_security: Some("max-age=31536000".to_string()),
+                    referrer_policy: Some("origin".to_string()),
+                },
+                "disabled" => SecurityHeadersConfig {
+                    preset: Some("disabled".to_string()),
+                    content_security_policy: None,
+                    x_frame_options: None,
+                    strict_transport_security: None,
+                    referrer_policy: None,
+                },
+                _ => SecurityHeadersConfig {
+                    preset: Some(preset.to_string()),
+                    content_security_policy: None,
+                    x_frame_options: None,
+                    strict_transport_security: None,
+                    referrer_policy: None,
+                },
+            }
+        }
+
         // Try to get security headers from project configuration first
-        let headers_config = if let Some(proj) = project {
-            debug!("Applying security headers for project id={}", proj.id);
+        // Returns: None = no config (should check global), Some(config) = explicit config from project
+        let (project_has_explicit_config, headers_config) = if let Some(proj) = project {
+            debug!(
+                "Applying security headers for project id={}, slug={}",
+                proj.id, proj.slug
+            );
             if let Some(ref deploy_config) = proj.deployment_config {
+                debug!(
+                    "Project {} has deployment_config, security field: {}",
+                    proj.id,
+                    deploy_config.security.is_some()
+                );
                 if let Some(ref security) = deploy_config.security {
+                    debug!(
+                        "Security config present: enabled={}, headers={}, rate_limiting={}, attack_mode={}",
+                        security.enabled.unwrap_or(true),
+                        security.headers.is_some(),
+                        security.rate_limiting.is_some(),
+                        security.attack_mode.is_some()
+                    );
+
+                    // Check if security is explicitly disabled at project level
+                    if security.enabled == Some(false) {
+                        debug!("Security headers are explicitly disabled at project level - skipping global fallback");
+                        return Ok(());
+                    }
+
                     if let Some(ref headers) = security.headers {
-                        debug!(
-                            "Using project-level security headers: preset={:?}",
-                            headers.preset
-                        );
-                        Some(headers.clone())
+                        // Check if we have a preset but no individual headers configured
+                        let has_preset = headers.preset.is_some();
+                        let has_individual_headers = headers.content_security_policy.is_some()
+                            || headers.x_frame_options.is_some()
+                            || headers.strict_transport_security.is_some()
+                            || headers.referrer_policy.is_some();
+
+                        // Check if preset is "disabled"
+                        let preset_disabled = has_preset
+                            && headers.preset.as_ref().map(|p| p.to_lowercase())
+                                == Some("disabled".to_string());
+
+                        if preset_disabled {
+                            debug!("Project has security headers preset set to 'disabled' - skipping global fallback");
+                            return Ok(());
+                        }
+
+                        if has_preset && !has_individual_headers {
+                            // Use preset to generate default headers
+                            let preset_name = headers.preset.as_ref().unwrap();
+                            debug!(
+                                "Using preset '{}' to generate security headers from project config",
+                                preset_name
+                            );
+                            (true, Some(get_preset_headers(preset_name)))
+                        } else if has_individual_headers {
+                            // Use individual headers as configured
+                            debug!(
+                                "Using custom security headers from project: preset={:?}, csp={}, x_frame={}, hsts={}, referrer={}",
+                                headers.preset,
+                                headers.content_security_policy.is_some(),
+                                headers.x_frame_options.is_some(),
+                                headers.strict_transport_security.is_some(),
+                                headers.referrer_policy.is_some()
+                            );
+                            (true, Some(headers.clone()))
+                        } else {
+                            // No preset and no individual headers - project has config but empty, don't fall back to global
+                            debug!("Project has security config but no headers or preset configured - skipping global fallback");
+                            (true, None)
+                        }
                     } else {
-                        debug!("Project has security config but no headers configured");
-                        None
+                        debug!("Project has security config but no headers configured (headers field is None) - allowing global fallback");
+                        (false, None)
                     }
                 } else {
-                    debug!("Project has deployment_config but no security config");
-                    None
+                    debug!("Project has deployment_config but no security config (security field is None) - allowing global fallback");
+                    (false, None)
                 }
             } else {
-                debug!("Project has no deployment_config");
-                None
+                debug!("Project {} has no deployment_config field (is None) - allowing global fallback", proj.id);
+                (false, None)
             }
         } else {
-            debug!("No project context available for security headers");
-            None
+            debug!("No project context available for security headers - allowing global fallback");
+            (false, None)
         };
 
-        // If no project-level config, get from global settings
-        let headers_config = if headers_config.is_none() {
-            debug!("No project-level security headers, checking global settings");
+        // If project didn't have explicit config, check global settings
+        let headers_config = if !project_has_explicit_config && headers_config.is_none() {
+            debug!("No explicit project-level security headers, checking global settings");
             match self.config_service.get_settings().await {
                 Ok(settings) => {
                     let headers = &settings.security_headers;
