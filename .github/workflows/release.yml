@@ -63,6 +63,7 @@ jobs:
 
       - name: Build WASM
         run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
           cd crates/temps-captcha-wasm
           bun run build
 
@@ -145,6 +146,7 @@ jobs:
 
       - name: Build WASM
         run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
           cd crates/temps-captcha-wasm
           bun run build
 
@@ -227,6 +229,7 @@ jobs:
 
       - name: Build WASM
         run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
           cd crates/temps-captcha-wasm
           bun run build
 
