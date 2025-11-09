@@ -8,7 +8,8 @@ import {
 import NotFound from '@/components/global/NotFound'
 import { ProjectAnalytics } from '@/components/project/ProjectAnalytics'
 import { ProjectDeployments } from '@/components/project/ProjectDeployments'
-import { ProjectDetailSidebar } from '@/components/project/ProjectDetailSidebar'
+import { ProjectDetailSidebar, MobileSidebarProvider } from '@/components/project/ProjectDetailSidebar'
+import { ProjectDetailHeader } from '@/components/project/ProjectDetailHeader'
 import { ProjectOverview } from '@/components/project/ProjectOverview'
 import { ProjectRuntime } from '@/components/project/ProjectRuntime'
 import { ProjectSettings } from '@/components/project/ProjectSettings'
@@ -18,16 +19,12 @@ import { ProjectMonitors } from '@/components/project/ProjectMonitors'
 import { MonitorDetail } from '@/components/project/MonitorDetail'
 import { ErrorTracking } from '@/components/projects/ErrorTracking'
 import { EnvironmentsTabsView } from './EnvironmentsTabsView'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
-import { Badge } from '@/components/ui/badge'
-import { buttonVariants } from '@/components/ui/button'
 import { Confetti } from '@/components/ui/confetti'
 import { Skeleton } from '@/components/ui/skeleton'
 
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { cn } from '@/lib/utils'
 import { DeploymentDetails } from '@/pages/DeploymentDetails'
 import { ErrorEventDetail } from './ErrorEventDetail'
 import { ErrorGroupDetail } from './ErrorGroupDetail'
@@ -35,7 +32,6 @@ import RequestLogs from './RequestLogs'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import {
-  Link,
   Navigate,
   Route,
   Routes,
@@ -262,69 +258,18 @@ export function ProjectDetail() {
   }
 
   return (
-    <div className="flex h-full w-full overflow-hidden">
-      <Confetti active={showConfetti} duration={4000} particleCount={100} />
-      <ProjectDetailSidebar project={project} />
-      <div className="flex flex-1 flex-col overflow-hidden">
-        <header className="flex h-16 shrink-0 items-center gap-2 border-b px-4">
-          <div className="flex flex-1 items-center justify-between gap-4">
-            <div className="flex items-center gap-4">
-              <Avatar className="size-8">
-                <AvatarImage src={`/api/projects/${project.id}/favicon`} />
-                <AvatarFallback>{project.name.charAt(0)}</AvatarFallback>
-              </Avatar>
-              <div className="flex flex-wrap items-center gap-2">
-                <h1 className="text-lg font-semibold">{project.slug}</h1>
-                <Badge
-                  variant={project.last_deployment ? 'default' : 'outline'}
-                >
-                  {project.last_deployment ? 'Deployed' : 'Not deployed'}
-                </Badge>
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              {activeVisitorsCount !== undefined && (
-                <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-muted/30 rounded-full">
-                  <div
-                    className={`h-2 w-2 rounded-full ${activeVisitorsCount?.active_visitors > 0 ? 'bg-green-500 animate-pulse' : 'bg-gray-400'}`}
-                  />
-                  <span className="text-sm font-semibold">
-                    {activeVisitorsCount?.active_visitors}
-                  </span>
-                </div>
-              )}
-              {repository?.clone_url && (
-                <Link
-                  to={repository.clone_url.replace('.git', '')}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className={cn(
-                    buttonVariants({
-                      variant: 'outline',
-                      size: 'sm',
-                    })
-                  )}
-                >
-                  Repository
-                </Link>
-              )}
-              {lastDeployment && !isLoadingLastDeployment && (
-                <Link
-                  to={lastDeployment.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className={cn(
-                    buttonVariants({
-                      size: 'sm',
-                    })
-                  )}
-                >
-                  Visit
-                </Link>
-              )}
-            </div>
-          </div>
-        </header>
+    <MobileSidebarProvider>
+      <div className="flex h-full w-full overflow-hidden">
+        <Confetti active={showConfetti} duration={4000} particleCount={100} />
+        <ProjectDetailSidebar project={project} />
+        <div className="flex flex-1 flex-col overflow-hidden">
+          <ProjectDetailHeader
+            project={project}
+            activeVisitorsCount={activeVisitorsCount}
+            repositoryCloneUrl={repository?.clone_url}
+            lastDeploymentUrl={lastDeployment?.url}
+            isLoadingLastDeployment={isLoadingLastDeployment}
+          />
         <div className="flex-1 overflow-y-auto p-4">
           {/* Attack Mode Banner */}
           {(project as any).attack_mode && (
@@ -414,5 +359,6 @@ export function ProjectDetail() {
         </div>
       </div>
     </div>
+    </MobileSidebarProvider>
   )
 }

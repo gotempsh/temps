@@ -5,19 +5,34 @@ import {
   BarChart3,
   ChevronDown,
   ChevronRight,
-  Container,
   Database,
   FileText,
   GitBranch,
   Home,
   Layers,
-  Monitor,
   ScrollText,
   Settings,
   Shield,
 } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useContext, useEffect, useState, createContext } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
+import { Sheet, SheetContent } from '@/components/ui/sheet'
+
+// Context for mobile sidebar menu state
+interface MobileSidebarContextType {
+  isOpen: boolean
+  setIsOpen: (open: boolean) => void
+}
+
+const MobileSidebarContext = createContext<MobileSidebarContextType | undefined>(undefined)
+
+export function useMobileSidebar() {
+  const context = useContext(MobileSidebarContext)
+  if (!context) {
+    throw new Error('useMobileSidebar must be used within a ProjectDetailSidebar')
+  }
+  return context
+}
 
 // Keyboard shortcut component for Cmd/Ctrl modifier
 interface CmdKeyboardShortcutProps {
@@ -130,6 +145,20 @@ const baseNavItems: NavItem[] = [
   },
 ]
 
+interface MobileSidebarProviderProps {
+  children: React.ReactNode
+}
+
+export function MobileSidebarProvider({ children }: MobileSidebarProviderProps) {
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false)
+
+  return (
+    <MobileSidebarContext.Provider value={{ isOpen: isMobileMenuOpen, setIsOpen: setIsMobileMenuOpen }}>
+      {children}
+    </MobileSidebarContext.Provider>
+  )
+}
+
 export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
   const location = useLocation()
   const navigate = useNavigate()
@@ -212,8 +241,110 @@ export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
     baseNavItems[baseNavItems.length - 1], // Settings (last item)
   ]
 
+  // Navigation content component (reusable for mobile and desktop)
+  const NavigationContent = ({ closeSheet }: { closeSheet?: () => void }) => (
+    <nav className="flex flex-col gap-1 p-2 overflow-y-auto">
+      {navItems.map((item) => {
+        const Icon = item.icon
+        const active = isActive(item.url)
+        const hasSubItems = item.subItems && item.subItems.length > 0
+        const isExpanded = expandedItems.includes(item.title)
+        const parentActive = isParentActive(item)
+
+        return (
+          <div key={item.title}>
+            {hasSubItems && item.subItems ? (
+              <>
+                <div className="flex items-center gap-0">
+                  <Link
+                    to={`/projects/${project.slug}/${item.subItems[0].url}`}
+                    onClick={closeSheet}
+                    className={cn(
+                      'flex flex-1 items-center gap-3 rounded-l-lg px-3 py-2 text-sm transition-all hover:bg-accent',
+                      active || parentActive
+                        ? 'bg-accent text-accent-foreground font-medium'
+                        : 'text-muted-foreground'
+                    )}
+                  >
+                    <Icon className="h-4 w-4" />
+                    <span className="flex-1 text-left">{item.title}</span>
+                    {item.kbd && (
+                      <kbd className="pointer-events-none hidden h-5 select-none items-center gap-1 rounded border bg-muted px-1.5 font-mono text-[10px] font-medium opacity-100 sm:flex">
+                        <span className="text-xs">⌘</span>
+                        {item.kbd}
+                      </kbd>
+                    )}
+                  </Link>
+                  <button
+                    onClick={() => toggleExpanded(item.title)}
+                    className={cn(
+                      'flex items-center justify-center rounded-r-lg px-2 py-2 text-sm transition-all hover:bg-accent',
+                      active || parentActive
+                        ? 'bg-accent text-accent-foreground font-medium'
+                        : 'text-muted-foreground'
+                    )}
+                  >
+                    {isExpanded ? (
+                      <ChevronDown className="h-4 w-4" />
+                    ) : (
+                      <ChevronRight className="h-4 w-4" />
+                    )}
+                  </button>
+                </div>
+                {isExpanded && (
+                  <div className="ml-7 mt-1 flex flex-col gap-1">
+                    {item.subItems.map((subItem) => {
+                      const subActive = isActive(subItem.url)
+                      return (
+                        <Link
+                          key={subItem.url}
+                          to={`/projects/${project.slug}/${subItem.url}`}
+                          onClick={closeSheet}
+                          className={cn(
+                            'rounded-lg px-3 py-1.5 text-sm transition-all hover:bg-accent',
+                            subActive
+                              ? 'bg-accent text-accent-foreground font-medium'
+                              : 'text-muted-foreground'
+                          )}
+                        >
+                          {subItem.title}
+                        </Link>
+                      )
+                    })}
+                  </div>
+                )}
+              </>
+            ) : (
+              <Link
+                to={`/projects/${project.slug}/${item.url}`}
+                onClick={closeSheet}
+                className={cn(
+                  'flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-all hover:bg-accent',
+                  active
+                    ? 'bg-accent text-accent-foreground font-medium'
+                    : 'text-muted-foreground'
+                )}
+              >
+                <Icon className="h-4 w-4" />
+                <span className="flex-1">{item.title}</span>
+                {item.kbd && (
+                  <kbd className="pointer-events-none hidden h-5 select-none items-center gap-1 rounded border bg-muted px-1.5 font-mono text-[10px] font-medium opacity-100 sm:flex">
+                    <span className="text-xs">⌘</span>
+                    {item.kbd}
+                  </kbd>
+                )}
+              </Link>
+            )}
+          </div>
+        )
+      })}
+    </nav>
+  )
+
+  const { isOpen, setIsOpen } = useMobileSidebar()
+
   return (
-    <div className="hidden md:flex h-full w-56 flex-col border-r bg-background overflow-hidden">
+    <>
       {/* Keyboard shortcuts */}
       {navItems.map(
         (item) =>
@@ -226,99 +357,22 @@ export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
           )
       )}
 
-      <nav className="flex flex-col gap-1 p-2 overflow-y-auto">
-        {navItems.map((item) => {
-          const Icon = item.icon
-          const active = isActive(item.url)
-          const hasSubItems = item.subItems && item.subItems.length > 0
-          const isExpanded = expandedItems.includes(item.title)
-          const parentActive = isParentActive(item)
+      {/* Desktop sidebar - hidden on mobile */}
+      <div className="hidden md:flex h-full w-56 flex-col border-r bg-background overflow-hidden">
+        <NavigationContent />
+      </div>
 
-          return (
-            <div key={item.title}>
-              {hasSubItems ? (
-                <>
-                  <div className="flex items-center gap-0">
-                    <Link
-                      to={`/projects/${project.slug}/${item.subItems[0].url}`}
-                      className={cn(
-                        'flex flex-1 items-center gap-3 rounded-l-lg px-3 py-2 text-sm transition-all hover:bg-accent',
-                        active || parentActive
-                          ? 'bg-accent text-accent-foreground font-medium'
-                          : 'text-muted-foreground'
-                      )}
-                    >
-                      <Icon className="h-4 w-4" />
-                      <span className="flex-1 text-left">{item.title}</span>
-                      {item.kbd && (
-                        <kbd className="pointer-events-none hidden h-5 select-none items-center gap-1 rounded border bg-muted px-1.5 font-mono text-[10px] font-medium opacity-100 sm:flex">
-                          <span className="text-xs">⌘</span>
-                          {item.kbd}
-                        </kbd>
-                      )}
-                    </Link>
-                    <button
-                      onClick={() => toggleExpanded(item.title)}
-                      className={cn(
-                        'flex items-center justify-center rounded-r-lg px-2 py-2 text-sm transition-all hover:bg-accent',
-                        active || parentActive
-                          ? 'bg-accent text-accent-foreground font-medium'
-                          : 'text-muted-foreground'
-                      )}
-                    >
-                      {isExpanded ? (
-                        <ChevronDown className="h-4 w-4" />
-                      ) : (
-                        <ChevronRight className="h-4 w-4" />
-                      )}
-                    </button>
-                  </div>
-                  {isExpanded && (
-                    <div className="ml-7 mt-1 flex flex-col gap-1">
-                      {item.subItems.map((subItem) => {
-                        const subActive = isActive(subItem.url)
-                        return (
-                          <Link
-                            key={subItem.url}
-                            to={`/projects/${project.slug}/${subItem.url}`}
-                            className={cn(
-                              'rounded-lg px-3 py-1.5 text-sm transition-all hover:bg-accent',
-                              subActive
-                                ? 'bg-accent text-accent-foreground font-medium'
-                                : 'text-muted-foreground'
-                            )}
-                          >
-                            {subItem.title}
-                          </Link>
-                        )
-                      })}
-                    </div>
-                  )}
-                </>
-              ) : (
-                <Link
-                  to={`/projects/${project.slug}/${item.url}`}
-                  className={cn(
-                    'flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-all hover:bg-accent',
-                    active
-                      ? 'bg-accent text-accent-foreground font-medium'
-                      : 'text-muted-foreground'
-                  )}
-                >
-                  <Icon className="h-4 w-4" />
-                  <span className="flex-1">{item.title}</span>
-                  {item.kbd && (
-                    <kbd className="pointer-events-none hidden h-5 select-none items-center gap-1 rounded border bg-muted px-1.5 font-mono text-[10px] font-medium opacity-100 sm:flex">
-                      <span className="text-xs">⌘</span>
-                      {item.kbd}
-                    </kbd>
-                  )}
-                </Link>
-              )}
+      {/* Mobile menu sheet - controlled by context */}
+      <Sheet open={isOpen} onOpenChange={setIsOpen}>
+        <SheetContent side="left" className="w-56 p-0">
+          <div className="h-full flex flex-col overflow-hidden">
+            <div className="border-b p-4">
+              <h2 className="font-semibold text-lg">{project.name}</h2>
             </div>
-          )
-        })}
-      </nav>
-    </div>
+            <NavigationContent closeSheet={() => setIsOpen(false)} />
+          </div>
+        </SheetContent>
+      </Sheet>
+    </>
   )
 }
