@@ -27,15 +27,15 @@ export function ProjectDetailHeader({
   return (
     <header className="flex h-16 shrink-0 items-center gap-2 border-b px-4">
       <Button
-        variant="ghost"
+        variant="outline"
         size="icon"
-        className="md:hidden"
+        className="md:hidden flex-shrink-0"
         onClick={() => setIsOpen(true)}
         aria-label="Open navigation menu"
       >
         <Menu className="h-5 w-5" />
       </Button>
-      <div className="flex flex-1 items-center justify-between gap-4">
+      <div className="flex flex-1 items-center justify-between gap-4 min-w-0">
         <div className="flex items-center gap-4">
           <Avatar className="size-8">
             <AvatarImage src={`/api/projects/${project.id}/favicon`} />

@@ -428,6 +428,49 @@ impl RedisService {
 
         Ok(RedisConfig::from(input_config))
     }
+
+    /// Verify that a Docker image can be pulled without actually downloading the full image
+    /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
+    #[allow(dead_code)]
+    async fn verify_image_pullable(&self, image: &str) -> Result<()> {
+        // Parse image name and tag
+        let (image_name, tag) = if let Some((name, tag)) = image.split_once(':') {
+            (name.to_string(), tag.to_string())
+        } else {
+            (image.to_string(), "latest".to_string())
+        };
+
+        info!("Attempting to pull Docker image: {}", image);
+
+        // Try to pull the image - this will fail if it doesn't exist
+        let result = self
+            .docker
+            .create_image(
+                Some(bollard::query_parameters::CreateImageOptions {
+                    from_image: Some(image_name.clone()),
+                    tag: Some(tag.clone()),
+                    ..Default::default()
+                }),
+                None,
+                None,
+            )
+            .try_collect::<Vec<_>>()
+            .await;
+
+        match result {
+            Ok(_) => {
+                info!("Docker image {} is available and pullable", image);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to pull Docker image {}: {}", image, e);
+                Err(anyhow::anyhow!(
+                    "Cannot upgrade: Docker image '{}' is not available or cannot be pulled. Error: {}",
+                    image, e
+                ))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -540,11 +583,11 @@ impl ExternalService for RedisService {
             for key in properties.keys().cloned().collect::<Vec<_>>() {
                 // Define which fields should be editable
                 let editable = match key.as_str() {
-                    "host" => false,    // Don't change host after creation
-                    "port" => true,     // Port can be changed
-                    "password" => true, // Password can be updated
-                    "image" => true,    // Image can be upgraded
-                    "version" => true,  // Version can be changed
+                    "host" => false,     // Don't change host after creation
+                    "port" => true,      // Port can be changed
+                    "password" => false, // Password is auto-generated and cannot be changed
+                    "image" => true,     // Image can be upgraded
+                    "version" => true,   // Version can be changed
                     _ => false,
                 };
 
@@ -1050,6 +1093,31 @@ impl ExternalService for RedisService {
     async fn get_current_version(&self) -> Result<String> {
         let (_, version) = self.get_current_docker_image().await?;
         Ok(version)
+    }
+
+    async fn upgrade(&self, old_config: ServiceConfig, new_config: ServiceConfig) -> Result<()> {
+        info!("Starting Redis upgrade");
+
+        let _old_redis_config = self.get_redis_config(old_config)?;
+        let new_redis_config = self.get_redis_config(new_config)?;
+
+        // Verify the new image can be pulled BEFORE stopping the old container
+        let new_image = format!("{}:{}", new_redis_config.image, new_redis_config.version);
+        info!("Verifying new Docker image is available: {}", new_image);
+        self.verify_image_pullable(&new_image).await?;
+        info!("New Docker image verified and is available");
+
+        // Stop the old container
+        info!("Stopping old Redis container");
+        self.stop().await?;
+
+        // Create container with new image (keeping the same volume for data persistence)
+        info!("Starting Redis container with new image");
+        self.create_container(&self.docker, &new_redis_config, &new_redis_config.password)
+            .await?;
+
+        info!("Redis upgrade completed successfully");
+        Ok(())
     }
 }
 

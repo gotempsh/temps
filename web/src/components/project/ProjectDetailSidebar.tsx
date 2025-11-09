@@ -266,7 +266,7 @@ export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
                         : 'text-muted-foreground'
                     )}
                   >
-                    <Icon className="h-4 w-4" />
+                    <Icon className="h-4 w-4 flex-shrink-0" />
                     <span className="flex-1 text-left">{item.title}</span>
                     {item.kbd && (
                       <kbd className="pointer-events-none hidden h-5 select-none items-center gap-1 rounded border bg-muted px-1.5 font-mono text-[10px] font-medium opacity-100 sm:flex">
@@ -325,7 +325,7 @@ export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
                     : 'text-muted-foreground'
                 )}
               >
-                <Icon className="h-4 w-4" />
+                <Icon className="h-4 w-4 flex-shrink-0" />
                 <span className="flex-1">{item.title}</span>
                 {item.kbd && (
                   <kbd className="pointer-events-none hidden h-5 select-none items-center gap-1 rounded border bg-muted px-1.5 font-mono text-[10px] font-medium opacity-100 sm:flex">
@@ -364,7 +364,7 @@ export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
 
       {/* Mobile menu sheet - controlled by context */}
       <Sheet open={isOpen} onOpenChange={setIsOpen}>
-        <SheetContent side="left" className="w-56 p-0">
+        <SheetContent side="left" className="w-72 p-0">
           <div className="h-full flex flex-col overflow-hidden">
             <div className="border-b p-4">
               <h2 className="font-semibold text-lg">{project.name}</h2>

@@ -136,13 +136,13 @@ const data = {
 }
 
 function NavProjects({ projects }: { projects: ProjectResponse[] }) {
-  const { isMinimal } = useSidebar()
+  const { isMinimal, isMobile } = useSidebar()
 
   return (
     <SidebarGroup
-      className={isMinimal ? '' : 'group-data-[collapsible=icon]:hidden'}
+      className={isMinimal && !isMobile ? '' : 'group-data-[collapsible=icon]:hidden'}
     >
-      <SidebarGroupLabel className={isMinimal ? 'hidden' : ''}>
+      <SidebarGroupLabel className={isMinimal && !isMobile ? 'hidden' : ''}>
         Projects
       </SidebarGroupLabel>
       <SidebarMenu>
@@ -150,15 +150,15 @@ function NavProjects({ projects }: { projects: ProjectResponse[] }) {
           <SidebarMenuItem key={item.id}>
             <SidebarMenuButton
               asChild
-              tooltip={isMinimal ? item.name : undefined}
-              className={cn('justify-center', !isMinimal && 'justify-start')}
+              tooltip={isMinimal && !isMobile ? item.name : undefined}
+              className={cn('justify-center', (!isMinimal || isMobile) && 'justify-start')}
             >
               <Link to={`/projects/${item.slug}`}>
                 <Avatar className="size-6">
                   <AvatarImage src={`/api/projects/${item.id}/favicon`} />
                   <AvatarFallback>{item.name.charAt(0)}</AvatarFallback>
                 </Avatar>
-                {!isMinimal && <span>{item.name}</span>}
+                {(!isMinimal || isMobile) && <span>{item.name}</span>}
               </Link>
             </SidebarMenuButton>
           </SidebarMenuItem>
@@ -166,12 +166,12 @@ function NavProjects({ projects }: { projects: ProjectResponse[] }) {
         <SidebarMenuItem>
           <SidebarMenuButton
             asChild
-            tooltip={isMinimal ? 'More Projects' : undefined}
-            className={cn('justify-center', !isMinimal && 'justify-start')}
+            tooltip={isMinimal && !isMobile ? 'More Projects' : undefined}
+            className={cn('justify-center', (!isMinimal || isMobile) && 'justify-start')}
           >
             <Link to="/projects">
               <MoreHorizontal />
-              {!isMinimal && <span>More</span>}
+              {(!isMinimal || isMobile) && <span>More</span>}
             </Link>
           </SidebarMenuButton>
         </SidebarMenuItem>
@@ -192,11 +192,11 @@ function NavMain({
   }[]
 }) {
   const location = useLocation()
-  const { isMinimal } = useSidebar()
+  const { isMinimal, isMobile } = useSidebar()
 
   return (
     <SidebarGroup>
-      <SidebarGroupLabel className={isMinimal ? 'hidden' : ''}>
+      <SidebarGroupLabel className={isMinimal && !isMobile ? 'hidden' : ''}>
         Platform
       </SidebarGroupLabel>
       <SidebarMenu>
@@ -207,20 +207,20 @@ function NavMain({
               <SidebarMenuItem>
                 <SidebarMenuButton
                   asChild
-                  tooltip={isMinimal ? item.title : undefined}
+                  tooltip={isMinimal && !isMobile ? item.title : undefined}
                   className={cn(
                     'justify-center',
-                    !isMinimal && 'justify-start',
+                    (!isMinimal || isMobile) && 'justify-start',
                     isActive &&
                       'bg-sidebar-accent text-sidebar-accent-foreground'
                   )}
                 >
                   <Link to={item.url}>
                     <item.icon />
-                    {!isMinimal && <span>{item.title}</span>}
+                    {(!isMinimal || isMobile) && <span>{item.title}</span>}
                   </Link>
                 </SidebarMenuButton>
-                {!isMinimal && item.items?.length ? (
+                {(!isMinimal || isMobile) && item.items?.length ? (
                   <>
                     <CollapsibleTrigger asChild>
                       <SidebarMenuAction className="data-[state=open]:rotate-90">
@@ -258,13 +258,13 @@ function NavSettings({
   items: { title: string; url: string; icon: LucideIcon }[]
 }) {
   const location = useLocation()
-  const { isMinimal } = useSidebar()
+  const { isMinimal, isMobile } = useSidebar()
 
   return (
     <SidebarGroup
-      className={isMinimal ? '' : 'group-data-[collapsible=icon]:hidden'}
+      className={isMinimal && !isMobile ? '' : 'group-data-[collapsible=icon]:hidden'}
     >
-      <SidebarGroupLabel className={isMinimal ? 'hidden' : ''}>
+      <SidebarGroupLabel className={isMinimal && !isMobile ? 'hidden' : ''}>
         Settings
       </SidebarGroupLabel>
       <SidebarMenu>
@@ -274,16 +274,16 @@ function NavSettings({
             <SidebarMenuItem key={item.title}>
               <SidebarMenuButton
                 asChild
-                tooltip={isMinimal ? item.title : undefined}
+                tooltip={isMinimal && !isMobile ? item.title : undefined}
                 className={cn(
                   'justify-center',
-                  !isMinimal && 'justify-start',
+                  (!isMinimal || isMobile) && 'justify-start',
                   isActive && 'bg-sidebar-accent text-sidebar-accent-foreground'
                 )}
               >
                 <Link to={item.url}>
                   <item.icon />
-                  {!isMinimal && <span>{item.title}</span>}
+                  {(!isMinimal || isMobile) && <span>{item.title}</span>}
                 </Link>
               </SidebarMenuButton>
             </SidebarMenuItem>
@@ -331,7 +331,7 @@ export default function AppSidebar() {
                   <img src="/favicon.png" alt="logo" className="size-full" />
                 </div>
                 {(!isMinimal || isMobile) && (
-                  <div className="grid flex-1 text-left text-sm leading-tight">
+                  <div className={cn('grid flex-1 text-left text-sm leading-tight', isMinimal && isMobile && 'text-xs')}>
                     <span className="truncate font-semibold">Temps</span>
                     <span className="truncate text-xs">v1.0.0</span>
                   </div>
@@ -356,7 +356,7 @@ export default function AppSidebar() {
 
 function NavUser() {
   const { user } = useAuth()
-  const { isMobile } = useSidebar()
+  const { isMobile, isMinimal } = useSidebar()
   const { logout } = useAuth()
   if (!user) return null
 
@@ -378,12 +378,14 @@ function NavUser() {
                   {user.username?.slice(0, 2).toUpperCase() || 'U'}
                 </AvatarFallback>
               </Avatar>
-              <div className="grid flex-1 text-left text-sm leading-tight">
-                <span className="truncate font-semibold">
-                  {user.username || 'User'}
-                </span>
-                <span className="truncate text-xs">{user.email}</span>
-              </div>
+              {(!isMinimal || isMobile) && (
+                <div className="grid flex-1 text-left text-sm leading-tight">
+                  <span className="truncate font-semibold">
+                    {user.username || 'User'}
+                  </span>
+                  <span className="truncate text-xs">{user.email}</span>
+                </div>
+              )}
               <ChevronsUpDown className="ml-auto size-4" />
             </SidebarMenuButton>
           </DropdownMenuTrigger>

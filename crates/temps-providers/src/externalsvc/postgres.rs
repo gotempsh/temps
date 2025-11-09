@@ -382,6 +382,11 @@ impl PostgresService {
             exposed_ports: Some(HashMap::from([("5432/tcp".to_string(), HashMap::new())])),
             env: Some(env_vars.iter().map(|s| s.to_string()).collect()),
             labels: Some(container_labels),
+            cmd: Some(vec![
+                "postgres".to_string(),
+                "-c".to_string(),
+                format!("max_connections={}", config.max_connections),
+            ]),
             host_config: Some(bollard::models::HostConfig {
                 restart_policy: Some(bollard::models::RestartPolicy {
                     name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
@@ -765,6 +770,11 @@ impl PostgresService {
                 format!("POSTGRES_USER=postgres"),
                 format!("POSTGRES_PASSWORD={}", new_config.password),
             ]),
+            cmd: Some(vec![
+                "postgres".to_string(),
+                "-c".to_string(),
+                format!("max_connections={}", new_config.max_connections),
+            ]),
             host_config: Some(bollard::models::HostConfig {
                 mounts: Some(vec![bollard::models::Mount {
                     target: Some("/var/lib/postgresql/data".to_string()),
@@ -900,6 +910,48 @@ impl PostgresService {
         }
 
         Ok(())
+    }
+
+    /// Verify that a Docker image can be pulled without actually downloading the full image
+    /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
+    async fn verify_image_pullable(&self, image: &str) -> Result<()> {
+        // Parse image name and tag
+        let (image_name, tag) = if let Some((name, tag)) = image.split_once(':') {
+            (name.to_string(), tag.to_string())
+        } else {
+            (image.to_string(), "latest".to_string())
+        };
+
+        info!("Attempting to pull Docker image: {}", image);
+
+        // Try to pull the image - this will fail if it doesn't exist
+        let result = self
+            .docker
+            .create_image(
+                Some(bollard::query_parameters::CreateImageOptions {
+                    from_image: Some(image_name.clone()),
+                    tag: Some(tag.clone()),
+                    ..Default::default()
+                }),
+                None,
+                None,
+            )
+            .try_collect::<Vec<_>>()
+            .await;
+
+        match result {
+            Ok(_) => {
+                info!("Docker image {} is available and pullable", image);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to pull Docker image {}: {}", image, e);
+                Err(anyhow::anyhow!(
+                    "Cannot upgrade: Docker image '{}' is not available or cannot be pulled. Error: {}",
+                    image, e
+                ))
+            }
+        }
     }
 }
 
@@ -1212,7 +1264,7 @@ impl ExternalService for PostgresService {
                     "port" => true,            // Port can be changed
                     "database" => false,       // Don't change database name after creation
                     "username" => false,       // Don't change username after creation
-                    "password" => true,        // Password can be updated
+                    "password" => false,       // Password is auto-generated and cannot be changed
                     "max_connections" => true, // Max connections can be adjusted
                     "ssl_mode" => true,        // SSL mode can be changed
                     "docker_image" => true,    // Docker image can be upgraded
@@ -1483,6 +1535,15 @@ impl ExternalService for PostgresService {
                 new_version
             ));
         }
+
+        // Verify the new image can be pulled BEFORE stopping the old container
+        info!(
+            "Verifying new Docker image is available: {}",
+            new_pg_config.docker_image
+        );
+        self.verify_image_pullable(&new_pg_config.docker_image)
+            .await?;
+        info!("New Docker image verified and is available");
 
         // Stop the old container
         info!("Stopping old PostgreSQL container");

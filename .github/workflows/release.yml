@@ -61,6 +61,11 @@ jobs:
           cd web
           bun install
 
+      - name: Build WASM
+        run: |
+          cd crates/temps-captcha-wasm
+          bun run build
+
       - name: Build release binary
         run: cargo build --release --bin temps
         env:
@@ -138,6 +143,11 @@ jobs:
           cd web
           bun install
 
+      - name: Build WASM
+        run: |
+          cd crates/temps-captcha-wasm
+          bun run build
+
       - name: Build release binary
         run: cargo build --release --bin temps --target x86_64-apple-darwin
         env:
@@ -214,6 +224,11 @@ jobs:
         run: |
           cd web
           bun install
+
+      - name: Build WASM
+        run: |
+          cd crates/temps-captcha-wasm
+          bun run build
 
       - name: Build release binary
         run: cargo build --release --bin temps --target aarch64-apple-darwin

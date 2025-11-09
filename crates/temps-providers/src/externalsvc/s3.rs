@@ -469,6 +469,49 @@ impl S3Service {
 
         Ok(S3Config::from(input_config))
     }
+
+    /// Verify that a Docker image can be pulled without actually downloading the full image
+    /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
+    #[allow(dead_code)]
+    async fn verify_image_pullable(&self, image: &str) -> Result<()> {
+        // Parse image name and tag
+        let (image_name, tag) = if let Some((name, tag)) = image.split_once(':') {
+            (name.to_string(), tag.to_string())
+        } else {
+            (image.to_string(), "latest".to_string())
+        };
+
+        info!("Attempting to pull Docker image: {}", image);
+
+        // Try to pull the image - this will fail if it doesn't exist
+        let result = self
+            .docker
+            .create_image(
+                Some(bollard::query_parameters::CreateImageOptions {
+                    from_image: Some(image_name.clone()),
+                    tag: Some(tag.clone()),
+                    ..Default::default()
+                }),
+                None,
+                None,
+            )
+            .try_collect::<Vec<_>>()
+            .await;
+
+        match result {
+            Ok(_) => {
+                info!("Docker image {} is available and pullable", image);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to pull Docker image {}: {}", image, e);
+                Err(anyhow::anyhow!(
+                    "Cannot upgrade: Docker image '{}' is not available or cannot be pulled. Error: {}",
+                    image, e
+                ))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1390,6 +1433,32 @@ impl ExternalService for S3Service {
     async fn get_current_version(&self) -> Result<String> {
         let (_, version) = self.get_current_docker_image().await?;
         Ok(version)
+    }
+
+    async fn upgrade(&self, old_config: ServiceConfig, new_config: ServiceConfig) -> Result<()> {
+        info!("Starting S3/MinIO upgrade");
+
+        let _old_s3_config = self.get_s3_config(old_config)?;
+        let new_s3_config = self.get_s3_config(new_config)?;
+
+        // Verify the new image can be pulled BEFORE stopping the old container
+        info!(
+            "Verifying new Docker image is available: {}",
+            new_s3_config.image
+        );
+        self.verify_image_pullable(&new_s3_config.image).await?;
+        info!("New Docker image verified and is available");
+
+        // Stop the old container
+        info!("Stopping old S3/MinIO container");
+        self.stop().await?;
+
+        // Create container with new image (keeping the same volume for data persistence)
+        info!("Starting S3/MinIO container with new image");
+        self.create_container(&self.docker, &new_s3_config).await?;
+
+        info!("S3/MinIO upgrade completed successfully");
+        Ok(())
     }
 }
 

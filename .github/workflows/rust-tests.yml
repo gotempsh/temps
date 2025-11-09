@@ -25,8 +25,18 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.org/wasm-pack/installer/init.sh -sSf | sh
 
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Build WASM
+        run: |
+          cd crates/temps-captcha-wasm
+          bun run build
 
       - name: Check workspace
         run: cargo check --workspace --all-targets
@@ -61,8 +71,18 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.org/wasm-pack/installer/init.sh -sSf | sh
 
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Build WASM
+        run: |
+          cd crates/temps-captcha-wasm
+          bun run build
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -112,8 +132,18 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.org/wasm-pack/installer/init.sh -sSf | sh
 
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Build WASM
+        run: |
+          cd crates/temps-captcha-wasm
+          bun run build
 
       - name: Verify TimescaleDB is ready
         run: |

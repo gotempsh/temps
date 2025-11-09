@@ -83,7 +83,7 @@ impl ParameterStrategy for PostgresParameterStrategy {
     }
 
     fn updateable_keys(&self) -> Vec<&'static str> {
-        vec!["port", "docker_image", "max_connections"]
+        vec!["port", "docker_image", "max_connections", "ssl_mode"]
     }
 
     fn readonly_keys(&self) -> Vec<&'static str> {
@@ -197,7 +197,7 @@ impl ParameterStrategy for RedisParameterStrategy {
     }
 
     fn updateable_keys(&self) -> Vec<&'static str> {
-        vec!["port", "docker_image"]
+        vec!["port", "docker_image", "image", "version"]
     }
 
     fn readonly_keys(&self) -> Vec<&'static str> {
@@ -412,7 +412,7 @@ impl ParameterStrategy for MongodbParameterStrategy {
     }
 
     fn updateable_keys(&self) -> Vec<&'static str> {
-        vec!["port", "docker_image"]
+        vec!["port", "docker_image", "image", "version"]
     }
 
     fn readonly_keys(&self) -> Vec<&'static str> {
@@ -519,6 +519,7 @@ mod tests {
         assert!(strategy.updateable_keys().contains(&"docker_image"));
         assert!(strategy.updateable_keys().contains(&"port"));
         assert!(strategy.updateable_keys().contains(&"max_connections"));
+        assert!(strategy.updateable_keys().contains(&"ssl_mode"));
     }
 
     #[test]
@@ -562,6 +563,34 @@ mod tests {
 
         let result = strategy.validate_for_update(&updates);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_redis_updateable_image_version() {
+        let strategy = RedisParameterStrategy;
+        let mut updates = HashMap::new();
+        updates.insert(
+            "image".to_string(),
+            JsonValue::String("redis:8-alpine".to_string()),
+        );
+        updates.insert("version".to_string(), JsonValue::String("8".to_string()));
+
+        let result = strategy.validate_for_update(&updates);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mongodb_updateable_image_version() {
+        let strategy = MongodbParameterStrategy;
+        let mut updates = HashMap::new();
+        updates.insert(
+            "image".to_string(),
+            JsonValue::String("mongo:9".to_string()),
+        );
+        updates.insert("version".to_string(), JsonValue::String("9".to_string()));
+
+        let result = strategy.validate_for_update(&updates);
+        assert!(result.is_ok());
     }
 
     #[test]

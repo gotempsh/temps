@@ -5,6 +5,8 @@ import {
   startServiceMutation,
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
+import { UpgradeServiceDialog } from '@/components/storage/UpgradeServiceDialog'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -25,16 +27,17 @@ import {
 } from '@/components/ui/dialog'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
 import { ServiceLogo } from '@/components/ui/service-logo'
-import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
-import { UpgradeServiceDialog } from '@/components/storage/UpgradeServiceDialog'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { maskValue, shouldMaskValue } from '@/lib/masking'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
   ArrowLeft,
   ArrowUpCircle,
+  Eye,
+  EyeOff,
   Loader2,
   Pencil,
   RefreshCcw,
@@ -53,6 +56,9 @@ export function ServiceDetail() {
   const [isUpgradeDialogOpen, setIsUpgradeDialogOpen] = useState(false)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [visibleParameters, setVisibleParameters] = useState<Set<string>>(
+    new Set()
+  )
 
   const {
     data: service,
@@ -129,7 +135,11 @@ export function ServiceDetail() {
       toast.success('Service deleted successfully')
       navigate('/storage')
     },
-    onError: () => {
+    onError: (error: any) => {
+      toast.error('Failed to delete service', {
+        description:
+          error.detail || error.message || 'An unexpected error occurred',
+      })
       setIsDeleteDialogOpen(false)
     },
   })
@@ -204,7 +214,10 @@ export function ServiceDetail() {
                 <ArrowLeft className="h-4 w-4" />
               </Button>
             </Link>
-            <ServiceLogo service={service.service.service_type} className="h-8 w-8" />
+            <ServiceLogo
+              service={service.service.service_type}
+              className="h-8 w-8"
+            />
             <div className="flex flex-col gap-2">
               <div className="flex items-center gap-2 flex-wrap">
                 <h1 className="text-xl font-semibold sm:text-2xl">
@@ -223,7 +236,10 @@ export function ServiceDetail() {
                   {service.service.status}
                 </Badge>
                 <Badge variant="outline" className="gap-1.5">
-                  <ServiceLogo service={service.service.service_type} className="h-3 w-3" />
+                  <ServiceLogo
+                    service={service.service.service_type}
+                    className="h-3 w-3"
+                  />
                   {service.service.service_type}
                 </Badge>
               </div>
@@ -296,22 +312,66 @@ export function ServiceDetail() {
           <Card>
             <CardHeader>
               <CardTitle>Configuration</CardTitle>
-              <CardDescription>Current service configuration</CardDescription>
+              <CardDescription>Current service parameters</CardDescription>
             </CardHeader>
-            <CardContent className="space-y-4">
-              {service.current_parameters?.docker_image && (
-                <div className="space-y-2">
-                  <div className="text-sm font-medium">Docker Image</div>
-                  <div className="flex items-center gap-2 rounded-md border border-border bg-muted/50 p-3 font-mono text-sm">
-                    <span className="flex-1 break-all text-foreground">
-                      {service.current_parameters.docker_image}
-                    </span>
-                  </div>
+            <CardContent>
+              {service.current_parameters &&
+              Object.keys(service.current_parameters).length > 0 ? (
+                <div className="space-y-4">
+                  {Object.entries(service.current_parameters).map(
+                    ([key, value]) => {
+                      const isSensitive = shouldMaskValue(key)
+                      const isVisible = visibleParameters.has(key)
+                      const displayValue =
+                        isSensitive && !isVisible ? maskValue(value) : value
+
+                      return (
+                        <div key={key} className="space-y-1.5">
+                          <div className="text-sm font-medium capitalize">
+                            {key
+                              .replace(/_/g, ' ')
+                              .replace(/\b\w/g, (char) => char.toUpperCase())}
+                          </div>
+                          <div className="flex items-center gap-2 rounded-md border border-border bg-muted/50 p-3">
+                            <span className="flex-1 break-all text-foreground font-mono text-sm">
+                              {displayValue || (
+                                <span className="text-muted-foreground">-</span>
+                              )}
+                            </span>
+                            {isSensitive && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => {
+                                  setVisibleParameters((prev) => {
+                                    const next = new Set(prev)
+                                    if (next.has(key)) {
+                                      next.delete(key)
+                                    } else {
+                                      next.add(key)
+                                    }
+                                    return next
+                                  })
+                                }}
+                                className="flex-shrink-0"
+                                title={isVisible ? 'Hide value' : 'Show value'}
+                              >
+                                {isVisible ? (
+                                  <EyeOff className="h-4 w-4" />
+                                ) : (
+                                  <Eye className="h-4 w-4" />
+                                )}
+                              </Button>
+                            )}
+                          </div>
+                        </div>
+                      )
+                    }
+                  )}
                 </div>
-              )}
-              {!service.current_parameters?.docker_image && (
+              ) : (
                 <div className="text-sm text-muted-foreground">
-                  No docker image configured
+                  No parameters configured
                 </div>
               )}
             </CardContent>
@@ -404,6 +464,7 @@ export function ServiceDetail() {
         open={isEditDialogOpen}
         onOpenChange={setIsEditDialogOpen}
         service={service.service}
+        currentParameters={service.current_parameters}
         onSuccess={() => {
           refetch()
           queryClient.invalidateQueries({

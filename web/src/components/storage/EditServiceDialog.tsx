@@ -11,6 +11,7 @@ interface EditServiceDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   service: ExternalServiceInfo
+  currentParameters?: Record<string, string> | null
   onSuccess: () => void
 }
 
@@ -18,6 +19,7 @@ export function EditServiceDialog({
   open,
   onOpenChange,
   service,
+  currentParameters,
   onSuccess,
 }: EditServiceDialogProps) {
   return (
@@ -28,6 +30,7 @@ export function EditServiceDialog({
         </DialogHeader>
         <EditServiceForm
           service={service}
+          currentParameters={currentParameters}
           onCancel={() => onOpenChange(false)}
           onSuccess={() => {
             onOpenChange(false)

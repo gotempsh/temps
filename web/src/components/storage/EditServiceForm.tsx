@@ -22,12 +22,14 @@ import * as z from 'zod'
 
 interface EditServiceFormProps {
   service: ExternalServiceInfo
+  currentParameters?: Record<string, string> | null
   onCancel: () => void
   onSuccess: () => void
 }
 
 export function EditServiceForm({
   service,
+  currentParameters,
   onCancel,
   onSuccess,
 }: EditServiceFormProps) {
@@ -42,7 +44,8 @@ export function EditServiceForm({
     }
   )
 
-  // Extract parameters array from response
+  // Extract and filter parameters array from response
+  // Only includes parameters where x-editable is true (excludes immutable parameters)
   const parameters = useMemo(() => {
     if (!parametersResponse) return undefined
 
@@ -66,25 +69,32 @@ export function EditServiceForm({
         required?: string[]
       }
 
-      return Object.entries(schema.properties).map(([key, prop]) => ({
-        name: key,
-        description: prop.description || '',
-        default_value:
-          prop.default !== undefined && prop.default !== null
-            ? String(prop.default)
-            : '',
-        required: schema.required?.includes(key) || false,
-        encrypted:
-          key.toLowerCase().includes('password') ||
-          key.toLowerCase().includes('secret'),
-        validation_pattern: prop.pattern || undefined,
-        type:
-          prop.type === 'integer' ||
-          prop.format === 'uint32' ||
-          prop.format === 'int32'
-            ? 'number'
-            : 'string',
-      }))
+      return Object.entries(schema.properties)
+        .filter(([, prop]) => {
+          // Only include parameters that are editable (x-editable is not explicitly false)
+          // If x-editable is not specified, default to true for backward compatibility
+          return prop['x-editable'] !== false
+        })
+        .map(([key, prop]) => ({
+          name: key,
+          description: prop.description || '',
+          default_value:
+            prop.default !== undefined && prop.default !== null
+              ? String(prop.default)
+              : '',
+          required: schema.required?.includes(key) || false,
+          encrypted:
+            key.toLowerCase().includes('password') ||
+            key.toLowerCase().includes('secret'),
+          validation_pattern: prop.pattern || undefined,
+          type:
+            prop.type === 'integer' ||
+            prop.format === 'uint32' ||
+            prop.format === 'int32'
+              ? 'number'
+              : 'string',
+          x_editable: prop['x-editable'] !== false,
+        }))
     }
 
     return undefined
@@ -127,13 +137,6 @@ export function EditServiceForm({
     }
 
     return z.object({
-      name: z
-        .string()
-        .min(1, 'Service name is required')
-        .regex(
-          /^[a-z0-9-]+$/,
-          'Name must contain only lowercase letters, numbers, and hyphens'
-        ),
       parameters: z.object(paramSchema),
     })
   }, [parameters])
@@ -145,19 +148,25 @@ export function EditServiceForm({
     mode: 'onChange',
     reValidateMode: 'onChange',
     defaultValues: {
-      name: service.name,
       parameters: {},
     },
   })
 
   // Set default values for parameters when they are loaded
+  // Uses current parameter values as defaults, falling back to empty strings
   useEffect(() => {
     if (Array.isArray(parameters)) {
       const defaultParameters = parameters.reduce<Record<string, string>>(
         (acc, param) => {
           if (param && typeof param === 'object' && 'name' in param) {
-            // Use empty string for password fields, keep existing values for others
-            acc[param.name as string] = param.encrypted ? '' : ''
+            const paramName = param.name as string
+            // Priority: current value > empty string
+            // For encrypted fields (passwords), keep empty to allow optional updates
+            if (currentParameters?.[paramName]) {
+              acc[paramName] = currentParameters[paramName]
+            } else {
+              acc[paramName] = ''
+            }
           }
           return acc
         },
@@ -165,7 +174,7 @@ export function EditServiceForm({
       )
       form.setValue('parameters', defaultParameters)
     }
-  }, [parameters, form])
+  }, [parameters, currentParameters, form])
 
   const updateServiceMut = useMutation({
     ...updateServiceMutation(),
@@ -207,7 +216,6 @@ export function EditServiceForm({
     await updateServiceMut.mutateAsync({
       path: { id: service.id },
       body: {
-        name: values.name,
         parameters: processedParameters,
       },
     })
@@ -229,20 +237,6 @@ export function EditServiceForm({
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
-        <FormField
-          control={form.control}
-          name="name"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>Name</FormLabel>
-              <FormControl>
-                <Input {...field} placeholder="Service name" />
-              </FormControl>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
-
         {Array.isArray(parameters) &&
           parameters.map((param) => {
             if (!param || typeof param !== 'object' || !('name' in param)) {
@@ -256,6 +250,7 @@ export function EditServiceForm({
               default_value?: string
               description?: string
               type?: string
+              x_editable?: boolean
             }
             return (
               <FormField

@@ -608,16 +608,6 @@ impl ExternalServiceManager {
         service_update.updated_at = Set(Utc::now());
         service_update.update(self.db.as_ref()).await?;
 
-        // Update name/slug if provided
-        if let Some(new_name) = &request.name {
-            let new_slug = Self::generate_slug(new_name);
-            let mut name_update: external_services::ActiveModel = service.clone().into();
-            name_update.name = Set(new_name.clone());
-            name_update.slug = Set(Some(new_slug));
-            name_update.updated_at = Set(Utc::now());
-            name_update.update(self.db.as_ref()).await?;
-        }
-
         // Reinitialize the service (this will stop, remove, and recreate the container with new image)
         self.initialize_service(service_id).await?;
 
