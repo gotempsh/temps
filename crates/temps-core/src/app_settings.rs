@@ -25,6 +25,9 @@ pub struct AppSettings {
     // Security settings
     pub security_headers: SecurityHeadersSettings,
     pub rate_limiting: RateLimitSettings,
+
+    // Docker registry settings
+    pub docker_registry: DockerRegistrySettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -47,6 +50,17 @@ pub struct LetsEncryptSettings {
 pub struct DnsProviderSettings {
     pub provider: String,
     pub cloudflare_api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct DockerRegistrySettings {
+    pub enabled: bool,
+    pub registry_url: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub tls_verify: bool,
+    pub ca_certificate: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -85,6 +99,7 @@ impl Default for AppSettings {
             dns_provider: DnsProviderSettings::default(),
             security_headers: SecurityHeadersSettings::default(),
             rate_limiting: RateLimitSettings::default(),
+            docker_registry: DockerRegistrySettings::default(),
         }
     }
 }
@@ -113,6 +128,19 @@ impl Default for DnsProviderSettings {
         Self {
             provider: "manual".to_string(),
             cloudflare_api_key: None,
+        }
+    }
+}
+
+impl Default for DockerRegistrySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            registry_url: None,
+            username: None,
+            password: None,
+            tls_verify: true,
+            ca_certificate: None,
         }
     }
 }

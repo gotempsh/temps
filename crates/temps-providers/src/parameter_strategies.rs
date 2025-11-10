@@ -43,9 +43,7 @@ impl ParameterStrategy for PostgresParameterStrategy {
         if !params.contains_key("username") || is_empty_value(params.get("username")) {
             return Err("'username' is required for PostgreSQL".to_string());
         }
-        if !params.contains_key("password") || is_empty_value(params.get("password")) {
-            return Err("'password' is required for PostgreSQL".to_string());
-        }
+        // Password is optional - will be auto-generated if not provided
         Ok(())
     }
 
@@ -62,6 +60,14 @@ impl ParameterStrategy for PostgresParameterStrategy {
             params.insert(
                 "docker_image".to_string(),
                 JsonValue::String("postgres:17-alpine".to_string()),
+            );
+        }
+
+        // Auto-generate password if not provided
+        if is_empty_value(params.get("password")) {
+            params.insert(
+                "password".to_string(),
+                JsonValue::String(generate_secure_password()),
             );
         }
 
@@ -107,7 +113,7 @@ impl ParameterStrategy for PostgresParameterStrategy {
         Some(json!({
             "type": "object",
             "title": "PostgreSQL Parameters",
-            "required": ["database", "username", "password"],
+            "required": ["database", "username"],
             "properties": {
                 "database": {
                     "type": "string",
@@ -121,7 +127,7 @@ impl ParameterStrategy for PostgresParameterStrategy {
                 },
                 "password": {
                     "type": "string",
-                    "description": "User password (read-only after creation)",
+                    "description": "User password (read-only after creation, auto-generated if not provided)",
                     "example": "secure_password"
                 },
                 "host": {
@@ -372,9 +378,7 @@ impl ParameterStrategy for MongodbParameterStrategy {
         if !params.contains_key("username") || is_empty_value(params.get("username")) {
             return Err("'username' is required for MongoDB".to_string());
         }
-        if !params.contains_key("password") || is_empty_value(params.get("password")) {
-            return Err("'password' is required for MongoDB".to_string());
-        }
+        // Password is optional - will be auto-generated if not provided
         Ok(())
     }
 
@@ -391,6 +395,14 @@ impl ParameterStrategy for MongodbParameterStrategy {
             params.insert(
                 "docker_image".to_string(),
                 JsonValue::String("mongo:latest".to_string()),
+            );
+        }
+
+        // Auto-generate password if not provided
+        if is_empty_value(params.get("password")) {
+            params.insert(
+                "password".to_string(),
+                JsonValue::String(generate_secure_password()),
             );
         }
 
@@ -436,7 +448,7 @@ impl ParameterStrategy for MongodbParameterStrategy {
         Some(json!({
             "type": "object",
             "title": "MongoDB Parameters",
-            "required": ["database", "username", "password"],
+            "required": ["database", "username"],
             "properties": {
                 "database": {
                     "type": "string",
@@ -450,7 +462,7 @@ impl ParameterStrategy for MongodbParameterStrategy {
                 },
                 "password": {
                     "type": "string",
-                    "description": "User password (read-only after creation)",
+                    "description": "User password (read-only after creation, auto-generated if not provided)",
                     "example": "secure_password"
                 },
                 "port": {
@@ -498,6 +510,16 @@ fn is_empty_value(value: Option<&JsonValue>) -> bool {
 fn find_available_port(start_port: u16) -> Option<u16> {
     use std::net::TcpListener;
     (start_port..start_port + 100).find(|&port| TcpListener::bind(("0.0.0.0", port)).is_ok())
+}
+
+fn generate_secure_password() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let charset: &[u8] =
+        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*_-+=";
+    (0..32)
+        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .collect()
 }
 
 #[cfg(test)]

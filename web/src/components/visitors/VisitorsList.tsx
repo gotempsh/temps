@@ -15,15 +15,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
-import { Badge } from '@/components/ui/badge'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
@@ -133,16 +124,9 @@ export function VisitorsList({ project }: VisitorsListProps) {
         </CardHeader>
         <CardContent>
           {isLoading ? (
-            <div className="space-y-2">
-              {[...Array(5)].map((_, i) => (
-                <div key={i} className="flex items-center space-x-4 py-4">
-                  <Skeleton className="h-10 w-10 rounded-full" />
-                  <div className="flex-1 space-y-2">
-                    <Skeleton className="h-4 w-[200px]" />
-                    <Skeleton className="h-3 w-[150px]" />
-                  </div>
-                  <Skeleton className="h-4 w-[100px]" />
-                </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              {[...Array(4)].map((_, i) => (
+                <Skeleton key={i} className="h-96 w-full rounded-lg" />
               ))}
             </div>
           ) : error ? (
@@ -161,105 +145,139 @@ export function VisitorsList({ project }: VisitorsListProps) {
             </div>
           ) : (
             <>
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Visitor</TableHead>
-                    <TableHead>Location</TableHead>
-                    <TableHead>User Agent</TableHead>
-                    <TableHead>Sessions</TableHead>
-                    <TableHead>Page Views</TableHead>
-                    <TableHead>First Seen</TableHead>
-                    <TableHead>Last Seen</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {data.visitors.map((visitor: VisitorInfo) => (
-                    <TableRow
-                      key={visitor.visitor_id}
-                      className="cursor-pointer hover:bg-muted/50"
-                      onClick={() => {
-                        navigate(
-                          `/projects/${project.slug}/analytics/visitors/${visitor.id}`
-                        )
-                      }}
-                    >
-                      <TableCell>
-                        <div className="flex items-center gap-2">
-                          {visitor.is_crawler ? (
-                            <Bug className="h-4 w-4 text-muted-foreground" />
-                          ) : (
-                            <UserIcon className="h-4 w-4 text-muted-foreground" />
-                          )}
-                          <div>
-                            <div className="font-medium text-sm">
-                              {visitor.visitor_id.substring(0, 8)}...
-                            </div>
-                            {visitor.crawler_name && (
-                              <Badge variant="outline" className="text-xs">
-                                {visitor.crawler_name}
-                              </Badge>
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {data.visitors.map((visitor: VisitorInfo) => (
+                  <Card
+                    key={visitor.visitor_id}
+                    className="cursor-pointer hover:shadow-md hover:border-primary/60 transition-all border-l-4 border-l-blue-500"
+                    onClick={() => {
+                      navigate(
+                        `/projects/${project.slug}/analytics/visitors/${visitor.id}`
+                      )
+                    }}
+                  >
+                    <CardContent className="p-5 space-y-4">
+                      {/* Header with visitor type indicator */}
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex items-center gap-3 flex-1 min-w-0">
+                          {/* Avatar/Icon */}
+                          <div
+                            className={`p-2.5 rounded-lg flex-shrink-0 ${
+                              visitor.is_crawler
+                                ? 'bg-amber-100 dark:bg-amber-900/30'
+                                : 'bg-blue-100 dark:bg-blue-900/30'
+                            }`}
+                          >
+                            {visitor.is_crawler ? (
+                              <Bug
+                                className={`h-5 w-5 text-amber-600 dark:text-amber-400`}
+                              />
+                            ) : (
+                              <UserIcon
+                                className={`h-5 w-5 text-blue-600 dark:text-blue-400`}
+                              />
                             )}
                           </div>
+
+                          {/* Visitor ID and Type */}
+                          <div className="min-w-0 flex-1">
+                            <div className="font-mono text-xs text-muted-foreground truncate">
+                              {visitor.visitor_id?.substring(0, 12)}
+                            </div>
+                            <p className="text-sm font-medium text-foreground mt-1">
+                              {visitor.is_crawler ? 'Bot' : 'Human Visitor'}
+                              {visitor.crawler_name &&
+                                ` - ${visitor.crawler_name}`}
+                            </p>
+                          </div>
                         </div>
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex items-center gap-1">
-                          <Globe className="h-3 w-3 text-muted-foreground" />
-                          <span className="text-sm">
+
+                        {/* Sessions and Page Views */}
+                        <div className="flex-shrink-0 text-right">
+                          <div className="text-sm font-semibold">
+                            {visitor.sessions_count}
+                          </div>
+                          <p className="text-xs text-muted-foreground">
+                            session{visitor.sessions_count !== 1 ? 's' : ''}
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Browser and Page Views */}
+                      <div className="grid grid-cols-2 gap-3 pt-2 border-t">
+                        <div>
+                          <p className="text-xs text-muted-foreground font-medium mb-1">
+                            Browser
+                          </p>
+                          <p className="text-sm font-medium">
+                            {visitor.user_agent
+                              ? getBrowserName(visitor.user_agent)
+                              : 'Unknown'}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-muted-foreground font-medium mb-1">
+                            Page Views
+                          </p>
+                          <div className="flex items-center gap-1">
+                            <MousePointer className="h-3 w-3 text-muted-foreground" />
+                            <span className="text-sm font-medium">
+                              {visitor.page_views}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Location info */}
+                      <div className="pt-2 border-t">
+                        <p className="text-xs text-muted-foreground font-medium mb-2">
+                          Location
+                        </p>
+                        <div className="flex items-start gap-2">
+                          <Globe className="h-4 w-4 text-muted-foreground flex-shrink-0 mt-0.5" />
+                          <div className="text-sm font-medium">
                             {visitor.location || 'Unknown'}
-                          </span>
+                          </div>
                         </div>
-                      </TableCell>
-                      <TableCell>
-                        <div
-                          className="text-sm truncate max-w-[200px]"
-                          title={visitor.user_agent || 'Unknown'}
-                        >
-                          {visitor.user_agent
-                            ? visitor.user_agent.includes('Chrome')
-                              ? 'Chrome'
-                              : visitor.user_agent.includes('Safari') &&
-                                  !visitor.user_agent.includes('Chrome')
-                                ? 'Safari'
-                                : visitor.user_agent.includes('Firefox')
-                                  ? 'Firefox'
-                                  : visitor.user_agent.includes('Edge')
-                                    ? 'Edge'
-                                    : visitor.user_agent.includes('bot') ||
-                                        visitor.user_agent.includes('Bot')
-                                      ? 'Bot'
-                                      : 'Other'
-                            : 'Unknown'}
+                      </div>
+
+                      {/* First and Last Seen */}
+                      <div className="pt-2 border-t grid grid-cols-2 gap-3">
+                        <div>
+                          <p className="text-xs text-muted-foreground font-medium mb-1">
+                            First Seen
+                          </p>
+                          <p className="text-sm font-medium">
+                            {format(
+                              new Date(visitor.first_seen),
+                              'MMM d, HH:mm'
+                            )}
+                          </p>
                         </div>
-                      </TableCell>
-                      <TableCell>
-                        <div className="text-sm font-medium">
-                          {visitor.sessions_count}
+                        <div>
+                          <p className="text-xs text-muted-foreground font-medium mb-1">
+                            Last Seen
+                          </p>
+                          <p className="text-sm font-medium">
+                            {format(
+                              new Date(visitor.last_seen),
+                              'MMM d, HH:mm'
+                            )}
+                          </p>
                         </div>
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex items-center gap-1">
-                          <MousePointer className="h-3 w-3 text-muted-foreground" />
-                          <span className="text-sm">{visitor.page_views}</span>
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-sm text-muted-foreground">
-                        {format(
-                          new Date(visitor.first_seen),
-                          'MMM d, yyyy HH:mm'
-                        )}
-                      </TableCell>
-                      <TableCell className="text-sm text-muted-foreground">
-                        {format(
-                          new Date(visitor.last_seen),
-                          'MMM d, yyyy HH:mm'
-                        )}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+                      </div>
+
+                      {/* View details footer */}
+                      <div className="pt-2 border-t flex items-center justify-between">
+                        <span className="text-xs text-muted-foreground">
+                          View full details
+                        </span>
+                        <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                      </div>
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
 
               {/* Pagination */}
               {totalPages > 1 && (
@@ -316,4 +334,22 @@ export function VisitorsList({ project }: VisitorsListProps) {
       </Card>
     </div>
   )
+}
+
+// Helper function to extract browser name from user agent
+function getBrowserName(userAgent: string): string {
+  if (userAgent.includes('Chrome') && !userAgent.includes('Chromium')) {
+    return 'Chrome'
+  } else if (userAgent.includes('Safari') && !userAgent.includes('Chrome')) {
+    return 'Safari'
+  } else if (userAgent.includes('Firefox')) {
+    return 'Firefox'
+  } else if (userAgent.includes('Edge')) {
+    return 'Edge'
+  } else if (userAgent.includes('Opera') || userAgent.includes('OPR')) {
+    return 'Opera'
+  } else if (userAgent.includes('bot') || userAgent.includes('Bot')) {
+    return 'Bot'
+  }
+  return 'Unknown'
 }

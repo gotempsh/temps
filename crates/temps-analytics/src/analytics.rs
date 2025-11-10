@@ -229,63 +229,89 @@ impl Analytics for AnalyticsService {
         offset: Option<i32>,
     ) -> Result<VisitorsResponse, AnalyticsError> {
         // Build WHERE conditions with parameterized queries
-        let mut where_conditions = vec![
-            "e.project_id = $1".to_string(),
-            "e.timestamp >= $2".to_string(),
-            "e.timestamp <= $3".to_string(),
-        ];
-        let mut values: Vec<sea_orm::Value> =
-            vec![project_id.into(), start_date.into(), end_date.into()];
-        let mut param_index = 4;
+        let mut where_conditions = vec!["v.project_id = $1".to_string()];
+        let mut values: Vec<sea_orm::Value> = vec![project_id.into()];
+        let mut param_index = 2;
 
+        // Add environment filter if provided
         if let Some(env_id) = environment_id {
-            where_conditions.push(format!("e.environment_id = ${}", param_index));
+            where_conditions.push(format!("v.environment_id = ${}", param_index));
             values.push(env_id.into());
             param_index += 1;
         }
 
+        // Add crawler filter if requested
         if include_crawlers == Some(false) {
-            where_conditions.push("e.is_crawler = false".to_string());
+            where_conditions.push("v.is_crawler = false".to_string());
         }
+
+        // Add date range filter - check last_seen is within range
+        where_conditions.push(format!("v.last_seen >= ${}", param_index));
+        values.push(start_date.into());
+        param_index += 1;
+
+        where_conditions.push(format!("v.last_seen <= ${}", param_index));
+        values.push(end_date.into());
+        param_index += 1;
 
         let limit_val = limit.unwrap_or(50).min(100);
         let offset_val = offset.unwrap_or(0);
 
         let where_clause = where_conditions.join(" AND ");
+
+        // Count total before applying limit/offset
+        let count_sql = format!(
+            r#"
+            SELECT COUNT(*) as total
+            FROM visitor v
+            WHERE {}
+            "#,
+            where_clause
+        );
+
+        #[derive(FromQueryResult)]
+        struct CountResult {
+            total: i64,
+        }
+
+        let count_results = CountResult::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &count_sql,
+            values.clone(),
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        let total_count = count_results.first().map(|r| r.total).unwrap_or(0);
+
+        // Query visitors with geolocation data
         let sql_query = format!(
             r#"
-            WITH visitor_summary AS (
-                SELECT
-                    v.id,
-                    v.visitor_id,
-                    v.user_agent,
-                    MIN(e.timestamp) as first_seen,
-                    MAX(e.timestamp) as last_seen,
-                    COUNT(DISTINCT e.session_id) as session_count,
-                    COUNT(*) FILTER (WHERE e.event_type = 'page_view') as page_views,
-                    COUNT(DISTINCT e.page_path) as unique_pages,
-                    ARRAY_AGG(DISTINCT ig.country) FILTER (WHERE ig.country IS NOT NULL) as countries,
-                    ARRAY_AGG(DISTINCT e.browser) FILTER (WHERE e.browser IS NOT NULL) as browsers
-                FROM visitor v
-                INNER JOIN events e ON v.id = e.visitor_id
-                LEFT JOIN ip_geolocations ig ON e.ip_geolocation_id = ig.id
-                WHERE {}
-                GROUP BY v.id, v.visitor_id, v.user_agent
-            )
             SELECT
-                id,
-                visitor_id,
-                user_agent,
-                first_seen,
-                last_seen,
-                session_count,
-                page_views,
-                unique_pages,
-                countries[1] as country,
-                browsers[1] as browser,
-                (SELECT COUNT(*) FROM visitor_summary) as total_count
-            FROM visitor_summary
-            ORDER BY last_seen DESC
+                v.id,
+                v.visitor_id,
+                v.project_id,
+                v.environment_id,
+                v.first_seen,
+                v.last_seen,
+                v.user_agent,
+                v.ip_address_id,
+                v.is_crawler,
+                v.crawler_name,
+                v.custom_data,
+                ig.ip_address,
+                ig.latitude,
+                ig.longitude,
+                ig.region,
+                ig.city,
+                ig.country,
+                ig.country_code,
+                ig.timezone,
+                ig.is_eu
+            FROM visitor v
+            LEFT JOIN ip_geolocations ig ON v.ip_address_id = ig.id
+            WHERE {}
+            ORDER BY v.last_seen DESC
             LIMIT ${} OFFSET ${}
             "#,
             where_clause,
@@ -301,49 +327,64 @@ impl Analytics for AnalyticsService {
         struct VisitorResult {
             id: i32,
             visitor_id: String,
-            user_agent: Option<String>,
+            project_id: i32,
+            environment_id: i32,
             first_seen: UtcDateTime,
             last_seen: UtcDateTime,
-            session_count: i64,
-            page_views: i64,
-            unique_pages: i64,
+            user_agent: Option<String>,
+            ip_address_id: Option<i32>,
+            is_crawler: bool,
+            crawler_name: Option<String>,
+            custom_data: Option<serde_json::Value>,
+            ip_address: Option<String>,
+            latitude: Option<f64>,
+            longitude: Option<f64>,
+            region: Option<String>,
+            city: Option<String>,
             country: Option<String>,
-            browser: Option<String>,
-            total_count: i64,
+            country_code: Option<String>,
+            timezone: Option<String>,
+            is_eu: Option<bool>,
         }
 
         let results = VisitorResult::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            sql_query,
+            &sql_query,
             values,
         ))
         .all(self.db.as_ref())
         .await?;
-
-        let total_count = results.first().map(|r| r.total_count).unwrap_or(0);
 
         let visitors = results
             .into_iter()
             .map(|r| crate::types::responses::VisitorInfo {
                 id: r.id,
                 visitor_id: r.visitor_id,
-                user_agent: r.user_agent,
+                project_id: r.project_id,
+                environment_id: r.environment_id,
                 first_seen: r.first_seen,
                 last_seen: r.last_seen,
-                location: r.country.clone(),
-                is_crawler: false, // Would need to fetch from events
-                crawler_name: None,
-                sessions_count: r.session_count,
-                page_views: r.page_views,
-                unique_pages: r.unique_pages,
-                browser: r.browser.clone(),
+                user_agent: r.user_agent,
+                ip_address_id: r.ip_address_id,
+                is_crawler: r.is_crawler,
+                crawler_name: r.crawler_name,
+                custom_data: r.custom_data,
+                ip_address: r.ip_address,
+                latitude: r.latitude,
+                longitude: r.longitude,
+                region: r.region,
+                city: r.city,
+                country: r.country,
+                country_code: r.country_code,
+                timezone: r.timezone,
+                is_eu: r.is_eu,
             })
             .collect();
 
         Ok(VisitorsResponse {
             visitors,
             total_count,
-            filtered_count: total_count, // For now, same as total
+            filtered_count: total_count,
         })
     }
     /// Get visitor basic info from database
@@ -573,71 +614,54 @@ impl Analytics for AnalyticsService {
         visitor_id: i32,
     ) -> Result<Option<VisitorDetails>, AnalyticsError> {
         let sql_query = r#"
-            WITH visitor_stats AS (
-                SELECT
-                    v.id,
-                    v.visitor_id,
-                    MIN(e.timestamp) as first_seen,
-                    MAX(e.timestamp) as last_seen,
-                    COUNT(DISTINCT e.session_id) as total_sessions,
-                    COUNT(*) FILTER (WHERE e.event_type = 'page_view') as total_page_views,
-                    COUNT(*) as total_events,
-                    COUNT(*) FILTER (WHERE e.is_bounce = true) as bounce_count,
-                    COUNT(*) FILTER (WHERE e.event_type NOT IN ('page_view', 'page_leave')) as engagement_count,
-                    STRING_AGG(DISTINCT e.user_agent, ', ') as user_agents,
-                    STRING_AGG(DISTINCT ig.country, ', ') as countries,
-                    STRING_AGG(DISTINCT ig.city, ', ') as cities,
-                    BOOL_OR(e.is_crawler) as is_crawler,
-                    STRING_AGG(DISTINCT e.crawler_name, ', ') as crawler_names,
-                    v.custom_data
-                FROM visitor v
-                LEFT JOIN events e ON v.id = e.visitor_id
-                LEFT JOIN ip_geolocations ig ON e.ip_geolocation_id = ig.id
-                WHERE v.id = $1
-                GROUP BY v.id, v.visitor_id, v.custom_data
-            )
             SELECT
-                id,
-                visitor_id,
-                first_seen,
-                last_seen,
-                user_agents as user_agent,
-                COALESCE(countries || ', ' || cities, countries, cities) as location,
-                countries as country,
-                cities as city,
-                is_crawler,
-                crawler_names as crawler_name,
-                total_sessions,
-                total_page_views,
-                total_events,
-                CASE WHEN total_sessions > 0
-                     THEN bounce_count::float / total_sessions::float * 100
-                     ELSE 0 END as bounce_rate,
-                CASE WHEN total_sessions > 0
-                     THEN engagement_count::float / total_events::float * 100
-                     ELSE 0 END as engagement_rate,
-                custom_data
-            FROM visitor_stats
+                v.id,
+                v.visitor_id,
+                v.project_id,
+                v.environment_id,
+                v.first_seen,
+                v.last_seen,
+                v.user_agent,
+                v.ip_address_id,
+                v.is_crawler,
+                v.crawler_name,
+                v.custom_data,
+                ig.ip_address,
+                ig.latitude,
+                ig.longitude,
+                ig.region,
+                ig.city,
+                ig.country,
+                ig.country_code,
+                ig.timezone,
+                ig.is_eu
+            FROM visitor v
+            LEFT JOIN ip_geolocations ig ON v.ip_address_id = ig.id
+            WHERE v.id = $1
             "#;
 
         #[derive(FromQueryResult)]
         struct DetailResult {
             id: i32,
             visitor_id: String,
+            project_id: i32,
+            environment_id: i32,
             first_seen: UtcDateTime,
             last_seen: UtcDateTime,
             user_agent: Option<String>,
-            location: Option<String>,
-            country: Option<String>,
-            city: Option<String>,
+            ip_address_id: Option<i32>,
             is_crawler: bool,
             crawler_name: Option<String>,
-            total_sessions: i64,
-            total_page_views: i64,
-            total_events: i64,
-            bounce_rate: f64,
-            engagement_rate: f64,
-            custom_data: Option<String>,
+            custom_data: Option<serde_json::Value>,
+            ip_address: Option<String>,
+            latitude: Option<f64>,
+            longitude: Option<f64>,
+            region: Option<String>,
+            city: Option<String>,
+            country: Option<String>,
+            country_code: Option<String>,
+            timezone: Option<String>,
+            is_eu: Option<bool>,
         }
 
         let result = DetailResult::find_by_statement(Statement::from_sql_and_values(
@@ -651,20 +675,24 @@ impl Analytics for AnalyticsService {
         Ok(result.map(|r| VisitorDetails {
             id: r.id,
             visitor_id: r.visitor_id,
+            project_id: r.project_id,
+            environment_id: r.environment_id,
             first_seen: r.first_seen,
             last_seen: r.last_seen,
             user_agent: r.user_agent,
-            location: r.location,
-            country: r.country,
-            city: r.city,
+            ip_address_id: r.ip_address_id,
             is_crawler: r.is_crawler,
             crawler_name: r.crawler_name,
-            total_sessions: r.total_sessions,
-            total_page_views: r.total_page_views,
-            total_events: r.total_events,
-            bounce_rate: r.bounce_rate,
-            engagement_rate: r.engagement_rate,
-            custom_data: r.custom_data.and_then(|s| serde_json::from_str(&s).ok()),
+            custom_data: r.custom_data,
+            ip_address: r.ip_address,
+            latitude: r.latitude,
+            longitude: r.longitude,
+            region: r.region,
+            city: r.city,
+            country: r.country,
+            country_code: r.country_code,
+            timezone: r.timezone,
+            is_eu: r.is_eu,
         }))
     }
 
@@ -1654,6 +1682,107 @@ WHERE project_id = $1
             }
             None => Ok(None),
         }
+    }
+
+    async fn get_live_visitors(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        window_minutes: i32,
+    ) -> Result<Vec<crate::types::responses::LiveVisitorInfo>, AnalyticsError> {
+        let sql = r#"
+            SELECT
+                v.id,
+                v.visitor_id,
+                v.project_id,
+                v.environment_id,
+                v.first_seen,
+                v.last_seen,
+                v.user_agent,
+                v.ip_address_id,
+                v.is_crawler,
+                v.crawler_name,
+                v.custom_data,
+                ig.ip_address,
+                ig.latitude,
+                ig.longitude,
+                ig.region,
+                ig.city,
+                ig.country,
+                ig.country_code,
+                ig.timezone,
+                ig.is_eu
+            FROM visitor v
+            LEFT JOIN ip_geolocations ig ON v.ip_address_id = ig.id
+            WHERE v.project_id = $1
+              AND ($2::int IS NULL OR v.environment_id = $2)
+              AND v.last_seen >= NOW() - INTERVAL '1 minute' * $3
+            ORDER BY v.last_seen DESC
+        "#;
+
+        #[derive(FromQueryResult)]
+        struct LiveVisitorRow {
+            id: i32,
+            visitor_id: String,
+            project_id: i32,
+            environment_id: i32,
+            first_seen: UtcDateTime,
+            last_seen: UtcDateTime,
+            user_agent: Option<String>,
+            ip_address_id: Option<i32>,
+            is_crawler: bool,
+            crawler_name: Option<String>,
+            custom_data: Option<serde_json::Value>,
+            ip_address: Option<String>,
+            latitude: Option<f64>,
+            longitude: Option<f64>,
+            region: Option<String>,
+            city: Option<String>,
+            country: Option<String>,
+            country_code: Option<String>,
+            timezone: Option<String>,
+            is_eu: Option<bool>,
+        }
+
+        let rows = LiveVisitorRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            vec![
+                project_id.into(),
+                environment_id.into(),
+                window_minutes.into(),
+            ],
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        let visitors = rows
+            .into_iter()
+            .map(|row| crate::types::responses::LiveVisitorInfo {
+                id: row.id,
+                visitor_id: row.visitor_id,
+                project_id: row.project_id,
+                environment_id: row.environment_id,
+                first_seen: row.first_seen,
+                last_seen: row.last_seen,
+                user_agent: row.user_agent,
+                ip_address_id: row.ip_address_id,
+                is_crawler: row.is_crawler,
+                crawler_name: row.crawler_name,
+                custom_data: row.custom_data,
+                ip_address: row.ip_address,
+                latitude: row.latitude,
+                longitude: row.longitude,
+                region: row.region,
+                city: row.city,
+                country: row.country,
+                country_code: row.country_code,
+                timezone: row.timezone,
+                is_eu: row.is_eu,
+            })
+            .collect();
+
+        Ok(visitors)
     }
 
     async fn get_general_stats(

@@ -36,6 +36,7 @@ pub struct AppState {
         has_analytics_events,
         get_page_paths,
         get_active_visitors,
+        get_live_visitors_list,
         get_page_hourly_sessions,
         get_visitor_by_id,
         get_visitor_by_guid,
@@ -82,6 +83,8 @@ pub struct AppState {
         PageHourlySessionsResponse,
         PageSessionComparison,
         PagesComparisonResponse,
+        LiveVisitorInfo,
+        LiveVisitorsListResponse,
         // Query schemas
         MetricsQuery,
         ViewsOverTimeQuery,
@@ -149,6 +152,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/analytics/has-events", get(has_analytics_events))
         .route("/analytics/page-paths", get(get_page_paths))
         .route("/analytics/active-visitors", get(get_active_visitors))
+        .route("/analytics/live-visitors", get(get_live_visitors_list))
         .route(
             "/analytics/page-hourly-sessions",
             get(get_page_hourly_sessions),
@@ -791,12 +795,7 @@ pub async fn get_active_visitors(
 
     match app_state
         .analytics_service
-        .get_active_visitors_details(
-            project_id,
-            query.environment_id,
-            query.deployment_id,
-            Some(window),
-        )
+        .get_active_visitors_details(project_id, query.environment_id, Some(window), None)
         .await
     {
         Ok(visitors) => {
@@ -804,6 +803,56 @@ pub async fn get_active_visitors(
             let response = ActiveVisitorsResponse {
                 count,
                 visitors: visitors.visitors,
+                window_minutes: window,
+            };
+            Ok(Json(response))
+        }
+        Err(e) => {
+            error!("Analytics error: {:?}", e);
+            Err(handle_analytics_error(e))
+        }
+    }
+}
+
+/// Get list of currently live visitors from visitor table
+#[utoipa::path(
+    tag = "Analytics",
+    get,
+    path = "/analytics/live-visitors",
+    params(
+        ("project_id" = i32, Query, description = "Project ID"),
+        ("environment_id" = Option<i32>, Query, description = "Environment ID (optional)"),
+        ("window_minutes" = Option<i32>, Query, description = "Time window in minutes for live visitors (default: 5)")
+    ),
+    responses(
+        (status = 200, description = "Successfully retrieved live visitors list", body = LiveVisitorsListResponse),
+        (status = 400, description = "Invalid parameters or project not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_live_visitors_list(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Query(query): Query<ActiveVisitorsQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+
+    let project_id = query.project_id;
+    let window = query.window_minutes.unwrap_or(5);
+
+    match app_state
+        .analytics_service
+        .get_live_visitors(project_id, query.environment_id, window)
+        .await
+    {
+        Ok(live_visitors) => {
+            let total_count = live_visitors.len() as i64;
+            let response = LiveVisitorsListResponse {
+                total_count,
+                visitors: live_visitors,
                 window_minutes: window,
             };
             Ok(Json(response))

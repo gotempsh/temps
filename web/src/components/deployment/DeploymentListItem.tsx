@@ -10,7 +10,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { useQuery } from '@tanstack/react-query'
-import { GitBranch, GitCommit, MoreHorizontal, X } from 'lucide-react'
+import { GitBranch, GitCommit, MoreHorizontal, X, RotateCcw, RefreshCw, CheckCircle2 } from 'lucide-react'
 import { useCallback, useEffect, useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import { TimeAgo } from '../utils/TimeAgo'
@@ -18,19 +18,17 @@ import { DeploymentStatusBadge } from './DeploymentStatusBadge'
 
 interface DeploymentListItemProps {
   deployment: DeploymentResponse
-  onViewDetails?: () => void
   onRedeploy?: () => void
   onCancel?: () => void
-  onCopyUrl?: () => void
+  onRollback?: () => void
   onDeploymentUpdate?: (updatedDeployment: DeploymentResponse) => void
 }
 
 export default function DeploymentListItem({
   deployment: initialDeployment,
-  onViewDetails,
   onRedeploy,
   onCancel,
-  onCopyUrl,
+  onRollback,
   onDeploymentUpdate,
 }: DeploymentListItemProps) {
   const { refetch, data: refreshedDeployment } = useQuery({
@@ -88,6 +86,12 @@ export default function DeploymentListItem({
           </Link>
           <Badge variant="secondary">{deployment.environment.name}</Badge>
           <DeploymentStatusBadge deployment={deployment} />
+          {deployment.is_current && (
+            <Badge variant="default" className="bg-green-600 hover:bg-green-700 flex items-center gap-1">
+              <CheckCircle2 className="h-3 w-3" />
+              Current
+            </Badge>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
           <div className="flex items-center gap-2">
@@ -137,9 +141,6 @@ export default function DeploymentListItem({
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
-            <DropdownMenuItem onClick={onViewDetails}>
-              View details
-            </DropdownMenuItem>
             {(deployment.status === 'running' ||
               deployment.status === 'pending') && (
               <DropdownMenuItem
@@ -158,16 +159,20 @@ export default function DeploymentListItem({
                 onRedeploy?.()
               }}
             >
+              <RefreshCw className="mr-2 h-4 w-4" />
               Redeploy
             </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={(e) => {
-                e.preventDefault()
-                onCopyUrl?.()
-              }}
-            >
-              Copy URL
-            </DropdownMenuItem>
+            {(deployment.status === 'superseded' || deployment.status === 'completed') && (
+              <DropdownMenuItem
+                onClick={(e) => {
+                  e.preventDefault()
+                  onRollback?.()
+                }}
+              >
+                <RotateCcw className="mr-2 h-4 w-4" />
+                Rollback to this
+              </DropdownMenuItem>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
       </div>

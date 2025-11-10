@@ -295,15 +295,15 @@ impl MongodbService {
                 test: Some(vec![
                     "CMD-SHELL".to_string(),
                     format!(
-                        "mongosh --eval 'db.adminCommand(\"ping\")' --quiet -u {} -p {} --authenticationDatabase admin",
+                        "mongosh --norc --eval \"db.adminCommand('ping')\" -u {} -p {} --authenticationDatabase admin || exit 1",
                         config.username, config.password
                     ),
                 ]),
-                interval: Some(1000000000), // 1 second
-                timeout: Some(3000000000),  // 3 seconds
-                retries: Some(3),
-                start_period: Some(10000000000),  // 10 seconds
-                start_interval: Some(1000000000), // 1 second
+                interval: Some(2000000000), // 2 seconds
+                timeout: Some(10000000000),  // 10 seconds
+                retries: Some(5),
+                start_period: Some(15000000000),  // 15 seconds
+                start_interval: Some(2000000000), // 2 seconds
             }),
             ..Default::default()
         };

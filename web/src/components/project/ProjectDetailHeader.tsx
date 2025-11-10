@@ -3,8 +3,8 @@ import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
-import { Menu, Github, ExternalLink } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Menu, Github, ExternalLink, Users } from 'lucide-react'
+import { Link, useNavigate } from 'react-router-dom'
 import { useMobileSidebar } from './ProjectDetailSidebar'
 
 interface ProjectDetailHeaderProps {
@@ -23,6 +23,13 @@ export function ProjectDetailHeader({
   isLoadingLastDeployment = false,
 }: ProjectDetailHeaderProps) {
   const { setIsOpen } = useMobileSidebar()
+  const navigate = useNavigate()
+
+  const handleVisitorsClick = () => {
+    if ((activeVisitorsCount?.active_visitors ?? 0) > 0) {
+      navigate(`/projects/${project.slug}/analytics/live-visitors`)
+    }
+  }
 
   return (
     <header className="flex h-16 shrink-0 items-center gap-2 border-b px-4">
@@ -52,14 +59,30 @@ export function ProjectDetailHeader({
         </div>
         <div className="flex items-center gap-2">
           {activeVisitorsCount !== undefined && (
-            <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-muted/30 rounded-full">
+            <button
+              onClick={handleVisitorsClick}
+              disabled={(activeVisitorsCount?.active_visitors ?? 0) === 0}
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 bg-muted/30 rounded-full transition-colors ${
+                (activeVisitorsCount?.active_visitors ?? 0) > 0
+                  ? 'cursor-pointer hover:bg-muted/50 active:bg-muted/70'
+                  : 'cursor-default'
+              }`}
+              title={
+                (activeVisitorsCount?.active_visitors ?? 0) > 0
+                  ? 'Click to view live visitors'
+                  : 'No active visitors'
+              }
+            >
               <div
                 className={`h-2 w-2 rounded-full ${activeVisitorsCount?.active_visitors > 0 ? 'bg-green-500 animate-pulse' : 'bg-gray-400'}`}
               />
-              <span className="text-sm font-semibold">
+              <span className="text-sm font-semibold flex items-center gap-1">
+                {(activeVisitorsCount?.active_visitors ?? 0) > 0 && (
+                  <Users className="h-3.5 w-3.5" />
+                )}
                 {activeVisitorsCount?.active_visitors}
               </span>
-            </div>
+            </button>
           )}
           {/* Mobile: Icon-only buttons */}
           <div className="md:hidden flex items-center gap-1">

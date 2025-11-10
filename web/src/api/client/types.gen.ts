@@ -138,6 +138,7 @@ export type ApiKeyResponse = {
 export type AppSettings = {
     allow_readonly_external_access?: boolean;
     dns_provider?: DnsProviderSettings;
+    docker_registry?: DockerRegistrySettings;
     external_url?: string | null;
     letsencrypt?: LetsEncryptSettings;
     preview_domain?: string;
@@ -151,6 +152,7 @@ export type AppSettings = {
  */
 export type AppSettingsResponse = {
     dns_provider: DnsProviderSettingsMasked;
+    docker_registry: DockerRegistrySettingsMasked;
     external_url?: string | null;
     letsencrypt: LetsEncryptSettings;
     preview_domain: string;
@@ -1240,6 +1242,27 @@ export type DnsProviderSettingsMasked = {
     provider: string;
 };
 
+export type DockerRegistrySettings = {
+    ca_certificate?: string | null;
+    enabled?: boolean;
+    password?: string | null;
+    registry_url?: string | null;
+    tls_verify?: boolean;
+    username?: string | null;
+};
+
+/**
+ * Docker registry settings with masked sensitive fields
+ */
+export type DockerRegistrySettingsMasked = {
+    ca_certificate?: string | null;
+    enabled: boolean;
+    password?: string | null;
+    registry_url?: string | null;
+    tls_verify: boolean;
+    username?: string | null;
+};
+
 /**
  * Configuration for Dockerfile preset
  * Allows customizing the Dockerfile path and build context for Docker-based deployments
@@ -1667,6 +1690,21 @@ export type ExecuteImportResponse = {
      * Execution status
      */
     status: ImportExecutionStatus;
+};
+
+export type ExecuteOperationRequest = {
+    operation: string;
+};
+
+/**
+ * Response for external image operations
+ */
+export type ExternalImageResponse = {
+    digest?: string | null;
+    id: string;
+    image_ref: string;
+    pushed_at: string;
+    size?: number | null;
 };
 
 export type ExternalServiceDetails = {
@@ -2272,6 +2310,35 @@ export type ListPresetsResponse = {
     total: number;
 };
 
+export type LiveVisitorInfo = {
+    city?: string | null;
+    country?: string | null;
+    country_code?: string | null;
+    crawler_name?: string | null;
+    custom_data?: unknown;
+    environment_id: number;
+    first_seen: string;
+    id: number;
+    ip_address?: string | null;
+    ip_address_id?: number | null;
+    is_crawler: boolean;
+    is_eu?: boolean | null;
+    last_seen: string;
+    latitude?: number | null;
+    longitude?: number | null;
+    project_id: number;
+    region?: string | null;
+    timezone?: string | null;
+    user_agent?: string | null;
+    visitor_id: string;
+};
+
+export type LiveVisitorsListResponse = {
+    total_count: number;
+    visitors: Array<LiveVisitorInfo>;
+    window_minutes: number;
+};
+
 export type LocationCount = {
     count: number;
     location: string;
@@ -2442,6 +2509,19 @@ export type OperatingSystemCount = {
     count: number;
     operating_system: string;
     percentage: number;
+};
+
+export type OperationResultResponse = {
+    data?: unknown;
+    executed_at: string;
+    message: string;
+    operation: string;
+    success: boolean;
+};
+
+export type OperationResultsResponse = {
+    deployment_id: string;
+    operations: Array<OperationResultResponse>;
 };
 
 /**
@@ -3060,6 +3140,14 @@ export type ProxyLogsPaginatedResponse = {
     page_size: number;
     total: number;
     total_pages: number;
+};
+
+/**
+ * Request to push an external image
+ */
+export type PushImageRequest = {
+    image_ref: string;
+    metadata?: unknown;
 };
 
 /**
@@ -4418,16 +4506,24 @@ export type VisitorDetails = {
 };
 
 export type VisitorInfo = {
-    browser?: string | null;
+    city?: string | null;
+    country?: string | null;
+    country_code?: string | null;
     crawler_name?: string | null;
+    custom_data?: unknown;
+    environment_id: number;
     first_seen: string;
     id: number;
+    ip_address?: string | null;
+    ip_address_id?: number | null;
     is_crawler: boolean;
+    is_eu?: boolean | null;
     last_seen: string;
-    location?: string | null;
-    page_views: number;
-    sessions_count: number;
-    unique_pages: number;
+    latitude?: number | null;
+    longitude?: number | null;
+    project_id: number;
+    region?: string | null;
+    timezone?: string | null;
     user_agent?: string | null;
     visitor_id: string;
 };
@@ -4922,6 +5018,46 @@ export type GetGeneralStatsResponses = {
 };
 
 export type GetGeneralStatsResponse = GetGeneralStatsResponses[keyof GetGeneralStatsResponses];
+
+export type GetLiveVisitorsListData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID (optional)
+         */
+        environment_id?: number;
+        /**
+         * Time window in minutes for live visitors (default: 5)
+         */
+        window_minutes?: number;
+    };
+    url: '/analytics/live-visitors';
+};
+
+export type GetLiveVisitorsListErrors = {
+    /**
+     * Invalid parameters or project not found
+     */
+    400: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetLiveVisitorsListResponses = {
+    /**
+     * Successfully retrieved live visitors list
+     */
+    200: LiveVisitorsListResponse;
+};
+
+export type GetLiveVisitorsListResponse = GetLiveVisitorsListResponses[keyof GetLiveVisitorsListResponses];
 
 export type GetPageHourlySessionsData = {
     body?: never;
@@ -11120,6 +11256,125 @@ export type TailDeploymentJobLogsErrors = {
     500: unknown;
 };
 
+export type GetDeploymentOperationsData = {
+    body?: never;
+    path: {
+        project_id: number;
+        deployment_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/operations';
+};
+
+export type GetDeploymentOperationsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Deployment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDeploymentOperationsResponses = {
+    /**
+     * List of operations
+     */
+    200: OperationResultsResponse;
+};
+
+export type GetDeploymentOperationsResponse = GetDeploymentOperationsResponses[keyof GetDeploymentOperationsResponses];
+
+export type ExecuteDeploymentOperationData = {
+    body: ExecuteOperationRequest;
+    path: {
+        project_id: number;
+        deployment_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/operations';
+};
+
+export type ExecuteDeploymentOperationErrors = {
+    /**
+     * Invalid operation
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Deployment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ExecuteDeploymentOperationResponses = {
+    /**
+     * Operation executed
+     */
+    202: OperationResultResponse;
+};
+
+export type ExecuteDeploymentOperationResponse = ExecuteDeploymentOperationResponses[keyof ExecuteDeploymentOperationResponses];
+
+export type GetDeploymentOperationStatusData = {
+    body?: never;
+    path: {
+        project_id: number;
+        deployment_id: string;
+        operation_type: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/operations/{operation_type}';
+};
+
+export type GetDeploymentOperationStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Operation not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDeploymentOperationStatusResponses = {
+    /**
+     * Operation status
+     */
+    200: OperationResultResponse;
+};
+
+export type GetDeploymentOperationStatusResponse = GetDeploymentOperationStatusResponses[keyof GetDeploymentOperationStatusResponses];
+
 export type PauseDeploymentData = {
     body?: never;
     path: {
@@ -13435,6 +13690,114 @@ export type GetHourlyVisitsResponses = {
 };
 
 export type GetHourlyVisitsResponse = GetHourlyVisitsResponses[keyof GetHourlyVisitsResponses];
+
+export type ListExternalImagesData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/images';
+};
+
+export type ListExternalImagesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListExternalImagesResponses = {
+    /**
+     * List of external images
+     */
+    200: Array<ExternalImageResponse>;
+};
+
+export type ListExternalImagesResponse = ListExternalImagesResponses[keyof ListExternalImagesResponses];
+
+export type PushExternalImageData = {
+    body: PushImageRequest;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/images/push';
+};
+
+export type PushExternalImageErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type PushExternalImageResponses = {
+    /**
+     * Image pushed successfully
+     */
+    201: ExternalImageResponse;
+};
+
+export type PushExternalImageResponse = PushExternalImageResponses[keyof PushExternalImageResponses];
+
+export type GetExternalImageData = {
+    body?: never;
+    path: {
+        project_id: number;
+        image_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/images/{image_id}';
+};
+
+export type GetExternalImageErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Image not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetExternalImageResponses = {
+    /**
+     * Image details
+     */
+    200: ExternalImageResponse;
+};
+
+export type GetExternalImageResponse = GetExternalImageResponses[keyof GetExternalImageResponses];
 
 export type ListIncidentsData = {
     body?: never;

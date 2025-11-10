@@ -15,6 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Use `#[tokio::main]` when integrating with pingora
 - **Use plain text logging** - ALWAYS use structured logging with `append_structured_log()` or helper methods (`log_info`, `log_success`, `log_warning`, `log_error`)
 - **Create markdown documentation files (*.md) unless explicitly requested** - No README files, no documentation files unless the user asks
+- **Auto-generate documentation without explicit request** - Store any auto-generated docs in `thoughts/` directory instead of root
 
 ### ✅ ALWAYS
 - Run `cargo check --lib` after every modification

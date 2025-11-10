@@ -2,6 +2,7 @@ import { ProjectResponse } from '@/api/client'
 import {
   cancelDeploymentMutation,
   getProjectDeploymentsOptions,
+  rollbackToDeploymentMutation,
   triggerProjectPipelineMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import DeploymentListItem from '@/components/deployment/DeploymentListItem'
@@ -156,6 +157,32 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     },
   })
 
+  const rollbackDeployment = useMutation({
+    ...rollbackToDeploymentMutation(),
+    meta: {
+      errorTitle: 'Failed to rollback deployment',
+    },
+    onSuccess: () => {
+      toast.success('Deployment rollback initiated successfully')
+      refetch()
+    },
+    onError: (error: any) => {
+      // Check if it's an expired token error
+      if (isExpiredTokenError(error)) {
+        const message = getExpiredTokenMessage(error)
+        toast.error(message)
+      } else if (error.detail) {
+        toast.error(error.detail)
+      } else {
+        const errorMessage = getErrorMessage(
+          error,
+          'Failed to rollback deployment'
+        )
+        toast.error(errorMessage)
+      }
+    },
+  })
+
   const handleRedeploy = async ({
     branch,
     commit,
@@ -185,6 +212,22 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         deployment_id: deploymentId,
       },
     })
+  }
+
+  const handleRollbackDeployment = async (deploymentId: number) => {
+    toast.promise(
+      rollbackDeployment.mutateAsync({
+        path: {
+          project_id: project.id,
+          deployment_id: deploymentId,
+        },
+      }),
+      {
+        loading: 'Rolling back deployment...',
+        success: 'Deployment rollback initiated successfully',
+        error: 'Failed to rollback deployment',
+      }
+    )
   }
 
   if (error) {
@@ -291,13 +334,12 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             >
               <DeploymentListItem
                 deployment={deployment}
-                onViewDetails={() => {}}
                 onRedeploy={() => {
                   setSelectedDeployment(deployment.id)
                   setIsRedeployModalOpen(true)
                 }}
                 onCancel={() => handleCancelDeployment(deployment.id)}
-                onCopyUrl={() => {}}
+                onRollback={() => handleRollbackDeployment(deployment.id)}
               />
             </Link>
           ))}

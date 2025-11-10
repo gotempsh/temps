@@ -19,6 +19,7 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { SecuritySettings } from '@/components/settings/SecuritySettings'
+import { DockerRegistrySettings } from '@/components/settings/DockerRegistrySettings'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
@@ -26,7 +27,7 @@ import {
   useUpdateSettings,
   type PlatformSettings,
 } from '@/hooks/useSettings'
-import { AlertCircle, Globe, Image, Link, Loader2, Save, Settings2, Shield } from 'lucide-react'
+import { AlertCircle, Globe, Image, Link, Loader2, Save, Settings2, Shield, Key } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -38,6 +39,7 @@ type SettingsFormData = Pick<
   | 'screenshots'
   | 'security_headers'
   | 'rate_limiting'
+  | 'docker_registry'
 >
 
 export function Settings() {
@@ -79,12 +81,21 @@ export function Settings() {
         whitelist_ips: [],
         blacklist_ips: [],
       },
+      docker_registry: {
+        enabled: false,
+        registry_url: null,
+        username: null,
+        password: null,
+        tls_verify: true,
+        ca_certificate: null,
+      },
     },
   })
 
   const screenshots = useWatch({ control, name: 'screenshots' })
   const securityHeaders = useWatch({ control, name: 'security_headers' })
   const rateLimiting = useWatch({ control, name: 'rate_limiting' })
+  const dockerRegistry = useWatch({ control, name: 'docker_registry' })
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Settings' }])
@@ -119,6 +130,14 @@ export function Settings() {
           max_requests_per_hour: 1000,
           whitelist_ips: [],
           blacklist_ips: [],
+        },
+        docker_registry: settings.docker_registry || {
+          enabled: false,
+          registry_url: null,
+          username: null,
+          password: null,
+          tls_verify: true,
+          ca_certificate: null,
         },
       })
     }
@@ -178,10 +197,14 @@ export function Settings() {
 
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
           <Tabs defaultValue="general" className="space-y-6">
-            <TabsList className="grid w-full grid-cols-2 lg:w-auto lg:inline-grid">
+            <TabsList className="grid w-full grid-cols-3 lg:w-auto lg:inline-grid">
               <TabsTrigger value="general" className="gap-2">
                 <Settings2 className="h-4 w-4" />
                 General
+              </TabsTrigger>
+              <TabsTrigger value="docker" className="gap-2">
+                <Key className="h-4 w-4" />
+                Docker Registry
               </TabsTrigger>
               <TabsTrigger value="security" className="gap-2">
                 <Shield className="h-4 w-4" />
@@ -329,6 +352,15 @@ export function Settings() {
                   )}
                 </CardContent>
               </Card>
+            </TabsContent>
+
+            <TabsContent value="docker" className="space-y-6">
+              <DockerRegistrySettings
+                control={control}
+                register={register}
+                setValue={setValue}
+                dockerRegistry={dockerRegistry}
+              />
             </TabsContent>
 
             <TabsContent value="security" className="space-y-6">

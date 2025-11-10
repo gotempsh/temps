@@ -158,16 +158,25 @@ impl TempsPlugin for DeploymentsPlugin {
             .get_service::<crate::services::DatabaseCronConfigService>()
             .expect("DatabaseCronConfigService must be registered before configuring routes");
 
+        // Create external deployment manager for handling external images and operations
+        let external_deployment_manager =
+            Arc::new(crate::services::ExternalDeploymentManager::new());
+
         let app_state = Arc::new(handlers::types::AppState {
             deployment_service,
             log_service,
             cron_service,
+            external_deployment_manager,
         });
 
         let deployments_routes = handlers::deployments::configure_routes();
         let cron_routes = handlers::crons::configure_routes();
+        let external_images_routes = handlers::external_images::configure_routes();
 
-        let routes = deployments_routes.merge(cron_routes).with_state(app_state);
+        let routes = deployments_routes
+            .merge(cron_routes)
+            .merge(external_images_routes)
+            .with_state(app_state);
 
         Some(PluginRoutes { router: routes })
     }
@@ -176,10 +185,12 @@ impl TempsPlugin for DeploymentsPlugin {
         let deployments_schema =
             <handlers::deployments::DeploymentsApiDoc as UtoimaOpenApi>::openapi();
         let cron_schema = <handlers::crons::CronApiDoc as UtoimaOpenApi>::openapi();
+        let external_images_schema =
+            <handlers::external_images::ExternalImagesApiDoc as UtoimaOpenApi>::openapi();
 
         Some(temps_core::openapi::merge_openapi_schemas(
             deployments_schema,
-            vec![cron_schema],
+            vec![cron_schema, external_images_schema],
         ))
     }
 }

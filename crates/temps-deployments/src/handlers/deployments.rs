@@ -192,6 +192,11 @@ impl From<crate::services::services::DeploymentError> for Problem {
             DeploymentError::InvalidInput(msg) => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid Input")
                 .with_detail(msg),
+            DeploymentError::InvalidDeploymentState(msg) => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Deployment State")
+                    .with_detail(msg)
+            }
             DeploymentError::PipelineError(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Pipeline Error")
@@ -1509,6 +1514,7 @@ mod tests {
             deployment_service,
             log_service,
             cron_service,
+            external_deployment_manager: Arc::new(crate::services::ExternalDeploymentManager::new()),
         });
 
         // Create test data in database
@@ -1776,6 +1782,7 @@ mod tests {
             deployment_service,
             log_service: log_service.clone(),
             cron_service,
+            external_deployment_manager: Arc::new(crate::services::ExternalDeploymentManager::new()),
         });
 
         // Create test data
@@ -2042,6 +2049,7 @@ mod tests {
             deployment_service,
             log_service: log_service.clone(),
             cron_service,
+            external_deployment_manager: Arc::new(crate::services::ExternalDeploymentManager::new()),
         });
 
         // Create test data
@@ -2315,6 +2323,7 @@ mod tests {
             deployment_service,
             log_service,
             cron_service,
+            external_deployment_manager: Arc::new(crate::services::ExternalDeploymentManager::new()),
         })
     }
 

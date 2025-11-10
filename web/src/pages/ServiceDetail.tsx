@@ -121,8 +121,8 @@ export function ServiceDetail() {
       errorTitle: 'Failed to stop service',
     },
     onSuccess: () => {
+      toast.success('Service stopped successfully')
       refetch()
-      setError(null)
     },
   })
 

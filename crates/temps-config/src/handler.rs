@@ -45,6 +45,9 @@ pub struct AppSettingsResponse {
     // Security settings
     pub security_headers: SecurityHeadersSettings,
     pub rate_limiting: RateLimitSettings,
+
+    // Docker registry settings with masked password
+    pub docker_registry: DockerRegistrySettingsMasked,
 }
 
 /// DNS provider settings with masked sensitive fields
@@ -52,6 +55,17 @@ pub struct AppSettingsResponse {
 pub struct DnsProviderSettingsMasked {
     pub provider: String,
     pub cloudflare_api_key: Option<String>, // Will be masked as "******" if set
+}
+
+/// Docker registry settings with masked sensitive fields
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DockerRegistrySettingsMasked {
+    pub enabled: bool,
+    pub registry_url: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>, // Will be masked as "******" if set
+    pub tls_verify: bool,
+    pub ca_certificate: Option<String>,
 }
 
 impl From<AppSettings> for AppSettingsResponse {
@@ -71,6 +85,18 @@ impl From<AppSettings> for AppSettingsResponse {
             },
             security_headers: settings.security_headers,
             rate_limiting: settings.rate_limiting,
+            docker_registry: DockerRegistrySettingsMasked {
+                enabled: settings.docker_registry.enabled,
+                registry_url: settings.docker_registry.registry_url,
+                username: settings.docker_registry.username,
+                // Mask the password if it exists
+                password: settings
+                    .docker_registry
+                    .password
+                    .map(|_| "******".to_string()),
+                tls_verify: settings.docker_registry.tls_verify,
+                ca_certificate: settings.docker_registry.ca_certificate,
+            },
         }
     }
 }
@@ -82,6 +108,7 @@ impl From<AppSettings> for AppSettingsResponse {
         AppSettings,
         AppSettingsResponse,
         DnsProviderSettingsMasked,
+        DockerRegistrySettingsMasked,
         SettingsUpdateResponse
     )),
     info(
@@ -159,7 +186,7 @@ async fn update_settings(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
 
-    // If cloudflare_api_key is "******", preserve the existing value
+    // If sensitive fields are masked, preserve the existing values
     if let Some(ref key) = settings.dns_provider.cloudflare_api_key {
         if key == "******" {
             // Get current settings to preserve the actual API key
@@ -171,6 +198,24 @@ async fn update_settings(
                 Err(e) => {
                     tracing::warn!(
                         "Could not fetch current settings to preserve API key: {}",
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    // If docker registry password is "******", preserve the existing value
+    if let Some(ref password) = settings.docker_registry.password {
+        if password == "******" {
+            // Get current settings to preserve the actual password
+            match app_state.config_service.get_settings().await {
+                Ok(current_settings) => {
+                    settings.docker_registry.password = current_settings.docker_registry.password;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Could not fetch current settings to preserve Docker registry password: {}",
                         e
                     );
                 }

@@ -168,6 +168,14 @@ pub trait Analytics: Send + Sync {
         visitor_id: &str,
     ) -> Result<Option<crate::types::responses::VisitorWithGeolocation>, AnalyticsError>;
 
+    /// Get live visitors from visitor table with recent activity
+    async fn get_live_visitors(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        window_minutes: i32,
+    ) -> Result<Vec<crate::types::responses::LiveVisitorInfo>, AnalyticsError>;
+
     /// Get general stats across all projects
     async fn get_general_stats(
         &self,

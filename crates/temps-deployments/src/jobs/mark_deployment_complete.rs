@@ -328,16 +328,18 @@ impl MarkDeploymentCompleteJob {
         })
     }
 
-    /// Cancel and teardown all running/pending deployments for the same environment
+    /// Teardown all running/pending deployments for the same environment
     /// This ensures only one active deployment per environment
+    /// Note: Deployment state is NOT changed - the is_current flag indicates which deployment is active
     async fn cancel_previous_deployments(&self, environment_id: i32) {
         use sea_orm::Set;
 
-        self.log("Checking for previous deployments to cancel...".to_string())
+        self.log("Checking for previous deployments to teardown...".to_string())
             .await
             .ok();
 
         // Find all running or pending deployments for this environment (excluding the new one)
+        // Note: "failed" deployments are intentionally excluded to preserve error history
         let previous_deployments = match deployments::Entity::find()
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
             .filter(deployments::Column::Id.ne(self.deployment_id))
@@ -360,14 +362,14 @@ impl MarkDeploymentCompleteJob {
         };
 
         if previous_deployments.is_empty() {
-            self.log("No previous deployments to cancel".to_string())
+            self.log("No previous deployments to teardown".to_string())
                 .await
                 .ok();
             return;
         }
 
         self.log(format!(
-            "Found {} previous deployment(s) to cancel",
+            "Found {} previous deployment(s) to teardown",
             previous_deployments.len()
         ))
         .await
@@ -376,7 +378,7 @@ impl MarkDeploymentCompleteJob {
         for deployment in previous_deployments {
             let deployment_id = deployment.id;
             self.log(format!(
-                "Cancelling deployment {} (state: {})",
+                "Tearing down deployment {} (state: {})",
                 deployment_id, deployment.state
             ))
             .await
@@ -450,29 +452,15 @@ impl MarkDeploymentCompleteJob {
                 }
             }
 
-            // Update deployment to cancelled state
-            let mut active_deployment: deployments::ActiveModel = deployment.into();
-            active_deployment.state = Set("cancelled".to_string());
-            active_deployment.cancelled_reason =
-                Set(Some("Superseded by new deployment".to_string()));
-            active_deployment.finished_at = Set(Some(chrono::Utc::now()));
-            active_deployment.updated_at = Set(chrono::Utc::now());
-
-            match active_deployment.update(self.db.as_ref()).await {
-                Ok(_) => {
-                    self.log(format!("Cancelled deployment {}", deployment_id))
-                        .await
-                        .ok();
-                }
-                Err(e) => {
-                    self.log(format!("Failed to update deployment status: {}", e))
-                        .await
-                        .ok();
-                }
-            }
+            self.log(format!(
+                "Torn down deployment {} - containers stopped and removed",
+                deployment_id
+            ))
+            .await
+            .ok();
         }
 
-        self.log("All previous deployments cancelled successfully".to_string())
+        self.log("All previous deployments torn down successfully".to_string())
             .await
             .ok();
     }

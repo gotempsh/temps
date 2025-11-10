@@ -124,18 +124,27 @@ pub struct BrowserStats {
 pub struct VisitorInfo {
     pub id: i32,
     pub visitor_id: String,
+    pub project_id: i32,
+    pub environment_id: i32,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
     pub first_seen: UtcDateTime,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
     pub last_seen: UtcDateTime,
     pub user_agent: Option<String>,
-    pub location: Option<String>,
+    pub ip_address_id: Option<i32>,
     pub is_crawler: bool,
     pub crawler_name: Option<String>,
-    pub sessions_count: i64,
-    pub page_views: i64,
-    pub unique_pages: i64,
-    pub browser: Option<String>,
+    pub custom_data: Option<serde_json::Value>,
+    // IP and Geolocation fields
+    pub ip_address: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub country: Option<String>,
+    pub country_code: Option<String>,
+    pub timezone: Option<String>,
+    pub is_eu: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -149,22 +158,27 @@ pub struct VisitorsResponse {
 pub struct VisitorDetails {
     pub id: i32,
     pub visitor_id: String,
+    pub project_id: i32,
+    pub environment_id: i32,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
     pub first_seen: UtcDateTime,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
     pub last_seen: UtcDateTime,
     pub user_agent: Option<String>,
-    pub location: Option<String>,
-    pub country: Option<String>,
-    pub city: Option<String>,
+    pub ip_address_id: Option<i32>,
     pub is_crawler: bool,
     pub crawler_name: Option<String>,
-    pub total_sessions: i64,
-    pub total_page_views: i64,
-    pub total_events: i64,
-    pub bounce_rate: f64,
-    pub engagement_rate: f64,
-    pub custom_data: Option<serde_json::Value>, // User-provided custom data
+    pub custom_data: Option<serde_json::Value>,
+    // IP and Geolocation fields
+    pub ip_address: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub country: Option<String>,
+    pub country_code: Option<String>,
+    pub timezone: Option<String>,
+    pub is_eu: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -437,4 +451,38 @@ pub struct ProjectStatsBreakdown {
     pub total_page_views: i64,
     pub bounce_rate: f64,
     pub engagement_rate: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LiveVisitorInfo {
+    pub id: i32,
+    pub visitor_id: String,
+    pub project_id: i32,
+    pub environment_id: i32,
+    #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
+    pub first_seen: UtcDateTime,
+    #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
+    pub last_seen: UtcDateTime,
+    pub user_agent: Option<String>,
+    pub ip_address_id: Option<i32>,
+    pub is_crawler: bool,
+    pub crawler_name: Option<String>,
+    pub custom_data: Option<serde_json::Value>,
+    // IP and Geolocation fields
+    pub ip_address: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub country: Option<String>,
+    pub country_code: Option<String>,
+    pub timezone: Option<String>,
+    pub is_eu: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LiveVisitorsListResponse {
+    pub total_count: i64,
+    pub visitors: Vec<LiveVisitorInfo>,
+    pub window_minutes: i32,
 }

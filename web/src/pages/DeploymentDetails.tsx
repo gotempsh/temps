@@ -4,6 +4,7 @@ import {
   getDeploymentOptions,
   pauseDeploymentMutation,
   resumeDeploymentMutation,
+  rollbackToDeploymentMutation,
   triggerProjectPipelineMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { DeploymentStages } from '@/components/deployments/DeploymentStages'
@@ -25,6 +26,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
+  CheckCircle2,
   ChevronDown,
   ChevronUp,
   Clock,
@@ -33,6 +35,7 @@ import {
   MoreVertical,
   Pause,
   Play,
+  RotateCcw,
   RotateCw,
   X,
 } from 'lucide-react'
@@ -117,6 +120,17 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     },
   })
 
+  const rollbackDeployment = useMutation({
+    ...rollbackToDeploymentMutation(),
+    meta: {
+      errorTitle: 'Failed to rollback deployment',
+    },
+    onSuccess: () => {
+      toast.success('Deployment rollback initiated successfully')
+      navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+    },
+  })
+
   const handleRedeploy = async ({
     branch,
     commit,
@@ -163,6 +177,15 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
 
   const handleCancelDeployment = async () => {
     await cancelDeployment.mutateAsync({
+      path: {
+        project_id: project.id,
+        deployment_id: Number(deploymentId),
+      },
+    })
+  }
+
+  const handleRollbackDeployment = async () => {
+    await rollbackDeployment.mutateAsync({
       path: {
         project_id: project.id,
         deployment_id: Number(deploymentId),
@@ -320,6 +343,12 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
                   />
                   {deployment.status}
                 </Badge>
+                {deployment.is_current && (
+                  <Badge variant="default" className="bg-green-600 hover:bg-green-700 flex items-center gap-1">
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                    Current
+                  </Badge>
+                )}
                 <span className="text-muted-foreground/30">•</span>
                 <div className="flex items-center gap-1.5">
                   <Clock className="h-4 w-4" />
@@ -417,6 +446,15 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
                         >
                           <Pause className="mr-2 h-4 w-4" />
                           Pause Deployment
+                        </DropdownMenuItem>
+                      )}
+                      {(deployment?.status === 'superseded' || deployment?.status === 'completed') && (
+                        <DropdownMenuItem
+                          onClick={handleRollbackDeployment}
+                          disabled={rollbackDeployment.isPending}
+                        >
+                          <RotateCcw className="mr-2 h-4 w-4" />
+                          Rollback to this
                         </DropdownMenuItem>
                       )}
                       {deployment?.status === 'paused' && (

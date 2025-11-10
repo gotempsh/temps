@@ -162,6 +162,8 @@ pub struct DeployImageJob {
     container_ids: Arc<Mutex<Vec<String>>>,
     /// Background task handle for log streaming (aborted on cleanup)
     log_stream_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Optional: directly provided image tag (for external/pre-built images, bypasses BuildImageJob lookup)
+    external_image_tag: Option<String>,
 }
 
 impl std::fmt::Debug for DeployImageJob {
@@ -193,6 +195,7 @@ impl DeployImageJob {
             log_service: None,
             container_ids: Arc::new(Mutex::new(Vec::new())),
             log_stream_task: Arc::new(Mutex::new(None)),
+            external_image_tag: None,
         }
     }
 
@@ -228,6 +231,11 @@ impl DeployImageJob {
 
     pub fn with_log_service(mut self, log_service: Arc<LogService>) -> Self {
         self.log_service = Some(log_service);
+        self
+    }
+
+    pub fn with_external_image_tag(mut self, image_tag: String) -> Self {
+        self.external_image_tag = Some(image_tag);
         self
     }
 
@@ -638,16 +646,41 @@ impl DeployImageJob {
 
         // Phase 1: Wait for container to be running
         loop {
-            let container_info = self
+            // Try to get container info, but don't fail hard if it can't be found
+            // (container might have been removed by Docker or other processes)
+            let container_info = match self
                 .container_deployer
                 .get_container_info(&deploy_result.container_id)
                 .await
-                .map_err(|e| {
-                    WorkflowError::JobExecutionFailed(format!(
-                        "Failed to check deployment status: {}",
+            {
+                Ok(info) => info,
+                Err(e) => {
+                    // Container not found - might have been removed, but that's okay
+                    // Log a warning but don't fail the deployment
+                    tracing::warn!(
+                        "Cannot verify container {} during deployment - container may have been removed: {}",
+                        deploy_result.container_id,
                         e
-                    ))
-                })?;
+                    );
+                    self.log(
+                        context,
+                        format!(
+                            "⏳ Container status check failed (may have been removed): {}",
+                            e
+                        ),
+                    )
+                    .await?;
+
+                    // Wait a bit and try again, but don't fail if we can't verify
+                    if start_time.elapsed() > max_wait_time {
+                        self.log(context, "Container verification timeout - proceeding anyway (container may be running)".to_string())
+                            .await?;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
 
             match container_info.status {
                 DeployerContainerStatus::Running => {
@@ -917,12 +950,31 @@ impl WorkflowTask for DeployImageJob {
     }
 
     fn depends_on(&self) -> Vec<String> {
-        vec![self.build_job_id.clone()]
+        // If external image is provided, no dependencies on build job
+        if self.external_image_tag.is_some() {
+            vec![]
+        } else {
+            vec![self.build_job_id.clone()]
+        }
     }
 
     async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
-        // Get typed output from the build job
-        let image_output = BuildImageOutput::from_context(&context, &self.build_job_id)?;
+        // Get image output either from external tag or from build job
+        let image_output = if let Some(ref external_tag) = self.external_image_tag {
+            // External image provided directly - create synthetic BuildImageOutput
+            self.log(&context, format!("Using external image: {}", external_tag))
+                .await?;
+            BuildImageOutput {
+                image_tag: external_tag.clone(),
+                image_id: format!("external-{}", external_tag.replace(":", "-")),
+                size_bytes: 0, // Not applicable for external images
+                build_context: std::path::PathBuf::from("."),
+                dockerfile_path: std::path::PathBuf::from("."),
+            }
+        } else {
+            // Standard workflow - get from build job output
+            BuildImageOutput::from_context(&context, &self.build_job_id)?
+        };
 
         // Deploy the image (logs written in real-time)
         let deployment_output = self.deploy_image(&image_output, &context).await?;
@@ -964,7 +1016,12 @@ impl WorkflowTask for DeployImageJob {
     }
 
     async fn validate_prerequisites(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
-        // Verify that the build job output is available
+        // If external image is provided, skip build job validation
+        if self.external_image_tag.is_some() {
+            return Ok(());
+        }
+
+        // Verify that the build job output is available (for standard workflow)
         BuildImageOutput::from_context(context, &self.build_job_id)?;
 
         // Basic validation

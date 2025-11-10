@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 use crate::services::database_cron_service::DatabaseCronConfigService;
+use crate::services::ExternalDeploymentManager;
 use crate::DeploymentService;
 
 pub struct AppState {
     pub deployment_service: Arc<DeploymentService>,
     pub log_service: Arc<temps_logs::LogService>,
     pub cron_service: Arc<DatabaseCronConfigService>,
+    pub external_deployment_manager: Arc<ExternalDeploymentManager>,
 }
 
 use crate::services::types::Deployment;

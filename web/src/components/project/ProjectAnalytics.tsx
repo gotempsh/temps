@@ -15,6 +15,8 @@ import { Pages } from '@/components/analytics/Pages'
 import { SessionReplays } from '@/components/analytics/SessionReplays'
 import { FunnelDetail } from '@/components/funnel/FunnelDetail'
 import { FunnelManagement } from '@/components/funnel/FunnelManagement'
+import { LiveVisitorsList } from '@/components/visitors/LiveVisitorsList'
+import { LiveVisitors } from '@/pages/LiveVisitors'
 import { Button } from '@/components/ui/button'
 import { Calendar } from '@/components/ui/calendar'
 import {
@@ -671,6 +673,7 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
       <Route index element={<ProjectAnalyticsOverview project={project} />} />
       <Route path="requests/*" element={<RequestLogs project={project} />} />
       <Route path="funnels/*" element={<FunnelAnalytics project={project} />} />
+      <Route path="live-visitors" element={<LiveVisitors project={project} />} />
       <Route
         path="visitors/*"
         element={<VisitorAnalytics project={project} />}
