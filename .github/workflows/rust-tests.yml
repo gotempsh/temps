@@ -22,11 +22,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install wasm-pack
-        run: |
-          curl https://rustwasm.org/wasm-pack/installer/init.sh -sSf | sh
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -35,9 +30,9 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Build WASM
+      - name: Install wasm-pack and Build WASM
         run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo install wasm-pack
           cd crates/temps-captcha-wasm
           bun run build
 
@@ -71,11 +66,6 @@ jobs:
         with:
           components: clippy
 
-      - name: Install wasm-pack
-        run: |
-          curl https://rustwasm.org/wasm-pack/installer/init.sh -sSf | sh
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -84,9 +74,9 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Build WASM
+      - name: Install wasm-pack and Build WASM
         run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo install wasm-pack
           cd crates/temps-captcha-wasm
           bun run build
 
@@ -135,11 +125,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install wasm-pack
-        run: |
-          curl https://rustwasm.org/wasm-pack/installer/init.sh -sSf | sh
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -148,9 +133,9 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Build WASM
+      - name: Install wasm-pack and Build WASM
         run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo install wasm-pack
           cd crates/temps-captcha-wasm
           bun run build
 
