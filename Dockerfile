@@ -73,8 +73,7 @@ FROM alpine:3.20
 RUN apk add --no-cache \
     ca-certificates \
     libssl3 \
-    postgresql-client \
-    dumb-init
+    postgresql-client
 
 # Create app user
 RUN addgroup -g 1001 -S appgroup && \
@@ -118,10 +117,7 @@ EXPOSE 3443
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
 
-# Use dumb-init to properly handle signals
-ENTRYPOINT ["/sbin/dumb-init", "--"]
-
-# Default command (uses environment variables for configuration)
+# Run the application (Pingora handles signals internally)
 CMD ["/app/temps", "serve"]
 
 # Build instructions:
