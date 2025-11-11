@@ -1,4 +1,8 @@
-import { getProjectBySlugOptions, getEnvironmentsOptions, createEnvironmentMutation } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getProjectBySlugOptions,
+  getEnvironmentsOptions,
+  createEnvironmentMutation,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -27,7 +31,11 @@ export function EnvironmentsList() {
   })
 
   // Then get environments
-  const { data: environments, isLoading: isEnvironmentsLoading, refetch } = useQuery({
+  const {
+    data: environments,
+    isLoading: isEnvironmentsLoading,
+    refetch,
+  } = useQuery({
     ...getEnvironmentsOptions({
       path: {
         project_id: project?.id || 0,
@@ -127,7 +135,10 @@ export function EnvironmentsList() {
                       Create your first environment to get started
                     </p>
                   </div>
-                  <Button onClick={() => setIsDialogOpen(true)} className="w-full">
+                  <Button
+                    onClick={() => setIsDialogOpen(true)}
+                    className="w-full"
+                  >
                     <Plus className="h-4 w-4 mr-2" />
                     Create Environment
                   </Button>
@@ -140,7 +151,9 @@ export function EnvironmentsList() {
                 <EnvironmentCard
                   key={env.id}
                   environment={env}
-                  onSelect={() => navigate(`/projects/${slug}/environments/${env.id}`)}
+                  onSelect={() =>
+                    navigate(`/projects/${slug}/environments/${env.id}`)
+                  }
                 />
               ))}
             </div>
@@ -153,6 +166,7 @@ export function EnvironmentsList() {
         open={isDialogOpen}
         onOpenChange={setIsDialogOpen}
         onSubmit={handleCreateEnvironment}
+        project={project}
       />
     </div>
   )
@@ -164,11 +178,12 @@ interface EnvironmentCardProps {
 }
 
 function EnvironmentCard({ environment, onSelect }: EnvironmentCardProps) {
-  const statusColor = {
-    running: 'bg-green-500',
-    stopped: 'bg-gray-400',
-    error: 'bg-red-500',
-  }[environment.status] || 'bg-gray-400'
+  const statusColor =
+    {
+      running: 'bg-green-500',
+      stopped: 'bg-gray-400',
+      error: 'bg-red-500',
+    }[environment.status] || 'bg-gray-400'
 
   return (
     <Card
@@ -181,7 +196,10 @@ function EnvironmentCard({ environment, onSelect }: EnvironmentCardProps) {
           <div>
             <h3 className="text-lg font-semibold">{environment.name}</h3>
             <p className="text-sm text-muted-foreground mt-1">
-              Branch: <code className="bg-muted px-1.5 py-0.5 rounded text-xs">{environment.branch}</code>
+              Branch:{' '}
+              <code className="bg-muted px-1.5 py-0.5 rounded text-xs">
+                {environment.branch}
+              </code>
             </p>
           </div>
           <Badge

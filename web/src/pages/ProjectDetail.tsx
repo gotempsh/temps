@@ -8,7 +8,10 @@ import {
 import NotFound from '@/components/global/NotFound'
 import { ProjectAnalytics } from '@/components/project/ProjectAnalytics'
 import { ProjectDeployments } from '@/components/project/ProjectDeployments'
-import { ProjectDetailSidebar, MobileSidebarProvider } from '@/components/project/ProjectDetailSidebar'
+import {
+  ProjectDetailSidebar,
+  MobileSidebarProvider,
+} from '@/components/project/ProjectDetailSidebar'
 import { ProjectDetailHeader } from '@/components/project/ProjectDetailHeader'
 import { ProjectOverview } from '@/components/project/ProjectOverview'
 import { ProjectRuntime } from '@/components/project/ProjectRuntime'
@@ -270,95 +273,100 @@ export function ProjectDetail() {
             lastDeploymentUrl={lastDeployment?.url}
             isLoadingLastDeployment={isLoadingLastDeployment}
           />
-        <div className="flex-1 overflow-y-auto p-4">
-          {/* Attack Mode Banner */}
-          {(project as any).attack_mode && (
-            <Alert className="mb-4 border-primary bg-primary/10">
-              <ShieldAlert className="h-4 w-4 text-primary" />
-              <AlertDescription className="flex items-center justify-between">
-                <span className="text-foreground">
-                  Attack Mode is enabled for this project
-                </span>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 px-2 text-primary hover:bg-primary/20"
-                  onClick={handleDisableAttackMode}
-                  disabled={disableAttackMode.isPending}
-                >
-                  {disableAttackMode.isPending ? 'Disabling...' : 'Disable'}
-                </Button>
-              </AlertDescription>
-            </Alert>
-          )}
-          <Routes>
-            <Route index element={<Navigate to="project" replace />} />
-            <Route
-              path="project"
-              element={
-                <ProjectOverview
-                  project={project}
-                  lastDeployment={lastDeployment}
-                />
-              }
-            />
-            <Route
-              path="deployments"
-              element={<ProjectDeployments project={project} />}
-            />
-            <Route
-              path="deployments/:deploymentId"
-              element={<DeploymentDetails project={project} />}
-            />
-            <Route
-              path="analytics/*"
-              element={<ProjectAnalytics project={project} />}
-            />
-            <Route
-              path="storage"
-              element={<ProjectStorage project={project} />}
-            />
-            <Route
-              path="runtime"
-              element={<ProjectRuntime project={project} />}
-            />
-            <Route
-              path="settings/*"
-              element={<ProjectSettings project={project} refetch={refetch} />}
-            />
-            <Route
-              path="speed"
-              element={<ProjectSpeedInsights project={project} />}
-            />
-            <Route path="logs/*" element={<RequestLogs project={project} />} />
-            <Route
-              path="monitors"
-              element={<ProjectMonitors project={project} />}
-            />
-            <Route
-              path="monitors/:monitorId"
-              element={<MonitorDetail project={project} />}
-            />
-            <Route
-              path="errors"
-              element={<ErrorTracking project={project} />}
-            />
-            <Route
-              path="errors/:errorGroupId"
-              element={<ErrorGroupDetail project={project} />}
-            />
-            <Route
-              path="errors/:errorGroupId/event/:eventId"
-              element={<ErrorEventDetail project={project} />}
-            />
-            <Route
-              path="environments/*"
-              element={<EnvironmentsTabsView project={project} />}
-            />
-          </Routes>
+          <div className="flex-1 overflow-y-auto p-4">
+            {/* Attack Mode Banner */}
+            {(project as any).attack_mode && (
+              <Alert className="mb-4 border-primary bg-primary/10">
+                <ShieldAlert className="h-4 w-4 text-primary" />
+                <AlertDescription className="flex items-center justify-between">
+                  <span className="text-foreground">
+                    Attack Mode is enabled for this project
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2 text-primary hover:bg-primary/20"
+                    onClick={handleDisableAttackMode}
+                    disabled={disableAttackMode.isPending}
+                  >
+                    {disableAttackMode.isPending ? 'Disabling...' : 'Disable'}
+                  </Button>
+                </AlertDescription>
+              </Alert>
+            )}
+            <Routes>
+              <Route index element={<Navigate to="project" replace />} />
+              <Route
+                path="project"
+                element={
+                  <ProjectOverview
+                    project={project}
+                    lastDeployment={lastDeployment}
+                  />
+                }
+              />
+              <Route
+                path="deployments"
+                element={<ProjectDeployments project={project} />}
+              />
+              <Route
+                path="deployments/:deploymentId"
+                element={<DeploymentDetails project={project} />}
+              />
+              <Route
+                path="analytics/*"
+                element={<ProjectAnalytics project={project} />}
+              />
+              <Route
+                path="storage"
+                element={<ProjectStorage project={project} />}
+              />
+              <Route
+                path="runtime"
+                element={<ProjectRuntime project={project} />}
+              />
+              <Route
+                path="settings/*"
+                element={
+                  <ProjectSettings project={project} refetch={refetch} />
+                }
+              />
+              <Route
+                path="speed"
+                element={<ProjectSpeedInsights project={project} />}
+              />
+              <Route
+                path="logs/*"
+                element={<RequestLogs project={project} />}
+              />
+              <Route
+                path="monitors"
+                element={<ProjectMonitors project={project} />}
+              />
+              <Route
+                path="monitors/:monitorId"
+                element={<MonitorDetail project={project} />}
+              />
+              <Route
+                path="errors"
+                element={<ErrorTracking project={project} />}
+              />
+              <Route
+                path="errors/:errorGroupId"
+                element={<ErrorGroupDetail project={project} />}
+              />
+              <Route
+                path="errors/:errorGroupId/event/:eventId"
+                element={<ErrorEventDetail project={project} />}
+              />
+              <Route
+                path="environments/*"
+                element={<EnvironmentsTabsView project={project} />}
+              />
+            </Routes>
+          </div>
         </div>
       </div>
-    </div>
     </MobileSidebarProvider>
   )
 }

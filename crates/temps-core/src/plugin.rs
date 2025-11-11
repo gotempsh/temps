@@ -695,26 +695,26 @@ impl PluginManager {
             .info(
                 InfoBuilder::new()
                     .title("Temps")
-                    .description(Some("A comprehensive API for managing projects, deployments, and infrastructure resources"))
+                    .description(Some(
+                        "An API for managing projects, deployments, and infrastructure resources",
+                    ))
                     .version("1.0.0")
                     .contact(Some(
                         ContactBuilder::new()
                             .name(Some("Temps Support"))
                             .url(Some("https://temps.sh"))
-                            .build()
+                            .build(),
                     ))
-                    .build()
+                    .build(),
             )
-            .servers(Some(vec![
-                ServerBuilder::new()
-                    .url("/api")
-                    .description(Some("Base path for all API endpoints"))
-                    .build()
-            ]))
+            .servers(Some(vec![ServerBuilder::new()
+                .url("/api")
+                .description(Some("Base path for all API endpoints"))
+                .build()]))
             .components(Some(
                 ComponentsBuilder::new()
                     .security_scheme("bearer_auth", self.create_bearer_auth_scheme())
-                    .build()
+                    .build(),
             ))
             .build();
 

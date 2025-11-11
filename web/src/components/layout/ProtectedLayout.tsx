@@ -27,11 +27,15 @@ export const ProtectedLayout = ({
     const errorObj = error as any
     const errorTitle = errorObj?.title
     const errorDetail = errorObj?.detail
-    const errorMessage = error?.message || errorDetail || 'An unexpected error occurred'
+    const errorMessage =
+      error?.message || errorDetail || 'An unexpected error occurred'
 
     // 401 - Unauthorized: Show login page (user not authenticated)
     // Check for authentication-related errors
-    if (errorTitle === 'Authentication Required' || errorTitle === 'Unauthorized') {
+    if (
+      errorTitle === 'Authentication Required' ||
+      errorTitle === 'Unauthorized'
+    ) {
       return <Login />
     }
 
@@ -97,7 +101,11 @@ export const ProtectedLayout = ({
               )}
             </AlertDescription>
           </Alert>
-          <Button onClick={() => refetch()} className="w-full" variant="default">
+          <Button
+            onClick={() => refetch()}
+            className="w-full"
+            variant="default"
+          >
             <RefreshCw className="mr-2 h-4 w-4" />
             Retry
           </Button>

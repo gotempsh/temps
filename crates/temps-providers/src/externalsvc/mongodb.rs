@@ -54,15 +54,10 @@ pub struct MongodbInputConfig {
     #[schemars(with = "Option<String>", example = "example_password")]
     pub password: Option<String>,
 
-    /// Docker image to use for MongoDB
-    #[serde(default = "default_image")]
-    #[schemars(example = "example_image", default = "default_image")]
-    pub image: String,
-
-    /// MongoDB version
-    #[serde(default = "default_version")]
-    #[schemars(example = "example_version", default = "default_version")]
-    pub version: String,
+    /// Docker image to use for MongoDB (e.g., mongo:8.0, mongo:7.0)
+    #[serde(default = "default_docker_image")]
+    #[schemars(example = "example_docker_image", default = "default_docker_image")]
+    pub docker_image: String,
 }
 
 // Example functions for schemars
@@ -86,12 +81,12 @@ fn example_password() -> &'static str {
     ""
 }
 
-fn example_image() -> &'static str {
-    "mongo"
+fn default_docker_image() -> String {
+    "mongo:8.0".to_string()
 }
 
-fn example_version() -> &'static str {
-    "8.0"
+fn example_docker_image() -> &'static str {
+    "mongo:8.0"
 }
 
 /// Internal runtime configuration for MongoDB service
@@ -104,8 +99,7 @@ pub struct MongodbRuntimeConfig {
     pub database: String,
     pub username: String,
     pub password: String,
-    pub image: String,
-    pub version: String,
+    pub docker_image: String,
 }
 
 impl From<MongodbInputConfig> for MongodbRuntimeConfig {
@@ -120,8 +114,7 @@ impl From<MongodbInputConfig> for MongodbRuntimeConfig {
             database: input.database,
             username: input.username,
             password: input.password.unwrap_or_else(generate_password),
-            image: input.image,
-            version: input.version,
+            docker_image: input.docker_image,
         }
     }
 }
@@ -159,14 +152,6 @@ pub fn generate_password() -> String {
         .take(16)
         .map(char::from)
         .collect()
-}
-
-fn default_image() -> String {
-    "mongo".to_string()
-}
-
-fn default_version() -> String {
-    "8.0".to_string()
 }
 
 fn is_port_available(port: u16) -> bool {
@@ -231,7 +216,7 @@ impl MongodbService {
         container_labels.insert("temps.service".to_string(), "mongodb".to_string());
         container_labels.insert("temps.name".to_string(), self.name.clone());
 
-        let image_tag = format!("{}:{}", config.image, config.version);
+        let image_tag = config.docker_image.clone();
 
         // Pull the image first
         info!("Pulling MongoDB image: {}", image_tag);
@@ -292,17 +277,20 @@ impl MongodbService {
             }),
             networking_config,
             healthcheck: Some(bollard::models::HealthConfig {
-                test: Some(vec![
-                    "CMD-SHELL".to_string(),
+                test: Some(vec!["CMD-SHELL".to_string(), {
+                    // Properly escape credentials for shell execution by wrapping in single quotes
+                    // and escaping any single quotes within the values
+                    let escaped_username = config.username.replace("'", "'\"'\"'");
+                    let escaped_password = config.password.replace("'", "'\"'\"'");
                     format!(
-                        "mongosh --norc --eval \"db.adminCommand('ping')\" -u {} -p {} --authenticationDatabase admin || exit 1",
-                        config.username, config.password
-                    ),
-                ]),
+                            "mongosh --norc --eval \"db.adminCommand('ping')\" -u '{}' -p '{}' --authenticationDatabase admin || exit 1",
+                            escaped_username, escaped_password
+                        )
+                }]),
                 interval: Some(2000000000), // 2 seconds
-                timeout: Some(10000000000),  // 10 seconds
+                timeout: Some(10000000000), // 10 seconds
                 retries: Some(5),
-                start_period: Some(15000000000),  // 15 seconds
+                start_period: Some(45000000000), // 45 seconds - gives MongoDB time to initialize credentials
                 start_interval: Some(2000000000), // 2 seconds
             }),
             ..Default::default()
@@ -546,13 +534,12 @@ impl ExternalService for MongodbService {
             for key in properties.keys().cloned().collect::<Vec<_>>() {
                 // Define which fields should be editable
                 let editable = match key.as_str() {
-                    "host" => false,     // Don't change host after creation
-                    "port" => true,      // Port can be changed
-                    "database" => false, // Don't change database name after creation
-                    "username" => false, // Don't change username after creation
-                    "password" => false, // Password is auto-generated and cannot be changed
-                    "image" => true,     // Image can be upgraded
-                    "version" => true,   // Version can be upgraded
+                    "host" => false,        // Don't change host after creation
+                    "port" => true,         // Port can be changed
+                    "database" => false,    // Don't change database name after creation
+                    "username" => false,    // Don't change username after creation
+                    "password" => false,    // Password is auto-generated and cannot be changed
+                    "docker_image" => true, // Docker image can be upgraded
                     _ => false,
                 };
 
@@ -1131,12 +1118,12 @@ impl ExternalService for MongodbService {
         let new_mongodb_config = self.get_mongodb_config(new_config)?;
 
         // Verify the new image can be pulled BEFORE stopping the old container
-        let new_image = format!(
-            "{}:{}",
-            new_mongodb_config.image, new_mongodb_config.version
+        info!(
+            "Verifying new Docker image is available: {}",
+            new_mongodb_config.docker_image
         );
-        info!("Verifying new Docker image is available: {}", new_image);
-        self.verify_image_pullable(&new_image).await?;
+        self.verify_image_pullable(&new_mongodb_config.docker_image)
+            .await?;
         info!("New Docker image verified and is available");
 
         // Stop the old container
@@ -1161,8 +1148,7 @@ mod tests {
     fn test_default_values() {
         assert_eq!(default_host(), "localhost");
         assert_eq!(default_username(), "root");
-        assert_eq!(default_image(), "mongo");
-        assert_eq!(default_version(), "8.0");
+        assert_eq!(default_docker_image(), "mongo:8.0".to_string());
     }
 
     #[test]
@@ -1247,7 +1233,12 @@ mod tests {
 
         // Check for expected fields
         let expected_fields = vec![
-            "host", "port", "database", "username", "password", "image", "version",
+            "host",
+            "port",
+            "database",
+            "username",
+            "password",
+            "docker_image",
         ];
         for field in &expected_fields {
             assert!(
@@ -1299,9 +1290,8 @@ mod tests {
             ("port", true),
             ("database", false),
             ("username", false),
-            ("password", true),
-            ("image", true),
-            ("version", true),
+            ("password", false),
+            ("docker_image", true),
         ];
 
         for (field_name, should_be_editable) in editable_status {
@@ -1325,48 +1315,45 @@ mod tests {
 
     #[test]
     fn test_default_docker_image() {
-        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
-        let service = MongodbService::new("test-image".to_string(), docker);
-
-        let (image_name, version) = service.get_default_docker_image();
-        assert_eq!(image_name, "mongo", "Default image should be mongo");
-        assert_eq!(version, "8.0", "Default version should be 8.0");
+        assert_eq!(
+            default_docker_image(),
+            "mongo:8.0".to_string(),
+            "Default docker_image should be mongo:8.0"
+        );
     }
 
     #[test]
-    fn test_image_and_version_configuration() {
+    fn test_docker_image_configuration() {
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let _service = MongodbService::new("test-config".to_string(), docker);
 
-        // Create config with specific image and version
+        // Create config with specific docker_image
         let config = ServiceConfig {
             name: "test-mongo".to_string(),
             service_type: super::ServiceType::Mongodb,
             version: None,
             parameters: serde_json::json!({
                 "host": "localhost",
-                "port": Some("27017"),
+                "port": "27017",
                 "database": "testdb",
                 "username": "testuser",
                 "password": "testpass123",
-                "image": "mongo",
-                "version": "8.0"
+                "docker_image": "mongo:8.0"
             }),
         };
 
-        // Verify configuration contains image and version
+        // Verify configuration contains docker_image
         assert_eq!(
-            config.parameters.get("image").and_then(|v| v.as_str()),
-            Some("mongo")
-        );
-        assert_eq!(
-            config.parameters.get("version").and_then(|v| v.as_str()),
-            Some("8.0")
+            config
+                .parameters
+                .get("docker_image")
+                .and_then(|v| v.as_str()),
+            Some("mongo:8.0")
         );
     }
 
     #[test]
-    fn test_mongodb_version_upgrade_config() {
+    fn test_mongodb_upgrade_config() {
         // Test simulated upgrade from MongoDB 7.0 to 8.0
         let old_config = ServiceConfig {
             name: "test-mongo".to_string(),
@@ -1374,12 +1361,11 @@ mod tests {
             version: None,
             parameters: serde_json::json!({
                 "host": "localhost",
-                "port": Some("27017"),
+                "port": "27017",
                 "database": "testdb",
                 "username": "testuser",
                 "password": "testpass123",
-                "image": "mongo",
-                "version": "7.0"
+                "docker_image": "mongo:7.0"
             }),
         };
 
@@ -1389,28 +1375,33 @@ mod tests {
             version: None,
             parameters: serde_json::json!({
                 "host": "localhost",
-                "port": Some("27017"),
+                "port": "27017",
                 "database": "testdb",
                 "username": "testuser",
                 "password": "testpass123",
-                "image": "mongo",
-                "version": "8.0"
+                "docker_image": "mongo:8.0"
             }),
         };
 
-        // Verify version upgrade configuration
-        let old_version = old_config
+        // Verify upgrade configuration
+        let old_image = old_config
             .parameters
-            .get("version")
+            .get("docker_image")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let new_version = new_config
+        let new_image = new_config
             .parameters
-            .get("version")
+            .get("docker_image")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        assert_eq!(old_version, "7.0", "Old version should be 7.0");
-        assert_eq!(new_version, "8.0", "New version should be 8.0");
+        assert_eq!(
+            old_image, "mongo:7.0",
+            "Old docker_image should be mongo:7.0"
+        );
+        assert_eq!(
+            new_image, "mongo:8.0",
+            "New docker_image should be mongo:8.0"
+        );
     }
 }

@@ -51,7 +51,7 @@ pub trait Analytics: Send + Sync {
         visitor_id: i32,
     ) -> Result<Option<crate::types::responses::VisitorRecord>, AnalyticsError>;
 
-    /// Get comprehensive visitor statistics
+    /// Get visitor statistics
     async fn get_visitor_statistics(
         &self,
         visitor_id: i32,

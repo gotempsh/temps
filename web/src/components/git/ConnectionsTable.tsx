@@ -3,6 +3,7 @@
 import { useState } from 'react'
 import { ConnectionResponse, ProviderResponse } from '@/api/client/types.gen'
 import { deleteConnectionMutation } from '@/api/client/@tanstack/react-query.gen'
+import { isGitHubApp, isGitLabOAuth } from '@/lib/provider'
 import { UpdateTokenDialog } from '@/components/git/UpdateTokenDialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -54,8 +55,8 @@ interface ConnectionsTableProps {
   provider?: ProviderResponse
   onSyncRepository: (connectionId: number) => void
   onAuthorize?: () => void
+  onInstallGitHubApp?: () => void
   isSyncing: boolean
-  isAuthorizing?: boolean
   onConnectionDeleted?: () => void
 }
 
@@ -66,8 +67,8 @@ export function ConnectionsTable({
   provider,
   onSyncRepository,
   onAuthorize,
+  onInstallGitHubApp,
   isSyncing,
-  isAuthorizing = false,
   onConnectionDeleted,
 }: ConnectionsTableProps) {
   const queryClient = useQueryClient()
@@ -127,14 +128,6 @@ export function ConnectionsTable({
     setCurrentPage(1) // Reset to first page when changing page size
   }
 
-  // Helper to check if provider is OAuth-based (GitHub App or GitLab OAuth)
-  const isOAuthProvider =
-    provider &&
-    ((provider.provider_type === 'github' &&
-      (provider.auth_method === 'app' ||
-        provider.auth_method === 'github_app')) ||
-      (provider.provider_type === 'gitlab' && provider.auth_method === 'oauth'))
-
   // Helper to check if provider is PAT-based (GitHub PAT or GitLab PAT)
   const isPATProvider =
     provider &&
@@ -152,21 +145,18 @@ export function ConnectionsTable({
   return (
     <div className="space-y-4">
       {/* Action Buttons */}
-      {isOAuthProvider && onAuthorize && (
-        <div className="flex justify-end">
-          <Button
-            variant="default"
-            size="sm"
-            onClick={onAuthorize}
-            disabled={isAuthorizing}
-            className="gap-2"
-          >
-            <ExternalLink className="h-4 w-4" />
-            {isAuthorizing ? 'Authorizing...' : 'Authorize'}
-          </Button>
-        </div>
+      {provider && isGitHubApp(provider) && (
+        <Button onClick={onInstallGitHubApp} className="gap-2">
+          <ExternalLink className="h-4 w-4" />
+          Install GitHub App
+        </Button>
       )}
-
+      {provider && isGitLabOAuth(provider) && (
+        <Button onClick={onAuthorize} className="gap-2">
+          <ExternalLink className="h-4 w-4" />
+          Authorize
+        </Button>
+      )}
       {/* Table */}
       <div className="overflow-x-auto">
         <Table>
@@ -288,8 +278,8 @@ export function ConnectionsTable({
                         <Key className="h-4 w-4" />
                       </Button>
                     )}
-                    {/* Only show Delete button for OAuth-based providers */}
-                    {isOAuthProvider && (
+                    {/* Only show Delete button for GitHub App providers */}
+                    {provider && isGitHubApp(provider) && (
                       <Button
                         variant="ghost"
                         size="sm"

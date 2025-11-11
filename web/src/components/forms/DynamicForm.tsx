@@ -1,4 +1,3 @@
-import { ServiceTypeParameterResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import {
   Form,
@@ -172,7 +171,11 @@ export function DynamicForm({
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
+      <form
+        onSubmit={form.handleSubmit(handleSubmit)}
+        className="space-y-6"
+        autoComplete="off"
+      >
         {parameters.map((param, index) => {
           const nextParam = parameters[index + 1]
           const shouldPair = isPairedField(param.name, nextParam?.name)
@@ -187,7 +190,6 @@ export function DynamicForm({
           if (shouldPair && nextParam) {
             return (
               <div key={param.name} className="grid grid-cols-2 gap-4">
-                {/* First field */}
                 <FormField
                   control={form.control}
                   name={param.name as keyof FormValues}
@@ -203,6 +205,7 @@ export function DynamicForm({
                       <FormControl>
                         <Input
                           {...field}
+                          autoComplete="new-password"
                           type={param.encrypted ? 'password' : 'text'}
                           placeholder={param.default_value || undefined}
                         />
@@ -231,6 +234,7 @@ export function DynamicForm({
                       <FormControl>
                         <Input
                           {...field}
+                          autoComplete="new-password"
                           type={nextParam.encrypted ? 'password' : 'text'}
                           placeholder={nextParam.default_value || undefined}
                         />
@@ -294,6 +298,7 @@ export function DynamicForm({
                       // Render Input for fields without choices
                       <Input
                         {...field}
+                        autoComplete="new-password"
                         type={param.encrypted ? 'password' : 'text'}
                         placeholder={param.default_value || undefined}
                       />

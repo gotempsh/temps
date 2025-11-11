@@ -12,6 +12,7 @@ use rand::Rng;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use std::future::IntoFuture;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use temps_analytics::AnalyticsPlugin;
 use temps_analytics_events::EventsPlugin;
@@ -382,6 +383,32 @@ async fn serve_static_file(req: Request) -> Response {
     }
 }
 
+/// Validate GeoLite2-City database exists (must be downloaded by user)
+/// No system dependencies - database file must be placed manually
+fn validate_geolite2_database(db_path: &PathBuf) -> anyhow::Result<()> {
+    if !db_path.exists() {
+        return Err(anyhow::anyhow!(
+            "❌ GeoLite2-City.mmdb not found\n\n\
+            The MaxMind GeoLite2 database is required for geolocation features.\n\n\
+            📍 Expected location: {}\n\n\
+            📥 Setup (once, takes 2 minutes):\n\
+            1. Visit: https://www.maxmind.com/en/geolite2/geolite2-free-data-sources\n\
+            2. Create free MaxMind account (if needed)\n\
+            3. Download 'GeoLite2-City' (GZIP format: .tar.gz)\n\
+            4. Extract the archive:\n\
+               tar xzf GeoLite2-City_*.tar.gz\n\n\
+            5. Copy the database file to data directory:\n\
+               cp GeoLite2-City_*/GeoLite2-City.mmdb {}\n\n\
+            6. Start the server again\n\n\
+            🐳 For Docker users:\n\
+            See Dockerfile in the repository for embedding the database",
+            db_path.display(),
+            db_path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Initialize and start the console API server
 pub async fn start_console_api(
     db: Arc<DbConnection>,
@@ -391,9 +418,68 @@ pub async fn start_console_api(
     route_table: Arc<temps_proxy::CachedPeerTable>,
     ready_signal: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> anyhow::Result<()> {
-    let docker = bollard::Docker::connect_with_defaults()
-        .map_err(|e| anyhow::anyhow!("Failed to connect to docker: {}", e))?;
+    // PRE-VALIDATE all plugin dependencies BEFORE initializing plugin manager
+    // This ensures clear error messages if any critical resources are missing
+    debug!("Pre-validating plugin dependencies...");
+
+    // 1. Validate Docker connectivity
+    debug!("Checking Docker daemon connectivity...");
+    let docker = match bollard::Docker::connect_with_defaults() {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "❌ Docker dependency check FAILED\n\n\
+                The system requires Docker to be running and accessible.\n\n\
+                Error details: {}\n\n\
+                Solutions:\n\
+                1. Ensure Docker daemon is running\n\
+                   - macOS: Check Docker Desktop application\n\
+                   - Linux: Run 'sudo systemctl start docker'\n\n\
+                2. Verify Docker socket permissions\n\
+                   - Linux: Run 'sudo usermod -aG docker $USER'\n\n\
+                3. Check Docker environment variables\n\
+                   - DOCKER_HOST may need to be set\n\n\
+                Deployment features will not be available until Docker is accessible.",
+                e
+            ));
+        }
+    };
     let docker = Arc::new(docker);
+    debug!("✓ Docker daemon is accessible");
+
+    // 2. Validate GeoPlugin dependencies (GeoLite2 database)
+    debug!("Checking GeoLite2 database...");
+    let geo_db_path = config.data_dir.join("GeoLite2-City.mmdb");
+    validate_geolite2_database(&geo_db_path)?;
+    debug!("✓ GeoLite2 database file found");
+
+    // 3. Validate logs directory is writable
+    debug!("Checking logs directory...");
+    let logs_dir = config.data_dir.join("logs");
+    if let Err(e) = std::fs::create_dir_all(&logs_dir) {
+        return Err(anyhow::anyhow!(
+            "❌ Logs directory creation FAILED\n\n\
+            Cannot create or access the logs directory.\n\n\
+            Path: {}\n\
+            Error: {}\n\n\
+            Solutions:\n\
+            1. Check directory permissions\n\
+               - Ensure write permissions to parent directory: {}\n\n\
+            2. Verify disk space\n\
+               - Run: df -h\n\n\
+            3. Check file ownership\n\
+               - Run: ls -la {}\n\n\
+            Logs are required for system diagnostics and operation tracking.",
+            logs_dir.display(),
+            e,
+            config.data_dir.display(),
+            config.data_dir.display()
+        ));
+    }
+    debug!("✓ Logs directory is accessible");
+
+    debug!("✓ All plugin dependencies validated successfully");
+
     // Initialize plugin manager
     let mut plugin_manager = PluginManager::new();
 
@@ -451,7 +537,7 @@ pub async fn start_console_api(
     let performance_plugin = Box::new(PerformancePlugin);
     plugin_manager.register_plugin(performance_plugin);
 
-    // 4. GeoPlugin - provides geolocation services (depends on database)
+    // 4. GeoPlugin - provides geolocation services (database validated in pre-validation)
     debug!("Registering GeoPlugin");
     let geo_plugin = Box::new(GeoPlugin::new());
     plugin_manager.register_plugin(geo_plugin);
@@ -552,10 +638,24 @@ pub async fn start_console_api(
 
     // Initialize all plugins
     debug!("Initializing plugins");
-    plugin_manager
-        .initialize_plugins()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to initialize plugins: {}", e))?;
+    if let Err(e) = plugin_manager.initialize_plugins().await {
+        let error_msg = format!("{}", e);
+        tracing::error!("❌ Plugin initialization FAILED");
+        tracing::error!("Error: {}", error_msg);
+        tracing::error!("Error details: {:?}", e);
+        tracing::error!("");
+        tracing::error!("Most common causes:");
+        tracing::error!("  • Missing GeoLite2-City.mmdb file");
+        tracing::error!("  • Database connection failed");
+        tracing::error!("  • Service initialization error");
+        tracing::error!("");
+        tracing::error!("Check the error message above for details.");
+        return Err(anyhow::anyhow!(
+            "Plugin initialization failed: {}",
+            error_msg
+        ));
+    }
+    debug!("All plugins initialized successfully");
 
     // Check if any users exist, if not prompt for admin email
     let service_context = plugin_manager.service_context();

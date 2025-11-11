@@ -614,6 +614,10 @@ export type CreateEmailProviderRequest = {
 export type CreateEnvironmentRequest = {
     branch: string;
     name: string;
+    /**
+     * If true, set this environment as the preview environment for the project
+     */
+    set_as_preview?: boolean;
 };
 
 export type CreateEnvironmentVariableRequest = {
@@ -3661,6 +3665,13 @@ export type SessionSummary = {
     started_at: string;
 };
 
+export type SetPreviewEnvironmentRequest = {
+    /**
+     * Environment ID to set as preview
+     */
+    environment_id: number;
+};
+
 /**
  * Response for successful settings update
  */
@@ -4049,7 +4060,10 @@ export type TokenRenewalRequest = {
 export type TriggerPipelinePayload = {
     branch?: string | null;
     commit?: string | null;
-    environment_id: number;
+    /**
+     * Optional environment ID - if not provided, will use the project's preview environment
+     */
+    environment_id?: number | null;
     tag?: string | null;
 };
 
@@ -4487,20 +4501,24 @@ export type ViewsOverTimeQuery = {
 };
 
 export type VisitorDetails = {
-    bounce_rate: number;
     city?: string | null;
     country?: string | null;
+    country_code?: string | null;
     crawler_name?: string | null;
     custom_data?: unknown;
-    engagement_rate: number;
+    environment_id: number;
     first_seen: string;
     id: number;
+    ip_address?: string | null;
+    ip_address_id?: number | null;
     is_crawler: boolean;
+    is_eu?: boolean | null;
     last_seen: string;
-    location?: string | null;
-    total_events: number;
-    total_page_views: number;
-    total_sessions: number;
+    latitude?: number | null;
+    longitude?: number | null;
+    project_id: number;
+    region?: string | null;
+    timezone?: string | null;
     user_agent?: string | null;
     visitor_id: string;
 };
@@ -13987,6 +14005,40 @@ export type CreateMonitorResponses = {
 };
 
 export type CreateMonitorResponse = CreateMonitorResponses[keyof CreateMonitorResponses];
+
+export type SetPreviewEnvironmentData = {
+    body: SetPreviewEnvironmentRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/preview-environment';
+};
+
+export type SetPreviewEnvironmentErrors = {
+    /**
+     * Invalid input
+     */
+    400: unknown;
+    /**
+     * Project or environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetPreviewEnvironmentResponses = {
+    /**
+     * Preview environment set successfully
+     */
+    200: unknown;
+};
 
 export type UpdateProjectSettingsData = {
     body: UpdateProjectSettingsRequest;

@@ -1,36 +1,114 @@
-version: '3.8'
+version: '3.9'
 
 services:
-  timescaledb:
+  # PostgreSQL Database (with TimescaleDB extension)
+  postgres:
     image: timescale/timescaledb:latest-pg17
+    container_name: temps-postgres
     restart: always
-    ports:
-      - "5432:5432"
     environment:
-      # Default environment variables for TimescaleDB HA
-      POSTGRES_DB: postgres
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
+      POSTGRES_DB: temps
+      POSTGRES_USER: temps
+      POSTGRES_PASSWORD: temps_password_change_me
       # TimescaleDB specific settings
       TIMESCALEDB_TELEMETRY: off
       # Connection settings
       POSTGRES_HOST_AUTH_METHOD: md5
+    ports:
+      - "5432:5432"
     volumes:
-      - timescaledb_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
       - ./timescaledb.conf:/etc/postgresql/postgresql.conf:ro
     networks:
-      - timescale_network
+      - temps-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U temps"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 30s
 
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: temps-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - temps-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Temps Application
+  # Note: Before running, ensure GeoLite2-City.mmdb is downloaded and placed in ./data/
+  #       See Dockerfile for instructions
+  temps:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Uncomment and set your MaxMind license key to embed GeoLite2 database
+        # MAXMIND_LICENSE_KEY: "your_license_key_here"
+    container_name: temps-app
+    restart: unless-stopped
+    environment:
+      # Database configuration
+      TEMPS_DATABASE_URL: postgresql://temps:temps_password_change_me@postgres:5432/temps
+
+      # Server configuration
+      TEMPS_ADDRESS: 0.0.0.0:3000
+      TEMPS_TLS_ADDRESS: 0.0.0.0:3443
+
+      # Console API configuration
+      TEMPS_CONSOLE_ADDRESS: 0.0.0.0:9000
+
+      # Data directory
+      TEMPS_DATA_DIR: /app/data
+
+      # Logging
+      TEMPS_LOG_LEVEL: info
+
+      # Redis configuration (if needed by services)
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "3000:3000"      # HTTP API
+      - "3443:3443"      # HTTPS API (if configured)
+      - "9000:9000"      # Console API
+    volumes:
+      # Persistent data directory
+      - temps_data:/app/data
+
+      # Optional: Mount local GeoLite2 database
+      # Uncomment and update path to your local database file
+      # - ./GeoLite2-City.mmdb:/app/data/GeoLite2-City.mmdb:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - temps-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
 volumes:
-  timescaledb_data:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  temps_data:
     driver: local
 
 networks:
-  timescale_network:
+  temps-network:
     driver: bridge

@@ -72,14 +72,18 @@ export function ContainerConfiguration({
                 <div className="text-sm font-medium text-muted-foreground">
                   Container Port
                 </div>
-                <div className="text-sm font-mono mt-1">{container.container_port}</div>
+                <div className="text-sm font-mono mt-1">
+                  {container.container_port}
+                </div>
               </div>
               {container.host_port && (
                 <div className="p-2 rounded bg-muted">
                   <div className="text-sm font-medium text-muted-foreground">
                     Host Port
                   </div>
-                  <div className="text-sm font-mono mt-1">{container.host_port}</div>
+                  <div className="text-sm font-mono mt-1">
+                    {container.host_port}
+                  </div>
                 </div>
               )}
             </div>
@@ -98,66 +102,73 @@ export function ContainerConfiguration({
             </CardHeader>
             <CardContent>
               <div className="space-y-2 max-h-96 overflow-y-auto">
-                {Array.isArray(container.environment_variables) ? (
-                  container.environment_variables.map((envVar: any, idx: number) => {
-                    let key = ''
-                    let value = ''
+                {Array.isArray(container.environment_variables)
+                  ? container.environment_variables.map(
+                      (envVar: any, idx: number) => {
+                        let key = ''
+                        let value = ''
 
-                    if (typeof envVar === 'string') {
-                      // Handle "KEY=VALUE" format
-                      const [k, v] = envVar.split('=')
-                      key = k
-                      value = v
-                    } else if (typeof envVar === 'object' && envVar !== null) {
-                      // Handle object format - try common property names
-                      if ('name' in envVar && 'value' in envVar) {
-                        key = String((envVar as any).name)
-                        value = String((envVar as any).value)
-                      } else if ('key' in envVar && 'value' in envVar) {
-                        key = String((envVar as any).key)
-                        value = String((envVar as any).value)
-                      } else {
-                        // Fallback: use first two properties
-                        const entries = Object.entries(envVar)
-                        if (entries.length >= 2) {
-                          key = String(entries[0][1])
-                          value = String(entries[1][1])
-                        } else if (entries.length === 1) {
-                          key = String(entries[0][0])
-                          value = String(entries[0][1])
+                        if (typeof envVar === 'string') {
+                          // Handle "KEY=VALUE" format
+                          const [k, v] = envVar.split('=')
+                          key = k
+                          value = v
+                        } else if (
+                          typeof envVar === 'object' &&
+                          envVar !== null
+                        ) {
+                          // Handle object format - try common property names
+                          if ('name' in envVar && 'value' in envVar) {
+                            key = String((envVar as any).name)
+                            value = String((envVar as any).value)
+                          } else if ('key' in envVar && 'value' in envVar) {
+                            key = String((envVar as any).key)
+                            value = String((envVar as any).value)
+                          } else {
+                            // Fallback: use first two properties
+                            const entries = Object.entries(envVar)
+                            if (entries.length >= 2) {
+                              key = String(entries[0][1])
+                              value = String(entries[1][1])
+                            } else if (entries.length === 1) {
+                              key = String(entries[0][0])
+                              value = String(entries[0][1])
+                            }
+                          }
                         }
+
+                        if (!key) return null
+
+                        return (
+                          <div
+                            key={idx}
+                            className="p-2 rounded bg-muted text-sm font-mono"
+                          >
+                            <div className="font-medium text-foreground">
+                              {key}
+                            </div>
+                            <div className="text-muted-foreground break-all">
+                              {value || 'N/A'}
+                            </div>
+                          </div>
+                        )
                       }
-                    }
-
-                    if (!key) return null
-
-                    return (
-                      <div
-                        key={idx}
-                        className="p-2 rounded bg-muted text-sm font-mono"
-                      >
-                        <div className="font-medium text-foreground">{key}</div>
-                        <div className="text-muted-foreground break-all">
-                          {value || 'N/A'}
-                        </div>
-                      </div>
                     )
-                  })
-                ) : (
-                  Object.entries(container.environment_variables).map(
-                    ([key, value]) => (
-                      <div
-                        key={key}
-                        className="p-2 rounded bg-muted text-sm font-mono"
-                      >
-                        <div className="font-medium text-foreground">{key}</div>
-                        <div className="text-muted-foreground break-all">
-                          {String(value)}
+                  : Object.entries(container.environment_variables).map(
+                      ([key, value]) => (
+                        <div
+                          key={key}
+                          className="p-2 rounded bg-muted text-sm font-mono"
+                        >
+                          <div className="font-medium text-foreground">
+                            {key}
+                          </div>
+                          <div className="text-muted-foreground break-all">
+                            {String(value)}
+                          </div>
                         </div>
-                      </div>
-                    )
-                  )
-                )}
+                      )
+                    )}
               </div>
             </CardContent>
           </Card>

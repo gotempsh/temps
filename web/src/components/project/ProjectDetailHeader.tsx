@@ -50,9 +50,7 @@ export function ProjectDetailHeader({
           </Avatar>
           <div className="flex flex-wrap items-center gap-2">
             <h1 className="text-lg font-semibold">{project.slug}</h1>
-            <Badge
-              variant={project.last_deployment ? 'default' : 'outline'}
-            >
+            <Badge variant={project.last_deployment ? 'default' : 'outline'}>
               {project.last_deployment ? 'Deployed' : 'Not deployed'}
             </Badge>
           </div>

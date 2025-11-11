@@ -30,7 +30,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return false
       }
       // Don't retry on 504 or connection errors
-      if (error?.status === 504 || error?.code === 'ECONNREFUSED' || error?.message?.includes('Failed to fetch')) {
+      if (
+        error?.status === 504 ||
+        error?.code === 'ECONNREFUSED' ||
+        error?.message?.includes('Failed to fetch')
+      ) {
         return false
       }
       return failureCount < 1

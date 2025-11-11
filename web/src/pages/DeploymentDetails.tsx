@@ -344,7 +344,10 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
                   {deployment.status}
                 </Badge>
                 {deployment.is_current && (
-                  <Badge variant="default" className="bg-green-600 hover:bg-green-700 flex items-center gap-1">
+                  <Badge
+                    variant="default"
+                    className="bg-green-600 hover:bg-green-700 flex items-center gap-1"
+                  >
                     <CheckCircle2 className="h-3.5 w-3.5" />
                     Current
                   </Badge>
@@ -448,7 +451,8 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
                           Pause Deployment
                         </DropdownMenuItem>
                       )}
-                      {(deployment?.status === 'superseded' || deployment?.status === 'completed') && (
+                      {(deployment?.status === 'superseded' ||
+                        deployment?.status === 'completed') && (
                         <DropdownMenuItem
                           onClick={handleRollbackDeployment}
                           disabled={rollbackDeployment.isPending}

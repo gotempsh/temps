@@ -595,10 +595,7 @@ export function CodeBlock({
             title={showLineNumbers ? 'Hide line numbers' : 'Show line numbers'}
           >
             <Hash
-              className={cn(
-                'h-3 w-3 mr-1',
-                showLineNumbers && 'text-blue-500'
-              )}
+              className={cn('h-3 w-3 mr-1', showLineNumbers && 'text-blue-500')}
             />
             <span className="text-xs">Lines</span>
           </Button>

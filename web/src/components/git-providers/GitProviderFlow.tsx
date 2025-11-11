@@ -90,6 +90,7 @@ export function GitProviderFlow({
   const [gitlabClientSecret, setGitlabClientSecret] = useState('')
   const [gitlabAppName, setGitlabAppName] = useState('GitLab OAuth App')
   const [isPollingInstallations, setIsPollingInstallations] = useState(false)
+  const [isWaitingForWebhook, setIsWaitingForWebhook] = useState(false)
   const pollingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const previousProviderCountRef = useRef<number>(0)
 
@@ -122,6 +123,31 @@ export function GitProviderFlow({
   const externalUrl = wildcardDomain
     ? `https://temps.${wildcardDomain.domain.replace('*.', '')}`
     : null
+
+  // Detect GitHub installation processing from query parameters
+  useEffect(() => {
+    const searchParams = new URLSearchParams(window.location.search)
+    const isProcessingInstallation =
+      searchParams.has('github_installation_processing') ||
+      searchParams.has('github_installation_complete')
+
+    if (isProcessingInstallation) {
+      // Use queueMicrotask to defer state updates and prevent cascading renders
+      queueMicrotask(() => {
+        setIsWaitingForWebhook(true)
+        setIsPollingInstallations(true)
+
+        // Clean up the query param from the URL (prevent re-triggering on refresh)
+        window.history.replaceState({}, '', window.location.pathname)
+
+        toast.info('Setting up GitHub installation...', {
+          description:
+            'Waiting for webhook to process. This usually takes a few seconds.',
+          duration: 5000,
+        })
+      })
+    }
+  }, [])
 
   // Cleanup polling on unmount or when polling stops
   useEffect(() => {
@@ -171,12 +197,20 @@ export function GitProviderFlow({
       if (newGitHubApp) {
         // Use queueMicrotask to defer state updates and avoid cascading renders
         queueMicrotask(() => {
-          // Stop polling
+          // Stop polling and webhook waiting
           setIsPollingInstallations(false)
+          setIsWaitingForWebhook(false)
 
           // Show success message
-          toast.success('GitHub App created successfully!', {
-            description: 'Now install it to connect your repositories',
+          const message = isWaitingForWebhook
+            ? 'GitHub App installation detected!'
+            : 'GitHub App created successfully!'
+          const description = isWaitingForWebhook
+            ? 'Your installation has been processed'
+            : 'Now install it to connect your repositories'
+
+          toast.success(message, {
+            description,
           })
 
           // Switch to method selection to show the "Use Existing GitHub App" option
@@ -188,7 +222,7 @@ export function GitProviderFlow({
     }
 
     previousProviderCountRef.current = currentCount
-  }, [gitProviders, isPollingInstallations])
+  }, [gitProviders, isPollingInstallations, isWaitingForWebhook])
 
   // Check environment for GitHub App compatibility
   const isLocalhost =
@@ -499,6 +533,44 @@ export function GitProviderFlow({
     } else if (currentStep === 'configure-gitlab-app-credentials') {
       setCurrentStep('configure-gitlab-app')
     }
+  }
+
+  if (isWaitingForWebhook) {
+    return (
+      <div className={cn('space-y-6', className)}>
+        <div className="text-center space-y-4 py-12">
+          <div className="flex justify-center">
+            <div className="h-20 w-20 rounded-full bg-blue-100 dark:bg-blue-900/20 flex items-center justify-center">
+              <Loader2 className="h-10 w-10 text-blue-600 dark:text-blue-400 animate-spin" />
+            </div>
+          </div>
+          <div>
+            <h3 className="text-xl sm:text-2xl font-semibold">
+              Setting Up GitHub Installation
+            </h3>
+            <p className="text-sm sm:text-base text-muted-foreground mt-2">
+              Processing your installation webhook...
+            </p>
+            <p className="text-xs sm:text-sm text-muted-foreground mt-4">
+              This usually takes a few seconds. Please wait.
+            </p>
+          </div>
+        </div>
+
+        <Card className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+          <CardContent className="pt-6">
+            <div className="space-y-2">
+              <h4 className="font-medium text-sm">What&apos;s happening?</h4>
+              <ul className="text-sm text-muted-foreground space-y-1 ml-4">
+                <li>• GitHub sent an installation webhook to our servers</li>
+                <li>• We&apos;re verifying and processing your installation</li>
+                <li>• Your GitHub App will be ready to use shortly</li>
+              </ul>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    )
   }
 
   if (currentStep === 'success') {

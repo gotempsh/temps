@@ -57,7 +57,9 @@ export function EnvVariablesDisplay({
         <div className="flex items-center gap-2">
           {showCopy && (
             <CopyButton
-              value={entries.map(([key, value]) => `${key}=${value}`).join('\n')}
+              value={entries
+                .map(([key, value]) => `${key}=${value}`)
+                .join('\n')}
             />
           )}
           {showMaskToggle && (

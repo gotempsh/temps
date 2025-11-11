@@ -3,10 +3,7 @@ import {
   getProviderMetadataOptions,
   getServiceTypeParametersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import {
-  CreateServiceResponse,
-  ServiceTypeRoute,
-} from '@/api/client/types.gen'
+import { CreateServiceResponse, ServiceTypeRoute } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import {
   Form,
@@ -25,12 +22,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { DynamicForm } from '@/components/forms/DynamicForm'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { customAlphabet } from 'nanoid'
 import { ArrowLeft, Loader2 } from 'lucide-react'
+import { customAlphabet } from 'nanoid'
 import { useEffect, useMemo } from 'react'
 import { useForm } from 'react-hook-form'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
@@ -69,14 +65,16 @@ export function CreateService() {
   )
 
   // Fetch parameters for the selected service type
-  const { data: parametersResponse, isLoading: isLoadingParameters } = useQuery({
-    ...getServiceTypeParametersOptions({
-      path: {
-        service_type: serviceType || '',
-      },
-    }),
-    enabled: !!serviceType,
-  })
+  const { data: parametersResponse, isLoading: isLoadingParameters } = useQuery(
+    {
+      ...getServiceTypeParametersOptions({
+        path: {
+          service_type: serviceType || '',
+        },
+      }),
+      enabled: !!serviceType,
+    }
+  )
 
   // Convert JSON schema to parameters array if needed
   const parameters = useMemo(() => {
@@ -331,7 +329,11 @@ export function CreateService() {
 
         {/* Form */}
         <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
+          <form
+            onSubmit={form.handleSubmit(onSubmit)}
+            className="space-y-6"
+            autoComplete="off"
+          >
             {/* Service Name */}
             <FormField
               control={form.control}
@@ -340,7 +342,11 @@ export function CreateService() {
                 <FormItem>
                   <FormLabel>Service Name</FormLabel>
                   <FormControl>
-                    <Input {...field} placeholder={`my-${serviceType}`} />
+                    <Input
+                      {...field}
+                      placeholder={`my-${serviceType}`}
+                      autoComplete="new-password"
+                    />
                   </FormControl>
                   <FormDescription>
                     A unique name to identify this service
@@ -351,7 +357,7 @@ export function CreateService() {
             />
 
             {/* Dynamic Parameters */}
-            {parameters?.map((param: ServiceTypeParameterResponse, index: number) => {
+            {parameters?.map((param, index: number) => {
               // Check if this parameter should be grouped with the next one
               const isHost = param.name === 'host'
               const isUsername = param.name === 'username'
@@ -395,6 +401,7 @@ export function CreateService() {
                               required={param.required}
                               pattern={param.validation_pattern || undefined}
                               placeholder={param.default_value || undefined}
+                              autoComplete="new-password"
                             />
                           </FormControl>
                           {param.description && (
@@ -427,9 +434,8 @@ export function CreateService() {
                               pattern={
                                 nextParam.validation_pattern || undefined
                               }
-                              placeholder={
-                                nextParam.default_value || undefined
-                              }
+                              placeholder={nextParam.default_value || undefined}
+                              autoComplete="new-password"
                             />
                           </FormControl>
                           {nextParam.description && (
@@ -465,11 +471,19 @@ export function CreateService() {
                           // Render Select for fields with choices
                           <Select
                             onValueChange={field.onChange}
-                            value={field.value as string || param.default_value || undefined}
+                            value={
+                              (field.value as string) ||
+                              param.default_value ||
+                              undefined
+                            }
                           >
                             <SelectTrigger>
                               <SelectValue
-                                placeholder={param.default_value ? `Default: ${param.default_value}` : `Select ${param.name}`}
+                                placeholder={
+                                  param.default_value
+                                    ? `Default: ${param.default_value}`
+                                    : `Select ${param.name}`
+                                }
                               />
                             </SelectTrigger>
                             <SelectContent>
@@ -495,6 +509,7 @@ export function CreateService() {
                             required={param.required}
                             pattern={param.validation_pattern || undefined}
                             placeholder={param.default_value || undefined}
+                            autoComplete="new-password"
                           />
                         )}
                       </FormControl>

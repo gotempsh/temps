@@ -110,18 +110,28 @@ impl ServeCommand {
             )
             .await
             {
-                tracing::error!("Failed to start console API server: {}", e);
+                tracing::error!("❌ Failed to start console API server");
+                tracing::error!("Error: {}", e);
+                tracing::error!("Error details: {:?}", e);
                 tracing::error!("Console API server will not be available");
+                tracing::error!(
+                    "Check the logs above for more details about what failed during initialization"
+                );
             }
         });
 
         // Wait for console API to be ready before starting proxy
         info!("Waiting for console API to be ready...");
-        if let Err(err) = rt.block_on(ready_rx) {
-            tracing::error!("Console API failed to start properly: {}", err);
-            return Err(anyhow::anyhow!("Console API failed to start: {}", err));
+        if let Err(_err) = rt.block_on(ready_rx) {
+            tracing::error!("❌ Console API failed to start");
+            tracing::error!("The console API task exited without signaling readiness.");
+            tracing::error!("This usually happens when plugin initialization fails.");
+            tracing::error!("Check the error messages above (starting with '❌ Failed to start console API') for details.");
+            return Err(anyhow::anyhow!(
+                "Console API failed to start - check logs above for the specific error"
+            ));
         }
-        info!("Console API is ready, starting proxy server...");
+        info!("✅ Console API is ready, starting proxy server...");
 
         // Start proxy server (this will block until shutdown)
         start_proxy_server(

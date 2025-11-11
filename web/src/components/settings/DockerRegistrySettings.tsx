@@ -81,8 +81,9 @@ export function DockerRegistrySettings({
             <Alert>
               <AlertCircle className="h-4 w-4" />
               <AlertDescription>
-                Ensure your registry URL is accessible from the deployment environment.
-                Credentials are stored securely and never exposed in API responses.
+                Ensure your registry URL is accessible from the deployment
+                environment. Credentials are stored securely and never exposed
+                in API responses.
               </AlertDescription>
             </Alert>
 
@@ -95,7 +96,8 @@ export function DockerRegistrySettings({
                 {...register('docker_registry.registry_url')}
               />
               <p className="text-sm text-muted-foreground">
-                Full URL to the Docker registry (e.g., https://registry.example.com or https://private.azurecr.io)
+                Full URL to the Docker registry (e.g.,
+                https://registry.example.com or https://private.azurecr.io)
               </p>
             </div>
 
@@ -117,7 +119,10 @@ export function DockerRegistrySettings({
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="registry-password" className="flex items-center gap-2">
+                <Label
+                  htmlFor="registry-password"
+                  className="flex items-center gap-2"
+                >
                   <Lock className="h-4 w-4" />
                   Password / Token
                 </Label>
@@ -131,7 +136,8 @@ export function DockerRegistrySettings({
                   {...register('docker_registry.password')}
                 />
                 <p className="text-sm text-muted-foreground">
-                  Registry password or API token. If masked (shown as ••••••••), it's already saved.
+                  Registry password or API token. If masked (shown as ••••••••),
+                  it's already saved.
                 </p>
               </div>
             </div>
@@ -160,15 +166,14 @@ export function DockerRegistrySettings({
               <Alert variant="destructive">
                 <AlertCircle className="h-4 w-4" />
                 <AlertDescription>
-                  ⚠️ TLS verification is disabled. This should only be used for testing or self-signed certificates in development.
+                  ⚠️ TLS verification is disabled. This should only be used for
+                  testing or self-signed certificates in development.
                 </AlertDescription>
               </Alert>
             )}
 
             <div className="space-y-2">
-              <Label htmlFor="ca-certificate">
-                CA Certificate (Optional)
-              </Label>
+              <Label htmlFor="ca-certificate">CA Certificate (Optional)</Label>
               <Textarea
                 id="ca-certificate"
                 placeholder="-----BEGIN CERTIFICATE-----&#10;MIIDXTCCAkWgAwIBAgIJAJC1/...&#10;-----END CERTIFICATE-----"
@@ -177,7 +182,8 @@ export function DockerRegistrySettings({
                 {...register('docker_registry.ca_certificate')}
               />
               <p className="text-sm text-muted-foreground">
-                PEM-encoded CA certificate for self-signed or private registries. Include the BEGIN/END CERTIFICATE lines.
+                PEM-encoded CA certificate for self-signed or private
+                registries. Include the BEGIN/END CERTIFICATE lines.
               </p>
             </div>
 
@@ -186,11 +192,27 @@ export function DockerRegistrySettings({
               <AlertDescription>
                 <strong>Usage Tips:</strong>
                 <ul className="list-disc list-inside mt-2 space-y-1 text-xs">
-                  <li><strong>Docker Hub:</strong> Leave URL empty or use https://docker.io</li>
-                  <li><strong>Private Registry:</strong> Use full URL (e.g., https://registry.mycompany.com)</li>
-                  <li><strong>Self-signed:</strong> Provide CA certificate and optionally disable TLS verification for testing</li>
-                  <li><strong>Azure Container Registry:</strong> Use https://[name].azurecr.io with service principal credentials</li>
-                  <li><strong>Amazon ECR:</strong> Use registry URL like https://[account-id].dkr.ecr.[region].amazonaws.com with AWS credentials</li>
+                  <li>
+                    <strong>Docker Hub:</strong> Leave URL empty or use
+                    https://docker.io
+                  </li>
+                  <li>
+                    <strong>Private Registry:</strong> Use full URL (e.g.,
+                    https://registry.mycompany.com)
+                  </li>
+                  <li>
+                    <strong>Self-signed:</strong> Provide CA certificate and
+                    optionally disable TLS verification for testing
+                  </li>
+                  <li>
+                    <strong>Azure Container Registry:</strong> Use
+                    https://[name].azurecr.io with service principal credentials
+                  </li>
+                  <li>
+                    <strong>Amazon ECR:</strong> Use registry URL like
+                    https://[account-id].dkr.ecr.[region].amazonaws.com with AWS
+                    credentials
+                  </li>
                 </ul>
               </AlertDescription>
             </Alert>
@@ -199,7 +221,8 @@ export function DockerRegistrySettings({
 
         {!dockerRegistry?.enabled && (
           <div className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
-            External Docker registry is currently disabled. Enable it to use a custom registry for deployments.
+            External Docker registry is currently disabled. Enable it to use a
+            custom registry for deployments.
           </div>
         )}
       </CardContent>

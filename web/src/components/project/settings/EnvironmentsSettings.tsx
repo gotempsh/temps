@@ -54,9 +54,11 @@ export function EnvironmentsSettings({ project }: EnvironmentsSettingsProps) {
   const handleCreateEnvironment = async ({
     name,
     branch,
+    isPreview,
   }: {
     name: string
     branch: string
+    isPreview: boolean
   }) => {
     try {
       await createEnvironment.mutateAsync({
@@ -66,6 +68,7 @@ export function EnvironmentsSettings({ project }: EnvironmentsSettingsProps) {
         body: {
           name,
           branch,
+          is_preview: isPreview,
         },
       })
 
@@ -116,6 +119,7 @@ export function EnvironmentsSettings({ project }: EnvironmentsSettingsProps) {
               onSubmit={handleCreateEnvironment}
               open={open}
               onOpenChange={setOpen}
+              project={project}
             />
           )}
         </div>
@@ -135,6 +139,7 @@ export function EnvironmentsSettings({ project }: EnvironmentsSettingsProps) {
                 onSubmit={handleCreateEnvironment}
                 open={open}
                 onOpenChange={setOpen}
+                project={project}
               />
             </EmptyPlaceholder>
           ) : (

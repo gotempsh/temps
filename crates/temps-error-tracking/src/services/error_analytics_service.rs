@@ -15,7 +15,7 @@ pub struct ErrorAnalyticsService {
     db: Arc<DatabaseConnection>,
 }
 
-/// Comprehensive error dashboard statistics
+/// Error dashboard statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorDashboardStats {
     // Total errors count
@@ -161,7 +161,7 @@ impl ErrorAnalyticsService {
         "1 hour".to_string()
     }
 
-    /// Get comprehensive dashboard statistics
+    /// Get dashboard statistics
     pub async fn get_dashboard_stats(
         &self,
         project_id: i32,

@@ -565,6 +565,52 @@ impl EnvironmentService {
             env_id
         )))
     }
+
+    /// Set an environment as the preview environment for a project
+    pub async fn set_preview_environment(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<(), EnvironmentError> {
+        // Verify the project exists
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| EnvironmentError::Other(e.to_string()))?
+            .ok_or_else(|| {
+                EnvironmentError::NotFound(format!("Project {} not found", project_id))
+            })?;
+
+        // Verify the environment exists and belongs to this project
+        let environment = environments::Entity::find_by_id(environment_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| EnvironmentError::Other(e.to_string()))?
+            .ok_or_else(|| {
+                EnvironmentError::NotFound(format!("Environment {} not found", environment_id))
+            })?;
+
+        if environment.project_id != project_id {
+            return Err(EnvironmentError::InvalidInput(
+                "Environment does not belong to this project".to_string(),
+            ));
+        }
+
+        // Update the project to set the preview_environment_id
+        let mut active_project: projects::ActiveModel = project.into();
+        active_project.preview_environment_id = Set(Some(environment_id));
+        active_project
+            .update(self.db.as_ref())
+            .await
+            .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+
+        info!(
+            "Preview environment set - project_id: {}, environment_id: {}",
+            project_id, environment_id
+        );
+
+        Ok(())
+    }
 }
 
 // #[cfg(test)]

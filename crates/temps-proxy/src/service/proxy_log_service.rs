@@ -230,7 +230,7 @@ impl ProxyLogService {
         Ok(result)
     }
 
-    /// Get proxy logs with comprehensive filters and pagination
+    /// Get proxy logs with filters and pagination
     pub async fn list_with_filters(
         &self,
         start_date: Option<UtcDateTime>,

@@ -12,7 +12,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use temps_entities::{events, ip_geolocations, visitor};
 
-/// Test helper for comprehensive analytics event testing
+/// Test helper for analytics event testing
 #[cfg(test)]
 pub struct AnalyticsTestHelper {
     pub service: AnalyticsService,
@@ -45,7 +45,7 @@ impl AnalyticsTestHelper {
         })
     }
 
-    /// Store comprehensive test analytics events
+    /// Store test analytics events
     pub async fn store_test_events(&self) -> anyhow::Result<TestDataSet> {
         // Clean any existing data
         self.cleanup().await?;
@@ -114,7 +114,7 @@ impl AnalyticsTestHelper {
             .create_geolocation("CA", "Ontario", "Toronto", 43.6532, -79.3832)
             .await?;
 
-        // Create comprehensive event dataset
+        // Create event dataset
         let events = vec![
             // Visitor 1 - Complete user journey
             TestEvent {

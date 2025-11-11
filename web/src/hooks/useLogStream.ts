@@ -66,9 +66,7 @@ export function useLogStream({
   const containerWidth = useRef<number>(0)
 
   const filteredLogs = searchTerm
-    ? logs.filter((log) =>
-        log.toLowerCase().includes(searchTerm.toLowerCase())
-      )
+    ? logs.filter((log) => log.toLowerCase().includes(searchTerm.toLowerCase()))
     : logs
 
   const virtualizer = useVirtualizer({
@@ -93,7 +91,12 @@ export function useLogStream({
 
     try {
       // Add timestamps query parameter to request server-side timestamps
-      const url = new URL(wsUrl, typeof window !== 'undefined' ? window.location.origin : 'http://localhost')
+      const url = new URL(
+        wsUrl,
+        typeof window !== 'undefined'
+          ? window.location.origin
+          : 'http://localhost'
+      )
       url.searchParams.set('timestamps', showTimestamps.toString())
 
       const ws = new WebSocket(url.toString())
@@ -115,10 +118,7 @@ export function useLogStream({
           } else if (parsed.log) {
             setLogs((prev) => [...prev, parsed.log])
           } else {
-            setLogs((prev) => [
-              ...prev,
-              JSON.stringify(parsed, null, 2),
-            ])
+            setLogs((prev) => [...prev, JSON.stringify(parsed, null, 2)])
           }
         } catch {
           const line = event.data.trim()
@@ -194,9 +194,7 @@ export function useLogStream({
     (index: number) => {
       if (index >= 0 && index < filteredLogs.length) {
         setCurrentMatchIndex(index)
-        const element = document.querySelector(
-          `[data-match-index="${index}"]`
-        )
+        const element = document.querySelector(`[data-match-index="${index}"]`)
         element?.scrollIntoView({
           behavior: 'smooth',
           block: 'center',
@@ -215,9 +213,7 @@ export function useLogStream({
   const handlePrevMatch = () => {
     if (filteredLogs.length === 0) return
     const prevIndex =
-      currentMatchIndex <= 0
-        ? filteredLogs.length - 1
-        : currentMatchIndex - 1
+      currentMatchIndex <= 0 ? filteredLogs.length - 1 : currentMatchIndex - 1
     scrollToMatch(prevIndex)
   }
 

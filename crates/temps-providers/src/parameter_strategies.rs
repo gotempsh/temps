@@ -203,7 +203,7 @@ impl ParameterStrategy for RedisParameterStrategy {
     }
 
     fn updateable_keys(&self) -> Vec<&'static str> {
-        vec!["port", "docker_image", "image", "version"]
+        vec!["port", "docker_image"]
     }
 
     fn readonly_keys(&self) -> Vec<&'static str> {
@@ -424,7 +424,7 @@ impl ParameterStrategy for MongodbParameterStrategy {
     }
 
     fn updateable_keys(&self) -> Vec<&'static str> {
-        vec!["port", "docker_image", "image", "version"]
+        vec!["port", "docker_image"]
     }
 
     fn readonly_keys(&self) -> Vec<&'static str> {
@@ -588,28 +588,26 @@ mod tests {
     }
 
     #[test]
-    fn test_redis_updateable_image_version() {
+    fn test_redis_updateable_docker_image() {
         let strategy = RedisParameterStrategy;
         let mut updates = HashMap::new();
         updates.insert(
-            "image".to_string(),
+            "docker_image".to_string(),
             JsonValue::String("redis:8-alpine".to_string()),
         );
-        updates.insert("version".to_string(), JsonValue::String("8".to_string()));
 
         let result = strategy.validate_for_update(&updates);
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_mongodb_updateable_image_version() {
+    fn test_mongodb_updateable_docker_image() {
         let strategy = MongodbParameterStrategy;
         let mut updates = HashMap::new();
         updates.insert(
-            "image".to_string(),
-            JsonValue::String("mongo:9".to_string()),
+            "docker_image".to_string(),
+            JsonValue::String("mongo:9.0".to_string()),
         );
-        updates.insert("version".to_string(), JsonValue::String("9".to_string()));
 
         let result = strategy.validate_for_update(&updates);
         assert!(result.is_ok());

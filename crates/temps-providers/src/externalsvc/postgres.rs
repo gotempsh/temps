@@ -403,7 +403,7 @@ impl PostgresService {
                 interval: Some(1000000000), // 1 second
                 timeout: Some(3000000000),  // 3 seconds
                 retries: Some(3),
-                start_period: Some(5000000000),   // 5 seconds
+                start_period: Some(30000000000), // 30 seconds - gives PostgreSQL time to initialize
                 start_interval: Some(1000000000), // 1 second
             }),
             ..Default::default()

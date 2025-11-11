@@ -839,7 +839,7 @@ pub async fn list_repositories_by_provider(
 
 /// List synced repositories with advanced filtering
 ///
-/// Lists repositories that have been synced to the database with comprehensive filtering options.
+/// Lists repositories that have been synced to the database with filtering options.
 /// This provides fast access to repository metadata with filtering by connection, search, and other criteria.
 #[utoipa::path(
     get,

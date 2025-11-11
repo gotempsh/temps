@@ -88,7 +88,9 @@ export default function EmptyStateStorage({}: EmptyStateStorageProps) {
                         </div>
                         <Button
                           onClick={() =>
-                            navigate(`/storage/create?type=${provider.service_type}`)
+                            navigate(
+                              `/storage/create?type=${provider.service_type}`
+                            )
                           }
                         >
                           Create

@@ -816,7 +816,7 @@ CMD ["echo", "Hello from container"]
     }
 
     #[test]
-    fn test_comprehensive_type_validation() {
+    fn test_type_validation() {
         // Test all our public types can be created and used
 
         // Test ResourceLimits

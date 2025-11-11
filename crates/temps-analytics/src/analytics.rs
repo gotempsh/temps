@@ -409,7 +409,7 @@ impl Analytics for AnalyticsService {
         }))
     }
 
-    /// Get comprehensive visitor statistics
+    /// Get visitor statistics
     async fn get_visitor_statistics(
         &self,
         visitor_id: i32,

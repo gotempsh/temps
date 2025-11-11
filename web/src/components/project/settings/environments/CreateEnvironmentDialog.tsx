@@ -17,14 +17,19 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { Checkbox } from '@/components/ui/checkbox'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { Plus } from 'lucide-react'
 import { useForm } from 'react-hook-form'
 import { z } from 'zod'
+import { ProjectResponse } from '@/api/client'
+import { BranchSelector } from '@/components/deployments/BranchSelector'
+import { useState } from 'react'
 
 const formSchema = z.object({
   name: z.string().min(1, 'Environment name is required').max(50),
   branch: z.string().min(1, 'Branch name is required'),
+  isPreview: z.boolean().default(false),
 })
 
 type FormValues = z.infer<typeof formSchema>
@@ -33,24 +38,29 @@ interface CreateEnvironmentDialogProps {
   onSubmit: (values: FormValues) => Promise<void>
   open: boolean
   onOpenChange: (open: boolean) => void
+  project?: ProjectResponse
 }
 
 export function CreateEnvironmentDialog({
   onSubmit,
   open,
   onOpenChange,
+  project,
 }: CreateEnvironmentDialogProps) {
+  const [branchError, setBranchError] = useState<string | null>(null)
   const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
     defaultValues: {
       name: '',
-      branch: 'main',
+      branch: project?.main_branch || 'main',
+      isPreview: false,
     },
   })
 
   const handleSubmit = async (values: FormValues) => {
     await onSubmit(values)
     form.reset()
+    setBranchError(null)
     onOpenChange(false)
   }
 
@@ -100,12 +110,56 @@ export function CreateEnvironmentDialog({
                 <FormItem>
                   <FormLabel>Git Branch</FormLabel>
                   <FormControl>
-                    <Input
-                      placeholder="e.g., main, develop, feature/branch"
-                      {...field}
+                    {project?.repo_owner && project?.repo_name ? (
+                      <BranchSelector
+                        repoOwner={project.repo_owner}
+                        repoName={project.repo_name}
+                        connectionId={project.git_provider_connection_id || 0}
+                        defaultBranch={project.main_branch}
+                        value={field.value}
+                        onChange={(val) => {
+                          field.onChange(val)
+                          setBranchError(null)
+                        }}
+                        onError={setBranchError}
+                      />
+                    ) : (
+                      <Input
+                        placeholder="e.g., main, develop, feature/branch"
+                        {...field}
+                      />
+                    )}
+                  </FormControl>
+                  {branchError && (
+                    <p className="text-sm font-medium text-destructive">
+                      {branchError}
+                    </p>
+                  )}
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <FormField
+              control={form.control}
+              name="isPreview"
+              render={({ field }) => (
+                <FormItem className="flex flex-row items-center space-x-3 space-y-0 rounded-md border p-4">
+                  <FormControl>
+                    <Checkbox
+                      checked={field.value}
+                      onCheckedChange={field.onChange}
                     />
                   </FormControl>
-                  <FormMessage />
+                  <div className="space-y-1 leading-none">
+                    <FormLabel className="text-base font-normal cursor-pointer">
+                      Preview Environment
+                    </FormLabel>
+                    <p className="text-sm text-muted-foreground">
+                      Branches that don't match any environment will deploy here
+                      (e.g., PRs, feature branches)
+                    </p>
+                  </div>
                 </FormItem>
               )}
             />

@@ -18,8 +18,6 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{error, info};
 
-const REDIS_IMAGE: &str = "redis:7.4.1-alpine";
-
 /// Input configuration for creating a Redis service
 /// This is what users provide when creating the service
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -42,15 +40,10 @@ pub struct RedisInputConfig {
     #[schemars(with = "Option<String>", example = "example_password")]
     pub password: Option<String>,
 
-    /// Docker image to use for Redis
-    #[serde(default = "default_image")]
-    #[schemars(example = "example_image", default = "default_image")]
-    pub image: String,
-
-    /// Redis version
-    #[serde(default = "default_version")]
-    #[schemars(example = "example_version", default = "default_version")]
-    pub version: String,
+    /// Full Docker image reference (e.g., "redis:7-alpine")
+    #[serde(default = "default_docker_image")]
+    #[schemars(example = "example_docker_image", default = "default_docker_image")]
+    pub docker_image: String,
 }
 
 /// Internal runtime configuration for Redis service
@@ -60,8 +53,7 @@ pub struct RedisConfig {
     pub host: String,
     pub port: String,
     pub password: String,
-    pub image: String,
-    pub version: String,
+    pub docker_image: String,
 }
 
 impl From<RedisInputConfig> for RedisConfig {
@@ -74,8 +66,7 @@ impl From<RedisInputConfig> for RedisConfig {
                     .unwrap_or_else(|| "6379".to_string())
             }),
             password: input.password.unwrap_or_else(generate_password),
-            image: input.image,
-            version: input.version,
+            docker_image: input.docker_image,
         }
     }
 }
@@ -117,20 +108,12 @@ fn example_password() -> &'static str {
     "your-secure-password"
 }
 
-fn default_image() -> String {
-    "redis".to_string()
+fn default_docker_image() -> String {
+    "redis:7-alpine".to_string()
 }
 
-fn example_image() -> &'static str {
-    "redis"
-}
-
-fn default_version() -> String {
-    "7-alpine".to_string()
-}
-
-fn example_version() -> &'static str {
-    "7-alpine"
+fn example_docker_image() -> &'static str {
+    "redis:7-alpine"
 }
 
 fn is_port_available(port: u16) -> bool {
@@ -180,14 +163,14 @@ impl RedisService {
     ) -> Result<()> {
         let container_name = self.get_container_name();
 
-        // Pull the Redis image first
-        info!("Pulling Redis image {}", REDIS_IMAGE);
+        // Use the docker_image from config
+        info!("Pulling Redis image {}", config.docker_image);
 
         // Parse image name and tag
-        let (image_name, tag) = if let Some((name, tag)) = REDIS_IMAGE.split_once(':') {
+        let (image_name, tag) = if let Some((name, tag)) = config.docker_image.split_once(':') {
             (name.to_string(), tag.to_string())
         } else {
-            (REDIS_IMAGE.to_string(), "latest".to_string())
+            (config.docker_image.to_string(), "latest".to_string())
         };
 
         docker
@@ -260,7 +243,7 @@ impl RedisService {
             )])),
         });
         let container_config = bollard::models::ContainerCreateBody {
-            image: Some(REDIS_IMAGE.to_string()),
+            image: Some(config.docker_image.clone()),
             exposed_ports: Some(HashMap::from([("6379/tcp".to_string(), HashMap::new())])),
             env: Some(env_vars.iter().map(|s| s.as_str().to_string()).collect()),
             labels: Some(
@@ -575,19 +558,18 @@ impl ExternalService for RedisService {
         let schema = schemars::schema_for!(RedisInputConfig);
         let mut schema_json = serde_json::to_value(schema).ok()?;
 
-        // Add metadata about which fields are editable
+        // Add metadata about which fields are editable (based on RedisParameterStrategy::updateable_keys)
         if let Some(properties) = schema_json
             .get_mut("properties")
             .and_then(|p| p.as_object_mut())
         {
             for key in properties.keys().cloned().collect::<Vec<_>>() {
-                // Define which fields should be editable
+                // Define which fields should be editable - must match RedisParameterStrategy::updateable_keys()
                 let editable = match key.as_str() {
-                    "host" => false,     // Don't change host after creation
-                    "port" => true,      // Port can be changed
-                    "password" => false, // Password is auto-generated and cannot be changed
-                    "image" => true,     // Image can be upgraded
-                    "version" => true,   // Version can be changed
+                    "host" => false,        // Read-only
+                    "port" => true,         // Updateable
+                    "password" => false,    // Read-only
+                    "docker_image" => true, // Updateable
                     _ => false,
                 };
 
@@ -1102,9 +1084,12 @@ impl ExternalService for RedisService {
         let new_redis_config = self.get_redis_config(new_config)?;
 
         // Verify the new image can be pulled BEFORE stopping the old container
-        let new_image = format!("{}:{}", new_redis_config.image, new_redis_config.version);
-        info!("Verifying new Docker image is available: {}", new_image);
-        self.verify_image_pullable(&new_image).await?;
+        info!(
+            "Verifying new Docker image is available: {}",
+            new_redis_config.docker_image
+        );
+        self.verify_image_pullable(&new_redis_config.docker_image)
+            .await?;
         info!("New Docker image verified and is available");
 
         // Stop the old container
@@ -1141,13 +1126,12 @@ mod tests {
             .and_then(|v| v.as_object())
             .expect("Properties should be an object");
 
-        // Define expected editable status for each field
+        // Define expected editable status for each field - must match RedisParameterStrategy::updateable_keys()
         let editable_status = vec![
             ("host", false),
             ("port", true),
-            ("password", true),
-            ("image", true),
-            ("version", true),
+            ("password", false),
+            ("docker_image", true),
         ];
 
         for (field_name, should_be_editable) in editable_status {
@@ -1229,21 +1213,56 @@ mod tests {
 
     #[test]
     fn test_image_and_version_in_config() {
-        // Test Redis configuration with image and version fields
+        // Test Redis configuration with docker_image field
         let input_config = RedisInputConfig {
             host: "localhost".to_string(),
             port: Some("6379".to_string()),
             password: Some("mypassword".to_string()),
-            image: "redis".to_string(),
-            version: "7-alpine".to_string(),
+            docker_image: "redis:7-alpine".to_string(),
         };
 
         // Convert to runtime config
         let runtime_config: RedisConfig = input_config.into();
 
-        // Verify both image and version are preserved
-        assert_eq!(runtime_config.image, "redis");
-        assert_eq!(runtime_config.version, "7-alpine");
+        // Verify docker_image is used directly
+        assert_eq!(runtime_config.docker_image, "redis:7-alpine");
+    }
+
+    #[test]
+    fn test_docker_image_parameter() {
+        // Test Redis configuration with docker_image parameter
+        let input_config = RedisInputConfig {
+            host: "localhost".to_string(),
+            port: Some("6379".to_string()),
+            password: Some("mypassword".to_string()),
+            docker_image: "redis:8-alpine".to_string(),
+        };
+
+        // Convert to runtime config
+        let runtime_config: RedisConfig = input_config.into();
+
+        // Verify docker_image is used
+        assert_eq!(
+            runtime_config.docker_image, "redis:8-alpine",
+            "Docker image should use provided docker_image"
+        );
+    }
+
+    #[test]
+    fn test_docker_image_without_tag() {
+        // Test Redis configuration with docker_image parameter but no tag
+        let input_config = RedisInputConfig {
+            host: "localhost".to_string(),
+            port: Some("6379".to_string()),
+            password: Some("mypassword".to_string()),
+            docker_image: "redis".to_string(), // No tag
+        };
+
+        // Convert to runtime config
+        let runtime_config: RedisConfig = input_config.into();
+
+        // Verify docker_image with no tag is preserved as-is
+        assert_eq!(runtime_config.docker_image, "redis");
     }
 
     #[test]

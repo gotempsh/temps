@@ -14,9 +14,7 @@ interface ContainerLogsViewerProps {
   containerId: string
 }
 
-export function ContainerLogsViewer({
-  fetchUrl,
-}: ContainerLogsViewerProps) {
+export function ContainerLogsViewer({ fetchUrl }: ContainerLogsViewerProps) {
   // Convert HTTP URL to WebSocket URL
   const wsUrl = (() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -164,8 +162,7 @@ export function ContainerLogsViewer({
           {virtualizer.getVirtualItems().map((virtualItem) => {
             const log = filteredLogs[virtualItem.index]
             const isMatch =
-              searchTerm &&
-              log.toLowerCase().includes(searchTerm.toLowerCase())
+              searchTerm && log.toLowerCase().includes(searchTerm.toLowerCase())
 
             return (
               <div
@@ -184,8 +181,9 @@ export function ContainerLogsViewer({
                     className="py-1 break-all"
                     data-match-index={virtualItem.index}
                   >
-                    {log.split(new RegExp(`(${searchTerm})`, 'gi')).map(
-                      (part, i) =>
+                    {log
+                      .split(new RegExp(`(${searchTerm})`, 'gi'))
+                      .map((part, i) =>
                         part.toLowerCase() === searchTerm.toLowerCase() ? (
                           <span
                             key={i}
@@ -196,7 +194,7 @@ export function ContainerLogsViewer({
                         ) : (
                           <span key={i}>{part}</span>
                         )
-                    )}
+                      )}
                   </div>
                 ) : (
                   <div className="py-1 break-all">{log}</div>

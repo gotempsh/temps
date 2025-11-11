@@ -61,7 +61,7 @@ pub fn compute_tls_fingerprint_from_arc(ssl_digest: &Arc<SslDigest>) -> Option<S
     compute_tls_fingerprint(ssl_digest.as_ref())
 }
 
-/// Compute a comprehensive fingerprint with client characteristics
+/// Compute a fingerprint with client characteristics
 ///
 /// Extended fingerprint includes:
 /// - TLS version
@@ -72,7 +72,7 @@ pub fn compute_tls_fingerprint_from_arc(ssl_digest: &Arc<SslDigest>) -> Option<S
 /// This creates a unique identifier per person/device/location,
 /// ensuring different users get different fingerprints even with
 /// the same TLS configuration.
-pub fn compute_comprehensive_fingerprint(
+pub fn compute_fingerprint(
     ssl_digest: &SslDigest,
     ip_address: Option<&str>,
     user_agent: &str,
@@ -111,19 +111,19 @@ pub fn compute_comprehensive_fingerprint(
         ip_address = ip_part,
         user_agent = user_agent,
         fingerprint = fingerprint,
-        "Computed comprehensive client fingerprint"
+        "Computed client fingerprint"
     );
 
     Some(fingerprint)
 }
 
-/// Compute comprehensive fingerprint from Arc<SslDigest> with client characteristics
-pub fn compute_comprehensive_fingerprint_from_arc(
+/// Compute fingerprint from Arc<SslDigest> with client characteristics
+pub fn compute_fingerprint_from_arc(
     ssl_digest: &Arc<SslDigest>,
     ip_address: Option<&str>,
     user_agent: &str,
 ) -> Option<String> {
-    compute_comprehensive_fingerprint(ssl_digest.as_ref(), ip_address, user_agent)
+    compute_fingerprint(ssl_digest.as_ref(), ip_address, user_agent)
 }
 
 #[cfg(test)]

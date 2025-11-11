@@ -39,6 +39,8 @@ pub struct Model {
     pub git_provider_connection_id: Option<i32>,
     /// Attack mode - when enabled, requires CAPTCHA verification for all visitors
     pub attack_mode: bool,
+    /// Preview environment ID - optional FK to designate which environment is for previews
+    pub preview_environment_id: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -53,6 +55,12 @@ pub enum Relation {
         to = "super::git_provider_connections::Column::Id"
     )]
     GitProviderConnection,
+    #[sea_orm(
+        belongs_to = "super::environments::Entity",
+        from = "Column::PreviewEnvironmentId",
+        to = "super::environments::Column::Id"
+    )]
+    PreviewEnvironment,
 }
 
 impl Related<super::env_vars::Entity> for Entity {

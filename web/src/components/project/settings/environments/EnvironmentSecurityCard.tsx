@@ -1,10 +1,6 @@
 import { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import { updateEnvironmentSettingsMutation } from '@/api/client/@tanstack/react-query.gen'
-import {
-  Alert,
-  AlertDescription,
-  AlertTitle,
-} from '@/components/ui/alert'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -87,10 +83,12 @@ export function EnvironmentSecurityCard({
       security: {
         enabled: environment.deployment_config?.security?.enabled ?? undefined,
         headers: {
-          preset: environment.deployment_config?.security?.headers?.preset ?? undefined,
-          contentSecurityPolicy:
-            environment.deployment_config?.security?.headers?.contentSecurityPolicy ??
+          preset:
+            environment.deployment_config?.security?.headers?.preset ??
             undefined,
+          contentSecurityPolicy:
+            environment.deployment_config?.security?.headers
+              ?.contentSecurityPolicy ?? undefined,
           xFrameOptions:
             environment.deployment_config?.security?.headers?.xFrameOptions ??
             undefined,
@@ -109,11 +107,11 @@ export function EnvironmentSecurityCard({
             environment.deployment_config?.security?.rateLimiting
               ?.maxRequestsPerHour ?? undefined,
           whitelistIps:
-            environment.deployment_config?.security?.rateLimiting?.whitelistIps ??
-            [],
+            environment.deployment_config?.security?.rateLimiting
+              ?.whitelistIps ?? [],
           blacklistIps:
-            environment.deployment_config?.security?.rateLimiting?.blacklistIps ??
-            [],
+            environment.deployment_config?.security?.rateLimiting
+              ?.blacklistIps ?? [],
         },
       },
     },
@@ -228,7 +226,8 @@ export function EnvironmentSecurityCard({
               <div className="space-y-0.5">
                 <Label htmlFor="env-attack-mode">Enable Attack Mode</Label>
                 <p className="text-sm text-muted-foreground">
-                  Require CAPTCHA verification for all visitors to this environment
+                  Require CAPTCHA verification for all visitors to this
+                  environment
                 </p>
               </div>
               <Switch
@@ -246,8 +245,9 @@ export function EnvironmentSecurityCard({
                   <InfoIcon className="h-4 w-4" />
                   <AlertTitle>Environment Attack Mode Active</AlertTitle>
                   <AlertDescription>
-                    All visitors to this environment will be required to complete a CAPTCHA challenge
-                    before accessing your application. Sessions are valid for 24 hours.
+                    All visitors to this environment will be required to
+                    complete a CAPTCHA challenge before accessing your
+                    application. Sessions are valid for 24 hours.
                   </AlertDescription>
                 </Alert>
               </>
@@ -260,7 +260,9 @@ export function EnvironmentSecurityCard({
           <div className="space-y-4">
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
-                <Label htmlFor="security-enabled">Enable Security Headers</Label>
+                <Label htmlFor="security-enabled">
+                  Enable Security Headers
+                </Label>
                 <p className="text-sm text-muted-foreground">
                   Apply security headers to HTTP responses
                 </p>
@@ -286,14 +288,18 @@ export function EnvironmentSecurityCard({
                       <Select
                         value={field.value || 'inherit'}
                         onValueChange={(value) => {
-                          field.onChange(value === 'inherit' ? undefined : value)
+                          field.onChange(
+                            value === 'inherit' ? undefined : value
+                          )
                         }}
                       >
                         <SelectTrigger id="security-preset">
                           <SelectValue placeholder="Inherit from project" />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="inherit">Inherit from project</SelectItem>
+                          <SelectItem value="inherit">
+                            Inherit from project
+                          </SelectItem>
                           <SelectItem value="strict">
                             Strict - Maximum security
                           </SelectItem>
@@ -369,7 +375,9 @@ export function EnvironmentSecurityCard({
               <div className="space-y-4">
                 <div className="flex items-center justify-between">
                   <div className="space-y-0.5">
-                    <Label htmlFor="rate-limiting-enabled">Enable Rate Limiting</Label>
+                    <Label htmlFor="rate-limiting-enabled">
+                      Enable Rate Limiting
+                    </Label>
                     <p className="text-sm text-muted-foreground">
                       Limit requests per IP address
                     </p>
@@ -378,7 +386,9 @@ export function EnvironmentSecurityCard({
                     id="rate-limiting-enabled"
                     checked={securityConfig?.enabled ?? false}
                     onCheckedChange={(checked) =>
-                      setValue('security.enabled', checked, { shouldDirty: true })
+                      setValue('security.enabled', checked, {
+                        shouldDirty: true,
+                      })
                     }
                   />
                 </div>
@@ -394,9 +404,12 @@ export function EnvironmentSecurityCard({
                       type="number"
                       min="1"
                       placeholder="Inherit from project"
-                      {...register('security.rateLimiting.maxRequestsPerMinute', {
-                        valueAsNumber: true,
-                      })}
+                      {...register(
+                        'security.rateLimiting.maxRequestsPerMinute',
+                        {
+                          valueAsNumber: true,
+                        }
+                      )}
                     />
                     <p className="text-sm text-muted-foreground">
                       Override project rate limit per minute
@@ -509,7 +522,9 @@ export function EnvironmentSecurityCard({
         <CardFooter>
           <Button
             type="submit"
-            disabled={!isDirty || isSubmitting || updateEnvironmentSettings.isPending}
+            disabled={
+              !isDirty || isSubmitting || updateEnvironmentSettings.isPending
+            }
           >
             Save Security Configuration
           </Button>

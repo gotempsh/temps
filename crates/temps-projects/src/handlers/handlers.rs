@@ -773,8 +773,23 @@ pub async fn trigger_project_pipeline(
     // Get the project for audit logging
     let project = state.project_service.get_project(id).await?;
 
+    // Determine which environment to use: explicit payload or project's preview environment
+    let environment_id = if let Some(env_id) = payload.environment_id {
+        env_id
+    } else if let Some(preview_env_id) = project.preview_environment_id {
+        info!(
+            "No environment specified, using project's preview environment: {}",
+            preview_env_id
+        );
+        preview_env_id
+    } else {
+        return Err(temps_core::error_builder::bad_request()
+            .detail("No environment specified and project has no preview environment configured")
+            .build());
+    };
+
     // Get the environment for audit logging
-    let environment = temps_entities::environments::Entity::find_by_id(payload.environment_id)
+    let environment = temps_entities::environments::Entity::find_by_id(environment_id)
         .filter(temps_entities::environments::Column::ProjectId.eq(id))
         .one(state.project_service.db.as_ref())
         .await
@@ -815,11 +830,11 @@ pub async fn trigger_project_pipeline(
     }
 
     // Trigger the pipeline
-    let (project_id, environment_id, branch, tag, commit) = state
+    let (project_id, triggered_env_id, branch, tag, commit) = state
         .project_service
         .trigger_pipeline(
             id,
-            payload.environment_id,
+            environment_id,
             payload.branch,
             payload.tag,
             payload.commit,
@@ -833,7 +848,7 @@ pub async fn trigger_project_pipeline(
     let response = super::types::TriggerPipelineResponse {
         message: "Pipeline triggered successfully".to_string(),
         project_id,
-        environment_id,
+        environment_id: triggered_env_id,
         branch,
         tag,
         commit,

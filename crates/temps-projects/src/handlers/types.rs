@@ -188,7 +188,8 @@ pub struct TriggerPipelinePayload {
     pub branch: Option<String>,
     pub tag: Option<String>,
     pub commit: Option<String>,
-    pub environment_id: i32,
+    /// Optional environment ID - if not provided, will use the project's preview environment
+    pub environment_id: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

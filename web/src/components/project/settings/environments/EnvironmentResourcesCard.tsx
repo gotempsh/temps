@@ -79,7 +79,8 @@ export function EnvironmentResourcesCard({
       <CardHeader>
         <CardTitle>Resources & Scaling</CardTitle>
         <CardDescription>
-          Configure compute resources, scaling, and network settings for this environment
+          Configure compute resources, scaling, and network settings for this
+          environment
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -208,8 +209,8 @@ export function EnvironmentResourcesCard({
                     placeholder="Auto-detected from image"
                   />
                   <p className="text-xs text-muted-foreground mt-1">
-                    Override the port for this environment. Priority: Image EXPOSE
-                    → This value → Project port → Default (3000)
+                    Override the port for this environment. Priority: Image
+                    EXPOSE → This value → Project port → Default (3000)
                   </p>
                 </div>
               </div>

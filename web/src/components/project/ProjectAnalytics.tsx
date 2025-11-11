@@ -673,7 +673,10 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
       <Route index element={<ProjectAnalyticsOverview project={project} />} />
       <Route path="requests/*" element={<RequestLogs project={project} />} />
       <Route path="funnels/*" element={<FunnelAnalytics project={project} />} />
-      <Route path="live-visitors" element={<LiveVisitors project={project} />} />
+      <Route
+        path="live-visitors"
+        element={<LiveVisitors project={project} />}
+      />
       <Route
         path="visitors/*"
         element={<VisitorAnalytics project={project} />}

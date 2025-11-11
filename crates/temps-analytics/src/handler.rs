@@ -336,7 +336,7 @@ pub async fn get_visitor_info(
     }
 }
 
-/// Get comprehensive visitor statistics
+/// Get visitor statistics
 #[utoipa::path(
     tag = "Analytics",
     get,

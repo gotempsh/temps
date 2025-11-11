@@ -140,7 +140,9 @@ function NavProjects({ projects }: { projects: ProjectResponse[] }) {
 
   return (
     <SidebarGroup
-      className={isMinimal && !isMobile ? '' : 'group-data-[collapsible=icon]:hidden'}
+      className={
+        isMinimal && !isMobile ? '' : 'group-data-[collapsible=icon]:hidden'
+      }
     >
       <SidebarGroupLabel className={isMinimal && !isMobile ? 'hidden' : ''}>
         Projects
@@ -151,7 +153,10 @@ function NavProjects({ projects }: { projects: ProjectResponse[] }) {
             <SidebarMenuButton
               asChild
               tooltip={isMinimal && !isMobile ? item.name : undefined}
-              className={cn('justify-center', (!isMinimal || isMobile) && 'justify-start')}
+              className={cn(
+                'justify-center',
+                (!isMinimal || isMobile) && 'justify-start'
+              )}
             >
               <Link to={`/projects/${item.slug}`}>
                 <Avatar className="size-6">
@@ -167,7 +172,10 @@ function NavProjects({ projects }: { projects: ProjectResponse[] }) {
           <SidebarMenuButton
             asChild
             tooltip={isMinimal && !isMobile ? 'More Projects' : undefined}
-            className={cn('justify-center', (!isMinimal || isMobile) && 'justify-start')}
+            className={cn(
+              'justify-center',
+              (!isMinimal || isMobile) && 'justify-start'
+            )}
           >
             <Link to="/projects">
               <MoreHorizontal />
@@ -262,7 +270,9 @@ function NavSettings({
 
   return (
     <SidebarGroup
-      className={isMinimal && !isMobile ? '' : 'group-data-[collapsible=icon]:hidden'}
+      className={
+        isMinimal && !isMobile ? '' : 'group-data-[collapsible=icon]:hidden'
+      }
     >
       <SidebarGroupLabel className={isMinimal && !isMobile ? 'hidden' : ''}>
         Settings
@@ -331,7 +341,12 @@ export default function AppSidebar() {
                   <img src="/favicon.png" alt="logo" className="size-full" />
                 </div>
                 {(!isMinimal || isMobile) && (
-                  <div className={cn('grid flex-1 text-left text-sm leading-tight', isMinimal && isMobile && 'text-xs')}>
+                  <div
+                    className={cn(
+                      'grid flex-1 text-left text-sm leading-tight',
+                      isMinimal && isMobile && 'text-xs'
+                    )}
+                  >
                     <span className="truncate font-semibold">Temps</span>
                     <span className="truncate text-xs">v1.0.0</span>
                   </div>

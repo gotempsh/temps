@@ -1,7 +1,4 @@
-import {
-  ExternalServiceInfo,
-  ProjectResponse,
-} from '@/api/client'
+import { ExternalServiceInfo, ProjectResponse } from '@/api/client'
 import {
   getServicePreviewEnvironmentVariablesMaskedOptions,
   linkServiceToProjectMutation,

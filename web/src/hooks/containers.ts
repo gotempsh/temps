@@ -5,11 +5,7 @@ import {
   stopContainerMutation,
   restartContainerMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import {
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 
 export function useContainers(projectId: string, environmentId: string) {
@@ -71,7 +67,8 @@ export function useContainerAction(projectId: string, environmentId: string) {
         return await mutationFn(baseParams)
       }
     },
-    onSuccess: (_, { action }) => {
+    onSuccess: (_, { action, containerId }) => {
+      // Invalidate the containers list
       queryClient.invalidateQueries({
         queryKey: listContainersOptions({
           path: {
@@ -80,13 +77,23 @@ export function useContainerAction(projectId: string, environmentId: string) {
           },
         }).queryKey,
       })
-      const actionLabel =
-        action.charAt(0).toUpperCase() + action.slice(1)
+
+      // Invalidate the specific container detail
+      queryClient.invalidateQueries({
+        queryKey: getContainerDetailOptions({
+          path: {
+            project_id: projectId,
+            environment_id: environmentId,
+            container_id: containerId,
+          },
+        }).queryKey,
+      })
+
+      const actionLabel = action.charAt(0).toUpperCase() + action.slice(1)
       toast.success(`Container ${actionLabel.toLowerCase()}ed successfully`)
     },
     onError: (error: any, { action }) => {
-      const actionLabel =
-        action.charAt(0).toUpperCase() + action.slice(1)
+      const actionLabel = action.charAt(0).toUpperCase() + action.slice(1)
       toast.error(
         `Failed to ${action} container: ${error?.message || 'Unknown error'}`
       )

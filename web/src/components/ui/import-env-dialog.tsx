@@ -252,7 +252,9 @@ export function ImportEnvDialog({
         selectedVars.map((v) => ({
           key: v.key,
           value: v.value,
-          ...(showEnvironmentSelection && { environments: selectedEnvironments }),
+          ...(showEnvironmentSelection && {
+            environments: selectedEnvironments,
+          }),
         }))
       )
 
@@ -345,7 +347,8 @@ export function ImportEnvDialog({
                 <div className="border rounded-md max-h-[250px] overflow-auto">
                   <div className="divide-y">
                     {parsedVariables.map((variable, index) => {
-                      const alreadyExists = existingKeys?.has(variable.key) ?? false
+                      const alreadyExists =
+                        existingKeys?.has(variable.key) ?? false
                       return (
                         <div
                           key={index}

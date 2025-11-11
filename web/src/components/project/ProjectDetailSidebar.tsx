@@ -13,8 +13,16 @@ import {
   ScrollText,
   Settings,
   Shield,
+  Key,
+  Globe,
 } from 'lucide-react'
-import { useCallback, useContext, useEffect, useState, createContext } from 'react'
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useState,
+  createContext,
+} from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { Sheet, SheetContent } from '@/components/ui/sheet'
 
@@ -24,12 +32,16 @@ interface MobileSidebarContextType {
   setIsOpen: (open: boolean) => void
 }
 
-const MobileSidebarContext = createContext<MobileSidebarContextType | undefined>(undefined)
+const MobileSidebarContext = createContext<
+  MobileSidebarContextType | undefined
+>(undefined)
 
 export function useMobileSidebar() {
   const context = useContext(MobileSidebarContext)
   if (!context) {
-    throw new Error('useMobileSidebar must be used within a ProjectDetailSidebar')
+    throw new Error(
+      'useMobileSidebar must be used within a ProjectDetailSidebar'
+    )
   }
   return context
 }
@@ -72,8 +84,8 @@ interface NavItem {
   subItems?: { title: string; url: string }[]
 }
 
-
 const baseNavItems: NavItem[] = [
+  // Core Development
   {
     title: 'Project',
     url: 'project',
@@ -86,6 +98,8 @@ const baseNavItems: NavItem[] = [
     icon: GitBranch,
     kbd: 'D',
   },
+
+  // Monitoring & Analytics (High Frequency)
   {
     title: 'Analytics',
     url: 'analytics',
@@ -101,23 +115,6 @@ const baseNavItems: NavItem[] = [
     ],
   },
   {
-    title: 'Request Logs',
-    url: 'analytics/requests',
-    icon: FileText,
-  },
-  {
-    title: 'Storage',
-    url: 'storage',
-    icon: Database,
-    kbd: 'S',
-  },
-  {
-    title: 'Runtime Logs',
-    url: 'runtime',
-    icon: ScrollText,
-    kbd: 'L',
-  },
-  {
     title: 'Error Tracking',
     url: 'errors',
     icon: Shield,
@@ -129,6 +126,44 @@ const baseNavItems: NavItem[] = [
     icon: Activity,
     kbd: 'M',
   },
+
+  // Debugging (Medium Frequency)
+  {
+    title: 'Runtime Logs',
+    url: 'runtime',
+    icon: ScrollText,
+    kbd: 'L',
+  },
+  {
+    title: 'HTTP Requests',
+    url: 'analytics/requests',
+    icon: FileText,
+  },
+
+  // Management (Medium Frequency)
+  {
+    title: 'Domains',
+    url: 'settings/domains',
+    icon: Globe,
+  },
+  {
+    title: 'Storage',
+    url: 'storage',
+    icon: Database,
+    kbd: 'S',
+  },
+
+  // Configuration (Lower Frequency)
+  {
+    title: 'Environment Variables',
+    url: 'settings/environment-variables',
+    icon: Key,
+  },
+  {
+    title: 'Git',
+    url: 'settings/git',
+    icon: GitBranch,
+  },
   {
     title: 'Settings',
     url: 'settings',
@@ -136,9 +171,6 @@ const baseNavItems: NavItem[] = [
     kbd: ',',
     subItems: [
       { title: 'General', url: 'settings/general' },
-      { title: 'Domains', url: 'settings/domains' },
-      { title: 'Environment Variables', url: 'settings/environment-variables' },
-      { title: 'Git', url: 'settings/git' },
       { title: 'Security', url: 'settings/security' },
       { title: 'Cron Jobs', url: 'settings/cron-jobs' },
     ],
@@ -149,11 +181,15 @@ interface MobileSidebarProviderProps {
   children: React.ReactNode
 }
 
-export function MobileSidebarProvider({ children }: MobileSidebarProviderProps) {
+export function MobileSidebarProvider({
+  children,
+}: MobileSidebarProviderProps) {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false)
 
   return (
-    <MobileSidebarContext.Provider value={{ isOpen: isMobileMenuOpen, setIsOpen: setIsMobileMenuOpen }}>
+    <MobileSidebarContext.Provider
+      value={{ isOpen: isMobileMenuOpen, setIsOpen: setIsMobileMenuOpen }}
+    >
       {children}
     </MobileSidebarContext.Provider>
   )
@@ -162,7 +198,10 @@ export function MobileSidebarProvider({ children }: MobileSidebarProviderProps) 
 export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
   const location = useLocation()
   const navigate = useNavigate()
-  const [expandedItems, setExpandedItems] = useState<string[]>(['analytics'])
+  const [expandedItems, setExpandedItems] = useState<string[]>([
+    'analytics',
+    'settings',
+  ])
 
   const isActive = (url: string) => {
     const path = location.pathname
@@ -228,17 +267,18 @@ export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
     [project.slug, navigate]
   )
 
-  // Build nav items including environments (without subItems)
+  // Build nav items including environments
+  // Find the index of Settings (last item in baseNavItems)
+  const settingsIndex = baseNavItems.length - 1
   const navItems: NavItem[] = [
-    ...baseNavItems.slice(0, baseNavItems.length - 1), // All items except Settings
+    ...baseNavItems.slice(0, settingsIndex), // All items before Settings
     // Insert Environments before Settings
     {
       title: 'Environments',
       url: 'environments',
       icon: Layers,
-      kbd: 'V',
     },
-    baseNavItems[baseNavItems.length - 1], // Settings (last item)
+    baseNavItems[settingsIndex], // Settings (last item)
   ]
 
   // Navigation content component (reusable for mobile and desktop)

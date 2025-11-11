@@ -84,9 +84,7 @@ function PermissionsDisplay({ permissions }: PermissionsDisplayProps) {
             className="text-sm h-auto p-0"
             onClick={() => setShowAll(!showAll)}
           >
-            {showAll
-              ? 'Show less'
-              : `Show ${permissions.length - 10} more`}
+            {showAll ? 'Show less' : `Show ${permissions.length - 10} more`}
           </Button>
         )}
       </div>

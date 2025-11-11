@@ -27,7 +27,17 @@ import {
   useUpdateSettings,
   type PlatformSettings,
 } from '@/hooks/useSettings'
-import { AlertCircle, Globe, Image, Link, Loader2, Save, Settings2, Shield, Key } from 'lucide-react'
+import {
+  AlertCircle,
+  Globe,
+  Image,
+  Link,
+  Loader2,
+  Save,
+  Settings2,
+  Shield,
+  Key,
+} from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -233,7 +243,8 @@ export function Settings() {
                       {...register('external_url')}
                     />
                     <p className="text-sm text-muted-foreground">
-                      Used for OAuth callbacks, webhooks, and external integrations
+                      Used for OAuth callbacks, webhooks, and external
+                      integrations
                     </p>
                   </div>
                 </CardContent>
@@ -325,7 +336,9 @@ export function Settings() {
 
                       {screenshots.provider === 'external' && (
                         <div className="space-y-2">
-                          <Label htmlFor="screenshot-url">Screenshot API URL</Label>
+                          <Label htmlFor="screenshot-url">
+                            Screenshot API URL
+                          </Label>
                           <Input
                             id="screenshot-url"
                             type="url"
@@ -342,7 +355,8 @@ export function Settings() {
                           <p className="text-sm text-muted-foreground">
                             Example:{' '}
                             <code className="px-1 py-0.5 bg-muted rounded text-xs">
-                              https://screenshot-worker.example.com/?url={'{url}'}
+                              https://screenshot-worker.example.com/?url=
+                              {'{url}'}
                               &width=1920&height=1080
                             </code>
                           </p>

@@ -18,7 +18,7 @@ use utoipa::OpenApi;
 use super::types::{
     AddEnvironmentDomainRequest, CreateEnvironmentRequest, CreateEnvironmentVariableRequest,
     EnvironmentDomainResponse, EnvironmentInfo, EnvironmentResponse, EnvironmentVariableResponse,
-    EnvironmentVariableValueResponse, GetEnvironmentVariablesQuery,
+    EnvironmentVariableValueResponse, GetEnvironmentVariablesQuery, SetPreviewEnvironmentRequest,
     UpdateEnvironmentSettingsRequest,
 };
 use temps_core::problemdetails::Problem;
@@ -534,6 +534,39 @@ pub async fn update_environment_settings(
     Ok(Json(EnvironmentResponse::from(updated_environment)).into_response())
 }
 
+/// Set an environment as the preview environment for a project
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/preview-environment",
+    tag = "Projects",
+    request_body = SetPreviewEnvironmentRequest,
+    responses(
+        (status = 200, description = "Preview environment set successfully"),
+        (status = 400, description = "Invalid input"),
+        (status = 404, description = "Project or environment not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("project_id" = i32, Path, description = "Project ID")
+    )
+)]
+pub async fn set_preview_environment(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Json(request): Json<SetPreviewEnvironmentRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsWrite);
+
+    // Set the environment as preview
+    state
+        .environment_service
+        .set_preview_environment(project_id, request.environment_id)
+        .await?;
+
+    Ok(StatusCode::OK)
+}
+
 /// Create a new environment for a project
 #[utoipa::path(
     post,
@@ -563,6 +596,14 @@ pub async fn create_environment(
         .create_new_environment(project_id, request.name, request.branch, None)
         .await?;
 
+    // If set_as_preview flag is true, set this environment as the preview environment
+    if request.set_as_preview {
+        state
+            .environment_service
+            .set_preview_environment(project_id, environment.id)
+            .await?;
+    }
+
     Ok((
         StatusCode::CREATED,
         Json(EnvironmentResponse::from(environment)),
@@ -585,6 +626,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/projects/{project_id}/environments/{id_or_slug}/settings",
             put(update_environment_settings),
+        )
+        .route(
+            "/projects/{project_id}/preview-environment",
+            post(set_preview_environment),
         )
         // Environment domains
         .route(
@@ -629,6 +674,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         get_environment,
         create_environment,
         update_environment_settings,
+        set_preview_environment,
         get_environment_domains,
         add_environment_domain,
         delete_environment_domain,
@@ -643,6 +689,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             EnvironmentResponse,
             CreateEnvironmentRequest,
             UpdateEnvironmentSettingsRequest,
+            SetPreviewEnvironmentRequest,
             EnvironmentDomainResponse,
             AddEnvironmentDomainRequest,
             EnvironmentVariableResponse,

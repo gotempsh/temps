@@ -130,7 +130,9 @@ export function FrameworkSelector({
               disabled={isLoading}
               className="text-xs"
             >
-              <RefreshCw className={`h-3 w-3 mr-1 ${isLoading ? 'animate-spin' : ''}`} />
+              <RefreshCw
+                className={`h-3 w-3 mr-1 ${isLoading ? 'animate-spin' : ''}`}
+              />
               Refresh
             </Button>
           )}

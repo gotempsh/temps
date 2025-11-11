@@ -2,10 +2,12 @@ import { getEnvironmentOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { ContainerManagement } from '@/components/containers/ContainerManagement'
-import { EnvironmentSettingsDialog } from '@/components/environments/EnvironmentSettingsDialog'
+import { EnvironmentSettingsContent } from '@/components/environments/EnvironmentSettingsContent'
+import { EnvironmentSidebar } from '@/components/environments/EnvironmentSidebar'
 import { useQuery } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router-dom'
 import { ProjectResponse } from '@/api/client'
+import { useCallback } from 'react'
 
 interface EnvironmentDashboardProps {
   project: ProjectResponse
@@ -17,16 +19,15 @@ export function EnvironmentDashboard({
   environmentId,
 }: EnvironmentDashboardProps) {
   const [searchParams, setSearchParams] = useSearchParams()
-  const showSettings = searchParams.get('settings') === 'true'
+  const activeView = (searchParams.get('view') || 'containers') as string
 
-  const handleSettingsOpen = (open: boolean) => {
-    if (open) {
-      searchParams.set('settings', 'true')
-    } else {
-      searchParams.delete('settings')
-    }
-    setSearchParams(searchParams)
-  }
+  const handleViewChange = useCallback(
+    (view: string) => {
+      searchParams.set('view', view)
+      setSearchParams(searchParams)
+    },
+    [searchParams, setSearchParams]
+  )
 
   // Then, get the environment using the project ID
   const {
@@ -97,25 +98,62 @@ export function EnvironmentDashboard({
     )
   }
 
-  return (
-    <div className="flex flex-col h-full">
-      {/* Main Content */}
-      <div className="flex-1 overflow-auto">
-        <div className="p-6">
+  // Check if the project is static (preset === 'custom' means it's a static site)
+  const isStatic = project?.preset === 'custom'
+
+  // Render content based on active view
+  const renderContent = () => {
+    switch (activeView) {
+      case 'settings':
+        return (
+          <div className="space-y-6">
+            <div>
+              <h2 className="text-2xl font-bold">
+                {environment.name} Settings
+              </h2>
+              <p className="text-sm text-muted-foreground mt-1">
+                Configure domains, environment variables, and resources for this
+                environment.
+              </p>
+            </div>
+            <EnvironmentSettingsContent
+              environment={environment}
+              projectId={project?.id.toString() || ''}
+              environmentId={environmentId.toString()}
+            />
+          </div>
+        )
+      case 'containers':
+      default:
+        return isStatic ? (
+          <div className="flex flex-col items-center justify-center h-96 text-center">
+            <p className="text-muted-foreground">
+              This static site does not have running containers to manage.
+            </p>
+          </div>
+        ) : (
           <ContainerManagement
             projectId={project?.id.toString() || ''}
             environmentId={environmentId.toString()}
           />
-        </div>
-      </div>
+        )
+    }
+  }
 
-      {/* Settings Dialog */}
-      <EnvironmentSettingsDialog
-        open={showSettings}
-        onOpenChange={handleSettingsOpen}
+  return (
+    <div className="flex flex-col lg:flex-row h-full">
+      {/* Sidebar/Navigation */}
+      <EnvironmentSidebar
         environment={environment}
-        projectId={project?.id.toString() || ''}
+        activeView={activeView}
+        onViewChange={handleViewChange}
+        isStatic={isStatic}
       />
+
+      {/* Main Content */}
+      <div className="flex-1 overflow-auto flex flex-col">
+        <div className="flex-1 p-6">{renderContent()}</div>
+      </div>
     </div>
   )
 }

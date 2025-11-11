@@ -142,4 +142,13 @@ pub struct UpdateEnvironmentSettingsRequest {
 pub struct CreateEnvironmentRequest {
     pub name: String,
     pub branch: String,
+    /// If true, set this environment as the preview environment for the project
+    #[serde(default)]
+    pub set_as_preview: bool,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct SetPreviewEnvironmentRequest {
+    /// Environment ID to set as preview
+    pub environment_id: i32,
 }

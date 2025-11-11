@@ -382,7 +382,11 @@ export function ProjectConfigurator({
       (p) => p.slug === presetName
     )
 
-    if (matchingPreset && matchingPreset.default_port !== null && matchingPreset.default_port !== undefined) {
+    if (
+      matchingPreset &&
+      matchingPreset.default_port !== null &&
+      matchingPreset.default_port !== undefined
+    ) {
       form.setValue('port', matchingPreset.default_port, {
         shouldValidate: true,
         shouldDirty: false, // Don't mark as dirty when auto-setting

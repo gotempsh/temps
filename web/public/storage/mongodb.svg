@@ -1,0 +1,14 @@
+<svg viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <!-- MongoDB Leaf Icon -->
+  <defs>
+    <style>
+      .mongodb-leaf { fill: #13AA52; }
+    </style>
+  </defs>
+
+  <!-- Leaf shape -->
+  <path class="mongodb-leaf" d="M128 32C128 32 90 70 90 120C90 160 108 180 128 190C148 180 166 160 166 120C166 70 128 32 128 32Z"/>
+
+  <!-- Inner detail -->
+  <ellipse class="mongodb-leaf" cx="128" cy="100" rx="16" ry="24" opacity="0.8"/>
+</svg>

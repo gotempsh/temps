@@ -54,10 +54,10 @@ pub struct S3InputConfig {
     #[schemars(example = "example_region", default = "default_region")]
     pub region: String,
 
-    /// Docker image to use for MinIO
+    /// Docker image to use for MinIO (e.g., minio/minio:RELEASE.2025-09-07T16-13-09Z)
     #[serde(default = "default_image")]
     #[schemars(example = "example_image", default = "default_image")]
-    pub image: String,
+    pub docker_image: String,
 }
 
 /// Internal runtime configuration for S3/MinIO service
@@ -69,7 +69,7 @@ pub struct S3Config {
     pub secret_key: String,
     pub host: String,
     pub region: String,
-    pub image: String,
+    pub docker_image: String,
 }
 
 impl From<S3InputConfig> for S3Config {
@@ -84,7 +84,7 @@ impl From<S3InputConfig> for S3Config {
             secret_key: input.secret_key.unwrap_or_else(default_secret_key),
             host: input.host,
             region: input.region,
-            image: input.image,
+            docker_image: input.docker_image,
         }
     }
 }
@@ -167,7 +167,7 @@ pub struct S3Service {
 }
 
 impl S3Service {
-    const IMAGE: &'static str = "minio/minio:RELEASE.2025-09-07T16-13-09Z";
+    /// MinIO Client (mc) utility image - used for temporary operations like migration and copy
     const MC_IMAGE: &'static str = "minio/mc:RELEASE.2025-08-13T08-35-41Z";
 
     pub fn new(name: String, docker: Arc<Docker>) -> Self {
@@ -185,13 +185,13 @@ impl S3Service {
 
     async fn create_container(&self, docker: &Docker, config: &S3Config) -> Result<()> {
         // Pull the image first
-        info!("Pulling MinIO image {}", Self::IMAGE);
+        info!("Pulling MinIO image {}", config.docker_image);
 
         // Parse image name and tag
-        let (image_name, tag) = if let Some((name, tag)) = Self::IMAGE.split_once(':') {
+        let (image_name, tag) = if let Some((name, tag)) = config.docker_image.split_once(':') {
             (name.to_string(), tag.to_string())
         } else {
-            (Self::IMAGE.to_string(), "latest".to_string())
+            (config.docker_image.to_string(), "latest".to_string())
         };
 
         docker
@@ -278,7 +278,7 @@ impl S3Service {
         };
 
         let container_config = bollard::models::ContainerCreateBody {
-            image: Some(Self::IMAGE.to_string()),
+            image: Some(config.docker_image.to_string()),
             networking_config,
             exposed_ports: Some(HashMap::from([("9000/tcp".to_string(), HashMap::new())])),
             env: Some(env_vars.iter().map(|s| s.as_str().to_string()).collect()),
@@ -598,20 +598,20 @@ impl ExternalService for S3Service {
         let schema = schemars::schema_for!(S3InputConfig);
         let mut schema_json = serde_json::to_value(schema).ok()?;
 
-        // Add metadata about which fields are editable
+        // Add metadata about which fields are editable (based on S3ParameterStrategy::updateable_keys)
         if let Some(properties) = schema_json
             .get_mut("properties")
             .and_then(|p| p.as_object_mut())
         {
             for key in properties.keys().cloned().collect::<Vec<_>>() {
-                // Define which fields should be editable
+                // Define which fields should be editable - must match S3ParameterStrategy::updateable_keys()
                 let editable = match key.as_str() {
-                    "host" => false,       // Don't change host after creation
-                    "port" => true,        // Port can be changed
-                    "access_key" => false, // Don't change access key after creation
-                    "secret_key" => false, // Don't change secret key after creation
-                    "region" => true,      // Region can be updated
-                    "image" => true,       // Image can be upgraded
+                    "host" => false,        // Read-only
+                    "port" => true,         // Updateable
+                    "access_key" => false,  // Read-only
+                    "secret_key" => false,  // Read-only
+                    "region" => false,      // Read-only
+                    "docker_image" => true, // Updateable
                     _ => false,
                 };
 
@@ -1444,9 +1444,10 @@ impl ExternalService for S3Service {
         // Verify the new image can be pulled BEFORE stopping the old container
         info!(
             "Verifying new Docker image is available: {}",
-            new_s3_config.image
+            new_s3_config.docker_image
         );
-        self.verify_image_pullable(&new_s3_config.image).await?;
+        self.verify_image_pullable(&new_s3_config.docker_image)
+            .await?;
         info!("New Docker image verified and is available");
 
         // Stop the old container
@@ -1510,8 +1511,8 @@ mod tests {
             ("port", true),
             ("access_key", false),
             ("secret_key", false),
-            ("region", true),
-            ("image", true),
+            ("region", false),
+            ("docker_image", true),
         ];
 
         for (field_name, should_be_editable) in editable_status {
@@ -1551,22 +1552,22 @@ mod tests {
 
     #[test]
     fn test_image_field_in_configuration() {
-        // Test S3 configuration with image field
+        // Test S3 configuration with docker_image field
         let input_config = S3InputConfig {
             port: Some("9000".to_string()),
             access_key: Some("minioadmin".to_string()),
             secret_key: Some("minioadmin".to_string()),
             host: "localhost".to_string(),
             region: "us-east-1".to_string(),
-            image: "minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string(),
+            docker_image: "minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string(),
         };
 
         // Convert to runtime config
         let runtime_config: S3Config = input_config.into();
 
-        // Verify image is preserved
+        // Verify docker_image is preserved
         assert_eq!(
-            runtime_config.image,
+            runtime_config.docker_image,
             "minio/minio:RELEASE.2025-09-07T16-13-09Z"
         );
     }

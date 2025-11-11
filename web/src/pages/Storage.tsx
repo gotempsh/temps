@@ -162,7 +162,10 @@ export function Storage() {
 
         <div className="grid gap-4">
           {services.map((service) => (
-            <Card key={service.id} className="transition-colors hover:bg-muted/50">
+            <Card
+              key={service.id}
+              className="transition-colors hover:bg-muted/50"
+            >
               <CardHeader>
                 <div className="flex items-center justify-between">
                   <div

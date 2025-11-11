@@ -10,7 +10,15 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { useQuery } from '@tanstack/react-query'
-import { GitBranch, GitCommit, MoreHorizontal, X, RotateCcw, RefreshCw, CheckCircle2 } from 'lucide-react'
+import {
+  GitBranch,
+  GitCommit,
+  MoreHorizontal,
+  X,
+  RotateCcw,
+  RefreshCw,
+  CheckCircle2,
+} from 'lucide-react'
 import { useCallback, useEffect, useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import { TimeAgo } from '../utils/TimeAgo'
@@ -87,7 +95,10 @@ export default function DeploymentListItem({
           <Badge variant="secondary">{deployment.environment.name}</Badge>
           <DeploymentStatusBadge deployment={deployment} />
           {deployment.is_current && (
-            <Badge variant="default" className="bg-green-600 hover:bg-green-700 flex items-center gap-1">
+            <Badge
+              variant="default"
+              className="bg-green-600 hover:bg-green-700 flex items-center gap-1"
+            >
               <CheckCircle2 className="h-3 w-3" />
               Current
             </Badge>
@@ -162,7 +173,8 @@ export default function DeploymentListItem({
               <RefreshCw className="mr-2 h-4 w-4" />
               Redeploy
             </DropdownMenuItem>
-            {(deployment.status === 'superseded' || deployment.status === 'completed') && (
+            {(deployment.status === 'superseded' ||
+              deployment.status === 'completed') && (
               <DropdownMenuItem
                 onClick={(e) => {
                   e.preventDefault()

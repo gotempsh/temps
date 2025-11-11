@@ -7,6 +7,7 @@ import {
   getEnvironmentOptions,
   getEnvironmentVariablesOptions,
   getEnvironmentVariableValueOptions,
+  teardownEnvironmentMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -17,6 +18,15 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -214,6 +224,7 @@ export function EnvironmentDetail({
   }>()
   const [newDomain, setNewDomain] = useState('')
   const [domainError, setDomainError] = useState<string | null>(null)
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const queryClient = useQueryClient()
 
   // Use prop if provided, otherwise use URL param
@@ -279,6 +290,20 @@ export function EnvironmentDetail({
     onSuccess: () => {
       toast.success('Domain removed successfully')
       refetchDomains()
+    },
+  })
+
+  const deleteEnvironmentMutation = useMutation({
+    ...teardownEnvironmentMutation(),
+    onSuccess: () => {
+      toast.success('Environment deleted successfully')
+      setShowDeleteConfirm(false)
+      queryClient.invalidateQueries({ queryKey: ['environments'] })
+      // Navigate back to environments list
+      window.history.back()
+    },
+    onError: (error: any) => {
+      toast.error(error?.message || 'Failed to delete environment')
     },
   })
 
@@ -523,6 +548,61 @@ export function EnvironmentDetail({
           queryClient.invalidateQueries({ queryKey: ['environment'] })
         }}
       />
+
+      <Card className="border-destructive/50 bg-destructive/5">
+        <CardHeader>
+          <CardTitle className="text-destructive">Danger Zone</CardTitle>
+          <CardDescription>
+            Irreversible and destructive actions
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Deleting this environment will remove all configurations,
+              deployments, and data associated with it. This action cannot be
+              undone.
+            </p>
+            <AlertDialog
+              open={showDeleteConfirm}
+              onOpenChange={setShowDeleteConfirm}
+            >
+              <AlertDialogTrigger asChild>
+                <Button variant="destructive">
+                  <Trash2 className="h-4 w-4 mr-2" />
+                  Delete Environment
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogTitle>Delete Environment</AlertDialogTitle>
+                <AlertDialogDescription>
+                  Are you sure you want to delete the "{environment.name}"
+                  environment? This action cannot be undone.
+                </AlertDialogDescription>
+                <div className="flex justify-end gap-3 mt-6">
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction
+                    onClick={async () => {
+                      await deleteEnvironmentMutation.mutateAsync({
+                        path: {
+                          project_id: project.id || 0,
+                          env_id: Number(environmentId),
+                        },
+                      })
+                    }}
+                    className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                    disabled={deleteEnvironmentMutation.isPending}
+                  >
+                    {deleteEnvironmentMutation.isPending
+                      ? 'Deleting...'
+                      : 'Delete Environment'}
+                  </AlertDialogAction>
+                </div>
+              </AlertDialogContent>
+            </AlertDialog>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   )
 }

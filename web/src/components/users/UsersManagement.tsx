@@ -190,7 +190,9 @@ export function UsersManagement({
           if (!prev) return null
           return {
             ...prev,
-            roles: prev.roles.filter((r) => r.name !== variables.path.role_type),
+            roles: prev.roles.filter(
+              (r) => r.name !== variables.path.role_type
+            ),
           }
         })
       }
@@ -445,7 +447,11 @@ export function UsersManagement({
                       userToManageRoles.roles.map((r) => [r.name, r])
                     ).values()
                   ).map((r) => r.name)
-                  handleRoleChange(userToManageRoles.user.id, value, currentRoles)
+                  handleRoleChange(
+                    userToManageRoles.user.id,
+                    value,
+                    currentRoles
+                  )
                 }}
                 disabled={assignRole.isPending || removeRole.isPending}
                 className="space-y-3"
@@ -456,7 +462,9 @@ export function UsersManagement({
                       userToManageRoles.roles.map((r) => [r.name, r])
                     ).values()
                   )
-                  const isActive = uniqueRoles.some((r) => r.name === role.value)
+                  const isActive = uniqueRoles.some(
+                    (r) => r.name === role.value
+                  )
                   return (
                     <div
                       key={role.value}
@@ -472,7 +480,9 @@ export function UsersManagement({
                         className="flex-1 cursor-pointer space-y-1"
                       >
                         <div className="flex items-center gap-2">
-                          <div className="text-sm font-medium">{role.label}</div>
+                          <div className="text-sm font-medium">
+                            {role.label}
+                          </div>
                           {isActive && (
                             <Badge variant="secondary" className="text-xs">
                               Active

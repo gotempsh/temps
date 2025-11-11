@@ -205,7 +205,7 @@ impl LoadBalancer {
         Ok(host.to_string())
     }
 
-    /// Extract comprehensive TLS fingerprint with client characteristics
+    /// Extract TLS fingerprint with client characteristics
     ///
     /// Returns a fingerprint including:
     /// - TLS version and cipher (from TLS handshake)
@@ -219,18 +219,16 @@ impl LoadBalancer {
         // digest() returns Option<&Digest>, and Digest contains ssl_digest: Option<Arc<SslDigest>>
         if let Some(digest) = session.downstream_session.digest() {
             if let Some(ssl_digest) = &digest.ssl_digest {
-                // Compute comprehensive fingerprint with IP and user agent
-                if let Some(fingerprint) =
-                    tls_fingerprint::compute_comprehensive_fingerprint_from_arc(
-                        ssl_digest,
-                        ctx.ip_address.as_deref(),
-                        &ctx.user_agent,
-                    )
-                {
+                // Compute fingerprint with IP and user agent
+                if let Some(fingerprint) = tls_fingerprint::compute_fingerprint_from_arc(
+                    ssl_digest,
+                    ctx.ip_address.as_deref(),
+                    &ctx.user_agent,
+                ) {
                     ctx.tls_fingerprint = Some(fingerprint.clone());
 
                     debug!(
-                        "Extracted comprehensive fingerprint: {} (IP: {}, UA: {}) for request_id={}",
+                        "Extracted fingerprint: {} (IP: {}, UA: {}) for request_id={}",
                         fingerprint,
                         ctx.ip_address.as_ref().unwrap_or(&"unknown".to_string()),
                         ctx.user_agent,
@@ -1512,7 +1510,7 @@ impl ProxyHttp for LoadBalancer {
         session: &mut PingoraSession,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        // Extract client IP address FIRST (needed for comprehensive TLS fingerprinting)
+        // Extract client IP address FIRST (needed for TLS fingerprinting)
         let client_ip = session
             .client_addr()
             .map(|addr| {
@@ -1522,7 +1520,7 @@ impl ProxyHttp for LoadBalancer {
             .unwrap_or_else(|| "unknown".to_string());
         ctx.ip_address = Some(client_ip.clone());
 
-        // Extract user-agent FIRST (needed for comprehensive TLS fingerprinting)
+        // Extract user-agent FIRST (needed for TLS fingerprinting)
         ctx.user_agent = session
             .req_header()
             .headers

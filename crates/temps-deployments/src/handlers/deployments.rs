@@ -72,7 +72,7 @@ use temps_core::problemdetails::Problem;
     info(
         title = "Deployments API",
         description = "API endpoints for managing deployments, containers, and logs. \
-        Provides comprehensive deployment lifecycle management including rollbacks, pausing/resuming, \
+        Provides deployment lifecycle management including rollbacks, pausing/resuming, \
         real-time log streaming, and container management (start/stop/restart).",
         version = "1.0.0"
     )

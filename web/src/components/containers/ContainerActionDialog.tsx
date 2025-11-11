@@ -35,7 +35,8 @@ export function ContainerActionDialog({
   const actionDescriptions = {
     start: 'This will start the container.',
     stop: 'This will stop the container. Any unsaved data may be lost.',
-    restart: 'This will restart the container. There may be a brief interruption in service.',
+    restart:
+      'This will restart the container. There may be a brief interruption in service.',
   }
 
   const handleConfirm = async () => {

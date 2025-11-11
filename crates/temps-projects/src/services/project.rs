@@ -1267,6 +1267,7 @@ impl ProjectService {
             is_on_demand: false, // Deprecated field, default to false
             deployment_config: deployment_config.clone(),
             attack_mode: db_project.attack_mode,
+            preview_environment_id: db_project.preview_environment_id,
         }
     }
 
@@ -1707,6 +1708,7 @@ mod tests {
                 None,
                 None,
                 Some(Preset::Nixpacks.to_string()),
+                None,
                 None,
             )
             .await;

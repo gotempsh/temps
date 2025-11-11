@@ -47,7 +47,9 @@ interface JsonSchemaFormProps {
   /**
    * Callback when form is submitted
    */
-  onSubmit: (values: Record<string, string | null | number>) => Promise<void> | void
+  onSubmit: (
+    values: Record<string, string | null | number>
+  ) => Promise<void> | void
 
   /**
    * Callback when cancel button is clicked
@@ -287,6 +289,7 @@ export function JsonSchemaForm({
                         ? 'number'
                         : 'text'
                   }
+                  autoComplete="off"
                   placeholder={
                     property.examples?.[0] ||
                     (property.default ? String(property.default) : undefined)

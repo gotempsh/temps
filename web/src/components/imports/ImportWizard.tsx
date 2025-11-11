@@ -822,7 +822,9 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
               <CardContent className="pt-6 space-y-6">
                 {/* Project Name */}
                 <div className="space-y-2">
-                  <Label className="text-base font-semibold">Project Name</Label>
+                  <Label className="text-base font-semibold">
+                    Project Name
+                  </Label>
                   <p className="text-sm text-muted-foreground">
                     Enter a name for your project
                   </p>
@@ -862,7 +864,9 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
 
                 {/* Framework Preset */}
                 <div className="space-y-2">
-                  <Label className="text-base font-semibold">Framework Preset</Label>
+                  <Label className="text-base font-semibold">
+                    Framework Preset
+                  </Label>
                   <p className="text-sm text-muted-foreground">
                     Configure the project type based on the detected framework
                   </p>
@@ -997,8 +1001,10 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
                       <CardHeader>
                         <CardTitle>Environment Variables</CardTitle>
                         <CardDescription>
-                          {Object.keys(importPlan.plan.deployment.env_vars)
-                            .length}{' '}
+                          {
+                            Object.keys(importPlan.plan.deployment.env_vars)
+                              .length
+                          }{' '}
                           environment variable
                           {Object.keys(importPlan.plan.deployment.env_vars)
                             .length === 1
@@ -1016,7 +1022,10 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
                             let key = envKey
                             let value = ''
 
-                            if (typeof envValue === 'object' && envValue !== null) {
+                            if (
+                              typeof envValue === 'object' &&
+                              envValue !== null
+                            ) {
                               // If it's an object with 'key' and 'value' properties
                               const envObj = envValue as any
                               key = envObj.key || envKey

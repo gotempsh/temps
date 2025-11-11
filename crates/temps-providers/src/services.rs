@@ -90,6 +90,12 @@ pub enum ExternalServiceError {
     #[error("Docker operation failed for service {id}: {reason}")]
     DockerError { id: i32, reason: String },
 
+    #[error("Project {project_id} already has a linked service of type '{service_type}'")]
+    DuplicateServiceType {
+        project_id: i32,
+        service_type: String,
+    },
+
     #[error("Internal error: {reason}")]
     InternalError { reason: String },
 }
@@ -966,14 +972,33 @@ impl ExternalServiceManager {
         service_id_val: i32,
         project_id_val: i32,
     ) -> Result<ProjectServiceInfo, ExternalServiceError> {
-        // Verify service exists
-        let _service = self.get_service(service_id_val).await?;
+        // Verify service exists and get its type
+        let service = self.get_service(service_id_val).await?;
+        let service_type = service.service_type.clone();
 
         // Verify project exists
         let _project = projects::Entity::find_by_id(project_id_val)
             .one(self.db.as_ref())
             .await?
             .ok_or(ExternalServiceError::ProjectNotFound { id: project_id_val })?;
+
+        // Check for duplicate service type
+        // Get all existing project_services for this project
+        let existing_links = project_services::Entity::find()
+            .filter(project_services::Column::ProjectId.eq(project_id_val))
+            .all(self.db.as_ref())
+            .await?;
+
+        // Check if any existing service has the same type
+        for existing_link in existing_links {
+            let existing_service = self.get_service(existing_link.service_id).await?;
+            if existing_service.service_type == service_type {
+                return Err(ExternalServiceError::DuplicateServiceType {
+                    project_id: project_id_val,
+                    service_type,
+                });
+            }
+        }
 
         // Create link
         let new_link = project_services::ActiveModel {
@@ -2726,5 +2751,113 @@ mod tests {
 
         // Cleanup
         let _ = manager.delete_service(service_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_prevent_duplicate_service_type_linking() {
+        use temps_entities::preset::Preset;
+        use temps_entities::{external_services, project_services, projects};
+
+        let (_manager, test_db) = setup_test_manager().await;
+
+        // Create a test project
+        let project = projects::ActiveModel {
+            name: Set("test-project-duplicate-services".to_string()),
+            preset: Set(Preset::Static),
+            slug: Set("test-project-duplicate".to_string()),
+            directory: Set(".".to_string()),
+            main_branch: Set("main".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            ..Default::default()
+        };
+        let project = project
+            .insert(test_db.db.as_ref())
+            .await
+            .expect("Failed to create project");
+        let project_id = project.id;
+
+        // Create first PostgreSQL service (directly in database, not via manager)
+        let service_pg1 = external_services::ActiveModel {
+            name: Set("test-postgres-1".to_string()),
+            service_type: Set("postgres".to_string()),
+            version: Set(Some("16".to_string())),
+            status: Set("active".to_string()),
+            slug: Set(Some("test-postgres-1".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let service_pg1 = service_pg1
+            .insert(test_db.db.as_ref())
+            .await
+            .expect("Failed to create first service");
+
+        // Create second PostgreSQL service
+        let service_pg2 = external_services::ActiveModel {
+            name: Set("test-postgres-2".to_string()),
+            service_type: Set("postgres".to_string()),
+            version: Set(Some("16".to_string())),
+            status: Set("active".to_string()),
+            slug: Set(Some("test-postgres-2".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let service_pg2 = service_pg2
+            .insert(test_db.db.as_ref())
+            .await
+            .expect("Failed to create second service");
+
+        // Create an ExternalServiceManager for testing
+        let encryption_key = "test_encryption_key_1234567890ab";
+        let encryption_service = Arc::new(EncryptionService::new(encryption_key).unwrap());
+        let docker = Arc::new(Docker::connect_with_local_defaults().ok().unwrap());
+        let manager = ExternalServiceManager::new(test_db.db.clone(), encryption_service, docker);
+
+        // Link first PostgreSQL service to project
+        let result_link1 = manager
+            .link_service_to_project(service_pg1.id, project_id)
+            .await;
+        assert!(
+            result_link1.is_ok(),
+            "Failed to link first PostgreSQL service: {:?}",
+            result_link1.err()
+        );
+
+        // Try to link second PostgreSQL service (should fail due to duplicate type)
+        let result_link2 = manager
+            .link_service_to_project(service_pg2.id, project_id)
+            .await;
+
+        assert!(
+            result_link2.is_err(),
+            "Expected linking second PostgreSQL service to fail due to duplicate service type"
+        );
+
+        // Verify it's the correct error type
+        match result_link2 {
+            Err(ExternalServiceError::DuplicateServiceType {
+                project_id: pid,
+                service_type,
+            }) => {
+                assert_eq!(pid, project_id);
+                assert_eq!(service_type, "postgres");
+            }
+            _ => panic!(
+                "Expected DuplicateServiceType error, got: {:?}",
+                result_link2
+            ),
+        }
+
+        // Verify first link was created by checking the database
+        let links = project_services::Entity::find()
+            .filter(project_services::Column::ProjectId.eq(project_id))
+            .all(test_db.db.as_ref())
+            .await
+            .expect("Failed to query links");
+
+        assert_eq!(links.len(), 1, "Expected exactly one service link");
+        assert_eq!(links[0].service_id, service_pg1.id);
     }
 }
