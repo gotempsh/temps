@@ -18,6 +18,10 @@ ARG PREBUILT_BINARY
 
 # Install required build dependencies
 RUN apk add --no-cache \
+    bash \
+    build-base \
+    cmake \
+    perl \
     musl-dev \
     pkgconfig \
     openssl-dev \
@@ -27,12 +31,14 @@ RUN apk add --no-cache \
     tar \
     gzip
 
-# Set build cache mount for cargo (speeds up rebuilds)
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
-    cargo install bun
+# Install bun using the official installer (faster and doesn't require nightly Rust)
+RUN curl -fsSL https://bun.sh/install | bash && \
+    ln -s $HOME/.bun/bin/bun /usr/local/bin/bun
 
-# Create app directory and copy source code
+# Create app directory
+RUN mkdir -p /app
+
+# Copy source code
 WORKDIR /build
 COPY . .
 
@@ -47,8 +53,11 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
       echo "Skipping build - will use prebuilt binary"; \
     fi
 
-# If prebuilt binary is provided in build context, copy it to /app/temps
-COPY --chown=root:root ${PREBUILT_BINARY} /app/temps 2>/dev/null || true
+# Copy prebuilt binary if provided in build context
+RUN if [ -n "$PREBUILT_BINARY" ] && [ -f "/build/$PREBUILT_BINARY" ]; then \
+      cp "/build/$PREBUILT_BINARY" /app/temps && \
+      chown root:root /app/temps; \
+    fi
 
 # Verify binary exists
 RUN test -f /app/temps || { \
