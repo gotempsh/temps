@@ -1,6 +1,6 @@
 # Multi-stage build for Temps with embedded MaxMind GeoLite2 database
 # Stage 1: Builder
-FROM rust:1.81-alpine AS builder
+FROM rust:1.90-alpine AS builder
 
 # Install required build dependencies
 RUN apk add --no-cache \
@@ -11,9 +11,7 @@ RUN apk add --no-cache \
     git \
     curl \
     tar \
-    gzip \
-    node \
-    npm
+    gzip
 
 # Set build cache mount for cargo (speeds up rebuilds)
 RUN --mount=type=cache,target=/root/.cargo/registry \
@@ -33,31 +31,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     cargo build --release --bin temps && \
     cp /build/target/release/temps /app/temps
 
-# Stage 2: Download GeoLite2 Database
-# This stage downloads the MaxMind GeoLite2-City database
-# Note: Requires MAXMIND_LICENSE_KEY build argument for production
-FROM curlimages/curl:latest AS geolite2-downloader
-
-ARG MAXMIND_LICENSE_KEY=""
-
-WORKDIR /tmp
-
-# Download GeoLite2-City database from MaxMind
-# This requires a valid MAXMIND_LICENSE_KEY for automated downloads
-# For manual setup, see the instructions below
-RUN if [ -n "$MAXMIND_LICENSE_KEY" ]; then \
-      echo "Downloading GeoLite2-City database..." && \
-      curl -L "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz" \
-        -o GeoLite2-City.tar.gz && \
-      tar xzf GeoLite2-City.tar.gz && \
-      find . -name "GeoLite2-City.mmdb" -exec cp {} /tmp/GeoLite2-City.mmdb \; && \
-      echo "GeoLite2 database downloaded successfully"; \
-    else \
-      echo "WARNING: MAXMIND_LICENSE_KEY not provided. Database will not be embedded." && \
-      echo "To embed the database, build with: --build-arg MAXMIND_LICENSE_KEY=your_key"; \
-    fi
-
-# Stage 3: Runtime
+# Stage 2: Runtime
 FROM alpine:3.20
 
 # Install runtime dependencies
@@ -81,8 +55,17 @@ COPY --from=builder /app/temps /app/temps
 RUN mkdir -p /app/data/logs && \
     chown -R appuser:appgroup /app
 
-# Copy GeoLite2 database if available
-COPY --from=geolite2-downloader --chown=appuser:appgroup /tmp/GeoLite2-City.mmdb* /app/data/ || true
+# Copy GeoLite2 database from local repository if available
+# The database should be placed in the repository root or crates/temps-cli directory
+RUN if [ -f GeoLite2-City.mmdb ]; then \
+      cp GeoLite2-City.mmdb /app/data/GeoLite2-City.mmdb && \
+      chown appuser:appgroup /app/data/GeoLite2-City.mmdb; \
+    elif [ -f crates/temps-cli/GeoLite2-City.mmdb ]; then \
+      cp crates/temps-cli/GeoLite2-City.mmdb /app/data/GeoLite2-City.mmdb && \
+      chown appuser:appgroup /app/data/GeoLite2-City.mmdb; \
+    else \
+      echo "Note: GeoLite2 database not found in repository. Geolocation features will be disabled."; \
+    fi
 
 # Set permissions
 RUN chmod -R 755 /app/data
@@ -103,11 +86,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # Use dumb-init to properly handle signals
 ENTRYPOINT ["/sbin/dumb-init", "--"]
 
-# Default command
-CMD ["/app/temps", "serve", \
-     "--address=0.0.0.0:3000", \
-     "--database-url=postgresql://user:password@postgres:5432/temps", \
-     "--data-dir=/app/data"]
+# Default command (uses environment variables for configuration)
+CMD ["/app/temps", "serve"]
 
 # Build instructions:
 # ==================
@@ -115,12 +95,12 @@ CMD ["/app/temps", "serve", \
 #    docker build -t temps:latest .
 #
 # 2. Build with embedded GeoLite2 database:
-#    docker build -t temps:latest --build-arg MAXMIND_LICENSE_KEY=your_license_key .
-#
-#    To get MAXMIND_LICENSE_KEY:
+#    First, download the GeoLite2-City.mmdb database:
 #    - Visit: https://www.maxmind.com/en/account/login
-#    - Create free account and generate license key
-#    - Use key as build argument
+#    - Create free account and download GeoLite2-City.mmdb
+#    - Place the file in the repository root or crates/temps-cli/
+#    Then build:
+#    docker build -t temps:latest .
 #
 # 3. Run the container:
 #    docker run -d \
@@ -146,10 +126,14 @@ CMD ["/app/temps", "serve", \
 #
 # Notes:
 # ======
-# - If GeoLite2 database is not embedded at build time, you can mount it:
+# - GeoLite2 database should be placed in the repository root or crates/temps-cli/
+#   before building the Docker image for it to be embedded in the image.
+#
+# - If GeoLite2 database is not embedded at build time, you can mount it at runtime:
 #   docker run -v /path/to/GeoLite2-City.mmdb:/app/data/GeoLite2-City.mmdb temps:latest
 #
-# - GeoLite2 database must exist for geolocation features to work
+# - GeoLite2 database is optional but required for geolocation features
 #   Download from: https://www.maxmind.com/en/geolite2/geolite2-free-data-sources
 #
 # - Geolocation features will be disabled if database is missing (non-fatal)
+#   The application will continue to run normally with a warning in logs
