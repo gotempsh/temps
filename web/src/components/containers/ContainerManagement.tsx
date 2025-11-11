@@ -1,28 +1,35 @@
 import { useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { useContainers } from '@/hooks/containers'
 import { ContainerList } from './ContainerList'
 import { ContainerDetail } from './ContainerDetail'
 import { ContainerActionDialog } from './ContainerActionDialog'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { listContainersOptions } from '@/api/client/@tanstack/react-query.gen'
+import { ProjectResponse } from '@/api/client'
 
 interface ContainerManagementProps {
-  projectId: string
+  project: ProjectResponse
   environmentId: string
 }
 
 export function ContainerManagement({
-  projectId,
+  project,
   environmentId,
 }: ContainerManagementProps) {
   const [searchParams, setSearchParams] = useSearchParams()
   const [actionType, setActionType] = useState<
     'start' | 'stop' | 'restart' | null
   >(null)
-
-  const { data: containers, isLoading } = useContainers(
-    projectId,
-    environmentId
-  )
+  const queryClient = useQueryClient()
+  const { data: containers, isLoading } = useQuery({
+    ...listContainersOptions({
+      path: {
+        project_id: project.id,
+        environment_id: parseInt(environmentId),
+      },
+    }),
+    staleTime: 5000,
+  })
 
   // Get container ID from URL params or default to first container
   const userSelectedId = searchParams.get('container')
@@ -85,7 +92,7 @@ export function ContainerManagement({
       <div className="flex-1 overflow-hidden">
         {selectedContainerId && (
           <ContainerDetail
-            projectId={projectId}
+            projectId={project.id.toString()}
             environmentId={environmentId}
             containerId={selectedContainerId}
             tab={selectedTab}
@@ -97,11 +104,22 @@ export function ContainerManagement({
 
       {/* Action Confirm Dialog */}
       <ContainerActionDialog
-        projectId={projectId}
+        projectId={project.id.toString()}
         environmentId={environmentId}
         action={actionType}
         containerId={selectedContainerId}
         onClose={() => setActionType(null)}
+        onSuccess={() => {
+          // Invalidate the containers list
+          queryClient.invalidateQueries({
+            queryKey: listContainersOptions({
+              path: {
+                project_id: project.id,
+                environment_id: parseInt(environmentId),
+              },
+            }).queryKey,
+          })
+        }}
       />
     </div>
   )

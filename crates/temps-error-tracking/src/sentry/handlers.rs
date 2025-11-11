@@ -201,7 +201,11 @@ async fn ingest_sentry_envelope(
     {
         Ok(events) => events,
         Err(e) => {
-            tracing::error!("Failed to parse envelope: {:?}", e);
+            tracing::error!(
+                "Failed to parse envelope for project {}: {:?}",
+                project_id,
+                e
+            );
             return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
         }
     };

@@ -12,7 +12,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, Key, RefreshCw } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useMemo, useState, useEffect } from 'react'
 import { isExpiredTokenError } from '@/utils/errorHandling'
 import { Link } from 'react-router-dom'
 
@@ -24,6 +24,7 @@ interface BranchSelectorProps {
   value?: string
   onChange: (branch: string) => void
   onError?: (error: string | null) => void
+  onBranchesLoaded?: (branches: string[]) => void
   disabled?: boolean
 }
 
@@ -35,6 +36,7 @@ export function BranchSelector({
   value = '',
   onChange,
   onError,
+  onBranchesLoaded,
   disabled = false,
 }: BranchSelectorProps) {
   const [isCustomBranch, setIsCustomBranch] = useState(false)
@@ -116,6 +118,13 @@ export function BranchSelector({
   }, [branchesQuery.data, defaultBranch])
 
   const effectiveBranch = value || defaultBranch || ''
+
+  // Notify parent when branches are loaded
+  useEffect(() => {
+    if (sortedBranches.length > 0 && onBranchesLoaded) {
+      onBranchesLoaded(sortedBranches.map((b) => b.name))
+    }
+  }, [sortedBranches, onBranchesLoaded])
 
   if (hasExpiredToken) {
     return (

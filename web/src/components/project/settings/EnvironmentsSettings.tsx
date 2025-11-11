@@ -20,7 +20,7 @@ interface EnvironmentsSettingsProps {
 
 export function EnvironmentsSettings({ project }: EnvironmentsSettingsProps) {
   const [searchParams, setSearchParams] = useSearchParams()
-
+  console.log('project', project)
   const {
     data: environments,
     refetch,

@@ -7,7 +7,15 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
-import { useContainerAction } from '@/hooks/containers'
+import {
+  startContainerMutation,
+  stopContainerMutation,
+  restartContainerMutation,
+  listContainersOptions,
+  getContainerDetailOptions,
+} from '@/api/client/@tanstack/react-query.gen'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 
 interface ContainerActionDialogProps {
   projectId: string
@@ -15,6 +23,7 @@ interface ContainerActionDialogProps {
   action: 'start' | 'stop' | 'restart' | null
   containerId: string | null
   onClose: () => void
+  onSuccess?: () => void
 }
 
 export function ContainerActionDialog({
@@ -23,8 +32,76 @@ export function ContainerActionDialog({
   action,
   containerId,
   onClose,
+  onSuccess,
 }: ContainerActionDialogProps) {
-  const mutation = useContainerAction(projectId, environmentId)
+  const queryClient = useQueryClient()
+
+  const mutation = useMutation({
+    mutationFn: async ({
+      containerId,
+      action,
+    }: {
+      containerId: string
+      action: 'start' | 'stop' | 'restart'
+    }) => {
+      const baseParams = {
+        path: {
+          project_id: parseInt(projectId),
+          environment_id: parseInt(environmentId),
+          container_id: containerId,
+        },
+      }
+
+      if (action === 'start') {
+        const options = startContainerMutation()
+        if (options.mutationFn) {
+          return await options.mutationFn(baseParams)
+        }
+      } else if (action === 'stop') {
+        const options = stopContainerMutation()
+        if (options.mutationFn) {
+          return await options.mutationFn(baseParams)
+        }
+      } else if (action === 'restart') {
+        const options = restartContainerMutation()
+        if (options.mutationFn) {
+          return await options.mutationFn(baseParams)
+        }
+      }
+      throw new Error(`Invalid action: ${action}`)
+    },
+    onSuccess: (_, { action, containerId }) => {
+      // Invalidate the containers list
+      queryClient.invalidateQueries({
+        queryKey: listContainersOptions({
+          path: {
+            project_id: parseInt(projectId),
+            environment_id: parseInt(environmentId),
+          },
+        }).queryKey,
+      })
+
+      // Invalidate the specific container detail
+      queryClient.invalidateQueries({
+        queryKey: getContainerDetailOptions({
+          path: {
+            project_id: parseInt(projectId),
+            environment_id: parseInt(environmentId),
+            container_id: containerId,
+          },
+        }).queryKey,
+      })
+
+      const actionLabel = action.charAt(0).toUpperCase() + action.slice(1)
+      toast.success(`Container ${actionLabel.toLowerCase()}ed successfully`)
+      onSuccess?.()
+    },
+    onError: (error: any, { action }) => {
+      toast.error(
+        `Failed to ${action} container: ${error?.message || 'Unknown error'}`
+      )
+    },
+  })
 
   const actionLabels = {
     start: 'Start',

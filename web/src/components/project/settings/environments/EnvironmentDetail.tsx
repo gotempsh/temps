@@ -40,7 +40,6 @@ import { TimeAgo } from '@/components/utils/TimeAgo'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  ArrowLeft,
   ExternalLink,
   Eye,
   EyeOff,
@@ -51,13 +50,12 @@ import {
 import { useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
-import { EnvironmentGitConfigCard } from './EnvironmentGitConfigCard'
-import { EnvironmentResourcesCard } from './EnvironmentResourcesCard'
-import { EnvironmentSecurityCard } from './EnvironmentSecurityCard'
+import { EnvironmentConfigurationCard } from './EnvironmentConfigurationCard'
 
 interface EnvironmentDetailProps {
   project: ProjectResponse
   environmentId?: number // Optional: if not provided, will use useParams
+  initialEnvironment?: any // Optional: initial environment data to use as default
 }
 
 function EnvironmentDetailSkeleton() {
@@ -218,6 +216,7 @@ function CurrentDeployment({
 export function EnvironmentDetail({
   project,
   environmentId: propEnvironmentId,
+  initialEnvironment,
 }: EnvironmentDetailProps) {
   const { environmentId: paramEnvironmentId } = useParams<{
     environmentId: string
@@ -229,8 +228,10 @@ export function EnvironmentDetail({
 
   // Use prop if provided, otherwise use URL param
   const environmentId = propEnvironmentId ?? Number(paramEnvironmentId)
+
+  // Use the passed initialEnvironment if available, otherwise fetch
   const {
-    data: environment,
+    data: environment = initialEnvironment,
     isLoading: isLoadingEnvironment,
     error: environmentError,
   } = useQuery({
@@ -240,6 +241,10 @@ export function EnvironmentDetail({
         env_id: Number(environmentId!),
       },
     }),
+    initialData: initialEnvironment,
+    staleTime: Infinity, // Keep initial data fresh indefinitely
+    gcTime: 1000 * 60 * 10, // 10 minutes - keep in cache
+    enabled: !initialEnvironment, // Only fetch if we don't have initial data
   })
 
   const {
@@ -384,24 +389,6 @@ export function EnvironmentDetail({
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="space-y-1">
-          <h2 className="text-2xl font-semibold tracking-tight">
-            {environment.name}
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            Configure domains, environment variables, and resources for this
-            environment.
-          </p>
-        </div>
-        <Button variant="outline" size="sm" asChild className="hidden sm:flex">
-          <Link to="..">
-            <ArrowLeft className="h-4 w-4 mr-2" />
-            Back to Environments
-          </Link>
-        </Button>
-      </div>
-
       {environment.current_deployment_id && (
         <CurrentDeployment
           project={project}
@@ -527,21 +514,7 @@ export function EnvironmentDetail({
         </CardContent>
       </Card>
 
-      <EnvironmentGitConfigCard
-        project={project}
-        environment={environment}
-        onUpdate={() => {
-          queryClient.invalidateQueries({ queryKey: ['environment'] })
-        }}
-      />
-      <EnvironmentResourcesCard
-        project={project}
-        environment={environment}
-        onUpdate={() => {
-          queryClient.invalidateQueries({ queryKey: ['environment'] })
-        }}
-      />
-      <EnvironmentSecurityCard
+      <EnvironmentConfigurationCard
         project={project}
         environment={environment}
         onUpdate={() => {
@@ -576,8 +549,8 @@ export function EnvironmentDetail({
               <AlertDialogContent>
                 <AlertDialogTitle>Delete Environment</AlertDialogTitle>
                 <AlertDialogDescription>
-                  Are you sure you want to delete the "{environment.name}"
-                  environment? This action cannot be undone.
+                  Are you sure you want to delete the &quot;{environment.name}
+                  &quot; environment? This action cannot be undone.
                 </AlertDialogDescription>
                 <div className="flex justify-end gap-3 mt-6">
                   <AlertDialogCancel>Cancel</AlertDialogCancel>

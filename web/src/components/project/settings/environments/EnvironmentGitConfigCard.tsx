@@ -12,7 +12,7 @@ import {
 import { Label } from '@/components/ui/label'
 import { useMutation } from '@tanstack/react-query'
 import { GitBranch, Loader2 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { toast } from 'sonner'
 
 interface EnvironmentGitConfigCardProps {
@@ -28,11 +28,6 @@ export function EnvironmentGitConfigCard({
 }: EnvironmentGitConfigCardProps) {
   const [branch, setBranch] = useState(environment.branch ?? '')
   const [isEditing, setIsEditing] = useState(false)
-
-  // Sync local state when environment prop changes (e.g., after refresh)
-  useEffect(() => {
-    setBranch(environment.branch ?? '')
-  }, [environment.branch])
 
   const updateEnvironmentSettings = useMutation({
     ...updateEnvironmentSettingsMutation(),

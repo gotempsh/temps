@@ -89,7 +89,8 @@ impl ServeCommand {
             }
         });
 
-        // Create a channel to wait for console API to be ready
+        // Create a channel to pass error information back from console API task
+        let (error_tx, mut error_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
         // Start console API server in background with error handling
@@ -110,13 +111,19 @@ impl ServeCommand {
             )
             .await
             {
+                let error_msg = format!("{}", e);
+                let error_details = format!("{:?}", e);
+
                 tracing::error!("❌ Failed to start console API server");
-                tracing::error!("Error: {}", e);
-                tracing::error!("Error details: {:?}", e);
+                tracing::error!("Error: {}", error_msg);
+                tracing::error!("Error details: {}", error_details);
                 tracing::error!("Console API server will not be available");
                 tracing::error!(
                     "Check the logs above for more details about what failed during initialization"
                 );
+
+                // Send error information back to main thread
+                let _ = error_tx.send(error_msg).await;
             }
         });
 
@@ -124,12 +131,40 @@ impl ServeCommand {
         info!("Waiting for console API to be ready...");
         if let Err(_err) = rt.block_on(ready_rx) {
             tracing::error!("❌ Console API failed to start");
-            tracing::error!("The console API task exited without signaling readiness.");
-            tracing::error!("This usually happens when plugin initialization fails.");
-            tracing::error!("Check the error messages above (starting with '❌ Failed to start console API') for details.");
-            return Err(anyhow::anyhow!(
-                "Console API failed to start - check logs above for the specific error"
-            ));
+
+            // Try to get error details from the error channel
+            let error_detail = std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().ok()?;
+                rt.block_on(async {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        error_rx.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Some(msg)) => Some(msg),
+                        _ => None,
+                    }
+                })
+            })
+            .join()
+            .ok()
+            .flatten();
+
+            if let Some(error_detail) = error_detail {
+                tracing::error!("The console API task exited with error: {}", error_detail);
+                return Err(anyhow::anyhow!(
+                    "Console API failed to start: {}",
+                    error_detail
+                ));
+            } else {
+                tracing::error!("The console API task exited without signaling readiness.");
+                tracing::error!("This usually happens when plugin initialization fails.");
+                tracing::error!("Check the error messages above (starting with '❌ Failed to start console API') for details.");
+                return Err(anyhow::anyhow!(
+                    "Console API failed to start - check logs above for the specific error"
+                ));
+            }
         }
         info!("✅ Console API is ready, starting proxy server...");
 

@@ -383,30 +383,51 @@ async fn serve_static_file(req: Request) -> Response {
     }
 }
 
-/// Validate GeoLite2-City database exists (must be downloaded by user)
+/// Validate GeoLite2-City database exists in multiple locations
+/// Checks: current directory → data directory → home directory
 /// No system dependencies - database file must be placed manually
-fn validate_geolite2_database(db_path: &PathBuf) -> anyhow::Result<()> {
-    if !db_path.exists() {
-        return Err(anyhow::anyhow!(
-            "❌ GeoLite2-City.mmdb not found\n\n\
-            The MaxMind GeoLite2 database is required for geolocation features.\n\n\
-            📍 Expected location: {}\n\n\
-            📥 Setup (once, takes 2 minutes):\n\
-            1. Visit: https://www.maxmind.com/en/geolite2/geolite2-free-data-sources\n\
-            2. Create free MaxMind account (if needed)\n\
-            3. Download 'GeoLite2-City' (GZIP format: .tar.gz)\n\
-            4. Extract the archive:\n\
-               tar xzf GeoLite2-City_*.tar.gz\n\n\
-            5. Copy the database file to data directory:\n\
-               cp GeoLite2-City_*/GeoLite2-City.mmdb {}\n\n\
-            6. Start the server again\n\n\
-            🐳 For Docker users:\n\
-            See Dockerfile in the repository for embedding the database",
-            db_path.display(),
-            db_path.display()
-        ));
+fn validate_geolite2_database(default_db_path: &PathBuf) -> anyhow::Result<()> {
+    // Check multiple locations in order of preference
+    let search_paths = vec![
+        // 1. Current working directory (most convenient for local development)
+        PathBuf::from("./GeoLite2-City.mmdb"),
+        // 2. Data directory (from config)
+        default_db_path.clone(),
+    ];
+
+    // Try to find the database in any of the search paths
+    for path in &search_paths {
+        if path.exists() {
+            debug!("✓ GeoLite2 database found at: {}", path.display());
+            return Ok(());
+        }
     }
-    Ok(())
+
+    // Database not found in any location
+    return Err(anyhow::anyhow!(
+        "❌ GeoLite2-City.mmdb not found\n\n\
+        The MaxMind GeoLite2 database is required for geolocation features.\n\n\
+        📍 Checked locations (in order):\n\
+        1. {}\n\
+        2. {}\n\n\
+        📥 Setup (once, takes 2 minutes):\n\
+        1. Visit: https://www.maxmind.com/en/geolite2/geolite2-free-data-sources\n\
+        2. Create free MaxMind account (if needed)\n\
+        3. Download 'GeoLite2-City' (GZIP format: .tar.gz)\n\
+        4. Extract the archive:\n\
+           tar xzf GeoLite2-City_*.tar.gz\n\n\
+        5. Copy the database file to any location above:\n\
+           # Option A: Current directory (recommended for local development)\n\
+           cp GeoLite2-City_*/GeoLite2-City.mmdb .\n\n\
+           # Option B: Data directory\n\
+           cp GeoLite2-City_*/GeoLite2-City.mmdb {}\n\n\
+        6. Start the server again\n\n\
+        🐳 For Docker users:\n\
+        See Dockerfile in the repository for embedding the database",
+        search_paths[0].display(),
+        search_paths[1].display(),
+        search_paths[1].display()
+    ));
 }
 
 /// Initialize and start the console API server

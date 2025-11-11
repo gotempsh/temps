@@ -25,6 +25,7 @@ import { InfoIcon, Shield } from 'lucide-react'
 import { useForm, Controller } from 'react-hook-form'
 import { toast } from 'sonner'
 import { useMutation } from '@tanstack/react-query'
+import { useEffect } from 'react'
 
 interface EnvironmentSecurityCardProps {
   project: ProjectResponse
@@ -75,6 +76,7 @@ export function EnvironmentSecurityCard({
     register,
     handleSubmit,
     setValue,
+    reset,
     watch,
     formState: { isDirty, isSubmitting },
   } = useForm<FormData>({
@@ -116,6 +118,47 @@ export function EnvironmentSecurityCard({
       },
     },
   })
+
+  // Reset form when environment changes
+  useEffect(() => {
+    reset({
+      attack_mode: environment.attack_mode ?? false,
+      security: {
+        enabled: environment.deployment_config?.security?.enabled ?? undefined,
+        headers: {
+          preset:
+            environment.deployment_config?.security?.headers?.preset ??
+            undefined,
+          contentSecurityPolicy:
+            environment.deployment_config?.security?.headers
+              ?.contentSecurityPolicy ?? undefined,
+          xFrameOptions:
+            environment.deployment_config?.security?.headers?.xFrameOptions ??
+            undefined,
+          strictTransportSecurity:
+            environment.deployment_config?.security?.headers
+              ?.strictTransportSecurity ?? undefined,
+          referrerPolicy:
+            environment.deployment_config?.security?.headers?.referrerPolicy ??
+            undefined,
+        },
+        rateLimiting: {
+          maxRequestsPerMinute:
+            environment.deployment_config?.security?.rateLimiting
+              ?.maxRequestsPerMinute ?? undefined,
+          maxRequestsPerHour:
+            environment.deployment_config?.security?.rateLimiting
+              ?.maxRequestsPerHour ?? undefined,
+          whitelistIps:
+            environment.deployment_config?.security?.rateLimiting
+              ?.whitelistIps ?? [],
+          blacklistIps:
+            environment.deployment_config?.security?.rateLimiting
+              ?.blacklistIps ?? [],
+        },
+      },
+    })
+  }, [environment, reset])
 
   const securityConfig = watch('security')
 

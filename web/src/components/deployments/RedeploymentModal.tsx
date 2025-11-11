@@ -20,10 +20,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { useQuery } from '@tanstack/react-query'
-import { useMemo, useState } from 'react'
+import { useMemo, useState, useEffect } from 'react'
 import { toast } from 'sonner'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { AlertTriangle } from 'lucide-react'
 import { BranchSelector } from './BranchSelector'
 
 interface RedeploymentModalProps {
@@ -95,10 +97,33 @@ export function RedeploymentModal({
   const [deploymentType, setDeploymentType] = useState<
     'branch' | 'commit' | 'tag'
   >(defaultType || 'branch')
+  const [availableBranches, setAvailableBranches] = useState<string[]>([])
+  const [branchNotFound, setBranchNotFound] = useState(false)
 
   // Derive effective values (either user-selected or initial/default)
   const effectiveBranch = selectedBranch || initialBranch
   const effectiveEnvironment = selectedEnvironment ?? initialEnvironment
+
+  // When environment selection changes, automatically select its branch
+  useEffect(() => {
+    if (!selectedEnvironment || !environmentsQuery.data) return
+
+    const selectedEnv = environmentsQuery.data.find(
+      (env: EnvironmentResponse) => env.id === selectedEnvironment
+    )
+
+    if (!selectedEnv?.branch) return
+
+    // Set branch type and switch to branch deployment mode
+    setDeploymentType('branch')
+    setSelectedBranch(selectedEnv.branch)
+    setBranchNotFound(false)
+
+    // Check if branch exists in available branches
+    if (availableBranches.length > 0 && !availableBranches.includes(selectedEnv.branch)) {
+      setBranchNotFound(true)
+    }
+  }, [selectedEnvironment, environmentsQuery.data, availableBranches])
 
   const validateCommit = (commit: string) => {
     const commitRegex = /^[0-9a-f]{7,40}$/
@@ -155,17 +180,41 @@ export function RedeploymentModal({
                 <TabsTrigger value="tag">Tag</TabsTrigger>
               </TabsList>
               <TabsContent value="branch" className="space-y-2">
-                <BranchSelector
-                  repoOwner={projectQuery.data?.repo_owner || ''}
-                  repoName={projectQuery.data?.repo_name || ''}
-                  connectionId={
-                    projectQuery.data?.git_provider_connection_id || 0
-                  }
-                  defaultBranch={projectQuery.data?.main_branch}
-                  value={selectedBranch}
-                  onChange={setSelectedBranch}
-                  disabled={isLoading}
-                />
+                {branchNotFound && (
+                  <Alert className="border-amber-200 bg-amber-50">
+                    <AlertTriangle className="h-4 w-4 text-amber-600" />
+                    <AlertDescription className="text-amber-800">
+                      The branch "{selectedBranch}" for this environment was not found in the repository.
+                      You can continue with the current branch name, or switch to deploy by commit hash.
+                    </AlertDescription>
+                  </Alert>
+                )}
+                {deploymentType === 'branch' && selectedEnvironment && !availableBranches.includes(selectedBranch) && availableBranches.length > 0 ? (
+                  <div className="space-y-2">
+                    <Input
+                      value={selectedBranch}
+                      onChange={(e) => setSelectedBranch(e.target.value)}
+                      placeholder="Enter branch name manually"
+                      disabled={isLoading}
+                    />
+                  </div>
+                ) : (
+                  <BranchSelector
+                    repoOwner={projectQuery.data?.repo_owner || ''}
+                    repoName={projectQuery.data?.repo_name || ''}
+                    connectionId={
+                      projectQuery.data?.git_provider_connection_id || 0
+                    }
+                    defaultBranch={projectQuery.data?.main_branch}
+                    value={selectedBranch}
+                    onChange={(branch) => {
+                      setSelectedBranch(branch)
+                      setBranchNotFound(false)
+                    }}
+                    onBranchesLoaded={(branches) => setAvailableBranches(branches)}
+                    disabled={isLoading}
+                  />
+                )}
               </TabsContent>
               <TabsContent value="commit">
                 <Input

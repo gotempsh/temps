@@ -3,26 +3,22 @@ import { EnvironmentDetail } from '../project/settings/environments/EnvironmentD
 
 interface EnvironmentSettingsContentProps {
   environment: EnvironmentResponse
-  projectId: string
+  project: ProjectResponse
   environmentId: string
 }
 
 export function EnvironmentSettingsContent({
   environment,
-  projectId,
+  project,
   environmentId,
 }: EnvironmentSettingsContentProps) {
-  // Create a minimal project object for the EnvironmentDetail component
-  const project: ProjectResponse = {
-    id: parseInt(projectId),
-    slug: projectId, // This will be the numeric ID as a string
-  } as ProjectResponse
-
   return (
     <div className="space-y-6">
       <EnvironmentDetail
         project={project}
         environmentId={parseInt(environmentId)}
+        initialEnvironment={environment}
+        key={environment.id}
       />
     </div>
   )

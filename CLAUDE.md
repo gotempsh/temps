@@ -1567,6 +1567,139 @@ docker.remove_container(
 - Boolean fields use plain `bool` instead of `Option<bool>`
 - Network options: `CreateNetworkOptions` → `NetworkCreateRequest`
 
+## Production Docker Deployment
+
+### Multi-Stage Dockerfile
+
+The project includes a production-ready `Dockerfile` with multi-stage build:
+
+**Stages:**
+1. **Builder**: Compiles Rust binary with cargo
+2. **GeoLite2-Downloader**: Optionally downloads MaxMind database
+3. **Runtime**: Alpine-based final image with binary and database
+
+**Features:**
+- Multi-stage build keeps final image small (~100MB)
+- Non-root user execution (security best practice)
+- Health checks via HTTP endpoint
+- Optional GeoLite2 database embedding
+- Support for both embedded and mounted databases
+
+**Build Commands:**
+
+```bash
+# Without embedded database (user downloads manually)
+docker build -t temps:latest .
+
+# With embedded GeoLite2 database (requires MAXMIND_LICENSE_KEY)
+docker build -t temps:latest \
+  --build-arg MAXMIND_LICENSE_KEY=your_license_key .
+
+# Run the container
+docker run -d \
+  --name temps \
+  -p 3000:3000 \
+  -e TEMPS_DATABASE_URL="postgresql://user:password@postgres:5432/temps" \
+  -v temps_data:/app/data \
+  temps:latest
+```
+
+### Docker Compose Setup
+
+The project includes `docker-compose.yml` with complete stack:
+
+**Services:**
+- **PostgreSQL + TimescaleDB**: Database with time-series extension
+- **Redis**: Cache service
+- **Temps Application**: Main service with health checks
+
+**Features:**
+- Service dependencies with health checks
+- Volume management for data persistence
+- Network isolation
+- Pre-configured environment variables
+
+**Quick Start:**
+
+```bash
+# Start all services
+docker-compose up -d
+
+# View logs
+docker-compose logs -f temps
+
+# Stop services
+docker-compose down
+
+# Stop and remove volumes (WARNING: deletes data)
+docker-compose down -v
+```
+
+**Environment Configuration** (in docker-compose.yml):
+```yaml
+TEMPS_DATABASE_URL: postgresql://temps:password@postgres:5432/temps
+TEMPS_ADDRESS: 0.0.0.0:3000
+TEMPS_DATA_DIR: /app/data
+REDIS_URL: redis://redis:6379
+```
+
+### GeoLite2 Database Management
+
+**Philosophy:** Zero system dependencies - MaxMind database must be downloaded by user
+
+**Implementation:**
+- File: `crates/temps-cli/src/commands/serve/console.rs` - Function: `validate_geolite2_database()`
+- Validation runs at console API startup (pre-validation before plugin initialization)
+- If database missing, clear error message with setup instructions
+
+**Setup Options:**
+
+1. **Manual Download (Recommended)**
+   - Download from: https://www.maxmind.com/en/geolite2/geolite2-free-data-sources
+   - Extract: `tar xzf GeoLite2-City_*.tar.gz`
+   - Place at: `~/.temps/GeoLite2-City.mmdb`
+
+2. **Docker with Embedded Database**
+   - Use MAXMIND_LICENSE_KEY build argument
+   - Database auto-downloaded and embedded during build
+   - No runtime setup needed
+
+3. **Docker with Volume Mount**
+   - Download database locally
+   - Mount to container: `-v ./GeoLite2-City.mmdb:/app/data/GeoLite2-City.mmdb:ro`
+
+4. **Docker Compose Method**
+   - Set `MAXMIND_LICENSE_KEY` in docker-compose.yml build args
+   - Or uncomment volume mount and provide local database
+
+**Error Handling:**
+- Missing database shows friendly error with download instructions
+- No external tools required (geoipupdate)
+- Geolocation features gracefully disabled if database unavailable
+- Clear distinction between setup instructions (pre-validation) and runtime errors
+
+### Dockerfile Best Practices
+
+**What's Included:**
+- Alpine base image (small footprint)
+- Build cache mounts for faster rebuilds
+- Security: non-root user, read-only volumes where applicable
+- Health checks (HTTP endpoint check)
+- Signal handling with dumb-init
+
+**Build Cache Optimization:**
+```dockerfile
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --bin temps
+```
+
+**See Files:**
+- `Dockerfile` - Multi-stage production build
+- `.dockerignore` - Optimizes build context
+- `docker-compose.yml` - Complete stack for development/deployment
+
 ## CLI Commands
 
 ### Available Commands

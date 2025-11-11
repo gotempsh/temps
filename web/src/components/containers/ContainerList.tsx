@@ -32,7 +32,6 @@ export function ContainerList({
     <div className="w-80 border-r bg-muted/30 flex flex-col">
       {/* Header */}
       <div className="p-4 border-b">
-        <h2 className="font-semibold mb-3">Containers</h2>
         <Tabs
           value={statusFilter}
           onValueChange={(value) =>
@@ -136,10 +135,10 @@ function ContainerCard({
               )}
             />
             <div className="flex-1 min-w-0">
-              <p className="font-semibold text-sm truncate">
+              <p className="font-semibold text-sm break-words leading-tight">
                 {container.container_name}
               </p>
-              <p className="text-xs text-muted-foreground truncate">
+              <p className="text-xs text-muted-foreground break-words leading-tight">
                 {container.image_name}
               </p>
             </div>

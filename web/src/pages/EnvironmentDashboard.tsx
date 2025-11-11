@@ -106,22 +106,11 @@ export function EnvironmentDashboard({
     switch (activeView) {
       case 'settings':
         return (
-          <div className="space-y-6">
-            <div>
-              <h2 className="text-2xl font-bold">
-                {environment.name} Settings
-              </h2>
-              <p className="text-sm text-muted-foreground mt-1">
-                Configure domains, environment variables, and resources for this
-                environment.
-              </p>
-            </div>
-            <EnvironmentSettingsContent
-              environment={environment}
-              projectId={project?.id.toString() || ''}
-              environmentId={environmentId.toString()}
-            />
-          </div>
+          <EnvironmentSettingsContent
+            environment={environment}
+            project={project}
+            environmentId={environmentId.toString()}
+          />
         )
       case 'containers':
       default:
@@ -133,7 +122,7 @@ export function EnvironmentDashboard({
           </div>
         ) : (
           <ContainerManagement
-            projectId={project?.id.toString() || ''}
+            project={project}
             environmentId={environmentId.toString()}
           />
         )

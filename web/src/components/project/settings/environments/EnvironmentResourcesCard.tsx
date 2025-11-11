@@ -27,13 +27,15 @@ export function EnvironmentResourcesCard({
   onUpdate,
 }: EnvironmentResourcesCardProps) {
   const [formData, setFormData] = useState({
-    cpu_request: environment.cpu_request?.toString() ?? '',
-    cpu_limit: environment.cpu_limit?.toString() ?? '',
-    memory_request: environment.memory_request?.toString() ?? '',
-    memory_limit: environment.memory_limit?.toString() ?? '',
-    replicas: environment.replicas?.toString() ?? '1',
-    exposed_port: environment.exposed_port?.toString() ?? '',
+    cpu_request: environment.deployment_config?.cpuRequest?.toString() ?? '',
+    cpu_limit: environment.deployment_config?.cpuLimit?.toString() ?? '',
+    memory_request:
+      environment.deployment_config?.memoryRequest?.toString() ?? '',
+    memory_limit: environment.deployment_config?.memoryLimit?.toString() ?? '',
+    replicas: environment.deployment_config?.replicas?.toString() ?? '1',
+    exposed_port: environment.deployment_config?.exposedPort?.toString() ?? '',
   })
+
   const updateEnvironmentSettings = useMutation({
     ...updateEnvironmentSettingsMutation(),
     meta: {
