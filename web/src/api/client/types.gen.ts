@@ -269,6 +269,10 @@ export type AvailableContainerInfo = {
      */
     container_name: string;
     /**
+     * Exposed ports (e.g., [5432] for PostgreSQL, [6379] for Redis)
+     */
+    exposed_ports?: Array<number>;
+    /**
      * Docker image name (e.g., "postgres:17-alpine")
      */
     image: string;
@@ -2934,6 +2938,12 @@ export type ProjectDsnResponse = {
     public_key: string;
 };
 
+export type ProjectInfo = {
+    created_at: string;
+    id: number;
+    slug: string;
+};
+
 export type ProjectPresetResponse = {
     /**
      * Default exposed port for this preset (e.g., 3000 for Next.js, 8000 for FastAPI)
@@ -2982,7 +2992,7 @@ export type ProjectResponse = {
 
 export type ProjectServiceInfo = {
     id: number;
-    project_id: number;
+    project: ProjectInfo;
     service: ExternalServiceInfo;
 };
 

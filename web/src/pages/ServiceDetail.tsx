@@ -2,6 +2,7 @@ import {
   deleteServiceMutation,
   getServiceOptions,
   getServicePreviewEnvironmentVariablesMaskedOptions,
+  listServiceProjectsOptions,
   startServiceMutation,
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -84,6 +85,15 @@ export function ServiceDetail() {
     enabled: !!id,
     staleTime: 5 * 60 * 1000, // Cache for 5 minutes
   })
+
+  // Query for linked projects
+  const { data: linkedProjectsResponse, isLoading: linkedProjectsLoading } =
+    useQuery({
+      ...listServiceProjectsOptions({
+        path: { id: parseInt(id!) },
+      }),
+      enabled: !!id,
+    })
 
   useEffect(() => {
     if (service) {
@@ -308,6 +318,64 @@ export function ServiceDetail() {
         )}
 
         <div className="grid gap-6">
+          {/* Linked Projects Section */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <span>Linked Projects</span>
+                <Badge variant="outline">
+                  {linkedProjectsLoading ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    linkedProjectsResponse?.length || 0
+                  )}
+                </Badge>
+              </CardTitle>
+              <CardDescription>
+                Projects that are using this service
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {linkedProjectsLoading ? (
+                <div className="flex items-center justify-center py-8">
+                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                  <span className="text-sm text-muted-foreground">
+                    Loading projects...
+                  </span>
+                </div>
+              ) : linkedProjectsResponse &&
+                linkedProjectsResponse.length > 0 ? (
+                <div className="space-y-2">
+                  {linkedProjectsResponse.map((link) => (
+                    <div
+                      key={link.id}
+                      className="flex items-center justify-between p-3 rounded-md border border-border hover:bg-muted/50 transition-colors"
+                    >
+                      <div className="flex flex-col">
+                        <p className="font-medium text-sm">
+                          {link.project.slug}
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          Linked <TimeAgo date={link.service.created_at} />
+                        </p>
+                      </div>
+                      <Link to={`/projects/${link.project.slug}`}>
+                        <Button variant="ghost" size="sm" className="gap-2">
+                          <ArrowLeft className="h-4 w-4 rotate-180" />
+                          View Project
+                        </Button>
+                      </Link>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-sm text-muted-foreground text-center py-8">
+                  No projects are currently using this service
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
           {/* Service Configuration Section */}
           <Card>
             <CardHeader>

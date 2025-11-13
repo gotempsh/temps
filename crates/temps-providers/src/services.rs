@@ -193,9 +193,16 @@ pub struct ExternalServiceInfo {
 }
 
 #[derive(Debug, Serialize, Clone)]
+pub struct ProjectInfo {
+    pub id: i32,
+    pub slug: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
 pub struct ProjectServiceInfo {
     pub id: i32,
-    pub project_id: i32,
+    pub project: ProjectInfo,
     pub service: ExternalServiceInfo,
 }
 
@@ -1038,9 +1045,21 @@ impl ExternalServiceManager {
         let link = new_link.insert(self.db.as_ref()).await?;
         let service_info = self.get_service_info(service_id_val).await?;
 
+        // Fetch project metadata
+        let project = projects::Entity::find_by_id(link.project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ExternalServiceError::ProjectNotFound {
+                id: link.project_id,
+            })?;
+
         Ok(ProjectServiceInfo {
             id: link.id,
-            project_id: link.project_id,
+            project: ProjectInfo {
+                id: project.id,
+                slug: project.slug,
+                created_at: project.created_at.to_rfc3339(),
+            },
             service: service_info,
         })
     }
@@ -1237,15 +1256,27 @@ impl ExternalServiceManager {
             .all(self.db.as_ref())
             .await?;
 
-        // Convert to ProjectServiceInfo
-        let project_services_list = links
-            .into_iter()
-            .map(|link| ProjectServiceInfo {
+        // Convert to ProjectServiceInfo with project metadata
+        let mut project_services_list = Vec::new();
+        for link in links {
+            // Fetch project metadata
+            let project = projects::Entity::find_by_id(link.project_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ExternalServiceError::ProjectNotFound {
+                    id: link.project_id,
+                })?;
+
+            project_services_list.push(ProjectServiceInfo {
                 id: link.id,
-                project_id: link.project_id,
+                project: ProjectInfo {
+                    id: project.id,
+                    slug: project.slug,
+                    created_at: project.created_at.to_rfc3339(),
+                },
                 service: service_info.clone(),
-            })
-            .collect();
+            });
+        }
 
         Ok(project_services_list)
     }
@@ -1254,8 +1285,8 @@ impl ExternalServiceManager {
         &self,
         project_id_val: i32,
     ) -> Result<Vec<ProjectServiceInfo>, ExternalServiceError> {
-        // Verify project exists
-        let _project = projects::Entity::find_by_id(project_id_val)
+        // Verify project exists and fetch its metadata
+        let project = projects::Entity::find_by_id(project_id_val)
             .one(self.db.as_ref())
             .await?
             .ok_or(ExternalServiceError::ProjectNotFound { id: project_id_val })?;
@@ -1272,7 +1303,11 @@ impl ExternalServiceManager {
             let service_info = self.get_service_info(link.service_id).await?;
             project_services_list.push(ProjectServiceInfo {
                 id: link.id,
-                project_id: link.project_id,
+                project: ProjectInfo {
+                    id: project.id,
+                    slug: project.slug.clone(),
+                    created_at: project.created_at.to_rfc3339(),
+                },
                 service: service_info,
             });
         }

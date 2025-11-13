@@ -281,9 +281,17 @@ pub struct ImportExternalServiceRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ProjectInfo {
+    pub id: i32,
+    pub slug: String,
+    #[schema(example = "2025-10-12T12:15:47.609192Z")]
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ProjectServiceInfo {
     pub id: i32,
-    pub project_id: i32,
+    pub project: ProjectInfo,
     pub service: ExternalServiceInfo,
 }
 

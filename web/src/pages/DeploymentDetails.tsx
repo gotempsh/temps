@@ -451,8 +451,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
                           Pause Deployment
                         </DropdownMenuItem>
                       )}
-                      {(deployment?.status === 'superseded' ||
-                        deployment?.status === 'completed') && (
+                      {deployment?.status === 'completed' && (
                         <DropdownMenuItem
                           onClick={handleRollbackDeployment}
                           disabled={rollbackDeployment.isPending}
@@ -504,6 +503,18 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
                     <ChevronDown className="h-3.5 w-3.5" />
                   )}
                 </Button>
+              </div>
+            )}
+
+            {/* Cancelled Reason - Show if deployment was cancelled */}
+            {deployment.cancelled_reason && (
+              <div className="flex items-start gap-2 mt-2">
+                <div className="flex-1 text-sm text-destructive border-l-2 border-destructive/50 pl-3">
+                  <div className="font-medium mb-1">Cancellation Reason</div>
+                  <div className="text-sm text-destructive/80">
+                    {deployment.cancelled_reason}
+                  </div>
+                </div>
               </div>
             )}
           </div>
