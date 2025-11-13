@@ -124,7 +124,8 @@ export function BranchSelector({
     if (sortedBranches.length > 0 && onBranchesLoaded) {
       onBranchesLoaded(sortedBranches.map((b) => b.name))
     }
-  }, [sortedBranches, onBranchesLoaded])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sortedBranches])
 
   if (hasExpiredToken) {
     return (
@@ -135,7 +136,7 @@ export function BranchSelector({
           <p className="mb-2">
             Your Git provider token has expired. Please reconnect to continue.
           </p>
-          <Link to="/settings/git-providers">
+          <Link to="/git-providers">
             <Button variant="outline" size="sm">
               <Key className="mr-2 h-4 w-4" />
               Manage Git Providers

@@ -52,7 +52,7 @@ export function ImportServiceForm({
     ...getServiceTypesOptions(),
   })
 
-  // Auto-detect service type from container image
+  // Auto-detect service type from container image (only if not already set)
   useEffect(() => {
     if (!selectedServiceType && container.image) {
       const detectedType = getServiceTypeWithFallback(
@@ -63,7 +63,8 @@ export function ImportServiceForm({
         setSelectedServiceType(detectedType)
       }
     }
-  }, [container.image, container.service_type, selectedServiceType])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [container.image, container.service_type])
 
   // Fetch parameters for the selected service type
   const { data: parametersResponse, isLoading: isLoadingParameters } = useQuery(
@@ -78,7 +79,15 @@ export function ImportServiceForm({
   )
 
   // Extract parameters array from response
-  const parameters = useMemo(() => {
+  const parameters = useMemo((): Array<{
+    name: string
+    description?: string
+    default_value?: string
+    required?: boolean
+    encrypted?: boolean
+    validation_pattern?: string
+    type?: string
+  }> | undefined => {
     if (!parametersResponse) return undefined
 
     if (Array.isArray(parametersResponse)) return parametersResponse
@@ -88,7 +97,8 @@ export function ImportServiceForm({
       parametersResponse !== null &&
       'parameters' in parametersResponse
     ) {
-      return (parametersResponse as { parameters: unknown }).parameters
+      const params = (parametersResponse as { parameters: unknown }).parameters
+      if (Array.isArray(params)) return params
     }
 
     if (
@@ -201,7 +211,7 @@ export function ImportServiceForm({
       )
       form.setValue('parameters', defaultParameters)
     }
-  }, [parameters, form])
+  }, [parameters])
 
   const importServiceMut = useMutation({
     ...importExternalServiceMutation(),
@@ -218,11 +228,16 @@ export function ImportServiceForm({
   })
 
   const onSubmit = async (values: FormValues) => {
+    if (!selectedServiceType) {
+      toast.error('Please select a service type')
+      return
+    }
     await importServiceMut.mutateAsync({
       body: {
         container_id: container.container_id,
         name: values.name,
         parameters: values.parameters || {},
+        service_type: selectedServiceType as any,
       },
     })
   }

@@ -84,7 +84,7 @@ export function ImportService() {
     ...getServiceTypesOptions(),
   })
 
-  // Auto-detect service type from container image when container is selected
+  // Auto-detect service type from container image when container is selected (only if not already set)
   useEffect(() => {
     if (selectedContainer && !selectedServiceType) {
       const detectedType = getServiceTypeWithFallback(
@@ -95,7 +95,8 @@ export function ImportService() {
         setSelectedServiceType(detectedType)
       }
     }
-  }, [selectedContainer, selectedServiceType])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedContainer])
 
   // Fetch parameters for the selected service type
   const { data: parametersResponse, isLoading: isLoadingParameters } = useQuery(
@@ -227,7 +228,7 @@ export function ImportService() {
       )
       form.setValue('parameters', defaultParameters)
     }
-  }, [parameters, form])
+  }, [parameters])
 
   const importServiceMut = useMutation({
     ...importExternalServiceMutation(),
@@ -244,13 +245,14 @@ export function ImportService() {
   })
 
   const onSubmit = async (values: FormValues) => {
-    if (!selectedContainer) return
+    if (!selectedContainer || !selectedServiceType) return
 
     await importServiceMut.mutateAsync({
       body: {
         container_id: selectedContainer.container_id,
         name: values.name,
         parameters: values.parameters || {},
+        service_type: selectedServiceType as any,
       },
     })
   }
