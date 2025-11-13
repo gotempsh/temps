@@ -87,6 +87,19 @@ impl TempsPlugin for DeploymentsPlugin {
                 tracing::debug!("Starting cron scheduler");
                 scheduler_service.start_cron_scheduler().await;
             });
+
+            // Start Docker cleanup scheduler in background (nightly cleanup at 2 AM UTC)
+            let docker_cleanup = Arc::new(crate::services::DockerCleanupService::new(Arc::new(
+                crate::services::DefaultDockerClient,
+            )));
+            tokio::spawn({
+                let cleanup_service = docker_cleanup.clone();
+                async move {
+                    tracing::debug!("Starting Docker cleanup scheduler");
+                    cleanup_service.start_cleanup_scheduler().await;
+                }
+            });
+
             // Get screenshot service (required)
             let screenshot_service =
                 context.require_service::<temps_screenshots::ScreenshotService>();

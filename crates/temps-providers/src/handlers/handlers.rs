@@ -23,10 +23,10 @@ use super::audit::{
     ExternalServiceUpdatedAudit,
 };
 use crate::handlers::types::{
-    CreateExternalServiceRequest, EnvironmentVariableInfo, ExternalServiceDetails,
-    ExternalServiceInfo, LinkServiceRequest, ProjectServiceInfo, ProviderMetadata,
-    ServiceParameter, ServiceTypeInfo, ServiceTypeRoute, UpdateExternalServiceRequest,
-    UpgradeExternalServiceRequest,
+    AvailableContainerInfo, CreateExternalServiceRequest, EnvironmentVariableInfo,
+    ExternalServiceDetails, ExternalServiceInfo, ImportExternalServiceRequest, LinkServiceRequest,
+    ProjectServiceInfo, ProviderMetadata, ServiceParameter, ServiceTypeInfo, ServiceTypeRoute,
+    UpdateExternalServiceRequest, UpgradeExternalServiceRequest,
 };
 use crate::services::EnvironmentVariableOptions;
 use temps_core::AuditContext;
@@ -97,10 +97,131 @@ async fn get_provider_metadata(
     }
 }
 
+/// List available Docker containers that can be imported as services
+#[utoipa::path(
+    get,
+    path = "/external-services/available-containers",
+    tag = "External Services",
+    responses(
+        (status = 200, description = "List of available containers", body = Vec<AvailableContainerInfo>),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_available_containers(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+
+    let containers = state
+        .external_service_manager
+        .list_available_containers()
+        .await
+        .map_err(|e| {
+            error!("Failed to list available containers: {}", e);
+            internal_server_error()
+                .detail("Failed to list available containers")
+                .build()
+        })?;
+
+    let response: Vec<AvailableContainerInfo> = containers
+        .into_iter()
+        .map(|c| AvailableContainerInfo {
+            container_id: c.container_id,
+            container_name: c.container_name,
+            image: c.image,
+            version: c.version,
+            service_type: ServiceTypeRoute::from(c.service_type),
+            is_running: c.is_running,
+            exposed_ports: c.exposed_ports,
+        })
+        .collect();
+
+    Ok((StatusCode::OK, Json(response)))
+}
+
+/// Import an existing Docker container as a managed external service
+#[utoipa::path(
+    post,
+    path = "/external-services/import",
+    tag = "External Services",
+    request_body = ImportExternalServiceRequest,
+    responses(
+        (status = 201, description = "Service imported successfully", body = ExternalServiceInfo),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn import_external_service(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<ImportExternalServiceRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesCreate);
+
+    // Convert handler-layer request to service-layer request
+    let service_type =
+        crate::ServiceType::from_str(&request.service_type.to_string()).map_err(|e| {
+            error!("Invalid service type: {}", e);
+            bad_request()
+                .detail(format!("Invalid service type: {}", e))
+                .build()
+        })?;
+
+    let service_request = crate::services::ImportExternalServiceRequest {
+        name: request.name.clone(),
+        service_type,
+        version: request.version,
+        parameters: request.parameters.clone(),
+        container_id: request.container_id.clone(),
+    };
+
+    let service = state
+        .external_service_manager
+        .import_service(service_request)
+        .await
+        .map_err(|e| {
+            error!("Failed to import service: {}", e);
+            bad_request()
+                .detail(format!("Failed to import service: {}", e))
+                .build()
+        })?;
+
+    // Log audit event
+    let audit = ExternalServiceCreatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        service_id: service.id,
+        name: service.name.clone(),
+        service_type: service.service_type.to_string(),
+        version: service.version.clone(),
+    };
+
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    Ok((StatusCode::CREATED, Json(service)))
+}
+
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/external-services", get(list_services))
         .route("/external-services", post(create_service))
+        .route(
+            "/external-services/available-containers",
+            get(list_available_containers),
+        )
+        .route("/external-services/import", post(import_external_service))
         .route("/external-services/types", get(get_service_types))
         .route(
             "/external-services/providers/metadata",
@@ -1150,6 +1271,8 @@ async fn get_service_preview_environment_variables_masked(
         list_services,
         get_service,
         create_service,
+        list_available_containers,
+        import_external_service,
         update_service,
         upgrade_service,
         delete_service,
@@ -1176,6 +1299,8 @@ async fn get_service_preview_environment_variables_masked(
         CreateExternalServiceRequest,
         UpdateExternalServiceRequest,
         UpgradeExternalServiceRequest,
+        ImportExternalServiceRequest,
+        AvailableContainerInfo,
         LinkServiceRequest,
         ProjectServiceInfo,
         EnvironmentVariableInfo,

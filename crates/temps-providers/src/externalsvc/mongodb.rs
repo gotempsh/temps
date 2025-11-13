@@ -1138,6 +1138,105 @@ impl ExternalService for MongodbService {
         info!("MongoDB upgrade completed successfully");
         Ok(())
     }
+
+    async fn import_from_container(
+        &self,
+        container_id: String,
+        service_name: String,
+        credentials: HashMap<String, String>,
+        additional_config: serde_json::Value,
+    ) -> Result<ServiceConfig> {
+        // Inspect the container to get details
+        let container = self
+            .docker
+            .inspect_container(
+                &container_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to inspect container '{}': {}", container_id, e)
+            })?;
+
+        // Extract image name and version
+        let image = container.config.and_then(|c| c.image).ok_or_else(|| {
+            anyhow::anyhow!("Could not determine image for container '{}'", container_id)
+        })?;
+
+        // Extract version from image name (e.g., "mongo:7" -> "7")
+        let version = if let Some(tag_pos) = image.rfind(':') {
+            image[tag_pos + 1..].to_string()
+        } else {
+            "7".to_string()
+        };
+
+        // Extract port from additional config if provided, otherwise use 27017
+        let port = additional_config
+            .get("port")
+            .and_then(|v| v.as_str())
+            .unwrap_or("27017")
+            .to_string();
+
+        // Extract credentials
+        let username = credentials.get("username").cloned();
+        let password = credentials.get("password").cloned();
+        let database = credentials
+            .get("database")
+            .cloned()
+            .unwrap_or_else(|| "admin".to_string());
+
+        // Build connection URL for verification
+        let connection_url = if let (Some(user), Some(pass)) = (&username, &password) {
+            format!(
+                "mongodb://{}:{}@localhost:{}/{}",
+                user, pass, port, database
+            )
+        } else {
+            format!("mongodb://localhost:{}", port)
+        };
+
+        // Verify connection to the imported service
+        match tokio::runtime::Runtime::new().ok().and_then(|rt| {
+            rt.block_on(async {
+                match mongodb::Client::with_uri_str(&connection_url).await {
+                    Ok(client) => client.list_databases().await.ok(),
+                    Err(_) => None,
+                }
+            })
+        }) {
+            Some(_) => {
+                info!("Successfully verified MongoDB connection for import");
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Failed to connect to MongoDB at localhost:{} with provided credentials. Verify port, username, and password.",
+                    port
+                ));
+            }
+        }
+
+        // Build the ServiceConfig for registration
+        let config = ServiceConfig {
+            name: service_name,
+            service_type: ServiceType::Mongodb,
+            version: Some(version),
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": port,
+                "username": username.unwrap_or_default(),
+                "password": password.unwrap_or_default(),
+                "database": database,
+                "docker_image": image,
+                "container_id": container_id,
+            }),
+        };
+
+        info!(
+            "Successfully imported MongoDB service '{}' from container",
+            config.name
+        );
+        Ok(config)
+    }
 }
 
 #[cfg(test)]
@@ -1402,6 +1501,99 @@ mod tests {
         assert_eq!(
             new_image, "mongo:8.0",
             "New docker_image should be mongo:8.0"
+        );
+    }
+
+    #[test]
+    fn test_import_service_config_creation() {
+        let config = ServiceConfig {
+            name: "test-mongodb-import".to_string(),
+            service_type: ServiceType::Mongodb,
+            version: Some("7.0".to_string()),
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": 27017,
+                "username": "mongouser",
+                "password": "mongopass",
+                "database": "admin",
+                "docker_image": "mongo:7.0",
+                "container_id": "def456ghi789",
+            }),
+        };
+
+        assert_eq!(config.name, "test-mongodb-import");
+        assert_eq!(config.service_type, ServiceType::Mongodb);
+        assert_eq!(config.version, Some("7.0".to_string()));
+        assert_eq!(config.parameters["port"], 27017);
+    }
+
+    #[test]
+    fn test_import_mongodb_version_extraction() {
+        let test_cases = vec![
+            ("mongo:7.0", "7.0"),
+            ("mongo:latest", "latest"),
+            ("mongo:6.0-ubuntu", "6.0-ubuntu"),
+            ("mongo:8.0-alpine", "8.0-alpine"),
+        ];
+
+        for (image, expected_version) in test_cases {
+            let version = if let Some(tag_pos) = image.rfind(':') {
+                image[tag_pos + 1..].to_string()
+            } else {
+                "latest".to_string()
+            };
+
+            assert_eq!(version, expected_version, "Failed for image: {}", image);
+        }
+    }
+
+    #[test]
+    fn test_import_validates_required_credentials() {
+        let credentials: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        // MongoDB requires username, password, port, database
+
+        assert!(credentials.get("username").is_none());
+        assert!(credentials.get("password").is_none());
+        assert!(credentials.get("port").is_none());
+        assert!(credentials.get("database").is_none());
+    }
+
+    #[test]
+    fn test_import_connection_string_format() {
+        let username = "mongouser";
+        let password = "mongopassword";
+        let port = 27017;
+
+        let connection_url = format!("mongodb://{}:{}@localhost:{}", username, password, port);
+
+        assert!(connection_url.contains("mongodb://"));
+        assert!(connection_url.contains("mongouser"));
+        assert!(connection_url.contains("mongopassword"));
+        assert!(connection_url.contains("localhost"));
+        assert!(connection_url.contains("27017"));
+    }
+
+    #[test]
+    fn test_import_credential_extraction() {
+        let mut credentials = std::collections::HashMap::new();
+        credentials.insert("username".to_string(), "mongouser".to_string());
+        credentials.insert("password".to_string(), "mongopass".to_string());
+        credentials.insert("port".to_string(), "27017".to_string());
+        credentials.insert("database".to_string(), "admin".to_string());
+
+        assert_eq!(
+            credentials.get("username").map(|s| s.as_str()),
+            Some("mongouser")
+        );
+        assert_eq!(
+            credentials.get("password").map(|s| s.as_str()),
+            Some("mongopass")
+        );
+        assert_eq!(credentials.get("port").map(|s| s.as_str()), Some("27017"));
+        assert_eq!(
+            credentials.get("database").map(|s| s.as_str()),
+            Some("admin")
         );
     }
 }

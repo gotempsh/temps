@@ -120,9 +120,13 @@ fn set_git_version_info() {
     println!("cargo:rustc-env=GIT_TAG={}", latest_tag);
     println!("cargo:rustc-env=BUILD_TIME={}", build_time);
 
-    // Rerun if git state changes
-    println!("cargo:rerun-if-changed=../.git/HEAD");
-    println!("cargo:rerun-if-changed=../.git/refs");
+    // Only track git state changes in release mode to avoid constant rebuilds in debug
+    let profile = env::var("PROFILE").unwrap_or_default();
+    if profile == "release" {
+        // Rerun if git state changes (release builds should have accurate version info)
+        println!("cargo:rerun-if-changed=../.git/HEAD");
+        println!("cargo:rerun-if-changed=../.git/refs");
+    }
 }
 
 fn build_web(web_dir: &std::path::Path, dist_dir: &std::path::Path) {

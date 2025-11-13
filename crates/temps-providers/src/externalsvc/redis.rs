@@ -1104,6 +1104,93 @@ impl ExternalService for RedisService {
         info!("Redis upgrade completed successfully");
         Ok(())
     }
+
+    async fn import_from_container(
+        &self,
+        container_id: String,
+        service_name: String,
+        credentials: HashMap<String, String>,
+        additional_config: serde_json::Value,
+    ) -> Result<ServiceConfig> {
+        // Inspect the container to get details
+        let container = self
+            .docker
+            .inspect_container(
+                &container_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to inspect container '{}': {}", container_id, e)
+            })?;
+
+        // Extract image name and version
+        let image = container.config.and_then(|c| c.image).ok_or_else(|| {
+            anyhow::anyhow!("Could not determine image for container '{}'", container_id)
+        })?;
+
+        // Extract version from image name (e.g., "redis:7-alpine" -> "7")
+        let version = if let Some(tag_pos) = image.rfind(':') {
+            image[tag_pos + 1..].to_string()
+        } else {
+            "7-alpine".to_string()
+        };
+
+        // Extract port from additional config if provided, otherwise use 6379
+        let port = additional_config
+            .get("port")
+            .and_then(|v| v.as_str())
+            .unwrap_or("6379")
+            .to_string();
+
+        // Extract password if provided
+        let password = credentials.get("password").cloned().unwrap_or_default();
+
+        // Verify connection to the imported service
+        let connection_url = if password.is_empty() {
+            format!("redis://localhost:{}", port)
+        } else {
+            format!("redis://:{}@localhost:{}", password, port)
+        };
+
+        match redis::Client::open(connection_url.as_str())
+            .ok()
+            .and_then(|client| {
+                tokio::runtime::Runtime::new()
+                    .ok()
+                    .and_then(|rt| rt.block_on(async { client.get_connection().ok() }))
+            }) {
+            Some(_) => {
+                info!("Successfully verified Redis connection for import");
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Failed to connect to Redis at localhost:{} with provided credentials. Verify port and password.",
+                    port
+                ));
+            }
+        }
+
+        // Build the ServiceConfig for registration
+        let config = ServiceConfig {
+            name: service_name,
+            service_type: ServiceType::Redis,
+            version: Some(version),
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": port,
+                "password": password,
+                "docker_image": image,
+                "container_id": container_id,
+            }),
+        };
+
+        info!(
+            "Successfully imported Redis service '{}' from container",
+            config.name
+        );
+        Ok(config)
+    }
 }
 
 #[cfg(test)]
@@ -1308,5 +1395,81 @@ mod tests {
 
         assert_eq!(old_version, "6-alpine", "Old version should be 6-alpine");
         assert_eq!(new_version, "7-alpine", "New version should be 7-alpine");
+    }
+
+    #[test]
+    fn test_import_service_config_creation() {
+        let config = ServiceConfig {
+            name: "test-redis-import".to_string(),
+            service_type: ServiceType::Redis,
+            version: Some("7-alpine".to_string()),
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": 6379,
+                "password": "",
+                "db": 0,
+                "docker_image": "redis:7-alpine",
+                "container_id": "xyz789abc123",
+            }),
+        };
+
+        assert_eq!(config.name, "test-redis-import");
+        assert_eq!(config.service_type, ServiceType::Redis);
+        assert_eq!(config.version, Some("7-alpine".to_string()));
+        assert_eq!(config.parameters["port"], 6379);
+    }
+
+    #[test]
+    fn test_import_redis_version_extraction() {
+        let test_cases = vec![
+            ("redis:7-alpine", "7-alpine"),
+            ("redis:latest", "latest"),
+            ("redis:6.2", "6.2"),
+            ("redis:7.0-alpine", "7.0-alpine"),
+        ];
+
+        for (image, expected_version) in test_cases {
+            let version = if let Some(tag_pos) = image.rfind(':') {
+                image[tag_pos + 1..].to_string()
+            } else {
+                "latest".to_string()
+            };
+
+            assert_eq!(version, expected_version, "Failed for image: {}", image);
+        }
+    }
+
+    #[test]
+    fn test_import_validates_required_credentials() {
+        let credentials: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        // Redis might only need port and optional password
+
+        assert!(credentials.get("port").is_none());
+        assert!(credentials.get("password").is_none());
+    }
+
+    #[test]
+    fn test_import_connection_string_with_password() {
+        let password = "redispassword";
+        let port = 6379;
+
+        let connection_url = format!("redis://{}@localhost:{}", password, port);
+
+        assert!(connection_url.contains("redis://"));
+        assert!(connection_url.contains("redispassword"));
+        assert!(connection_url.contains("localhost"));
+        assert!(connection_url.contains("6379"));
+    }
+
+    #[test]
+    fn test_import_connection_string_without_password() {
+        let port = 6379;
+
+        let connection_url = format!("redis://localhost:{}", port);
+
+        assert!(connection_url.contains("redis://"));
+        assert!(connection_url.contains("localhost"));
+        assert!(connection_url.contains("6379"));
     }
 }

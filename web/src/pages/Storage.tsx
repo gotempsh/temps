@@ -4,6 +4,7 @@ import { CreateServiceButton } from '@/components/storage/CreateServiceButton'
 import { CreateServiceDialog } from '@/components/storage/CreateServiceDialog'
 import { DeleteServiceButton } from '@/components/storage/DeleteServiceButton'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
+import { ImportServiceButton } from '@/components/storage/ImportServiceButton'
 import EmptyStateStorage from '@/components/storage/EmptyStateStorage'
 import { Button } from '@/components/ui/button'
 import {
@@ -157,7 +158,10 @@ export function Storage() {
       <div className="sm:p-4 space-y-6 md:p-6">
         <div className="flex items-center justify-between">
           <h1 className="text-xl font-semibold sm:text-2xl">Storage</h1>
-          <CreateServiceButton onSuccess={() => refetch()} />
+          <div className="flex items-center gap-2">
+            <ImportServiceButton onSuccess={() => refetch()} />
+            <CreateServiceButton onSuccess={() => refetch()} />
+          </div>
         </div>
 
         <div className="grid gap-4">

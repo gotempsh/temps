@@ -257,6 +257,36 @@ export type AuthTokenResponse = {
 };
 
 /**
+ * Available Docker container that can be imported as a service
+ */
+export type AvailableContainerInfo = {
+    /**
+     * Container ID or name
+     */
+    container_id: string;
+    /**
+     * Container display name
+     */
+    container_name: string;
+    /**
+     * Docker image name (e.g., "postgres:17-alpine")
+     */
+    image: string;
+    /**
+     * Whether the container is currently running
+     */
+    is_running: boolean;
+    /**
+     * Service type this container represents
+     */
+    service_type: ServiceTypeRoute;
+    /**
+     * Extracted version from image
+     */
+    version: string;
+};
+
+/**
  * Response containing all available permissions for frontend validation
  */
 export type AvailablePermissions = {
@@ -2018,6 +2048,34 @@ export type HttpChallengeDebugResponse = {
  * Import execution status
  */
 export type ImportExecutionStatus = 'pending' | 'inprogress' | 'completed' | 'failed';
+
+/**
+ * Request to import a Docker container as a managed service
+ */
+export type ImportExternalServiceRequest = {
+    /**
+     * Container ID or name to import
+     */
+    container_id: string;
+    /**
+     * Name to register the service as in Temps
+     */
+    name: string;
+    /**
+     * Service configuration parameters
+     */
+    parameters: {
+        [key: string]: unknown;
+    };
+    /**
+     * Service type
+     */
+    service_type: ServiceTypeRoute;
+    /**
+     * Optional version override
+     */
+    version?: string | null;
+};
 
 /**
  * Complete import plan describing all operations to onboard a workload
@@ -7379,6 +7437,33 @@ export type CreateServiceResponses = {
 
 export type CreateServiceResponse = CreateServiceResponses[keyof CreateServiceResponses];
 
+export type ListAvailableContainersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/external-services/available-containers';
+};
+
+export type ListAvailableContainersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListAvailableContainersResponses = {
+    /**
+     * List of available containers
+     */
+    200: Array<AvailableContainerInfo>;
+};
+
+export type ListAvailableContainersResponse = ListAvailableContainersResponses[keyof ListAvailableContainersResponses];
+
 export type GetServiceBySlugData = {
     body?: never;
     path: {
@@ -7410,6 +7495,41 @@ export type GetServiceBySlugResponses = {
 };
 
 export type GetServiceBySlugResponse = GetServiceBySlugResponses[keyof GetServiceBySlugResponses];
+
+export type ImportExternalServiceData = {
+    body: ImportExternalServiceRequest;
+    path?: never;
+    query?: never;
+    url: '/external-services/import';
+};
+
+export type ImportExternalServiceErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ImportExternalServiceResponses = {
+    /**
+     * Service imported successfully
+     */
+    201: ExternalServiceInfo;
+};
+
+export type ImportExternalServiceResponse = ImportExternalServiceResponses[keyof ImportExternalServiceResponses];
 
 export type ListProjectServicesData = {
     body?: never;

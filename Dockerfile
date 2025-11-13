@@ -1,14 +1,14 @@
 # Multi-stage build for Temps with embedded MaxMind GeoLite2 database
 #
-# Supports two build modes:
-# 1. Build from source (default):
-#    docker build -t temps:latest .
+# REQUIRES: Prebuilt Rust binary (target/release/temps)
+# This Dockerfile builds WASM and Web UI inside Docker, then packages
+# them with a prebuilt Rust binary.
 #
-# 2. Use prebuilt binary (for faster CI/CD):
+# Usage:
+#    cp target/release/temps .
 #    docker build -t temps:latest --build-arg PREBUILT_BINARY=temps .
-#    (where 'temps' is the prebuilt binary in the build context)
 
-# Build argument for prebuilt binary (optional)
+# Build argument for prebuilt binary (REQUIRED)
 ARG PREBUILT_BINARY=""
 
 # Stage 1: Builder
@@ -31,9 +31,18 @@ RUN apk add --no-cache \
     tar \
     gzip
 
+# Install Node.js and npm (needed for wasm-pack and bun)
+RUN apk add --no-cache nodejs npm
+
 # Install bun using the official installer (faster and doesn't require nightly Rust)
 RUN curl -fsSL https://bun.sh/install | bash && \
     ln -s $HOME/.bun/bin/bun /usr/local/bin/bun
+
+# Install wasm-pack globally
+RUN npm install -g wasm-pack
+
+# Install wasm32 target for Rust (needed for WASM compilation)
+RUN rustup target add wasm32-unknown-unknown
 
 # Create app directory
 RUN mkdir -p /app
@@ -42,21 +51,27 @@ RUN mkdir -p /app
 WORKDIR /build
 COPY . .
 
-# Build the binary (with optimizations) - or skip if using prebuilt
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
-    --mount=type=cache,target=/build/target \
-    if [ -z "$PREBUILT_BINARY" ]; then \
-      cargo build --release --bin temps && \
-      cp /build/target/release/temps /app/temps; \
-    else \
-      echo "Skipping build - will use prebuilt binary"; \
-    fi
+# Build WebAssembly for captcha (required for web UI)
+RUN cd /build/crates/temps-captcha-wasm && \
+    bun install && \
+    npm run build && \
+    echo "WASM build completed successfully at pkg/"
 
-# Copy prebuilt binary if provided in build context
-RUN if [ -n "$PREBUILT_BINARY" ] && [ -f "/build/$PREBUILT_BINARY" ]; then \
+# Build web UI (must happen before Rust build to embed in binary)
+RUN cd /build/web && \
+    bun install && \
+    RSBUILD_OUTPUT_PATH=/build/crates/temps-cli/dist \
+    bun run build && \
+    echo "Web UI build completed at /build/crates/temps-cli/dist"
+
+# Copy prebuilt binary from build context
+RUN if [ -f "/build/$PREBUILT_BINARY" ]; then \
       cp "/build/$PREBUILT_BINARY" /app/temps && \
+      chmod +x /app/temps && \
       chown root:root /app/temps; \
+    else \
+      echo "ERROR: Prebuilt binary not found at /build/$PREBUILT_BINARY"; \
+      exit 1; \
     fi
 
 # Verify binary exists
@@ -122,25 +137,36 @@ CMD ["/app/temps", "serve"]
 
 # Build instructions:
 # ==================
-# 1. Basic build from source (build Rust binary inside Docker):
-#    docker build -t temps:latest .
+# REQUIRED BUILD STEPS (before Docker):
+# The Rust binary MUST be built outside Docker with all dependencies:
 #
-# 2. Fast build with prebuilt binary (for CI/CD):
-#    First, build the binary outside Docker:
+# 1. Build WebAssembly (temps-captcha-wasm):
+#    cd crates/temps-captcha-wasm
+#    bun install
+#    npm run build
+#    Output: pkg/
+#
+# 2. Build Web UI (must happen before Rust binary):
+#    cd web
+#    bun install
+#    RSBUILD_OUTPUT_PATH=../crates/temps-cli/dist bun run build
+#    Output: crates/temps-cli/dist/
+#
+# 3. Build Rust Binary (includes embedded web UI):
 #    cargo build --release --bin temps
-#    Then build Docker image with prebuilt binary:
-#    docker build -t temps:latest --build-arg PREBUILT_BINARY=target/release/temps .
-#    Or copy the binary to current directory first:
+#    Output: target/release/temps
+#
+# DOCKER BUILD (requires prebuilt binary):
+#
+# 1. Copy the prebuilt binary to build context:
 #    cp target/release/temps .
+#
+# 2. Build Docker image:
 #    docker build -t temps:latest --build-arg PREBUILT_BINARY=temps .
 #
-# 3. Build with embedded GeoLite2 database:
-#    First, download the GeoLite2-City.mmdb database:
-#    - Visit: https://www.maxmind.com/en/account/login
-#    - Create free account and download GeoLite2-City.mmdb
-#    - Place the file in the repository root or crates/temps-cli/
-#    Then build (works with both modes above):
-#    docker build -t temps:latest .
+# 3. Optional: Add GeoLite2 database:
+#    First, download from: https://www.maxmind.com/en/account/login
+#    Then build Docker image (WASM and Web UI built inside Docker):
 #    docker build -t temps:latest --build-arg PREBUILT_BINARY=temps .
 #
 # 4. Run the container:
@@ -167,10 +193,21 @@ CMD ["/app/temps", "serve"]
 #
 # Notes:
 # ======
-# PREBUILT BINARY:
-# - Using a prebuilt binary skips the Rust compilation step, making Docker builds 5-10x faster
-# - Ideal for CI/CD pipelines where you build the binary once and reuse it across environments
-# - The prebuilt binary must be for the same Linux architecture as the Docker image
+# BUILD COMPONENTS:
+# - WASM Build: temps-captcha-wasm crate compiled to WebAssembly using wasm-pack
+#   Location: Built inside Docker at crates/temps-captcha-wasm/pkg/
+# - Web UI Build: Rsbuild frontend application built with bun
+#   Location: Built inside Docker at crates/temps-cli/dist/
+# - Rust Binary: Main server binary (MUST be prebuilt outside Docker)
+#   Includes: Embedded web UI via include_dir! macro in temps-cli
+#
+# WHY PREBUILT BINARY:
+# - The Rust binary is built outside Docker to leverage local caches and development setup
+# - WASM and Web UI are still built inside Docker (dependencies: nodejs, npm, bun, wasm-pack)
+# - Docker builds WASM and Web UI from source, then includes the prebuilt binary
+# - The prebuilt binary must:
+#   - Be for the same Linux architecture as the Docker image (musl x86_64 for Alpine)
+#   - Have been built with full web UI and WASM included (from step 1-3 above)
 #
 # GEOLITE2 DATABASE:
 # - GeoLite2 database should be placed in the repository root or crates/temps-cli/

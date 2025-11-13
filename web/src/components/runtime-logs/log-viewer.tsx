@@ -79,7 +79,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     estimateSize: (index) => {
       return estimateLineHeight(logs[index], containerWidth.current)
     },
-    overscan: 5,
+    overscan: 20,
     measureElement: (element) => {
       return element?.getBoundingClientRect().height ?? 0
     },
@@ -648,7 +648,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
             <div
               ref={parentRef}
               className={cn(
-                'h-[600px] overflow-auto p-4 font-mono text-xs bg-background text-foreground',
+                'h-[600px] overflow-auto p-4 font-mono text-xs bg-background text-foreground select-text',
                 connectionStatus === 'connecting' && 'opacity-50'
               )}
               onScroll={handleScroll}

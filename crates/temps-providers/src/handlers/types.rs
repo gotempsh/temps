@@ -238,6 +238,48 @@ pub struct LinkServiceRequest {
     pub project_id: i32,
 }
 
+/// Available Docker container that can be imported as a service
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AvailableContainerInfo {
+    /// Container ID or name
+    #[schema(example = "abc123def456")]
+    pub container_id: String,
+    /// Container display name
+    #[schema(example = "my-postgres")]
+    pub container_name: String,
+    /// Docker image name (e.g., "postgres:17-alpine")
+    #[schema(example = "postgres:17-alpine")]
+    pub image: String,
+    /// Extracted version from image
+    #[schema(example = "17")]
+    pub version: String,
+    /// Service type this container represents
+    pub service_type: ServiceTypeRoute,
+    /// Whether the container is currently running
+    #[schema(example = true)]
+    pub is_running: bool,
+    /// Exposed ports (e.g., [5432] for PostgreSQL, [6379] for Redis)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exposed_ports: Vec<u16>,
+}
+
+/// Request to import a Docker container as a managed service
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ImportExternalServiceRequest {
+    /// Name to register the service as in Temps
+    #[schema(example = "production-database")]
+    pub name: String,
+    /// Service type
+    pub service_type: ServiceTypeRoute,
+    /// Optional version override
+    pub version: Option<String>,
+    /// Service configuration parameters
+    pub parameters: HashMap<String, serde_json::Value>,
+    /// Container ID or name to import
+    #[schema(example = "abc123def456")]
+    pub container_id: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ProjectServiceInfo {
     pub id: i32,

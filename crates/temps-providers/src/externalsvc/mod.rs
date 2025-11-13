@@ -102,6 +102,26 @@ pub struct RuntimeEnvVar {
     pub sensitive: bool,
 }
 
+/// Information about an available Docker container that can be imported
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AvailableContainer {
+    /// Container ID or name
+    pub container_id: String,
+    /// Container name
+    pub container_name: String,
+    /// Docker image name (e.g., "postgres:17-alpine")
+    pub image: String,
+    /// Extracted version from image (e.g., "17")
+    pub version: String,
+    /// Service type this container represents
+    pub service_type: ServiceType,
+    /// Whether the container is currently running
+    pub is_running: bool,
+    /// Exposed ports (e.g., [5432] for PostgreSQL, [6379] for Redis)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exposed_ports: Vec<u16>,
+}
+
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait ExternalService: Send + Sync {
@@ -248,5 +268,26 @@ pub trait ExternalService: Send + Sync {
         Err(anyhow::anyhow!(
             "Getting current version not implemented for this service"
         ))
+    }
+
+    /// Import an existing running Docker container as a managed service
+    /// User provides container ID and necessary credentials/configuration
+    ///
+    /// # Arguments
+    /// * `container_id` - Docker container ID or name of the running service
+    /// * `service_name` - Name to register the service as in Temps
+    /// * `credentials` - User-provided credentials (username, password, etc)
+    /// * `additional_config` - Any additional configuration needed (ports, paths, etc)
+    ///
+    /// # Returns
+    /// * Returns registered ServiceConfig with managed parameters
+    async fn import_from_container(
+        &self,
+        _container_id: String,
+        _service_name: String,
+        _credentials: HashMap<String, String>,
+        _additional_config: serde_json::Value,
+    ) -> Result<ServiceConfig> {
+        Err(anyhow::anyhow!("Import not implemented for this service"))
     }
 }

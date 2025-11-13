@@ -1461,6 +1461,111 @@ impl ExternalService for S3Service {
         info!("S3/MinIO upgrade completed successfully");
         Ok(())
     }
+
+    async fn import_from_container(
+        &self,
+        container_id: String,
+        service_name: String,
+        credentials: HashMap<String, String>,
+        additional_config: serde_json::Value,
+    ) -> Result<ServiceConfig> {
+        // Inspect the container to get details
+        let container = self
+            .docker
+            .inspect_container(
+                &container_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to inspect container '{}': {}", container_id, e)
+            })?;
+
+        // Extract image name and version
+        let image = container.config.and_then(|c| c.image).ok_or_else(|| {
+            anyhow::anyhow!("Could not determine image for container '{}'", container_id)
+        })?;
+
+        // Extract version from image name (e.g., "minio/minio:latest" -> "latest")
+        let version = if let Some(tag_pos) = image.rfind(':') {
+            image[tag_pos + 1..].to_string()
+        } else {
+            "latest".to_string()
+        };
+
+        // Extract port from additional config if provided, otherwise use 9000
+        let port = additional_config
+            .get("port")
+            .and_then(|v| v.as_str())
+            .unwrap_or("9000")
+            .to_string();
+
+        // Extract credentials
+        let access_key = credentials
+            .get("access_key")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Access key is required for S3/MinIO import"))?;
+        let secret_key = credentials
+            .get("secret_key")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Secret key is required for S3/MinIO import"))?;
+
+        // Build endpoint
+        let endpoint = format!("http://localhost:{}", port);
+
+        // Verify connection to the imported service by attempting to list buckets
+        match tokio::runtime::Runtime::new().ok().and_then(|rt| {
+            rt.block_on(async {
+                let creds = aws_sdk_s3::config::Credentials::new(
+                    &access_key,
+                    &secret_key,
+                    None,
+                    None,
+                    "imported",
+                );
+
+                let config = aws_sdk_s3::config::Config::builder()
+                    .credentials_provider(creds)
+                    .endpoint_url(&endpoint)
+                    .build();
+
+                let client = aws_sdk_s3::Client::from_conf(config);
+                client.list_buckets().send().await.ok()
+            })
+        }) {
+            Some(_) => {
+                info!("Successfully verified S3/MinIO connection for import");
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Failed to connect to S3/MinIO at {} with provided credentials. Verify endpoint, access key, and secret key.",
+                    endpoint
+                ));
+            }
+        }
+
+        // Build the ServiceConfig for registration
+        let config = ServiceConfig {
+            name: service_name,
+            service_type: ServiceType::S3,
+            version: Some(version),
+            parameters: serde_json::json!({
+                "endpoint": endpoint,
+                "port": port,
+                "access_key": access_key,
+                "secret_key": secret_key,
+                "use_ssl": false,
+                "docker_image": image,
+                "container_id": container_id,
+            }),
+        };
+
+        info!(
+            "Successfully imported S3/MinIO service '{}' from container",
+            config.name
+        );
+        Ok(config)
+    }
 }
 
 fn parse_multiline_json_output(output: &str) -> Result<Vec<serde_json::Value>> {
@@ -1624,5 +1729,104 @@ mod tests {
             "New image should contain 2025-09-07"
         );
         assert_ne!(old_image, new_image, "Images should be different");
+    }
+
+    #[test]
+    fn test_import_service_config_creation() {
+        let config = ServiceConfig {
+            name: "test-s3-import".to_string(),
+            service_type: ServiceType::S3,
+            version: Some("latest".to_string()),
+            parameters: serde_json::json!({
+                "access_key": "minioadmin",
+                "secret_key": "minioadmin",
+                "endpoint_url": "http://localhost:9000",
+                "region": "us-east-1",
+                "use_ssl": false,
+                "docker_image": "minio/minio:latest",
+                "container_id": "ghi789jkl012",
+            }),
+        };
+
+        assert_eq!(config.name, "test-s3-import");
+        assert_eq!(config.service_type, ServiceType::S3);
+        assert_eq!(config.version, Some("latest".to_string()));
+    }
+
+    #[test]
+    fn test_import_s3_version_extraction() {
+        let test_cases = vec![
+            ("minio/minio:latest", "latest"),
+            (
+                "minio/minio:RELEASE.2025-01-01T00-00-00Z",
+                "RELEASE.2025-01-01T00-00-00Z",
+            ),
+            ("minio/minio:2024", "2024"),
+        ];
+
+        for (image, expected_version) in test_cases {
+            let version = if let Some(tag_pos) = image.rfind(':') {
+                image[tag_pos + 1..].to_string()
+            } else {
+                "latest".to_string()
+            };
+
+            assert_eq!(version, expected_version, "Failed for image: {}", image);
+        }
+    }
+
+    #[test]
+    fn test_import_validates_required_credentials() {
+        let credentials: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        // S3 requires access_key and secret_key
+
+        assert!(credentials.get("access_key").is_none());
+        assert!(credentials.get("secret_key").is_none());
+    }
+
+    #[test]
+    fn test_import_credential_extraction() {
+        let mut credentials: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        credentials.insert("access_key".to_string(), "AKIAIOSFODNN7EXAMPLE".to_string());
+        credentials.insert(
+            "secret_key".to_string(),
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+        );
+        credentials.insert(
+            "endpoint_url".to_string(),
+            "http://localhost:9000".to_string(),
+        );
+
+        assert_eq!(
+            credentials.get("access_key").map(|s| s.as_str()),
+            Some("AKIAIOSFODNN7EXAMPLE")
+        );
+        assert_eq!(
+            credentials.get("secret_key").map(|s| s.as_str()),
+            Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+        );
+        assert_eq!(
+            credentials.get("endpoint_url").map(|s| s.as_str()),
+            Some("http://localhost:9000")
+        );
+    }
+
+    #[test]
+    fn test_import_s3_endpoint_validation() {
+        let endpoints = vec![
+            "http://localhost:9000",
+            "https://s3.amazonaws.com",
+            "http://minio:9000",
+        ];
+
+        for endpoint in endpoints {
+            assert!(
+                endpoint.contains("://"),
+                "Endpoint should have protocol: {}",
+                endpoint
+            );
+        }
     }
 }

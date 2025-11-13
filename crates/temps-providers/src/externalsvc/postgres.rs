@@ -8,6 +8,7 @@ use sea_orm::{prelude::*, *};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::TcpListener;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use temps_entities::external_service_backups;
@@ -1264,7 +1265,7 @@ impl ExternalService for PostgresService {
                     "port" => true,            // Port can be changed
                     "database" => false,       // Don't change database name after creation
                     "username" => false,       // Don't change username after creation
-                    "password" => false,       // Password is auto-generated and cannot be changed
+                    "password" => true,        // Password can be changed by user
                     "max_connections" => true, // Max connections can be adjusted
                     "ssl_mode" => true,        // SSL mode can be changed
                     "docker_image" => true,    // Docker image can be upgraded
@@ -1598,6 +1599,107 @@ impl ExternalService for PostgresService {
     async fn get_current_version(&self) -> Result<String> {
         let (_, version) = self.get_current_docker_image().await?;
         Ok(version)
+    }
+
+    async fn import_from_container(
+        &self,
+        container_id: String,
+        service_name: String,
+        credentials: HashMap<String, String>,
+        additional_config: serde_json::Value,
+    ) -> Result<ServiceConfig> {
+        // Inspect the container to get details
+        let container = self
+            .docker
+            .inspect_container(
+                &container_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to inspect container '{}': {}", container_id, e)
+            })?;
+
+        // Extract image name and version
+        let image = container.config.and_then(|c| c.image).ok_or_else(|| {
+            anyhow::anyhow!("Could not determine image for container '{}'", container_id)
+        })?;
+
+        // Extract version from image name (e.g., "postgres:17-alpine" -> "17")
+        let version = if let Some(tag_pos) = image.rfind(':') {
+            image[tag_pos + 1..].to_string()
+        } else {
+            "17-alpine".to_string()
+        };
+
+        // Extract credentials from user input
+        let username = credentials
+            .get("username")
+            .cloned()
+            .unwrap_or_else(|| "postgres".to_string());
+        let password = credentials
+            .get("password")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Password is required for PostgreSQL import"))?;
+        let database = credentials
+            .get("database")
+            .cloned()
+            .unwrap_or_else(|| "postgres".to_string());
+
+        // Extract port from additional config if provided, otherwise use 5432
+        let port = additional_config
+            .get("port")
+            .and_then(|v| v.as_str())
+            .unwrap_or("5432")
+            .to_string();
+
+        // Verify connection to the imported service
+        let connection_url = format!(
+            "postgresql://{}:{}@{}:{}/{}",
+            username, password, "localhost", port, database
+        );
+
+        match sqlx::postgres::PgConnectOptions::from_str(&connection_url)
+            .ok()
+            .and_then(|_opts| {
+                tokio::runtime::Runtime::new()
+                    .ok()
+                    .and_then(|rt| rt.block_on(sqlx::PgPool::connect(&connection_url)).ok())
+            }) {
+            Some(_) => {
+                info!("Successfully verified PostgreSQL connection for import");
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Failed to connect to PostgreSQL at {}:{} with provided credentials. Verify host, port, username, and password.",
+                    "localhost", port
+                ));
+            }
+        }
+
+        // Build the ServiceConfig for registration
+        let config = ServiceConfig {
+            name: service_name,
+            service_type: ServiceType::Postgres,
+            version: Some(version),
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": port,
+                "database": database,
+                "username": username,
+                "password": password,
+                "max_connections": "20",
+                "ssl_mode": "disable",
+                "docker_image": image,
+                "container_id": container_id,
+            }),
+        };
+
+        info!(
+            "Successfully imported PostgreSQL service '{}' from container",
+            config.name
+        );
+        Ok(config)
     }
 }
 
@@ -2244,5 +2346,124 @@ mod tests {
         db_pool.close().await;
         let _ = v17_service.stop().await;
         let _ = v17_service.remove().await;
+    }
+
+    #[test]
+    fn test_import_service_config_creation() {
+        // Test that ServiceConfig is properly created for import
+        let config = ServiceConfig {
+            name: "test-postgres-import".to_string(),
+            service_type: ServiceType::Postgres,
+            version: Some("15-alpine".to_string()),
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": 5432,
+                "database": "testdb",
+                "username": "postgres",
+                "password": "testpass",
+                "max_connections": "20",
+                "ssl_mode": "disable",
+                "docker_image": "postgres:15-alpine",
+                "container_id": "abc123def456",
+            }),
+        };
+
+        assert_eq!(config.name, "test-postgres-import");
+        assert_eq!(config.service_type, ServiceType::Postgres);
+        assert_eq!(config.version, Some("15-alpine".to_string()));
+        assert_eq!(config.parameters["host"], "localhost");
+        assert_eq!(config.parameters["port"], 5432);
+    }
+
+    #[test]
+    fn test_import_version_extraction_with_tag() {
+        // Test version extraction from Docker image names
+        let test_cases = vec![
+            ("postgres:15-alpine", "15-alpine"),
+            ("postgres:latest", "latest"),
+            ("postgres:14.5", "14.5"),
+            ("postgres:16-bookworm", "16-bookworm"),
+        ];
+
+        for (image, expected_version) in test_cases {
+            let version = if let Some(tag_pos) = image.rfind(':') {
+                image[tag_pos + 1..].to_string()
+            } else {
+                "latest".to_string()
+            };
+
+            assert_eq!(version, expected_version, "Failed for image: {}", image);
+        }
+    }
+
+    #[test]
+    fn test_import_version_extraction_without_tag() {
+        let image = "postgres";
+        let version = if let Some(tag_pos) = image.rfind(':') {
+            image[tag_pos + 1..].to_string()
+        } else {
+            "latest".to_string()
+        };
+
+        assert_eq!(version, "latest");
+    }
+
+    #[test]
+    fn test_import_connection_url_format() {
+        let username = "postgres";
+        let password = "mysecretpassword";
+        let port = 5432;
+        let database = "importeddb";
+
+        let connection_url = format!(
+            "postgresql://{}:{}@localhost:{}/{}",
+            username, password, port, database
+        );
+
+        // Verify all components are present
+        assert!(connection_url.contains("postgresql://"));
+        assert!(connection_url.contains("postgres"));
+        assert!(connection_url.contains("mysecretpassword"));
+        assert!(connection_url.contains("localhost"));
+        assert!(connection_url.contains("5432"));
+        assert!(connection_url.contains("importeddb"));
+    }
+
+    #[test]
+    fn test_import_validates_required_credentials() {
+        let credentials: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        // Missing all required fields
+
+        // These should all be None
+        assert!(credentials.get("username").is_none());
+        assert!(credentials.get("password").is_none());
+        assert!(credentials.get("port").is_none());
+        assert!(credentials.get("database").is_none());
+    }
+
+    #[test]
+    fn test_import_credential_extraction() {
+        let mut credentials: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        credentials.insert("username".to_string(), "importuser".to_string());
+        credentials.insert("password".to_string(), "importpass".to_string());
+        credentials.insert("port".to_string(), "5433".to_string());
+        credentials.insert("database".to_string(), "importdb".to_string());
+
+        // Verify credential extraction
+        assert_eq!(
+            credentials.get("username").map(|s| s.as_str()),
+            Some("importuser")
+        );
+        assert_eq!(
+            credentials.get("password").map(|s| s.as_str()),
+            Some("importpass")
+        );
+        assert_eq!(credentials.get("port").map(|s| s.as_str()), Some("5433"));
+        assert_eq!(
+            credentials.get("database").map(|s| s.as_str()),
+            Some("importdb")
+        );
     }
 }

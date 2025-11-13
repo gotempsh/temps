@@ -46,6 +46,9 @@ const Storage = lazy(() =>
 const CreateService = lazy(() =>
   import('./pages/CreateServiceNew').then((m) => ({ default: m.CreateService }))
 )
+const ImportService = lazy(() =>
+  import('./pages/ImportService').then((m) => ({ default: m.ImportService }))
+)
 const ServiceDetail = lazy(() =>
   import('./pages/ServiceDetail').then((m) => ({ default: m.ServiceDetail }))
 )
@@ -261,6 +264,10 @@ const AppContent = () => {
                                   <Route
                                     path="/storage/create"
                                     element={<CreateService />}
+                                  />
+                                  <Route
+                                    path="/storage/import"
+                                    element={<ImportService />}
                                   />
                                   <Route
                                     path="/storage/:id"
