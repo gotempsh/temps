@@ -136,7 +136,7 @@ export function BranchSelector({
           <p className="mb-2">
             Your Git provider token has expired. Please reconnect to continue.
           </p>
-          <Link to="/git-providers">
+          <Link to="/git-sources">
             <Button variant="outline" size="sm">
               <Key className="mr-2 h-4 w-4" />
               Manage Git Providers

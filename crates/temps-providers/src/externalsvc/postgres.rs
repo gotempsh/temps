@@ -68,7 +68,7 @@ pub struct PostgresInputConfig {
     #[schemars(example = "example_ssl_mode", default = "default_ssl_mode_string")]
     pub ssl_mode: Option<String>,
 
-    /// Docker image to use (defaults to postgres:17-alpine, supports timescaledb/timescaledb-ha:pg17)
+    /// Docker image to use (defaults to postgres:18-alpine, supports timescaledb/timescaledb-ha:pg17)
     #[serde(default = "default_docker_image")]
     #[schemars(example = "example_docker_image", default = "default_docker_image")]
     pub docker_image: Option<String>,
@@ -104,7 +104,7 @@ impl From<PostgresInputConfig> for PostgresConfig {
             ssl_mode: input.ssl_mode,
             docker_image: input
                 .docker_image
-                .unwrap_or_else(|| "postgres:17-alpine".to_string()),
+                .unwrap_or_else(|| "postgres:18-alpine".to_string()),
         }
     }
 }
@@ -174,7 +174,7 @@ fn default_ssl_mode_string() -> String {
 }
 
 fn default_docker_image() -> Option<String> {
-    Some("postgres:17-alpine".to_string())
+    Some("postgres:18-alpine".to_string())
 }
 
 // Schema example functions
@@ -207,7 +207,7 @@ fn example_ssl_mode() -> &'static str {
 }
 
 fn example_docker_image() -> &'static str {
-    "postgres:17-alpine"
+    "postgres:18-alpine"
 }
 
 fn is_port_available(port: u16) -> bool {
@@ -343,10 +343,15 @@ impl PostgresService {
             (name_label_key, self.name.to_string()),
         ]);
 
+        // Determine PGDATA path based on docker image
+        let pgdata_path = Self::get_pgdata_path(&config.docker_image)
+            .map_err(|e| anyhow::anyhow!("Failed to determine PGDATA path: {}", e))?;
+
         let env_vars = [
             format!("POSTGRES_USER={}", config.username),
             format!("POSTGRES_PASSWORD={}", config.password),
             format!("POSTGRES_DB={}", config.database),
+            format!("PGDATA={}", pgdata_path),
             "POSTGRES_HOST_AUTH_METHOD=md5".to_string(), // Use md5 password authentication for better compatibility
         ];
 
@@ -359,7 +364,8 @@ impl PostgresService {
                 }]),
             )])),
             mounts: Some(vec![bollard::models::Mount {
-                target: Some("/var/lib/postgresql/data".to_string()),
+                // Always mount at /var/lib/postgresql - PGDATA env var controls subdirectory
+                target: Some("/var/lib/postgresql".to_string()),
                 source: Some(volume_name),
                 typ: Some(bollard::models::MountTypeEnum::VOLUME),
                 ..Default::default()
@@ -569,6 +575,13 @@ impl PostgresService {
         }
     }
 
+    /// Determine the PGDATA directory based on the docker image
+    /// All PostgreSQL versions use: /var/lib/postgresql/{version}/docker
+    fn get_pgdata_path(docker_image: &str) -> Result<String> {
+        let version = Self::extract_postgres_version(docker_image)?;
+        Ok(format!("/var/lib/postgresql/{}/docker", version))
+    }
+
     /// Run pg_upgrade to migrate data from old version to new version
     /// Uses pg_dump/pg_restore for cross-architecture compatibility
     async fn run_pg_upgrade(
@@ -764,12 +777,17 @@ impl PostgresService {
 
         // Now create the final v17 container with the upgraded data
         info!("Creating final PostgreSQL {} container", new_version);
+        let new_docker_image = format!("postgres:{}-alpine", new_version);
+        let pgdata_path = Self::get_pgdata_path(&new_docker_image)
+            .map_err(|e| anyhow::anyhow!("Failed to determine PGDATA path: {}", e))?;
+
         let final_container_config = bollard::models::ContainerCreateBody {
-            image: Some(format!("postgres:{}-alpine", new_version)),
+            image: Some(new_docker_image),
             env: Some(vec![
                 "POSTGRES_HOST_AUTH_METHOD=md5".to_string(),
                 format!("POSTGRES_USER=postgres"),
                 format!("POSTGRES_PASSWORD={}", new_config.password),
+                format!("PGDATA={}", pgdata_path),
             ]),
             cmd: Some(vec![
                 "postgres".to_string(),
@@ -778,7 +796,8 @@ impl PostgresService {
             ]),
             host_config: Some(bollard::models::HostConfig {
                 mounts: Some(vec![bollard::models::Mount {
-                    target: Some("/var/lib/postgresql/data".to_string()),
+                    // Always mount at /var/lib/postgresql - PGDATA env var controls subdirectory
+                    target: Some("/var/lib/postgresql".to_string()),
                     source: Some(volume_name.clone()),
                     typ: Some(bollard::models::MountTypeEnum::VOLUME),
                     read_only: Some(false),
@@ -1200,7 +1219,7 @@ impl ExternalService for PostgresService {
             "POSTGRES_URL".to_string(),
             format!(
                 "postgresql://{}:{}@{}:{}/{}",
-                config.username, config.password, container_name, 5432, resource_name
+                config.username, config.password, container_name, config.port, resource_name
             ),
         );
 
@@ -1625,7 +1644,7 @@ impl ExternalService for PostgresService {
             anyhow::anyhow!("Could not determine image for container '{}'", container_id)
         })?;
 
-        // Extract version from image name (e.g., "postgres:17-alpine" -> "17")
+        // Extract version from image name (e.g., "postgres:18-alpine" -> "17")
         let version = if let Some(tag_pos) = image.rfind(':') {
             image[tag_pos + 1..].to_string()
         } else {
@@ -1726,7 +1745,7 @@ mod tests {
         assert_eq!(runtime_config.database, "postgres");
         assert_eq!(runtime_config.username, "postgres");
         assert_eq!(runtime_config.max_connections, "100");
-        assert_eq!(runtime_config.docker_image, "postgres:17-alpine");
+        assert_eq!(runtime_config.docker_image, "postgres:18-alpine");
         assert!(runtime_config.password.len() >= 16); // Auto-generated password
     }
 
@@ -1815,7 +1834,7 @@ mod tests {
                 "password": "testpass123",
                 "max_connections": 100,
                 "ssl_mode": "disable",
-                "docker_image": "postgres:17-alpine"
+                "docker_image": "postgres:18-alpine"
             }),
         };
 
@@ -1841,7 +1860,7 @@ mod tests {
                 "password": "testpass123",
                 "max_connections": 100,
                 "ssl_mode": "disable",
-                "docker_image": "postgres:17-alpine"
+                "docker_image": "postgres:18-alpine"
             }),
         };
 
@@ -1898,7 +1917,7 @@ mod tests {
                 "password": "testpass123",
                 "max_connections": 100,
                 "ssl_mode": "disable",
-                "docker_image": "postgres:17-alpine"
+                "docker_image": "postgres:18-alpine"
             }),
         };
 
@@ -1917,7 +1936,7 @@ mod tests {
             .and_then(|v| v.as_str());
 
         assert_eq!(old_image, Some("postgres:16-alpine"));
-        assert_eq!(new_image, Some("postgres:17-alpine"));
+        assert_eq!(new_image, Some("postgres:18-alpine"));
     }
 
     #[test]
@@ -1959,7 +1978,7 @@ mod tests {
         // Test various PostgreSQL image formats
         let test_cases = vec![
             ("postgres:16-alpine", 16),
-            ("postgres:17-alpine", 17),
+            ("postgres:18-alpine", 17),
             ("postgres:16.0-alpine", 16),
             ("postgres:17.2-alpine", 17),
             ("timescale/timescaledb-ha:pg16", 16),
@@ -2145,7 +2164,7 @@ mod tests {
             "username": "postgres",
             "password": password,
             "max_connections": 100,
-            "docker_image": "postgres:17-alpine",
+            "docker_image": "postgres:18-alpine",
         });
 
         let v17_config = ServiceConfig {
