@@ -163,10 +163,13 @@ export function ServiceDataBrowser() {
     }
 
     // Find the hierarchy level configuration
-    const hierarchyLevel = explorerSupport.hierarchy.find((h) => h.level === level)
+    const hierarchyLevel = explorerSupport.hierarchy.find(
+      (h) => h.level === level
+    )
     if (!hierarchyLevel) {
       // If level not found, use the last level configuration
-      const lastLevel = explorerSupport.hierarchy[explorerSupport.hierarchy.length - 1]
+      const lastLevel =
+        explorerSupport.hierarchy[explorerSupport.hierarchy.length - 1]
       return {
         can_list_containers: lastLevel.can_list_containers,
         can_list_entities: lastLevel.can_list_entities,
@@ -191,14 +194,21 @@ export function ServiceDataBrowser() {
 
     switch (type) {
       case 'bucket':
+        // S3 bucket icon
         return <Package className={className} />
+      case 'prefix':
+        // S3 prefix (folder-like in S3)
+        return isExpanded ? (
+          <FolderOpen className={className} />
+        ) : (
+          <Folder className={className} />
+        )
       case 'schema':
         return <Database className={className} />
       case 'database':
         return <Database className={className} />
       case 'namespace':
         return <Layers className={className} />
-      case 'object':
       case 'folder':
       default:
         return isExpanded ? (
@@ -216,6 +226,7 @@ export function ServiceDataBrowser() {
 
     switch (type) {
       case 'object':
+        // S3 object icon
         return <File className={className} />
       case 'table':
         return <TableIcon className={className} />
@@ -1011,8 +1022,11 @@ function TreeView({
   onNodeClick: (node: TreeNode) => void
   selectedPath: string
   selectedEntity: string
-  getContainerIcon: (containerType: string | undefined, isExpanded: boolean) => JSX.Element
-  getEntityIcon: (entityType: string | undefined) => JSX.Element
+  getContainerIcon: (
+    containerType: string | undefined,
+    isExpanded: boolean
+  ) => React.ReactElement
+  getEntityIcon: (entityType: string | undefined) => React.ReactElement
 }) {
   return (
     <div className="space-y-1">
@@ -1050,8 +1064,11 @@ function TreeNodeComponent({
   onNodeClick: (node: TreeNode) => void
   selectedPath: string
   selectedEntity: string
-  getContainerIcon: (containerType: string | undefined, isExpanded: boolean) => JSX.Element
-  getEntityIcon: (entityType: string | undefined) => JSX.Element
+  getContainerIcon: (
+    containerType: string | undefined,
+    isExpanded: boolean
+  ) => React.ReactElement
+  getEntityIcon: (entityType: string | undefined) => React.ReactElement
 }) {
   const isSelected =
     node.type === 'container'
@@ -1337,7 +1354,7 @@ function EntityDataView({
   explorerSupport?: ExplorerSupportResponse
   onSort: (field: string) => void
   onRefresh: () => void
-  getEntityIcon: (entityType: string | undefined) => JSX.Element
+  getEntityIcon: (entityType: string | undefined) => React.ReactElement
   isObjectStore: () => boolean
 }) {
   const [showSchema, setShowSchema] = useState(false)
