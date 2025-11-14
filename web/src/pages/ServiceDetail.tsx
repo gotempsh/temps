@@ -37,6 +37,7 @@ import {
   AlertCircle,
   ArrowLeft,
   ArrowUpCircle,
+  Database,
   Eye,
   EyeOff,
   Loader2,
@@ -281,6 +282,12 @@ export function ServiceDetail() {
                   ? 'Creating...'
                   : 'Start'}
             </Button>
+            <Link to={`/storage/${id}/browse`}>
+              <Button variant="outline" size="sm" className="gap-2">
+                <Database className="h-4 w-4" />
+                Browse Data
+              </Button>
+            </Link>
             <Button
               variant="outline"
               size="sm"

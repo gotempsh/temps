@@ -12,6 +12,11 @@ temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
+temps-query = { path = "../temps-query" }
+temps-query-postgres = { path = "../temps-query-postgres" }
+temps-query-s3 = { path = "../temps-query-s3" }
+temps-query-redis = { path = "../temps-query-redis" }
+temps-query-mongodb = { path = "../temps-query-mongodb" }
 serde = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

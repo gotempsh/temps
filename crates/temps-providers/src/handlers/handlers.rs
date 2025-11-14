@@ -282,6 +282,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/external-services/by-slug/{slug}",
             get(get_service_by_slug),
         )
+        .merge(super::query_handlers::configure_query_routes())
 }
 
 /// Get parameter schema for a specific service type
@@ -1288,6 +1289,13 @@ async fn get_service_preview_environment_variables_masked(
         get_service_preview_environment_variable_names,
         get_service_preview_environment_variables_masked,
         get_service_by_slug,
+        super::query_handlers::check_explorer_support,
+        super::query_handlers::list_root_containers,
+        super::query_handlers::list_containers_at_path,
+        super::query_handlers::get_container_info,
+        super::query_handlers::list_entities,
+        super::query_handlers::get_entity_info,
+        super::query_handlers::query_data,
     ),
     components(schemas(
         ServiceTypeInfo,
@@ -1304,15 +1312,24 @@ async fn get_service_preview_environment_variables_masked(
         LinkServiceRequest,
         ProjectServiceInfo,
         EnvironmentVariableInfo,
+        super::query_handlers::ExplorerSupportResponse,
+        super::query_handlers::ContainerResponse,
+        super::query_handlers::EntityResponse,
+        super::query_handlers::EntityInfoResponse,
+        super::query_handlers::FieldResponse,
+        super::query_handlers::QueryDataRequest,
+        super::query_handlers::QueryDataResponse,
     )),
     info(
         title = "External Services API",
         description = "API endpoints for managing external service integrations. \
-        Handles configuration, authentication, and interaction with third-party services.",
+        Handles configuration, authentication, and interaction with third-party services. \
+        Includes query capabilities for browsing and querying data from external services.",
         version = "1.0.0"
     ),
     tags(
-        (name = "External Services", description = "External service integration endpoints")
+        (name = "External Services", description = "External service integration endpoints"),
+        (name = "External Services - Query", description = "Data querying and exploration endpoints")
     )
 )]
 pub struct ExternalServiceApiDoc;

@@ -52,6 +52,11 @@ const ImportService = lazy(() =>
 const ServiceDetail = lazy(() =>
   import('./pages/ServiceDetail').then((m) => ({ default: m.ServiceDetail }))
 )
+const ServiceDataBrowser = lazy(() =>
+  import('./pages/ServiceDataBrowser').then((m) => ({
+    default: m.ServiceDataBrowser,
+  }))
+)
 const Users = lazy(() =>
   import('./pages/Users').then((m) => ({ default: m.Users }))
 )
@@ -272,6 +277,10 @@ const AppContent = () => {
                                   <Route
                                     path="/storage/:id"
                                     element={<ServiceDetail />}
+                                  />
+                                  <Route
+                                    path="/storage/:id/browse"
+                                    element={<ServiceDataBrowser />}
                                   />
                                   <Route path="/users" element={<Users />} />
                                   <Route

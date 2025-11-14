@@ -1,4 +1,4 @@
-use crate::ExternalServiceManager;
+use crate::{ExternalServiceManager, QueryService};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -10,6 +10,7 @@ use temps_core::AuditLogger;
 pub struct AppState {
     pub external_service_manager: Arc<ExternalServiceManager>,
     pub audit_service: Arc<dyn AuditLogger>,
+    pub query_service: Arc<QueryService>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

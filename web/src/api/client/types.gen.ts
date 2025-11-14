@@ -595,6 +595,37 @@ export type ContainerMetricsResponse = {
     timestamp: string;
 };
 
+export type ContainerResponse = {
+    /**
+     * Can this container hold other containers?
+     */
+    can_contain_containers: boolean;
+    /**
+     * Can this container hold entities (tables, collections, etc.)?
+     */
+    can_contain_entities: boolean;
+    /**
+     * Type of child containers (if can_contain_containers is true)
+     */
+    child_container_type?: string | null;
+    /**
+     * Container type (database, schema, keyspace, bucket, etc.)
+     */
+    container_type: string;
+    /**
+     * Label for entity type (if can_contain_entities is true)
+     */
+    entity_type_label?: string | null;
+    /**
+     * Additional metadata
+     */
+    metadata: unknown;
+    /**
+     * Container name
+     */
+    name: string;
+};
+
 export type CreateApiKeyRequest = {
     expires_at?: string | null;
     name: string;
@@ -1390,6 +1421,44 @@ export type EnrichVisitorResponse = {
     visitor_id: string;
 };
 
+export type EntityInfoResponse = {
+    /**
+     * Full container path
+     */
+    container_path: Array<string>;
+    /**
+     * Entity name
+     */
+    entity: string;
+    /**
+     * Entity type
+     */
+    entity_type: string;
+    /**
+     * Field definitions
+     */
+    fields: Array<FieldResponse>;
+    /**
+     * JSON Schema for sort options (if supported)
+     */
+    sort_schema?: unknown;
+};
+
+export type EntityResponse = {
+    /**
+     * Entity type (table, view, collection, etc.)
+     */
+    entity_type: string;
+    /**
+     * Entity name (table/collection)
+     */
+    name: string;
+    /**
+     * Approximate row count
+     */
+    row_count?: number | null;
+};
+
 /**
  * Environment variable with masked sensitive values
  */
@@ -1734,6 +1803,33 @@ export type ExecuteOperationRequest = {
     operation: string;
 };
 
+export type ExplorerSupportResponse = {
+    /**
+     * Capabilities supported by this service
+     */
+    capabilities: Array<string>;
+    /**
+     * JSON Schema for filter format with embedded UI hints (if supported)
+     */
+    filter_schema?: unknown;
+    /**
+     * Hierarchy levels (describes the navigation structure)
+     */
+    hierarchy: Array<HierarchyLevel>;
+    /**
+     * Reason why explorer is not supported (if applicable)
+     */
+    reason?: string | null;
+    /**
+     * Service type
+     */
+    service_type: string;
+    /**
+     * Whether the service supports query explorer functionality
+     */
+    supported: boolean;
+};
+
 /**
  * Response for external image operations
  */
@@ -1762,6 +1858,21 @@ export type ExternalServiceInfo = {
     status: string;
     updated_at: string;
     version?: string | null;
+};
+
+export type FieldResponse = {
+    /**
+     * Field type (Int32, String, Timestamp, etc.)
+     */
+    field_type: string;
+    /**
+     * Field name
+     */
+    name: string;
+    /**
+     * Whether the field is nullable
+     */
+    nullable: boolean;
 };
 
 export type FunnelMetricsResponse = {
@@ -2003,6 +2114,32 @@ export type HealthCheckConfiguration = {
      * Timeout for each check (seconds)
      */
     timeout: number;
+};
+
+/**
+ * Describes a level in the data source hierarchy
+ */
+export type HierarchyLevel = {
+    /**
+     * Can list containers at this level?
+     */
+    can_list_containers: boolean;
+    /**
+     * Can list entities at this level?
+     */
+    can_list_entities: boolean;
+    /**
+     * Type of container at this level
+     */
+    container_type: string;
+    /**
+     * Level number (0 = root)
+     */
+    level: number;
+    /**
+     * Human-readable name for this level
+     */
+    name: string;
 };
 
 export type HourlyPageSessions = {
@@ -3220,6 +3357,52 @@ export type ProxyLogsPaginatedResponse = {
 export type PushImageRequest = {
     image_ref: string;
     metadata?: unknown;
+};
+
+export type QueryDataRequest = {
+    /**
+     * JSON filters (backend-specific format)
+     */
+    filters?: unknown;
+    /**
+     * Maximum number of rows to return
+     */
+    limit?: number;
+    /**
+     * Number of rows to skip
+     */
+    offset?: number;
+    /**
+     * Sort by field name
+     */
+    sort_by?: string | null;
+    /**
+     * Sort order (asc/desc)
+     */
+    sort_order?: string | null;
+};
+
+export type QueryDataResponse = {
+    /**
+     * Query execution time in milliseconds
+     */
+    execution_time_ms: number;
+    /**
+     * Field definitions
+     */
+    fields: Array<FieldResponse>;
+    /**
+     * Number of rows returned in this response
+     */
+    returned_count: number;
+    /**
+     * Data rows (array of JSON objects)
+     */
+    rows: Array<unknown>;
+    /**
+     * Total number of rows matching the query (before limit/offset)
+     */
+    total_count: number;
 };
 
 /**
@@ -8166,6 +8349,276 @@ export type UpgradeServiceResponses = {
 };
 
 export type UpgradeServiceResponse = UpgradeServiceResponses[keyof UpgradeServiceResponses];
+
+export type ListRootContainersData = {
+    body?: never;
+    path: {
+        service_id: number;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/containers';
+};
+
+export type ListRootContainersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListRootContainersResponses = {
+    /**
+     * List of root containers
+     */
+    200: Array<ContainerResponse>;
+};
+
+export type ListRootContainersResponse = ListRootContainersResponses[keyof ListRootContainersResponses];
+
+export type ListContainersAtPathData = {
+    body?: never;
+    path: {
+        service_id: number;
+        path: string;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/containers/{path}';
+};
+
+export type ListContainersAtPathErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service or container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListContainersAtPathResponses = {
+    /**
+     * List of containers
+     */
+    200: Array<ContainerResponse>;
+};
+
+export type ListContainersAtPathResponse = ListContainersAtPathResponses[keyof ListContainersAtPathResponses];
+
+export type ListEntitiesData = {
+    body?: never;
+    path: {
+        service_id: number;
+        path: string;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/containers/{path}/entities';
+};
+
+export type ListEntitiesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service or container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListEntitiesResponses = {
+    /**
+     * List of entities
+     */
+    200: Array<EntityResponse>;
+};
+
+export type ListEntitiesResponse = ListEntitiesResponses[keyof ListEntitiesResponses];
+
+export type GetEntityInfoData = {
+    body?: never;
+    path: {
+        service_id: number;
+        path: string;
+        entity: string;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/containers/{path}/entities/{entity}';
+};
+
+export type GetEntityInfoErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service, container, or entity not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetEntityInfoResponses = {
+    /**
+     * Entity details
+     */
+    200: EntityInfoResponse;
+};
+
+export type GetEntityInfoResponse = GetEntityInfoResponses[keyof GetEntityInfoResponses];
+
+export type QueryDataData = {
+    body: QueryDataRequest;
+    path: {
+        service_id: number;
+        path: string;
+        entity: string;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/containers/{path}/entities/{entity}/data';
+};
+
+export type QueryDataErrors = {
+    /**
+     * Invalid query
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service, container, or entity not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type QueryDataResponses = {
+    /**
+     * Query results
+     */
+    200: QueryDataResponse;
+};
+
+export type QueryDataResponse2 = QueryDataResponses[keyof QueryDataResponses];
+
+export type GetContainerInfoData = {
+    body?: never;
+    path: {
+        service_id: number;
+        path: string;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/containers/{path}/info';
+};
+
+export type GetContainerInfoErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service or container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetContainerInfoResponses = {
+    /**
+     * Container information
+     */
+    200: ContainerResponse;
+};
+
+export type GetContainerInfoResponse = GetContainerInfoResponses[keyof GetContainerInfoResponses];
+
+export type CheckExplorerSupportData = {
+    body?: never;
+    path: {
+        service_id: number;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/explorer-support';
+};
+
+export type CheckExplorerSupportErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CheckExplorerSupportResponses = {
+    /**
+     * Explorer support information
+     */
+    200: ExplorerSupportResponse;
+};
+
+export type CheckExplorerSupportResponse = CheckExplorerSupportResponses[keyof CheckExplorerSupportResponses];
 
 export type GetFileData = {
     body?: never;

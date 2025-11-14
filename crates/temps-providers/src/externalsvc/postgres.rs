@@ -1219,7 +1219,7 @@ impl ExternalService for PostgresService {
             "POSTGRES_URL".to_string(),
             format!(
                 "postgresql://{}:{}@{}:{}/{}",
-                config.username, config.password, container_name, config.port, resource_name
+                config.username, config.password, container_name, 5432, resource_name
             ),
         );
 
