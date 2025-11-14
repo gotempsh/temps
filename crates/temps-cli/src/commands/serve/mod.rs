@@ -129,8 +129,10 @@ impl ServeCommand {
 
         // Wait for console API to be ready before starting proxy
         info!("Waiting for console API to be ready...");
-        if let Err(_err) = rt.block_on(ready_rx) {
+        if let Err(recv_err) = rt.block_on(ready_rx) {
             tracing::error!("❌ Console API failed to start");
+            tracing::error!("Ready signal channel error: {:?}", recv_err);
+            tracing::error!("This means the console API task exited or panicked before sending the ready signal.");
 
             // Try to get error details from the error channel
             let error_detail = std::thread::spawn(move || {

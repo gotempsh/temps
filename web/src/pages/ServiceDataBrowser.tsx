@@ -45,13 +45,17 @@ import {
   ArrowLeft,
   ArrowUpDown,
   Box,
+  Calendar,
   ChevronDown,
   ChevronRight,
   Database,
+  Download,
   File,
   FileText,
   Folder,
   FolderOpen,
+  HardDrive,
+  Hash,
   Layers,
   Loader2,
   Package,
@@ -60,6 +64,7 @@ import {
   SortAsc,
   SortDesc,
   Table as TableIcon,
+  Type,
   X,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
@@ -244,6 +249,26 @@ export function ServiceDataBrowser() {
     return explorerSupport?.capabilities?.includes('object-store') || false
   }
 
+  // Helper function to format file size
+  const formatFileSize = (bytes: number): string => {
+    if (bytes === 0) return '0 Bytes'
+    const k = 1024
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB']
+    const i = Math.floor(Math.log(bytes) / Math.log(k))
+    return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i]
+  }
+
+  // Helper function to format date
+  const formatDate = (dateString: string | undefined): string => {
+    if (!dateString) return 'N/A'
+    try {
+      const date = new Date(dateString)
+      return date.toLocaleString()
+    } catch {
+      return dateString
+    }
+  }
+
   // Get root containers
   const {
     data: rootContainers,
@@ -298,24 +323,30 @@ export function ServiceDataBrowser() {
   })
 
   // Load entity data when entity is selected or page changes
+  // Skip for S3 objects as they should be downloaded, not queried
   useEffect(() => {
     if (selectedEntity && selectedPath && id) {
-      const queryRequest: QueryDataRequest = {
-        limit: pageSize,
-        offset: (page - 1) * pageSize,
-        sort_by: dataSortField || undefined,
-        sort_order: dataSortField ? dataSortOrder : undefined,
-        filters: dataFilter || undefined,
-      }
+      // Check if this is an S3 object (skip query for object stores)
+      const isS3Object = entityInfo?.entity_type === 'object' && isObjectStore()
 
-      queryEntityData.mutate({
-        path: {
-          service_id: parseInt(id),
-          path: selectedPath,
-          entity: selectedEntity,
-        },
-        body: queryRequest,
-      })
+      if (!isS3Object) {
+        const queryRequest: QueryDataRequest = {
+          limit: pageSize,
+          offset: (page - 1) * pageSize,
+          sort_by: dataSortField || undefined,
+          sort_order: dataSortField ? dataSortOrder : undefined,
+          filters: dataFilter || undefined,
+        }
+
+        queryEntityData.mutate({
+          path: {
+            service_id: parseInt(id),
+            path: selectedPath,
+            entity: selectedEntity,
+          },
+          body: queryRequest,
+        })
+      }
     }
     // queryEntityData.mutate is stable and doesn't need to be in dependencies
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -328,6 +359,7 @@ export function ServiceDataBrowser() {
     dataSortField,
     dataSortOrder,
     dataFilter,
+    entityInfo?.entity_type,
   ])
 
   // Update breadcrumbs
@@ -504,7 +536,7 @@ export function ServiceDataBrowser() {
         })
       }
 
-      setTreeNodes(updateNodes(treeNodes))
+      setTreeNodes((prevNodes) => updateNodes(prevNodes))
     } catch (error: any) {
       console.error('Failed to load node children:', error)
       setTreeError(error?.detail || 'Failed to load containers and entities')
@@ -556,7 +588,7 @@ export function ServiceDataBrowser() {
           })
         }
 
-        setTreeNodes(updateNodes(treeNodes))
+        setTreeNodes((prevNodes) => updateNodes(prevNodes))
 
         // Load children if expanding for the first time
         if (needsLoading) {
@@ -963,6 +995,11 @@ export function ServiceDataBrowser() {
               }}
               getEntityIcon={getEntityIcon}
               isObjectStore={isObjectStore}
+              formatFileSize={formatFileSize}
+              formatDate={formatDate}
+              serviceId={id || ''}
+              containerPath={selectedPath}
+              entityName={selectedEntity}
             />
           ) : selectedPath ? (
             // Show container info
@@ -1333,6 +1370,11 @@ function EntityDataView({
   onRefresh,
   getEntityIcon,
   isObjectStore,
+  formatFileSize,
+  formatDate,
+  serviceId,
+  containerPath,
+  entityName,
 }: {
   entityInfo?: EntityInfoResponse
   entityInfoLoading: boolean
@@ -1356,8 +1398,52 @@ function EntityDataView({
   onRefresh: () => void
   getEntityIcon: (entityType: string | undefined) => React.ReactElement
   isObjectStore: () => boolean
+  formatFileSize: (bytes: number) => string
+  formatDate: (dateString: string | undefined) => string
+  serviceId: string
+  containerPath: string
+  entityName: string
 }) {
   const [showSchema, setShowSchema] = useState(false)
+  const [isFilterExpanded, setIsFilterExpanded] = useState(false)
+  const [isDownloading, setIsDownloading] = useState(false)
+
+  // Handle streaming download for S3 objects
+  const handleDownload = async () => {
+    if (!serviceId || !containerPath || !entityName) return
+
+    try {
+      setIsDownloading(true)
+
+      // Construct the download URL using the correct endpoint
+      const downloadUrl = `/api/external-services/${serviceId}/query/containers/${containerPath}/entities/${entityName}/download`
+
+      // Fetch the file as a stream
+      const response = await fetch(downloadUrl)
+
+      if (!response.ok) {
+        throw new Error(`Download failed: ${response.statusText}`)
+      }
+
+      // Get the blob from the response
+      const blob = await response.blob()
+
+      // Create a download link
+      const url = window.URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = entityName
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      window.URL.revokeObjectURL(url)
+    } catch (error) {
+      console.error('Download failed:', error)
+      // You might want to show a toast notification here
+    } finally {
+      setIsDownloading(false)
+    }
+  }
 
   // Check if SQL capability is available (for filter support)
   const hasSqlCapability =
@@ -1454,6 +1540,28 @@ function EntityDataView({
                 </CardDescription>
               </div>
               <div className="flex items-center gap-2">
+                {/* Download button for S3 objects */}
+                {isObjectStore() && entityInfo.entity_type === 'object' && (
+                  <Button
+                    variant="default"
+                    size="sm"
+                    onClick={handleDownload}
+                    disabled={isDownloading}
+                    className="gap-2"
+                  >
+                    {isDownloading ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        Downloading...
+                      </>
+                    ) : (
+                      <>
+                        <Download className="h-4 w-4" />
+                        Download
+                      </>
+                    )}
+                  </Button>
+                )}
                 {!isObjectStore() && entityInfo.fields && (
                   <Button
                     variant="outline"
@@ -1463,18 +1571,104 @@ function EntityDataView({
                     {showSchema ? 'Hide' : 'Show'} Schema
                   </Button>
                 )}
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={onRefresh}
-                  className="gap-2"
-                >
-                  <RefreshCcw className="h-4 w-4" />
-                  Refresh
-                </Button>
+                {/* Only show Refresh button for non-S3-objects */}
+                {!(isObjectStore() && entityInfo.entity_type === 'object') && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={onRefresh}
+                    className="gap-2"
+                  >
+                    <RefreshCcw className="h-4 w-4" />
+                    Refresh
+                  </Button>
+                )}
               </div>
             </div>
           </CardHeader>
+
+          {/* Show object metadata for S3 objects */}
+          {isObjectStore() && entityInfo.entity_type === 'object' && (entityInfo as any).metadata && (
+            <CardContent className="pt-0">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-4">
+                {/* File Size */}
+                {(entityInfo as any).size_bytes !== undefined && (
+                  <div className="flex items-start gap-3">
+                    <div className="p-2 rounded-md bg-muted">
+                      <HardDrive className="h-4 w-4 text-muted-foreground" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-muted-foreground">Size</p>
+                      <p className="text-base font-mono break-all">
+                        {formatFileSize((entityInfo as any).size_bytes)}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Content Type */}
+                {(entityInfo as any).metadata.content_type && (
+                  <div className="flex items-start gap-3">
+                    <div className="p-2 rounded-md bg-muted">
+                      <Type className="h-4 w-4 text-muted-foreground" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-muted-foreground">Content Type</p>
+                      <p className="text-base font-mono break-all">
+                        {(entityInfo as any).metadata.content_type}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Last Modified */}
+                {(entityInfo as any).metadata.last_modified && (
+                  <div className="flex items-start gap-3">
+                    <div className="p-2 rounded-md bg-muted">
+                      <Calendar className="h-4 w-4 text-muted-foreground" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-muted-foreground">Last Modified</p>
+                      <p className="text-base font-mono break-all">
+                        {formatDate((entityInfo as any).metadata.last_modified)}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* ETag */}
+                {(entityInfo as any).metadata.etag && (
+                  <div className="flex items-start gap-3">
+                    <div className="p-2 rounded-md bg-muted">
+                      <Hash className="h-4 w-4 text-muted-foreground" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-muted-foreground">ETag</p>
+                      <p className="text-base font-mono break-all">
+                        {(entityInfo as any).metadata.etag}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Storage Class */}
+                {(entityInfo as any).metadata.storage_class && (
+                  <div className="flex items-start gap-3">
+                    <div className="p-2 rounded-md bg-muted">
+                      <Package className="h-4 w-4 text-muted-foreground" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-muted-foreground">Storage Class</p>
+                      <p className="text-base font-mono break-all">
+                        {(entityInfo as any).metadata.storage_class}
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </CardContent>
+          )}
+
           {!isObjectStore() && showSchema && entityInfo.fields && (
             <CardContent>
               <div className="space-y-2">
@@ -1513,13 +1707,34 @@ function EntityDataView({
         </Card>
       )}
 
-      {/* Data Table - Always show this card */}
-      <Card>
-        <CardHeader>
-          <div className="flex items-center justify-between">
-            <div>
-              <CardTitle>
-                {isObjectStore() ? 'Object Metadata' : 'Data'}
+      {/* Data Table - Only show for non-S3-objects */}
+      {!(isObjectStore() && entityInfo?.entity_type === 'object') && (
+        <Card>
+          <CardHeader>
+            <div className="flex items-center justify-between">
+              <div>
+                <CardTitle className="flex items-center gap-2">
+                  Data
+                {hasFilterSupport && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setIsFilterExpanded(!isFilterExpanded)}
+                    className="h-7 px-2"
+                  >
+                    {isFilterExpanded ? (
+                      <>
+                        <ChevronDown className="h-4 w-4" />
+                        <span className="text-xs ml-1">Hide Filter</span>
+                      </>
+                    ) : (
+                      <>
+                        <ChevronRight className="h-4 w-4" />
+                        <span className="text-xs ml-1">Show Filter</span>
+                      </>
+                    )}
+                  </Button>
+                )}
               </CardTitle>
               {queryResult && (
                 <CardDescription>
@@ -1551,8 +1766,8 @@ function EntityDataView({
               </AlertDescription>
             </Alert>
           )}
-          {/* Filter Input - Only show if filtering is supported */}
-          {hasFilterSupport && (
+          {/* Filter Input - Only show if filtering is supported and expanded */}
+          {hasFilterSupport && isFilterExpanded && (
             <div className="mt-4 space-y-3">
               {/* Show schema-based filter builder if filter_schema exists */}
               {hasFilterSchema && explorerSupport?.filter_schema ? (
@@ -1724,6 +1939,7 @@ function EntityDataView({
           )}
         </CardContent>
       </Card>
+      )}
     </div>
   )
 }

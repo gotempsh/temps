@@ -1439,6 +1439,18 @@ export type EntityInfoResponse = {
      */
     fields: Array<FieldResponse>;
     /**
+     * Additional metadata (content_type, last_modified, etag, etc.)
+     */
+    metadata?: unknown;
+    /**
+     * Approximate row count (for tables/collections)
+     */
+    row_count?: number | null;
+    /**
+     * Size in bytes (for objects/files)
+     */
+    size_bytes?: number | null;
+    /**
      * JSON Schema for sort options (if supported)
      */
     sort_schema?: unknown;
@@ -8544,6 +8556,45 @@ export type QueryDataResponses = {
 };
 
 export type QueryDataResponse2 = QueryDataResponses[keyof QueryDataResponses];
+
+export type DownloadObjectData = {
+    body?: never;
+    path: {
+        service_id: number;
+        path: string;
+        entity: string;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/containers/{path}/entities/{entity}/download';
+};
+
+export type DownloadObjectErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Object not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DownloadObjectResponses = {
+    /**
+     * Object data stream
+     */
+    200: Blob | File;
+};
+
+export type DownloadObjectResponse = DownloadObjectResponses[keyof DownloadObjectResponses];
 
 export type GetContainerInfoData = {
     body?: never;

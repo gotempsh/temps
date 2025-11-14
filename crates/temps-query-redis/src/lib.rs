@@ -112,6 +112,7 @@ impl RedisSource {
                 row_count: Some(1),
                 size_bytes: None,
                 schema: None,
+                metadata: None,
             })
             .collect();
 
@@ -194,6 +195,7 @@ impl RedisSource {
             row_count: Some(1),
             size_bytes: None,
             schema: Some(schema),
+            metadata: None,
         })
     }
 }

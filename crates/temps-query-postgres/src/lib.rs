@@ -480,6 +480,7 @@ impl DataSource for PostgresSource {
                     row_count: None,
                     size_bytes: None,
                     schema: None,
+                    metadata: None,
                 }
             })
             .collect();
@@ -555,6 +556,7 @@ impl DataSource for PostgresSource {
             row_count,
             size_bytes: None,
             schema: Some(self.get_schema(container_path, entity_name).await?),
+            metadata: None,
         })
     }
 

@@ -91,8 +91,8 @@ impl MongoDBSource {
         let entities: Vec<EntityInfo> = collection_names
             .into_iter()
             .map(|name| {
-                let mut metadata = HashMap::new();
-                metadata.insert("database".to_string(), serde_json::json!(db_name));
+                let mut metadata_map = HashMap::new();
+                metadata_map.insert("database".to_string(), serde_json::json!(db_name));
 
                 EntityInfo {
                     namespace: db_name.to_string(),
@@ -101,6 +101,7 @@ impl MongoDBSource {
                     row_count: None, // Would require counting documents
                     size_bytes: None,
                     schema: None,
+                    metadata: Some(serde_json::to_value(metadata_map).unwrap()),
                 }
             })
             .collect();
@@ -152,10 +153,10 @@ impl MongoDBSource {
             None
         };
 
-        let mut metadata = HashMap::new();
-        metadata.insert("database".to_string(), serde_json::json!(db_name));
+        let mut metadata_map = HashMap::new();
+        metadata_map.insert("database".to_string(), serde_json::json!(db_name));
         if let Some(count) = doc_count {
-            metadata.insert("document_count".to_string(), serde_json::json!(count));
+            metadata_map.insert("document_count".to_string(), serde_json::json!(count));
         }
 
         Ok(EntityInfo {
@@ -165,6 +166,7 @@ impl MongoDBSource {
             row_count: doc_count.map(|c| c as usize),
             size_bytes: None,
             schema,
+            metadata: Some(serde_json::to_value(metadata_map).unwrap()),
         })
     }
 

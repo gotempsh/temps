@@ -372,6 +372,8 @@ pub struct EntityInfo {
     pub row_count: Option<usize>,
     pub size_bytes: Option<u64>,
     pub schema: Option<DatasetSchema>,
+    /// Additional backend-specific metadata (content_type, last_modified, etag, etc.)
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[cfg(test)]

@@ -1296,6 +1296,7 @@ async fn get_service_preview_environment_variables_masked(
         super::query_handlers::list_entities,
         super::query_handlers::get_entity_info,
         super::query_handlers::query_data,
+        super::query_handlers::download_object,
     ),
     components(schemas(
         ServiceTypeInfo,

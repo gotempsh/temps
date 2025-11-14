@@ -135,6 +135,7 @@ impl S3Source {
                 row_count: None,
                 size_bytes: Some(size),
                 schema: None,
+                metadata: None,
             })
         });
 
@@ -164,9 +165,16 @@ impl S3Source {
             })?;
 
         let size = response.content_length().unwrap_or(0) as u64;
-        let _content_type = response
+        let content_type = response
             .content_type()
-            .unwrap_or("application/octet-stream");
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let last_modified = response.last_modified().map(|dt| dt.to_string());
+        let etag = response.e_tag().map(|s| s.to_string());
+        let storage_class = response.storage_class().map(|s| s.as_str().to_string());
+        let server_side_encryption = response
+            .server_side_encryption()
+            .map(|s| s.as_str().to_string());
 
         // Build schema with basic object metadata
         let schema = DatasetSchema {
@@ -195,10 +203,38 @@ impl S3Source {
                     nullable: true,
                     description: Some("Last modification timestamp".to_string()),
                 },
+                FieldDef {
+                    name: "etag".to_string(),
+                    field_type: FieldType::String,
+                    nullable: true,
+                    description: Some("Entity tag for version tracking".to_string()),
+                },
+                FieldDef {
+                    name: "storage_class".to_string(),
+                    field_type: FieldType::String,
+                    nullable: true,
+                    description: Some("S3 storage class".to_string()),
+                },
             ],
             partitions: None,
             primary_key: Some(vec!["key".to_string()]),
         };
+
+        // Build metadata JSON
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("content_type".to_string(), serde_json::json!(content_type));
+        if let Some(lm) = last_modified {
+            metadata.insert("last_modified".to_string(), serde_json::json!(lm));
+        }
+        if let Some(et) = etag {
+            metadata.insert("etag".to_string(), serde_json::json!(et));
+        }
+        if let Some(sc) = storage_class {
+            metadata.insert("storage_class".to_string(), serde_json::json!(sc));
+        }
+        if let Some(sse) = server_side_encryption {
+            metadata.insert("server_side_encryption".to_string(), serde_json::json!(sse));
+        }
 
         Ok(EntityInfo {
             namespace: bucket.to_string(),
@@ -207,6 +243,7 @@ impl S3Source {
             row_count: Some(1),
             size_bytes: Some(size),
             schema: Some(schema),
+            metadata: Some(serde_json::Value::Object(metadata)),
         })
     }
 }

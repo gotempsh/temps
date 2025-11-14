@@ -111,6 +111,17 @@ pub struct EntityInfoResponse {
     /// JSON Schema for sort options (if supported)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_schema: Option<serde_json::Value>,
+    /// Approximate row count (for tables/collections)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 1234)]
+    pub row_count: Option<usize>,
+    /// Size in bytes (for objects/files)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 1048576)]
+    pub size_bytes: Option<u64>,
+    /// Additional metadata (content_type, last_modified, etag, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -559,10 +570,13 @@ pub async fn get_entity_info(
 
     let response = EntityInfoResponse {
         container_path: segments,
-        entity: entity_info.name,
-        entity_type: entity_info.entity_type,
+        entity: entity_info.name.clone(),
+        entity_type: entity_info.entity_type.clone(),
         fields,
         sort_schema,
+        row_count: entity_info.row_count,
+        size_bytes: entity_info.size_bytes,
+        metadata: entity_info.metadata,
     };
 
     Ok(Json(response))
