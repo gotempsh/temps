@@ -5,7 +5,12 @@ import {
   listRootContainersOptions,
   queryDataMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { listContainersAtPath, listEntities } from '@/api/client/sdk.gen'
+import {
+  downloadObject,
+  getEntityInfo,
+  listContainersAtPath,
+  listEntities,
+} from '@/api/client/sdk.gen'
 import type {
   ContainerResponse,
   EntityInfoResponse,
@@ -24,6 +29,12 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -48,8 +59,9 @@ import {
   Calendar,
   ChevronDown,
   ChevronRight,
-  Database,
   Download,
+  Eye,
+  Database,
   File,
   FileText,
   Folder,
@@ -58,6 +70,7 @@ import {
   Hash,
   Layers,
   Loader2,
+  Menu,
   Package,
   RefreshCcw,
   Search,
@@ -67,7 +80,7 @@ import {
   Type,
   X,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 
 interface TreeNode {
@@ -82,6 +95,7 @@ interface TreeNode {
   level?: number // Hierarchy level (0 = root, 1 = first level, etc.)
   canContainContainers?: boolean
   canContainEntities?: boolean
+  entityCountHint?: 'small' | 'large' | null // Hint about entity count
 }
 
 export function ServiceDataBrowser() {
@@ -90,18 +104,28 @@ export function ServiceDataBrowser() {
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
 
-  // Parse path and entity from URL
+  // Parse path and entity from URL - these are the source of truth
   const pathParam = searchParams.get('path') || ''
   const entityParam = searchParams.get('entity') || ''
 
   // Tree state
   const [treeNodes, setTreeNodes] = useState<TreeNode[]>([])
-  const [selectedPath, setSelectedPath] = useState<string>(pathParam)
-  const [selectedEntity, setSelectedEntity] = useState<string>(entityParam)
   const [treeError, setTreeError] = useState<string | null>(null)
+
+  // Sync state with URL params (for component logic that expects state)
+  const selectedPath = pathParam
+  const selectedEntity = entityParam
+
+  // Track the last expanded path to avoid re-expanding
+  const lastExpandedPathRef = useRef<string>('')
 
   // Filter state (for sidebar tree only)
   const [filterText, setFilterText] = useState('')
+
+  // Sidebar toggle state (mobile responsive) - default closed on mobile, open on desktop
+  const [isSidebarOpen, setIsSidebarOpen] = useState(
+    typeof window !== 'undefined' ? window.innerWidth >= 768 : true
+  )
 
   // Pagination state
   const [page, setPage] = useState(1)
@@ -175,12 +199,19 @@ export function ServiceDataBrowser() {
       // If level not found, use the last level configuration
       const lastLevel =
         explorerSupport.hierarchy[explorerSupport.hierarchy.length - 1]
+      console.warn(`Hierarchy level ${level} not found, using last level:`, lastLevel)
       return {
         can_list_containers: lastLevel.can_list_containers,
         can_list_entities: lastLevel.can_list_entities,
         container_type: lastLevel.container_type,
       }
     }
+
+    console.debug(`Hierarchy capabilities for level ${level}:`, {
+      can_list_containers: hierarchyLevel.can_list_containers,
+      can_list_entities: hierarchyLevel.can_list_entities,
+      container_type: hierarchyLevel.container_type,
+    })
 
     return {
       can_list_containers: hierarchyLevel.can_list_containers,
@@ -285,9 +316,10 @@ export function ServiceDataBrowser() {
   // Initialize tree with root containers
   useEffect(() => {
     if (rootContainers && treeNodes.length === 0) {
-      // Root containers are always level 0
-      const rootLevel = 0
-      const hierarchyInfo = getHierarchyCapabilities(rootLevel)
+      // Root containers exist at depth 1 (e.g., databases in PostgreSQL)
+      // They should get the capabilities from hierarchy level 1 (what databases can do)
+      const containerDepth = 1
+      const hierarchyInfo = getHierarchyCapabilities(containerDepth)
 
       const nodes: TreeNode[] = rootContainers.map((container) => ({
         name: container.name,
@@ -296,14 +328,85 @@ export function ServiceDataBrowser() {
         isExpanded: false,
         isLoaded: false,
         children: [],
-        level: rootLevel,
+        level: containerDepth,
         containerType: container.container_type || hierarchyInfo.container_type,
-        canContainContainers: hierarchyInfo.can_list_containers,
-        canContainEntities: hierarchyInfo.can_list_entities,
+        canContainContainers:
+          container.can_contain_containers ?? hierarchyInfo.can_list_containers,
+        canContainEntities:
+          container.can_contain_entities ?? hierarchyInfo.can_list_entities,
+        entityCountHint: (container.entity_count_hint as 'small' | 'large' | null) || null,
       }))
       setTreeNodes(nodes)
     }
   }, [rootContainers, treeNodes.length, explorerSupport])
+
+  // Sync tree expansion with selected path from URL
+  useEffect(() => {
+    if (!selectedPath || treeNodes.length === 0) return
+
+    // Skip if we've already expanded this exact path
+    if (lastExpandedPathRef.current === selectedPath) return
+
+    const pathSegments = selectedPath.split('/')
+
+    // Expand each level of the path sequentially
+    const expandPath = async () => {
+      for (let i = 0; i < pathSegments.length; i++) {
+        const currentPath = pathSegments.slice(0, i + 1).join('/')
+
+        // Find the node at this path
+        const findNode = (nodes: TreeNode[], path: string): TreeNode | null => {
+          for (const node of nodes) {
+            if (node.path === path) return node
+            if (node.children) {
+              const found = findNode(node.children, path)
+              if (found) return found
+            }
+          }
+          return null
+        }
+
+        const node = findNode(treeNodes, currentPath)
+
+        // If node exists and can have children
+        if (node && node.type === 'container') {
+          // If not already expanded and can contain children, expand it
+          if (
+            !node.isExpanded &&
+            (node.canContainContainers || node.canContainEntities)
+          ) {
+            // Toggle expansion
+            setTreeNodes((prevNodes) => {
+              const updateNodes = (nodes: TreeNode[]): TreeNode[] => {
+                return nodes.map((n) => {
+                  if (n.path === currentPath) {
+                    return { ...n, isExpanded: true }
+                  } else if (n.children) {
+                    return { ...n, children: updateNodes(n.children) }
+                  }
+                  return n
+                })
+              }
+              return updateNodes(prevNodes)
+            })
+
+            // Load children if not loaded - wait for it to complete before moving to next level
+            if (!node.isLoaded) {
+              await loadNodeChildren(currentPath)
+              // Wait a bit for state to update
+              await new Promise((resolve) => setTimeout(resolve, 100))
+            }
+          }
+        }
+      }
+
+      // Mark this path as expanded
+      lastExpandedPathRef.current = selectedPath
+    }
+
+    expandPath()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPath])
 
   // Get entity info when entity is selected
   const { data: entityInfo, isLoading: entityInfoLoading } = useQuery({
@@ -373,9 +476,22 @@ export function ServiceDataBrowser() {
       { label: 'Browse Data', href: `/storage/${id}/browse` },
     ]
 
+    // Break down path into clickable segments
     if (selectedPath) {
-      crumbs.push({ label: selectedPath, href: '' })
+      const pathSegments = selectedPath.split('/')
+      let accumulatedPath = ''
+
+      pathSegments.forEach((segment, index) => {
+        accumulatedPath += (index > 0 ? '/' : '') + segment
+        const isLast = index === pathSegments.length - 1 && !selectedEntity
+
+        crumbs.push({
+          label: segment,
+          href: isLast ? '' : `/storage/${id}/browse?path=${encodeURIComponent(accumulatedPath)}`,
+        })
+      })
     }
+
     if (selectedEntity) {
       crumbs.push({ label: selectedEntity, href: '' })
     }
@@ -439,54 +555,92 @@ export function ServiceDataBrowser() {
       setTreeError(null) // Clear any previous errors
       let containersData: ContainerResponse[] = []
       let entitiesData: EntityResponse[] = []
-      let hasError = false
-      let errorMessage = ''
 
-      // Try to fetch containers at this path (may not exist for all service types)
-      try {
-        const containersResponse = await listContainersAtPath({
-          path: { service_id: parseInt(id!), path: nodePath },
-        })
-        if (containersResponse.data && Array.isArray(containersResponse.data)) {
-          containersData = containersResponse.data
+      // Find the node to determine what it can contain based on hierarchy
+      const findNode = (nodes: TreeNode[], path: string): TreeNode | null => {
+        for (const node of nodes) {
+          if (node.path === path) return node
+          if (node.children) {
+            const found = findNode(node.children, path)
+            if (found) return found
+          }
         }
-      } catch (error: any) {
-        // Check if this is a real error or just no containers
-        if (error?.detail) {
-          hasError = true
-          errorMessage = error.detail
-        } else {
-          console.debug('No containers at path:', nodePath)
+        return null
+      }
+
+      const currentNode = findNode(treeNodes, nodePath)
+      const canListContainers = currentNode?.canContainContainers ?? true
+      const canListEntities = currentNode?.canContainEntities ?? true
+
+      // Only fetch containers if this node can contain them
+      if (canListContainers) {
+        try {
+          const containersResponse = await listContainersAtPath({
+            path: { service_id: parseInt(id!), path: nodePath },
+          })
+          if (containersResponse.data && Array.isArray(containersResponse.data)) {
+            containersData = containersResponse.data
+          }
+        } catch (error: any) {
+          // Only show error if this was supposed to have containers
+          if (error?.detail && !error.detail.includes('only supports')) {
+            console.error('Error loading containers:', error)
+          }
         }
       }
 
-      // Try to fetch entities at this path (may not exist for all service types)
-      try {
-        const entitiesResponse = await listEntities({
-          path: { service_id: parseInt(id!), path: nodePath },
-        })
-        if (entitiesResponse.data && Array.isArray(entitiesResponse.data)) {
-          entitiesData = entitiesResponse.data
+      // Only fetch entities if this node can contain them (and is not a leaf container)
+      // For tree loading, we want to show entities that represent sub-containers (like tables in schemas)
+      if (canListEntities) {
+        try {
+          const entitiesResponse = await listEntities({
+            path: { service_id: parseInt(id!), path: nodePath },
+          })
+          // Handle paginated response - extract entities array
+          if (entitiesResponse.data) {
+            if (Array.isArray(entitiesResponse.data)) {
+              // Legacy: Direct array response
+              entitiesData = entitiesResponse.data
+            } else if (entitiesResponse.data.entities && Array.isArray(entitiesResponse.data.entities)) {
+              // New: Paginated response with entities array
+              entitiesData = entitiesResponse.data.entities
+            }
+          }
+        } catch (error: any) {
+          // Only show error if this was supposed to have entities
+          if (error?.detail && !error.detail.includes('requires path depth')) {
+            console.error('Error loading entities:', error)
+          }
         }
-      } catch (error: any) {
-        // Check if this is a real error or just no entities
-        if (error?.detail) {
-          hasError = true
-          errorMessage = error.detail
-        } else {
-          console.debug('No entities at path:', nodePath)
-        }
-      }
-
-      // If we got a real error, show it
-      if (hasError) {
-        setTreeError(errorMessage)
-        return
       }
 
       const updateNodes = (nodes: TreeNode[]): TreeNode[] => {
         return nodes.map((node) => {
           if (node.path === nodePath) {
+            // Use entity_count_hint to decide if we should show entities in tree or table
+            // "large" means show in paginated table (don't add to tree)
+            // "small" or null means we can show in tree
+            const shouldShowEntitiesInTable = node.entityCountHint === 'large'
+
+            console.log('Loading children for node:', {
+              path: nodePath,
+              canContainEntities: node.canContainEntities,
+              canContainContainers: node.canContainContainers,
+              entityCountHint: node.entityCountHint,
+              shouldShowEntitiesInTable,
+            })
+
+            if (shouldShowEntitiesInTable) {
+              // Mark as loaded but don't add children to tree
+              // Children will be displayed in ContainerEntitiesView instead
+              console.log('Skipping tree children (large entity count):', nodePath)
+              return {
+                ...node,
+                isLoaded: true,
+                children: [],
+              }
+            }
+
             const children: TreeNode[] = []
             // Calculate child level (current level + 1)
             const currentLevel = node.level !== undefined ? node.level : 0
@@ -505,19 +659,26 @@ export function ServiceDataBrowser() {
                 level: childLevel,
                 containerType:
                   container.container_type || childHierarchyInfo.container_type,
-                canContainContainers: childHierarchyInfo.can_list_containers,
-                canContainEntities: childHierarchyInfo.can_list_entities,
+                canContainContainers:
+                  container.can_contain_containers ??
+                  childHierarchyInfo.can_list_containers,
+                canContainEntities:
+                  container.can_contain_entities ??
+                  childHierarchyInfo.can_list_entities,
+                entityCountHint:
+                  (container.entity_count_hint as 'small' | 'large' | null) || null,
               })
             })
 
-            // Add entities
+            // Add entities (e.g., PostgreSQL tables, MongoDB collections)
+            // These should be added as 'entity' type so clicking them triggers entity data view
             entitiesData.forEach((entity: EntityResponse) => {
               children.push({
                 name: entity.name,
                 path: `${nodePath}/${entity.name}`,
-                type: 'entity',
-                level: childLevel,
+                type: 'entity', // ← Key change: entities are entities, not containers
                 entityType: entity.entity_type,
+                level: childLevel,
               })
             })
 
@@ -546,9 +707,8 @@ export function ServiceDataBrowser() {
   // Handle node click
   const handleNodeClick = async (node: TreeNode) => {
     if (node.type === 'container') {
-      setSelectedPath(node.path)
-      setSelectedEntity('')
-      setSearchParams({ path: node.path })
+      // Update URL params - use replace to avoid page reload
+      setSearchParams({ path: node.path }, { replace: true })
       setPage(1)
 
       // Find the current node state
@@ -564,11 +724,24 @@ export function ServiceDataBrowser() {
       }
 
       const currentNode = findNode(treeNodes, node.path)
-      const canHaveChildren =
-        node.canContainContainers || node.canContainEntities
 
-      // Only toggle if the node can have children
-      if (canHaveChildren) {
+      // If this container can only list entities (leaf container like S3 bucket),
+      // we don't expand it in the tree - we'll show entities in the main area
+      const isLeafContainer =
+        node.canContainEntities && !node.canContainContainers
+
+      if (isLeafContainer) {
+        // Don't expand in tree, just select it
+        // The main content area will show the entities table via ContainerEntitiesView
+        // Close sidebar on mobile
+        if (window.innerWidth < 768) {
+          setIsSidebarOpen(false)
+        }
+        return
+      }
+
+      // For containers that can contain other containers, handle expansion
+      if (node.canContainContainers) {
         const isCurrentlyExpanded = currentNode?.isExpanded || false
         const needsLoading =
           currentNode && !currentNode.isLoaded && !isCurrentlyExpanded
@@ -596,13 +769,21 @@ export function ServiceDataBrowser() {
         }
       }
     } else if (node.type === 'entity') {
-      setSelectedEntity(node.name)
-      setSelectedPath(node.path.split('/').slice(0, -1).join('/'))
-      setSearchParams({
-        path: node.path.split('/').slice(0, -1).join('/'),
-        entity: node.name,
-      })
+      // Update URL params for entity selection - use replace to avoid page reload
+      const parentPath = node.path.split('/').slice(0, -1).join('/')
+      setSearchParams(
+        {
+          path: parentPath,
+          entity: node.name,
+        },
+        { replace: true }
+      )
       setPage(1)
+
+      // Close sidebar on mobile when selecting an entity
+      if (window.innerWidth < 768) {
+        setIsSidebarOpen(false)
+      }
     }
   }
 
@@ -657,6 +838,85 @@ export function ServiceDataBrowser() {
       return filterNodes(treeNodes, filterText)
     }
     return treeNodes
+  }
+
+  // Helper to find selected node
+  const findSelectedNode = (
+    nodes: TreeNode[],
+    path: string
+  ): TreeNode | null => {
+    for (const node of nodes) {
+      if (node.path === path) return node
+      if (node.children) {
+        const found = findSelectedNode(node.children, path)
+        if (found) return found
+      }
+    }
+    return null
+  }
+
+  // Helper to render container content
+  const renderContainerContent = () => {
+    if (!selectedPath) return null
+
+    const selectedNode = findSelectedNode(treeNodes, selectedPath)
+
+    console.log('renderContainerContent:', {
+      selectedPath,
+      selectedNode,
+      canContainEntities: selectedNode?.canContainEntities,
+      canContainContainers: selectedNode?.canContainContainers,
+      entityCountHint: selectedNode?.entityCountHint,
+    })
+
+    // Show entities table if:
+    // 1. entity_count_hint is "large" (show in paginated table)
+    // 2. OR it's a leaf container (can_contain_entities=true AND can_contain_containers=false)
+    const shouldShowEntitiesTable =
+      selectedNode &&
+      (selectedNode.entityCountHint === 'large' ||
+        (selectedNode.canContainEntities === true &&
+          selectedNode.canContainContainers === false))
+
+    console.log('shouldShowEntitiesTable check:', {
+      shouldShowEntitiesTable,
+      entityCountHint: selectedNode?.entityCountHint,
+      selectedNode: selectedNode?.name,
+      path: selectedPath,
+    })
+
+    if (shouldShowEntitiesTable) {
+      // Show entities table for leaf containers (like S3 buckets or database tables)
+      return (
+        <ContainerEntitiesView
+          serviceId={id || ''}
+          containerPath={selectedPath}
+          containerName={selectedPath.split('/').pop() || ''}
+          getEntityIcon={getEntityIcon}
+          isObjectStore={isObjectStore}
+          formatFileSize={formatFileSize}
+          formatDate={formatDate}
+        />
+      )
+    }
+
+    // Regular container - show info message
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Container: {selectedPath.split('/').pop()}</CardTitle>
+          <CardDescription>
+            Select an entity from the sidebar to view its data
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm text-muted-foreground">
+            Expand folders in the sidebar to navigate through your data
+            structure.
+          </p>
+        </CardContent>
+      </Card>
+    )
   }
 
   // Loading state
@@ -835,7 +1095,7 @@ export function ServiceDataBrowser() {
   return (
     <div className="flex-1 overflow-hidden flex flex-col">
       {/* Header */}
-      <div className="p-6 pb-0">
+      <div className="p-4 md:p-6 pb-0">
         <div className="flex items-center gap-3 mb-4">
           <Button
             variant="ghost"
@@ -844,15 +1104,24 @@ export function ServiceDataBrowser() {
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
+          {/* Mobile sidebar toggle */}
+          <Button
+            variant="ghost"
+            size="icon"
+            className="md:hidden"
+            onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+          >
+            <Menu className="h-4 w-4" />
+          </Button>
           <ServiceLogo
             service={service.service.service_type}
             className="h-8 w-8"
           />
           <div className="flex flex-col">
-            <h1 className="text-2xl font-semibold">
+            <h1 className="text-xl md:text-2xl font-semibold">
               {service.service.name} - Data Browser
             </h1>
-            <p className="text-sm text-muted-foreground">
+            <p className="text-xs md:text-sm text-muted-foreground hidden sm:block">
               Explore containers and browse data
             </p>
           </div>
@@ -860,9 +1129,22 @@ export function ServiceDataBrowser() {
       </div>
 
       {/* Main content area with sidebar */}
-      <div className="flex-1 flex overflow-hidden px-6 pb-6">
+      <div className="flex-1 flex gap-0 md:gap-6 px-0 md:px-6 pb-0 md:pb-6 min-h-0 relative overflow-hidden">
         {/* Sidebar - Tree View */}
-        <div className="w-80 border-r pr-4">
+        <div
+          className={`
+            ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}
+            md:translate-x-0
+            transition-transform duration-300 ease-in-out
+            fixed md:relative
+            top-0 left-0 md:left-auto md:top-auto
+            z-40
+            w-full md:w-80
+            h-full
+            flex-shrink-0
+            px-4 md:px-0
+          `}
+        >
           <Card className="h-full flex flex-col">
             <CardHeader className="pb-3">
               <CardTitle className="text-base flex items-center gap-2">
@@ -896,7 +1178,7 @@ export function ServiceDataBrowser() {
               </div>
             </div>
 
-            <CardContent className="flex-1 p-0 overflow-hidden border-t">
+            <CardContent className="flex-1 p-0 overflow-hidden border-t min-h-0">
               {/* Show tree error if present */}
               {treeError && (
                 <div className="p-4 border-b">
@@ -941,8 +1223,19 @@ export function ServiceDataBrowser() {
           </Card>
         </div>
 
+        {/* Overlay for mobile when sidebar is open */}
+        {isSidebarOpen && (
+          <div
+            className="fixed inset-0 bg-black/50 z-30 md:hidden"
+            onClick={() => setIsSidebarOpen(false)}
+          />
+        )}
+
         {/* Main content */}
-        <div className="flex-1 pl-6 overflow-auto">
+        <div
+          className="flex-1 overflow-y-auto px-4 md:px-0"
+          style={{ height: 'calc(100vh - 180px)' }}
+        >
           {selectedEntity ? (
             // Show entity data
             <EntityDataView
@@ -1002,23 +1295,7 @@ export function ServiceDataBrowser() {
               entityName={selectedEntity}
             />
           ) : selectedPath ? (
-            // Show container info
-            <Card>
-              <CardHeader>
-                <CardTitle>
-                  Container: {selectedPath.split('/').pop()}
-                </CardTitle>
-                <CardDescription>
-                  Select an entity from the sidebar to view its data
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <p className="text-sm text-muted-foreground">
-                  Expand folders in the sidebar to navigate through your data
-                  structure.
-                </p>
-              </CardContent>
-            </Card>
+            renderContainerContent()
           ) : (
             // Show welcome message
             <Card>
@@ -1112,7 +1389,14 @@ function TreeNodeComponent({
       ? node.path === selectedPath && !selectedEntity
       : node.path === `${selectedPath}/${selectedEntity}`
 
-  const hasChildren = node.canContainContainers || node.canContainEntities
+  // Only show chevron if:
+  // 1. It's a container
+  // 2. It can contain containers
+  // 3. AND entity_count_hint is NOT "large" (large means show entities in table, not tree)
+  const canExpand =
+    node.type === 'container' &&
+    node.canContainContainers &&
+    node.entityCountHint !== 'large'
 
   return (
     <div>
@@ -1126,7 +1410,7 @@ function TreeNodeComponent({
         }`}
         style={{ paddingLeft: `${level * 16 + 8}px` }}
       >
-        {node.type === 'container' && hasChildren && (
+        {canExpand && (
           <span className="flex-shrink-0">
             {node.isExpanded ? (
               <ChevronDown className="h-3.5 w-3.5" />
@@ -1343,6 +1627,486 @@ function DynamicFilterBuilder({
           renderField(fieldName, fieldSchema)
       )}
     </div>
+  )
+}
+
+// Container Entities View Component - Shows entities in a leaf container (like S3 bucket)
+function ContainerEntitiesView({
+  serviceId,
+  containerPath,
+  containerName,
+  getEntityIcon,
+  isObjectStore,
+  formatFileSize,
+  formatDate,
+}: {
+  serviceId: string
+  containerPath: string
+  containerName: string
+  getEntityIcon: (entityType: string | undefined) => React.ReactElement
+  isObjectStore: () => boolean
+  formatFileSize: (bytes: number) => string
+  formatDate: (dateString: string | undefined) => string
+}) {
+  const [nextToken, setNextToken] = useState<string | null>(null)
+  const [selectedEntityForInfo, setSelectedEntityForInfo] = useState<string | null>(
+    null
+  )
+  const pageSize = 20
+
+  // Fetch entities at this container path
+  const {
+    data: entitiesResponse,
+    isLoading,
+    error,
+    refetch,
+  } = useQuery({
+    queryKey: ['container-entities', serviceId, containerPath, nextToken],
+    queryFn: async () => {
+      const response = await listEntities({
+        path: { service_id: parseInt(serviceId), path: containerPath },
+        query: {
+          limit: pageSize,
+          token: nextToken || undefined,
+        },
+      })
+      return response.data
+    },
+    enabled: !!serviceId && !!containerPath,
+  })
+
+  // Fetch entity info when an entity is selected
+  const {
+    data: entityInfo,
+    isLoading: entityInfoLoading,
+    error: entityInfoError,
+  } = useQuery({
+    queryKey: ['entity-info', serviceId, containerPath, selectedEntityForInfo],
+    queryFn: async () => {
+      if (!selectedEntityForInfo) return null
+      const response = await getEntityInfo({
+        path: {
+          service_id: parseInt(serviceId),
+          path: containerPath,
+          entity: selectedEntityForInfo,
+        },
+      })
+      return response.data
+    },
+    enabled: !!serviceId && !!containerPath && !!selectedEntityForInfo,
+  })
+
+  if (isLoading) {
+    return (
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <div className="space-y-2 flex-1">
+              <Skeleton className="h-6 w-48" />
+              <Skeleton className="h-4 w-64" />
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-3">
+            <Skeleton className="h-12 w-full" />
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-full" />
+          </div>
+        </CardContent>
+      </Card>
+    )
+  }
+
+  if (error) {
+    const err = error as any
+    // Extract detailed error information
+    const errorDetail = err?.detail || err?.message || err?.error?.detail || 'Failed to load entities'
+    const errorTitle = err?.title || err?.error?.title || 'Error'
+
+    console.error('ContainerEntitiesView error:', {
+      containerPath,
+      error: err,
+      detail: errorDetail,
+      title: errorTitle,
+    })
+
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Database className="h-5 w-5" />
+            {containerName}
+          </CardTitle>
+          <CardDescription className="text-xs text-muted-foreground mt-1">
+            Path: {containerPath}
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertDescription>
+              <div className="space-y-2">
+                <div className="font-medium">{errorTitle}</div>
+                <div className="text-sm">{errorDetail}</div>
+                {err?.status && (
+                  <div className="text-xs opacity-70">Status: {err.status}</div>
+                )}
+              </div>
+            </AlertDescription>
+          </Alert>
+        </CardContent>
+      </Card>
+    )
+  }
+
+  const entitiesList = entitiesResponse?.entities || []
+  const hasMore = entitiesResponse?.has_more || false
+  const total = entitiesResponse?.total
+  const count = entitiesResponse?.count || 0
+
+  // Split path into segments for display
+  const pathSegments = containerPath.split('/')
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <div className="flex-1">
+            <div className="flex items-center gap-2 text-sm text-muted-foreground mb-2">
+              {pathSegments.map((segment, index) => (
+                <div key={index} className="flex items-center gap-2">
+                  {index > 0 && <span>/</span>}
+                  <span className={index === pathSegments.length - 1 ? 'font-medium text-foreground' : ''}>
+                    {segment}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <CardTitle className="flex items-center gap-2">
+              <Database className="h-5 w-5" />
+              {containerName}
+            </CardTitle>
+            <CardDescription>
+              Showing {count} {isObjectStore() ? 'objects' : 'entities'}
+              {total !== null && total !== undefined && ` of ${total}`}
+            </CardDescription>
+          </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setNextToken(null)
+              refetch()
+            }}
+            className="gap-2"
+          >
+            <RefreshCcw className="h-4 w-4" />
+            Refresh
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {entitiesList.length > 0 ? (
+          <>
+            <div className="rounded-md border overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b bg-muted/50">
+                    <th className="text-left p-3 font-medium whitespace-nowrap">
+                      Type
+                    </th>
+                    <th className="text-left p-3 font-medium whitespace-nowrap">
+                      Name
+                    </th>
+                    {isObjectStore() && (
+                      <>
+                        <th className="text-left p-3 font-medium whitespace-nowrap">
+                          Content Type
+                        </th>
+                        <th className="text-left p-3 font-medium whitespace-nowrap">
+                          Size
+                        </th>
+                        <th className="text-left p-3 font-medium whitespace-nowrap">
+                          Last Modified
+                        </th>
+                        <th className="text-right p-3 font-medium whitespace-nowrap">
+                          Actions
+                        </th>
+                      </>
+                    )}
+                  </tr>
+                </thead>
+                <tbody>
+                  {entitiesList.map((entity: EntityResponse, idx: number) => (
+                    <tr
+                      key={`${entity.name}-${idx}`}
+                      className="border-b last:border-0 hover:bg-muted/30"
+                    >
+                      <td className="p-3">
+                        <div className="[&>svg]:h-4 [&>svg]:w-4">
+                          {getEntityIcon(entity.entity_type)}
+                        </div>
+                      </td>
+                      <td className="p-3 font-mono text-xs">{entity.name}</td>
+                      {isObjectStore() && (
+                        <>
+                          <td className="p-3 text-xs">
+                            {(entity as any).metadata?.content_type ||
+                              (entity as any).content_type ||
+                              '-'}
+                          </td>
+                          <td className="p-3 text-xs">
+                            {(entity as any).size_bytes !== undefined
+                              ? formatFileSize((entity as any).size_bytes)
+                              : '-'}
+                          </td>
+                          <td className="p-3 text-xs">
+                            {(entity as any).last_modified
+                              ? formatDate((entity as any).last_modified)
+                              : '-'}
+                          </td>
+                          <td className="p-3 text-right">
+                            <div className="flex items-center justify-end gap-1">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 px-2"
+                                onClick={async () => {
+                                  try {
+                                    const response = await downloadObject({
+                                      path: {
+                                        service_id: parseInt(serviceId),
+                                        path: containerPath,
+                                        entity: entity.name,
+                                      },
+                                    })
+
+                                    // Ensure we have a Blob
+                                    let blob: Blob
+                                    const data = response.data as any
+                                    if (data instanceof Blob) {
+                                      blob = data
+                                    } else if (typeof data === 'string') {
+                                      // Convert string to Blob
+                                      blob = new Blob([data], {
+                                        type: 'application/octet-stream',
+                                      })
+                                    } else if (data) {
+                                      // Convert other data types to JSON string then Blob
+                                      const jsonStr = JSON.stringify(data)
+                                      blob = new Blob([jsonStr], {
+                                        type: 'application/json',
+                                      })
+                                    } else {
+                                      throw new Error('No data received from server')
+                                    }
+
+                                    const url = window.URL.createObjectURL(blob)
+                                    const a = document.createElement('a')
+                                    a.href = url
+                                    a.download = entity.name
+                                    document.body.appendChild(a)
+                                    a.click()
+                                    window.URL.revokeObjectURL(url)
+                                    document.body.removeChild(a)
+                                  } catch (error) {
+                                    console.error('Failed to download object:', error)
+                                  }
+                                }}
+                                title="Download"
+                              >
+                                <Download className="h-4 w-4" />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 px-2"
+                                onClick={() => {
+                                  setSelectedEntityForInfo(entity.name)
+                                }}
+                                title="View Info"
+                              >
+                                <Eye className="h-4 w-4" />
+                              </Button>
+                            </div>
+                          </td>
+                        </>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Pagination Controls */}
+            <div className="flex items-center justify-between mt-4">
+              <div className="text-sm text-muted-foreground">
+                {count} {isObjectStore() ? 'objects' : 'entities'} shown
+                {total !== null && total !== undefined && ` of ${total} total`}
+              </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!nextToken}
+                  onClick={() => setNextToken(null)}
+                >
+                  First Page
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!hasMore}
+                  onClick={() =>
+                    setNextToken(entitiesResponse?.next_token || null)
+                  }
+                >
+                  Next Page
+                </Button>
+              </div>
+            </div>
+
+            {/* Entity Info Modal */}
+            <Dialog
+              open={!!selectedEntityForInfo}
+              onOpenChange={(open) => {
+                if (!open) setSelectedEntityForInfo(null)
+              }}
+            >
+              <DialogContent className="max-w-4xl max-h-[80vh] overflow-y-auto">
+                <DialogHeader>
+                  <DialogTitle className="flex items-center gap-2">
+                    <FileText className="h-5 w-5" />
+                    Entity Info: {selectedEntityForInfo}
+                  </DialogTitle>
+                </DialogHeader>
+
+                {entityInfoLoading && (
+                  <div className="flex items-center justify-center py-8">
+                    <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+                  </div>
+                )}
+
+                {entityInfoError && (
+                  <Alert variant="destructive">
+                    <AlertCircle className="h-4 w-4" />
+                    <AlertDescription>
+                      Failed to load entity info
+                    </AlertDescription>
+                  </Alert>
+                )}
+
+                {entityInfo && !entityInfoLoading && (
+                  <div className="space-y-6">
+                    {/* Metadata Section */}
+                    {entityInfo.metadata &&
+                    typeof entityInfo.metadata === 'object' &&
+                    entityInfo.metadata !== null ? (
+                      <div>
+                        <h4 className="font-semibold mb-3">Metadata</h4>
+                        <div className="rounded-md border">
+                          <table className="w-full text-sm">
+                            <tbody>
+                              {Object.entries(
+                                entityInfo.metadata as Record<string, any>
+                              ).map(([key, value]) => (
+                                <tr key={key} className="border-b last:border-0">
+                                  <td className="p-3 font-medium bg-muted/50 w-1/3">
+                                    {key}
+                                  </td>
+                                  <td className="p-3 font-mono text-xs break-all">
+                                    {value === null
+                                      ? 'null'
+                                      : typeof value === 'object'
+                                        ? JSON.stringify(value, null, 2)
+                                        : String(value)}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {/* Fields Section */}
+                    {entityInfo.fields && entityInfo.fields.length > 0 && (
+                      <div>
+                        <h4 className="font-semibold mb-3">Fields</h4>
+                        <div className="rounded-md border">
+                          <table className="w-full text-sm">
+                            <thead>
+                              <tr className="border-b bg-muted/50">
+                                <th className="text-left p-3 font-medium">Name</th>
+                                <th className="text-left p-3 font-medium">Type</th>
+                                <th className="text-left p-3 font-medium">
+                                  Nullable
+                                </th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {entityInfo.fields.map((field) => (
+                                <tr key={field.name} className="border-b last:border-0">
+                                  <td className="p-3 font-mono text-xs">
+                                    {field.name}
+                                  </td>
+                                  <td className="p-3 text-xs">{field.field_type}</td>
+                                  <td className="p-3 text-xs">
+                                    {field.nullable ? 'Yes' : 'No'}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Additional Info */}
+                    {(entityInfo.size_bytes !== null &&
+                      entityInfo.size_bytes !== undefined) ||
+                    (entityInfo.row_count !== null &&
+                      entityInfo.row_count !== undefined) ? (
+                      <div className="grid grid-cols-2 gap-4">
+                        {entityInfo.size_bytes !== null &&
+                          entityInfo.size_bytes !== undefined && (
+                            <div>
+                              <div className="text-sm font-medium text-muted-foreground">
+                                Size
+                              </div>
+                              <div className="text-lg font-semibold">
+                                {formatFileSize(entityInfo.size_bytes)}
+                              </div>
+                            </div>
+                          )}
+                        {entityInfo.row_count !== null &&
+                          entityInfo.row_count !== undefined && (
+                            <div>
+                              <div className="text-sm font-medium text-muted-foreground">
+                                Row Count
+                              </div>
+                              <div className="text-lg font-semibold">
+                                {entityInfo.row_count.toLocaleString()}
+                              </div>
+                            </div>
+                          )}
+                      </div>
+                    ) : null}
+                  </div>
+                )}
+              </DialogContent>
+            </Dialog>
+          </>
+        ) : (
+          <div className="text-center py-8 text-sm text-muted-foreground">
+            No {isObjectStore() ? 'objects' : 'entities'} found in this
+            container
+          </div>
+        )}
+      </CardContent>
+    </Card>
   )
 }
 
@@ -1588,86 +2352,100 @@ function EntityDataView({
           </CardHeader>
 
           {/* Show object metadata for S3 objects */}
-          {isObjectStore() && entityInfo.entity_type === 'object' && (entityInfo as any).metadata && (
-            <CardContent className="pt-0">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-4">
-                {/* File Size */}
-                {(entityInfo as any).size_bytes !== undefined && (
-                  <div className="flex items-start gap-3">
-                    <div className="p-2 rounded-md bg-muted">
-                      <HardDrive className="h-4 w-4 text-muted-foreground" />
+          {isObjectStore() &&
+            entityInfo.entity_type === 'object' &&
+            (entityInfo as any).metadata && (
+              <CardContent className="pt-0">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-4">
+                  {/* File Size */}
+                  {(entityInfo as any).size_bytes !== undefined && (
+                    <div className="flex items-start gap-3">
+                      <div className="p-2 rounded-md bg-muted">
+                        <HardDrive className="h-4 w-4 text-muted-foreground" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-muted-foreground">
+                          Size
+                        </p>
+                        <p className="text-base font-mono break-all">
+                          {formatFileSize((entityInfo as any).size_bytes)}
+                        </p>
+                      </div>
                     </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-muted-foreground">Size</p>
-                      <p className="text-base font-mono break-all">
-                        {formatFileSize((entityInfo as any).size_bytes)}
-                      </p>
-                    </div>
-                  </div>
-                )}
+                  )}
 
-                {/* Content Type */}
-                {(entityInfo as any).metadata.content_type && (
-                  <div className="flex items-start gap-3">
-                    <div className="p-2 rounded-md bg-muted">
-                      <Type className="h-4 w-4 text-muted-foreground" />
+                  {/* Content Type */}
+                  {(entityInfo as any).metadata.content_type && (
+                    <div className="flex items-start gap-3">
+                      <div className="p-2 rounded-md bg-muted">
+                        <Type className="h-4 w-4 text-muted-foreground" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-muted-foreground">
+                          Content Type
+                        </p>
+                        <p className="text-base font-mono break-all">
+                          {(entityInfo as any).metadata.content_type}
+                        </p>
+                      </div>
                     </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-muted-foreground">Content Type</p>
-                      <p className="text-base font-mono break-all">
-                        {(entityInfo as any).metadata.content_type}
-                      </p>
-                    </div>
-                  </div>
-                )}
+                  )}
 
-                {/* Last Modified */}
-                {(entityInfo as any).metadata.last_modified && (
-                  <div className="flex items-start gap-3">
-                    <div className="p-2 rounded-md bg-muted">
-                      <Calendar className="h-4 w-4 text-muted-foreground" />
+                  {/* Last Modified */}
+                  {(entityInfo as any).metadata.last_modified && (
+                    <div className="flex items-start gap-3">
+                      <div className="p-2 rounded-md bg-muted">
+                        <Calendar className="h-4 w-4 text-muted-foreground" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-muted-foreground">
+                          Last Modified
+                        </p>
+                        <p className="text-base font-mono break-all">
+                          {formatDate(
+                            (entityInfo as any).metadata.last_modified
+                          )}
+                        </p>
+                      </div>
                     </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-muted-foreground">Last Modified</p>
-                      <p className="text-base font-mono break-all">
-                        {formatDate((entityInfo as any).metadata.last_modified)}
-                      </p>
-                    </div>
-                  </div>
-                )}
+                  )}
 
-                {/* ETag */}
-                {(entityInfo as any).metadata.etag && (
-                  <div className="flex items-start gap-3">
-                    <div className="p-2 rounded-md bg-muted">
-                      <Hash className="h-4 w-4 text-muted-foreground" />
+                  {/* ETag */}
+                  {(entityInfo as any).metadata.etag && (
+                    <div className="flex items-start gap-3">
+                      <div className="p-2 rounded-md bg-muted">
+                        <Hash className="h-4 w-4 text-muted-foreground" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-muted-foreground">
+                          ETag
+                        </p>
+                        <p className="text-base font-mono break-all">
+                          {(entityInfo as any).metadata.etag}
+                        </p>
+                      </div>
                     </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-muted-foreground">ETag</p>
-                      <p className="text-base font-mono break-all">
-                        {(entityInfo as any).metadata.etag}
-                      </p>
-                    </div>
-                  </div>
-                )}
+                  )}
 
-                {/* Storage Class */}
-                {(entityInfo as any).metadata.storage_class && (
-                  <div className="flex items-start gap-3">
-                    <div className="p-2 rounded-md bg-muted">
-                      <Package className="h-4 w-4 text-muted-foreground" />
+                  {/* Storage Class */}
+                  {(entityInfo as any).metadata.storage_class && (
+                    <div className="flex items-start gap-3">
+                      <div className="p-2 rounded-md bg-muted">
+                        <Package className="h-4 w-4 text-muted-foreground" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-muted-foreground">
+                          Storage Class
+                        </p>
+                        <p className="text-base font-mono break-all">
+                          {(entityInfo as any).metadata.storage_class}
+                        </p>
+                      </div>
                     </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-muted-foreground">Storage Class</p>
-                      <p className="text-base font-mono break-all">
-                        {(entityInfo as any).metadata.storage_class}
-                      </p>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </CardContent>
-          )}
+                  )}
+                </div>
+              </CardContent>
+            )}
 
           {!isObjectStore() && showSchema && entityInfo.fields && (
             <CardContent>
@@ -1715,230 +2493,234 @@ function EntityDataView({
               <div>
                 <CardTitle className="flex items-center gap-2">
                   Data
-                {hasFilterSupport && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => setIsFilterExpanded(!isFilterExpanded)}
-                    className="h-7 px-2"
-                  >
-                    {isFilterExpanded ? (
-                      <>
-                        <ChevronDown className="h-4 w-4" />
-                        <span className="text-xs ml-1">Hide Filter</span>
-                      </>
-                    ) : (
-                      <>
-                        <ChevronRight className="h-4 w-4" />
-                        <span className="text-xs ml-1">Show Filter</span>
-                      </>
-                    )}
-                  </Button>
+                  {hasFilterSupport && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setIsFilterExpanded(!isFilterExpanded)}
+                      className="h-7 px-2"
+                    >
+                      {isFilterExpanded ? (
+                        <>
+                          <ChevronDown className="h-4 w-4" />
+                          <span className="text-xs ml-1">Hide Filter</span>
+                        </>
+                      ) : (
+                        <>
+                          <ChevronRight className="h-4 w-4" />
+                          <span className="text-xs ml-1">Show Filter</span>
+                        </>
+                      )}
+                    </Button>
+                  )}
+                </CardTitle>
+                {queryResult && (
+                  <CardDescription>
+                    Showing {queryResult.returned_count} of{' '}
+                    {queryResult.total_count || '?'}{' '}
+                    {isObjectStore() ? 'objects' : 'rows'}
+                    {appliedFilter !== undefined && ' (filtered)'} • Execution
+                    time: {queryResult.execution_time_ms}ms
+                  </CardDescription>
                 )}
-              </CardTitle>
-              {queryResult && (
-                <CardDescription>
-                  Showing {queryResult.returned_count} of{' '}
-                  {queryResult.total_count || '?'}{' '}
-                  {isObjectStore() ? 'objects' : 'rows'}
-                  {appliedFilter !== undefined && ' (filtered)'} • Execution
-                  time: {queryResult.execution_time_ms}ms
-                </CardDescription>
+              </div>
+              {queryLoading && (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  <span>Loading...</span>
+                </div>
               )}
             </div>
-            {queryLoading && (
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                <span>Loading...</span>
-              </div>
+
+            {/* Show error if query failed */}
+            {queryError && errorTitle && errorDetail && (
+              <Alert variant="destructive" className="mt-4">
+                <AlertCircle className="h-4 w-4" />
+                <AlertDescription>
+                  <div className="space-y-1">
+                    <p className="font-semibold">{errorTitle}</p>
+                    <p className="text-sm">{errorDetail}</p>
+                  </div>
+                </AlertDescription>
+              </Alert>
             )}
-          </div>
-
-          {/* Show error if query failed */}
-          {queryError && errorTitle && errorDetail && (
-            <Alert variant="destructive" className="mt-4">
-              <AlertCircle className="h-4 w-4" />
-              <AlertDescription>
-                <div className="space-y-1">
-                  <p className="font-semibold">{errorTitle}</p>
-                  <p className="text-sm">{errorDetail}</p>
-                </div>
-              </AlertDescription>
-            </Alert>
-          )}
-          {/* Filter Input - Only show if filtering is supported and expanded */}
-          {hasFilterSupport && isFilterExpanded && (
-            <div className="mt-4 space-y-3">
-              {/* Show schema-based filter builder if filter_schema exists */}
-              {hasFilterSchema && explorerSupport?.filter_schema ? (
-                <DynamicFilterBuilder
-                  schema={explorerSupport.filter_schema}
-                  formData={filterFormData}
-                  onFormDataChange={onFilterFormDataChange}
-                  onApplyFilter={onApplyFilter}
-                />
-              ) : (
-                /* Show simple text input for SQL WHERE clause */
-                <div className="relative flex-1">
-                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                  <input
-                    type="text"
-                    placeholder={
-                      hasSqlCapability
-                        ? 'Filter data (SQL WHERE clause)...'
-                        : 'Filter data (server-side search)...'
-                    }
-                    value={dataFilterInput}
-                    onChange={(e) => onDataFilterInputChange(e.target.value)}
-                    onKeyDown={(e) => {
-                      // Apply filter on Enter (with or without Ctrl/Cmd)
-                      if (e.key === 'Enter') {
-                        onApplyFilter()
-                      }
-                    }}
-                    className="w-full pl-10 pr-4 py-2.5 text-sm border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-ring"
+            {/* Filter Input - Only show if filtering is supported and expanded */}
+            {hasFilterSupport && isFilterExpanded && (
+              <div className="mt-4 space-y-3">
+                {/* Show schema-based filter builder if filter_schema exists */}
+                {hasFilterSchema && explorerSupport?.filter_schema ? (
+                  <DynamicFilterBuilder
+                    schema={explorerSupport.filter_schema}
+                    formData={filterFormData}
+                    onFormDataChange={onFilterFormDataChange}
+                    onApplyFilter={onApplyFilter}
                   />
-                </div>
-              )}
-
-              {/* Action buttons */}
-              <div className="flex gap-2">
-                <Button
-                  onClick={onApplyFilter}
-                  disabled={
-                    hasFilterSchema
-                      ? Object.keys(filterFormData).length === 0
-                      : !dataFilterInput.trim()
-                  }
-                  size="default"
-                  className="px-6"
-                >
-                  Apply Filter
-                </Button>
-                {appliedFilter !== undefined && (
-                  <Button
-                    onClick={onClearFilter}
-                    variant="outline"
-                    size="default"
-                    className="gap-2"
-                  >
-                    <X className="h-4 w-4" />
-                    Clear
-                  </Button>
+                ) : (
+                  /* Show simple text input for SQL WHERE clause */
+                  <div className="relative flex-1">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                    <input
+                      type="text"
+                      placeholder={
+                        hasSqlCapability
+                          ? 'Filter data (SQL WHERE clause)...'
+                          : 'Filter data (server-side search)...'
+                      }
+                      value={dataFilterInput}
+                      onChange={(e) => onDataFilterInputChange(e.target.value)}
+                      onKeyDown={(e) => {
+                        // Apply filter on Enter (with or without Ctrl/Cmd)
+                        if (e.key === 'Enter') {
+                          onApplyFilter()
+                        }
+                      }}
+                      className="w-full pl-10 pr-4 py-2.5 text-sm border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-ring"
+                    />
+                  </div>
                 )}
-              </div>
-            </div>
-          )}
-          {/* Show info badge about capabilities */}
-          {explorerSupport && (
-            <div className="flex gap-2 mt-3">
-              {explorerSupport.capabilities.map((capability) => (
-                <Badge key={capability} variant="secondary" className="text-xs">
-                  {capability.toUpperCase()}
-                </Badge>
-              ))}
-            </div>
-          )}
-        </CardHeader>
-        <CardContent>
-          {queryResult && queryResult.rows && queryResult.rows.length > 0 ? (
-            <>
-              <div className="rounded-md border overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b bg-muted/50">
-                      {queryResult.fields?.map((field: FieldResponse) => (
-                        <th
-                          key={field.name}
-                          className="text-left p-3 font-medium whitespace-nowrap"
-                        >
-                          <button
-                            onClick={() => onSort(field.name)}
-                            className="flex items-center gap-2 hover:text-foreground transition-colors group w-full"
-                          >
-                            <span>{field.name}</span>
-                            {dataSortField === field.name ? (
-                              dataSortOrder === 'asc' ? (
-                                <SortAsc className="h-4 w-4" />
-                              ) : (
-                                <SortDesc className="h-4 w-4" />
-                              )
-                            ) : (
-                              <ArrowUpDown className="h-4 w-4 opacity-0 group-hover:opacity-50 transition-opacity" />
-                            )}
-                          </button>
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {queryResult.rows.map((row: any, rowIndex: number) => (
-                      <tr
-                        key={rowIndex}
-                        className="border-b last:border-0 hover:bg-muted/30"
-                      >
-                        {queryResult.fields?.map((field: FieldResponse) => (
-                          <td
-                            key={field.name}
-                            className="p-3 font-mono text-xs max-w-xs truncate"
-                            title={String(row[field.name])}
-                          >
-                            {row[field.name] !== null &&
-                            row[field.name] !== undefined
-                              ? String(row[field.name])
-                              : '-'}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
 
-              {/* Pagination */}
-              <div className="flex items-center justify-between mt-4">
-                <div className="text-sm text-muted-foreground flex items-center gap-2">
-                  <span>
-                    Page {page} • Rows {(page - 1) * pageSize + 1} -{' '}
-                    {(page - 1) * pageSize + queryResult.returned_count}
-                  </span>
+                {/* Action buttons */}
+                <div className="flex gap-2">
+                  <Button
+                    onClick={onApplyFilter}
+                    disabled={
+                      hasFilterSchema
+                        ? Object.keys(filterFormData).length === 0
+                        : !dataFilterInput.trim()
+                    }
+                    size="default"
+                    className="px-6"
+                  >
+                    Apply Filter
+                  </Button>
                   {appliedFilter !== undefined && (
-                    <Badge variant="secondary" className="text-xs">
-                      Filtered
-                    </Badge>
+                    <Button
+                      onClick={onClearFilter}
+                      variant="outline"
+                      size="default"
+                      className="gap-2"
+                    >
+                      <X className="h-4 w-4" />
+                      Clear
+                    </Button>
                   )}
                 </div>
-                <div className="flex items-center gap-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={page === 1}
-                    onClick={() => onPageChange(page - 1)}
-                  >
-                    Previous
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={
-                      !queryResult || queryResult.returned_count < pageSize
-                    }
-                    onClick={() => onPageChange(page + 1)}
-                  >
-                    Next
-                  </Button>
-                </div>
               </div>
-            </>
-          ) : (
-            <div className="text-center py-8 text-sm text-muted-foreground">
-              {appliedFilter !== undefined
-                ? 'No results match your filter'
-                : 'No data found'}
-            </div>
-          )}
-        </CardContent>
-      </Card>
+            )}
+            {/* Show info badge about capabilities */}
+            {explorerSupport && (
+              <div className="flex gap-2 mt-3">
+                {explorerSupport.capabilities.map((capability) => (
+                  <Badge
+                    key={capability}
+                    variant="secondary"
+                    className="text-xs"
+                  >
+                    {capability.toUpperCase()}
+                  </Badge>
+                ))}
+              </div>
+            )}
+          </CardHeader>
+          <CardContent>
+            {queryResult && queryResult.rows && queryResult.rows.length > 0 ? (
+              <>
+                <div className="rounded-md border overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b bg-muted/50">
+                        {queryResult.fields?.map((field: FieldResponse) => (
+                          <th
+                            key={field.name}
+                            className="text-left p-3 font-medium whitespace-nowrap"
+                          >
+                            <button
+                              onClick={() => onSort(field.name)}
+                              className="flex items-center gap-2 hover:text-foreground transition-colors group w-full"
+                            >
+                              <span>{field.name}</span>
+                              {dataSortField === field.name ? (
+                                dataSortOrder === 'asc' ? (
+                                  <SortAsc className="h-4 w-4" />
+                                ) : (
+                                  <SortDesc className="h-4 w-4" />
+                                )
+                              ) : (
+                                <ArrowUpDown className="h-4 w-4 opacity-0 group-hover:opacity-50 transition-opacity" />
+                              )}
+                            </button>
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {queryResult.rows.map((row: any, rowIndex: number) => (
+                        <tr
+                          key={rowIndex}
+                          className="border-b last:border-0 hover:bg-muted/30"
+                        >
+                          {queryResult.fields?.map((field: FieldResponse) => (
+                            <td
+                              key={field.name}
+                              className="p-3 font-mono text-xs max-w-xs truncate"
+                              title={String(row[field.name])}
+                            >
+                              {row[field.name] !== null &&
+                              row[field.name] !== undefined
+                                ? String(row[field.name])
+                                : '-'}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Pagination */}
+                <div className="flex items-center justify-between mt-4">
+                  <div className="text-sm text-muted-foreground flex items-center gap-2">
+                    <span>
+                      Page {page} • Rows {(page - 1) * pageSize + 1} -{' '}
+                      {(page - 1) * pageSize + queryResult.returned_count}
+                    </span>
+                    {appliedFilter !== undefined && (
+                      <Badge variant="secondary" className="text-xs">
+                        Filtered
+                      </Badge>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={page === 1}
+                      onClick={() => onPageChange(page - 1)}
+                    >
+                      Previous
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={
+                        !queryResult || queryResult.returned_count < pageSize
+                      }
+                      onClick={() => onPageChange(page + 1)}
+                    >
+                      Next
+                    </Button>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="text-center py-8 text-sm text-muted-foreground">
+                {appliedFilter !== undefined
+                  ? 'No results match your filter'
+                  : 'No data found'}
+              </div>
+            )}
+          </CardContent>
+        </Card>
       )}
     </div>
   )

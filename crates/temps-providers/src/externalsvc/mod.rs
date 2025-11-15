@@ -22,7 +22,7 @@ pub struct ServiceConfig {
     pub version: Option<String>,
     pub parameters: serde_json::Value,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ServiceType {
     Mongodb,

@@ -38,6 +38,10 @@ pub struct ContainerResponse {
     /// Label for entity type (if can_contain_entities is true)
     #[schema(example = "table")]
     pub entity_type_label: Option<String>,
+    /// Hint for UI on expected entity count (small = sidebar, large = pagination)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "large")]
+    pub entity_count_hint: Option<String>,
     /// Additional metadata
     pub metadata: serde_json::Value,
 }
@@ -54,6 +58,10 @@ impl From<ContainerInfo> for ContainerResponse {
                 .child_container_type
                 .map(|t| t.to_string()),
             entity_type_label: info.capabilities.entity_type_label,
+            entity_count_hint: info.capabilities.entity_count_hint.map(|hint| match hint {
+                temps_query::EntityCountHint::Small => "small".to_string(),
+                temps_query::EntityCountHint::Large => "large".to_string(),
+            }),
             metadata: serde_json::to_value(info.metadata).unwrap_or_default(),
         }
     }
@@ -70,6 +78,10 @@ pub struct EntityResponse {
     /// Approximate row count
     #[schema(example = 1234)]
     pub row_count: Option<usize>,
+    /// Size in bytes (for files/objects)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 1048576)]
+    pub size_bytes: Option<u64>,
 }
 
 impl From<EntityInfo> for EntityResponse {
@@ -78,8 +90,42 @@ impl From<EntityInfo> for EntityResponse {
             name: info.name,
             entity_type: info.entity_type,
             row_count: info.row_count,
+            size_bytes: info.size_bytes,
         }
     }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PaginatedEntitiesResponse {
+    /// List of entities
+    pub entities: Vec<EntityResponse>,
+    /// Total number of entities (if available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
+    /// Number of entities returned
+    pub count: usize,
+    /// Limit used for this request
+    pub limit: usize,
+    /// Whether there are more entities available
+    pub has_more: bool,
+    /// Continuation token for next page (S3, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ListEntitiesQuery {
+    /// Maximum number of entities to return
+    #[schema(example = 100)]
+    #[serde(default = "default_entity_limit")]
+    pub limit: usize,
+    /// Continuation token for pagination (backend-specific)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+fn default_entity_limit() -> usize {
+    100
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -480,8 +526,12 @@ pub async fn get_container_info(
     get,
     path = "/external-services/{service_id}/query/containers/{path}/entities",
     tag = "External Services - Query",
+    params(
+        ("limit" = Option<usize>, Query, description = "Maximum number of entities to return (default: 100, max: 1000)"),
+        ("token" = Option<String>, Query, description = "Continuation token for pagination"),
+    ),
     responses(
-        (status = 200, description = "List of entities", body = Vec<EntityResponse>),
+        (status = 200, description = "Paginated list of entities", body = PaginatedEntitiesResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Service or container not found"),
@@ -493,15 +543,19 @@ pub async fn list_entities(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
     Path((service_id, path_str)): Path<(i32, String)>,
+    axum::extract::Query(query): axum::extract::Query<ListEntitiesQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
 
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
     let path = ContainerPath::new(segments);
 
-    let entities = app_state
+    // Cap limit at 1000
+    let limit = std::cmp::min(query.limit, 1000);
+
+    let (entities, next_token) = app_state
         .query_service
-        .list_entities(service_id, &path)
+        .list_entities_paginated(service_id, &path, limit, query.token)
         .await
         .map_err(|e| {
             temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -509,7 +563,19 @@ pub async fn list_entities(
                 .with_detail(format!("Failed to list entities: {}", e))
         })?;
 
-    let response: Vec<EntityResponse> = entities.into_iter().map(Into::into).collect();
+    let count = entities.len();
+    let has_more = next_token.is_some();
+    let entity_responses: Vec<EntityResponse> = entities.into_iter().map(Into::into).collect();
+
+    let response = PaginatedEntitiesResponse {
+        entities: entity_responses,
+        total: None, // Not all backends can provide total count efficiently
+        count,
+        limit,
+        has_more,
+        next_token,
+    };
+
     Ok(Json(response))
 }
 

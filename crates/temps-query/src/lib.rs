@@ -79,6 +79,6 @@ pub use traits::{
 };
 pub use types::{
     Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType, DataRow,
-    DatabaseInfo, DatasetSchema, EntityInfo, EntityRef, FieldDef, FieldType, NamespaceInfo,
-    NamespaceRef, QueryOptions, QueryResult, QueryStats,
+    DatabaseInfo, DatasetSchema, EntityCountHint, EntityInfo, EntityRef, FieldDef, FieldType,
+    NamespaceInfo, NamespaceRef, QueryOptions, QueryResult, QueryStats,
 };

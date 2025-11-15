@@ -32,14 +32,13 @@ use redis::{AsyncCommands, RedisError};
 use std::collections::HashMap;
 use temps_query::{
     Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType, DataError,
-    DataRow, DataSource, DatasetSchema, EntityInfo, FieldDef, FieldType, Result,
+    DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType, Result,
 };
 use tracing::{debug, error};
 
 /// Redis data source implementation
 pub struct RedisSource {
     connection: ConnectionManager,
-    url: String,
 }
 
 impl RedisSource {
@@ -63,10 +62,7 @@ impl RedisSource {
 
         debug!("Redis client created successfully");
 
-        Ok(Self {
-            connection,
-            url: url.to_string(),
-        })
+        Ok(Self { connection })
     }
 
     /// Get connection to a specific Redis database
@@ -76,7 +72,7 @@ impl RedisSource {
         // Select the database
         redis::cmd("SELECT")
             .arg(db)
-            .query_async(&mut conn)
+            .query_async::<()>(&mut conn)
             .await
             .map_err(|e: RedisError| {
                 error!("Failed to select database {}: {}", db, e);
@@ -188,6 +184,11 @@ impl RedisSource {
             primary_key: Some(vec!["key".to_string()]),
         };
 
+        // Build metadata with TTL information
+        let mut metadata_map = HashMap::new();
+        metadata_map.insert("ttl".to_string(), serde_json::json!(ttl));
+        metadata_map.insert("has_expiry".to_string(), serde_json::json!(ttl >= 0));
+
         Ok(EntityInfo {
             namespace: db.to_string(),
             name: key.to_string(),
@@ -195,7 +196,7 @@ impl RedisSource {
             row_count: Some(1),
             size_bytes: None,
             schema: Some(schema),
-            metadata: None,
+            metadata: Some(serde_json::to_value(metadata_map).unwrap()),
         })
     }
 }
@@ -230,6 +231,7 @@ impl DataSource for RedisSource {
                                 can_contain_entities: true,
                                 child_container_type: None,
                                 entity_type_label: Some("key".to_string()),
+                                entity_count_hint: Some(EntityCountHint::Small),
                             },
                             metadata,
                         }
@@ -296,6 +298,7 @@ impl DataSource for RedisSource {
                 can_contain_entities: true,
                 child_container_type: None,
                 entity_type_label: Some("key".to_string()),
+                entity_count_hint: Some(EntityCountHint::Small),
             },
             metadata,
         })

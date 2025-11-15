@@ -39,7 +39,7 @@ use aws_sdk_s3::Client;
 use std::collections::HashMap;
 use temps_query::{
     Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType, DataError,
-    DataSource, DatasetSchema, EntityInfo, FieldDef, FieldType, Result,
+    DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType, Result,
 };
 use tracing::{debug, error};
 
@@ -143,6 +143,85 @@ impl S3Source {
         debug!("Found {} objects in bucket '{}'", result.len(), bucket);
 
         Ok(result)
+    }
+
+    /// List entities (objects) with pagination support
+    /// Returns (entities, next_continuation_token)
+    pub async fn list_entities_paginated(
+        &self,
+        container_path: &ContainerPath,
+        limit: usize,
+        continuation_token: Option<String>,
+    ) -> Result<(Vec<EntityInfo>, Option<String>)> {
+        if container_path.depth() == 0 {
+            return Err(DataError::InvalidQuery(
+                "Cannot list entities at root level - specify a bucket path".to_string(),
+            ));
+        }
+
+        let bucket_name = &container_path.segments[0];
+
+        // If depth > 1, use remaining segments as prefix
+        let prefix = if container_path.depth() > 1 {
+            Some(container_path.segments[1..].join("/") + "/")
+        } else {
+            None
+        };
+
+        debug!(
+            "Listing objects in bucket '{}' with prefix: {:?}, limit: {}, token: {:?}",
+            bucket_name, prefix, limit, continuation_token
+        );
+
+        let mut request = self
+            .client
+            .list_objects_v2()
+            .bucket(bucket_name)
+            .max_keys(limit as i32);
+
+        if let Some(pfx) = prefix.as_ref() {
+            request = request.prefix(pfx);
+        }
+
+        if let Some(token) = continuation_token.as_ref() {
+            request = request.continuation_token(token);
+        }
+
+        let response = request.send().await.map_err(|e| {
+            error!("Failed to list objects in bucket '{}': {}", bucket_name, e);
+            DataError::QueryFailed(format!("Failed to list objects: {}", e))
+        })?;
+
+        let objects: Vec<EntityInfo> = response
+            .contents()
+            .iter()
+            .filter_map(|obj| {
+                let key = obj.key()?;
+                let size = obj.size().unwrap_or(0) as u64;
+
+                Some(EntityInfo {
+                    namespace: bucket_name.to_string(),
+                    name: key.to_string(),
+                    entity_type: "object".to_string(),
+                    row_count: None,
+                    size_bytes: Some(size),
+                    schema: None,
+                    metadata: None,
+                })
+            })
+            .collect();
+
+        // Get next continuation token if available
+        let next_token = response.next_continuation_token().map(|s| s.to_string());
+
+        debug!(
+            "Found {} objects in bucket '{}', has_more: {}",
+            objects.len(),
+            bucket_name,
+            next_token.is_some()
+        );
+
+        Ok((objects, next_token))
     }
 
     /// Get metadata for a specific object
@@ -294,6 +373,7 @@ impl DataSource for S3Source {
                                 can_contain_entities: true,
                                 child_container_type: None,
                                 entity_type_label: Some("object".to_string()),
+                                entity_count_hint: Some(EntityCountHint::Large),
                             },
                             metadata,
                         })
@@ -346,6 +426,7 @@ impl DataSource for S3Source {
                 can_contain_entities: true,
                 child_container_type: None,
                 entity_type_label: Some("object".to_string()),
+                entity_count_hint: Some(EntityCountHint::Large),
             },
             metadata,
         })

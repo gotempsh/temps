@@ -1316,6 +1316,8 @@ async fn get_service_preview_environment_variables_masked(
         super::query_handlers::ExplorerSupportResponse,
         super::query_handlers::ContainerResponse,
         super::query_handlers::EntityResponse,
+        super::query_handlers::PaginatedEntitiesResponse,
+        super::query_handlers::ListEntitiesQuery,
         super::query_handlers::EntityInfoResponse,
         super::query_handlers::FieldResponse,
         super::query_handlers::QueryDataRequest,

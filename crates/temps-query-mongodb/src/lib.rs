@@ -34,14 +34,13 @@ use mongodb::{
 use std::collections::HashMap;
 use temps_query::{
     Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType, DataError,
-    DataSource, DatasetSchema, EntityInfo, FieldDef, FieldType, Result,
+    DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType, Result,
 };
 use tracing::{debug, error};
 
 /// MongoDB data source implementation
 pub struct MongoDBSource {
     client: Client,
-    url: String,
 }
 
 impl MongoDBSource {
@@ -71,10 +70,7 @@ impl MongoDBSource {
 
         debug!("MongoDB client created successfully");
 
-        Ok(Self {
-            client,
-            url: url.to_string(),
-        })
+        Ok(Self { client })
     }
 
     /// List collections in a specific database
@@ -241,6 +237,7 @@ impl DataSource for MongoDBSource {
                                 can_contain_entities: true,
                                 child_container_type: None,
                                 entity_type_label: Some("collection".to_string()),
+                                entity_count_hint: Some(EntityCountHint::Small),
                             },
                             metadata,
                         }
@@ -304,6 +301,7 @@ impl DataSource for MongoDBSource {
                 can_contain_entities: true,
                 child_container_type: None,
                 entity_type_label: Some("collection".to_string()),
+                entity_count_hint: Some(EntityCountHint::Small),
             },
             metadata,
         })
@@ -369,6 +367,233 @@ impl DataSource for MongoDBSource {
         debug!("Closing MongoDB source");
         // MongoDB client handles cleanup automatically
         Ok(())
+    }
+}
+
+#[async_trait]
+impl temps_query::Queryable for MongoDBSource {
+    async fn query(
+        &self,
+        container_path: &temps_query::ContainerPath,
+        entity_name: &str,
+        filters: Option<serde_json::Value>,
+        options: temps_query::QueryOptions,
+    ) -> Result<temps_query::QueryResult> {
+        if container_path.depth() == 0 {
+            return Err(DataError::InvalidQuery(
+                "Cannot query at root level - specify a database path".to_string(),
+            ));
+        }
+
+        let db_name = &container_path.segments[0];
+        let db = self.client.database(db_name);
+        let collection = db.collection::<Document>(entity_name);
+
+        // Convert filter JSON to MongoDB Document
+        let filter_doc = if let Some(filter_value) = filters {
+            // If the filter is already a MongoDB query, use it directly
+            // Otherwise, treat it as key-value equality filters
+            match filter_value {
+                serde_json::Value::Object(map) => {
+                    let mut doc = Document::new();
+                    for (key, value) in map {
+                        // Convert JSON value to BSON value
+                        if let Ok(bson_value) = mongodb::bson::to_bson(&value) {
+                            doc.insert(key, bson_value);
+                        }
+                    }
+                    doc
+                }
+                _ => Document::new(),
+            }
+        } else {
+            Document::new()
+        };
+
+        debug!("MongoDB filter: {:?}", filter_doc);
+
+        // Apply pagination
+        let limit = options.limit.unwrap_or(100) as i64;
+        let skip = options.offset.unwrap_or(0) as u64;
+
+        // Apply sorting
+        let sort_doc = if let Some(sort_by) = &options.sort_by {
+            let sort_order = match options.sort_order.as_deref() {
+                Some("desc") | Some("DESC") => -1,
+                _ => 1,
+            };
+            doc! { sort_by: sort_order }
+        } else {
+            doc! { "_id": 1 } // Default sort by _id ascending
+        };
+
+        debug!(
+            "MongoDB query: filter={:?}, limit={}, skip={}, sort={:?}",
+            filter_doc, limit, skip, sort_doc
+        );
+
+        let start_time = std::time::Instant::now();
+
+        // Execute query
+        let mut cursor = collection
+            .find(filter_doc.clone())
+            .sort(sort_doc)
+            .limit(limit)
+            .skip(skip)
+            .await
+            .map_err(|e| {
+                error!("MongoDB query failed: {}", e);
+                DataError::QueryFailed(format!("MongoDB query failed: {}", e))
+            })?;
+
+        // Collect results
+        let mut rows = Vec::new();
+        while cursor.advance().await.map_err(|e| {
+            error!("Failed to iterate MongoDB cursor: {}", e);
+            DataError::QueryFailed(format!("Failed to iterate results: {}", e))
+        })? {
+            let doc = cursor.deserialize_current().map_err(|e| {
+                error!("Failed to deserialize MongoDB document: {}", e);
+                DataError::QueryFailed(format!("Failed to deserialize document: {}", e))
+            })?;
+
+            // Convert Document to HashMap for DataRow
+            let mut row_map = std::collections::HashMap::new();
+            for (key, value) in doc {
+                // Convert BSON to serde_json::Value
+                // Use serde to convert BSON value to JSON
+                if let Ok(json_value) = serde_json::to_value(&value) {
+                    row_map.insert(key, json_value);
+                }
+            }
+            rows.push(row_map);
+        }
+
+        // Get total count (expensive, but needed for pagination)
+        let total_count = collection.count_documents(filter_doc).await.map_err(|e| {
+            error!("Failed to count MongoDB documents: {}", e);
+            DataError::QueryFailed(format!("Failed to count documents: {}", e))
+        })?;
+
+        let execution_time = start_time.elapsed();
+
+        // Get schema from first document
+        let schema = if let Some(first_row) = rows.first() {
+            let fields: Vec<temps_query::FieldDef> = first_row
+                .iter()
+                .map(|(key, value)| {
+                    let field_type = match value {
+                        serde_json::Value::String(_) => temps_query::FieldType::String,
+                        serde_json::Value::Number(n) if n.is_i64() => temps_query::FieldType::Int64,
+                        serde_json::Value::Number(n) if n.is_f64() => {
+                            temps_query::FieldType::Float64
+                        }
+                        serde_json::Value::Bool(_) => temps_query::FieldType::Boolean,
+                        serde_json::Value::Array(_) => temps_query::FieldType::Json,
+                        serde_json::Value::Object(_) => temps_query::FieldType::Json,
+                        _ => temps_query::FieldType::String,
+                    };
+
+                    temps_query::FieldDef {
+                        name: key.clone(),
+                        field_type,
+                        nullable: true,
+                        description: None,
+                    }
+                })
+                .collect();
+
+            temps_query::DatasetSchema {
+                fields,
+                partitions: None,
+                primary_key: Some(vec!["_id".to_string()]),
+            }
+        } else {
+            // Empty result - create schema from collection sample
+            temps_query::DatasetSchema {
+                fields: vec![],
+                partitions: None,
+                primary_key: Some(vec!["_id".to_string()]),
+            }
+        };
+
+        // Check if there are more results
+        let returned_rows = rows.len();
+        let has_more = (skip + returned_rows as u64) < total_count;
+
+        Ok(temps_query::QueryResult {
+            schema,
+            rows,
+            stats: temps_query::QueryStats {
+                row_count: returned_rows,
+                total_rows: Some(total_count as usize),
+                execution_ms: execution_time.as_millis() as u64,
+                has_more,
+                next_cursor: None, // MongoDB uses offset-based pagination, not cursors
+            },
+        })
+    }
+
+    async fn count(
+        &self,
+        container_path: &temps_query::ContainerPath,
+        entity_name: &str,
+        filters: Option<serde_json::Value>,
+    ) -> Result<u64> {
+        if container_path.depth() == 0 {
+            return Err(DataError::InvalidQuery(
+                "Cannot count at root level - specify a database path".to_string(),
+            ));
+        }
+
+        let db_name = &container_path.segments[0];
+        let db = self.client.database(db_name);
+        let collection = db.collection::<Document>(entity_name);
+
+        // Convert filter JSON to MongoDB Document
+        let filter_doc = if let Some(filter_value) = filters {
+            match filter_value {
+                serde_json::Value::Object(map) => {
+                    let mut doc = Document::new();
+                    for (key, value) in map {
+                        if let Ok(bson_value) = mongodb::bson::to_bson(&value) {
+                            doc.insert(key, bson_value);
+                        }
+                    }
+                    doc
+                }
+                _ => Document::new(),
+            }
+        } else {
+            Document::new()
+        };
+
+        let count = collection.count_documents(filter_doc).await.map_err(|e| {
+            error!("Failed to count MongoDB documents: {}", e);
+            DataError::QueryFailed(format!("Failed to count documents: {}", e))
+        })?;
+
+        Ok(count)
+    }
+
+    async fn entity_exists(
+        &self,
+        container_path: &temps_query::ContainerPath,
+        entity_name: &str,
+    ) -> Result<bool> {
+        if container_path.depth() == 0 {
+            return Ok(false);
+        }
+
+        let db_name = &container_path.segments[0];
+        let db = self.client.database(db_name);
+
+        let collections = db.list_collection_names().await.map_err(|e| {
+            error!("Failed to list collections: {}", e);
+            DataError::QueryFailed(format!("Failed to list collections: {}", e))
+        })?;
+
+        Ok(collections.contains(&entity_name.to_string()))
     }
 }
 

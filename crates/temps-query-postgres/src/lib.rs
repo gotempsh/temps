@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use temps_query::{
     Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType, DataError,
-    DataRow, DataSource, DatasetSchema, EntityInfo, FieldDef, FieldType, Introspect, QueryOptions,
-    QueryResult, QueryStats, Queryable, Result, SqlFeature,
+    DataRow, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType,
+    Introspect, QueryOptions, QueryResult, QueryStats, Queryable, Result, SqlFeature,
 };
 use tokio::sync::RwLock;
 use tokio_postgres::{Client, NoTls, Row};
@@ -241,6 +241,7 @@ impl DataSource for PostgresSource {
                                 can_contain_entities: false,
                                 child_container_type: Some(ContainerType::Schema),
                                 entity_type_label: None,
+                                entity_count_hint: None,
                             },
                             metadata,
                         }
@@ -300,6 +301,7 @@ impl DataSource for PostgresSource {
                                 can_contain_entities: true,
                                 child_container_type: None,
                                 entity_type_label: Some("table".to_string()),
+                                entity_count_hint: Some(EntityCountHint::Small),
                             },
                             metadata,
                         }
@@ -374,6 +376,7 @@ impl DataSource for PostgresSource {
                         can_contain_entities: false,
                         child_container_type: Some(ContainerType::Schema),
                         entity_type_label: None,
+                        entity_count_hint: None,
                     },
                     metadata,
                 })
@@ -414,6 +417,7 @@ impl DataSource for PostgresSource {
                         can_contain_entities: true,
                         child_container_type: None,
                         entity_type_label: Some("table".to_string()),
+                        entity_count_hint: Some(EntityCountHint::Small),
                     },
                     metadata,
                 })

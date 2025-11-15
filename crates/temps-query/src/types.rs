@@ -333,6 +333,18 @@ impl fmt::Display for ContainerPath {
     }
 }
 
+/// Hint for UI on expected entity count to determine display strategy
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntityCountHint {
+    /// Small count (dozens to hundreds) - UI should display in sidebar, fetch all at once
+    /// Examples: database tables, schemas, collections
+    Small,
+    /// Large count (thousands to millions) - UI should display in main data table with pagination
+    /// Examples: S3 objects, log entries, large datasets
+    Large,
+}
+
 /// Information about what a container can hold
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerCapabilities {
@@ -344,6 +356,10 @@ pub struct ContainerCapabilities {
     pub child_container_type: Option<ContainerType>,
     /// Type label for entities (e.g., "table", "collection", "object")
     pub entity_type_label: Option<String>,
+    /// Hint for UI on expected entity count
+    /// - Small: Dozens to hundreds of entities (display in sidebar, fetch all at once)
+    /// - Large: Thousands to millions of entities (display in main table, use pagination)
+    pub entity_count_hint: Option<EntityCountHint>,
 }
 
 /// Generic container information (database, schema, keyspace, bucket, etc.)

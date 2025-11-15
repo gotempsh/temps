@@ -33,15 +33,17 @@ impl QueryService {
     }
 
     /// Get or create a connection to a specific database
-    async fn get_connection_for_database(
+    /// If force_new is true, bypass cache and create a new connection
+    async fn get_connection_for_database_internal(
         &self,
         service_id: i32,
         database: &str,
+        force_new: bool,
     ) -> Result<Arc<dyn DataSource>> {
         let cache_key = (service_id, database.to_string());
 
-        // Check if we already have a connection
-        {
+        // Check if we already have a connection (unless force_new)
+        if !force_new {
             let connections = self.connections.read().await;
             if let Some(conn) = connections.get(&cache_key) {
                 debug!(
@@ -150,16 +152,20 @@ impl QueryService {
                         ))
                     })?;
 
-                // Build connection string
+                // Build connection string with URL-encoded credentials
                 let port = config.port.unwrap_or_else(|| "27017".to_string());
                 let password = config.password.unwrap_or_else(|| "".to_string());
 
+                // URL-encode username and password to handle special characters
+                let encoded_username = urlencoding::encode(&config.username);
+
                 let connection_string = if password.is_empty() {
-                    format!("mongodb://{}@{}:{}", config.username, config.host, port)
+                    format!("mongodb://{}@{}:{}", encoded_username, config.host, port)
                 } else {
+                    let encoded_password = urlencoding::encode(&password);
                     format!(
                         "mongodb://{}:{}@{}:{}",
-                        config.username, password, config.host, port
+                        encoded_username, encoded_password, config.host, port
                     )
                 };
 
@@ -181,14 +187,16 @@ impl QueryService {
                     ))
                 })?;
 
-                // Build connection string
+                // Build connection string with URL-encoded password
                 let port = config.port.unwrap_or_else(|| "6379".to_string());
                 let password = config.password.unwrap_or_else(|| "".to_string());
 
                 let connection_string = if password.is_empty() {
                     format!("redis://{}:{}", config.host, port)
                 } else {
-                    format!("redis://:{}@{}:{}", password, config.host, port)
+                    // URL-encode password to handle special characters
+                    let encoded_password = urlencoding::encode(&password);
+                    format!("redis://:{}@{}:{}", encoded_password, config.host, port)
                 };
 
                 // Create Redis source
@@ -201,11 +209,96 @@ impl QueryService {
             }
         };
 
-        // Cache the connection
+        // Cache the connection (remove old one if force_new)
         let mut connections = self.connections.write().await;
+        if force_new {
+            connections.remove(&cache_key);
+        }
         connections.insert(cache_key, connection.clone());
 
         Ok(connection)
+    }
+
+    /// Get or create a connection to a specific database with automatic retry on connection errors
+    async fn get_connection_for_database(
+        &self,
+        service_id: i32,
+        database: &str,
+    ) -> Result<Arc<dyn DataSource>> {
+        self.get_connection_for_database_internal(service_id, database, false)
+            .await
+    }
+
+    /// Check if an error is a connection-related error that should trigger a retry
+    fn is_connection_error(error: &DataError) -> bool {
+        match error {
+            DataError::ConnectionFailed(msg) => {
+                // Check for common connection error patterns
+                msg.contains("connection closed")
+                    || msg.contains("connection lost")
+                    || msg.contains("connection reset")
+                    || msg.contains("broken pipe")
+                    || msg.contains("EOF")
+                    || msg.contains("timeout")
+                    || msg.contains("timed out")
+                    || msg.contains("Connection refused")
+                    || msg.contains("network unreachable")
+            }
+            DataError::QueryFailed(msg) => {
+                // Database-specific connection errors
+                msg.contains("connection closed")
+                    || msg.contains("connection lost")
+                    || msg.contains("no connection")
+                    || msg.contains("server closed the connection")
+                    || msg.contains("lost connection")
+            }
+            _ => false,
+        }
+    }
+
+    /// Execute an operation with automatic connection retry on failure
+    async fn with_connection_retry<F, T, Fut>(
+        &self,
+        service_id: i32,
+        database: &str,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: Fn(Arc<dyn DataSource>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        // First attempt with cached connection
+        let conn = self
+            .get_connection_for_database(service_id, database)
+            .await?;
+
+        match operation(conn).await {
+            Ok(result) => Ok(result),
+            Err(e) if Self::is_connection_error(&e) => {
+                // Connection error detected - log and retry with new connection
+                tracing::warn!(
+                    "Connection error for service {} database {}: {}. Retrying with new connection...",
+                    service_id,
+                    database,
+                    e
+                );
+
+                // Remove stale connection from cache and create new one
+                let cache_key = (service_id, database.to_string());
+                {
+                    let mut connections = self.connections.write().await;
+                    connections.remove(&cache_key);
+                }
+
+                // Create new connection and retry
+                let new_conn = self
+                    .get_connection_for_database_internal(service_id, database, true)
+                    .await?;
+
+                operation(new_conn).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// List containers at a specific path in the hierarchy
@@ -259,10 +352,13 @@ impl QueryService {
             }
         };
 
-        let conn = self
-            .get_connection_for_database(service_id, &database)
-            .await?;
-        conn.list_containers(path).await
+        // Use retry mechanism for connection errors
+        let path_clone = path.clone();
+        self.with_connection_retry(service_id, &database, move |conn| {
+            let path_clone = path_clone.clone();
+            async move { conn.list_containers(&path_clone).await }
+        })
+        .await
     }
 
     /// Get information about a specific container
@@ -277,11 +373,13 @@ impl QueryService {
             ));
         }
 
-        let database = &path.segments[0];
-        let conn = self
-            .get_connection_for_database(service_id, database)
-            .await?;
-        conn.get_container_info(path).await
+        let database = path.segments[0].clone();
+        let path_clone = path.clone();
+        self.with_connection_retry(service_id, &database, move |conn| {
+            let path_clone = path_clone.clone();
+            async move { conn.get_container_info(&path_clone).await }
+        })
+        .await
     }
 
     /// List entities (tables, collections, objects) at a specific container path
@@ -298,11 +396,61 @@ impl QueryService {
             ));
         }
 
-        let database = &container_path.segments[0];
-        let conn = self
-            .get_connection_for_database(service_id, database)
-            .await?;
-        conn.list_entities(container_path).await
+        let database = container_path.segments[0].clone();
+        let path_clone = container_path.clone();
+        self.with_connection_retry(service_id, &database, move |conn| {
+            let path_clone = path_clone.clone();
+            async move { conn.list_entities(&path_clone).await }
+        })
+        .await
+    }
+
+    /// List entities with pagination support
+    /// Returns (entities, next_continuation_token)
+    pub async fn list_entities_paginated(
+        &self,
+        service_id: i32,
+        container_path: &ContainerPath,
+        limit: usize,
+        continuation_token: Option<String>,
+    ) -> Result<(Vec<EntityInfo>, Option<String>)> {
+        if container_path.depth() == 0 {
+            return Err(DataError::InvalidQuery(
+                "Cannot list entities at root level - specify a container path".to_string(),
+            ));
+        }
+
+        // Get service type to determine which implementation to use
+        let service = self
+            .external_service_manager
+            .get_service_config(service_id)
+            .await
+            .map_err(|e| DataError::ConnectionFailed(format!("Service not found: {}", e)))?;
+
+        let database = container_path.segments[0].clone();
+        let service_type = service.service_type;
+        let path_clone = container_path.clone();
+
+        self.with_connection_retry(service_id, &database, move |conn| {
+            let path_clone = path_clone.clone();
+            let continuation_token = continuation_token.clone();
+            async move {
+                // Check if this is S3 and use pagination
+                if service_type == crate::externalsvc::ServiceType::S3 {
+                    if let Some(s3_source) = conn.downcast_ref::<S3Source>() {
+                        return s3_source
+                            .list_entities_paginated(&path_clone, limit, continuation_token)
+                            .await;
+                    }
+                }
+
+                // For other backends (PostgreSQL, MongoDB, Redis), just return all entities with no pagination
+                // These typically don't have thousands of entities
+                let entities = conn.list_entities(&path_clone).await?;
+                Ok((entities, None))
+            }
+        })
+        .await
     }
 
     /// Get detailed information about an entity
@@ -319,11 +467,15 @@ impl QueryService {
             ));
         }
 
-        let database = &container_path.segments[0];
-        let conn = self
-            .get_connection_for_database(service_id, database)
-            .await?;
-        conn.get_entity_info(container_path, entity_name).await
+        let database = container_path.segments[0].clone();
+        let path_clone = container_path.clone();
+        let entity_name = entity_name.to_string();
+        self.with_connection_retry(service_id, &database, move |conn| {
+            let path_clone = path_clone.clone();
+            let entity_name = entity_name.clone();
+            async move { conn.get_entity_info(&path_clone, &entity_name).await }
+        })
+        .await
     }
 
     /// Query data from an entity
@@ -341,22 +493,36 @@ impl QueryService {
             ));
         }
 
-        let database = &container_path.segments[0];
-        let conn = self
-            .get_connection_for_database(service_id, database)
-            .await?;
+        let database = container_path.segments[0].clone();
+        let path_clone = container_path.clone();
+        let entity_name = entity_name.to_string();
+        self.with_connection_retry(service_id, &database, move |conn| {
+            let path_clone = path_clone.clone();
+            let entity_name = entity_name.clone();
+            let filters = filters.clone();
+            let options = options.clone();
+            async move {
+                // Check if source supports querying
+                use temps_query::Queryable;
 
-        // Check if source supports querying
-        if let Some(queryable) = conn.downcast_ref::<PostgresSource>() {
-            use temps_query::Queryable;
-            queryable
-                .query(container_path, entity_name, filters, options)
-                .await
-        } else {
-            Err(DataError::OperationNotSupported(
-                "Service does not support querying".to_string(),
-            ))
-        }
+                if let Some(queryable) = conn.downcast_ref::<PostgresSource>() {
+                    return queryable
+                        .query(&path_clone, &entity_name, filters, options)
+                        .await;
+                }
+
+                if let Some(queryable) = conn.downcast_ref::<MongoDBSource>() {
+                    return queryable
+                        .query(&path_clone, &entity_name, filters, options)
+                        .await;
+                }
+
+                Err(DataError::OperationNotSupported(
+                    "Service does not support querying".to_string(),
+                ))
+            }
+        })
+        .await
     }
 
     /// Get filter schema for a service (if it supports QuerySchemaProvider)
@@ -460,19 +626,24 @@ impl QueryService {
             ));
         }
 
-        let database = &container_path.segments[0];
-        let conn = self
-            .get_connection_for_database(service_id, database)
-            .await?;
-
-        // Check if source implements Downloadable trait
-        if let Some(downloadable) = conn.downcast_ref::<S3Source>() {
-            use temps_query::Downloadable;
-            downloadable.download(container_path, entity_name).await
-        } else {
-            Err(DataError::OperationNotSupported(
-                "This data source does not support downloads".to_string(),
-            ))
-        }
+        let database = container_path.segments[0].clone();
+        let path_clone = container_path.clone();
+        let entity_name = entity_name.to_string();
+        self.with_connection_retry(service_id, &database, move |conn| {
+            let path_clone = path_clone.clone();
+            let entity_name = entity_name.clone();
+            async move {
+                // Check if source implements Downloadable trait
+                if let Some(downloadable) = conn.downcast_ref::<S3Source>() {
+                    use temps_query::Downloadable;
+                    downloadable.download(&path_clone, &entity_name).await
+                } else {
+                    Err(DataError::OperationNotSupported(
+                        "This data source does not support downloads".to_string(),
+                    ))
+                }
+            }
+        })
+        .await
     }
 }

@@ -613,6 +613,10 @@ export type ContainerResponse = {
      */
     container_type: string;
     /**
+     * Hint for UI on expected entity count (small = sidebar, large = pagination)
+     */
+    entity_count_hint?: string | null;
+    /**
      * Label for entity type (if can_contain_entities is true)
      */
     entity_type_label?: string | null;
@@ -1469,6 +1473,10 @@ export type EntityResponse = {
      * Approximate row count
      */
     row_count?: number | null;
+    /**
+     * Size in bytes (for files/objects)
+     */
+    size_bytes?: number | null;
 };
 
 /**
@@ -2500,6 +2508,17 @@ export type ListDomainsResponse = {
     domains: Array<DomainResponse>;
 };
 
+export type ListEntitiesQuery = {
+    /**
+     * Maximum number of entities to return
+     */
+    limit?: number;
+    /**
+     * Continuation token for pagination (backend-specific)
+     */
+    token?: string | null;
+};
+
 export type ListErrorEventsQuery = {
     page?: number;
     page_size?: number;
@@ -2814,6 +2833,33 @@ export type PageVisit = {
 export type PagesComparisonResponse = {
     comparisons: Array<PageSessionComparison>;
     page_paths: Array<string>;
+};
+
+export type PaginatedEntitiesResponse = {
+    /**
+     * Number of entities returned
+     */
+    count: number;
+    /**
+     * List of entities
+     */
+    entities: Array<EntityResponse>;
+    /**
+     * Whether there are more entities available
+     */
+    has_more: boolean;
+    /**
+     * Limit used for this request
+     */
+    limit: number;
+    /**
+     * Continuation token for next page (S3, etc.)
+     */
+    next_token?: string | null;
+    /**
+     * Total number of entities (if available)
+     */
+    total?: number | null;
 };
 
 export type PaginatedErrorEventsResponse = {
@@ -8443,7 +8489,16 @@ export type ListEntitiesData = {
         service_id: number;
         path: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Maximum number of entities to return (default: 100, max: 1000)
+         */
+        limit?: number;
+        /**
+         * Continuation token for pagination
+         */
+        token?: string;
+    };
     url: '/external-services/{service_id}/query/containers/{path}/entities';
 };
 
@@ -8468,9 +8523,9 @@ export type ListEntitiesErrors = {
 
 export type ListEntitiesResponses = {
     /**
-     * List of entities
+     * Paginated list of entities
      */
-    200: Array<EntityResponse>;
+    200: PaginatedEntitiesResponse;
 };
 
 export type ListEntitiesResponse = ListEntitiesResponses[keyof ListEntitiesResponses];

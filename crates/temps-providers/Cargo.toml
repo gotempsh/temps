@@ -44,6 +44,7 @@ thiserror = { workspace = true }
 axum = { workspace = true }
 axum-macros = { workspace = true }
 schemars = { workspace = true }
+urlencoding = "2.1"
 
 [dev-dependencies]
 tokio-test = "0.4"

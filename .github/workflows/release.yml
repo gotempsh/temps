@@ -196,7 +196,7 @@ jobs:
           bun-version: latest
 
       - name: Cache Bun dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v4w
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
@@ -436,14 +436,35 @@ jobs:
           echo "View release at: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
 
   build-and-push-docker:
-    name: Build and Push Docker Image
+    name: Build and Push Docker Image (${{ matrix.platform }})
+    needs: [build-linux-amd64, build-darwin-amd64, build-darwin-arm64]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            artifact: temps-linux-amd64
+            tarball: temps-linux-amd64.tar.gz
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifacts
+
+      - name: Extract binary
+        run: |
+          cd artifacts
+          tar -xzf ${{ matrix.tarball }}
+          chmod +x temps
+          ls -lh temps
+          file temps
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -462,17 +483,60 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
 
+      - name: Extract platform tag
+        id: platform_tag
+        run: |
+          PLATFORM_TAG=$(echo "${{ matrix.platform }}" | sed 's/\//-/g')
+          echo "tag=$PLATFORM_TAG" >> $GITHUB_OUTPUT
+          echo "Platform tag: $PLATFORM_TAG"
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: ./Dockerfile.release
+          platforms: ${{ matrix.platform }}
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/temps:latest
-            ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/temps:latest-${{ steps.platform_tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-${{ steps.platform_tag.outputs.tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.title=Temps
+            org.opencontainers.image.description=Open-source platform for deploying and managing applications
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  create-docker-manifest:
+    name: Create Docker Manifest
+    needs: [build-and-push-docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Create and push manifest for latest
+        run: |
+          docker buildx imagetools create -t ghcr.io/${{ github.repository_owner }}/temps:latest \
+            ghcr.io/${{ github.repository_owner }}/temps:latest-linux-amd64
+
+      - name: Create and push manifest for version
+        run: |
+          docker buildx imagetools create -t ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }} \
+            ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-linux-amd64

@@ -1,0 +1,36 @@
+FROM alpine:3.19
+
+# Install runtime dependencies
+RUN apk add --no-cache \
+    ca-certificates \
+    tzdata \
+    libgcc \
+    libstdc++
+
+# Create non-root user
+RUN addgroup -g 1000 temps && \
+    adduser -D -u 1000 -G temps temps
+
+# Copy pre-built binary
+COPY artifacts/temps /usr/local/bin/temps
+
+# Set permissions
+RUN chmod +x /usr/local/bin/temps
+
+# Create data directory
+RUN mkdir -p /app/data && chown -R temps:temps /app
+
+# Switch to non-root user
+USER temps
+WORKDIR /app
+
+# Expose port
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
+
+# Run the binary
+ENTRYPOINT ["/usr/local/bin/temps"]
+CMD ["serve"]
