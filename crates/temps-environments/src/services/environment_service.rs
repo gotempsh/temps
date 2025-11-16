@@ -566,47 +566,43 @@ impl EnvironmentService {
         )))
     }
 
-    /// Set an environment as the preview environment for a project
-    pub async fn set_preview_environment(
+    /// Delete an environment permanently
+    ///
+    /// Prevents deletion of:
+    /// - Production environments (name = "Production" case-insensitive)
+    ///
+    /// Note: Active deployments should be cancelled before calling this method
+    /// Warning: This permanently deletes the environment and related data
+    pub async fn delete_environment(
         &self,
         project_id: i32,
-        environment_id: i32,
+        env_id: i32,
     ) -> Result<(), EnvironmentError> {
-        // Verify the project exists
-        let project = projects::Entity::find_by_id(project_id)
+        // Get the environment
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::Id.eq(env_id))
             .one(self.db.as_ref())
-            .await
-            .map_err(|e| EnvironmentError::Other(e.to_string()))?
+            .await?
             .ok_or_else(|| {
-                EnvironmentError::NotFound(format!("Project {} not found", project_id))
+                EnvironmentError::NotFound(format!("Environment {} not found", env_id))
             })?;
 
-        // Verify the environment exists and belongs to this project
-        let environment = environments::Entity::find_by_id(environment_id)
-            .one(self.db.as_ref())
-            .await
-            .map_err(|e| EnvironmentError::Other(e.to_string()))?
-            .ok_or_else(|| {
-                EnvironmentError::NotFound(format!("Environment {} not found", environment_id))
-            })?;
-
-        if environment.project_id != project_id {
+        // Prevent deletion of production environments
+        if environment.name.to_lowercase() == "production" {
             return Err(EnvironmentError::InvalidInput(
-                "Environment does not belong to this project".to_string(),
+                "Cannot delete production environment".to_string(),
             ));
         }
 
-        // Update the project to set the preview_environment_id
-        let mut active_project: projects::ActiveModel = project.into();
-        active_project.preview_environment_id = Set(Some(environment_id));
-        active_project
-            .update(self.db.as_ref())
-            .await
-            .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+        // Delete the environment permanently
+        environments::Entity::delete_by_id(env_id)
+            .exec(self.db.as_ref())
+            .await?;
 
         info!(
-            "Preview environment set - project_id: {}, environment_id: {}",
-            project_id, environment_id
+            "Permanently deleted environment {} (slug: {}) in project {}",
+            env_id, environment.slug, project_id
         );
 
         Ok(())

@@ -150,7 +150,27 @@ export function EnvironmentsTabsView({
               value={env.id.toString()}
               className="m-0 h-full overflow-auto"
             >
-              <EnvironmentDashboard project={project} environmentId={env.id} />
+              <EnvironmentDashboard
+                project={project}
+                environmentId={env.id}
+                onDelete={async () => {
+                  // Find another environment to switch to
+                  const remainingEnvs = environments.filter(
+                    (e) => e.id !== env.id
+                  )
+
+                  // Refresh the environments list
+                  await refetchEnvironments()
+
+                  if (remainingEnvs.length > 0) {
+                    // Switch to the first remaining environment
+                    setSelectedEnvId(remainingEnvs[0].id)
+                  } else {
+                    // No more environments, clear the selection
+                    setSelectedEnvId(undefined)
+                  }
+                }}
+              />
             </TabsContent>
           ))}
         </div>

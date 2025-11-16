@@ -2,12 +2,12 @@ import { ProjectResponse } from '@/api/client'
 import {
   addEnvironmentDomainMutation,
   deleteEnvironmentDomainMutation,
+  deleteEnvironmentMutation,
   getDeploymentOptions,
   getEnvironmentDomainsOptions,
   getEnvironmentOptions,
   getEnvironmentVariablesOptions,
   getEnvironmentVariableValueOptions,
-  teardownEnvironmentMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -56,6 +56,7 @@ interface EnvironmentDetailProps {
   project: ProjectResponse
   environmentId?: number // Optional: if not provided, will use useParams
   initialEnvironment?: any // Optional: initial environment data to use as default
+  onDelete?: () => void // Optional: callback after successful deletion
 }
 
 function EnvironmentDetailSkeleton() {
@@ -217,6 +218,7 @@ export function EnvironmentDetail({
   project,
   environmentId: propEnvironmentId,
   initialEnvironment,
+  onDelete,
 }: EnvironmentDetailProps) {
   const { environmentId: paramEnvironmentId } = useParams<{
     environmentId: string
@@ -298,14 +300,19 @@ export function EnvironmentDetail({
     },
   })
 
-  const deleteEnvironmentMutation = useMutation({
-    ...teardownEnvironmentMutation(),
+  const removeEnvironmentMutation = useMutation({
+    ...deleteEnvironmentMutation(),
     onSuccess: () => {
       toast.success('Environment deleted successfully')
       setShowDeleteConfirm(false)
       queryClient.invalidateQueries({ queryKey: ['environments'] })
-      // Navigate back to environments list
-      window.history.back()
+
+      // Call the onDelete callback if provided, otherwise fallback to history.back()
+      if (onDelete) {
+        onDelete()
+      } else {
+        window.history.back()
+      }
     },
     onError: (error: any) => {
       toast.error(error?.message || 'Failed to delete environment')
@@ -386,6 +393,9 @@ export function EnvironmentDetail({
   }
 
   if (!environment) return null
+
+  // Check if this is a production environment
+  const isProduction = environment.slug === 'production'
 
   return (
     <div className="space-y-6">
@@ -536,12 +546,18 @@ export function EnvironmentDetail({
               deployments, and data associated with it. This action cannot be
               undone.
             </p>
+            {isProduction && (
+              <p className="text-sm text-muted-foreground bg-muted p-3 rounded-md border">
+                ℹ️ The production environment cannot be deleted to prevent
+                accidental data loss.
+              </p>
+            )}
             <AlertDialog
               open={showDeleteConfirm}
               onOpenChange={setShowDeleteConfirm}
             >
               <AlertDialogTrigger asChild>
-                <Button variant="destructive">
+                <Button variant="destructive" disabled={isProduction}>
                   <Trash2 className="h-4 w-4 mr-2" />
                   Delete Environment
                 </Button>
@@ -556,7 +572,7 @@ export function EnvironmentDetail({
                   <AlertDialogCancel>Cancel</AlertDialogCancel>
                   <AlertDialogAction
                     onClick={async () => {
-                      await deleteEnvironmentMutation.mutateAsync({
+                      await removeEnvironmentMutation.mutateAsync({
                         path: {
                           project_id: project.id || 0,
                           env_id: Number(environmentId),
@@ -564,9 +580,9 @@ export function EnvironmentDetail({
                       })
                     }}
                     className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                    disabled={deleteEnvironmentMutation.isPending}
+                    disabled={removeEnvironmentMutation.isPending}
                   >
-                    {deleteEnvironmentMutation.isPending
+                    {removeEnvironmentMutation.isPending
                       ? 'Deleting...'
                       : 'Delete Environment'}
                   </AlertDialogAction>

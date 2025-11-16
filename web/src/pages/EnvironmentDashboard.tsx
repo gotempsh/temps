@@ -12,11 +12,13 @@ import { useCallback } from 'react'
 interface EnvironmentDashboardProps {
   project: ProjectResponse
   environmentId: number
+  onDelete?: () => void
 }
 
 export function EnvironmentDashboard({
   project,
   environmentId,
+  onDelete,
 }: EnvironmentDashboardProps) {
   const [searchParams, setSearchParams] = useSearchParams()
   const activeView = (searchParams.get('view') || 'containers') as string
@@ -110,6 +112,7 @@ export function EnvironmentDashboard({
             environment={environment}
             project={project}
             environmentId={environmentId.toString()}
+            onDelete={onDelete}
           />
         )
       case 'containers':

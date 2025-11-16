@@ -246,6 +246,8 @@ pub struct ProjectResponse {
     pub deployment_config: DeploymentConfig,
     /// Attack mode - when enabled, requires CAPTCHA verification for all project environments
     pub attack_mode: bool,
+    /// Enable automatic preview environment creation for each branch
+    pub enable_preview_environments: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -271,6 +273,7 @@ impl ProjectResponse {
             last_deployment: project.last_deployment.map(|d| d.timestamp_millis()),
             git_provider_connection_id: project.git_provider_connection_id,
             attack_mode: project.attack_mode,
+            enable_preview_environments: project.enable_preview_environments,
             deployment_config: DeploymentConfig {
                 cpu_request: project
                     .deployment_config
@@ -442,6 +445,8 @@ pub struct UpdateProjectSettingsRequest {
     pub directory: Option<String>,
     /// Enable/disable attack mode (CAPTCHA protection) for all project environments
     pub attack_mode: Option<bool>,
+    /// Enable automatic preview environment creation for each branch
+    pub enable_preview_environments: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

@@ -5,12 +5,14 @@ interface EnvironmentSettingsContentProps {
   environment: EnvironmentResponse
   project: ProjectResponse
   environmentId: string
+  onDelete?: () => void
 }
 
 export function EnvironmentSettingsContent({
   environment,
   project,
   environmentId,
+  onDelete,
 }: EnvironmentSettingsContentProps) {
   return (
     <div className="space-y-6">
@@ -18,6 +20,7 @@ export function EnvironmentSettingsContent({
         project={project}
         environmentId={parseInt(environmentId)}
         initialEnvironment={environment}
+        onDelete={onDelete}
         key={environment.id}
       />
     </div>

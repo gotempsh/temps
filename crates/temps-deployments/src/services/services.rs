@@ -1414,6 +1414,144 @@ impl DeploymentService {
         Ok(count)
     }
 
+    /// Cancel all active deployments for an environment
+    ///
+    /// Used when deleting an environment to ensure no deployments are left running
+    /// This method:
+    /// 1. Stops and removes all running containers
+    /// 2. Writes cancellation messages to job logs
+    /// 3. Updates deployment states to cancelled
+    pub async fn cancel_all_environment_deployments(
+        &self,
+        environment_id: i32,
+    ) -> Result<u64, DeploymentError> {
+        use temps_entities::{deployment_jobs, types::JobStatus};
+
+        info!(
+            "Cancelling all active deployments for environment {}",
+            environment_id
+        );
+
+        // First, stop and remove all containers for this environment
+        info!(
+            "Stopping and removing all containers for environment {}",
+            environment_id
+        );
+
+        let containers = deployment_containers::Entity::find()
+            .inner_join(deployments::Entity)
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .all(self.db.as_ref())
+            .await?;
+
+        for container in containers {
+            info!(
+                "Stopping and removing container {} for environment {}",
+                container.container_id, environment_id
+            );
+
+            // Stop the container
+            if let Err(e) = self.deployer.stop_container(&container.container_id).await {
+                warn!(
+                    "Failed to stop container {}: {} (continuing anyway)",
+                    container.container_id, e
+                );
+            }
+
+            // Remove the container
+            if let Err(e) = self
+                .deployer
+                .remove_container(&container.container_id)
+                .await
+            {
+                warn!(
+                    "Failed to remove container {}: {} (continuing anyway)",
+                    container.container_id, e
+                );
+            }
+
+            // Update container status to stopped
+            let mut active_container: deployment_containers::ActiveModel = container.into();
+            active_container.status = Set(Some("stopped".to_string()));
+            active_container.deleted_at = Set(Some(chrono::Utc::now()));
+            let _ = active_container.update(self.db.as_ref()).await;
+        }
+
+        // Find all active deployments for this environment
+        let active_deployments = deployments::Entity::find()
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployments::Column::State.is_in(vec![
+                "pending",
+                "running",
+                "deploying",
+                "ready",
+            ]))
+            .all(self.db.as_ref())
+            .await?;
+
+        let count = active_deployments.len() as u64;
+
+        if count == 0 {
+            info!(
+                "No active deployments found for environment {}",
+                environment_id
+            );
+            return Ok(0);
+        }
+
+        info!(
+            "Found {} active deployment(s) for environment {} - cancelling",
+            count, environment_id
+        );
+
+        for deployment in active_deployments {
+            // Find currently running jobs and write cancellation message to their logs
+            let running_jobs = deployment_jobs::Entity::find()
+                .filter(deployment_jobs::Column::DeploymentId.eq(deployment.id))
+                .filter(deployment_jobs::Column::Status.eq(JobStatus::Running))
+                .all(self.db.as_ref())
+                .await?;
+
+            for job in running_jobs {
+                info!(
+                    "📝 Writing cancellation message to running job: {} ({})",
+                    job.name, job.log_id
+                );
+
+                let cancel_msg = format!(
+                    "DEPLOYMENT CANCELLED DUE TO ENVIRONMENT DELETION - Job '{}' is being terminated",
+                    job.name
+                );
+                if let Err(e) = self
+                    .log_service
+                    .append_structured_log(&job.log_id, temps_logs::LogLevel::Error, &cancel_msg)
+                    .await
+                {
+                    warn!(
+                        "Failed to write cancellation message to job log {}: {}",
+                        job.log_id, e
+                    );
+                }
+            }
+
+            // Update deployment to cancelled state
+            let mut active_deployment: deployments::ActiveModel = deployment.into();
+            active_deployment.state = Set("cancelled".to_string());
+            active_deployment.cancelled_reason = Set(Some("Environment deleted".to_string()));
+            active_deployment.finished_at = Set(Some(chrono::Utc::now()));
+            active_deployment.updated_at = Set(chrono::Utc::now());
+            active_deployment.update(self.db.as_ref()).await?;
+        }
+
+        info!(
+            "Successfully cancelled {} deployment(s) and cleaned up containers for environment {}",
+            count, environment_id
+        );
+
+        Ok(count)
+    }
+
     /// Cancel a specific deployment
     pub async fn cancel_deployment(
         &self,
@@ -3357,5 +3495,18 @@ mod tests {
         let container = container.insert(db.as_ref()).await?;
 
         Ok((project, environment, deployment, container))
+    }
+}
+
+// Implement DeploymentCanceller trait from temps-core
+#[async_trait::async_trait]
+impl temps_core::DeploymentCanceller for DeploymentService {
+    async fn cancel_all_environment_deployments(
+        &self,
+        environment_id: i32,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        self.cancel_all_environment_deployments(environment_id)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 }

@@ -15,6 +15,8 @@ pub struct Model {
     pub value: String,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
+    /// Include this environment variable in preview environments
+    pub include_in_preview: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

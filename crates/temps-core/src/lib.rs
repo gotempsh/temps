@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod config;
+pub mod deployment;
 pub mod error;
 pub mod error_builder;
 pub mod jobs;
@@ -25,6 +26,7 @@ pub mod workflow_executor;
 pub use audit::*;
 pub use config::*;
 pub use constants::*;
+pub use deployment::*;
 pub use error::*;
 pub use error_builder::*;
 pub use jobs::*;

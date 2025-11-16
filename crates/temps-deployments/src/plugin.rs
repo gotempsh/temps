@@ -59,6 +59,11 @@ impl TempsPlugin for DeploymentsPlugin {
             ));
             context.register_service(deployment_service.clone());
 
+            // Also register as DeploymentCanceller trait for temps-environments
+            let deployment_canceller =
+                deployment_service.clone() as Arc<dyn temps_core::DeploymentCanceller>;
+            context.register_service(deployment_canceller);
+
             // Cancel any running deployments from previous server instance
             let cancel_service = deployment_service.clone();
             tokio::spawn(async move {

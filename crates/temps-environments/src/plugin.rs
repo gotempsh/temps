@@ -58,11 +58,15 @@ impl TempsPlugin for EnvironmentsPlugin {
         let environment_service = context.require_service::<EnvironmentService>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
         let env_var_service = context.require_service::<EnvVarService>();
-        let app_state = Arc::new(crate::handlers::AppState {
+        let deployment_service = context.require_service::<dyn temps_core::DeploymentCanceller>();
+
+        let app_state = crate::handlers::create_environment_app_state(
             environment_service,
             env_var_service,
             audit_service,
-        });
+            deployment_service,
+        );
+
         let routes = crate::handlers::configure_routes().with_state(app_state);
         Some(PluginRoutes { router: routes })
     }

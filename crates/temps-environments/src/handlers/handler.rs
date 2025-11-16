@@ -1,4 +1,6 @@
-use super::audit::{EnvironmentSettingsUpdatedAudit, EnvironmentSettingsUpdatedFields};
+use super::audit::{
+    EnvironmentDeletedAudit, EnvironmentSettingsUpdatedAudit, EnvironmentSettingsUpdatedFields,
+};
 use super::types::AppState;
 use axum::Router;
 use axum::{
@@ -12,13 +14,13 @@ use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::AuditContext;
 use temps_core::RequestMetadata;
-use tracing::error;
+use tracing::{error, info};
 use utoipa::OpenApi;
 
 use super::types::{
     AddEnvironmentDomainRequest, CreateEnvironmentRequest, CreateEnvironmentVariableRequest,
     EnvironmentDomainResponse, EnvironmentInfo, EnvironmentResponse, EnvironmentVariableResponse,
-    EnvironmentVariableValueResponse, GetEnvironmentVariablesQuery, SetPreviewEnvironmentRequest,
+    EnvironmentVariableValueResponse, GetEnvironmentVariablesQuery,
     UpdateEnvironmentSettingsRequest,
 };
 use temps_core::problemdetails::Problem;
@@ -278,6 +280,7 @@ pub async fn get_environment_variables(
                     current_deployment_id: env.current_deployment_id,
                 })
                 .collect(),
+            include_in_preview: v.include_in_preview,
         })
         .collect();
 
@@ -315,6 +318,7 @@ pub async fn create_environment_variable(
             request.environment_ids,
             request.key,
             request.value,
+            request.include_in_preview,
         )
         .await
         .map_err(Problem::from)?;
@@ -335,6 +339,7 @@ pub async fn create_environment_variable(
                 current_deployment_id: env.current_deployment_id,
             })
             .collect(),
+        include_in_preview: var.include_in_preview,
     };
 
     Ok((StatusCode::CREATED, Json(response)))
@@ -403,6 +408,7 @@ pub async fn update_environment_variable(
             request.key,
             request.value,
             request.environment_ids,
+            request.include_in_preview,
         )
         .await?;
 
@@ -422,6 +428,7 @@ pub async fn update_environment_variable(
                 current_deployment_id: env.current_deployment_id,
             })
             .collect(),
+        include_in_preview: var.include_in_preview,
     };
 
     Ok(Json(response))
@@ -534,37 +541,95 @@ pub async fn update_environment_settings(
     Ok(Json(EnvironmentResponse::from(updated_environment)).into_response())
 }
 
-/// Set an environment as the preview environment for a project
+/// Delete an environment permanently
+///
+/// Permanently deletes an environment and all related data. Cannot delete:
+/// - Production environments (name = "Production")
+///
+/// Warning: This action is permanent and cannot be undone.
+/// Active deployments are automatically cancelled before deletion.
 #[utoipa::path(
-    post,
-    path = "/projects/{project_id}/preview-environment",
+    delete,
+    path = "/projects/{project_id}/environments/{env_id}",
     tag = "Projects",
-    request_body = SetPreviewEnvironmentRequest,
     responses(
-        (status = 200, description = "Preview environment set successfully"),
-        (status = 400, description = "Invalid input"),
+        (status = 204, description = "Environment permanently deleted"),
+        (status = 400, description = "Cannot delete production environment"),
         (status = 404, description = "Project or environment not found"),
         (status = 500, description = "Internal server error")
     ),
     params(
-        ("project_id" = i32, Path, description = "Project ID")
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("env_id" = i32, Path, description = "Environment ID")
     )
 )]
-pub async fn set_preview_environment(
+pub async fn delete_environment(
     State(state): State<Arc<AppState>>,
-    Path(project_id): Path<i32>,
+    Path((project_id, env_id)): Path<(i32, i32)>,
     RequireAuth(auth): RequireAuth,
-    Json(request): Json<SetPreviewEnvironmentRequest>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsWrite);
+    permission_guard!(auth, EnvironmentsDelete);
 
-    // Set the environment as preview
-    state
+    // Get environment details before deletion for audit log
+    let environment = state
         .environment_service
-        .set_preview_environment(project_id, request.environment_id)
+        .get_environment(project_id, env_id)
         .await?;
 
-    Ok(StatusCode::OK)
+    let project = state.environment_service.get_project(project_id).await?;
+
+    // Cancel all active deployments for this environment
+    match state
+        .deployment_service
+        .cancel_all_environment_deployments(env_id)
+        .await
+    {
+        Ok(count) => {
+            if count > 0 {
+                info!(
+                    "Cancelled {} active deployment(s) before deleting environment {}",
+                    count, env_id
+                );
+            }
+        }
+        Err(e) => {
+            error!(
+                "Failed to cancel deployments for environment {}: {:?}",
+                env_id, e
+            );
+            // Continue with deletion even if cancellation fails
+        }
+    }
+
+    // Delete the environment
+    state
+        .environment_service
+        .delete_environment(project_id, env_id)
+        .await?;
+
+    // Create audit event
+    let audit_context = temps_core::AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    };
+
+    let audit_event = EnvironmentDeletedAudit {
+        context: audit_context,
+        project_id: project.id,
+        project_name: project.name,
+        project_slug: project.slug,
+        environment_id: environment.id,
+        environment_name: environment.name,
+        environment_slug: environment.slug,
+    };
+
+    if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
+        error!("Failed to create audit log: {:?}", e);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Create a new environment for a project
@@ -596,14 +661,6 @@ pub async fn create_environment(
         .create_new_environment(project_id, request.name, request.branch, None)
         .await?;
 
-    // If set_as_preview flag is true, set this environment as the preview environment
-    if request.set_as_preview {
-        state
-            .environment_service
-            .set_preview_environment(project_id, environment.id)
-            .await?;
-    }
-
     Ok((
         StatusCode::CREATED,
         Json(EnvironmentResponse::from(environment)),
@@ -621,15 +678,11 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/projects/{project_id}/environments/{id_or_slug}",
-            get(get_environment),
+            get(get_environment).delete(delete_environment),
         )
         .route(
             "/projects/{project_id}/environments/{id_or_slug}/settings",
             put(update_environment_settings),
-        )
-        .route(
-            "/projects/{project_id}/preview-environment",
-            post(set_preview_environment),
         )
         // Environment domains
         .route(
@@ -674,7 +727,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         get_environment,
         create_environment,
         update_environment_settings,
-        set_preview_environment,
+        delete_environment,
         get_environment_domains,
         add_environment_domain,
         delete_environment_domain,
@@ -689,7 +742,6 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             EnvironmentResponse,
             CreateEnvironmentRequest,
             UpdateEnvironmentSettingsRequest,
-            SetPreviewEnvironmentRequest,
             EnvironmentDomainResponse,
             AddEnvironmentDomainRequest,
             EnvironmentVariableResponse,

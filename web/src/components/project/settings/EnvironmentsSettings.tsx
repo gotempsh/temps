@@ -54,11 +54,9 @@ export function EnvironmentsSettings({ project }: EnvironmentsSettingsProps) {
   const handleCreateEnvironment = async ({
     name,
     branch,
-    isPreview,
   }: {
     name: string
     branch: string
-    isPreview: boolean
   }) => {
     try {
       await createEnvironment.mutateAsync({
@@ -68,7 +66,6 @@ export function EnvironmentsSettings({ project }: EnvironmentsSettingsProps) {
         body: {
           name,
           branch,
-          is_preview: isPreview,
         },
       })
 
@@ -171,7 +168,27 @@ export function EnvironmentsSettings({ project }: EnvironmentsSettingsProps) {
                   value={env.id.toString()}
                   className="mt-6"
                 >
-                  <EnvironmentDetail project={project} environmentId={env.id} />
+                  <EnvironmentDetail
+                    project={project}
+                    environmentId={env.id}
+                    onDelete={async () => {
+                      // Find another environment to switch to
+                      const remainingEnvs = environments.filter(
+                        (e) => e.id !== env.id
+                      )
+
+                      // Refresh the environments list
+                      await refetch()
+
+                      if (remainingEnvs.length > 0) {
+                        // Switch to the first remaining environment
+                        setSearchParams({ env: remainingEnvs[0].id.toString() })
+                      } else {
+                        // No more environments, clear the query param
+                        setSearchParams({})
+                      }
+                    }}
+                  />
                 </TabsContent>
               ))}
             </Tabs>

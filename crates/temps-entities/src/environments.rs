@@ -28,6 +28,9 @@ pub struct Model {
     /// These override project-level defaults for this specific environment
     /// Security settings are in deployment_config.security
     pub deployment_config: Option<DeploymentConfig>,
+    /// Indicates if this is a preview environment (auto-created per branch)
+    /// Use the 'branch' field to track which branch this preview is for
+    pub is_preview: bool,
 }
 
 impl Model {

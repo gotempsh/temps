@@ -475,6 +475,7 @@ pub async fn update_project_settings(
             settings.preset.clone(),
             settings.directory.clone(),
             settings.attack_mode,
+            settings.enable_preview_environments,
         )
         .await
         .map_err(Problem::from)?;
@@ -773,18 +774,12 @@ pub async fn trigger_project_pipeline(
     // Get the project for audit logging
     let project = state.project_service.get_project(id).await?;
 
-    // Determine which environment to use: explicit payload or project's preview environment
+    // Determine which environment to use: explicit payload or project's preview template environment
     let environment_id = if let Some(env_id) = payload.environment_id {
         env_id
-    } else if let Some(preview_env_id) = project.preview_environment_id {
-        info!(
-            "No environment specified, using project's preview environment: {}",
-            preview_env_id
-        );
-        preview_env_id
     } else {
         return Err(temps_core::error_builder::bad_request()
-            .detail("No environment specified and project has no preview environment configured")
+            .detail("No environment specified and project has no preview template environment configured")
             .build());
     };
 

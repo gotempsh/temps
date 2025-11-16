@@ -671,6 +671,7 @@ impl ProjectService {
         preset: Option<String>,
         directory: Option<String>,
         attack_mode: Option<bool>,
+        enable_preview_environments: Option<bool>,
     ) -> Result<Project, ProjectError> {
         // Get the current project
         let mut project = projects::Entity::find_by_id(project_id)
@@ -777,6 +778,28 @@ impl ProjectService {
 
             let mut active_project: projects::ActiveModel = project.into();
             active_project.attack_mode = Set(attack_mode_value);
+            active_project.update(self.db.as_ref()).await?;
+        }
+
+        // Update preview environment settings if any are provided
+        let needs_preview_update = enable_preview_environments.is_some();
+
+        if needs_preview_update {
+            // Reload project to ensure we have the latest state
+            let project = projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ProjectError::NotFound(format!(
+                    "Project {} not found",
+                    project_id
+                )))?;
+
+            let mut active_project: projects::ActiveModel = project.into();
+
+            if let Some(enable_preview) = enable_preview_environments {
+                active_project.enable_preview_environments = Set(enable_preview);
+            }
+
             active_project.update(self.db.as_ref()).await?;
         }
 
@@ -1267,7 +1290,7 @@ impl ProjectService {
             is_on_demand: false, // Deprecated field, default to false
             deployment_config: deployment_config.clone(),
             attack_mode: db_project.attack_mode,
-            preview_environment_id: db_project.preview_environment_id,
+            enable_preview_environments: db_project.enable_preview_environments,
         }
     }
 

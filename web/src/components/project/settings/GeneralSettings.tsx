@@ -68,8 +68,15 @@ const deploymentConfigSchema = z.object({
 
 type DeploymentConfigFormValues = z.infer<typeof deploymentConfigSchema>
 
+const previewEnvironmentsSchema = z.object({
+  enablePreviewEnvironments: z.boolean(),
+})
+
+type PreviewEnvironmentsFormValues = z.infer<typeof previewEnvironmentsSchema>
+
 export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   const navigate = useNavigate()
+
   const updateProjectSettings = useMutation({
     ...updateProjectSettingsMutation(),
     meta: {
@@ -106,6 +113,13 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       performanceMetricsEnabled:
         project?.deployment_config?.performanceMetricsEnabled ?? false,
       sessionRecordingEnabled: false,
+    },
+  })
+
+  const previewForm = useForm<PreviewEnvironmentsFormValues>({
+    resolver: zodResolver(previewEnvironmentsSchema),
+    defaultValues: {
+      enablePreviewEnvironments: project?.enable_preview_environments ?? false,
     },
   })
 
@@ -171,6 +185,27 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
         loading: 'Updating deployment configuration...',
         success: 'Deployment configuration updated successfully',
         error: 'Failed to update deployment configuration',
+      }
+    )
+    refetch()
+  }
+
+  const handleSavePreviewEnvironments = async (
+    values: PreviewEnvironmentsFormValues
+  ) => {
+    if (!project?.id) return
+
+    await toast.promise(
+      updateProjectSettings.mutateAsync({
+        path: { project_id: project.id! },
+        body: {
+          enable_preview_environments: values.enablePreviewEnvironments,
+        },
+      }),
+      {
+        loading: 'Updating preview environment settings...',
+        success: 'Preview environment settings updated successfully',
+        error: 'Failed to update preview environment settings',
       }
     )
     refetch()
@@ -497,6 +532,54 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
             <CardFooter>
               <Button type="submit" disabled={updateDeploymentConfig.isPending}>
                 Save Configuration
+              </Button>
+            </CardFooter>
+          </Card>
+        </form>
+      </Form>
+
+      {/* Preview Environments Card */}
+      <Form {...previewForm}>
+        <form
+          onSubmit={previewForm.handleSubmit(handleSavePreviewEnvironments)}
+        >
+          <Card className="bg-background text-foreground">
+            <CardHeader>
+              <CardTitle>Preview Environments</CardTitle>
+              <CardDescription>
+                Automatically create preview environments for each branch. When
+                enabled, deployments to branches that don't match any existing
+                environment will create temporary preview environments.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              <FormField
+                control={previewForm.control}
+                name="enablePreviewEnvironments"
+                render={({ field }) => (
+                  <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
+                    <div className="space-y-0.5">
+                      <FormLabel className="text-base">
+                        Enable Preview Environments
+                      </FormLabel>
+                      <FormDescription>
+                        Automatically create environments for feature branches,
+                        pull requests, and other non-production branches
+                      </FormDescription>
+                    </div>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+            </CardContent>
+            <CardFooter>
+              <Button type="submit" disabled={updateProjectSettings.isPending}>
+                Save Settings
               </Button>
             </CardFooter>
           </Card>

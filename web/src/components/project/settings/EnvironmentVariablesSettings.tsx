@@ -37,6 +37,8 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Checkbox } from '@/components/ui/checkbox'
 import { KbdBadge } from '@/components/ui/kbd-badge'
 import { ImportEnvDialog } from '@/components/ui/import-env-dialog'
+import { Switch } from '@/components/ui/switch'
+import { Label } from '@/components/ui/label'
 
 interface EnvironmentVariableRowProps {
   variable: EnvironmentVariableResponse
@@ -82,7 +84,8 @@ function EnvironmentVariableRow({
     if (showAllValues) {
       refetch()
     }
-  }, [showAllValues, refetch])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showAllValues])
 
   const dataValue = useMemo(() => data?.value ?? '', [data])
 
@@ -186,6 +189,11 @@ function EnvironmentVariableRow({
                   {env.name}
                 </span>
               ))}
+              {variable.include_in_preview && (
+                <span className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-500/20">
+                  Preview
+                </span>
+              )}
             </div>
           </div>
         </div>
@@ -337,6 +345,7 @@ interface AddEnvironmentVariableDialogProps {
     key: string
     value: string
     environments: number[]
+    includeInPreview: boolean
   }) => Promise<void>
   allEnvironments: any[]
 }
@@ -350,31 +359,47 @@ function AddEnvironmentVariableDialog({
   const [key, setKey] = useState('')
   const [value, setValue] = useState('')
   const [selectedEnvironments, setSelectedEnvironments] = useState<number[]>([])
+  const [includeInPreview, setIncludeInPreview] = useState(false)
+  const [hasInitialized, setHasInitialized] = useState(false)
 
-  // Default-select all environments when the dialog opens
+  // Default-select all environments when the dialog first opens
+  // But allow deselecting when includeInPreview is true
   useEffect(() => {
-    if (
-      isOpen &&
-      allEnvironments.length > 0 &&
-      selectedEnvironments.length === 0
-    ) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setSelectedEnvironments(allEnvironments.map((env) => env.id))
+    if (isOpen && allEnvironments.length > 0) {
+      if (!hasInitialized) {
+        // Only auto-select on first open
+        setSelectedEnvironments(allEnvironments.map((env) => env.id))
+        setHasInitialized(true)
+      }
+    } else if (!isOpen) {
+      // Reset initialization flag when dialog closes
+      setHasInitialized(false)
     }
-  }, [isOpen, allEnvironments, selectedEnvironments.length])
+  }, [isOpen, allEnvironments, hasInitialized])
 
   const handleSubmit = async () => {
-    if (!key || !value || selectedEnvironments.length === 0) {
-      toast.error(
-        'Please fill in all fields and select at least one environment'
-      )
+    // Validate key and value are filled
+    if (!key || !value) {
+      toast.error('Please fill in all fields')
       return
     }
 
-    await onSubmit({ key, value, environments: selectedEnvironments })
+    // Require at least one environment ONLY if includeInPreview is false
+    if (!includeInPreview && selectedEnvironments.length === 0) {
+      toast.error('Please select at least one environment')
+      return
+    }
+
+    await onSubmit({
+      key,
+      value,
+      environments: selectedEnvironments,
+      includeInPreview,
+    })
     setKey('')
     setValue('')
     setSelectedEnvironments([])
+    setIncludeInPreview(false)
   }
 
   return (
@@ -412,7 +437,14 @@ function AddEnvironmentVariableDialog({
               />
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">Environments</label>
+              <div className="flex items-center gap-2">
+                <label className="text-sm font-medium">Environments</label>
+                {includeInPreview && (
+                  <span className="text-xs text-muted-foreground">
+                    (Optional when including in preview)
+                  </span>
+                )}
+              </div>
               <div className="flex flex-wrap gap-2">
                 {allEnvironments.map((env) => (
                   <Button
@@ -437,6 +469,21 @@ function AddEnvironmentVariableDialog({
                 ))}
               </div>
             </div>
+            <div className="flex items-center justify-between space-x-2 rounded-lg border p-4">
+              <div className="flex-1 space-y-1">
+                <Label htmlFor="include-preview" className="text-sm font-medium">
+                  Include in Preview Environments
+                </Label>
+                <p className="text-sm text-muted-foreground">
+                  Automatically add this variable to preview environments
+                </p>
+              </div>
+              <Switch
+                id="include-preview"
+                checked={includeInPreview}
+                onCheckedChange={setIncludeInPreview}
+              />
+            </div>
           </div>
           <DialogFooter>
             <Button
@@ -447,6 +494,7 @@ function AddEnvironmentVariableDialog({
                 setKey('')
                 setValue('')
                 setSelectedEnvironments([])
+                setIncludeInPreview(false)
               }}
             >
               Cancel
@@ -609,6 +657,7 @@ export function EnvironmentVariablesSettings({
     key: string
     value: string
     environments: number[]
+    includeInPreview: boolean
   }) => {
     await createMutation.mutateAsync({
       path: {
@@ -618,6 +667,7 @@ export function EnvironmentVariablesSettings({
         key: values.key,
         value: values.value,
         environment_ids: values.environments,
+        include_in_preview: values.includeInPreview,
       },
     })
   }

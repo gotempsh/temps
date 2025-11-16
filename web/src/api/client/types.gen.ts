@@ -691,6 +691,10 @@ export type CreateEnvironmentRequest = {
 
 export type CreateEnvironmentVariableRequest = {
     environment_ids: Array<number>;
+    /**
+     * Include this environment variable in preview environments (default: true)
+     */
+    include_in_preview?: boolean;
     key: string;
     value: string;
 };
@@ -1529,6 +1533,11 @@ export type EnvironmentResponse = {
     current_deployment_id?: number | null;
     deployment_config?: null | DeploymentConfig;
     id: number;
+    /**
+     * Indicates if this is a preview environment (auto-created per branch)
+     * For preview environments, 'branch' contains the feature branch name
+     */
+    is_preview: boolean;
     main_url: string;
     name: string;
     project_id: number;
@@ -1567,6 +1576,10 @@ export type EnvironmentVariableResponse = {
     created_at: number;
     environments: Array<EnvironmentInfo>;
     id: number;
+    /**
+     * Include this environment variable in preview environments
+     */
+    include_in_preview: boolean;
     key: string;
     updated_at: number;
     value: string;
@@ -3173,6 +3186,10 @@ export type ProjectResponse = {
      */
     deployment_config: DeploymentConfig;
     directory: string;
+    /**
+     * Enable automatic preview environment creation for each branch
+     */
+    enable_preview_environments: boolean;
     git_provider_connection_id?: number | null;
     id: number;
     last_deployment?: number | null;
@@ -3974,13 +3991,6 @@ export type SessionSummary = {
     started_at: string;
 };
 
-export type SetPreviewEnvironmentRequest = {
-    /**
-     * Environment ID to set as preview
-     */
-    environment_id: number;
-};
-
 /**
  * Response for successful settings update
  */
@@ -4548,6 +4558,10 @@ export type UpdateProjectSettingsRequest = {
      */
     attack_mode?: boolean | null;
     directory?: string | null;
+    /**
+     * Enable automatic preview environment creation for each branch
+     */
+    enable_preview_environments?: boolean | null;
     git_provider_connection_id?: number | null;
     main_branch?: string | null;
     preset?: string | null;
@@ -12625,6 +12639,46 @@ export type CreateEnvironmentResponses = {
 
 export type CreateEnvironmentResponse = CreateEnvironmentResponses[keyof CreateEnvironmentResponses];
 
+export type DeleteEnvironmentData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        env_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{env_id}';
+};
+
+export type DeleteEnvironmentErrors = {
+    /**
+     * Cannot delete production or environment with active deployments
+     */
+    400: unknown;
+    /**
+     * Project or environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteEnvironmentResponses = {
+    /**
+     * Environment deleted successfully
+     */
+    204: void;
+};
+
+export type DeleteEnvironmentResponse = DeleteEnvironmentResponses[keyof DeleteEnvironmentResponses];
+
 export type GetEnvironmentData = {
     body?: never;
     path: {
@@ -14694,40 +14748,6 @@ export type CreateMonitorResponses = {
 };
 
 export type CreateMonitorResponse = CreateMonitorResponses[keyof CreateMonitorResponses];
-
-export type SetPreviewEnvironmentData = {
-    body: SetPreviewEnvironmentRequest;
-    path: {
-        /**
-         * Project ID
-         */
-        project_id: number;
-    };
-    query?: never;
-    url: '/projects/{project_id}/preview-environment';
-};
-
-export type SetPreviewEnvironmentErrors = {
-    /**
-     * Invalid input
-     */
-    400: unknown;
-    /**
-     * Project or environment not found
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type SetPreviewEnvironmentResponses = {
-    /**
-     * Preview environment set successfully
-     */
-    200: unknown;
-};
 
 export type UpdateProjectSettingsData = {
     body: UpdateProjectSettingsRequest;

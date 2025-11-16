@@ -1,26 +1,30 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_core::AuditLogger;
+use temps_core::{AuditLogger, DeploymentCanceller};
 use temps_entities::deployment_config::DeploymentConfig;
 use utoipa::ToSchema;
 
 use crate::services::env_var_service::EnvVarService;
 use crate::services::environment_service::EnvironmentService;
+
 pub struct AppState {
     pub environment_service: Arc<EnvironmentService>,
     pub env_var_service: Arc<EnvVarService>,
     pub audit_service: Arc<dyn AuditLogger>,
+    pub deployment_service: Arc<dyn DeploymentCanceller>,
 }
 
 pub fn create_environment_app_state(
     environment_service: Arc<EnvironmentService>,
     env_var_service: Arc<EnvVarService>,
     audit_service: Arc<dyn AuditLogger>,
+    deployment_service: Arc<dyn DeploymentCanceller>,
 ) -> Arc<AppState> {
     Arc::new(AppState {
         environment_service,
         env_var_service,
         audit_service,
+        deployment_service,
     })
 }
 
@@ -29,6 +33,13 @@ pub struct CreateEnvironmentVariableRequest {
     pub key: String,
     pub value: String,
     pub environment_ids: Vec<i32>,
+    /// Include this environment variable in preview environments (default: true)
+    #[serde(default = "default_include_in_preview")]
+    pub include_in_preview: bool,
+}
+
+fn default_include_in_preview() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -39,6 +50,8 @@ pub struct EnvironmentVariableResponse {
     pub created_at: i64,
     pub updated_at: i64,
     pub environments: Vec<EnvironmentInfo>,
+    /// Include this environment variable in preview environments
+    pub include_in_preview: bool,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -65,6 +78,9 @@ pub struct EnvironmentResponse {
     pub created_at: i64,
     pub updated_at: i64,
     pub branch: Option<String>,
+    /// Indicates if this is a preview environment (auto-created per branch)
+    /// For preview environments, 'branch' contains the feature branch name
+    pub is_preview: bool,
     /// Deployment configuration for this environment (overrides project-level config)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deployment_config: Option<DeploymentConfig>,
@@ -82,6 +98,7 @@ impl From<temps_entities::environments::Model> for EnvironmentResponse {
             created_at: env.created_at.timestamp_millis(),
             updated_at: env.updated_at.timestamp_millis(),
             branch: env.branch,
+            is_preview: env.is_preview,
             deployment_config: env.deployment_config,
         }
     }
@@ -145,10 +162,4 @@ pub struct CreateEnvironmentRequest {
     /// If true, set this environment as the preview environment for the project
     #[serde(default)]
     pub set_as_preview: bool,
-}
-
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct SetPreviewEnvironmentRequest {
-    /// Environment ID to set as preview
-    pub environment_id: i32,
 }

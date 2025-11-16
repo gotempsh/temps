@@ -298,11 +298,47 @@ async fn find_or_create_environment_for_branch(
     }
 
     info!(
-        "No environment matches branch '{}', looking for preview environment",
+        "No environment matches branch '{}', checking preview environments",
         branch_name
     );
 
-    // No exact match, try to find preview environment
+    // Check if preview environments are enabled for this project
+    if project.enable_preview_environments {
+        info!(
+            "Preview environments enabled for project {}, creating/finding per-branch preview",
+            project.id
+        );
+
+        // Slugify the branch name for use in environment name
+        let slugified_branch = temps_core::slugify_branch_name(branch_name);
+
+        // Try to find existing preview environment for this branch
+        if let Some(existing_preview) = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .filter(environments::Column::IsPreview.eq(true))
+            .filter(environments::Column::Branch.eq(branch_name))
+            .filter(environments::Column::DeletedAt.is_null())
+            .one(db.as_ref())
+            .await
+            .map_err(|e| format!("Database error finding preview environment: {}", e))?
+        {
+            info!(
+                "Found existing preview environment '{}' for branch '{}'",
+                existing_preview.name, branch_name
+            );
+            return Ok(existing_preview);
+        }
+
+        // Create new preview environment for this branch
+        return create_preview_environment(db, project, branch_name, &slugified_branch).await;
+    }
+
+    // Preview environments not enabled, try to find generic preview environment (legacy behavior)
+    info!(
+        "Preview environments not enabled for project {}, looking for generic preview environment",
+        project.id
+    );
+
     if let Some(preview_env) = environments::Entity::find()
         .filter(environments::Column::ProjectId.eq(project.id))
         .filter(environments::Column::Name.eq("preview"))
@@ -312,29 +348,33 @@ async fn find_or_create_environment_for_branch(
         .map_err(|e| format!("Database error finding preview environment: {}", e))?
     {
         info!(
-            "Using existing preview environment for branch '{}'",
+            "Using existing generic preview environment for branch '{}'",
             branch_name
         );
         return Ok(preview_env);
     }
 
-    // No preview environment exists, create one
-    info!("Creating preview environment for project {}", project.id);
+    // No preview environment exists, create generic one (legacy behavior)
+    info!(
+        "Creating generic preview environment for project {}",
+        project.id
+    );
 
     use chrono::Utc;
     use temps_entities::upstream_config::UpstreamList;
 
     let preview_env = environments::ActiveModel {
         name: Set("preview".to_string()),
-        slug: Set(format!("{}-preview", project.slug)),
+        slug: Set("preview".to_string()),
         subdomain: Set(format!("{}-preview", project.slug)),
-        host: Set(format!("{}-preview.temps.dev", project.slug)),
+        host: Set(String::new()),
         branch: Set(None), // No specific branch - matches all unmatched branches
         project_id: Set(project.id),
         upstreams: Set(UpstreamList::default()),
         deployment_config: Set(None), // Inherits from project
         current_deployment_id: Set(None),
         last_deployment: Set(None),
+        is_preview: Set(false), // Legacy generic preview, not a per-branch preview
         created_at: Set(Utc::now()),
         updated_at: Set(Utc::now()),
         deleted_at: Set(None),
@@ -347,11 +387,146 @@ async fn find_or_create_environment_for_branch(
         .map_err(|e| format!("Failed to create preview environment: {}", e))?;
 
     info!(
-        "Created preview environment '{}' for project {}",
+        "Created generic preview environment '{}' for project {}",
         created_env.name, project.id
     );
 
     Ok(created_env)
+}
+
+/// Create a new preview environment for a specific branch
+async fn create_preview_environment(
+    db: Arc<DbConnection>,
+    project: &temps_entities::projects::Model,
+    branch_name: &str,
+    slugified_branch: &str,
+) -> Result<temps_entities::environments::Model, String> {
+    use chrono::Utc;
+    use temps_entities::{environments, upstream_config::UpstreamList};
+
+    info!(
+        "Creating preview environment '{}' for branch '{}' in project {}",
+        slugified_branch, branch_name, project.id
+    );
+
+    let preview_env = environments::ActiveModel {
+        name: Set(slugified_branch.to_string()),
+        slug: Set(slugified_branch.to_string()),
+        subdomain: Set(format!("{}-{}", project.slug, slugified_branch)),
+        host: Set(String::new()),
+        branch: Set(Some(branch_name.to_string())), // Link to specific branch (used for both deployment and tracking)
+        project_id: Set(project.id),
+        upstreams: Set(UpstreamList::default()),
+        deployment_config: Set(None), // Inherits from project or template
+        current_deployment_id: Set(None),
+        last_deployment: Set(None),
+        is_preview: Set(true),
+        created_at: Set(Utc::now()),
+        updated_at: Set(Utc::now()),
+        deleted_at: Set(None),
+        ..Default::default()
+    };
+
+    let created_env = preview_env
+        .insert(db.as_ref())
+        .await
+        .map_err(|e| format!("Failed to create preview environment: {}", e))?;
+
+    info!(
+        "Created preview environment '{}' (ID: {}) for branch '{}'",
+        created_env.name, created_env.id, branch_name
+    );
+
+    // Copy environment variables marked for preview to the new preview environment
+    info!(
+        "Copying environment variables marked for preview to preview environment {}",
+        created_env.id
+    );
+
+    if let Err(e) =
+        copy_environment_variables_to_preview(db.clone(), created_env.id, project.id).await
+    {
+        error!(
+            "Failed to copy environment variables to preview environment {}: {}",
+            created_env.id, e
+        );
+        // Don't fail the preview environment creation, just log the error
+    } else {
+        info!(
+            "Successfully copied environment variables to preview environment {}",
+            created_env.id
+        );
+    }
+
+    Ok(created_env)
+}
+
+/// Copy project environment variables marked for preview to a preview environment
+/// Creates junction table entries linking env vars with include_in_preview=true to the new environment
+async fn copy_environment_variables_to_preview(
+    db: Arc<DbConnection>,
+    preview_environment_id: i32,
+    project_id: i32,
+) -> Result<(), String> {
+    use temps_entities::{env_var_environments, env_vars};
+
+    // Find all environment variables for this project that are marked to include in preview
+    let preview_env_vars = env_vars::Entity::find()
+        .filter(env_vars::Column::ProjectId.eq(project_id))
+        .filter(env_vars::Column::IncludeInPreview.eq(true))
+        .all(db.as_ref())
+        .await
+        .map_err(|e| format!("Failed to query project environment variables: {}", e))?;
+
+    if preview_env_vars.is_empty() {
+        info!(
+            "No environment variables marked for preview found in project {}",
+            project_id
+        );
+        return Ok(());
+    }
+
+    info!(
+        "Found {} environment variable(s) marked for preview in project {}",
+        preview_env_vars.len(),
+        project_id
+    );
+
+    // Create new env_var_environments entries for the preview environment
+    let mut created_count = 0;
+    let total_count = preview_env_vars.len();
+    for env_var in preview_env_vars {
+        let new_env_var_env = env_var_environments::ActiveModel {
+            env_var_id: Set(env_var.id),
+            environment_id: Set(preview_environment_id),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        };
+
+        match new_env_var_env.insert(db.as_ref()).await {
+            Ok(_) => {
+                created_count += 1;
+                debug!(
+                    "Linked env var '{}' to preview environment {}",
+                    env_var.key, preview_environment_id
+                );
+            }
+            Err(e) => {
+                error!(
+                    "Failed to link env var '{}' to preview environment {}: {}",
+                    env_var.key, preview_environment_id, e
+                );
+                // Continue copying other variables even if one fails
+            }
+        }
+    }
+
+    info!(
+        "Successfully linked {}/{} environment variable(s) to preview environment {}",
+        created_count, total_count, preview_environment_id
+    );
+
+    Ok(())
 }
 
 // Extracted free function for testing
@@ -406,12 +581,34 @@ async fn process_git_push_event(
             }
         };
 
+    // Check for duplicate deployment (same project, environment, and commit)
+    // This prevents duplicate deployments from being created if:
+    // - Multiple webhook URLs are configured in GitHub (both /webhook/git/github/events and /webhook/source/github/events)
+    // - GitHub sends duplicate webhooks
+    // - Race condition between concurrent push events
+    use sea_orm::{EntityTrait, PaginatorTrait, QueryOrder};
+    let existing_deployment = deployments::Entity::find()
+        .filter(deployments::Column::ProjectId.eq(project.id))
+        .filter(deployments::Column::EnvironmentId.eq(environment.id))
+        .filter(deployments::Column::CommitSha.eq(&job.commit))
+        .filter(deployments::Column::State.is_in(vec!["pending", "running", "deploying", "ready"]))
+        .order_by_desc(deployments::Column::CreatedAt)
+        .one(db.as_ref())
+        .await;
+
+    if let Ok(Some(existing)) = existing_deployment {
+        info!(
+            "Deployment already exists for project {} environment {} commit {} (deployment #{}, state: {}). Skipping duplicate.",
+            project.id, environment.id, job.commit, existing.id, existing.state
+        );
+        return;
+    }
+
     // Create deployment record directly (no more pipeline)
     // Note: Previous deployment teardown happens AFTER this deployment succeeds (zero-downtime)
     use chrono::Utc;
 
     // Get the next deployment number for this project
-    use sea_orm::{EntityTrait, PaginatorTrait};
     let paginator = deployments::Entity::find()
         .filter(deployments::Column::ProjectId.eq(project.id))
         .paginate(db.as_ref(), 1);
@@ -442,7 +639,7 @@ async fn process_git_push_event(
         };
 
     // Generate URL/slug based on environment type
-    let env_slug = if environment.name == "preview" {
+    let env_slug = if environment.is_preview {
         // For preview deployments, include branch name in slug for unique URLs
         let sanitized_branch = job
             .branch
@@ -1199,8 +1396,8 @@ mod tests {
         let preview_env = temps_entities::environments::ActiveModel {
             project_id: Set(project.id),
             name: Set("preview".to_string()),
-            slug: Set("existing-preview-test-preview".to_string()),
-            host: Set("existing-preview-test-preview.temps.dev".to_string()),
+            slug: Set("preview".to_string()),
+            host: Set(String::new()),
             branch: Set(None), // No specific branch
             upstreams: Set(UpstreamList::default()),
             subdomain: Set("existing-preview-test-preview".to_string()),
@@ -1279,9 +1476,9 @@ mod tests {
 
         // Verify preview environment was created
         assert_eq!(found_env.name, "preview");
-        assert_eq!(found_env.slug, "auto-create-preview-test-preview");
+        assert_eq!(found_env.slug, "preview");
         assert_eq!(found_env.subdomain, "auto-create-preview-test-preview");
-        assert_eq!(found_env.host, "auto-create-preview-test-preview.temps.dev");
+        assert_eq!(found_env.host, "");
         assert_eq!(found_env.branch, None); // No specific branch
         assert_eq!(found_env.project_id, project.id);
 
@@ -1469,8 +1666,8 @@ mod tests {
         let deleted_preview = temps_entities::environments::ActiveModel {
             project_id: Set(project.id),
             name: Set("preview".to_string()),
-            slug: Set("deleted-env-test-preview".to_string()),
-            host: Set("deleted-env-test-preview.temps.dev".to_string()),
+            slug: Set("preview".to_string()),
+            host: Set(String::new()),
             branch: Set(None),
             upstreams: Set(UpstreamList::default()),
             subdomain: Set("deleted-env-test-preview".to_string()),
