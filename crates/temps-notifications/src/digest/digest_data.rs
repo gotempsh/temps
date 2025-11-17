@@ -12,8 +12,7 @@ pub struct DigestSections {
     pub deployments: bool,
     pub errors: bool,
     pub funnels: bool,
-    pub security: bool,
-    pub resources: bool,
+    pub projects: bool,
 }
 
 impl Default for DigestSections {
@@ -23,8 +22,7 @@ impl Default for DigestSections {
             deployments: true,
             errors: true,
             funnels: true,
-            security: true,
-            resources: true,
+            projects: true,
         }
     }
 }
@@ -40,8 +38,7 @@ pub struct WeeklyDigestData {
     pub deployments: Option<DeploymentData>,
     pub errors: Option<ErrorData>,
     pub funnels: Option<FunnelData>,
-    pub security: Option<SecurityData>,
-    pub resources: Option<ResourceData>,
+    pub projects: Vec<ProjectStats>,
 }
 
 /// Executive summary with key metrics
@@ -166,17 +163,17 @@ pub struct SuspiciousActivity {
     pub description: String,
 }
 
-/// Resource and cost data
+/// Individual project statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceData {
-    pub storage_used_mb: f64,
-    pub storage_growth_mb: f64,
-    pub database_size_mb: f64,
-    pub database_growth_mb: f64,
-    pub log_volume_mb: f64,
-    pub backup_count: i64,
-    pub backup_size_mb: f64,
-    pub recommendations: Vec<String>,
+pub struct ProjectStats {
+    pub project_id: i32,
+    pub project_name: String,
+    pub project_slug: String,
+    pub visitors: i64,
+    pub page_views: i64,
+    pub unique_sessions: i64,
+    pub deployments: i64,
+    pub week_over_week_change: f64,
 }
 
 impl WeeklyDigestData {
@@ -198,8 +195,7 @@ impl WeeklyDigestData {
             deployments: None,
             errors: None,
             funnels: None,
-            security: None,
-            resources: None,
+            projects: Vec::new(),
         }
     }
 
@@ -209,7 +205,6 @@ impl WeeklyDigestData {
             || self.deployments.is_some()
             || self.errors.is_some()
             || self.funnels.is_some()
-            || self.security.is_some()
-            || self.resources.is_some()
+            || !self.projects.is_empty()
     }
 }

@@ -38,87 +38,124 @@ impl DigestScheduler {
         scheduler
     }
 
-    /// Main scheduler loop
+    /// Main scheduler loop - calculates exact sleep duration until next scheduled time
     async fn run_scheduler(&self) {
         loop {
-            // Check every hour if it's time to send digests
-            match self.check_and_send_digests().await {
-                Ok(sent_count) => {
-                    if sent_count > 0 {
-                        info!("Sent {} weekly digest(s)", sent_count);
-                    }
-                }
+            // Get current preferences
+            let preferences = match self.preferences_service.get_preferences().await {
+                Ok(prefs) => prefs,
                 Err(e) => {
-                    error!("Error checking/sending digests: {}", e);
+                    error!("Failed to get preferences: {}", e);
+                    // Sleep for 1 hour and retry
+                    sleep(TokioDuration::from_secs(3600)).await;
+                    continue;
                 }
+            };
+
+            // Skip if weekly digest is disabled
+            if !preferences.weekly_digest_enabled {
+                debug!("Weekly digest is disabled, checking again in 1 hour");
+                sleep(TokioDuration::from_secs(3600)).await;
+                continue;
             }
 
-            // Sleep for 1 hour before next check
-            sleep(TokioDuration::from_secs(3600)).await;
+            // Calculate duration until next scheduled time
+            let sleep_duration = self.calculate_next_run_duration(&preferences);
+
+            info!(
+                "Next weekly digest scheduled in {} hours ({} minutes)",
+                sleep_duration.as_secs() / 3600,
+                sleep_duration.as_secs() / 60
+            );
+
+            // Sleep until next scheduled time
+            sleep(sleep_duration).await;
+
+            // Send the digest
+            match self.send_digest(&preferences).await {
+                Ok(_) => {
+                    info!("Successfully sent weekly digest");
+                }
+                Err(e) => {
+                    error!("Failed to send weekly digest: {}", e);
+                }
+            }
         }
     }
 
-    /// Check if it's time to send digests and send them if needed
-    async fn check_and_send_digests(&self) -> anyhow::Result<usize> {
+    /// Calculate duration until next scheduled run
+    fn calculate_next_run_duration(
+        &self,
+        preferences: &crate::services::NotificationPreferences,
+    ) -> TokioDuration {
         let now = Utc::now();
-        let current_weekday = now.weekday();
-        let current_hour = now.hour();
-
-        debug!(
-            "Checking digest schedule: weekday={:?}, hour={}",
-            current_weekday, current_hour
-        );
-
-        // Get global preferences
-        let preferences = self.preferences_service.get_preferences().await?;
-
-        // Skip if weekly digest is disabled
-        if !preferences.weekly_digest_enabled {
-            debug!("Weekly digest is disabled");
-            return Ok(0);
-        }
-
-        // Check if today matches the configured send day
         let send_day = Self::parse_weekday(&preferences.digest_send_day);
-        if current_weekday != send_day {
-            debug!(
-                "Not the right day: current={:?}, configured={:?}",
-                current_weekday, send_day
-            );
-            return Ok(0);
-        }
-
-        // Check if current hour matches the configured send time
         let send_hour = Self::parse_hour(&preferences.digest_send_time);
-        if current_hour != send_hour {
-            debug!(
-                "Not the right hour: current={}, configured={}",
-                current_hour, send_hour
-            );
-            return Ok(0);
-        }
+        let send_minute = Self::parse_minute(&preferences.digest_send_time);
 
-        // It's time to send the digest
-        info!(
-            "Sending weekly digest at {:?} {}:00",
-            current_weekday, current_hour
-        );
+        // Calculate days until next occurrence of the target weekday
+        let current_weekday = now.weekday();
+        let days_until_target = if current_weekday == send_day {
+            // Same day - check if time has passed
+            let current_hour = now.hour();
+            let current_minute = now.minute();
 
-        // Generate and send digest to all enabled email providers
-        match self
-            .digest_service
+            if current_hour < send_hour
+                || (current_hour == send_hour && current_minute < send_minute)
+            {
+                // Time hasn't passed yet today
+                0
+            } else {
+                // Time has passed, schedule for next week
+                7
+            }
+        } else {
+            // Different day - calculate days forward
+            let current_day_num = current_weekday.num_days_from_monday();
+            let target_day_num = send_day.num_days_from_monday();
+
+            if target_day_num > current_day_num {
+                target_day_num - current_day_num
+            } else {
+                7 - (current_day_num - target_day_num)
+            }
+        };
+
+        // Calculate the exact target time
+        let target_time = if days_until_target == 0 {
+            // Today at the specified time
+            now.date_naive()
+                .and_hms_opt(send_hour, send_minute, 0)
+                .unwrap()
+                .and_utc()
+        } else {
+            // Future day at the specified time
+            (now + chrono::Duration::days(days_until_target as i64))
+                .date_naive()
+                .and_hms_opt(send_hour, send_minute, 0)
+                .unwrap()
+                .and_utc()
+        };
+
+        // Calculate duration from now to target time
+        let duration = target_time.signed_duration_since(now);
+        let seconds = duration.num_seconds().max(1); // Minimum 1 second
+
+        TokioDuration::from_secs(seconds as u64)
+    }
+
+    /// Send the weekly digest
+    async fn send_digest(
+        &self,
+        preferences: &crate::services::NotificationPreferences,
+    ) -> anyhow::Result<()> {
+        info!("Sending weekly digest");
+
+        self.digest_service
             .generate_and_send_weekly_digest(preferences.digest_sections.clone())
-            .await
-        {
-            Ok(_) => {
-                info!("Successfully sent weekly digest");
-                Ok(1)
-            }
-            Err(e) => {
-                warn!("Failed to send weekly digest: {}", e);
-                Err(e)
-            }
-        }
+            .await?;
+
+        Ok(())
     }
 
     /// Parse weekday string to Weekday enum
@@ -148,6 +185,14 @@ impl DigestScheduler {
                 9
             })
     }
+
+    /// Parse time string (HH:MM format) to minute (0-59)
+    fn parse_minute(time: &str) -> u32 {
+        time.split(':')
+            .nth(1)
+            .and_then(|m| m.parse().ok())
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -174,5 +219,15 @@ mod tests {
         assert_eq!(DigestScheduler::parse_hour("00:00"), 0);
         assert_eq!(DigestScheduler::parse_hour("23:59"), 23);
         assert_eq!(DigestScheduler::parse_hour("invalid"), 9); // Default
+    }
+
+    #[test]
+    fn test_parse_minute() {
+        assert_eq!(DigestScheduler::parse_minute("09:00"), 0);
+        assert_eq!(DigestScheduler::parse_minute("14:30"), 30);
+        assert_eq!(DigestScheduler::parse_minute("00:15"), 15);
+        assert_eq!(DigestScheduler::parse_minute("23:59"), 59);
+        assert_eq!(DigestScheduler::parse_minute("invalid"), 0); // Default
+        assert_eq!(DigestScheduler::parse_minute("09"), 0); // No colon, default to 0
     }
 }

@@ -292,63 +292,46 @@ pub fn render_html_template(digest: &WeeklyDigestData) -> Result<String> {
         ));
     }
 
-    // Security Section
-    if let Some(security) = &digest.security {
-        html.push_str(&format!(
+    // Projects Section
+    if !digest.projects.is_empty() {
+        html.push_str(
             r#"
         <div class="section">
-            <div class="section-title">🔒 Security & Access</div>
-            <div class="metric-grid">
-                <div class="metric">
-                    <div class="metric-label">New User Signups</div>
-                    <div class="metric-value">{}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Git Connections</div>
-                    <div class="metric-value">{}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">API Key Usage</div>
-                    <div class="metric-value">{}</div>
-                </div>
-            </div>
-        </div>
+            <div class="section-title">📦 Project Activity</div>
 "#,
-            security.new_user_signups, security.git_provider_connections, security.api_key_usage
-        ));
-    }
+        );
 
-    // Resources Section
-    if let Some(resources) = &digest.resources {
-        html.push_str(&format!(
-            r#"
-        <div class="section">
-            <div class="section-title">💾 Resources & Costs</div>
-            <div class="metric-grid">
-                <div class="metric">
-                    <div class="metric-label">Storage Used</div>
-                    <div class="metric-value">{:.1} MB</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Database Size</div>
-                    <div class="metric-value">{:.1} MB</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Backup Count</div>
-                    <div class="metric-value">{}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Log Volume</div>
-                    <div class="metric-value">{:.1} MB</div>
+        for project in &digest.projects {
+            let trend_class = if project.week_over_week_change >= 0.0 {
+                "positive"
+            } else {
+                "negative"
+            };
+
+            html.push_str(&format!(
+                r#"
+            <div style="margin-bottom: 15px; padding: 12px; background-color: #f9f9f9; border-radius: 6px; border-left: 4px solid #0066cc;">
+                <div style="font-weight: bold; font-size: 14px; margin-bottom: 8px;">{}</div>
+                <div style="display: flex; gap: 20px; flex-wrap: wrap; font-size: 12px;">
+                    <span><strong>Visitors:</strong> {}</span>
+                    <span><strong>Page Views:</strong> {}</span>
+                    <span><strong>Sessions:</strong> {}</span>
+                    <span><strong>Deployments:</strong> {}</span>
+                    <span class="metric-change {}"><strong>Trend:</strong> {:+.1}%</span>
                 </div>
             </div>
-        </div>
 "#,
-            resources.storage_used_mb,
-            resources.database_size_mb,
-            resources.backup_count,
-            resources.log_volume_mb
-        ));
+                project.project_name,
+                format_number(project.visitors),
+                format_number(project.page_views),
+                format_number(project.unique_sessions),
+                project.deployments,
+                trend_class,
+                project.week_over_week_change
+            ));
+        }
+
+        html.push_str("        </div>\n");
     }
 
     // Footer
@@ -456,40 +439,30 @@ Failed Checks:      {}
         ));
     }
 
-    // Security Section
-    if let Some(security) = &digest.security {
-        text.push_str(&format!(
+    // Projects Section
+    if !digest.projects.is_empty() {
+        text.push_str(
             r#"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔒 SECURITY & ACCESS
+📦 PROJECT ACTIVITY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-New User Signups:   {}
-Git Connections:    {}
-API Key Usage:      {}
+"#,
+        );
+
+        for project in &digest.projects {
+            text.push_str(&format!(
+                r#"{name}:
+  Visitors: {visitors} | Page Views: {page_views} | Sessions: {sessions} | Deployments: {deployments} | Trend: {trend:+.1}%
 
 "#,
-            security.new_user_signups, security.git_provider_connections, security.api_key_usage
-        ));
-    }
-
-    // Resources Section
-    if let Some(resources) = &digest.resources {
-        text.push_str(&format!(
-            r#"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💾 RESOURCES & COSTS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Storage Used:       {:.1} MB
-Database Size:      {:.1} MB
-Backup Count:       {}
-Log Volume:         {:.1} MB
-
-"#,
-            resources.storage_used_mb,
-            resources.database_size_mb,
-            resources.backup_count,
-            resources.log_volume_mb
-        ));
+                name = project.project_name,
+                visitors = format_number(project.visitors),
+                page_views = format_number(project.page_views),
+                sessions = format_number(project.unique_sessions),
+                deployments = project.deployments,
+                trend = project.week_over_week_change
+            ));
+        }
     }
 
     text.push_str(

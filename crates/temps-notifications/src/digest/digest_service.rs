@@ -9,9 +9,8 @@ use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
     QuerySelect,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
-use temps_entities::{audit_logs, deployments, events, projects, users};
+use temps_entities::{deployments, events, projects};
 use tracing::{error, info};
 
 pub struct DigestService {
@@ -92,18 +91,11 @@ impl DigestService {
             digest.funnels = self.aggregate_funnel_data(week_start, week_end).await.ok();
         }
 
-        if sections.security {
-            digest.security = self
-                .aggregate_security_data(week_start, week_end)
+        if sections.projects {
+            digest.projects = self
+                .aggregate_project_data(week_start, week_end)
                 .await
-                .ok();
-        }
-
-        if sections.resources {
-            digest.resources = self
-                .aggregate_resource_data(week_start, week_end)
-                .await
-                .ok();
+                .unwrap_or_default();
         }
 
         // Build executive summary
@@ -257,55 +249,87 @@ impl DigestService {
         })
     }
 
-    /// Aggregate security and access data
-    async fn aggregate_security_data(
+    /// Aggregate individual project statistics
+    async fn aggregate_project_data(
         &self,
         week_start: DateTime<Utc>,
         week_end: DateTime<Utc>,
-    ) -> Result<SecurityData> {
-        // Count new user signups
-        let new_user_signups = users::Entity::find()
-            .filter(users::Column::CreatedAt.between(week_start, week_end))
-            .count(self.db.as_ref())
-            .await? as i64;
+    ) -> Result<Vec<ProjectStats>> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+        use temps_entities::{deployments, events, projects};
 
-        // Aggregate audit logs by operation type
-        let audit_logs_list = audit_logs::Entity::find()
-            .filter(audit_logs::Column::CreatedAt.between(week_start, week_end))
-            .all(self.db.as_ref())
-            .await?;
+        // Get all projects
+        let all_projects = projects::Entity::find().all(self.db.as_ref()).await?;
 
-        let mut audit_log_summary: HashMap<String, i64> = HashMap::new();
-        for log in audit_logs_list {
-            *audit_log_summary.entry(log.operation_type).or_insert(0) += 1;
+        let mut project_stats = Vec::new();
+
+        for project in all_projects {
+            // Count unique sessions for this project
+            let visitors = events::Entity::find()
+                .filter(events::Column::ProjectId.eq(project.id))
+                .filter(events::Column::Timestamp.between(week_start, week_end))
+                .filter(events::Column::SessionId.is_not_null())
+                .select_only()
+                .column(events::Column::SessionId)
+                .distinct()
+                .count(self.db.as_ref())
+                .await? as i64;
+
+            // Count page views for this project
+            let page_views = events::Entity::find()
+                .filter(events::Column::ProjectId.eq(project.id))
+                .filter(events::Column::Timestamp.between(week_start, week_end))
+                .count(self.db.as_ref())
+                .await? as i64;
+
+            // Count deployments for this project
+            let deployment_count = deployments::Entity::find()
+                .filter(deployments::Column::ProjectId.eq(project.id))
+                .filter(deployments::Column::CreatedAt.between(week_start, week_end))
+                .count(self.db.as_ref())
+                .await? as i64;
+
+            // Calculate previous week visitors for trend
+            let prev_week_start = week_start - Duration::days(7);
+            let prev_week_end = week_start;
+
+            let prev_visitors = events::Entity::find()
+                .filter(events::Column::ProjectId.eq(project.id))
+                .filter(events::Column::Timestamp.between(prev_week_start, prev_week_end))
+                .filter(events::Column::SessionId.is_not_null())
+                .select_only()
+                .column(events::Column::SessionId)
+                .distinct()
+                .count(self.db.as_ref())
+                .await? as i64;
+
+            let week_over_week_change = if prev_visitors > 0 {
+                ((visitors - prev_visitors) as f64 / prev_visitors as f64) * 100.0
+            } else if visitors > 0 {
+                100.0 // If we had 0 before and now have some, that's 100% increase
+            } else {
+                0.0
+            };
+
+            // Only include projects that have activity
+            if visitors > 0 || page_views > 0 || deployment_count > 0 {
+                project_stats.push(ProjectStats {
+                    project_id: project.id,
+                    project_name: project.name.clone(),
+                    project_slug: project.slug.clone(),
+                    visitors,
+                    page_views,
+                    unique_sessions: visitors, // Same as visitors (unique sessions)
+                    deployments: deployment_count,
+                    week_over_week_change,
+                });
+            }
         }
 
-        Ok(SecurityData {
-            new_user_signups,
-            git_provider_connections: 0,
-            api_key_usage: 0,
-            suspicious_activities: vec![],
-            audit_log_summary,
-        })
-    }
+        // Sort projects by visitors (most active first)
+        project_stats.sort_by(|a, b| b.visitors.cmp(&a.visitors));
 
-    /// Aggregate resource and cost data
-    async fn aggregate_resource_data(
-        &self,
-        __week_start: DateTime<Utc>,
-        __week_end: DateTime<Utc>,
-    ) -> Result<ResourceData> {
-        // TODO: Implement resource usage queries (S3, database size, etc.)
-        Ok(ResourceData {
-            storage_used_mb: 0.0,
-            storage_growth_mb: 0.0,
-            database_size_mb: 0.0,
-            database_growth_mb: 0.0,
-            log_volume_mb: 0.0,
-            backup_count: 0,
-            backup_size_mb: 0.0,
-            recommendations: vec![],
-        })
+        Ok(project_stats)
     }
 
     /// Build executive summary from aggregated data
@@ -482,19 +506,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_aggregate_security_data_empty() {
+    async fn test_aggregate_project_data_empty() {
         let (service, test_db) = setup_test_service().await;
 
         let now = Utc::now();
         let week_start = now - Duration::days(7);
 
-        let security = service
-            .aggregate_security_data(week_start, now)
+        let projects = service
+            .aggregate_project_data(week_start, now)
             .await
-            .expect("Failed to aggregate security data");
+            .expect("Failed to aggregate project data");
 
-        assert_eq!(security.new_user_signups, 0);
-        assert!(security.audit_log_summary.is_empty());
+        assert_eq!(projects.len(), 0);
 
         test_db.cleanup_all_tables().await.expect("Cleanup failed");
     }
@@ -758,31 +781,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_aggregate_security_with_real_users() {
+    async fn test_aggregate_project_data_with_activity() {
         let (service, test_db) = setup_test_service().await;
 
         let now = Utc::now();
         let week_start = now - Duration::days(7);
 
-        // Create test users in current week
-        for i in 0..3 {
-            let user = users::ActiveModel {
-                name: Set(format!("User {}", i)),
-                email: Set(format!("user{}@example.com", i)),
-                password_hash: Set(Some("hash".to_string())),
-                created_at: Set(now - Duration::hours(i as i64)),
-                updated_at: Set(now),
+        // Create test project
+        let project = projects::ActiveModel {
+            name: Set("test-project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Astro),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        let project = project.insert(test_db.connection()).await.unwrap();
+
+        // Create test environment
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("production".to_string()),
+            host: Set("production.example.com".to_string()),
+            upstreams: Set(temps_entities::upstream_config::UpstreamList::default()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        let environment = environment.insert(test_db.connection()).await.unwrap();
+
+        // Create test deployment
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("deploy-1".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            commit_sha: Set(Some("abc123".to_string())),
+            branch_ref: Set(Some("refs/heads/main".to_string())),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        let deployment = deployment.insert(test_db.connection()).await.unwrap();
+
+        // Create test events (simulating visitors and page views)
+        for i in 0..5 {
+            let event = events::ActiveModel {
+                project_id: Set(project.id),
+                environment_id: Set(Some(environment.id)),
+                deployment_id: Set(Some(deployment.id)),
+                session_id: Set(Some(format!("session-{}", i))),
+                event_type: Set("pageview".to_string()),
+                timestamp: Set(now - Duration::hours(i as i64)),
+                hostname: Set("example.com".to_string()),
+                pathname: Set("/".to_string()),
+                page_path: Set("/".to_string()),
+                href: Set("https://example.com/".to_string()),
                 ..Default::default()
             };
-            user.insert(test_db.connection()).await.unwrap();
+            event.insert(test_db.connection()).await.unwrap();
         }
 
-        let security = service
-            .aggregate_security_data(week_start, now)
+        let projects_data = service
+            .aggregate_project_data(week_start, now)
             .await
-            .expect("Failed to aggregate security data");
+            .expect("Failed to aggregate project data");
 
-        assert_eq!(security.new_user_signups, 3);
+        assert_eq!(projects_data.len(), 1);
+        assert_eq!(projects_data[0].project_name, "test-project");
+        assert!(projects_data[0].visitors > 0);
 
         test_db.cleanup_all_tables().await.expect("Cleanup failed");
     }
@@ -899,7 +973,7 @@ mod tests {
         assert!(digest.has_data());
         assert!(digest.performance.is_some());
         assert!(digest.deployments.is_some());
-        assert!(digest.security.is_some());
+        assert!(!digest.projects.is_empty());
 
         // Verify performance data
         let perf = digest.performance.unwrap();
@@ -911,9 +985,9 @@ mod tests {
         assert_eq!(deploy.successful_deployments, 5); // 1 initial + 4 from loop
         assert_eq!(deploy.failed_deployments, 1);
 
-        // Verify security data
-        let security = digest.security.unwrap();
-        assert_eq!(security.new_user_signups, 2);
+        // Verify project data
+        assert_eq!(digest.projects.len(), 1);
+        assert_eq!(digest.projects[0].project_name, "integration-test-project");
 
         // Verify executive summary
         assert_eq!(digest.executive_summary.total_visitors, 10);

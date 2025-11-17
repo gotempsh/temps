@@ -21,14 +21,18 @@ function getIntensityColor(intensity: number): string {
 }
 
 function getTooltipText(count: number, date: Date): string {
-  const formattedDate = format(date, 'MMMM do')
+  const formattedDate = format(date, 'MMMM do, yyyy')
+  const today = new Date()
+  const isToday = format(date, 'yyyy-MM-dd') === format(today, 'yyyy-MM-dd')
+
+  const dateLabel = isToday ? `${formattedDate} (Today)` : formattedDate
 
   if (count === 0) {
-    return `No deployments on ${formattedDate}.`
+    return `No deployments on ${dateLabel}`
   } else if (count === 1) {
-    return `1 deployment on ${formattedDate}.`
+    return `1 deployment on ${dateLabel}`
   } else {
-    return `${count} deployments on ${formattedDate}.`
+    return `${count} deployments on ${dateLabel}`
   }
 }
 
@@ -60,11 +64,27 @@ export function DeploymentActivityGraph({ projectId }: DeploymentActivityGraphPr
     const startDate = new Date(data.start_date)
     const endDate = new Date(data.end_date)
 
-    // Get all weeks in the range
+    // Get all weeks in the range (including partial weeks at the end)
     const weeks = eachWeekOfInterval(
       { start: startDate, end: endDate },
       { weekStartsOn: 0 } // Sunday
     )
+
+    // Ensure we include the current week even if it's incomplete
+    // Check if endDate is in the last week we generated
+    const lastWeek = weeks[weeks.length - 1]
+    const lastWeekEnd = new Date(lastWeek.getTime() + 6 * 24 * 60 * 60 * 1000)
+
+    // If endDate is after the last week's end, we need to add one more week
+    if (endDate > lastWeekEnd) {
+      const nextWeekStart = new Date(lastWeekEnd.getTime() + 24 * 60 * 60 * 1000)
+      // Adjust to Sunday
+      const dayOfWeek = nextWeekStart.getDay()
+      if (dayOfWeek !== 0) {
+        nextWeekStart.setDate(nextWeekStart.getDate() - dayOfWeek)
+      }
+      weeks.push(nextWeekStart)
+    }
 
     // Create a 2D array of weeks × days (7 days per week)
     const weekData = weeks.map((weekStart) => {
@@ -206,10 +226,13 @@ export function DeploymentActivityGraph({ projectId }: DeploymentActivityGraphPr
                       }
 
                       // Render all days in range with their intensity color (including 0 = muted)
+                      const today = new Date()
+                      const isToday = format(day.day, 'yyyy-MM-dd') === format(today, 'yyyy-MM-dd')
+
                       return (
                         <div
                           key={day.date}
-                          className={`w-3 h-3 rounded-sm transition-colors cursor-pointer ${getIntensityColor(day.level)}`}
+                          className={`w-3 h-3 rounded-sm transition-colors cursor-pointer ${getIntensityColor(day.level)} ${isToday ? 'ring-1 ring-blue-500 dark:ring-blue-400' : ''}`}
                           onMouseEnter={(e) => {
                             const rect = e.currentTarget.getBoundingClientRect()
                             setTooltip({

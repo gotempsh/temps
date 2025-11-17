@@ -447,8 +447,6 @@ impl NotificationService {
     }
 
     fn get_batch_key(notification: &Notification) -> String {
-        // Create a key to group similar notifications
-        // You can customize this based on your needs
         format!(
             "{}:{}:{}",
             notification.notification_type, notification.priority, notification.title
@@ -858,7 +856,13 @@ fn default_digest_send_time() -> String {
 }
 
 fn default_digest_sections() -> crate::digest::DigestSections {
-    crate::digest::DigestSections::default()
+    crate::digest::DigestSections {
+        performance: true,
+        deployments: true,
+        errors: true,
+        funnels: true,
+        projects: true,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
