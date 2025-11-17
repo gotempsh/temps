@@ -145,15 +145,26 @@ pub async fn get_environment_domains(
         .await
         .map_err(Problem::from)?;
 
-    let response: Vec<EnvironmentDomainResponse> = domains
-        .into_iter()
-        .map(|d| EnvironmentDomainResponse {
+    let mut response: Vec<EnvironmentDomainResponse> = Vec::new();
+    for d in domains {
+        let fqdn = state
+            .environment_service
+            .compute_environment_fqdn(&d.domain)
+            .await;
+
+        let url = state
+            .environment_service
+            .compute_environment_url(&d.domain)
+            .await;
+
+        response.push(EnvironmentDomainResponse {
             id: d.id,
             environment_id: d.environment_id,
-            domain: d.domain,
+            domain: fqdn,
             created_at: d.created_at.timestamp_millis(),
-        })
-        .collect();
+            url,
+        });
+    }
 
     Ok(Json(response))
 }
@@ -189,11 +200,22 @@ pub async fn add_environment_domain(
         .await
         .map_err(Problem::from)?;
 
+    let fqdn = state
+        .environment_service
+        .compute_environment_fqdn(&domain.domain)
+        .await;
+
+    let url = state
+        .environment_service
+        .compute_environment_url(&domain.domain)
+        .await;
+
     let response = EnvironmentDomainResponse {
         id: domain.id,
         environment_id: domain.environment_id,
-        domain: domain.domain,
+        domain: fqdn,
         created_at: domain.created_at.timestamp_millis(),
+        url,
     };
 
     Ok((StatusCode::CREATED, Json(response)))

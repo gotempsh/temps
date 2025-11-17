@@ -110,6 +110,9 @@ pub struct EnvironmentDomainResponse {
     pub environment_id: i32,
     pub domain: String,
     pub created_at: i64,
+    /// Full URL for this domain (e.g., https://buildtolearndev-production.example.com)
+    #[schema(example = "https://buildtolearndev-production.example.com")]
+    pub url: String,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

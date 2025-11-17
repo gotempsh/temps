@@ -114,6 +114,13 @@ impl EnvironmentService {
         format!("{}://{}.{}", protocol, environment_slug, base_domain)
     }
 
+    /// Compute the full FQDN for an environment (without protocol)
+    pub async fn compute_environment_fqdn(&self, environment_slug: &str) -> String {
+        let settings = self.config_service.get_settings().await.unwrap_or_default();
+        let base_domain = settings.preview_domain.clone();
+        format!("{}.{}", environment_slug, base_domain)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_environment(
         &self,
@@ -479,27 +486,30 @@ impl EnvironmentService {
         project_id: i32,
         environment_id: i32,
     ) -> Result<Vec<environment_domains::Model>, EnvironmentError> {
-        // First verify that the environment belongs to the project
-        let environment_exists = environments::Entity::find()
+        // First verify that the environment belongs to the project and get it
+        let environment = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::Id.eq(environment_id))
             .one(self.db.as_ref())
             .await?;
 
-        if environment_exists.is_none() {
-            return Err(EnvironmentError::NotFound(format!(
-                ">>> Environment {} not found",
-                environment_id
-            )));
-        }
+        let env = environment.ok_or_else(|| {
+            EnvironmentError::NotFound(format!(">>> Environment {} not found", environment_id))
+        })?;
 
         // Get all domains for this environment
-        let domains = environment_domains::Entity::find()
+        let all_domains = environment_domains::Entity::find()
             .filter(environment_domains::Column::EnvironmentId.eq(environment_id))
             .all(self.db.as_ref())
             .await?;
 
-        Ok(domains)
+        // Filter out the default environment subdomain (which is auto-created and can't be removed)
+        let custom_domains: Vec<environment_domains::Model> = all_domains
+            .into_iter()
+            .filter(|d| d.domain != env.subdomain)
+            .collect();
+
+        Ok(custom_domains)
     }
 
     pub async fn add_environment_domain(

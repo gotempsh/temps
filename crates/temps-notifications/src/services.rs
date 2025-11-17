@@ -845,6 +845,22 @@ fn default_backup_successes_enabled() -> bool {
     true
 }
 
+fn default_weekly_digest_enabled() -> bool {
+    true
+}
+
+fn default_digest_send_day() -> String {
+    "monday".to_string()
+}
+
+fn default_digest_send_time() -> String {
+    "09:00".to_string()
+}
+
+fn default_digest_sections() -> crate::digest::DigestSections {
+    crate::digest::DigestSections::default()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationPreferences {
     // Notification Channels
@@ -876,6 +892,16 @@ pub struct NotificationPreferences {
     // Route Monitoring
     pub route_downtime_enabled: bool,
     pub load_balancer_issues_enabled: bool,
+
+    // Weekly Digest Settings
+    #[serde(default = "default_weekly_digest_enabled")]
+    pub weekly_digest_enabled: bool,
+    #[serde(default = "default_digest_send_day")]
+    pub digest_send_day: String, // "monday" | "friday" | "sunday"
+    #[serde(default = "default_digest_send_time")]
+    pub digest_send_time: String, // "09:00" format (24-hour)
+    #[serde(default = "default_digest_sections")]
+    pub digest_sections: crate::digest::DigestSections,
 }
 
 impl Default for NotificationPreferences {
@@ -904,6 +930,11 @@ impl Default for NotificationPreferences {
 
             route_downtime_enabled: true,
             load_balancer_issues_enabled: true,
+
+            weekly_digest_enabled: true,
+            digest_send_day: "monday".to_string(),
+            digest_send_time: "09:00".to_string(),
+            digest_sections: crate::digest::DigestSections::default(),
         }
     }
 }

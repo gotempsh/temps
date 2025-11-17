@@ -18,6 +18,7 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::{
+    digest::{DigestScheduler, DigestService},
     handlers::{configure_routes, NotificationProvidersApiDoc, NotificationState},
     services::{NotificationPreferencesService, NotificationService},
 };
@@ -69,12 +70,25 @@ impl TempsPlugin for NotificationsPlugin {
                 Arc::new(NotificationPreferencesService::new(db.clone()));
             context.register_service(notification_preferences_service.clone());
 
+            // Create DigestService
+            let digest_service =
+                Arc::new(DigestService::new(db.clone(), notification_service.clone()));
+            context.register_service(digest_service.clone());
+
             // Create NotificationState for handlers
             let notification_state = Arc::new(NotificationState::new(
-                notification_service,
-                notification_preferences_service,
+                notification_service.clone(),
+                notification_preferences_service.clone(),
+                digest_service.clone(),
             ));
             context.register_service(notification_state);
+
+            // Start the weekly digest scheduler
+            let scheduler = DigestScheduler::new(
+                digest_service.clone(),
+                notification_preferences_service.clone(),
+            );
+            context.register_service(scheduler);
 
             debug!("Notifications plugin services registered successfully");
             Ok(())

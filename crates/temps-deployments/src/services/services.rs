@@ -1908,6 +1908,83 @@ impl DeploymentService {
         debug!("Retrieved metrics for container: {}", container_id);
         Ok(stats)
     }
+
+    /// Get deployment activity graph for the last N days
+    /// Returns daily deployment counts with intensity levels for GitHub-style contribution graph
+    pub async fn get_activity_graph(
+        &self,
+        project_id: Option<i32>,
+        environment_id: Option<i32>,
+        days: i32,
+    ) -> Result<crate::handlers::types::ActivityGraphResponse, DeploymentError> {
+        use chrono::{Duration, NaiveDate, Utc};
+        use std::collections::HashMap;
+
+        let end_date = Utc::now().date_naive();
+        let start_date = end_date - Duration::days(days as i64 - 1);
+
+        // Convert NaiveDate to DateTime for comparison
+        let start_datetime = start_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let end_datetime = end_date.and_hms_opt(23, 59, 59).unwrap().and_utc();
+
+        // Build query using Sea-ORM
+        let mut query = deployments::Entity::find()
+            .filter(deployments::Column::CreatedAt.gte(start_datetime))
+            .filter(deployments::Column::CreatedAt.lte(end_datetime));
+
+        if let Some(pid) = project_id {
+            query = query.filter(deployments::Column::ProjectId.eq(pid));
+        }
+
+        if let Some(eid) = environment_id {
+            query = query.filter(deployments::Column::EnvironmentId.eq(eid));
+        }
+
+        // Fetch all deployments in the date range
+        let deployments_list = query.all(self.db.as_ref()).await?;
+
+        // Group deployments by date
+        let mut activity_map: HashMap<NaiveDate, i64> = HashMap::new();
+        for deployment in deployments_list {
+            let date = deployment.created_at.date_naive();
+            *activity_map.entry(date).or_insert(0) += 1;
+        }
+
+        // Generate all days in the range (including days with zero activity)
+        let mut days_vec = Vec::new();
+        let mut total_count = 0i64;
+        let mut current = start_date;
+
+        while current <= end_date {
+            let count = activity_map.get(&current).copied().unwrap_or(0);
+            total_count += count;
+
+            // Calculate intensity level for visualization
+            // 0: No activity, 1: Low (1-2), 2: Medium (3-5), 3: High (6-10), 4: Very High (11+)
+            let level = match count {
+                0 => 0,
+                1..=2 => 1,
+                3..=5 => 2,
+                6..=10 => 3,
+                _ => 4,
+            };
+
+            days_vec.push(crate::handlers::types::ActivityDay {
+                date: current.to_string(),
+                count,
+                level,
+            });
+
+            current = current.succ_opt().unwrap_or(current);
+        }
+
+        Ok(crate::handlers::types::ActivityGraphResponse {
+            days: days_vec,
+            total_count,
+            start_date: start_date.to_string(),
+            end_date: end_date.to_string(),
+        })
+    }
 }
 
 #[cfg(test)]

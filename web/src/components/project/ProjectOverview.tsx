@@ -22,6 +22,7 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { MetricCard } from '../dashboard/MetricCard'
+import { DeploymentActivityGraph } from './DeploymentActivityGraph'
 
 interface ProjectOverviewProps {
   project: ProjectResponse
@@ -206,6 +207,9 @@ export function ProjectOverview({
             projectName={project.slug}
           />
         )}
+      </div>
+      <div className="mt-6">
+        <DeploymentActivityGraph projectId={project.id} />
       </div>
     </>
   )

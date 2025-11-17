@@ -1,3 +1,4 @@
+use crate::digest::DigestService;
 use crate::services::{
     NotificationPreferences, NotificationPreferencesService, NotificationService, TlsMode,
 };
@@ -20,16 +21,19 @@ use utoipa::OpenApi;
 pub struct NotificationState {
     notification_service: Arc<NotificationService>,
     notification_preferences_service: Arc<NotificationPreferencesService>,
+    digest_service: Arc<DigestService>,
 }
 
 impl NotificationState {
     pub fn new(
         notification_service: Arc<NotificationService>,
         notification_preferences_service: Arc<NotificationPreferencesService>,
+        digest_service: Arc<DigestService>,
     ) -> Self {
         Self {
             notification_service,
             notification_preferences_service,
+            digest_service,
         }
     }
 }
@@ -54,6 +58,7 @@ impl NotificationState {
         get_preferences,
         update_preferences,
         delete_preferences,
+        trigger_weekly_digest,
     ),
     components(
         schemas(
@@ -70,6 +75,7 @@ impl NotificationState {
             UpdateEmailProviderRequest,
             NotificationPreferencesResponse,
             UpdatePreferencesRequest,
+            TriggerDigestResponse,
         )
     ),
     info(
@@ -825,6 +831,12 @@ pub struct NotificationPreferencesResponse {
     // Route Monitoring
     pub route_downtime_enabled: bool,
     pub load_balancer_issues_enabled: bool,
+
+    // Weekly Digest Settings
+    pub weekly_digest_enabled: bool,
+    pub digest_send_day: String,
+    pub digest_send_time: String,
+    pub digest_sections: crate::digest::DigestSections,
 }
 
 impl From<NotificationPreferences> for NotificationPreferencesResponse {
@@ -849,6 +861,10 @@ impl From<NotificationPreferences> for NotificationPreferencesResponse {
             retention_policy_violations_enabled: prefs.retention_policy_violations_enabled,
             route_downtime_enabled: prefs.route_downtime_enabled,
             load_balancer_issues_enabled: prefs.load_balancer_issues_enabled,
+            weekly_digest_enabled: prefs.weekly_digest_enabled,
+            digest_send_day: prefs.digest_send_day,
+            digest_send_time: prefs.digest_send_time,
+            digest_sections: prefs.digest_sections,
         }
     }
 }
@@ -949,6 +965,10 @@ async fn update_preferences(
             .retention_policy_violations_enabled,
         route_downtime_enabled: request.preferences.route_downtime_enabled,
         load_balancer_issues_enabled: request.preferences.load_balancer_issues_enabled,
+        weekly_digest_enabled: request.preferences.weekly_digest_enabled,
+        digest_send_day: request.preferences.digest_send_day.clone(),
+        digest_send_time: request.preferences.digest_send_time.clone(),
+        digest_sections: request.preferences.digest_sections.clone(),
     };
 
     match app_state
@@ -1010,6 +1030,68 @@ async fn delete_preferences(
     }
 }
 
+/// Trigger weekly digest generation manually
+#[utoipa::path(
+    post,
+    path = "/weekly-digest/trigger",
+    responses(
+        (status = 200, description = "Weekly digest triggered successfully", body = TriggerDigestResponse),
+        (status = 500, description = "Failed to generate digest")
+    ),
+    tag = "Notification Preferences",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn trigger_weekly_digest(
+    State(app_state): State<Arc<NotificationState>>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, NotificationPreferencesWrite);
+
+    info!("Manually triggering weekly digest generation");
+
+    // Get current preferences to determine which sections to include
+    let preferences = app_state
+        .notification_preferences_service
+        .get_preferences()
+        .await
+        .map_err(|e| {
+            error!("Failed to get preferences: {}", e);
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Failed to get preferences")
+                .detail(format!("Error: {}", e))
+                .build()
+        })?;
+
+    match app_state
+        .digest_service
+        .generate_and_send_weekly_digest(preferences.digest_sections)
+        .await
+    {
+        Ok(_) => {
+            info!("Weekly digest generated and sent successfully");
+            Ok(Json(TriggerDigestResponse {
+                success: true,
+                message: "Weekly digest generated and sent successfully".to_string(),
+            }))
+        }
+        Err(e) => {
+            error!("Failed to generate weekly digest: {}", e);
+            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Failed to generate weekly digest")
+                .detail(format!("Error: {}", e))
+                .build())
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct TriggerDigestResponse {
+    pub success: bool,
+    pub message: String,
+}
+
 pub fn configure_routes() -> Router<Arc<NotificationState>> {
     Router::new()
         .route("/notification-providers", get(list_notification_providers))
@@ -1037,6 +1119,7 @@ pub fn configure_routes() -> Router<Arc<NotificationState>> {
         .route("/notification-preferences", get(get_preferences))
         .route("/notification-preferences", put(update_preferences))
         .route("/notification-preferences", delete(delete_preferences))
+        .route("/weekly-digest/trigger", post(trigger_weekly_digest))
 }
 
 #[cfg(test)]
@@ -1097,9 +1180,16 @@ mod tests {
                 crate::services::NotificationPreferencesService::new(test_db.connection_arc()),
             );
 
+            // Create digest service
+            let digest_service = Arc::new(crate::digest::DigestService::new(
+                test_db.connection_arc(),
+                notification_service.clone(),
+            ));
+
             let notification_state = Arc::new(NotificationState::new(
                 notification_service,
                 notification_preferences_service,
+                digest_service,
             ));
 
             Ok(TestSetup {

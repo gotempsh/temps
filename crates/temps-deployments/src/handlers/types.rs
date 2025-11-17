@@ -648,3 +648,48 @@ pub struct ContainerActionResponse {
     pub status: String,
     pub message: String,
 }
+
+/// Query parameters for activity graph endpoint
+#[derive(Deserialize, ToSchema)]
+pub struct ActivityGraphQuery {
+    /// Optional project ID to filter activity
+    pub project_id: Option<i32>,
+    /// Optional environment ID to filter activity
+    pub environment_id: Option<i32>,
+    /// Number of days to include (default: 365 for last year)
+    #[serde(default = "default_days")]
+    pub days: i32,
+}
+
+fn default_days() -> i32 {
+    365
+}
+
+/// Response for activity graph showing daily deployment activity
+#[derive(Serialize, ToSchema)]
+pub struct ActivityGraphResponse {
+    /// Array of daily activity counts
+    pub days: Vec<ActivityDay>,
+    /// Total count of activities across all days
+    pub total_count: i64,
+    /// Date range start (YYYY-MM-DD)
+    #[schema(example = "2024-01-01")]
+    pub start_date: String,
+    /// Date range end (YYYY-MM-DD)
+    #[schema(example = "2024-12-31")]
+    pub end_date: String,
+}
+
+/// Daily activity count for a single day
+#[derive(Serialize, ToSchema)]
+pub struct ActivityDay {
+    /// Date in YYYY-MM-DD format
+    #[schema(example = "2024-06-15")]
+    pub date: String,
+    /// Number of deployments on this day
+    pub count: i64,
+    /// Intensity level (0-4) for visualization
+    /// 0: No activity, 1: Low (1-2), 2: Medium (3-5), 3: High (6-10), 4: Very High (11+)
+    #[schema(example = 2)]
+    pub level: i32,
+}

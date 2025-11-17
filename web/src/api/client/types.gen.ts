@@ -40,6 +40,65 @@ export type ActiveVisitorsResponse = {
     window_minutes: number;
 };
 
+/**
+ * Daily activity count for a single day
+ */
+export type ActivityDay = {
+    /**
+     * Number of deployments on this day
+     */
+    count: number;
+    /**
+     * Date in YYYY-MM-DD format
+     */
+    date: string;
+    /**
+     * Intensity level (0-4) for visualization
+     * 0: No activity, 1: Low (1-2), 2: Medium (3-5), 3: High (6-10), 4: Very High (11+)
+     */
+    level: number;
+};
+
+/**
+ * Query parameters for activity graph endpoint
+ */
+export type ActivityGraphQuery = {
+    /**
+     * Number of days to include (default: 365 for last year)
+     */
+    days?: number;
+    /**
+     * Optional environment ID to filter activity
+     */
+    environment_id?: number | null;
+    /**
+     * Optional project ID to filter activity
+     */
+    project_id?: number | null;
+};
+
+/**
+ * Response for activity graph showing daily deployment activity
+ */
+export type ActivityGraphResponse = {
+    /**
+     * Array of daily activity counts
+     */
+    days: Array<ActivityDay>;
+    /**
+     * Date range end (YYYY-MM-DD)
+     */
+    end_date: string;
+    /**
+     * Date range start (YYYY-MM-DD)
+     */
+    start_date: string;
+    /**
+     * Total count of activities across all days
+     */
+    total_count: number;
+};
+
 export type AddEnvironmentDomainRequest = {
     domain: string;
     is_primary: boolean;
@@ -1227,6 +1286,18 @@ export type DeviceCount = {
     percentage: number;
 };
 
+/**
+ * Sections that can be included in the weekly digest
+ */
+export type DigestSections = {
+    deployments: boolean;
+    errors: boolean;
+    funnels: boolean;
+    performance: boolean;
+    resources: boolean;
+    security: boolean;
+};
+
 export type DisableMfaRequest = {
     code: string;
 };
@@ -1518,6 +1589,10 @@ export type EnvironmentDomainResponse = {
     domain: string;
     environment_id: number;
     id: number;
+    /**
+     * Full URL for this domain (e.g., https://buildtolearndev-production.example.com)
+     */
+    url: string;
 };
 
 export type EnvironmentInfo = {
@@ -2726,6 +2801,9 @@ export type NotificationPreferencesResponse = {
     batch_similar_notifications: boolean;
     build_errors_enabled: boolean;
     deployment_failures_enabled: boolean;
+    digest_sections: DigestSections;
+    digest_send_day: string;
+    digest_send_time: string;
     dns_changes_enabled: boolean;
     domain_expiration_enabled: boolean;
     email_enabled: boolean;
@@ -2740,6 +2818,7 @@ export type NotificationPreferencesResponse = {
     slack_enabled: boolean;
     ssl_days_before_expiration: number;
     ssl_expiration_enabled: boolean;
+    weekly_digest_enabled: boolean;
 };
 
 export type NotificationProviderResponse = {
@@ -4374,6 +4453,11 @@ export type TodayStatsResponse = {
 
 export type TokenRenewalRequest = {
     refresh_token: string;
+};
+
+export type TriggerDigestResponse = {
+    message: string;
+    success: boolean;
 };
 
 export type TriggerPipelinePayload = {
@@ -7135,6 +7219,46 @@ export type GetBackupResponses = {
 };
 
 export type GetBackupResponse = GetBackupResponses[keyof GetBackupResponses];
+
+export type GetActivityGraphData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter by project ID (optional)
+         */
+        project_id?: number;
+        /**
+         * Filter by environment ID (optional)
+         */
+        environment_id?: number;
+        /**
+         * Number of days to include (default: 365)
+         */
+        days?: number;
+    };
+    url: '/deployments/activity-graph';
+};
+
+export type GetActivityGraphErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetActivityGraphResponses = {
+    /**
+     * Successfully retrieved activity graph
+     */
+    200: ActivityGraphResponse;
+};
+
+export type GetActivityGraphResponse = GetActivityGraphResponses[keyof GetActivityGraphResponses];
 
 export type LookupDnsARecordsData = {
     body?: never;
@@ -12657,7 +12781,7 @@ export type DeleteEnvironmentData = {
 
 export type DeleteEnvironmentErrors = {
     /**
-     * Cannot delete production or environment with active deployments
+     * Cannot delete production environment
      */
     400: unknown;
     /**
@@ -12672,7 +12796,7 @@ export type DeleteEnvironmentErrors = {
 
 export type DeleteEnvironmentResponses = {
     /**
-     * Environment deleted successfully
+     * Environment permanently deleted
      */
     204: void;
 };
@@ -16485,6 +16609,29 @@ export type AddEventsResponses = {
 };
 
 export type AddEventsResponse2 = AddEventsResponses[keyof AddEventsResponses];
+
+export type TriggerWeeklyDigestData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/weekly-digest/trigger';
+};
+
+export type TriggerWeeklyDigestErrors = {
+    /**
+     * Failed to generate digest
+     */
+    500: unknown;
+};
+
+export type TriggerWeeklyDigestResponses = {
+    /**
+     * Weekly digest triggered successfully
+     */
+    200: TriggerDigestResponse;
+};
+
+export type TriggerWeeklyDigestResponse = TriggerWeeklyDigestResponses[keyof TriggerWeeklyDigestResponses];
 
 export type ListAuditLogsData = {
     body?: never;

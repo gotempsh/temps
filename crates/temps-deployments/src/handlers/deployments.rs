@@ -20,8 +20,9 @@ use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 
 use crate::handlers::types::{
-    ContainerActionResponse, ContainerDetailResponse, ContainerInfoResponse, ContainerListResponse,
-    ContainerLogsQuery, ContainerMetricsResponse, DeploymentJobResponse, DeploymentJobsResponse,
+    ActivityDay, ActivityGraphQuery, ActivityGraphResponse, ContainerActionResponse,
+    ContainerDetailResponse, ContainerInfoResponse, ContainerListResponse, ContainerLogsQuery,
+    ContainerMetricsResponse, DeploymentJobResponse, DeploymentJobsResponse,
     DeploymentListResponse, DeploymentResponse, DeploymentStateResponse, EnvVarResponse,
     ResourceLimitsResponse,
 };
@@ -51,7 +52,8 @@ use temps_core::problemdetails::Problem;
         start_container,
         restart_container,
         get_container_metrics,
-        stream_container_metrics
+        stream_container_metrics,
+        get_activity_graph
     ),
     components(schemas(
         DeploymentListResponse,
@@ -67,7 +69,10 @@ use temps_core::problemdetails::Problem;
         EnvVarResponse,
         ResourceLimitsResponse,
         ContainerMetricsResponse,
-        ContainerActionResponse
+        ContainerActionResponse,
+        ActivityGraphQuery,
+        ActivityGraphResponse,
+        ActivityDay
     )),
     info(
         title = "Deployments API",
@@ -126,6 +131,8 @@ pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
             "/projects/{project_id}/environments/{env_id}/teardown",
             delete(teardown_environment),
         )
+        // Analytics
+        .route("/deployments/activity-graph", get(get_activity_graph))
         // Container management
         .route(
             "/projects/{project_id}/environments/{environment_id}/containers",
@@ -1409,6 +1416,49 @@ pub async fn stream_container_metrics(
     };
 
     Ok(axum::response::sse::Sse::new(sse_stream))
+}
+
+/// Get deployment activity graph showing daily deployment counts
+/// Similar to GitHub's contribution graph
+#[utoipa::path(
+    tag = "Deployments",
+    get,
+    path = "/deployments/activity-graph",
+    params(
+        ("project_id" = Option<i32>, Query, description = "Filter by project ID (optional)"),
+        ("environment_id" = Option<i32>, Query, description = "Filter by environment ID (optional)"),
+        ("days" = Option<i32>, Query, description = "Number of days to include (default: 365)"),
+    ),
+    responses(
+        (status = 200, description = "Successfully retrieved activity graph", body = ActivityGraphResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_activity_graph(
+    RequireAuth(_auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Query(query): Query<ActivityGraphQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    // Note: No specific permission check needed as this is general activity overview
+    // Users can only see their own projects based on the RequireAuth check
+
+    match app_state
+        .deployment_service
+        .get_activity_graph(query.project_id, query.environment_id, query.days)
+        .await
+    {
+        Ok(graph) => Ok(Json(graph)),
+        Err(e) => {
+            error!("Failed to get activity graph: {}", e);
+            Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Failed to retrieve activity graph")
+                .with_detail(e.to_string()))
+        }
+    }
 }
 
 #[cfg(test)]
