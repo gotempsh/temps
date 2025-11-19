@@ -19,7 +19,6 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   Globe,
-  MousePointer,
   Bug,
   Users as UserIcon,
   ChevronLeft,
@@ -191,18 +190,7 @@ export function VisitorsList({ project }: VisitorsListProps) {
                             </p>
                           </div>
                         </div>
-
-                        {/* Sessions and Page Views */}
-                        <div className="flex-shrink-0 text-right">
-                          <div className="text-sm font-semibold">
-                            {visitor.sessions_count}
-                          </div>
-                          <p className="text-xs text-muted-foreground">
-                            session{visitor.sessions_count !== 1 ? 's' : ''}
-                          </p>
-                        </div>
                       </div>
-
                       {/* Browser and Page Views */}
                       <div className="grid grid-cols-2 gap-3 pt-2 border-t">
                         <div>
@@ -215,17 +203,6 @@ export function VisitorsList({ project }: VisitorsListProps) {
                               : 'Unknown'}
                           </p>
                         </div>
-                        <div>
-                          <p className="text-xs text-muted-foreground font-medium mb-1">
-                            Page Views
-                          </p>
-                          <div className="flex items-center gap-1">
-                            <MousePointer className="h-3 w-3 text-muted-foreground" />
-                            <span className="text-sm font-medium">
-                              {visitor.page_views}
-                            </span>
-                          </div>
-                        </div>
                       </div>
 
                       {/* Location info */}
@@ -233,11 +210,15 @@ export function VisitorsList({ project }: VisitorsListProps) {
                         <p className="text-xs text-muted-foreground font-medium mb-2">
                           Location
                         </p>
-                        <div className="flex items-start gap-2">
-                          <Globe className="h-4 w-4 text-muted-foreground flex-shrink-0 mt-0.5" />
-                          <div className="text-sm font-medium">
-                            {visitor.location || 'Unknown'}
-                          </div>
+                        <div className="flex items-center gap-2">
+                          <Globe className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                          <span className="text-sm font-medium">
+                            {visitor.city}, {visitor.region}
+                          </span>
+                          <span className="text-xs text-muted-foreground">
+                            {visitor.country}
+                            {visitor.is_eu && ' (EU)'}
+                          </span>
                         </div>
                       </div>
 

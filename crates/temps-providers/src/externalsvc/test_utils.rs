@@ -93,7 +93,8 @@ impl MinioTestContainer {
         tokio::time::sleep(Duration::from_secs(3)).await;
         println!("✓ MinIO container started: {}", container.id);
 
-        // Configure S3 client
+        // Configure S3 client for localhost testing
+        // Using HTTP endpoint - SDK will automatically handle this without TLS
         let s3_config = aws_sdk_s3::config::Builder::new()
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
             .endpoint_url(format!("http://localhost:{}", port))
@@ -101,6 +102,7 @@ impl MinioTestContainer {
                 access_key, secret_key, None, None, "test",
             ))
             .force_path_style(true)
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .build();
 
         let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
