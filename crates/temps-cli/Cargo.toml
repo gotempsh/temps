@@ -69,6 +69,14 @@ async-trait = { workspace = true }
 sea-orm = { workspace = true }
 include_dir = "0.7"
 mime_guess = "2.0"
+aws-sdk-s3 = { workspace = true }
+url = { workspace = true }
+urlencoding = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+flate2 = "1.0"
+indicatif = "0.17"
+tar = { workspace = true }
 
 [build-dependencies]
 chrono = { workspace = true }

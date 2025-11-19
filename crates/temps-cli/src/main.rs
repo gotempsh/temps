@@ -6,7 +6,7 @@
 mod commands;
 
 use clap::{Parser, Subcommand};
-use commands::{ProxyCommand, ResetPasswordCommand, ServeCommand};
+use commands::{BackupCommand, ProxyCommand, ResetPasswordCommand, ServeCommand};
 use tracing_subscriber::{layer::SubscriberExt, Layer};
 
 #[derive(Parser)]
@@ -42,6 +42,8 @@ enum Commands {
     Proxy(ProxyCommand),
     /// Reset admin user password
     ResetAdminPassword(ResetPasswordCommand),
+    /// Backup management commands
+    Backup(BackupCommand),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -131,5 +133,6 @@ fn main() -> anyhow::Result<()> {
         Commands::Serve(serve_cmd) => serve_cmd.execute(),
         Commands::Proxy(proxy_cmd) => proxy_cmd.execute(),
         Commands::ResetAdminPassword(reset_cmd) => reset_cmd.execute(),
+        Commands::Backup(backup_cmd) => backup_cmd.execute(),
     }
 }

@@ -3,6 +3,7 @@ use super::{DockerfileWithArgs, PackageManager, Preset, ProjectType};
 use async_trait::async_trait;
 use tracing::debug;
 use std::path::Path;
+use super::providers::package_json::PackageJson;
 
 pub struct NextJs;
 
@@ -54,10 +55,16 @@ impl Preset for NextJs {
             build_cmd = build_cmd.replace("bun ", "/root/.bun/bin/bun ");
         }
 
-        let (base_image, start_cmd, run_image) = match package_manager {
-            PackageManager::Bun => ("node:22", "npx next start", "node:22-alpine"),
-            PackageManager::Yarn => ("node:22-alpine", "npx next start", "node:22-alpine"),
-            _ => ("node:22", "npx next start", "node:22-alpine"),
+        // Try to read package.json to get the start script
+        // If found, use the script content directly (e.g., "next start" or "node server.js")
+        // If not found, fall back to "next start"
+        let start_script = Self::get_start_script(config.local_path);
+        let start_cmd = start_script.unwrap_or_else(|| "next start".to_string());
+
+        let (base_image, run_image) = match package_manager {
+            PackageManager::Bun => ("node:22", "node:22-alpine"),
+            PackageManager::Yarn => ("node:22-alpine", "node:22-alpine"),
+            _ => ("node:22", "node:22-alpine"),
         };
 
         // Determine cache path based on whether it's a monorepo subproject
@@ -318,6 +325,26 @@ CMD ["node", "server.js"]
     }
 }
 
+impl NextJs {
+    /// Get the start script from package.json if it exists
+    /// Returns the start script command or None if not found
+    fn get_start_script(local_path: &Path) -> Option<String> {
+        let package_json_path = local_path.join("package.json");
+
+        if let Ok(content) = std::fs::read_to_string(&package_json_path) {
+            if let Ok(pkg) = PackageJson::parse(&content) {
+                if let Some(start_script) = pkg.get_script("start") {
+                    debug!("Found start script in package.json: {}", start_script);
+                    return Some(start_script.to_string());
+                }
+            }
+        }
+
+        debug!("No start script found in package.json, using default");
+        None
+    }
+}
+
 impl std::fmt::Display for NextJs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.label())
@@ -452,6 +479,70 @@ mod tests {
 
         // Verify no subdirectory change
         assert!(!result.content.contains("# Change to project subdirectory"));
+
+        // Cleanup
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_uses_start_script_from_package_json() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_custom_start");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Create package.json with custom start script
+        let package_json = r#"{
+            "scripts": {
+                "start": "node server.js"
+            }
+        }"#;
+        std::fs::write(temp_dir.join("package.json"), package_json).unwrap();
+
+        let preset = NextJs;
+        let result = preset.dockerfile(DockerfileConfig {
+            use_buildkit: true,
+            root_local_path: &temp_dir,
+            local_path: &temp_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        }).await;
+
+        // Verify custom start command is used
+        assert!(result.content.contains(r#"CMD ["node", "server.js"]"#));
+
+        // Cleanup
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_falls_back_to_next_start_when_no_start_script() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_default_start");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Create package.json without start script
+        let package_json = r#"{
+            "scripts": {
+                "build": "next build"
+            }
+        }"#;
+        std::fs::write(temp_dir.join("package.json"), package_json).unwrap();
+
+        let preset = NextJs;
+        let result = preset.dockerfile(DockerfileConfig {
+            use_buildkit: true,
+            root_local_path: &temp_dir,
+            local_path: &temp_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        }).await;
+
+        // Verify default "next start" is used
+        assert!(result.content.contains(r#"CMD ["next", "start"]"#));
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).ok();

@@ -272,7 +272,11 @@ impl ExternalServiceManager {
             ServiceType::Mongodb => Box::new(MongodbService::new(name, self.docker.clone())),
             ServiceType::Postgres => Box::new(PostgresService::new(name, self.docker.clone())),
             ServiceType::Redis => Box::new(RedisService::new(name, self.docker.clone())),
-            ServiceType::S3 => Box::new(S3Service::new(name, self.docker.clone())),
+            ServiceType::S3 => Box::new(S3Service::new(
+                name,
+                self.docker.clone(),
+                self.encryption_service.clone(),
+            )),
         }
     }
 
@@ -1898,7 +1902,11 @@ impl ExternalServiceManager {
                     .await?
             }
             ServiceType::S3 => {
-                let s3 = S3Service::new(request.name.clone(), Arc::clone(&self.docker));
+                let s3 = S3Service::new(
+                    request.name.clone(),
+                    Arc::clone(&self.docker),
+                    Arc::clone(&self.encryption_service),
+                );
                 s3.import_from_container(
                     request.container_id.clone(),
                     request.name.clone(),

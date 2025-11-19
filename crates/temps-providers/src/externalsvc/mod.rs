@@ -9,6 +9,10 @@ pub mod postgres;
 pub mod redis;
 pub mod s3;
 
+// Test utilities for backup and restore testing
+#[cfg(test)]
+pub mod test_utils;
+
 // Re-export services for easier access
 pub use mongodb::MongodbService;
 pub use postgres::PostgresService;

@@ -1910,7 +1910,8 @@ impl DeploymentService {
     }
 
     /// Get deployment activity graph for the last N days
-    /// Returns daily deployment counts with intensity levels for GitHub-style contribution graph
+    /// Returns daily counts of unique commits deployed, with intensity levels for GitHub-style contribution graph
+    /// Note: Only counts deployments that have a commit SHA, and counts each unique commit once per day
     pub async fn get_activity_graph(
         &self,
         project_id: Option<i32>,
@@ -1943,11 +1944,26 @@ impl DeploymentService {
         // Fetch all deployments in the date range
         let deployments_list = query.all(self.db.as_ref()).await?;
 
-        // Group deployments by date
-        let mut activity_map: HashMap<NaiveDate, i64> = HashMap::new();
+        // Group deployments by date, counting unique commit SHAs per day
+        // We use a HashMap of HashSet to track unique commits per date
+        let mut commits_by_date: HashMap<NaiveDate, std::collections::HashSet<String>> =
+            HashMap::new();
         for deployment in deployments_list {
             let date = deployment.created_at.date_naive();
-            *activity_map.entry(date).or_insert(0) += 1;
+
+            // Only count deployments with a commit SHA
+            if let Some(commit_sha) = deployment.commit_sha {
+                commits_by_date
+                    .entry(date)
+                    .or_insert_with(std::collections::HashSet::new)
+                    .insert(commit_sha);
+            }
+        }
+
+        // Convert unique commits to counts
+        let mut activity_map: HashMap<NaiveDate, i64> = HashMap::new();
+        for (date, commits) in commits_by_date {
+            activity_map.insert(date, commits.len() as i64);
         }
 
         // Generate all days in the range (including days with zero activity)

@@ -1596,4 +1596,223 @@ mod tests {
             Some("admin")
         );
     }
+
+    /// Test backup and restore of MongoDB to/from S3 using real Docker containers
+    /// This test uses MongoDB and MinIO (S3-compatible) containers
+    /// Demonstrates the use of test_utils for backup/restore testing
+    #[tokio::test]
+    async fn test_mongodb_backup_and_restore_to_s3() {
+        use super::super::test_utils::{
+            create_mock_backup, create_mock_db, create_mock_external_service, MinioTestContainer,
+        };
+
+        // Check if Docker is available
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                println!("Docker not available, skipping test: {}", e);
+                return;
+            }
+        };
+
+        // Verify Docker is actually responding
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping test");
+            return;
+        }
+
+        println!("✓ Docker is available");
+
+        // Test configuration
+        let service_name = format!("test-backup-{}", chrono::Utc::now().timestamp());
+        let username = "testuser";
+        let password = "testpass123";
+        let database = "testdb";
+        let test_port = find_available_port(27018).expect("No available port found");
+
+        println!("✓ Test configuration: MongoDB port {}", test_port);
+
+        // Step 1 & 2: Start MinIO container and set up S3 (using test utilities)
+        println!("Step 1: Starting MinIO container and setting up S3...");
+        let minio = MinioTestContainer::start(docker.clone(), "test-backups")
+            .await
+            .expect("Failed to start MinIO container");
+
+        // Step 3: Create MongoDB service and start container
+        println!("Step 3: Starting MongoDB container...");
+        let service = MongodbService::new(service_name.clone(), docker.clone());
+
+        let mongodb_config = MongodbRuntimeConfig {
+            host: "localhost".to_string(),
+            port: test_port.to_string(),
+            database: database.to_string(),
+            username: username.to_string(),
+            password: password.to_string(),
+            docker_image: "mongo:8.0".to_string(),
+        };
+
+        *service.config.write().await = Some(mongodb_config.clone());
+
+        // Create and start MongoDB container
+        service
+            .create_container(&docker, &mongodb_config)
+            .await
+            .expect("Failed to create MongoDB container");
+        println!("✓ MongoDB container started and healthy");
+
+        // Step 4: Insert test data into MongoDB
+        println!("Step 4: Inserting test data...");
+        let client = service
+            .get_mongo_client()
+            .await
+            .expect("Failed to get MongoDB client");
+        let db = client.database(&database);
+        let collection = db.collection::<mongodb::bson::Document>("test_collection");
+
+        // Insert test documents
+        let test_docs = vec![
+            doc! { "name": "Alice", "age": 30, "city": "New York" },
+            doc! { "name": "Bob", "age": 25, "city": "San Francisco" },
+            doc! { "name": "Charlie", "age": 35, "city": "Boston" },
+        ];
+        collection
+            .insert_many(&test_docs)
+            .await
+            .expect("Failed to insert test data");
+
+        let count_before = collection
+            .count_documents(doc! {})
+            .await
+            .expect("Failed to count documents");
+        assert_eq!(count_before, 3, "Should have 3 documents before backup");
+        println!("✓ Inserted {} test documents", count_before);
+
+        // Step 5: Backup MongoDB to S3 (using test utilities for mock entities)
+        println!("Step 5: Backing up MongoDB to S3...");
+
+        // Create mock entities using test utilities
+        let backup_record = create_mock_backup("backups/test");
+        let db_conn = create_mock_db()
+            .await
+            .expect("Failed to create mock database");
+        let external_service = create_mock_external_service(service_name.clone(), "mongodb", "8.0");
+
+        let service_config = ServiceConfig {
+            name: service_name.clone(),
+            service_type: ServiceType::Mongodb,
+            version: Some("8.0".to_string()),
+            parameters: serde_json::to_value(&mongodb_config).expect("Failed to serialize config"),
+        };
+
+        let backup_path = service
+            .backup_to_s3(
+                &minio.s3_client,
+                backup_record,
+                &minio.s3_source,
+                "backups/test",
+                "backups",
+                &db_conn,
+                &external_service,
+                service_config.clone(),
+            )
+            .await
+            .expect("Failed to backup MongoDB to S3");
+
+        println!("✓ Backup created at: {}", backup_path);
+
+        // Verify backup exists in S3
+        let backup_exists = minio
+            .s3_client
+            .head_object()
+            .bucket(&minio.bucket_name)
+            .key(&backup_path)
+            .send()
+            .await
+            .is_ok();
+        assert!(backup_exists, "Backup file should exist in S3");
+        println!("✓ Backup verified in S3");
+
+        // Step 6: Drop the database to simulate data loss
+        println!("Step 6: Dropping database to simulate data loss...");
+        service
+            .drop_database(&database)
+            .await
+            .expect("Failed to drop database");
+
+        // Verify data is gone
+        let db_after_drop = client.database(&database);
+        let collection_after_drop =
+            db_after_drop.collection::<mongodb::bson::Document>("test_collection");
+        let count_after_drop = collection_after_drop
+            .count_documents(doc! {})
+            .await
+            .expect("Failed to count documents");
+        assert_eq!(count_after_drop, 0, "Should have 0 documents after drop");
+        println!("✓ Database dropped successfully");
+
+        // Step 7: Restore from S3
+        println!("Step 7: Restoring MongoDB from S3...");
+        service
+            .restore_from_s3(
+                &minio.s3_client,
+                &backup_path,
+                &minio.s3_source,
+                service_config,
+            )
+            .await
+            .expect("Failed to restore MongoDB from S3");
+        println!("✓ Restore completed");
+
+        // Step 8: Verify restored data
+        println!("Step 8: Verifying restored data...");
+        let db_after_restore = client.database(&database);
+        let collection_after_restore =
+            db_after_restore.collection::<mongodb::bson::Document>("test_collection");
+        let count_after_restore = collection_after_restore
+            .count_documents(doc! {})
+            .await
+            .expect("Failed to count documents");
+        assert_eq!(
+            count_after_restore, 3,
+            "Should have 3 documents after restore"
+        );
+
+        // Verify the actual data
+        let restored_docs: Vec<mongodb::bson::Document> = collection_after_restore
+            .find(doc! {})
+            .await
+            .expect("Failed to query documents")
+            .try_collect()
+            .await
+            .expect("Failed to collect documents");
+
+        assert_eq!(restored_docs.len(), 3);
+
+        let names: Vec<String> = restored_docs
+            .iter()
+            .filter_map(|doc| doc.get_str("name").ok().map(|s| s.to_string()))
+            .collect();
+
+        assert!(names.contains(&"Alice".to_string()));
+        assert!(names.contains(&"Bob".to_string()));
+        assert!(names.contains(&"Charlie".to_string()));
+
+        println!(
+            "✓ Data verified: {} documents restored correctly",
+            count_after_restore
+        );
+
+        // Step 9: Cleanup
+        println!("Step 9: Cleaning up...");
+
+        // Stop and remove MongoDB container
+        let _ = service.stop().await;
+        let _ = service.remove().await;
+
+        // Stop and remove MinIO container (using test utility)
+        let _ = minio.cleanup().await;
+
+        println!("✓ Cleanup completed");
+        println!("\n✅ MongoDB backup and restore test completed successfully!");
+    }
 }

@@ -83,7 +83,8 @@ pub struct PostgresConfig {
     pub database: String,
     pub username: String,
     pub password: String,
-    pub max_connections: String,
+    #[serde(deserialize_with = "deserialize_max_connections")]
+    pub max_connections: u32,
     pub ssl_mode: Option<String>,
     pub docker_image: String,
 }
@@ -100,7 +101,7 @@ impl From<PostgresInputConfig> for PostgresConfig {
             database: input.database,
             username: input.username,
             password: input.password.unwrap_or_else(generate_password),
-            max_connections: input.max_connections.to_string(),
+            max_connections: input.max_connections,
             ssl_mode: input.ssl_mode,
             docker_image: input
                 .docker_image
@@ -494,7 +495,7 @@ impl PostgresService {
     async fn create_database(&self, service_config: ServiceConfig, name: &str) -> Result<()> {
         let config: PostgresConfig = self.get_postgres_config(service_config)?;
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(config.max_connections.parse::<u32>()?)
+            .max_connections(config.max_connections)
             .connect(&format!(
                 "postgres://{}:{}@{}:{}/postgres",
                 config.username, config.password, config.host, config.port
@@ -874,6 +875,8 @@ impl PostgresService {
         docker: &Docker,
         container_name: &str,
         backup_data: Vec<u8>,
+        username: &str,
+        password: &str,
     ) -> Result<()> {
         // Create a temporary file with the backup data
         // Create a temporary file for the backup data
@@ -899,13 +902,14 @@ impl PostgresService {
                 anyhow::anyhow!(format!("Failed to upload backup file to container: {}", e))
             })?;
 
-        // Execute psql to restore the backup
+        // Execute psql to restore the backup with actual credentials
+        let password_env = format!("PGPASSWORD={}", password);
         let exec = docker
             .create_exec(
                 container_name,
                 bollard::exec::CreateExecOptions {
-                    cmd: Some(vec!["psql", "-U", "postgres", "-f", "/backup.sql"]),
-                    env: Some(vec!["PGPASSWORD=postgres"]),
+                    cmd: Some(vec!["psql", "-U", username, "-f", "/backup.sql"]),
+                    env: Some(vec![password_env.as_str()]),
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
                     ..Default::default()
@@ -992,7 +996,7 @@ impl ExternalService for PostgresService {
         _subpath_root: &str,
         pool: &temps_database::DbConnection,
         external_service: &temps_entities::external_services::Model,
-        _service_config: ServiceConfig,
+        service_config: ServiceConfig,
     ) -> Result<String> {
         use chrono::Utc;
         use sea_orm::*;
@@ -1000,6 +1004,10 @@ impl ExternalService for PostgresService {
         use tempfile::NamedTempFile;
 
         info!("Starting PostgreSQL backup to S3");
+
+        // Get PostgreSQL configuration to extract credentials
+        let postgres_config = self.get_postgres_config(service_config)?;
+
         let metadata = serde_json::json!({
             "service_type": "postgres",
             "service_name": self.name,
@@ -1026,7 +1034,8 @@ impl ExternalService for PostgresService {
         // Create a temporary file for the backup
         let mut temp_file = tempfile::NamedTempFile::new()?;
 
-        // Execute pg_dumpall inside the container
+        // Execute pg_dumpall inside the container with actual credentials from config
+        let password_env = format!("PGPASSWORD={}", postgres_config.password);
         let exec = self
             .docker
             .create_exec(
@@ -1035,12 +1044,12 @@ impl ExternalService for PostgresService {
                     cmd: Some(vec![
                         "pg_dumpall",
                         "-U",
-                        "postgres",
+                        &postgres_config.username,
                         "-w",
                         "--clean",
                         "--if-exists",
                     ]),
-                    env: Some(vec!["PGPASSWORD=postgres"]),
+                    env: Some(vec![password_env.as_str()]),
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
                     ..Default::default()
@@ -1501,9 +1510,15 @@ impl ExternalService for PostgresService {
         s3_client: &aws_sdk_s3::Client,
         backup_location: &str,
         s3_source: &temps_entities::s3_sources::Model,
-        _service_config: ServiceConfig,
+        service_config: ServiceConfig,
     ) -> Result<()> {
         info!("Starting PostgreSQL restore from S3: {}", backup_location);
+
+        // Ensure container is running before attempting restore
+        self.start().await?;
+
+        // Get PostgreSQL configuration to extract credentials
+        let postgres_config = self.get_postgres_config(service_config)?;
 
         // Get the backup object from S3
         let get_obj = s3_client
@@ -1524,9 +1539,15 @@ impl ExternalService for PostgresService {
         // Get container name
         let container_name = self.get_container_name();
 
-        // Restore the backup using Docker
-        self.restore_backup_file(&self.docker, &container_name, decompressed_data)
-            .await?;
+        // Restore the backup using Docker with actual credentials
+        self.restore_backup_file(
+            &self.docker,
+            &container_name,
+            decompressed_data,
+            &postgres_config.username,
+            &postgres_config.password,
+        )
+        .await?;
 
         info!("PostgreSQL restore completed successfully");
         Ok(())
@@ -1744,7 +1765,7 @@ mod tests {
         assert_eq!(runtime_config.host, "localhost");
         assert_eq!(runtime_config.database, "postgres");
         assert_eq!(runtime_config.username, "postgres");
-        assert_eq!(runtime_config.max_connections, "100");
+        assert_eq!(runtime_config.max_connections, 100);
         assert_eq!(runtime_config.docker_image, "postgres:18-alpine");
         assert!(runtime_config.password.len() >= 16); // Auto-generated password
     }

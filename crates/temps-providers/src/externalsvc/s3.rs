@@ -5,7 +5,7 @@ use aws_sdk_s3::Client;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::Docker;
 use futures::TryStreamExt;
-use rand::{distributions::Alphanumeric, Rng};
+use rand::Rng;
 use schemars::JsonSchema;
 use sea_orm::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
+use temps_core::EncryptionService;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{debug, error, info};
@@ -107,18 +108,25 @@ fn default_host() -> String {
 }
 
 fn default_access_key() -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(15)
-        .map(char::from)
-        .collect()
+    // AWS Access Key format: AKIA + 16 uppercase alphanumeric characters = 20 chars total
+    let mut rng = rand::thread_rng();
+    let random_part: String = (0..16)
+        .map(|_| {
+            let charset = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            charset[rng.gen_range(0..charset.len())] as char
+        })
+        .collect();
+    format!("AKIA{}", random_part)
 }
 
 fn default_secret_key() -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(15)
-        .map(char::from)
+    // AWS Secret Key format: 40 characters of base64-like characters (alphanumeric + / +)
+    let mut rng = rand::thread_rng();
+    (0..40)
+        .map(|_| {
+            let charset = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/+";
+            charset[rng.gen_range(0..charset.len())] as char
+        })
         .collect()
 }
 
@@ -164,18 +172,24 @@ pub struct S3Service {
     config: Arc<RwLock<Option<S3Config>>>,
     client: Arc<RwLock<Option<Client>>>,
     docker: Arc<Docker>,
+    encryption_service: Arc<EncryptionService>,
 }
 
 impl S3Service {
     /// MinIO Client (mc) utility image - used for temporary operations like migration and copy
     const MC_IMAGE: &'static str = "minio/mc:RELEASE.2025-08-13T08-35-41Z";
 
-    pub fn new(name: String, docker: Arc<Docker>) -> Self {
+    pub fn new(
+        name: String,
+        docker: Arc<Docker>,
+        encryption_service: Arc<EncryptionService>,
+    ) -> Self {
         Self {
             name,
             config: Arc::new(RwLock::new(None)),
             client: Arc::new(RwLock::new(None)),
             docker,
+            encryption_service,
         }
     }
 
@@ -929,6 +943,14 @@ impl ExternalService for S3Service {
             .endpoint
             .clone()
             .unwrap_or(format!("{}:{}", s3_source.bucket_name, "9000"));
+        let decrypted_access_key = self
+            .encryption_service
+            .decrypt_string(&s3_source.access_key_id)
+            .map_err(|e| anyhow::anyhow!("Failed to decrypt access key: {}", e))?;
+        let decrypted_secret_key = self
+            .encryption_service
+            .decrypt_string(&s3_source.secret_key)
+            .map_err(|e| anyhow::anyhow!("Failed to decrypt secret key: {}", e))?;
 
         let env_vars = [
             format!(
@@ -940,7 +962,7 @@ impl ExternalService for S3Service {
             ),
             format!(
                 "MC_HOST_dest=http://{}:{}@{}",
-                s3_source.access_key_id, s3_source.secret_key, dest_endpoint
+                decrypted_access_key, decrypted_secret_key, dest_endpoint
             ),
         ];
 
@@ -1009,8 +1031,8 @@ impl ExternalService for S3Service {
                 "set",
                 "backup-dest",
                 &dest_endpoint,
-                &s3_source.access_key_id,
-                &s3_source.secret_key,
+                &decrypted_access_key,
+                &decrypted_secret_key,
             ],
             // Perform the mirror operation (without --remove to preserve files)
             vec!["mc", "mirror", "--overwrite", &source_name, &dest_name],
@@ -1114,6 +1136,9 @@ impl ExternalService for S3Service {
             backup_location
         );
 
+        // Ensure S3 container is running before attempting restore
+        self.start().await?;
+
         let docker = &self.docker;
         let container_name = format!("mc-restore-{}", uuid::Uuid::new_v4());
         let s3_config = self.get_s3_config(service_config)?;
@@ -1174,6 +1199,12 @@ impl ExternalService for S3Service {
         let source_endpoint = s3_source.endpoint.as_deref().unwrap_or("s3.amazonaws.com");
         let dest_endpoint = format!("http://localhost:{}", s3_config.port);
 
+        // Note: s3_source credentials are expected to be plain-text (already decrypted by caller)
+        // When called from CLI, they come from env vars (not encrypted)
+        // When called from main app, caller should decrypt before passing
+        let source_access_key = &s3_source.access_key_id;
+        let source_secret_key = &s3_source.secret_key;
+
         // Base commands for setting up aliases
         let setup_commands = vec![
             // Add source alias
@@ -1183,8 +1214,8 @@ impl ExternalService for S3Service {
                 "set",
                 "backup-source",
                 source_endpoint,
-                &s3_source.access_key_id,
-                &s3_source.secret_key,
+                source_access_key,
+                source_secret_key,
             ],
             // Add destination alias
             vec![
@@ -1597,7 +1628,9 @@ mod tests {
     #[test]
     fn test_parameter_schema_editable_fields() {
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
-        let service = S3Service::new("test-editable".to_string(), docker);
+        let encryption_service =
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+        let service = S3Service::new("test-editable".to_string(), docker, encryption_service);
 
         // Get the parameter schema
         let schema_opt = service.get_parameter_schema();
@@ -1642,8 +1675,9 @@ mod tests {
     #[test]
     fn test_default_docker_image() {
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
-        let service = S3Service::new("test-image".to_string(), docker);
-
+        let encryption_service =
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+        let service = S3Service::new("test-image".to_string(), docker, encryption_service);
         let (image_name, version) = service.get_default_docker_image();
         assert_eq!(
             image_name, "minio/minio",

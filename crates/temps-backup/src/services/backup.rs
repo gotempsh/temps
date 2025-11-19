@@ -282,6 +282,8 @@ impl BackupService {
             .await?;
 
         let mut external_backups = Vec::new();
+        let mut failed_services = Vec::new();
+
         for service in external_services {
             match self
                 .backup_external_service(&service, s3_source_id, backup_type, created_by)
@@ -296,7 +298,9 @@ impl BackupService {
                 }
                 Err(e) => {
                     error!("Failed to backup external service {}: {}", service.name, e);
-                    // Convert the error and send notification
+                    failed_services.push(service.name.clone());
+
+                    // Send notification about this specific failure
                     let error_msg = format!("External service backup failed: {}", e);
                     let failure_data = BackupFailureData {
                         schedule_id: schedule_id.unwrap_or(-1),
@@ -312,9 +316,17 @@ impl BackupService {
                         error!("Failed to send backup failure notification: {}", notify_err);
                     }
 
-                    return Err(BackupError::ExternalService(error_msg));
+                    // Continue with next service instead of stopping
                 }
             }
+        }
+
+        // Log summary of failed services if any
+        if !failed_services.is_empty() {
+            error!(
+                "Backup completed with failures. Failed services: {}",
+                failed_services.join(", ")
+            );
         }
 
         // After successful backup upload, create and upload metadata file
@@ -770,24 +782,190 @@ impl BackupService {
                         .send()
                         .await
                         .map_err(|e| {
-                            BackupError::S3(format!(
-                                "Failed to create S3 bucket '{}': {}",
-                                bucket_name,
-                                e.to_string()
-                            ))
+                            // Parse create bucket error for better messaging
+                            let error_msg = self.parse_s3_error(&e, bucket_name, "create");
+                            BackupError::S3(error_msg)
                         })?;
                     info!("Successfully created S3 bucket '{}'", bucket_name);
                     Ok(())
                 } else {
                     // Other S3 error (invalid credentials, no access, etc.)
-                    Err(BackupError::S3(format!(
-                        "Failed to access S3 bucket '{}': {}",
-                        bucket_name,
-                        e.to_string()
-                    )))
+                    let error_msg = self.parse_s3_error(&e, bucket_name, "access");
+                    Err(BackupError::S3(error_msg))
                 }
             }
         }
+    }
+
+    /// Parse S3 SDK errors and provide user-friendly, actionable error messages
+    fn parse_s3_error<E>(&self, error: &E, bucket_name: &str, operation: &str) -> String
+    where
+        E: std::error::Error + std::fmt::Display,
+    {
+        let error_str = error.to_string();
+
+        // Check for common error patterns and provide actionable guidance
+
+        // Connection/Network errors
+        if error_str.contains("ConnectorError")
+            || error_str.contains("connection")
+            || error_str.contains("ConnectionRefused")
+            || error_str.contains("tcp connect error")
+        {
+            return format!(
+                "Unable to connect to S3 endpoint for bucket '{}'. \
+                Please verify:\n\
+                • The endpoint URL is correct and reachable\n\
+                • Network/firewall allows connections to the S3 service\n\
+                • The S3 service is running (for MinIO/LocalStack)\n\
+                Technical details: {}",
+                bucket_name, error_str
+            );
+        }
+
+        // DNS resolution errors
+        if error_str.contains("dns error")
+            || error_str.contains("failed to lookup address")
+            || error_str.contains("Name or service not known")
+        {
+            return format!(
+                "Failed to resolve S3 endpoint hostname for bucket '{}'. \
+                Please verify:\n\
+                • The endpoint URL is correct\n\
+                • DNS is properly configured\n\
+                • The hostname is valid and resolvable\n\
+                Technical details: {}",
+                bucket_name, error_str
+            );
+        }
+
+        // Timeout errors
+        if error_str.contains("timeout") || error_str.contains("timed out") {
+            return format!(
+                "Connection to S3 endpoint timed out for bucket '{}'. \
+                Please verify:\n\
+                • The S3 service is running and responsive\n\
+                • Network latency is acceptable\n\
+                • Firewall rules allow connections\n\
+                Technical details: {}",
+                bucket_name, error_str
+            );
+        }
+
+        // Authentication errors
+        if error_str.contains("InvalidAccessKeyId")
+            || error_str.contains("SignatureDoesNotMatch")
+            || error_str.contains("InvalidSecurity")
+        {
+            return format!(
+                "Authentication failed for bucket '{}'. \
+                Please verify:\n\
+                • Access Key ID is correct\n\
+                • Secret Access Key is correct\n\
+                • Credentials have not expired\n\
+                • The credentials match the S3 service configuration\n\
+                Technical details: {}",
+                bucket_name, error_str
+            );
+        }
+
+        // Permission/Authorization errors
+        if error_str.contains("AccessDenied")
+            || error_str.contains("Forbidden")
+            || error_str.contains("403")
+        {
+            return format!(
+                "Access denied when trying to {} bucket '{}'. \
+                Please verify:\n\
+                • The credentials have sufficient permissions\n\
+                • The bucket exists and you have access to it\n\
+                • IAM policies allow the required S3 operations\n\
+                • Bucket policies do not restrict access\n\
+                Technical details: {}",
+                operation, bucket_name, error_str
+            );
+        }
+
+        // Bucket already exists (from another account)
+        if error_str.contains("BucketAlreadyExists") {
+            return format!(
+                "Bucket '{}' already exists in another account or region. \
+                Please:\n\
+                • Choose a different bucket name (bucket names must be globally unique)\n\
+                • Or verify you have access to this existing bucket\n\
+                Technical details: {}",
+                bucket_name, error_str
+            );
+        }
+
+        // Region mismatch
+        if error_str.contains("AuthorizationHeaderMalformed") || error_str.contains("region") {
+            return format!(
+                "Region configuration issue for bucket '{}'. \
+                Please verify:\n\
+                • The region is correctly specified\n\
+                • The bucket exists in the specified region\n\
+                • For MinIO/LocalStack, use a valid region (e.g., 'us-east-1')\n\
+                Technical details: {}",
+                bucket_name, error_str
+            );
+        }
+
+        // Invalid bucket name
+        if error_str.contains("InvalidBucketName") {
+            return format!(
+                "Invalid bucket name '{}'. \
+                Bucket names must:\n\
+                • Be between 3 and 63 characters long\n\
+                • Contain only lowercase letters, numbers, dots (.), and hyphens (-)\n\
+                • Begin and end with a letter or number\n\
+                • Not be formatted as an IP address\n\
+                Technical details: {}",
+                bucket_name, error_str
+            );
+        }
+
+        // SSL/TLS errors
+        if error_str.contains("ssl")
+            || error_str.contains("tls")
+            || error_str.contains("certificate")
+        {
+            return format!(
+                "SSL/TLS error when connecting to S3 for bucket '{}'. \
+                Please verify:\n\
+                • The endpoint URL scheme matches the service (http:// for local, https:// for AWS)\n\
+                • SSL certificates are valid (for custom endpoints)\n\
+                • For local development, ensure HTTP is configured correctly\n\
+                Technical details: {}",
+                bucket_name, error_str
+            );
+        }
+
+        // Generic S3 service error
+        if error_str.contains("service error") {
+            return format!(
+                "S3 service error when trying to {} bucket '{}'. \
+                This may be a temporary issue. Please:\n\
+                • Verify the S3 service is operational\n\
+                • Check service status/logs\n\
+                • Try again in a few moments\n\
+                Technical details: {}",
+                operation, bucket_name, error_str
+            );
+        }
+
+        // Default: return a formatted version of the error
+        format!(
+            "Failed to {} S3 bucket '{}': {}\n\
+            \n\
+            Please verify your S3 configuration:\n\
+            • Endpoint URL is correct\n\
+            • Access credentials are valid\n\
+            • Region is correctly specified\n\
+            • Bucket name is valid\n\
+            • Network connectivity to S3 service",
+            operation, bucket_name, error_str
+        )
     }
 
     async fn upload_backup(
@@ -1662,10 +1840,24 @@ impl BackupService {
             active.bucket_path = Set(bucket_path);
         }
         if let Some(access_key_id) = request.access_key_id {
-            active.access_key_id = Set(access_key_id);
+            // Encrypt access key before storing
+            let encrypted_access_key = self
+                .encryption_service
+                .encrypt_string(&access_key_id)
+                .map_err(|e| {
+                    BackupError::Internal(format!("Failed to encrypt access key: {}", e))
+                })?;
+            active.access_key_id = Set(encrypted_access_key);
         }
         if let Some(secret_key) = request.secret_key {
-            active.secret_key = Set(secret_key);
+            // Encrypt secret key before storing
+            let encrypted_secret_key = self
+                .encryption_service
+                .encrypt_string(&secret_key)
+                .map_err(|e| {
+                    BackupError::Internal(format!("Failed to encrypt secret key: {}", e))
+                })?;
+            active.secret_key = Set(encrypted_secret_key);
         }
         if let Some(region) = request.region {
             active.region = Set(region);
@@ -1787,7 +1979,7 @@ impl BackupService {
                 "created_at": backup.started_at.to_rfc3339(),
                 "size_bytes": backup.size_bytes,
                 "location": backup.s3_location.clone(),
-                "metadata_location": backup.s3_location.replace("backup.sqlite.gz", "metadata.json")
+                "metadata_location": backup.s3_location.replace("backup.postgresql.gz", "metadata.json")
             }));
         }
         index["last_updated"] = json!(Utc::now().to_rfc3339());
@@ -1936,6 +2128,7 @@ impl BackupService {
             .get_service_config(service_id)
             .await
             .map_err(|e| BackupError::ExternalService(e.to_string()))?;
+
         // Perform the backup
         let backup_location = service_instance
             .backup_to_s3(
