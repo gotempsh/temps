@@ -29,6 +29,8 @@ sea-orm = { workspace = true }
 redis = { version = "0.28.2", features = ["tokio-comp", "connection-manager"] }
 mongodb = "3.3.0"
 aws-sdk-s3 = { workspace = true }
+aws-smithy-runtime = "1.9"
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 chrono = { workspace = true }
@@ -49,3 +51,4 @@ urlencoding = "2.1"
 [dev-dependencies]
 tokio-test = "0.4"
 testcontainers = { workspace = true }
+hyper = { version = "1", features = ["client", "http1", "http2"] }

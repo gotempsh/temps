@@ -162,8 +162,11 @@ rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "std",
     "tls12",
-    "logging"
+    "logging",
+    "aws_lc_rs"
 ] }
+rustls-platform-verifier = "0.5"
+webpki-roots = "0.26"
 
 # ============================================================================
 # Reverse Proxy (Pingora)
@@ -178,7 +181,7 @@ prometheus = "0.14"
 # ============================================================================
 # Cloud Storage (S3/MinIO)
 aws-sdk-s3 = "1.106.0"
-
+aws-config = { version = "1.5", features = ["rustls", "rt-tokio"] }
 # Caching (Redis)
 redis = { version = "0.28.2", features = ["tokio-comp", "connection-manager"] }
 

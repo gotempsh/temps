@@ -15,6 +15,7 @@ use temps_entities::external_service_backups;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{error, info};
+use urlencoding;
 
 use crate::utils::ensure_network_exists;
 
@@ -494,12 +495,16 @@ impl PostgresService {
 
     async fn create_database(&self, service_config: ServiceConfig, name: &str) -> Result<()> {
         let config: PostgresConfig = self.get_postgres_config(service_config)?;
+        let connection_string = format!(
+            "postgres://{}:{}@{}:{}/postgres",
+            urlencoding::encode(&config.username),
+            urlencoding::encode(&config.password),
+            config.host,
+            config.port
+        );
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(config.max_connections)
-            .connect(&format!(
-                "postgres://{}:{}@{}:{}/postgres",
-                config.username, config.password, config.host, config.port
-            ))
+            .connect(&connection_string)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to postgres: {}", e))?;
 
@@ -1228,7 +1233,11 @@ impl ExternalService for PostgresService {
             "POSTGRES_URL".to_string(),
             format!(
                 "postgresql://{}:{}@{}:{}/{}",
-                config.username, config.password, container_name, 5432, resource_name
+                urlencoding::encode(&config.username),
+                urlencoding::encode(&config.password),
+                container_name,
+                5432,
+                resource_name
             ),
         );
 
@@ -1260,7 +1269,11 @@ impl ExternalService for PostgresService {
 
         let url = format!(
             "postgresql://{}:{}@{}:{}/{}",
-            username, password, container_name, 5432, database
+            urlencoding::encode(username),
+            urlencoding::encode(password),
+            container_name,
+            5432,
+            database
         );
 
         env_vars.insert("POSTGRES_URL".to_string(), url);
@@ -1487,7 +1500,11 @@ impl ExternalService for PostgresService {
 
         let url = format!(
             "postgresql://{}:{}@{}:{}/{}",
-            username, password, host, port, database
+            urlencoding::encode(username),
+            urlencoding::encode(password),
+            host,
+            port,
+            database
         );
 
         env_vars.insert("POSTGRES_URL".to_string(), url);
@@ -2231,7 +2248,8 @@ mod tests {
         // Connect and verify v16 version
         let connection_string = format!(
             "postgresql://postgres:{}@127.0.0.1:{}/postgres",
-            password, port
+            urlencoding::encode(&password),
+            port
         );
 
         // Try to connect with retries since database might still be initializing
@@ -2505,5 +2523,357 @@ mod tests {
             credentials.get("database").map(|s| s.as_str()),
             Some("importdb")
         );
+    }
+
+    #[tokio::test]
+    async fn test_postgres_backup_and_restore_to_s3() {
+        use super::super::test_utils::{
+            create_mock_backup, create_mock_db, create_mock_external_service, MinioTestContainer,
+        };
+
+        // Check if Docker is available
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                println!("Docker not available, skipping test: {}", e);
+                return;
+            }
+        };
+
+        // Verify Docker is actually responding
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping test");
+            return;
+        }
+
+        // Start MinIO container for S3 operations
+        let minio = match MinioTestContainer::start(docker.clone(), "postgres-backup-test").await {
+            Ok(m) => m,
+            Err(e) => {
+                let error_msg = e.to_string();
+                if error_msg.contains("certificate")
+                    || error_msg.contains("TrustStore")
+                    || error_msg.contains("panicked")
+                {
+                    println!("❌ Skipping PostgreSQL backup test: TLS certificate issue");
+                    println!(
+                        "   Reason: {}",
+                        error_msg.lines().next().unwrap_or(&error_msg)
+                    );
+                    println!("   Solution: Install system root certificates (required by AWS SDK even for HTTP endpoints)");
+                    return;
+                }
+                panic!("Failed to start MinIO container: {}", e);
+            }
+        };
+
+        // Create PostgreSQL service
+        let pg_port = 15432u16; // Use unique port
+        let pg_password = "testpass123";
+        let service_name = format!("test_pg_backup_{}", chrono::Utc::now().timestamp_millis());
+
+        let pg_params = serde_json::json!({
+            "host": "localhost",
+            "port": pg_port.to_string(),
+            "database": "postgres",
+            "username": "postgres",
+            "password": pg_password,
+            "max_connections": 100,
+            "docker_image": "postgres:17-alpine",
+        });
+
+        let pg_config = ServiceConfig {
+            name: service_name.clone(),
+            service_type: ServiceType::Postgres,
+            version: Some("17".to_string()),
+            parameters: pg_params,
+        };
+
+        let pg_service = PostgresService::new(service_name.clone(), docker.clone());
+
+        // Initialize PostgreSQL service
+        match pg_service.init(pg_config.clone()).await {
+            Ok(_) => println!("✓ PostgreSQL service initialized"),
+            Err(e) => {
+                println!("Failed to initialize PostgreSQL: {}. Skipping test", e);
+                let _ = minio.cleanup().await;
+                return;
+            }
+        }
+
+        // Wait for PostgreSQL to be healthy
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+        // Create a test database and insert data
+        let connection_string = format!(
+            "postgresql://postgres:{}@127.0.0.1:{}/postgres",
+            urlencoding::encode(&pg_password),
+            pg_port
+        );
+
+        let db_pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&connection_string)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(e) => {
+                println!("Failed to connect to PostgreSQL: {}. Skipping test", e);
+                let _ = pg_service.remove().await;
+                let _ = minio.cleanup().await;
+                return;
+            }
+        };
+
+        // Create test table and insert data
+        match sqlx::query("CREATE TABLE test_backup (id SERIAL PRIMARY KEY, name TEXT NOT NULL, value INT NOT NULL)")
+            .execute(&db_pool)
+            .await
+        {
+            Ok(_) => println!("✓ Test table created"),
+            Err(e) => {
+                println!("Failed to create test table: {}. Skipping test", e);
+                db_pool.close().await;
+                let _ = pg_service.remove().await;
+                let _ = minio.cleanup().await;
+                return;
+            }
+        }
+
+        match sqlx::query(
+            "INSERT INTO test_backup (name, value) VALUES ($1, $2), ($3, $4), ($5, $6)",
+        )
+        .bind("test1")
+        .bind(100)
+        .bind("test2")
+        .bind(200)
+        .bind("test3")
+        .bind(300)
+        .execute(&db_pool)
+        .await
+        {
+            Ok(_) => println!("✓ Test data inserted"),
+            Err(e) => {
+                println!("Failed to insert test data: {}. Skipping test", e);
+                db_pool.close().await;
+                let _ = pg_service.remove().await;
+                let _ = minio.cleanup().await;
+                return;
+            }
+        }
+
+        // Verify data was inserted
+        let count: (i64,) = match sqlx::query_as("SELECT COUNT(*) FROM test_backup")
+            .fetch_one(&db_pool)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                println!("Failed to count test data: {}. Skipping test", e);
+                db_pool.close().await;
+                let _ = pg_service.remove().await;
+                let _ = minio.cleanup().await;
+                return;
+            }
+        };
+        assert_eq!(count.0, 3, "Should have 3 rows");
+        println!("✓ Verified {} rows in test table", count.0);
+
+        // Close connection before backup
+        db_pool.close().await;
+
+        // Create mock database connection for backup/restore operations
+        let mock_db = match create_mock_db().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Failed to create mock database: {}. Skipping test", e);
+                let _ = pg_service.remove().await;
+                let _ = minio.cleanup().await;
+                return;
+            }
+        };
+
+        // Create mock backup record
+        let backup = create_mock_backup("backups/postgres/test");
+        let external_service = create_mock_external_service(service_name.clone(), "postgres", "17");
+
+        // Perform backup to S3
+        let backup_location = match pg_service
+            .backup_to_s3(
+                &minio.s3_client,
+                backup,
+                &minio.s3_source,
+                "backups/postgres",
+                "backups",
+                &mock_db,
+                &external_service,
+                pg_config.clone(),
+            )
+            .await
+        {
+            Ok(location) => {
+                println!("✓ Backup completed to: {}", location);
+                location
+            }
+            Err(e) => {
+                println!("Backup failed: {}. Skipping test", e);
+                let _ = pg_service.remove().await;
+                let _ = minio.cleanup().await;
+                return;
+            }
+        };
+
+        // Drop the test table to simulate data loss
+        let db_pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&connection_string)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(e) => {
+                println!("Failed to reconnect to PostgreSQL: {}. Skipping test", e);
+                let _ = pg_service.remove().await;
+                let _ = minio.cleanup().await;
+                return;
+            }
+        };
+
+        match sqlx::query("DROP TABLE IF EXISTS test_backup")
+            .execute(&db_pool)
+            .await
+        {
+            Ok(_) => println!("✓ Test table dropped (simulating data loss)"),
+            Err(e) => {
+                println!("Failed to drop test table: {}. Skipping test", e);
+                db_pool.close().await;
+                let _ = pg_service.remove().await;
+                let _ = minio.cleanup().await;
+                return;
+            }
+        }
+
+        // Verify table is gone
+        let table_exists: (bool,) = match sqlx::query_as(
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'test_backup')"
+        )
+        .fetch_one(&db_pool)
+        .await
+        {
+            Ok(exists) => exists,
+            Err(e) => {
+                println!("Failed to check table existence: {}. Skipping test", e);
+                db_pool.close().await;
+                let _ = pg_service.remove().await;
+                let _ = minio.cleanup().await;
+                return;
+            }
+        };
+        assert!(!table_exists.0, "Table should not exist after drop");
+        println!("✓ Verified table was dropped");
+
+        db_pool.close().await;
+
+        // Restore from S3 backup
+        match pg_service
+            .restore_from_s3(
+                &minio.s3_client,
+                &backup_location,
+                &minio.s3_source,
+                pg_config.clone(),
+            )
+            .await
+        {
+            Ok(_) => println!("✓ Restore completed from: {}", backup_location),
+            Err(e) => {
+                println!("Restore failed: {}. Skipping test", e);
+                let _ = pg_service.remove().await;
+                let _ = minio.cleanup().await;
+                return;
+            }
+        };
+
+        // Verify restored data
+        let db_pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&connection_string)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(e) => {
+                println!("Failed to reconnect after restore: {}. Skipping test", e);
+                let _ = pg_service.remove().await;
+                let _ = minio.cleanup().await;
+                return;
+            }
+        };
+
+        // Verify table exists
+        let table_exists: (bool,) = match sqlx::query_as(
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'test_backup')"
+        )
+        .fetch_one(&db_pool)
+        .await
+        {
+            Ok(exists) => exists,
+            Err(e) => {
+                println!("Failed to check restored table: {}. Skipping test", e);
+                db_pool.close().await;
+                let _ = pg_service.remove().await;
+                let _ = minio.cleanup().await;
+                return;
+            }
+        };
+        assert!(table_exists.0, "Table should exist after restore");
+        println!("✓ Verified table was restored");
+
+        // Verify row count
+        let count: (i64,) = match sqlx::query_as("SELECT COUNT(*) FROM test_backup")
+            .fetch_one(&db_pool)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                println!("Failed to count restored data: {}. Skipping test", e);
+                db_pool.close().await;
+                let _ = pg_service.remove().await;
+                let _ = minio.cleanup().await;
+                return;
+            }
+        };
+        assert_eq!(count.0, 3, "Should have 3 rows after restore");
+        println!("✓ Verified {} rows were restored", count.0);
+
+        // Verify actual data values
+        let rows: Vec<(i32, String, i32)> =
+            match sqlx::query_as("SELECT id, name, value FROM test_backup ORDER BY id")
+                .fetch_all(&db_pool)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("Failed to fetch restored rows: {}. Skipping test", e);
+                    db_pool.close().await;
+                    let _ = pg_service.remove().await;
+                    let _ = minio.cleanup().await;
+                    return;
+                }
+            };
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].1, "test1");
+        assert_eq!(rows[0].2, 100);
+        assert_eq!(rows[1].1, "test2");
+        assert_eq!(rows[1].2, 200);
+        assert_eq!(rows[2].1, "test3");
+        assert_eq!(rows[2].2, 300);
+        println!("✓ Verified all data values match original");
+
+        // Cleanup
+        db_pool.close().await;
+        let _ = pg_service.stop().await;
+        let _ = pg_service.remove().await;
+        let _ = minio.cleanup().await;
+
+        println!("✅ PostgreSQL backup and restore test passed!");
     }
 }

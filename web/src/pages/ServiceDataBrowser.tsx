@@ -199,7 +199,10 @@ export function ServiceDataBrowser() {
       // If level not found, use the last level configuration
       const lastLevel =
         explorerSupport.hierarchy[explorerSupport.hierarchy.length - 1]
-      console.warn(`Hierarchy level ${level} not found, using last level:`, lastLevel)
+      console.warn(
+        `Hierarchy level ${level} not found, using last level:`,
+        lastLevel
+      )
       return {
         can_list_containers: lastLevel.can_list_containers,
         can_list_entities: lastLevel.can_list_entities,
@@ -334,7 +337,8 @@ export function ServiceDataBrowser() {
           container.can_contain_containers ?? hierarchyInfo.can_list_containers,
         canContainEntities:
           container.can_contain_entities ?? hierarchyInfo.can_list_entities,
-        entityCountHint: (container.entity_count_hint as 'small' | 'large' | null) || null,
+        entityCountHint:
+          (container.entity_count_hint as 'small' | 'large' | null) || null,
       }))
       setTreeNodes(nodes)
     }
@@ -487,7 +491,9 @@ export function ServiceDataBrowser() {
 
         crumbs.push({
           label: segment,
-          href: isLast ? '' : `/storage/${id}/browse?path=${encodeURIComponent(accumulatedPath)}`,
+          href: isLast
+            ? ''
+            : `/storage/${id}/browse?path=${encodeURIComponent(accumulatedPath)}`,
         })
       })
     }
@@ -578,7 +584,10 @@ export function ServiceDataBrowser() {
           const containersResponse = await listContainersAtPath({
             path: { service_id: parseInt(id!), path: nodePath },
           })
-          if (containersResponse.data && Array.isArray(containersResponse.data)) {
+          if (
+            containersResponse.data &&
+            Array.isArray(containersResponse.data)
+          ) {
             containersData = containersResponse.data
           }
         } catch (error: any) {
@@ -601,7 +610,10 @@ export function ServiceDataBrowser() {
             if (Array.isArray(entitiesResponse.data)) {
               // Legacy: Direct array response
               entitiesData = entitiesResponse.data
-            } else if (entitiesResponse.data.entities && Array.isArray(entitiesResponse.data.entities)) {
+            } else if (
+              entitiesResponse.data.entities &&
+              Array.isArray(entitiesResponse.data.entities)
+            ) {
               // New: Paginated response with entities array
               entitiesData = entitiesResponse.data.entities
             }
@@ -633,7 +645,10 @@ export function ServiceDataBrowser() {
             if (shouldShowEntitiesInTable) {
               // Mark as loaded but don't add children to tree
               // Children will be displayed in ContainerEntitiesView instead
-              console.log('Skipping tree children (large entity count):', nodePath)
+              console.log(
+                'Skipping tree children (large entity count):',
+                nodePath
+              )
               return {
                 ...node,
                 isLoaded: true,
@@ -666,7 +681,8 @@ export function ServiceDataBrowser() {
                   container.can_contain_entities ??
                   childHierarchyInfo.can_list_entities,
                 entityCountHint:
-                  (container.entity_count_hint as 'small' | 'large' | null) || null,
+                  (container.entity_count_hint as 'small' | 'large' | null) ||
+                  null,
               })
             })
 
@@ -707,11 +723,7 @@ export function ServiceDataBrowser() {
   // Handle node click
   const handleNodeClick = async (node: TreeNode) => {
     if (node.type === 'container') {
-      // Update URL params - use replace to avoid page reload
-      setSearchParams({ path: node.path }, { replace: true })
-      setPage(1)
-
-      // Find the current node state
+      // Find the current node state BEFORE updating URL
       const findNode = (nodes: TreeNode[], path: string): TreeNode | null => {
         for (const n of nodes) {
           if (n.path === path) return n
@@ -725,12 +737,25 @@ export function ServiceDataBrowser() {
 
       const currentNode = findNode(treeNodes, node.path)
 
-      // If this container can only list entities (leaf container like S3 bucket),
-      // we don't expand it in the tree - we'll show entities in the main area
+      // Check if this container is currently expanded (has loaded children)
+      const isCurrentlyExpanded = currentNode?.isExpanded || false
+      const hasLoadedChildren =
+        currentNode?.isLoaded &&
+        currentNode?.children &&
+        currentNode.children.length > 0
+
+      // If this container can only list entities (leaf container like S3 bucket)
+      // AND it's not already expanded with children, treat it as a leaf
       const isLeafContainer =
-        node.canContainEntities && !node.canContainContainers
+        node.canContainEntities &&
+        !node.canContainContainers &&
+        !hasLoadedChildren
 
       if (isLeafContainer) {
+        // Update URL params - use replace to avoid page reload
+        setSearchParams({ path: node.path }, { replace: true })
+        setPage(1)
+
         // Don't expand in tree, just select it
         // The main content area will show the entities table via ContainerEntitiesView
         // Close sidebar on mobile
@@ -740,32 +765,64 @@ export function ServiceDataBrowser() {
         return
       }
 
-      // For containers that can contain other containers, handle expansion
-      if (node.canContainContainers) {
-        const isCurrentlyExpanded = currentNode?.isExpanded || false
-        const needsLoading =
-          currentNode && !currentNode.isLoaded && !isCurrentlyExpanded
+      // For containers that can contain other containers OR already have children, handle expansion
+      if (node.canContainContainers || hasLoadedChildren) {
+        const isAlreadySelected = selectedPath === node.path && !selectedEntity
 
-        // Toggle expansion state
-        const updateNodes = (nodes: TreeNode[]): TreeNode[] => {
-          return nodes.map((n) => {
-            if (n.path === node.path) {
-              return { ...n, isExpanded: !isCurrentlyExpanded }
-            } else if (node.path.startsWith(n.path + '/')) {
-              return {
-                ...n,
-                children: n.children ? updateNodes(n.children) : [],
+        // If clicking the same selected container, just toggle expansion
+        // If clicking a different container, select it AND expand if needed
+        if (isAlreadySelected) {
+          // Just toggle expansion without updating selection
+          const updateNodes = (nodes: TreeNode[]): TreeNode[] => {
+            return nodes.map((n) => {
+              if (n.path === node.path) {
+                return { ...n, isExpanded: !isCurrentlyExpanded }
+              } else if (node.path.startsWith(n.path + '/')) {
+                return {
+                  ...n,
+                  children: n.children ? updateNodes(n.children) : [],
+                }
               }
+              return n
+            })
+          }
+
+          setTreeNodes((prevNodes) => updateNodes(prevNodes))
+
+          // Load children if expanding for the first time
+          const needsLoading =
+            currentNode && !currentNode.isLoaded && !isCurrentlyExpanded
+          if (needsLoading) {
+            await loadNodeChildren(node.path)
+          }
+        } else {
+          // Different container - select it and expand if not already expanded
+          setSearchParams({ path: node.path }, { replace: true })
+          setPage(1)
+
+          // If not currently expanded, expand it
+          if (!isCurrentlyExpanded) {
+            const updateNodes = (nodes: TreeNode[]): TreeNode[] => {
+              return nodes.map((n) => {
+                if (n.path === node.path) {
+                  return { ...n, isExpanded: true }
+                } else if (node.path.startsWith(n.path + '/')) {
+                  return {
+                    ...n,
+                    children: n.children ? updateNodes(n.children) : [],
+                  }
+                }
+                return n
+              })
             }
-            return n
-          })
-        }
 
-        setTreeNodes((prevNodes) => updateNodes(prevNodes))
+            setTreeNodes((prevNodes) => updateNodes(prevNodes))
 
-        // Load children if expanding for the first time
-        if (needsLoading) {
-          await loadNodeChildren(node.path)
+            // Load children if not loaded
+            if (!currentNode?.isLoaded) {
+              await loadNodeChildren(node.path)
+            }
+          }
         }
       }
     } else if (node.type === 'entity') {
@@ -794,14 +851,18 @@ export function ServiceDataBrowser() {
     const filtered: TreeNode[] = []
     const lowerSearch = searchText.toLowerCase()
 
-    // Helper function to check if node or any descendant matches
-    const hasMatchInTree = (node: TreeNode): boolean => {
+    // Helper function to check if THIS node matches (not descendants)
+    const nodeMatches = (node: TreeNode): boolean => {
       const matchesName = node.name.toLowerCase().includes(lowerSearch)
       const matchesType =
-        node.containerType?.toLowerCase().includes(lowerSearch) ||
-        node.entityType?.toLowerCase().includes(lowerSearch)
+        (node.containerType?.toLowerCase().includes(lowerSearch) ?? false) ||
+        (node.entityType?.toLowerCase().includes(lowerSearch) ?? false)
+      return matchesName || matchesType
+    }
 
-      if (matchesName || matchesType) return true
+    // Helper function to check if node or any descendant matches
+    const hasMatchInTree = (node: TreeNode): boolean => {
+      if (nodeMatches(node)) return true
 
       if (node.children) {
         return node.children.some((child) => hasMatchInTree(child))
@@ -813,18 +874,31 @@ export function ServiceDataBrowser() {
     for (const node of nodes) {
       // Check if this node or any descendant matches
       if (hasMatchInTree(node)) {
-        // Filter children recursively
-        const filteredChildren = node.children
-          ? filterNodes(node.children, searchText)
-          : []
+        // If THIS node matches directly, show ALL its children (no filtering)
+        // If only descendants match, filter children recursively
+        const thisNodeMatches = nodeMatches(node)
+
+        let childrenToShow: TreeNode[]
+        if (thisNodeMatches && node.children) {
+          // Show ALL children when container itself matches
+          childrenToShow = node.children
+        } else if (node.children) {
+          // Filter children recursively when only descendants match
+          childrenToShow = filterNodes(node.children, searchText)
+        } else {
+          childrenToShow = []
+        }
 
         // Include this node (even if it doesn't match) if it has matching descendants
         // This preserves the full path to matching items
         filtered.push({
           ...node,
-          children: filteredChildren,
-          // Auto-expand if it has matching children to show the full tree
-          isExpanded: filteredChildren.length > 0 ? true : node.isExpanded,
+          children: childrenToShow,
+          // Auto-expand if it matches directly OR has matching children
+          isExpanded:
+            thisNodeMatches || childrenToShow.length > 0
+              ? true
+              : node.isExpanded,
         })
       }
     }
@@ -1649,9 +1723,9 @@ function ContainerEntitiesView({
   formatDate: (dateString: string | undefined) => string
 }) {
   const [nextToken, setNextToken] = useState<string | null>(null)
-  const [selectedEntityForInfo, setSelectedEntityForInfo] = useState<string | null>(
-    null
-  )
+  const [selectedEntityForInfo, setSelectedEntityForInfo] = useState<
+    string | null
+  >(null)
   const pageSize = 20
 
   // Fetch entities at this container path
@@ -1722,7 +1796,11 @@ function ContainerEntitiesView({
   if (error) {
     const err = error as any
     // Extract detailed error information
-    const errorDetail = err?.detail || err?.message || err?.error?.detail || 'Failed to load entities'
+    const errorDetail =
+      err?.detail ||
+      err?.message ||
+      err?.error?.detail ||
+      'Failed to load entities'
     const errorTitle = err?.title || err?.error?.title || 'Error'
 
     console.error('ContainerEntitiesView error:', {
@@ -1778,7 +1856,13 @@ function ContainerEntitiesView({
               {pathSegments.map((segment, index) => (
                 <div key={index} className="flex items-center gap-2">
                   {index > 0 && <span>/</span>}
-                  <span className={index === pathSegments.length - 1 ? 'font-medium text-foreground' : ''}>
+                  <span
+                    className={
+                      index === pathSegments.length - 1
+                        ? 'font-medium text-foreground'
+                        : ''
+                    }
+                  >
                     {segment}
                   </span>
                 </div>
@@ -1900,7 +1984,9 @@ function ContainerEntitiesView({
                                         type: 'application/json',
                                       })
                                     } else {
-                                      throw new Error('No data received from server')
+                                      throw new Error(
+                                        'No data received from server'
+                                      )
                                     }
 
                                     const url = window.URL.createObjectURL(blob)
@@ -1912,7 +1998,10 @@ function ContainerEntitiesView({
                                     window.URL.revokeObjectURL(url)
                                     document.body.removeChild(a)
                                   } catch (error) {
-                                    console.error('Failed to download object:', error)
+                                    console.error(
+                                      'Failed to download object:',
+                                      error
+                                    )
                                   }
                                 }}
                                 title="Download"
@@ -2012,7 +2101,10 @@ function ContainerEntitiesView({
                               {Object.entries(
                                 entityInfo.metadata as Record<string, any>
                               ).map(([key, value]) => (
-                                <tr key={key} className="border-b last:border-0">
+                                <tr
+                                  key={key}
+                                  className="border-b last:border-0"
+                                >
                                   <td className="p-3 font-medium bg-muted/50 w-1/3">
                                     {key}
                                   </td>
@@ -2039,8 +2131,12 @@ function ContainerEntitiesView({
                           <table className="w-full text-sm">
                             <thead>
                               <tr className="border-b bg-muted/50">
-                                <th className="text-left p-3 font-medium">Name</th>
-                                <th className="text-left p-3 font-medium">Type</th>
+                                <th className="text-left p-3 font-medium">
+                                  Name
+                                </th>
+                                <th className="text-left p-3 font-medium">
+                                  Type
+                                </th>
                                 <th className="text-left p-3 font-medium">
                                   Nullable
                                 </th>
@@ -2048,11 +2144,16 @@ function ContainerEntitiesView({
                             </thead>
                             <tbody>
                               {entityInfo.fields.map((field) => (
-                                <tr key={field.name} className="border-b last:border-0">
+                                <tr
+                                  key={field.name}
+                                  className="border-b last:border-0"
+                                >
                                   <td className="p-3 font-mono text-xs">
                                     {field.name}
                                   </td>
-                                  <td className="p-3 text-xs">{field.field_type}</td>
+                                  <td className="p-3 text-xs">
+                                    {field.field_type}
+                                  </td>
                                   <td className="p-3 text-xs">
                                     {field.nullable ? 'Yes' : 'No'}
                                   </td>

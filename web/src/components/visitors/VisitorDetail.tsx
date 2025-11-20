@@ -13,6 +13,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { CopyButton } from '@/components/ui/copy-button'
 import {
   Select,
   SelectContent,
@@ -41,9 +42,9 @@ import {
   ChevronRight,
   Clock,
   Globe as MapPinIcon,
-  MousePointer,
+  Monitor,
   PlayCircle,
-  TrendingUp,
+  Smartphone,
   Users as UserIcon,
 } from 'lucide-react'
 import * as React from 'react'
@@ -52,6 +53,112 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 interface VisitorDetailProps {
   project: ProjectResponse
   visitorId: number
+}
+
+// Helper function to parse user agent for browser/OS/device info
+function parseUserAgent(userAgent: string | null | undefined) {
+  if (!userAgent) {
+    return {
+      browser: 'Unknown',
+      os: 'Unknown',
+      device: 'Unknown',
+      deviceType: 'desktop' as const,
+    }
+  }
+
+  // Detect browser
+  let browser = 'Unknown'
+  if (userAgent.includes('Firefox')) browser = 'Firefox'
+  else if (userAgent.includes('Edg/')) browser = 'Edge'
+  else if (userAgent.includes('Chrome')) browser = 'Chrome'
+  else if (userAgent.includes('Safari') && !userAgent.includes('Chrome'))
+    browser = 'Safari'
+  else if (userAgent.includes('Opera') || userAgent.includes('OPR'))
+    browser = 'Opera'
+
+  // Detect OS
+  let os = 'Unknown'
+  if (userAgent.includes('Windows')) os = 'Windows'
+  else if (userAgent.includes('Mac OS X')) {
+    const match = userAgent.match(/Mac OS X ([\d_]+)/)
+    os = match ? `macOS ${match[1].replace(/_/g, '.')}` : 'macOS'
+  } else if (userAgent.includes('Linux')) os = 'Linux'
+  else if (userAgent.includes('Android')) os = 'Android'
+  else if (userAgent.includes('iOS') || userAgent.includes('iPhone')) os = 'iOS'
+
+  // Detect device type
+  let deviceType: 'mobile' | 'tablet' | 'desktop' = 'desktop'
+  let device = 'Desktop'
+
+  if (
+    userAgent.includes('Mobile') ||
+    userAgent.includes('iPhone') ||
+    userAgent.includes('Android')
+  ) {
+    deviceType = 'mobile'
+    device = 'Mobile'
+  } else if (userAgent.includes('iPad') || userAgent.includes('Tablet')) {
+    deviceType = 'tablet'
+    device = 'Tablet'
+  }
+
+  return { browser, os, device, deviceType }
+}
+
+// Component for displaying browser and device information
+function BrowserDeviceInfo({
+  userAgent,
+}: {
+  userAgent: string | null | undefined
+}) {
+  const userAgentInfo = parseUserAgent(userAgent)
+
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      {/* Browser Card */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardDescription className="flex items-center gap-1.5">
+            <Monitor className="h-4 w-4" />
+            Browser
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="text-lg font-semibold">{userAgentInfo.browser}</div>
+        </CardContent>
+      </Card>
+
+      {/* Operating System Card */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardDescription className="flex items-center gap-1.5">
+            <Monitor className="h-4 w-4" />
+            Operating System
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="text-lg font-semibold">{userAgentInfo.os}</div>
+        </CardContent>
+      </Card>
+
+      {/* Device Type Card */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardDescription className="flex items-center gap-1.5">
+            {userAgentInfo.deviceType === 'mobile' ? (
+              <Smartphone className="h-4 w-4" />
+            ) : (
+              <Monitor className="h-4 w-4" />
+            )}
+            Device
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="text-lg font-semibold">{userAgentInfo.device}</div>
+        </CardContent>
+      </Card>
+    </div>
+  )
 }
 
 export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
@@ -206,139 +313,84 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
         </Card>
       ) : visitorDetails ? (
         <>
-          {/* Visitor Info Cards */}
-          <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-4">
+          {/* Visitor Info Cards - Redesigned with better layout */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+            {/* Location Card */}
             <Card>
-              <CardHeader className="pb-2">
-                <CardDescription className="flex items-center gap-1">
-                  <MapPinIcon className="h-3 w-3" />
+              <CardHeader className="pb-3">
+                <CardDescription className="flex items-center gap-1.5">
+                  <MapPinIcon className="h-4 w-4" />
                   Location
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <div className="font-semibold">
+                <div className="text-xl font-semibold">
                   {visitorDetails?.country || 'Unknown'}
                 </div>
                 {visitorDetails?.city && (
-                  <div className="text-sm text-muted-foreground">
+                  <div className="text-sm text-muted-foreground mt-1">
                     {visitorDetails.city}
                   </div>
                 )}
               </CardContent>
             </Card>
 
+            {/* First Seen Card */}
             <Card>
-              <CardHeader className="pb-2">
-                <CardDescription className="flex items-center gap-1">
-                  <Calendar className="h-3 w-3" />
+              <CardHeader className="pb-3">
+                <CardDescription className="flex items-center gap-1.5">
+                  <Calendar className="h-4 w-4" />
                   First Seen
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <div className="font-semibold text-sm">
+                <div className="text-xl font-semibold">
                   {visitorDetails &&
                     format(new Date(visitorDetails.first_seen), 'MMM d, yyyy')}
                 </div>
-                <div className="text-xs text-muted-foreground">
+                <div className="text-sm text-muted-foreground mt-1">
                   {visitorDetails &&
                     format(new Date(visitorDetails.first_seen), 'HH:mm:ss')}
                 </div>
               </CardContent>
             </Card>
 
+            {/* Last Activity Card */}
             <Card>
-              <CardHeader className="pb-2">
-                <CardDescription className="flex items-center gap-1">
-                  <Clock className="h-3 w-3" />
+              <CardHeader className="pb-3">
+                <CardDescription className="flex items-center gap-1.5">
+                  <Clock className="h-4 w-4" />
                   Last Activity
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <div className="font-semibold text-sm">
+                <div className="text-xl font-semibold">
                   {visitorDetails &&
                     format(new Date(visitorDetails.last_seen), 'MMM d, yyyy')}
                 </div>
-                <div className="text-xs text-muted-foreground">
+                <div className="text-sm text-muted-foreground mt-1">
                   {visitorDetails &&
                     format(new Date(visitorDetails.last_seen), 'HH:mm:ss')}
                 </div>
               </CardContent>
             </Card>
 
+            {/* Type Card */}
             <Card>
-              <CardHeader className="pb-2">
-                <CardDescription className="flex items-center gap-1">
-                  <Activity className="h-3 w-3" />
-                  Sessions
+              <CardHeader className="pb-3">
+                <CardDescription className="flex items-center gap-1.5">
+                  {visitorDetails?.is_crawler ? (
+                    <Bug className="h-4 w-4" />
+                  ) : (
+                    <UserIcon className="h-4 w-4" />
+                  )}
+                  Visitor Type
                 </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="font-semibold text-2xl">
-                  {visitorDetails?.total_sessions}
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader className="pb-2">
-                <CardDescription className="flex items-center gap-1">
-                  <MousePointer className="h-3 w-3" />
-                  Page Views
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="font-semibold text-2xl">
-                  {visitorDetails?.total_page_views}
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader className="pb-2">
-                <CardDescription className="flex items-center gap-1">
-                  <TrendingUp className="h-3 w-3" />
-                  Engagement
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="font-semibold text-2xl">
-                  {visitorDetails?.engagement_rate.toFixed(1)}%
-                </div>
-              </CardContent>
-            </Card>
-          </div>
-
-          {/* Additional Metrics Row */}
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-            <Card>
-              <CardHeader className="pb-2">
-                <CardDescription>Total Events</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="font-semibold text-xl">
-                  {visitorDetails?.total_events}
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader className="pb-2">
-                <CardDescription>Bounce Rate</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="font-semibold text-xl">
-                  {visitorDetails?.bounce_rate.toFixed(1)}%
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader className="pb-2">
-                <CardDescription>Type</CardDescription>
               </CardHeader>
               <CardContent>
                 <Badge
                   variant={visitorDetails?.is_crawler ? 'secondary' : 'default'}
+                  className="text-base px-3 py-1"
                 >
                   {visitorDetails?.is_crawler
                     ? visitorDetails.crawler_name || 'Crawler'
@@ -346,21 +398,28 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                 </Badge>
               </CardContent>
             </Card>
-
-            <Card>
-              <CardHeader className="pb-2">
-                <CardDescription>User Agent</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div
-                  className="text-sm truncate"
-                  title={visitorDetails?.user_agent || 'Unknown'}
-                >
-                  {visitorDetails?.user_agent || 'Unknown'}
-                </div>
-              </CardContent>
-            </Card>
           </div>
+
+          {/* Browser & Device Information - New Section */}
+          <BrowserDeviceInfo userAgent={visitorDetails?.user_agent} />
+
+          {/* User Agent - Full Display with Copy */}
+          <Card>
+            <CardHeader className="pb-3">
+              <div className="flex items-center justify-between">
+                <CardTitle className="text-base">User Agent</CardTitle>
+                <CopyButton
+                  value={visitorDetails?.user_agent || ''}
+                  className="h-8 w-8 p-0 hover:bg-accent hover:text-accent-foreground rounded-md"
+                />
+              </div>
+            </CardHeader>
+            <CardContent>
+              <div className="text-sm font-mono bg-muted p-3 rounded-md break-all">
+                {visitorDetails?.user_agent || 'Unknown'}
+              </div>
+            </CardContent>
+          </Card>
 
           {/* Custom Data Section */}
           {visitorDetails?.custom_data &&
@@ -495,68 +554,122 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                 </div>
               ) : (
                 <>
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Session ID</TableHead>
-                        <TableHead>Started</TableHead>
-                        <TableHead>Duration</TableHead>
-                        <TableHead>Pages</TableHead>
-                        <TableHead>Events</TableHead>
-                        <TableHead>Entry Page</TableHead>
-                        <TableHead>Exit Page</TableHead>
-                        <TableHead>Bounce</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {sessions.sessions.map((session) => (
-                        <TableRow
-                          key={session.session_id}
-                          className="cursor-pointer hover:bg-muted/50"
-                          onClick={() =>
-                            navigate(
-                              `/projects/${project.slug}/analytics/visitors/${visitorId}/sessions/${session.session_id.toString()}`
-                            )
-                          }
-                        >
-                          <TableCell className="font-mono text-sm">
-                            {session.session_id}
-                          </TableCell>
-                          <TableCell className="text-sm">
-                            {session.started_at &&
-                            !isNaN(Date.parse(session.started_at))
-                              ? format(
-                                  new Date(session.started_at),
-                                  'MMM d, HH:mm:ss'
-                                )
-                              : '-'}
-                          </TableCell>
-                          <TableCell className="text-sm">
-                            {formatDuration(session.duration_seconds || 0)}
-                          </TableCell>
-                          <TableCell className="text-sm">
-                            {session.page_views || 0}
-                          </TableCell>
-                          <TableCell className="text-sm">
-                            {session.events_count}
-                          </TableCell>
-                          <TableCell className="text-sm max-w-[200px] truncate">
-                            {session.entry_path || '-'}
-                          </TableCell>
-                          <TableCell className="text-sm max-w-[200px] truncate">
-                            {session.exit_path || '-'}
-                          </TableCell>
-                          <TableCell>
-                            {session.is_bounced ? (
-                              <Badge variant="secondary">Yes</Badge>
-                            ) : (
-                              <Badge variant="outline">No</Badge>
-                            )}
-                          </TableCell>
+                  <div className="overflow-x-auto">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead className="w-[100px]">
+                            Session ID
+                          </TableHead>
+                          <TableHead className="w-[180px]">Started</TableHead>
+                          <TableHead className="w-[100px]">Duration</TableHead>
+                          <TableHead className="w-[80px] text-center">
+                            Pages
+                          </TableHead>
+                          <TableHead className="w-[80px] text-center">
+                            Events
+                          </TableHead>
+                          <TableHead className="min-w-[200px]">
+                            Entry Page
+                          </TableHead>
+                          <TableHead className="min-w-[200px]">
+                            Exit Page
+                          </TableHead>
+                          <TableHead className="w-[100px] text-center">
+                            Bounce
+                          </TableHead>
                         </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
+                      </TableHeader>
+                      <TableBody>
+                        {sessions.sessions.map((session) => (
+                          <TableRow
+                            key={session.session_id}
+                            className="cursor-pointer hover:bg-muted/50 transition-colors"
+                            onClick={() =>
+                              navigate(
+                                `/projects/${project.slug}/analytics/visitors/${visitorId}/sessions/${session.session_id.toString()}`
+                              )
+                            }
+                          >
+                            <TableCell className="font-mono text-xs">
+                              {session.session_id}
+                            </TableCell>
+                            <TableCell>
+                              {session.started_at &&
+                              !isNaN(Date.parse(session.started_at)) ? (
+                                <div className="flex flex-col">
+                                  <span className="text-sm font-medium">
+                                    {format(
+                                      new Date(session.started_at),
+                                      'MMM d, yyyy'
+                                    )}
+                                  </span>
+                                  <span className="text-xs text-muted-foreground">
+                                    {format(
+                                      new Date(session.started_at),
+                                      'HH:mm:ss'
+                                    )}
+                                  </span>
+                                </div>
+                              ) : (
+                                <span className="text-sm text-muted-foreground">
+                                  -
+                                </span>
+                              )}
+                            </TableCell>
+                            <TableCell className="text-sm font-medium">
+                              {formatDuration(session.duration_seconds || 0)}
+                            </TableCell>
+                            <TableCell className="text-center">
+                              <Badge variant="secondary" className="text-sm">
+                                {session.page_views || 0}
+                              </Badge>
+                            </TableCell>
+                            <TableCell className="text-center">
+                              <Badge variant="outline" className="text-sm">
+                                {session.events_count}
+                              </Badge>
+                            </TableCell>
+                            <TableCell className="max-w-[300px]">
+                              {session.entry_path ? (
+                                <div
+                                  className="text-sm truncate font-mono"
+                                  title={session.entry_path}
+                                >
+                                  {session.entry_path}
+                                </div>
+                              ) : (
+                                <span className="text-sm text-muted-foreground">
+                                  -
+                                </span>
+                              )}
+                            </TableCell>
+                            <TableCell className="max-w-[300px]">
+                              {session.exit_path ? (
+                                <div
+                                  className="text-sm truncate font-mono"
+                                  title={session.exit_path}
+                                >
+                                  {session.exit_path}
+                                </div>
+                              ) : (
+                                <span className="text-sm text-muted-foreground">
+                                  -
+                                </span>
+                              )}
+                            </TableCell>
+                            <TableCell className="text-center">
+                              {session.is_bounced ? (
+                                <Badge variant="secondary">Yes</Badge>
+                              ) : (
+                                <Badge variant="outline">No</Badge>
+                              )}
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
 
                   {/* Pagination */}
                   {totalPages > 1 && (

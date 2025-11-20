@@ -501,6 +501,7 @@ mod tests {
             performance_metrics_enabled: true,
             session_recording_enabled: false,
             replicas: 2,
+            security: None,
         };
 
         let env_config = DeploymentConfig {
@@ -513,6 +514,7 @@ mod tests {
             performance_metrics_enabled: false,
             session_recording_enabled: true, // Override
             replicas: 5,                     // Override
+            security: None,
         };
 
         let merged = project_config.merge(&env_config);
@@ -536,6 +538,7 @@ mod tests {
             memory_request: Some(128),
             memory_limit: Some(512),
             exposed_port: Some(3000),
+            security: None,
             ..Default::default()
         };
         assert!(valid_config.validate().is_ok());
@@ -543,6 +546,7 @@ mod tests {
         let invalid_cpu = DeploymentConfig {
             cpu_request: Some(2000),
             cpu_limit: Some(1000),
+            security: None,
             ..Default::default()
         };
         assert!(invalid_cpu.validate().is_err());
@@ -550,6 +554,7 @@ mod tests {
         let invalid_memory = DeploymentConfig {
             memory_request: Some(1024),
             memory_limit: Some(512),
+            security: None,
             ..Default::default()
         };
         assert!(invalid_memory.validate().is_err());
@@ -573,6 +578,7 @@ mod tests {
             performance_metrics_enabled: true,
             session_recording_enabled: false,
             replicas: 3,
+            security: None,
         };
 
         let json = serde_json::to_value(&config).unwrap();
@@ -593,6 +599,7 @@ mod tests {
             performance_metrics_enabled: true,
             session_recording_enabled: false,
             replicas: 2,
+            security: None,
         };
 
         let mut env_vars = HashMap::new();
