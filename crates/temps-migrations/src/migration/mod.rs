@@ -7,6 +7,7 @@ mod m20250205_000001_create_ip_access_control;
 mod m20250205_000002_add_attack_mode;
 mod m20250205_000003_add_projects_route_trigger;
 mod m20251115_000001_add_preview_environments_support;
+mod m20251121_000001_create_webhooks;
 
 pub struct Migrator;
 
@@ -21,6 +22,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20250205_000002_add_attack_mode::Migration),
             Box::new(m20250205_000003_add_projects_route_trigger::Migration),
             Box::new(m20251115_000001_add_preview_environments_support::Migration),
+            Box::new(m20251121_000001_create_webhooks::Migration),
         ]
     }
 }

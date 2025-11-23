@@ -959,6 +959,25 @@ export type CreateUserRequest = {
     username: string;
 };
 
+export type CreateWebhookRequestBody = {
+    /**
+     * Whether the webhook is enabled
+     */
+    enabled?: boolean | null;
+    /**
+     * Event types to subscribe to
+     */
+    events: Array<string>;
+    /**
+     * Secret for HMAC signature verification (optional)
+     */
+    secret?: string | null;
+    /**
+     * Target URL for webhook delivery
+     */
+    url: string;
+};
+
 export type CronExecutionInfo = {
     cron_id: number;
     error_message?: string | null;
@@ -1288,14 +1307,15 @@ export type DeviceCount = {
 
 /**
  * Sections that can be included in the weekly digest
+ * Note: `#[serde(default)]` allows backward compatibility when deserializing
+ * old data that may have `security` and `resources` fields instead of `projects`
  */
 export type DigestSections = {
-    deployments: boolean;
-    errors: boolean;
-    funnels: boolean;
-    performance: boolean;
-    resources: boolean;
-    security: boolean;
+    deployments?: boolean;
+    errors?: boolean;
+    funnels?: boolean;
+    performance?: boolean;
+    projects?: boolean;
 };
 
 export type DisableMfaRequest = {
@@ -1830,6 +1850,12 @@ export type EventTypeBreakdownQuery = {
     end_date: string;
     environment_id?: number | null;
     start_date: string;
+};
+
+export type EventTypeResponse = {
+    category: string;
+    description: string;
+    event_type: string;
 };
 
 export type EventTypesResponse = {
@@ -4750,6 +4776,25 @@ export type UpdateUserRequest = {
     name?: string | null;
 };
 
+export type UpdateWebhookRequestBody = {
+    /**
+     * Whether the webhook is enabled
+     */
+    enabled?: boolean | null;
+    /**
+     * Event types to subscribe to
+     */
+    events?: Array<string> | null;
+    /**
+     * Secret for HMAC signature verification
+     */
+    secret?: string | null;
+    /**
+     * Target URL for webhook delivery
+     */
+    url?: string | null;
+};
+
 export type UpgradeExternalServiceRequest = {
     /**
      * Docker image to upgrade to (e.g., "postgres:17-alpine")
@@ -5062,6 +5107,31 @@ export type VolumeMount = {
  * Volume type
  */
 export type VolumeType = 'bind' | 'volume' | 'tmpfs';
+
+export type WebhookDeliveryResponse = {
+    attempt_number: number;
+    created_at: string;
+    delivered_at?: string | null;
+    error_message?: string | null;
+    event_id: string;
+    event_type: string;
+    id: number;
+    response_body?: string | null;
+    status_code?: number | null;
+    success: boolean;
+    webhook_id: number;
+};
+
+export type WebhookResponse = {
+    created_at: string;
+    enabled: boolean;
+    events: Array<string>;
+    has_secret: boolean;
+    id: number;
+    project_id: number;
+    updated_at: string;
+    url: string;
+};
 
 /**
  * Brief descriptor for discovered workloads (used in listing)
@@ -15003,6 +15073,311 @@ export type GetUniqueCountsResponses = {
 
 export type GetUniqueCountsResponse = GetUniqueCountsResponses[keyof GetUniqueCountsResponses];
 
+export type ListWebhooksData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks';
+};
+
+export type ListWebhooksErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListWebhooksResponses = {
+    /**
+     * List of webhooks
+     */
+    200: Array<WebhookResponse>;
+};
+
+export type ListWebhooksResponse = ListWebhooksResponses[keyof ListWebhooksResponses];
+
+export type CreateWebhookData = {
+    body: CreateWebhookRequestBody;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks';
+};
+
+export type CreateWebhookErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateWebhookResponses = {
+    /**
+     * Webhook created
+     */
+    201: WebhookResponse;
+};
+
+export type CreateWebhookResponse = CreateWebhookResponses[keyof CreateWebhookResponses];
+
+export type DeleteWebhookData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks/{webhook_id}';
+};
+
+export type DeleteWebhookErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Webhook not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteWebhookResponses = {
+    /**
+     * Webhook deleted
+     */
+    204: void;
+};
+
+export type DeleteWebhookResponse = DeleteWebhookResponses[keyof DeleteWebhookResponses];
+
+export type GetWebhookData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks/{webhook_id}';
+};
+
+export type GetWebhookErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Webhook not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetWebhookResponses = {
+    /**
+     * Webhook details
+     */
+    200: WebhookResponse;
+};
+
+export type GetWebhookResponse = GetWebhookResponses[keyof GetWebhookResponses];
+
+export type UpdateWebhookData = {
+    body: UpdateWebhookRequestBody;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks/{webhook_id}';
+};
+
+export type UpdateWebhookErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Webhook not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateWebhookResponses = {
+    /**
+     * Webhook updated
+     */
+    200: WebhookResponse;
+};
+
+export type UpdateWebhookResponse = UpdateWebhookResponses[keyof UpdateWebhookResponses];
+
+export type ListDeliveriesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+    };
+    query?: {
+        /**
+         * Number of deliveries to return (default: 50)
+         */
+        limit?: number;
+    };
+    url: '/projects/{project_id}/webhooks/{webhook_id}/deliveries';
+};
+
+export type ListDeliveriesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDeliveriesResponses = {
+    /**
+     * List of deliveries
+     */
+    200: Array<WebhookDeliveryResponse>;
+};
+
+export type ListDeliveriesResponse = ListDeliveriesResponses[keyof ListDeliveriesResponses];
+
+export type RetryDeliveryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+        /**
+         * Delivery ID
+         */
+        delivery_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry';
+};
+
+export type RetryDeliveryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Delivery not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RetryDeliveryResponses = {
+    /**
+     * Delivery retried
+     */
+    200: WebhookDeliveryResponse;
+};
+
+export type RetryDeliveryResponse = RetryDeliveryResponses[keyof RetryDeliveryResponses];
+
 export type GetProxyLogsData = {
     body?: never;
     path?: never;
@@ -16609,6 +16984,22 @@ export type AddEventsResponses = {
 };
 
 export type AddEventsResponse2 = AddEventsResponses[keyof AddEventsResponses];
+
+export type ListEventTypesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/webhook-event-types';
+};
+
+export type ListEventTypesResponses = {
+    /**
+     * List of available event types
+     */
+    200: Array<EventTypeResponse>;
+};
+
+export type ListEventTypesResponse = ListEventTypesResponses[keyof ListEventTypesResponses];
 
 export type TriggerWeeklyDigestData = {
     body?: never;

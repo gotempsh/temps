@@ -8,6 +8,10 @@ import { EnvironmentVariablesSettings } from './settings/EnvironmentVariablesSet
 import { GeneralSettings } from './settings/GeneralSettings'
 import { GitSettings } from './settings/GitSettings'
 import { ProjectSecuritySettings } from './settings/ProjectSecuritySettings'
+import { WebhooksSettings } from './settings/WebhooksSettings'
+import { CreateWebhookPage } from './settings/webhooks/CreateWebhookPage'
+import { EditWebhookPage } from './settings/webhooks/EditWebhookPage'
+import { WebhookDetail } from './settings/webhooks/WebhookDetail'
 
 interface ProjectSettingsProps {
   project: ProjectResponse
@@ -45,6 +49,18 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
             element={<CronJobDetail project={project} />}
           />
         </Route>
+        <Route path="webhooks">
+          <Route index element={<WebhooksSettings project={project} />} />
+          <Route path="new" element={<CreateWebhookPage project={project} />} />
+          <Route
+            path=":webhookId/edit"
+            element={<EditWebhookPage project={project} />}
+          />
+        </Route>
+        <Route
+          path="webhooks/:webhookId"
+          element={<WebhookDetail project={project} />}
+        />
         <Route path="*" element={<Navigate to="general" replace />} />
       </Routes>
     </Card>

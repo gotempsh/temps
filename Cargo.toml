@@ -45,6 +45,7 @@ members = [
     "crates/temps-import",
     "crates/temps-import-docker",
     "crates/temps-captcha-wasm",
+    "crates/temps-webhooks",
 ]
 
 [workspace.package]

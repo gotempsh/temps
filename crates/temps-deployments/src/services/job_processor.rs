@@ -4,7 +4,7 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_core::{Job, JobReceiver};
+use temps_core::{Job, JobQueue, JobReceiver};
 use temps_database::DbConnection;
 use temps_entities::{
     deployments,
@@ -45,6 +45,7 @@ struct CommitInfo {
 pub struct JobProcessorService {
     db: Arc<DbConnection>,
     job_receiver: Box<dyn JobReceiver>,
+    queue: Arc<dyn JobQueue>,
     workflow_planner: Arc<WorkflowPlanner>,
     workflow_executor: Arc<WorkflowExecutionService>,
     git_provider_manager: Arc<temps_git::GitProviderManager>,
@@ -54,6 +55,7 @@ impl JobProcessorService {
     pub fn new(
         db: Arc<DbConnection>,
         job_receiver: Box<dyn JobReceiver>,
+        queue: Arc<dyn JobQueue>,
         workflow_executor: Arc<WorkflowExecutionService>,
         workflow_planner: Arc<WorkflowPlanner>,
         git_provider_manager: Arc<temps_git::GitProviderManager>,
@@ -61,6 +63,7 @@ impl JobProcessorService {
         Self {
             db,
             job_receiver,
+            queue,
             workflow_planner,
             workflow_executor,
             git_provider_manager,
@@ -70,6 +73,7 @@ impl JobProcessorService {
     pub fn with_external_service_manager(
         db: Arc<DbConnection>,
         job_receiver: Box<dyn JobReceiver>,
+        queue: Arc<dyn JobQueue>,
         workflow_executor: Arc<WorkflowExecutionService>,
         workflow_planner: Arc<WorkflowPlanner>,
         git_provider_manager: Arc<temps_git::GitProviderManager>,
@@ -77,6 +81,7 @@ impl JobProcessorService {
         Self {
             db,
             job_receiver,
+            queue,
             workflow_planner,
             workflow_executor,
             git_provider_manager,
@@ -105,6 +110,7 @@ impl JobProcessorService {
                             let workflow_executor = Arc::clone(&self.workflow_executor);
                             let db = Arc::clone(&self.db);
                             let git_provider_manager = Arc::clone(&self.git_provider_manager);
+                            let queue = Arc::clone(&self.queue);
 
                             // Spawn a task to handle the job asynchronously
                             tokio::spawn(async move {
@@ -114,6 +120,7 @@ impl JobProcessorService {
                                     workflow_executor,
                                     db,
                                     git_provider_manager,
+                                    queue,
                                     git_push_job,
                                 )
                                 .await;
@@ -244,6 +251,7 @@ impl JobProcessorService {
         workflow_executor: Arc<WorkflowExecutionService>,
         db: Arc<DbConnection>,
         git_provider_manager: Arc<temps_git::GitProviderManager>,
+        queue: Arc<dyn JobQueue>,
         job: temps_core::GitPushEventJob,
     ) {
         process_git_push_event(
@@ -251,6 +259,7 @@ impl JobProcessorService {
             workflow_executor,
             db,
             git_provider_manager,
+            queue,
             job,
         )
         .await;
@@ -535,6 +544,7 @@ async fn process_git_push_event(
     workflow_executor: Arc<WorkflowExecutionService>,
     db: Arc<DbConnection>,
     git_provider_manager: Arc<temps_git::GitProviderManager>,
+    queue: Arc<dyn JobQueue>,
     job: temps_core::GitPushEventJob,
 ) {
     info!(
@@ -728,6 +738,24 @@ async fn process_git_push_event(
         "Created deployment {} for project {} from GitPushEvent",
         deployment.id, project.id
     );
+
+    // Fire DeploymentCreated event to queue
+    let deployment_created_event = Job::DeploymentCreated(temps_core::DeploymentCreatedJob {
+        deployment_id: deployment.id,
+        project_id: project.id,
+        environment_id: environment.id,
+        environment_name: environment.name.clone(),
+        branch: job.branch.clone(),
+        commit_sha: Some(job.commit.clone()),
+    });
+    if let Err(e) = queue.send(deployment_created_event).await {
+        error!("Failed to send DeploymentCreated event: {}", e);
+    } else {
+        debug!(
+            "Sent DeploymentCreated event for deployment {}",
+            deployment.id
+        );
+    }
 
     // Update project's last_deployment timestamp
     let mut active_project: temps_entities::projects::ActiveModel = project.clone().into();

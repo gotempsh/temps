@@ -10108,6 +10108,7 @@ dependencies = [
  "temps-screenshots",
  "temps-static-files",
  "temps-status-page",
+ "temps-webhooks",
  "tokio",
  "tokio-util",
  "tracing",
@@ -11008,6 +11009,35 @@ dependencies = [
  "url",
  "utoipa",
  "wiremock",
+]
+
+[[package]]
+name = "temps-webhooks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.6",
+ "chrono",
+ "hex",
+ "hmac",
+ "reqwest",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2",
+ "temps-auth",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "testcontainers",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-test",
+ "tower 0.5.2",
+ "tracing",
+ "utoipa",
+ "uuid",
 ]
 
 [[package]]

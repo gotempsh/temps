@@ -5,7 +5,9 @@
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_core::{WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor};
+use temps_core::{
+    Job, JobQueue, WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor,
+};
 use temps_database::DbConnection;
 use temps_deployer::{static_deployer::StaticDeployer, ContainerDeployer, ImageBuilder};
 use temps_entities::{deployment_jobs, deployments, environments, projects};
@@ -23,6 +25,7 @@ use temps_screenshots::ScreenshotService;
 /// Service for executing deployment workflows
 pub struct WorkflowExecutionService {
     db: Arc<DbConnection>,
+    queue: Arc<dyn JobQueue>,
     git_provider: Arc<dyn GitProviderManagerTrait>,
     image_builder: Arc<dyn ImageBuilder>,
     container_deployer: Arc<dyn ContainerDeployer>,
@@ -37,6 +40,7 @@ impl WorkflowExecutionService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<DbConnection>,
+        queue: Arc<dyn JobQueue>,
         git_provider: Arc<dyn GitProviderManagerTrait>,
         image_builder: Arc<dyn ImageBuilder>,
         container_deployer: Arc<dyn ContainerDeployer>,
@@ -48,6 +52,7 @@ impl WorkflowExecutionService {
     ) -> Self {
         Self {
             db,
+            queue,
             git_provider,
             image_builder,
             container_deployer,
@@ -727,8 +732,8 @@ impl WorkflowExecutionService {
         };
         active_deployment.state = Set(state_str.to_string());
 
-        if let Some(reason) = cancelled_reason {
-            active_deployment.cancelled_reason = Set(Some(reason));
+        if let Some(ref reason) = cancelled_reason {
+            active_deployment.cancelled_reason = Set(Some(reason.clone()));
         }
 
         // Set timestamps based on status
@@ -745,7 +750,81 @@ impl WorkflowExecutionService {
         }
 
         active_deployment.updated_at = Set(chrono::Utc::now());
-        active_deployment.update(self.db.as_ref()).await?;
+        let updated_deployment = active_deployment.update(self.db.as_ref()).await?;
+
+        // Fire deployment lifecycle events to queue
+        // Get environment for environment_name
+        let environment = environments::Entity::find_by_id(updated_deployment.environment_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                WorkflowExecutionError::Validation(format!(
+                    "Environment {} not found for deployment {}",
+                    updated_deployment.environment_id, deployment_id
+                ))
+            })?;
+
+        match status {
+            temps_entities::types::PipelineStatus::Completed => {
+                // Get deployment URL from environment
+                let url = if !environment.host.is_empty() {
+                    Some(format!("https://{}", environment.host))
+                } else {
+                    None
+                };
+
+                let event = Job::DeploymentSucceeded(temps_core::DeploymentSucceededJob {
+                    deployment_id: updated_deployment.id,
+                    project_id: updated_deployment.project_id,
+                    environment_id: updated_deployment.environment_id,
+                    environment_name: environment.name.clone(),
+                    commit_sha: updated_deployment.commit_sha.clone(),
+                    url,
+                });
+                if let Err(e) = self.queue.send(event).await {
+                    error!("Failed to send DeploymentSucceeded event: {}", e);
+                } else {
+                    debug!(
+                        "Sent DeploymentSucceeded event for deployment {}",
+                        deployment_id
+                    );
+                }
+            }
+            temps_entities::types::PipelineStatus::Failed => {
+                let event = Job::DeploymentFailed(temps_core::DeploymentFailedJob {
+                    deployment_id: updated_deployment.id,
+                    project_id: updated_deployment.project_id,
+                    environment_id: updated_deployment.environment_id,
+                    environment_name: environment.name.clone(),
+                    error_message: cancelled_reason.clone().map(|s| s.to_string()),
+                });
+                if let Err(e) = self.queue.send(event).await {
+                    error!("Failed to send DeploymentFailed event: {}", e);
+                } else {
+                    debug!(
+                        "Sent DeploymentFailed event for deployment {}",
+                        deployment_id
+                    );
+                }
+            }
+            temps_entities::types::PipelineStatus::Cancelled => {
+                let event = Job::DeploymentCancelled(temps_core::DeploymentCancelledJob {
+                    deployment_id: updated_deployment.id,
+                    project_id: updated_deployment.project_id,
+                    environment_id: updated_deployment.environment_id,
+                    environment_name: environment.name,
+                });
+                if let Err(e) = self.queue.send(event).await {
+                    error!("Failed to send DeploymentCancelled event: {}", e);
+                } else {
+                    debug!(
+                        "Sent DeploymentCancelled event for deployment {}",
+                        deployment_id
+                    );
+                }
+            }
+            _ => {}
+        }
 
         Ok(())
     }
@@ -1058,6 +1137,9 @@ pub enum WorkflowExecutionError {
 
     #[error("Job creation failed: {0}")]
     JobCreationFailed(String),
+
+    #[error("Validation error: {0}")]
+    Validation(String),
 }
 
 impl From<anyhow::Error> for WorkflowExecutionError {
@@ -1428,6 +1510,8 @@ mod tests {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
         let git_provider = Arc::new(MockGitProvider);
         let image_builder = Arc::new(MockImageBuilder { should_fail: false });
         let container_deployer = Arc::new(MockContainerDeployer { should_fail: false });
@@ -1439,6 +1523,7 @@ mod tests {
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
         let _service = WorkflowExecutionService::new(
             db.clone(),
+            queue,
             git_provider,
             image_builder,
             container_deployer,
@@ -1461,6 +1546,8 @@ mod tests {
 
         let (_project, _environment, deployment) = create_test_data(&db).await?;
 
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
         let git_provider = Arc::new(MockGitProvider);
         let image_builder = Arc::new(MockImageBuilder { should_fail: false });
         let container_deployer = Arc::new(MockContainerDeployer { should_fail: false });
@@ -1472,6 +1559,7 @@ mod tests {
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
         let service = WorkflowExecutionService::new(
             db.clone(),
+            queue,
             git_provider,
             image_builder,
             container_deployer,
@@ -1559,6 +1647,8 @@ mod tests {
         };
         deploy_job.insert(db.as_ref()).await?;
 
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
         let git_provider = Arc::new(MockGitProvider);
         let image_builder = Arc::new(MockImageBuilder { should_fail: false });
         let container_deployer = Arc::new(MockContainerDeployer { should_fail: false });
@@ -1570,6 +1660,7 @@ mod tests {
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
         let service = WorkflowExecutionService::new(
             db.clone(),
+            queue,
             git_provider,
             image_builder,
             container_deployer,

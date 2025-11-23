@@ -49,3 +49,5 @@ pub use super::tls_acme_certificates::Entity as TlsAcmeCertificates;
 pub use super::user_roles::Entity as UserRoles;
 pub use super::users::Entity as Users;
 pub use super::visitor::Entity as Visitor;
+pub use super::webhook_deliveries::Entity as WebhookDeliveries;
+pub use super::webhooks::Entity as Webhooks;

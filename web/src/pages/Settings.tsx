@@ -386,6 +386,7 @@ export function Settings() {
                 rateLimiting={rateLimiting}
               />
             </TabsContent>
+
           </Tabs>
 
           {/* Sticky bottom save button - only shown when there are changes */}

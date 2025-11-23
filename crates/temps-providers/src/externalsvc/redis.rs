@@ -17,6 +17,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{error, info};
+use urlencoding;
 
 /// Input configuration for creating a Redis service
 /// This is what users provide when creating the service
@@ -538,9 +539,13 @@ impl ExternalService for RedisService {
         let password = parameters.get("password");
 
         let url = if let Some(pass) = password {
-            format!("redis://:{pass}@{container_name}:6379")
+            format!(
+                "redis://:{}@{}:6379",
+                urlencoding::encode(pass),
+                container_name
+            )
         } else {
-            format!("redis://{container_name}:6379")
+            format!("redis://{}:6379", container_name)
         };
 
         env_vars.insert("REDIS_URL".to_string(), url);
@@ -625,9 +630,14 @@ impl ExternalService for RedisService {
 
         // Connection URL with database number
         let url = if let Some(pass) = password {
-            format!("redis://:{pass}@{container_name}:6379/{db_number}")
+            format!(
+                "redis://:{}@{}:6379/{}",
+                urlencoding::encode(pass),
+                container_name,
+                db_number
+            )
         } else {
-            format!("redis://{container_name}:6379/{db_number}")
+            format!("redis://{}:6379/{}", container_name, db_number)
         };
         env_vars.insert("REDIS_URL".to_string(), url);
 
@@ -783,9 +793,9 @@ impl ExternalService for RedisService {
         let password = parameters.get("password");
 
         let url = if let Some(pass) = password {
-            format!("redis://:{pass}@{host}:{port}")
+            format!("redis://:{}@{}:{}", urlencoding::encode(pass), host, port)
         } else {
-            format!("redis://{host}:{port}")
+            format!("redis://{}:{}", host, port)
         };
 
         env_vars.insert("REDIS_URL".to_string(), url);
@@ -1150,7 +1160,11 @@ impl ExternalService for RedisService {
         let connection_url = if password.is_empty() {
             format!("redis://localhost:{}", port)
         } else {
-            format!("redis://:{}@localhost:{}", password, port)
+            format!(
+                "redis://:{}@localhost:{}",
+                urlencoding::encode(&password),
+                port
+            )
         };
 
         match redis::Client::open(connection_url.as_str())

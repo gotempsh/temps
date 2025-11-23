@@ -67,4 +67,8 @@ pub mod status_incident_updates;
 pub mod status_incidents;
 pub mod status_monitors;
 
+// Webhook entities
+pub mod webhook_deliveries;
+pub mod webhooks;
+
 pub mod prelude;

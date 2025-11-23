@@ -95,6 +95,73 @@ pub struct MonitorCreatedJob {
     pub monitor_name: String,
 }
 
+/// Job for when a deployment is created
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentCreatedJob {
+    pub deployment_id: i32,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub environment_name: String,
+    pub commit_sha: Option<String>,
+    pub branch: Option<String>,
+}
+
+/// Job for when a deployment succeeds
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentSucceededJob {
+    pub deployment_id: i32,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub environment_name: String,
+    pub commit_sha: Option<String>,
+    pub url: Option<String>,
+}
+
+/// Job for when a deployment fails
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentFailedJob {
+    pub deployment_id: i32,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub environment_name: String,
+    pub error_message: Option<String>,
+}
+
+/// Job for when a deployment is cancelled
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentCancelledJob {
+    pub deployment_id: i32,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub environment_name: String,
+}
+
+/// Job for when a deployment is ready (container is running and healthy)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentReadyJob {
+    pub deployment_id: i32,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub environment_name: String,
+    pub url: Option<String>,
+}
+
+/// Job for when a domain is created
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainCreatedJob {
+    pub domain_id: i32,
+    pub project_id: i32,
+    pub domain_name: String,
+}
+
+/// Job for when a domain certificate is provisioned
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainProvisionedJob {
+    pub domain_id: i32,
+    pub project_id: i32,
+    pub domain_name: String,
+}
+
 /// Core job enum containing all possible job types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Job {
@@ -115,6 +182,15 @@ pub enum Job {
     EnvironmentCreated(EnvironmentCreatedJob),
     EnvironmentDeleted(EnvironmentDeletedJob),
     MonitorCreated(MonitorCreatedJob),
+    // Deployment events
+    DeploymentCreated(DeploymentCreatedJob),
+    DeploymentSucceeded(DeploymentSucceededJob),
+    DeploymentFailed(DeploymentFailedJob),
+    DeploymentCancelled(DeploymentCancelledJob),
+    DeploymentReady(DeploymentReadyJob),
+    // Domain events
+    DomainCreated(DomainCreatedJob),
+    DomainProvisioned(DomainProvisionedJob),
 }
 
 impl fmt::Display for Job {
@@ -145,6 +221,13 @@ impl fmt::Display for Job {
             Job::EnvironmentCreated(job) => write!(f, "EnvironmentCreated(id: {}, name: {}, project: {})", job.environment_id, job.environment_name, job.project_id),
             Job::EnvironmentDeleted(job) => write!(f, "EnvironmentDeleted(id: {}, name: {}, project: {})", job.environment_id, job.environment_name, job.project_id),
             Job::MonitorCreated(job) => write!(f, "MonitorCreated(id: {}, name: {}, env: {}, project: {})", job.monitor_id, job.monitor_name, job.environment_id, job.project_id),
+            Job::DeploymentCreated(job) => write!(f, "DeploymentCreated(id: {}, env: {}, project: {})", job.deployment_id, job.environment_id, job.project_id),
+            Job::DeploymentSucceeded(job) => write!(f, "DeploymentSucceeded(id: {}, env: {}, project: {})", job.deployment_id, job.environment_id, job.project_id),
+            Job::DeploymentFailed(job) => write!(f, "DeploymentFailed(id: {}, env: {}, project: {}, error: {:?})", job.deployment_id, job.environment_id, job.project_id, job.error_message),
+            Job::DeploymentCancelled(job) => write!(f, "DeploymentCancelled(id: {}, env: {}, project: {})", job.deployment_id, job.environment_id, job.project_id),
+            Job::DeploymentReady(job) => write!(f, "DeploymentReady(id: {}, env: {}, project: {}, url: {:?})", job.deployment_id, job.environment_id, job.project_id, job.url),
+            Job::DomainCreated(job) => write!(f, "DomainCreated(id: {}, name: {}, project: {})", job.domain_id, job.domain_name, job.project_id),
+            Job::DomainProvisioned(job) => write!(f, "DomainProvisioned(id: {}, name: {}, project: {})", job.domain_id, job.domain_name, job.project_id),
         }
     }
 }

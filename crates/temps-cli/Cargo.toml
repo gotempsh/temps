@@ -47,6 +47,7 @@ temps-queue = { path = "../temps-queue" }
 temps-screenshots = { path = "../temps-screenshots" }
 temps-status-page = { path = "../temps-status-page" }
 temps-static-files = { path = "../temps-static-files" }
+temps-webhooks = { path = "../temps-webhooks" }
 tokio-util = { workspace = true }
 
 # CLI and runtime dependencies - reference from crates workspace

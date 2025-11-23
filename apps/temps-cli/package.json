@@ -1,0 +1,35 @@
+{
+  "name": "temps-cli",
+  "version": "0.1.0",
+  "description": "CLI for Temps deployment platform",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "temps": "./bin/temps"
+  },
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target node",
+    "build:bin": "bun build src/index.ts --compile --outfile bin/temps",
+    "generate:api": "bun openapi-ts",
+    "typecheck": "tsc --noEmit",
+    "link": "bun link"
+  },
+  "devDependencies": {
+    "@hey-api/openapi-ts": "^0.88.0",
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@hey-api/client-fetch": "^0.13.1",
+    "@inquirer/prompts": "^8.0.1",
+    "chalk": "^5.6.2",
+    "cli-table3": "^0.6.5",
+    "commander": "^14.0.2",
+    "conf": "^15.0.2",
+    "ora": "^9.0.0"
+  }
+}

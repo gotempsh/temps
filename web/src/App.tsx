@@ -105,6 +105,9 @@ const ProjectDetail = lazy(() =>
 const Settings = lazy(() =>
   import('./pages/Settings').then((m) => ({ default: m.Settings }))
 )
+const Notifications = lazy(() =>
+  import('./pages/Notifications').then((m) => ({ default: m.Notifications }))
+)
 const ExternalConnectivitySetup = lazy(() =>
   import('./pages/ExternalConnectivitySetup').then((m) => ({
     default: m.ExternalConnectivitySetup,
@@ -370,6 +373,10 @@ const AppContent = () => {
                                   <Route
                                     path="/settings"
                                     element={<Settings />}
+                                  />
+                                  <Route
+                                    path="/notifications"
+                                    element={<Notifications />}
                                   />
                                   <Route
                                     path="/settings/audit-logs"

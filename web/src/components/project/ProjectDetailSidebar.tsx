@@ -15,6 +15,7 @@ import {
   Shield,
   Key,
   Globe,
+  Webhook,
 } from 'lucide-react'
 import {
   useCallback,
@@ -173,6 +174,7 @@ const baseNavItems: NavItem[] = [
       { title: 'General', url: 'settings/general' },
       { title: 'Security', url: 'settings/security' },
       { title: 'Cron Jobs', url: 'settings/cron-jobs' },
+      { title: 'Webhooks', url: 'settings/webhooks' },
     ],
   },
 ]

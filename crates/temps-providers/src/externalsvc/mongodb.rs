@@ -17,6 +17,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{error, info};
+use urlencoding;
 
 use crate::utils::ensure_network_exists;
 
@@ -360,7 +361,10 @@ impl MongodbService {
 
         let connection_string = format!(
             "mongodb://{}:{}@{}:{}/?authSource=admin",
-            config.username, config.password, config.host, config.port
+            urlencoding::encode(&config.username),
+            urlencoding::encode(&config.password),
+            config.host,
+            config.port
         );
 
         let client_options = ClientOptions::parse(&connection_string).await?;
@@ -511,7 +515,10 @@ impl ExternalService for MongodbService {
 
         Ok(format!(
             "mongodb://{}:{}@{}:{}",
-            config.username, config.password, config.host, config.port
+            urlencoding::encode(&config.username),
+            urlencoding::encode(&config.password),
+            config.host,
+            config.port
         ))
     }
 
@@ -673,7 +680,11 @@ impl ExternalService for MongodbService {
             "MONGODB_URL".to_string(),
             format!(
                 "mongodb://{}:{}@{}:{}/{}",
-                username, password, host, port, database
+                urlencoding::encode(username),
+                urlencoding::encode(password),
+                host,
+                port,
+                database
             ),
         );
 
@@ -706,7 +717,10 @@ impl ExternalService for MongodbService {
             "MONGODB_URL".to_string(),
             format!(
                 "mongodb://{}:{}@{}:27017/{}",
-                username, password, container_name, database
+                urlencoding::encode(username),
+                urlencoding::encode(password),
+                container_name,
+                database
             ),
         );
 
@@ -822,7 +836,10 @@ impl ExternalService for MongodbService {
             "MONGODB_URL".to_string(),
             format!(
                 "mongodb://{}:{}@{}:27017/{}",
-                config.username, config.password, container_name, db_name
+                urlencoding::encode(&config.username),
+                urlencoding::encode(&config.password),
+                container_name,
+                db_name
             ),
         );
 
@@ -1189,7 +1206,10 @@ impl ExternalService for MongodbService {
         let connection_url = if let (Some(user), Some(pass)) = (&username, &password) {
             format!(
                 "mongodb://{}:{}@localhost:{}/{}",
-                user, pass, port, database
+                urlencoding::encode(user),
+                urlencoding::encode(pass),
+                port,
+                database
             )
         } else {
             format!("mongodb://localhost:{}", port)

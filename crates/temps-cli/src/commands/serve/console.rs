@@ -46,6 +46,7 @@ use temps_queue::QueuePlugin;
 use temps_screenshots::ScreenshotsPlugin;
 use temps_static_files::StaticFilesPlugin;
 use temps_status_page::StatusPagePlugin;
+use temps_webhooks::WebhooksPlugin;
 use tokio::net::TcpListener;
 use tracing::{debug, info};
 use utoipa_swagger_ui::SwaggerUi;
@@ -582,6 +583,11 @@ pub async fn start_console_api(
     debug!("Registering NotificationsPlugin");
     let notifications_plugin = Box::new(NotificationsPlugin::new());
     plugin_manager.register_plugin(notifications_plugin);
+
+    // 7.5. WebhooksPlugin - provides webhook delivery and management (depends on database and encryption)
+    debug!("Registering WebhooksPlugin");
+    let webhooks_plugin = Box::new(WebhooksPlugin::new());
+    plugin_manager.register_plugin(webhooks_plugin);
 
     // 4. DomainsPlugin - provides DNS and TLS certificate management (depends on config and database)
     debug!("Registering DomainsPlugin");

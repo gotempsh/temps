@@ -6,13 +6,21 @@ use std::collections::HashMap;
 use utoipa::ToSchema;
 
 /// Sections that can be included in the weekly digest
+/// Note: `#[serde(default)]` allows backward compatibility when deserializing
+/// old data that may have `security` and `resources` fields instead of `projects`
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
 pub struct DigestSections {
     pub performance: bool,
     pub deployments: bool,
     pub errors: bool,
     pub funnels: bool,
+    #[serde(default = "default_projects_enabled")]
     pub projects: bool,
+}
+
+fn default_projects_enabled() -> bool {
+    true
 }
 
 impl Default for DigestSections {

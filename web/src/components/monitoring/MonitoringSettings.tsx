@@ -28,7 +28,6 @@ import { useQuery } from '@tanstack/react-query'
 import { useForm } from 'react-hook-form'
 import { useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
-import { ProvidersManagement } from './ProvidersManagement'
 import {
   backupAlertsSchema,
   domainAlertsSchema,
@@ -884,7 +883,6 @@ export function MonitoringSettings() {
     { id: 'routes', label: 'Routes' },
     { id: 'notifications', label: 'Notifications' },
     { id: 'digest', label: 'Weekly Digest' },
-    { id: 'providers', label: 'Providers' },
   ] as const
 
   const handleProjectSave = async (data: ProjectAlertsFormData) => {
@@ -1162,8 +1160,6 @@ export function MonitoringSettings() {
             defaultValues={digestDefaults}
           />
         )
-      case 'providers':
-        return <ProvidersManagement />
       default:
         return null
     }

@@ -1,0 +1,392 @@
+================================================================================
+FRONTEND GITHUB APP INSTALLATION FLOW - ARCHITECTURE DIAGRAM
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ ENTRY POINTS                                                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Dashboard.tsx                          GitSources.tsx                       │
+│  (Empty state → Onboarding)     OR      (List existing providers)           │
+│         │                                       │                            │
+│         └───────────────────────┬────────────────┘                           │
+│                                 │                                           │
+│                          ImprovedOnboardingDashboard                        │
+│                                 │                                           │
+│                          AddGitProvider.tsx                                  │
+│                                 │                                           │
+│                           SUCCESS CONDITION                                  │
+│                     (Trigger navigation to DetailPage)                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ MULTI-STEP WIZARD: GitProviderFlow.tsx (CRITICAL)                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Step 1: PROVIDER SELECTION                                                 │
+│  ┌─────────────────────────────────────────────────────────────────┐       │
+│  │ • GitHub                                                         │       │
+│  │ • GitLab                                                         │       │
+│  └─────────────────────────────────────────────────────────────────┘       │
+│         │ (Select GitHub)                                                   │
+│         ▼                                                                    │
+│  Step 2: AUTHENTICATION METHOD                                              │
+│  ┌─────────────────────────────────────────────────────────────────┐       │
+│  │ • Create GitHub App (Manifest-based) ◄─── POLLING STARTS HERE   │       │
+│  │ • Use Existing GitHub App (if available)                         │       │
+│  │ • Personal Access Token (PAT)                                    │       │
+│  └─────────────────────────────────────────────────────────────────┘       │
+│         │ (Select "Create GitHub App")                                      │
+│         ▼                                                                    │
+│  Step 3a: GITHUB APP CREATION (handleCreateGitHubAppManifest)               │
+│  ┌─────────────────────────────────────────────────────────────────┐       │
+│  │ 1. Generate manifest with webhook URLs                           │       │
+│  │    - Webhook: {origin}/api/webhook/git/github/events            │       │
+│  │    - Callback: {origin}/api/webhook/git/github/callback         │       │
+│  │    - Auth: {origin}/api/webhook/git/github/auth                 │       │
+│  │                                                                  │       │
+│  │ 2. Create form and POST to GitHub                               │       │
+│  │    POST: https://github.com/settings/apps/new?state={uuid}      │       │
+│  │                                                                  │       │
+│  │ 3. Start polling listGitProviders every 2 seconds               │       │
+│  │    (refetchInterval: isPollingInstallations ? 2000 : false)      │       │
+│  │                                                                  │       │
+│  │ 4. Timeout polling after 60 seconds                             │       │
+│  └─────────────────────────────────────────────────────────────────┘       │
+│         │                                                                    │
+│         ▼ (User completes GitHub app creation & clicks Install)             │
+│  ┌─────────────────────────────────────────────────────────────────┐       │
+│  │ EXTERNAL: GitHub.com                                            │       │
+│  │ ┌──────────────────────────────────────────────────────────┐   │       │
+│  │ │ 1. User fills app settings form                         │   │       │
+│  │ │ 2. GitHub generates:                                    │   │       │
+│  │ │    - App ID                                             │   │       │
+│  │ │    - Client Secret                                      │   │       │
+│  │ │ 3. GitHub App created & ready for installation          │   │       │
+│  │ │ 4. User clicks "Install" on app page                   │   │       │
+│  │ │ 5. GitHub redirects to:                                 │   │       │
+│  │ │    {origin}/api/webhook/git/github/callback            │   │       │
+│  │ │    (with installation_id, code, state parameters)      │   │       │
+│  │ └──────────────────────────────────────────────────────────┘   │       │
+│  └─────────────────────────────────────────────────────────────────┘       │
+│         │                                                                    │
+│         ▼ (Backend handles callback, creates provider + connection)         │
+│  ┌─────────────────────────────────────────────────────────────────┐       │
+│  │ BACKEND: /api/webhook/git/github/callback                       │       │
+│  │ ┌──────────────────────────────────────────────────────────┐   │       │
+│  │ │ 1. Validate code/state parameters                       │   │       │
+│  │ │ 2. Exchange code for installation details               │   │       │
+│  │ │ 3. Create ProviderResponse (GitHub App type)            │   │       │
+│  │ │ 4. Create ConnectionResponse with installation_id       │   │       │
+│  │ │ 5. Return response to browser (or redirect)             │   │       │
+│  │ └──────────────────────────────────────────────────────────┘   │       │
+│  └─────────────────────────────────────────────────────────────────┘       │
+│         │                                                                    │
+│         ▼ (Polling detects new provider)                                    │
+│  Step 4: INSTALLATION DETECTION (useEffect lines 153-191)                   │
+│  ┌─────────────────────────────────────────────────────────────────┐       │
+│  │ 1. Query returns updated gitProviders array                    │       │
+│  │ 2. New GitHub App provider detected                            │       │
+│  │    (provider_type='github' && auth_method='github_app')        │       │
+│  │ 3. Show toast: "GitHub App created successfully!"             │       │
+│  │ 4. setState(currentStep = 'method')                           │       │
+│  │ 5. setSelectedProvider('github')                              │       │
+│  │ 6. Reset selectedMethod to null (allow user to choose)        │       │
+│  │ 7. Stop polling                                               │       │
+│  └─────────────────────────────────────────────────────────────────┘       │
+│         │                                                                    │
+│         ▼                                                                    │
+│  Step 5: SUCCESS SCREEN (currentStep === 'success')                         │
+│  ┌─────────────────────────────────────────────────────────────────┐       │
+│  │ ✓ Provider Added Successfully!                                  │       │
+│  │ You can now select repositories from this provider              │       │
+│  │                                                                  │       │
+│  │ [Continue] or auto-navigate                                     │       │
+│  └─────────────────────────────────────────────────────────────────┘       │
+│         │                                                                    │
+│         ▼                                                                    │
+│  onSuccess() callback triggered                                             │
+│  (GitProviderFlow.onSuccess) → Navigate back to GitSources or Detail        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ DISPLAY LOCATIONS: WHERE INSTALLATION IS SHOWN                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ▶ GitSources.tsx (List Page)                                               │
+│    └─ Provider cards show Active/Inactive status                            │
+│    └─ "Install GitHub App" button on each GitHub App provider               │
+│                                                                              │
+│  ▶ GitProviderDetail.tsx (Detail Page) ◄─── PRIMARY DISPLAY LOCATION       │
+│    └─ Top right button: "Install GitHub App" (if GitHub App type)          │
+│    └─ Provider Information Card:                                            │
+│       • Auth Method: "GitHub App"                                           │
+│       • Status: "Active" or "Inactive"                                      │
+│       • Base URL, Created, Updated timestamps                               │
+│    └─ GitHub App Setup Card (shown if NO connections exist):                │
+│       • "Installation Required" heading                                     │
+│       • Instructions text                                                   │
+│       • "Install GitHub App" button                                         │
+│    └─ Connections Table:                                                    │
+│       • Lists all connections                                               │
+│       • Shows installation_id column (installation_id if GitHub App)        │
+│       • Shows sync/refresh timestamps                                       │
+│       • "Install GitHub App" button in header (if GitHub App type)          │
+│    └─ Empty State (when no connections):                                    │
+│       • "No connections found" message                                      │
+│       • "Install GitHub App" button                                         │
+│                                                                              │
+│  ▶ Feedback Alerts (Throughout)                                             │
+│    └─ useFeedback hook shows success/error messages                         │
+│    └─ FeedbackAlert component displays at top of page                       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+POLLING MECHANISM - DETAILED FLOW
+================================================================================
+
+GitProviderFlow.tsx component:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ POLLING SETUP (lines 98-101)                                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│ const { data: gitProviders = [], refetch } = useQuery({                    │
+│   ...listGitProvidersOptions(),                                             │
+│   refetchInterval: isPollingInstallations ? 2000 : false                    │
+│ })                                                                           │
+│                                                                              │
+│ When isPollingInstallations = true:                                         │
+│   • Query refetches every 2000ms (2 seconds)                                │
+│   • GET /git-providers called repeatedly                                    │
+│   • Each response updates gitProviders data                                 │
+│                                                                              │
+│ When isPollingInstallations = false:                                        │
+│   • No automatic refetching (normal behavior)                               │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ TIMEOUT MECHANISM (lines 135-151)                                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│ useEffect(() => {                                                           │
+│   if (isPollingInstallations) {                                             │
+│     pollingTimeoutRef.current = setTimeout(() => {                         │
+│       setIsPollingInstallations(false)  // Stop polling after 60s           │
+│       toast.info('Stopped waiting for installation', ...)                  │
+│     }, 60000)  // 60 second timeout                                         │
+│   }                                                                          │
+│ }, [isPollingInstallations])                                                │
+│                                                                              │
+│ Purpose:                                                                    │
+│   • Stop wasting resources after 60 seconds                                 │
+│   • Notify user that automatic detection timed out                          │
+│   • User can manually refresh if needed                                     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ DETECTION MECHANISM (lines 153-191)                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│ useEffect(() => {                                                           │
+│   if (!gitProviders || gitProviders.length === 0) {                        │
+│     previousProviderCountRef.current = 0                                    │
+│     return                                                                  │
+│   }                                                                          │
+│                                                                              │
+│   const currentCount = gitProviders.length                                  │
+│   const previousCount = previousProviderCountRef.current                    │
+│                                                                              │
+│   // If we're polling AND count increased → new provider found!             │
+│   if (isPollingInstallations && currentCount > previousCount) {             │
+│     const newGitHubApp = gitProviders.find(                                 │
+│       provider => provider.provider_type === 'github'                       │
+│                && provider.auth_method === 'github_app'                     │
+│     )                                                                        │
+│                                                                              │
+│     if (newGitHubApp) {                                                     │
+│       queueMicrotask(() => {  // Defer to next microtask                   │
+│         setIsPollingInstallations(false)  // Stop polling                   │
+│         toast.success('GitHub App created successfully!', ...)             │
+│         setCurrentStep('method')  // Show method selection again            │
+│         setSelectedProvider('github')                                       │
+│         setSelectedMethod(null)  // Reset so user can choose                │
+│       })                                                                     │
+│     }                                                                        │
+│   }                                                                          │
+│                                                                              │
+│   previousProviderCountRef.current = currentCount                           │
+│ }, [gitProviders, isPollingInstallations])                                  │
+│                                                                              │
+│ Trigger Logic:                                                              │
+│   1. Every 2 seconds, gitProviders query updates                            │
+│   2. This effect runs with new gitProviders data                            │
+│   3. Compares current count vs previous count                               │
+│   4. If count increased AND polling active → detection success!             │
+│   5. Updates state using queueMicrotask to avoid cascading renders          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+DATA FLOW: INSTALLATION_ID TRACKING
+================================================================================
+
+GitHub Installation ID Journey:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 1. INSTALLATION AT GITHUB                                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│ GitHub generates unique installation_id when app is installed               │
+│ Example: installation_id = "12345678" (numeric)                             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 2. CALLBACK TO BACKEND                                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│ GitHub sends:                                                               │
+│ GET /api/webhook/git/github/callback?                                       │
+│       code=...&                                                             │
+│       state=...&                                                            │
+│       installation_id=12345678&                                             │
+│       setup_action=...                                                      │
+│                                                                              │
+│ Backend receives installation_id and stores it                              │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 3. STORED IN DATABASE                                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│ ConnectionResponse (types.gen.ts):                                          │
+│ {                                                                            │
+│   id: number,                                                               │
+│   provider_id: number,                                                      │
+│   installation_id: "12345678"  // ◄─── STORED HERE                         │
+│   ... other fields                                                          │
+│ }                                                                            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 4. RETURNED TO FRONTEND VIA API                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│ GET /git/connections returns:                                               │
+│ {                                                                            │
+│   connections: [                                                            │
+│     {                                                                        │
+│       id: 1,                                                                │
+│       installation_id: "12345678"  // ◄─── IN RESPONSE                      │
+│       ... other fields                                                      │
+│     }                                                                        │
+│   ]                                                                          │
+│ }                                                                            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 5. DISPLAYED IN CONNECTIONS TABLE                                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│ ConnectionsTable.tsx (lines 161-169):                                       │
+│                                                                              │
+│ <TableCell>                                                                 │
+│   {connection.installation_id ? (                                           │
+│     <span className="font-mono text-sm">                                   │
+│       {connection.installation_id}  {/* Display: "12345678" */}             │
+│     </span>                                                                 │
+│   ) : (                                                                     │
+│     <span className="text-muted-foreground">-</span>                        │
+│   )}                                                                         │
+│ </TableCell>                                                                │
+│                                                                              │
+│ In UI: Installation ID column shows "12345678" for GitHub App              │
+│        connections, "-" for other types (PAT, OAuth)                       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+COMPONENTS INVOLVED IN INSTALLATION DISPLAY
+================================================================================
+
+Provider Created → Display in GitProviderDetail → Show in Connections Table
+
+GitProviderDetail.tsx:
+├─ Checks if provider is GitHub App (isGitHubApp helper)
+├─ Shows GitHub App Setup Card (if no connections)
+│  └─ "Installation Required" heading
+│  └─ "Install GitHub App" button → handleInstallGitHubApp()
+│     └─ Opens: {baseUrl}/installations/new in new tab
+├─ Shows Connections Table
+│  ├─ Uses ConnectionsTable component
+│  └─ Passes:
+│     • connections (from query)
+│     • provider (for type checking)
+│     • onSyncRepository callback
+│     • onAuthorize callback
+│
+ConnectionsTable.tsx:
+├─ Receives connections array
+├─ Renders table with columns:
+│  • Connection Name
+│  • Repository
+│  • Installation ID ◄─── From connection.installation_id
+│  • Status
+│  • Last Sync
+│  • Actions (Sync, Delete, etc.)
+└─ installation_id displays as font-mono text for GitHub Apps
+
+When GitHub App is installed:
+1. Backend stores installation_id in database
+2. Connection returned with installation_id field populated
+3. Displayed in ConnectionsTable as monospace text
+4. Shows "12345678" for GitHub App connections
+
+
+================================================================================
+CURRENT GAPS & MISSING FEATURES
+================================================================================
+
+❌ NO dedicated installation success page
+   • Could create /web/src/pages/GitHubInstallationComplete.tsx
+   • Show success message with provider details
+   • Link to GitProviderDetail page
+
+❌ NO query parameter handling for GitHub callback
+   • GitHub redirects to /api/webhook/git/github/callback
+   • Frontend doesn't directly handle the callback
+   • All detection happens via polling
+
+❌ SETUP_URL not implemented
+   • GitHub app manifest includes setup_url field
+   • Could redirect to custom setup page after installation
+   • Currently unused
+
+❌ NO real-time updates
+   • Uses polling (not WebSocket/SSE)
+   • If tab closed, polling stops
+   • No persistent connection
+
+❌ NO installation status on list page
+   • GitSources.tsx doesn't show if app is "installed" vs "created"
+   • Both states look identical to user
+   • Could add badge/indicator
+
+================================================================================

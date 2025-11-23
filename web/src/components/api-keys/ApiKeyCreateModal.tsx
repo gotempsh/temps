@@ -1,4 +1,7 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
 import {
   Dialog,
   DialogContent,
@@ -8,7 +11,6 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import {
   Select,
   SelectContent,
@@ -22,8 +24,35 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { AlertCircle, Copy, Check, Shield, Key } from 'lucide-react'
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form'
 import type { CreateApiKeyRequest } from '@/api/client'
 import { useApiKeyPermissions } from './useApiKeyPermissions'
+
+const formSchema = z.object({
+  name: z.string().min(1, 'Name is required'),
+  expires_at: z
+    .string()
+    .optional()
+    .refine(
+      (val) => {
+        if (!val) return true
+        const expirationDate = new Date(val)
+        const today = new Date()
+        today.setHours(0, 0, 0, 0)
+        return expirationDate > today
+      },
+      { message: 'Expiration date must be greater than today' }
+    ),
+})
+
+type FormValues = z.infer<typeof formSchema>
 
 interface ApiKeyCreateModalProps {
   open: boolean
@@ -52,6 +81,14 @@ export function ApiKeyCreateModal({
   const { data: permissionsData, isLoading: isLoadingPermissions } =
     useApiKeyPermissions()
 
+  const form = useForm<FormValues>({
+    resolver: zodResolver(formSchema),
+    defaultValues: {
+      name: '',
+      expires_at: '',
+    },
+  })
+
   const handleCopyKey = async () => {
     if (newKeySecret) {
       await navigator.clipboard.writeText(newKeySecret)
@@ -60,18 +97,15 @@ export function ApiKeyCreateModal({
     }
   }
 
-  const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault()
-    const formData = new FormData(e.currentTarget)
-
+  const handleFormSubmit = (values: FormValues) => {
     const data: CreateApiKeyRequest = {
-      name: formData.get('name') as string,
+      name: values.name,
       role_type: useCustomPermissions ? 'custom' : selectedRole,
       permissions: useCustomPermissions
         ? Array.from(selectedPermissions)
         : undefined,
-      expires_at: formData.get('expires_at')
-        ? new Date(formData.get('expires_at') as string).toISOString()
+      expires_at: values.expires_at
+        ? new Date(values.expires_at).toISOString()
         : undefined,
     }
     onSubmit(data)
@@ -81,11 +115,22 @@ export function ApiKeyCreateModal({
     if (newKeySecret) {
       onKeySecretDismiss()
     }
+    form.reset()
     setSelectedRole('')
     setSelectedPermissions(new Set())
     setUseCustomPermissions(false)
     onOpenChange(false)
   }
+
+  // Reset form when dialog opens
+  useEffect(() => {
+    if (open && !newKeySecret) {
+      form.reset()
+      setSelectedRole('')
+      setSelectedPermissions(new Set())
+      setUseCustomPermissions(false)
+    }
+  }, [open, newKeySecret, form])
 
   const handleRoleChange = (role: string) => {
     setSelectedRole(role)
@@ -139,7 +184,7 @@ export function ApiKeyCreateModal({
                 </AlertDescription>
               </Alert>
               <div className="space-y-2">
-                <Label>Your API Key</Label>
+                <FormLabel>Your API Key</FormLabel>
                 <div className="flex gap-2">
                   <Input
                     value={newKeySecret}
@@ -168,170 +213,186 @@ export function ApiKeyCreateModal({
                 Create a new API key with specific roles and permissions.
               </DialogDescription>
             </DialogHeader>
-            <form onSubmit={handleSubmit}>
-              <div className="space-y-4 py-4">
-                <div className="space-y-2">
-                  <Label htmlFor="name">Name</Label>
-                  <Input
-                    id="name"
+            <Form {...form}>
+              <form onSubmit={form.handleSubmit(handleFormSubmit)}>
+                <div className="space-y-4 py-4">
+                  <FormField
+                    control={form.control}
                     name="name"
-                    placeholder="Production API Key"
-                    required
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Name</FormLabel>
+                        <FormControl>
+                          <Input
+                            placeholder="Production API Key"
+                            {...field}
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
                   />
-                </div>
 
-                <Tabs
-                  defaultValue="role"
-                  onValueChange={(v) => setUseCustomPermissions(v === 'custom')}
-                >
-                  <TabsList className="grid w-full grid-cols-2">
-                    <TabsTrigger value="role">
-                      <Shield className="h-4 w-4 mr-2" />
-                      Predefined Role
-                    </TabsTrigger>
-                    <TabsTrigger value="custom">
-                      <Key className="h-4 w-4 mr-2" />
-                      Custom Permissions
-                    </TabsTrigger>
-                  </TabsList>
+                  <Tabs
+                    defaultValue="role"
+                    onValueChange={(v) => setUseCustomPermissions(v === 'custom')}
+                  >
+                    <TabsList className="grid w-full grid-cols-2">
+                      <TabsTrigger value="role">
+                        <Shield className="h-4 w-4 mr-2" />
+                        Predefined Role
+                      </TabsTrigger>
+                      <TabsTrigger value="custom">
+                        <Key className="h-4 w-4 mr-2" />
+                        Custom Permissions
+                      </TabsTrigger>
+                    </TabsList>
 
-                  <TabsContent value="role" className="space-y-4">
-                    <div className="space-y-2">
-                      <Label htmlFor="role_type">Select Role</Label>
-                      {isLoadingPermissions ? (
-                        <div className="text-sm text-muted-foreground">
-                          Loading roles...
-                        </div>
-                      ) : (
-                        <Select
-                          value={selectedRole}
-                          onValueChange={handleRoleChange}
-                          required={!useCustomPermissions}
-                        >
-                          <SelectTrigger>
-                            <SelectValue placeholder="Select a role" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {permissionsData?.roles.map((role) => (
-                              <SelectItem key={role.name} value={role.name}>
-                                <div>
-                                  <div className="font-medium">{role.name}</div>
-                                  <div className="text-xs text-muted-foreground">
-                                    {role.description}
-                                  </div>
-                                </div>
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      )}
-                      {selectedRole && permissionsData && (
-                        <div className="mt-2 p-3 bg-muted rounded-md">
-                          <p className="text-sm font-medium mb-2">
-                            Permissions included:
-                          </p>
-                          <div className="text-xs text-muted-foreground space-y-1">
-                            {permissionsData.roles
-                              .find((r) => r.name === selectedRole)
-                              ?.permissions.map((p) => (
-                                <div key={p}>• {p}</div>
-                              ))}
+                    <TabsContent value="role" className="space-y-4">
+                      <div className="space-y-2">
+                        <FormLabel>Select Role</FormLabel>
+                        {isLoadingPermissions ? (
+                          <div className="text-sm text-muted-foreground">
+                            Loading roles...
                           </div>
-                        </div>
-                      )}
-                    </div>
-                  </TabsContent>
-
-                  <TabsContent value="custom" className="space-y-4">
-                    <div className="space-y-2">
-                      <Label>Select Permissions</Label>
-                      {isLoadingPermissions ? (
-                        <div className="text-sm text-muted-foreground">
-                          Loading permissions...
-                        </div>
-                      ) : (
-                        <ScrollArea className="h-[300px] border rounded-md p-3">
-                          {permissionsByCategory &&
-                            Object.entries(permissionsByCategory).map(
-                              ([category, perms]) => (
-                                <div key={category} className="mb-4">
-                                  <h4 className="font-medium text-sm mb-2">
-                                    {category}
-                                  </h4>
-                                  <div className="space-y-2 ml-2">
-                                    {perms.map((perm) => (
-                                      <div
-                                        key={perm.name}
-                                        className="flex items-start space-x-2"
-                                      >
-                                        <Checkbox
-                                          id={perm.name}
-                                          checked={selectedPermissions.has(
-                                            perm.name
-                                          )}
-                                          onCheckedChange={() =>
-                                            togglePermission(perm.name)
-                                          }
-                                        />
-                                        <div className="grid gap-1.5 leading-none">
-                                          <label
-                                            htmlFor={perm.name}
-                                            className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
-                                          >
-                                            {perm.name}
-                                          </label>
-                                          <p className="text-xs text-muted-foreground">
-                                            {perm.description}
-                                          </p>
-                                        </div>
-                                      </div>
-                                    ))}
+                        ) : (
+                          <Select
+                            value={selectedRole}
+                            onValueChange={handleRoleChange}
+                          >
+                            <SelectTrigger>
+                              <SelectValue placeholder="Select a role" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {permissionsData?.roles.map((role) => (
+                                <SelectItem key={role.name} value={role.name}>
+                                  <div>
+                                    <div className="font-medium">{role.name}</div>
+                                    <div className="text-xs text-muted-foreground">
+                                      {role.description}
+                                    </div>
                                   </div>
-                                </div>
-                              )
-                            )}
-                        </ScrollArea>
-                      )}
-                      {selectedPermissions.size > 0 && (
-                        <div className="text-xs text-muted-foreground">
-                          {selectedPermissions.size} permission
-                          {selectedPermissions.size !== 1 ? 's' : ''} selected
-                        </div>
-                      )}
-                    </div>
-                  </TabsContent>
-                </Tabs>
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        )}
+                        {selectedRole && permissionsData && (
+                          <div className="mt-2 p-3 bg-muted rounded-md">
+                            <p className="text-sm font-medium mb-2">
+                              Permissions included:
+                            </p>
+                            <div className="text-xs text-muted-foreground space-y-1">
+                              {permissionsData.roles
+                                .find((r) => r.name === selectedRole)
+                                ?.permissions.map((p) => (
+                                  <div key={p}>• {p}</div>
+                                ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </TabsContent>
 
-                <div className="space-y-2">
-                  <Label htmlFor="expires_at">Expiration Date (optional)</Label>
-                  <Input
-                    id="expires_at"
+                    <TabsContent value="custom" className="space-y-4">
+                      <div className="space-y-2">
+                        <FormLabel>Select Permissions</FormLabel>
+                        {isLoadingPermissions ? (
+                          <div className="text-sm text-muted-foreground">
+                            Loading permissions...
+                          </div>
+                        ) : (
+                          <ScrollArea className="h-[300px] border rounded-md p-3">
+                            {permissionsByCategory &&
+                              Object.entries(permissionsByCategory).map(
+                                ([category, perms]) => (
+                                  <div key={category} className="mb-4">
+                                    <h4 className="font-medium text-sm mb-2">
+                                      {category}
+                                    </h4>
+                                    <div className="space-y-2 ml-2">
+                                      {perms.map((perm) => (
+                                        <div
+                                          key={perm.name}
+                                          className="flex items-start space-x-2"
+                                        >
+                                          <Checkbox
+                                            id={perm.name}
+                                            checked={selectedPermissions.has(
+                                              perm.name
+                                            )}
+                                            onCheckedChange={() =>
+                                              togglePermission(perm.name)
+                                            }
+                                          />
+                                          <div className="grid gap-1.5 leading-none">
+                                            <label
+                                              htmlFor={perm.name}
+                                              className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
+                                            >
+                                              {perm.name}
+                                            </label>
+                                            <p className="text-xs text-muted-foreground">
+                                              {perm.description}
+                                            </p>
+                                          </div>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )
+                              )}
+                          </ScrollArea>
+                        )}
+                        {selectedPermissions.size > 0 && (
+                          <div className="text-xs text-muted-foreground">
+                            {selectedPermissions.size} permission
+                            {selectedPermissions.size !== 1 ? 's' : ''} selected
+                          </div>
+                        )}
+                      </div>
+                    </TabsContent>
+                  </Tabs>
+
+                  <FormField
+                    control={form.control}
                     name="expires_at"
-                    type="date"
-                    min={new Date().toISOString().split('T')[0]}
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Expiration Date (optional)</FormLabel>
+                        <FormControl>
+                          <Input
+                            type="date"
+                            min={new Date().toISOString().split('T')[0]}
+                            {...field}
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
                   />
                 </div>
-              </div>
-              <DialogFooter>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => onOpenChange(false)}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  type="submit"
-                  disabled={
-                    isPending ||
-                    (!useCustomPermissions && !selectedRole) ||
-                    (useCustomPermissions && selectedPermissions.size === 0)
-                  }
-                >
-                  {isPending ? 'Creating...' : 'Create'}
-                </Button>
-              </DialogFooter>
-            </form>
+                <DialogFooter>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => onOpenChange(false)}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    type="submit"
+                    disabled={
+                      isPending ||
+                      (!useCustomPermissions && !selectedRole) ||
+                      (useCustomPermissions && selectedPermissions.size === 0)
+                    }
+                  >
+                    {isPending ? 'Creating...' : 'Create'}
+                  </Button>
+                </DialogFooter>
+              </form>
+            </Form>
           </>
         )}
       </DialogContent>

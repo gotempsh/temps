@@ -17,6 +17,7 @@ import {
 import {
   Activity,
   BadgeCheck,
+  Bell,
   ChevronsUpDown,
   Database,
   DatabaseBackup,
@@ -91,6 +92,11 @@ const data = {
       title: 'Settings',
       url: '/settings',
       icon: Settings,
+    },
+    {
+      title: 'Notifications',
+      url: '/notifications',
+      icon: Bell,
     },
     {
       title: 'External Connectivity',
@@ -312,7 +318,7 @@ export default function AppSidebar() {
   // Auto-collapse sidebar when on project detail pages
   useEffect(() => {
     const isProjectDetailPage = location.pathname.match(
-      /^\/projects\/[^/]+\/(project|deployments|analytics|storage|runtime|settings|speed|errors|logs)/
+      /^\/projects\/[^/]+\/(project|deployments|analytics|storage|runtime|settings|speed|errors|logs|webhooks)/
     )
 
     if (isProjectDetailPage && !isMobile) {

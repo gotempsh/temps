@@ -116,6 +116,7 @@ impl TempsPlugin for DeploymentsPlugin {
             // Create WorkflowExecutionService
             let workflow_execution_service = Arc::new(WorkflowExecutionService::new(
                 db.clone(),
+                queue_service.clone(),
                 git_provider,
                 image_builder,
                 deployer,
@@ -146,6 +147,7 @@ impl TempsPlugin for DeploymentsPlugin {
             let mut job_processor = JobProcessorService::with_external_service_manager(
                 db,
                 job_receiver,
+                queue_service.clone(),
                 workflow_execution_service,
                 workflow_planner,
                 git_provider_manager,
