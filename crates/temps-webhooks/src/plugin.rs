@@ -63,22 +63,30 @@ impl TempsPlugin for WebhooksPlugin {
             let webhook_state = Arc::new(WebhookState::new(webhook_service.clone()));
             context.register_service(webhook_state);
 
-            // Create and start WebhookEventListener
+            // Create WebhookEventListener
             let event_listener = Arc::new(WebhookEventListener::new(
                 webhook_service.clone(),
                 queue.clone(),
             ));
 
-            // Start the listener
-            if let Err(e) = event_listener.start().await {
-                tracing::error!("Failed to start webhook event listener: {}", e);
-                return Err(PluginError::InitializationFailed(format!(
-                    "Failed to start webhook event listener: {}",
-                    e
-                )));
-            }
+            // Register the listener service FIRST
+            context.register_service(event_listener.clone());
 
-            context.register_service(event_listener);
+            // Start the listener in the background (don't await)
+            // This allows other plugins to initialize without waiting for the listener
+            tokio::spawn({
+                let event_listener = event_listener.clone();
+                async move {
+                    match event_listener.start().await {
+                        Ok(_) => {
+                            tracing::info!("🎉 Webhook event listener started successfully");
+                        }
+                        Err(e) => {
+                            tracing::error!("❌ Failed to start webhook event listener: {}", e);
+                        }
+                    }
+                }
+            });
 
             debug!("Webhooks plugin services registered successfully");
             Ok(())
