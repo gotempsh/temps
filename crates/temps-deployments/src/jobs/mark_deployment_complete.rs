@@ -9,7 +9,9 @@ use async_trait::async_trait;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_core::{JobResult, UtcDateTime, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_core::{
+    Job, JobQueue, JobResult, UtcDateTime, WorkflowContext, WorkflowError, WorkflowTask,
+};
 use temps_database::DbConnection;
 use temps_entities::{deployment_containers, deployments, environments};
 use temps_logs::{LogLevel, LogService};
@@ -30,6 +32,7 @@ pub struct MarkDeploymentCompleteJob {
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
     container_deployer: Arc<dyn temps_deployer::ContainerDeployer>,
+    queue: Arc<dyn JobQueue>,
 }
 
 impl std::fmt::Debug for MarkDeploymentCompleteJob {
@@ -47,6 +50,7 @@ impl MarkDeploymentCompleteJob {
         deployment_id: i32,
         db: Arc<DbConnection>,
         container_deployer: Arc<dyn temps_deployer::ContainerDeployer>,
+        queue: Arc<dyn JobQueue>,
     ) -> Self {
         Self {
             job_id,
@@ -55,6 +59,7 @@ impl MarkDeploymentCompleteJob {
             log_id: None,
             log_service: None,
             container_deployer,
+            queue,
         }
     }
 
@@ -137,7 +142,7 @@ impl MarkDeploymentCompleteJob {
         let environment_id = deployment.environment_id;
 
         // Update deployment with workflow outputs
-        let mut active_deployment: deployments::ActiveModel = deployment.into();
+        let mut active_deployment: deployments::ActiveModel = deployment.clone().into();
 
         // Extract image info from build job output
         if let Ok(Some(image_tag)) = context.get_output::<String>("build_image", "image_tag") {
@@ -300,6 +305,7 @@ impl MarkDeploymentCompleteJob {
         active_environment.current_deployment_id = Set(Some(self.deployment_id));
 
         active_environment
+            .clone()
             .update(self.db.as_ref())
             .await
             .map_err(|e| {
@@ -318,6 +324,33 @@ impl MarkDeploymentCompleteJob {
 
         self.log("Deployment is now LIVE and ready for traffic!".to_string())
             .await?;
+
+        // Emit DeploymentSucceeded event
+        // Get deployment URL from environment
+        let url = if !active_environment.host.as_ref().is_empty() {
+            Some(format!("https://{}", active_environment.host.as_ref()))
+        } else {
+            None
+        };
+
+        let event = Job::DeploymentSucceeded(temps_core::DeploymentSucceededJob {
+            deployment_id: self.deployment_id,
+            project_id: deployment.project_id,
+            environment_id,
+            environment_name: active_environment.name.as_ref().clone(),
+            commit_sha: deployment.commit_sha.clone(),
+            url,
+        });
+
+        if let Err(e) = self.queue.send(event).await {
+            self.log(format!("Failed to send DeploymentSucceeded event: {}", e))
+                .await?;
+        } else {
+            debug!(
+                "Sent DeploymentSucceeded event for deployment {}",
+                self.deployment_id
+            );
+        }
 
         // Cancel and teardown all previous deployments for this environment
         self.cancel_previous_deployments(environment_id).await;
@@ -540,6 +573,7 @@ pub struct MarkDeploymentCompleteJobBuilder {
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
     container_deployer: Option<Arc<dyn temps_deployer::ContainerDeployer>>,
+    queue: Option<Arc<dyn JobQueue>>,
 }
 
 impl MarkDeploymentCompleteJobBuilder {
@@ -551,6 +585,7 @@ impl MarkDeploymentCompleteJobBuilder {
             log_id: None,
             log_service: None,
             container_deployer: None,
+            queue: None,
         }
     }
 
@@ -587,6 +622,11 @@ impl MarkDeploymentCompleteJobBuilder {
         self
     }
 
+    pub fn queue(mut self, queue: Arc<dyn JobQueue>) -> Self {
+        self.queue = Some(queue);
+        self
+    }
+
     pub fn build(self) -> Result<MarkDeploymentCompleteJob, WorkflowError> {
         let job_id = self
             .job_id
@@ -600,8 +640,12 @@ impl MarkDeploymentCompleteJobBuilder {
         let container_deployer = self.container_deployer.ok_or_else(|| {
             WorkflowError::JobValidationFailed("container_deployer is required".to_string())
         })?;
+        let queue = self
+            .queue
+            .ok_or_else(|| WorkflowError::JobValidationFailed("queue is required".to_string()))?;
 
-        let mut job = MarkDeploymentCompleteJob::new(job_id, deployment_id, db, container_deployer);
+        let mut job =
+            MarkDeploymentCompleteJob::new(job_id, deployment_id, db, container_deployer, queue);
 
         if let Some(log_id) = self.log_id {
             job = job.with_log_id(log_id);

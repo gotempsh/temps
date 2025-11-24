@@ -37,6 +37,7 @@ impl WebhookState {
         update_webhook,
         delete_webhook,
         list_deliveries,
+        get_delivery,
         retry_delivery,
         list_event_types,
     ),
@@ -128,6 +129,9 @@ pub struct WebhookDeliveryResponse {
     pub webhook_id: i32,
     pub event_type: String,
     pub event_id: String,
+    /// JSON payload that was sent to the webhook endpoint
+    #[schema(example = json!({"event_type": "deployment.succeeded", "data": {"deployment_id": 123}}))]
+    pub payload: String,
     pub success: bool,
     pub status_code: Option<i32>,
     pub response_body: Option<String>,
@@ -145,6 +149,7 @@ impl From<temps_entities::webhook_deliveries::Model> for WebhookDeliveryResponse
             webhook_id: delivery.webhook_id,
             event_type: delivery.event_type,
             event_id: delivery.event_id,
+            payload: delivery.payload,
             success: delivery.success,
             status_code: delivery.status_code,
             response_body: delivery.response_body,
@@ -506,6 +511,67 @@ async fn list_deliveries(
     }
 }
 
+/// Get a specific webhook delivery by ID
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}",
+    responses(
+        (status = 200, description = "Delivery details including full payload", body = WebhookDeliveryResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Delivery not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("webhook_id" = i32, Path, description = "Webhook ID"),
+        ("delivery_id" = i32, Path, description = "Delivery ID")
+    ),
+    tag = "Webhook Deliveries",
+    security(("bearer_auth" = []))
+)]
+async fn get_delivery(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<WebhookState>>,
+    Path((project_id, webhook_id, delivery_id)): Path<(i32, i32, i32)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, WebhooksRead);
+
+    // Verify webhook belongs to project
+    if let Ok(Some(existing)) = state.webhook_service.get_webhook(webhook_id).await {
+        if existing.project_id != project_id {
+            return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .title("Webhook not found")
+                .detail("Webhook does not belong to this project")
+                .build());
+        }
+    }
+
+    // Get the delivery
+    match state.webhook_service.get_delivery(delivery_id).await {
+        Ok(Some(delivery)) => {
+            // Verify delivery belongs to the webhook
+            if delivery.webhook_id != webhook_id {
+                return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+                    .title("Delivery not found")
+                    .detail("Delivery does not belong to this webhook")
+                    .build());
+            }
+            Ok(Json(WebhookDeliveryResponse::from(delivery)))
+        }
+        Ok(None) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+            .title("Delivery not found")
+            .build()),
+        Err(e) => {
+            error!("Failed to get delivery: {}", e);
+            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Failed to get delivery")
+                .detail(e.to_string())
+                .build())
+        }
+    }
+}
+
 /// Retry a failed delivery
 #[utoipa::path(
     post,
@@ -634,6 +700,10 @@ pub fn configure_routes() -> Router<Arc<WebhookState>> {
         .route(
             "/projects/{project_id}/webhooks/{webhook_id}/deliveries",
             get(list_deliveries),
+        )
+        .route(
+            "/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}",
+            get(get_delivery),
         )
         .route(
             "/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry",

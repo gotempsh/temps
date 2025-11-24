@@ -96,6 +96,7 @@ fn main() -> anyhow::Result<()> {
              temps_analytics_session_replay={level},\
              temps_analytics_events={level},\
              temps_analytics_funnels={level},\
+             temps_webhooks={level},\
              pingora=warn,\
              sqlx=warn,\
              sea_orm=warn,\

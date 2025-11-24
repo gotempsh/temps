@@ -590,6 +590,7 @@ impl WorkflowExecutionService {
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone())
                     .container_deployer(self.container_deployer.clone())
+                    .queue(self.queue.clone())
                     .build()?;
 
                 Ok(Arc::new(job))

@@ -1,5 +1,8 @@
 import { ProjectResponse, WebhookResponse } from '@/api/client'
-import { updateWebhookMutation } from '@/api/client/@tanstack/react-query.gen'
+import {
+  updateWebhookMutation,
+  listEventTypesOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -23,29 +26,19 @@ import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useMutation } from '@tanstack/react-query'
-import { Loader2 } from 'lucide-react'
+import { useMutation, useQuery } from '@tanstack/react-query'
+import { AlertCircle, Loader2 } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
-
-const AVAILABLE_EVENTS = [
-  { id: 'deployment.started', label: 'Deployment Started', description: 'Triggered when a deployment begins' },
-  { id: 'deployment.succeeded', label: 'Deployment Succeeded', description: 'Triggered when a deployment completes successfully' },
-  { id: 'deployment.failed', label: 'Deployment Failed', description: 'Triggered when a deployment fails' },
-  { id: 'error.created', label: 'Error Created', description: 'Triggered when a new error is detected' },
-  { id: 'monitor.down', label: 'Monitor Down', description: 'Triggered when a monitor detects downtime' },
-  { id: 'monitor.up', label: 'Monitor Up', description: 'Triggered when a monitor recovers' },
-  { id: 'domain.verified', label: 'Domain Verified', description: 'Triggered when a domain is successfully verified' },
-  { id: 'domain.failed', label: 'Domain Verification Failed', description: 'Triggered when domain verification fails' },
-]
+import { Alert, AlertDescription } from '@/components/ui/alert'
 
 const formSchema = z.object({
-  url: z.string().url('Must be a valid URL').min(1, 'URL is required'),
+  url: z.string().min(1, 'URL is required').url('Must be a valid URL'),
   events: z.array(z.string()).min(1, 'Select at least one event'),
   secret: z.string().optional(),
-  enabled: z.boolean().default(true),
+  enabled: z.boolean().optional().default(true),
 })
 
 type FormValues = z.infer<typeof formSchema>
@@ -73,6 +66,15 @@ export function EditWebhookDialog({
       secret: '',
       enabled: true,
     },
+  })
+
+  // Fetch available event types from API
+  const {
+    data: eventTypes,
+    isLoading: isLoadingEventTypes,
+    isError: isEventTypesError,
+  } = useQuery({
+    ...listEventTypesOptions(),
   })
 
   // Update form when webhook changes
@@ -158,48 +160,83 @@ export function EditWebhookDialog({
                       Select which events should trigger this webhook
                     </FormDescription>
                   </div>
-                  <ScrollArea className="h-[300px] rounded-md border p-4">
-                    <div className="space-y-4">
-                      {AVAILABLE_EVENTS.map((event) => (
-                        <FormField
-                          key={event.id}
-                          control={form.control}
-                          name="events"
-                          render={({ field }) => {
-                            return (
-                              <FormItem
-                                key={event.id}
-                                className="flex flex-row items-start space-x-3 space-y-0"
-                              >
-                                <FormControl>
-                                  <Checkbox
-                                    checked={field.value?.includes(event.id)}
-                                    onCheckedChange={(checked) => {
-                                      return checked
-                                        ? field.onChange([...field.value, event.id])
-                                        : field.onChange(
-                                            field.value?.filter(
-                                              (value) => value !== event.id
-                                            )
-                                          )
-                                    }}
-                                  />
-                                </FormControl>
-                                <div className="space-y-1 leading-none">
-                                  <FormLabel className="font-medium cursor-pointer">
-                                    {event.label}
-                                  </FormLabel>
-                                  <FormDescription className="text-xs">
-                                    {event.description}
-                                  </FormDescription>
-                                </div>
-                              </FormItem>
-                            )
-                          }}
-                        />
-                      ))}
+
+                  {isLoadingEventTypes ? (
+                    <div className="flex items-center justify-center h-[300px] rounded-md border">
+                      <div className="flex flex-col items-center gap-2 text-muted-foreground">
+                        <Loader2 className="h-6 w-6 animate-spin" />
+                        <p className="text-sm">Loading event types...</p>
+                      </div>
                     </div>
-                  </ScrollArea>
+                  ) : isEventTypesError ? (
+                    <Alert variant="destructive">
+                      <AlertCircle className="h-4 w-4" />
+                      <AlertDescription>
+                        Failed to load event types. Please try again later.
+                      </AlertDescription>
+                    </Alert>
+                  ) : (
+                    <ScrollArea className="h-[300px] rounded-md border p-4">
+                      <div className="space-y-4">
+                        {eventTypes?.map((eventType) => (
+                          <FormField
+                            key={eventType.event_type}
+                            control={form.control}
+                            name="events"
+                            render={({ field }) => {
+                              return (
+                                <FormItem
+                                  key={eventType.event_type}
+                                  className="flex flex-row items-start space-x-3 space-y-0"
+                                >
+                                  <FormControl>
+                                    <Checkbox
+                                      checked={field.value?.includes(
+                                        eventType.event_type
+                                      )}
+                                      onCheckedChange={(checked) => {
+                                        return checked
+                                          ? field.onChange([
+                                              ...field.value,
+                                              eventType.event_type,
+                                            ])
+                                          : field.onChange(
+                                              field.value?.filter(
+                                                (value) =>
+                                                  value !== eventType.event_type
+                                              )
+                                            )
+                                      }}
+                                    />
+                                  </FormControl>
+                                  <div className="space-y-1 leading-none">
+                                    <div className="flex items-center gap-2">
+                                      <FormLabel className="font-medium cursor-pointer">
+                                        {eventType.event_type
+                                          .split('.')
+                                          .map(
+                                            (word) =>
+                                              word.charAt(0).toUpperCase() +
+                                              word.slice(1)
+                                          )
+                                          .join(' ')}
+                                      </FormLabel>
+                                      <span className="text-xs text-muted-foreground bg-muted px-2 py-0.5 rounded">
+                                        {eventType.category}
+                                      </span>
+                                    </div>
+                                    <FormDescription className="text-xs">
+                                      {eventType.description}
+                                    </FormDescription>
+                                  </div>
+                                </FormItem>
+                              )
+                            }}
+                          />
+                        ))}
+                      </div>
+                    </ScrollArea>
+                  )}
                   <FormMessage />
                 </FormItem>
               )}

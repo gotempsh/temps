@@ -15,7 +15,6 @@ import {
   Shield,
   Key,
   Globe,
-  Webhook,
 } from 'lucide-react'
 import {
   useCallback,
@@ -205,6 +204,33 @@ export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
     'settings',
   ])
 
+  // Build nav items including environments
+  const settingsIndex = baseNavItems.length - 1
+  const navItems: NavItem[] = [
+    ...baseNavItems.slice(0, settingsIndex),
+    {
+      title: 'Environments',
+      url: 'environments',
+      icon: Layers,
+    },
+    baseNavItems[settingsIndex],
+  ]
+
+  // Auto-expand parent items when navigating to their sub-items
+  useEffect(() => {
+    const path = location.pathname
+    navItems.forEach((item) => {
+      if (item.subItems) {
+        const isOnSubItem = item.subItems.some((subItem) =>
+          path.includes(`/${subItem.url}`)
+        )
+        if (isOnSubItem && !expandedItems.includes(item.title)) {
+          setExpandedItems((prev) => [...prev, item.title])
+        }
+      }
+    })
+  }, [location.pathname])
+
   const isActive = (url: string) => {
     const path = location.pathname
     if (url === 'project') {
@@ -268,20 +294,6 @@ export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
     },
     [project.slug, navigate]
   )
-
-  // Build nav items including environments
-  // Find the index of Settings (last item in baseNavItems)
-  const settingsIndex = baseNavItems.length - 1
-  const navItems: NavItem[] = [
-    ...baseNavItems.slice(0, settingsIndex), // All items before Settings
-    // Insert Environments before Settings
-    {
-      title: 'Environments',
-      url: 'environments',
-      icon: Layers,
-    },
-    baseNavItems[settingsIndex], // Settings (last item)
-  ]
 
   // Navigation content component (reusable for mobile and desktop)
   const NavigationContent = ({ closeSheet }: { closeSheet?: () => void }) => (
