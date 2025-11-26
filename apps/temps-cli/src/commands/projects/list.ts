@@ -1,17 +1,10 @@
 import { requireAuth } from '../../config/store.js'
 import { withSpinner } from '../../ui/spinner.js'
-import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
+import { printTable, type TableColumn } from '../../ui/table.js'
 import { newline, header, icons, json, colors, formatRelativeTime } from '../../ui/output.js'
-import { getClient } from '../../api/client.js'
-
-interface Project {
-  id: number
-  name: string
-  description?: string
-  status?: string
-  created_at: string
-  updated_at: string
-}
+import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import { getProjects } from '../../api/sdk.gen.js'
+import type { ProjectResponse } from '../../api/types.gen.js'
 
 interface ListOptions {
   json?: boolean
@@ -19,17 +12,16 @@ interface ListOptions {
 
 export async function list(options: ListOptions): Promise<void> {
   await requireAuth()
-
-  const client = getClient()
+  await setupClient()
 
   const projects = await withSpinner('Fetching projects...', async () => {
-    const response = await client.get('/api/projects')
+    const { data, error } = await getProjects({ client })
 
-    if (response.error) {
-      throw new Error('Failed to fetch projects')
+    if (error) {
+      throw new Error(getErrorMessage(error))
     }
 
-    return (response.data ?? []) as Project[]
+    return data?.projects ?? []
   })
 
   if (options.json) {
@@ -39,19 +31,14 @@ export async function list(options: ListOptions): Promise<void> {
 
   newline()
   header(`${icons.folder} Projects (${projects.length})`)
-
-  const columns: TableColumn<Project>[] = [
+  const columns: TableColumn<ProjectResponse>[] = [
     { header: 'ID', key: 'id', width: 8 },
-    { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
-    { header: 'Description', accessor: (p) => p.description ?? '-', width: 30 },
-    {
-      header: 'Status',
-      accessor: (p) => p.status ?? 'active',
-      color: (v) => statusBadge(v),
-    },
+    { header: 'Name', key: 'name', color: (v) => colors.bold(String(v)) },
+    { header: 'Slug', key: 'slug', width: 20 },
+    { header: 'Branch', key: 'main_branch', width: 15 },
     {
       header: 'Updated',
-      accessor: (p) => formatRelativeTime(p.updated_at),
+      accessor: (p) => formatRelativeTime(new Date(p.updated_at * 1000).toISOString()),
       color: (v) => colors.muted(v),
     },
   ]

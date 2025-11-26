@@ -1,4 +1,7 @@
 import Conf from 'conf'
+import { readFile, writeFile, mkdir } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { colors } from '../ui/output.js'
 
 export interface TempsConfig {
@@ -35,28 +38,16 @@ const SECRET_KEYS = {
 } as const
 
 /**
- * Get a secret from Bun's secure storage
- */
-function getSecret(key: string): string | undefined {
-  // Bun stores secrets as properties on process.env that are loaded from .env.local
-  // For secure storage, we use Bun's built-in secret storage via environment
-  const value = process.env[key]
-  return value || undefined
-}
-
-/**
- * Set a secret in Bun's secure storage
- * Writes to ~/.temps/.secrets file which is loaded automatically
+ * Set a secret in the secrets file
  */
 async function setSecret(key: string, value: string): Promise<void> {
-  const secretsPath = getSecretsPath()
   const secrets = await loadSecrets()
   secrets[key] = value
   await saveSecrets(secrets)
 }
 
 /**
- * Delete a secret from Bun's secure storage
+ * Delete a secret from the secrets file
  */
 async function deleteSecret(key: string): Promise<void> {
   const secrets = await loadSecrets()
@@ -78,9 +69,8 @@ function getSecretsPath(): string {
 async function loadSecrets(): Promise<Record<string, string>> {
   const secretsPath = getSecretsPath()
   try {
-    const file = Bun.file(secretsPath)
-    if (await file.exists()) {
-      const content = await file.text()
+    if (existsSync(secretsPath)) {
+      const content = await readFile(secretsPath, 'utf-8')
       const secrets: Record<string, string> = {}
       for (const line of content.split('\n')) {
         const trimmed = line.trim()
@@ -111,21 +101,17 @@ async function loadSecrets(): Promise<Record<string, string>> {
  */
 async function saveSecrets(secrets: Record<string, string>): Promise<void> {
   const secretsPath = getSecretsPath()
-  const dir = secretsPath.substring(0, secretsPath.lastIndexOf('/'))
+  const dir = dirname(secretsPath)
 
   // Ensure directory exists
-  await Bun.write(`${dir}/.keep`, '')
+  await mkdir(dir, { recursive: true })
 
   // Write secrets file
   const lines = ['# Temps CLI secrets - DO NOT SHARE THIS FILE']
   for (const [key, value] of Object.entries(secrets)) {
     lines.push(`${key}="${value}"`)
   }
-  await Bun.write(secretsPath, lines.join('\n') + '\n')
-
-  // Set restrictive permissions (owner read/write only)
-  const { chmod } = await import('node:fs/promises')
-  await chmod(secretsPath, 0o600)
+  await writeFile(secretsPath, lines.join('\n') + '\n', { mode: 0o600 })
 }
 
 export const config = {

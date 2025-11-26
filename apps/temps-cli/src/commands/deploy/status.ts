@@ -1,22 +1,9 @@
 import { requireAuth } from '../../config/store.js'
+import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import { getDeployment, getProjectBySlug } from '../../api/sdk.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
-import { newline, header, icons, json, colors, keyValue, formatDate } from '../../ui/output.js'
+import { newline, header, icons, json, colors, formatDate } from '../../ui/output.js'
 import { detailsTable, statusBadge } from '../../ui/table.js'
-import { getClient } from '../../api/client.js'
-
-interface Deployment {
-  id: number
-  project_name?: string
-  environment?: string
-  status: string
-  branch?: string
-  commit_sha?: string
-  commit_message?: string
-  created_at: string
-  started_at?: string
-  finished_at?: string
-  error_message?: string
-}
 
 interface StatusOptions {
   json?: boolean
@@ -24,19 +11,40 @@ interface StatusOptions {
 
 export async function status(deploymentId: string, options: StatusOptions): Promise<void> {
   await requireAuth()
+  await setupClient()
 
-  const client = getClient()
+  // Parse project and deployment from input
+  // Format: project:deployment_id or just deployment_id (requires project context)
+  let projectId: number
+  let depId: number
+
+  if (deploymentId.includes(':')) {
+    const [projectSlug, depIdStr] = deploymentId.split(':')
+    const { data, error } = await getProjectBySlug({
+      client,
+      path: { slug: projectSlug },
+    })
+    if (error || !data) {
+      throw new Error(`Project "${projectSlug}" not found`)
+    }
+    projectId = data.id
+    depId = parseInt(depIdStr, 10)
+  } else {
+    // Assume deploymentId is in format "projectId:deploymentId" as number:number
+    throw new Error('Please specify deployment as project:deployment_id (e.g., my-project:123)')
+  }
 
   const deployment = await withSpinner('Fetching deployment status...', async () => {
-    const response = await client.get('/api/deployments/{id}' as never, {
-      params: { path: { id: deploymentId } },
+    const { data, error } = await getDeployment({
+      client,
+      path: { project_id: projectId, deployment_id: depId },
     })
 
-    if (response.error || !response.data) {
-      throw new Error(`Deployment #${deploymentId} not found`)
+    if (error || !data) {
+      throw new Error(`Deployment #${depId} not found`)
     }
 
-    return response.data as Deployment
+    return data
   })
 
   if (options.json) {
@@ -55,31 +63,29 @@ export async function status(deploymentId: string, options: StatusOptions): Prom
         : 'Not started'
 
   detailsTable({
-    Project: deployment.project_name ?? 'Unknown',
-    Environment: deployment.environment ?? 'production',
+    Project: `Project ID ${deployment.project_id}`,
+    Environment: deployment.environment?.name ?? 'unknown',
     Status: statusBadge(deployment.status),
     Branch: deployment.branch ?? '-',
-    Commit: deployment.commit_sha?.substring(0, 7) ?? '-',
+    Commit: deployment.commit_hash?.substring(0, 7) ?? '-',
     Message: deployment.commit_message ?? '-',
     Duration: duration,
-    Created: formatDate(deployment.created_at),
-    Started: deployment.started_at ? formatDate(deployment.started_at) : '-',
-    Finished: deployment.finished_at ? formatDate(deployment.finished_at) : '-',
+    URL: deployment.url ?? '-',
+    Created: formatDate(new Date(deployment.created_at * 1000).toISOString()),
+    Started: deployment.started_at ? formatDate(new Date(deployment.started_at * 1000).toISOString()) : '-',
+    Finished: deployment.finished_at ? formatDate(new Date(deployment.finished_at * 1000).toISOString()) : '-',
   })
 
-  if (deployment.error_message) {
+  if (deployment.cancelled_reason) {
     newline()
-    console.log(colors.error(`Error: ${deployment.error_message}`))
+    console.log(colors.error(`Cancelled: ${deployment.cancelled_reason}`))
   }
 
   newline()
 }
 
-function calculateDuration(start: string, end: string): string {
-  const startDate = new Date(start)
-  const endDate = new Date(end)
-  const diffMs = endDate.getTime() - startDate.getTime()
-
+function calculateDuration(startMs: number, endMs: number): string {
+  const diffMs = (endMs - startMs) * 1000
   const seconds = Math.floor(diffMs / 1000)
   const minutes = Math.floor(seconds / 60)
 

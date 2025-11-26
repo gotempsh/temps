@@ -36,9 +36,13 @@ pub struct RedisInputConfig {
     #[schemars(example = "example_port")]
     pub port: Option<String>,
 
-    /// Redis password (auto-generated if not provided or empty)
+    /// Redis password (auto-generated if not provided, empty, or less than 8 characters)
     #[serde(default, deserialize_with = "deserialize_optional_password")]
-    #[schemars(with = "Option<String>", example = "example_password")]
+    #[schemars(
+        with = "Option<String>",
+        example = "example_password",
+        description = "Redis password (minimum 8 characters, auto-generated if not provided)"
+    )]
     pub password: Option<String>,
 
     /// Full Docker image reference (e.g., "redis:7-alpine")
@@ -72,13 +76,19 @@ impl From<RedisInputConfig> for RedisConfig {
     }
 }
 
+const MIN_PASSWORD_LENGTH: usize = 8;
+
 fn deserialize_optional_password<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let opt: Option<String> = Option::deserialize(deserializer)?;
     Ok(match opt {
-        Some(s) if !s.is_empty() => Some(s),
+        Some(s) if !s.is_empty() && s.len() >= MIN_PASSWORD_LENGTH => Some(s),
+        Some(s) if !s.is_empty() && s.len() < MIN_PASSWORD_LENGTH => {
+            // Password provided but too short - treat as None to trigger auto-generation
+            None
+        }
         _ => None,
     })
 }
@@ -128,8 +138,6 @@ fn find_available_port(start_port: u16) -> Option<u16> {
 pub struct RedisService {
     name: String,
     config: Arc<RwLock<Option<RedisConfig>>>,
-    client: Arc<RwLock<Option<Client>>>,
-    connection_manager: Arc<RwLock<Option<ConnectionManager>>>,
     docker: Arc<Docker>,
 }
 
@@ -138,18 +146,37 @@ impl RedisService {
         Self {
             name,
             config: Arc::new(RwLock::new(None)),
-            client: Arc::new(RwLock::new(None)),
-            connection_manager: Arc::new(RwLock::new(None)),
             docker,
         }
     }
 
-    pub async fn get_connection(&self) -> Result<ConnectionManager> {
-        let conn = self.connection_manager.read().await;
-        match conn.as_ref() {
-            Some(c) => Ok(c.clone()),
-            None => Err(anyhow::anyhow!("Redis connection not initialized")),
-        }
+    /// Create a fresh Redis connection
+    /// Connection will be automatically closed when ConnectionManager is dropped
+    async fn get_connection(&self) -> Result<ConnectionManager> {
+        let config = self
+            .config
+            .read()
+            .await
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Redis configuration not found"))?
+            .clone();
+
+        let connection_url = if config.password.is_empty() {
+            format!("redis://localhost:{}", config.port)
+        } else {
+            format!(
+                "redis://:{}@localhost:{}",
+                urlencoding::encode(&config.password),
+                config.port
+            )
+        };
+
+        let client = Client::open(connection_url.as_str())
+            .map_err(|e| anyhow::anyhow!("Failed to create Redis client: {}", e))?;
+
+        ConnectionManager::new(client)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create Redis connection manager: {}", e))
     }
 
     fn get_container_name(&self) -> String {
@@ -188,7 +215,7 @@ impl RedisService {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to pull Redis image: {}", e))?;
 
-        // Check if container already exists
+        // Check if container already exists and remove it
         let containers = docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
                 all: true,
@@ -201,8 +228,33 @@ impl RedisService {
             .await?;
 
         if !containers.is_empty() {
-            info!("Container {} already exists", container_name);
-            return Ok(());
+            info!(
+                "Container {} already exists, removing it to recreate with new configuration",
+                container_name
+            );
+
+            // Stop the container first
+            let _ = docker
+                .stop_container(
+                    &container_name,
+                    None::<bollard::query_parameters::StopContainerOptions>,
+                )
+                .await;
+
+            // Remove the container
+            docker
+                .remove_container(
+                    &container_name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        v: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to remove existing container: {}", e))?;
+
+            info!("Removed existing container {}", container_name);
         }
 
         let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);
@@ -214,6 +266,19 @@ impl RedisService {
         ]);
 
         let env_vars = [format!("REDIS_PASSWORD={}", password)];
+
+        // Build Redis server command with password authentication if password is set
+        let mut redis_cmd = vec![
+            "redis-server".to_string(),
+            "--appendonly".to_string(),
+            "yes".to_string(),
+        ];
+
+        // Add password requirement if password is not empty
+        if !password.is_empty() {
+            redis_cmd.push("--requirepass".to_string());
+            redis_cmd.push(password.to_string());
+        }
 
         let volume_name = format!("redis_data_{}", self.name);
         let host_config = bollard::models::HostConfig {
@@ -253,11 +318,7 @@ impl RedisService {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
             ),
-            cmd: Some(vec![
-                "redis-server".to_string(),
-                "--appendonly".to_string(),
-                "yes".to_string(),
-            ]),
+            cmd: Some(redis_cmd),
             host_config: Some(bollard::models::HostConfig {
                 restart_policy: Some(bollard::models::RestartPolicy {
                     name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
@@ -343,66 +404,18 @@ impl RedisService {
         Err(anyhow::anyhow!("Redis container health check timed out"))
     }
 
-    async fn create_database(&self, name: &str) -> Result<u8> {
-        let conn = self.get_connection().await?;
+    /// Calculate a deterministic database number (0-15) from a resource name
+    /// This allows us to allocate databases without requiring a Redis connection
+    fn calculate_database_number(&self, resource_name: &str) -> u8 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
-        // Get next available database number
-        let db_number = self.get_next_database_number().await?;
+        let mut hasher = DefaultHasher::new();
+        resource_name.hash(&mut hasher);
+        let hash = hasher.finish();
 
-        // Store the mapping of name to db number
-        redis::cmd("SET")
-            .arg(format!("_db_mapping:{}", name))
-            .arg(db_number.to_string())
-            .query_async::<()>(&mut conn.clone())
-            .await?;
-
-        Ok(db_number)
-    }
-
-    async fn drop_database(&self, name: &str) -> Result<()> {
-        let conn = self.get_connection().await?;
-
-        // Get the database number
-        let db_number: Option<String> = redis::cmd("GET")
-            .arg(format!("_db_mapping:{}", name))
-            .query_async(&mut conn.clone())
-            .await?;
-
-        if let Some(db_num) = db_number {
-            // Clear all keys in this database
-            redis::cmd("SELECT")
-                .arg(&db_num)
-                .query_async::<()>(&mut conn.clone())
-                .await?;
-
-            redis::cmd("FLUSHDB")
-                .query_async::<()>(&mut conn.clone())
-                .await?;
-
-            // Remove the mapping
-            redis::cmd("DEL")
-                .arg(format!("_db_mapping:{}", name))
-                .query_async::<()>(&mut conn.clone())
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    async fn get_next_database_number(&self) -> Result<u8> {
-        // You might want to implement a more sophisticated way to track database numbers
-        // For now, we'll just use a simple counter in Redis itself
-        let conn = self.get_connection().await?;
-        let counter: u8 = redis::cmd("INCR")
-            .arg("_db_counter")
-            .query_async(&mut conn.clone())
-            .await?;
-
-        if counter > 15 {
-            return Err(anyhow::anyhow!("No more Redis databases available"));
-        }
-
-        Ok(counter)
+        // Redis supports 16 databases (0-15), so we use modulo to get a valid number
+        (hash % 16) as u8
     }
 
     fn get_redis_config(&self, service_config: ServiceConfig) -> Result<RedisConfig> {
@@ -468,9 +481,12 @@ impl ExternalService for RedisService {
         // Store runtime config
         *self.config.write().await = Some(redis_config.clone());
 
-        // Create Docker container
+        // Create Docker container (but don't start it yet)
+        // Note: Connection will be established in start() method
         self.create_container(&self.docker, &redis_config, &redis_config.password)
             .await?;
+
+        info!("Redis container created, connection will be established on start");
 
         // Serialize the full runtime config to save to database
         // This ensures auto-generated values (password, port) are persisted
@@ -525,8 +541,7 @@ impl ExternalService for RedisService {
     }
 
     async fn cleanup(&self) -> Result<()> {
-        *self.connection_manager.write().await = None;
-        *self.client.write().await = None;
+        // No stored connections to clean up - connections are created on-demand and auto-closed
         Ok(())
     }
 
@@ -611,13 +626,9 @@ impl ExternalService for RedisService {
     ) -> Result<HashMap<String, String>> {
         let resource_name = format!("{}_{}", project_id, environment);
 
-        // Create the database and get its number
-        let db_number = self.create_database(&resource_name).await?;
-
-        let config_guard = self.config.read().await;
-        config_guard
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Redis not configured"))?;
+        // Calculate database number using a hash instead of requiring Redis connection
+        // This allows us to generate env vars before the service is started
+        let db_number = self.calculate_database_number(&resource_name);
 
         let mut env_vars = HashMap::new();
         let container_name = self.get_container_name();
@@ -625,8 +636,12 @@ impl ExternalService for RedisService {
         // Database number (specific to this project/environment)
         env_vars.insert("REDIS_DATABASE".to_string(), db_number.to_string());
 
-        // Get password from service config if available
-        let password = config.parameters.get("password").and_then(|v| v.as_str());
+        // Get password from service config if available (filter out empty strings)
+        let password = config
+            .parameters
+            .get("password")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
 
         // Connection URL with database number
         let url = if let Some(pass) = password {
@@ -689,13 +704,14 @@ impl ExternalService for RedisService {
         self.wait_for_container_health(&self.docker, &container_name)
             .await?;
 
+        // No connection initialization needed - connections are created on-demand when needed
+        info!("Redis container started successfully");
+
         Ok(())
     }
 
     async fn stop(&self) -> Result<()> {
-        // Clear the connection manager
-        *self.connection_manager.write().await = None;
-        *self.client.write().await = None;
+        // No stored connections to clean up - they are created on-demand
 
         // Stop the container if Docker is available
         let container_name = self.get_container_name();
@@ -808,9 +824,11 @@ impl ExternalService for RedisService {
         Ok(env_vars)
     }
 
-    async fn deprovision_resource(&self, project_id: &str, environment: &str) -> Result<()> {
-        let resource_name = format!("{}_{}", project_id, environment);
-        self.drop_database(&resource_name).await
+    async fn deprovision_resource(&self, _project_id: &str, _environment: &str) -> Result<()> {
+        // No database-level deprovisioning needed
+        // Each project/environment gets a calculated database number (0-15) based on hash
+        // Cleanup would happen at the application level (flushing keys with specific prefixes)
+        Ok(())
     }
 
     /// Backup Redis data to S3

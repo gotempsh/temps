@@ -126,6 +126,7 @@ export function ApiKeyCreateModal({
   useEffect(() => {
     if (open && !newKeySecret) {
       form.reset()
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setSelectedRole('')
       setSelectedPermissions(new Set())
       setUseCustomPermissions(false)
@@ -223,10 +224,7 @@ export function ApiKeyCreateModal({
                       <FormItem>
                         <FormLabel>Name</FormLabel>
                         <FormControl>
-                          <Input
-                            placeholder="Production API Key"
-                            {...field}
-                          />
+                          <Input placeholder="Production API Key" {...field} />
                         </FormControl>
                         <FormMessage />
                       </FormItem>
@@ -235,7 +233,9 @@ export function ApiKeyCreateModal({
 
                   <Tabs
                     defaultValue="role"
-                    onValueChange={(v) => setUseCustomPermissions(v === 'custom')}
+                    onValueChange={(v) =>
+                      setUseCustomPermissions(v === 'custom')
+                    }
                   >
                     <TabsList className="grid w-full grid-cols-2">
                       <TabsTrigger value="role">
@@ -267,7 +267,9 @@ export function ApiKeyCreateModal({
                               {permissionsData?.roles.map((role) => (
                                 <SelectItem key={role.name} value={role.name}>
                                   <div>
-                                    <div className="font-medium">{role.name}</div>
+                                    <div className="font-medium">
+                                      {role.name}
+                                    </div>
                                     <div className="text-xs text-muted-foreground">
                                       {role.description}
                                     </div>

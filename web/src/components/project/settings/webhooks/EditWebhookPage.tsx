@@ -2,6 +2,7 @@ import { ProjectResponse } from '@/api/client'
 import {
   getWebhookOptions,
   updateWebhookMutation,
+  listEventTypesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import {
@@ -28,81 +29,19 @@ import { Switch } from '@/components/ui/switch'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { ArrowLeft, Loader2 } from 'lucide-react'
+import { AlertCircle, ArrowLeft, Loader2 } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
 import { useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import { z } from 'zod'
-
-const AVAILABLE_EVENTS = [
-  {
-    category: 'Deployments',
-    events: [
-      {
-        id: 'deployment.started',
-        label: 'Deployment Started',
-        description: 'Triggered when a deployment begins',
-      },
-      {
-        id: 'deployment.succeeded',
-        label: 'Deployment Succeeded',
-        description: 'Triggered when a deployment completes successfully',
-      },
-      {
-        id: 'deployment.failed',
-        label: 'Deployment Failed',
-        description: 'Triggered when a deployment fails',
-      },
-    ],
-  },
-  {
-    category: 'Error Tracking',
-    events: [
-      {
-        id: 'error.created',
-        label: 'Error Created',
-        description: 'Triggered when a new error is detected',
-      },
-    ],
-  },
-  {
-    category: 'Monitoring',
-    events: [
-      {
-        id: 'monitor.down',
-        label: 'Monitor Down',
-        description: 'Triggered when a monitor detects downtime',
-      },
-      {
-        id: 'monitor.up',
-        label: 'Monitor Up',
-        description: 'Triggered when a monitor recovers',
-      },
-    ],
-  },
-  {
-    category: 'Domains',
-    events: [
-      {
-        id: 'domain.verified',
-        label: 'Domain Verified',
-        description: 'Triggered when a domain is successfully verified',
-      },
-      {
-        id: 'domain.failed',
-        label: 'Domain Verification Failed',
-        description: 'Triggered when domain verification fails',
-      },
-    ],
-  },
-]
+import { Alert, AlertDescription } from '@/components/ui/alert'
 
 const formSchema = z.object({
-  url: z.string().url('Must be a valid URL').min(1, 'URL is required'),
+  url: z.string().min(1, 'URL is required').url('Must be a valid URL'),
   events: z.array(z.string()).min(1, 'Select at least one event'),
   secret: z.string().optional(),
-  enabled: z.boolean().default(true),
+  enabled: z.boolean(),
 })
 
 type FormValues = z.infer<typeof formSchema>
@@ -128,6 +67,15 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
       },
     }),
     enabled: !!webhookId,
+  })
+
+  // Fetch available event types from API
+  const {
+    data: eventTypes,
+    isLoading: isLoadingEventTypes,
+    isError: isEventTypesError,
+  } = useQuery({
+    ...listEventTypesOptions(),
   })
 
   const form = useForm<FormValues>({
@@ -219,7 +167,9 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
           <Button
             variant="ghost"
             size="icon"
-            onClick={() => navigate(`/projects/${project.slug}/settings/webhooks`)}
+            onClick={() =>
+              navigate(`/projects/${project.slug}/settings/webhooks`)
+            }
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
@@ -230,7 +180,9 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
         <ErrorAlert
           title="Failed to load webhook"
           description={
-            error instanceof Error ? error.message : 'An unexpected error occurred'
+            error instanceof Error
+              ? error.message
+              : 'An unexpected error occurred'
           }
           retry={() => refetch()}
         />
@@ -248,7 +200,9 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
         <Button
           variant="ghost"
           size="icon"
-          onClick={() => navigate(`/projects/${project.slug}/settings/webhooks`)}
+          onClick={() =>
+            navigate(`/projects/${project.slug}/settings/webhooks`)
+          }
         >
           <ArrowLeft className="h-4 w-4" />
         </Button>
@@ -283,8 +237,8 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
                       />
                     </FormControl>
                     <FormDescription>
-                      The endpoint that will receive webhook events via HTTP POST
-                      requests
+                      The endpoint that will receive webhook events via HTTP
+                      POST requests
                     </FormDescription>
                     <FormMessage />
                   </FormItem>
@@ -311,14 +265,16 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
                     <FormDescription>
                       {webhook.has_secret ? (
                         <>
-                          This webhook has a secret configured. Leave empty to keep
-                          the existing secret, or enter a new one to update it.
+                          This webhook has a secret configured. Leave empty to
+                          keep the existing secret, or enter a new one to update
+                          it.
                         </>
                       ) : (
                         <>
-                          Used to verify webhook authenticity via HMAC signatures
-                          in the X-Webhook-Signature header. If provided, all
-                          webhook requests will include a signature you can verify.
+                          Used to verify webhook authenticity via HMAC
+                          signatures in the X-Webhook-Signature header. If
+                          provided, all webhook requests will include a
+                          signature you can verify.
                         </>
                       )}
                     </FormDescription>
@@ -333,7 +289,9 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
                 render={({ field }) => (
                   <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
                     <div className="space-y-0.5">
-                      <FormLabel className="text-base">Enable webhook</FormLabel>
+                      <FormLabel className="text-base">
+                        Enable webhook
+                      </FormLabel>
                       <FormDescription>
                         Control whether this webhook receives events
                       </FormDescription>
@@ -358,72 +316,119 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <FormField
-                control={form.control}
-                name="events"
-                render={() => (
-                  <FormItem>
-                    <div className="space-y-6">
-                      {AVAILABLE_EVENTS.map((category, categoryIndex) => (
-                        <div key={category.category}>
-                          {categoryIndex > 0 && <Separator className="my-4" />}
-                          <div className="space-y-4">
-                            <h4 className="text-sm font-semibold">
-                              {category.category}
-                            </h4>
-                            <div className="space-y-4">
-                              {category.events.map((event) => (
-                                <FormField
-                                  key={event.id}
-                                  control={form.control}
-                                  name="events"
-                                  render={({ field }) => {
-                                    return (
-                                      <FormItem
-                                        key={event.id}
-                                        className="flex flex-row items-start space-x-3 space-y-0"
-                                      >
-                                        <FormControl>
-                                          <Checkbox
-                                            checked={field.value?.includes(
-                                              event.id
-                                            )}
-                                            onCheckedChange={(checked) => {
-                                              return checked
-                                                ? field.onChange([
-                                                    ...field.value,
-                                                    event.id,
-                                                  ])
-                                                : field.onChange(
-                                                    field.value?.filter(
-                                                      (value) => value !== event.id
+              {isLoadingEventTypes ? (
+                <div className="space-y-4">
+                  <Skeleton className="h-4 w-32" />
+                  <Skeleton className="h-10 w-full" />
+                  <Skeleton className="h-10 w-full" />
+                  <Skeleton className="h-10 w-full" />
+                </div>
+              ) : isEventTypesError ? (
+                <Alert variant="destructive">
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertDescription>
+                    Failed to load event types. Please try again later.
+                  </AlertDescription>
+                </Alert>
+              ) : (
+                <FormField
+                  control={form.control}
+                  name="events"
+                  render={() => {
+                    // Group events by category
+                    const eventsByCategory =
+                      eventTypes?.reduce(
+                        (acc, eventType) => {
+                          const category = eventType.category
+                          if (!acc[category]) {
+                            acc[category] = []
+                          }
+                          acc[category].push(eventType)
+                          return acc
+                        },
+                        {} as Record<string, typeof eventTypes>
+                      ) || {}
+
+                    return (
+                      <FormItem>
+                        <div className="space-y-6">
+                          {Object.entries(eventsByCategory).map(
+                            ([category, events], categoryIndex) => (
+                              <div key={category}>
+                                {categoryIndex > 0 && (
+                                  <Separator className="my-4" />
+                                )}
+                                <div className="space-y-4">
+                                  <h4 className="text-sm font-semibold">
+                                    {category}
+                                  </h4>
+                                  <div className="space-y-4">
+                                    {events.map((event) => (
+                                      <FormField
+                                        key={event.event_type}
+                                        control={form.control}
+                                        name="events"
+                                        render={({ field }) => {
+                                          return (
+                                            <FormItem
+                                              key={event.event_type}
+                                              className="flex flex-row items-start space-x-3 space-y-0"
+                                            >
+                                              <FormControl>
+                                                <Checkbox
+                                                  checked={field.value?.includes(
+                                                    event.event_type
+                                                  )}
+                                                  onCheckedChange={(checked) => {
+                                                    return checked
+                                                      ? field.onChange([
+                                                          ...field.value,
+                                                          event.event_type,
+                                                        ])
+                                                      : field.onChange(
+                                                          field.value?.filter(
+                                                            (value) =>
+                                                              value !==
+                                                              event.event_type
+                                                          )
+                                                        )
+                                                  }}
+                                                />
+                                              </FormControl>
+                                              <div className="space-y-1 leading-none">
+                                                <FormLabel className="font-medium cursor-pointer">
+                                                  {event.event_type
+                                                    .split('.')
+                                                    .map(
+                                                      (word) =>
+                                                        word
+                                                          .charAt(0)
+                                                          .toUpperCase() +
+                                                        word.slice(1)
                                                     )
-                                                  )
-                                            }}
-                                          />
-                                        </FormControl>
-                                        <div className="space-y-1 leading-none">
-                                          <FormLabel className="font-medium cursor-pointer">
-                                            {event.label}
-                                          </FormLabel>
-                                          <FormDescription className="text-xs">
-                                            {event.description}
-                                          </FormDescription>
-                                        </div>
-                                      </FormItem>
-                                    )
-                                  }}
-                                />
-                              ))}
-                            </div>
-                          </div>
+                                                    .join(' ')}
+                                                </FormLabel>
+                                                <FormDescription className="text-xs">
+                                                  {event.description}
+                                                </FormDescription>
+                                              </div>
+                                            </FormItem>
+                                          )
+                                        }}
+                                      />
+                                    ))}
+                                  </div>
+                                </div>
+                              </div>
+                            )
+                          )}
                         </div>
-                      ))}
-                    </div>
-                    <FormMessage className="mt-4" />
-                  </FormItem>
-                )}
-              />
+                        <FormMessage className="mt-4" />
+                      </FormItem>
+                    )
+                  }}
+                />
+              )}
             </CardContent>
           </Card>
 

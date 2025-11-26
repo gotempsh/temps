@@ -1,8 +1,15 @@
 import { requireAuth, config } from '../../config/store.js'
+import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import {
+  getProjectBySlug,
+  getEnvironments,
+  triggerProjectPipeline,
+  getLastDeployment,
+} from '../../api/sdk.gen.js'
+import type { EnvironmentResponse, DeploymentResponse } from '../../api/types.gen.js'
 import { promptSelect, promptText, promptConfirm } from '../../ui/prompts.js'
 import { startSpinner, succeedSpinner, failSpinner, updateSpinner } from '../../ui/spinner.js'
 import { success, info, warning, newline, icons, colors, header, keyValue, box } from '../../ui/output.js'
-import { getClient } from '../../api/client.js'
 
 interface DeployOptions {
   environment: string
@@ -10,16 +17,9 @@ interface DeployOptions {
   wait?: boolean
 }
 
-interface Deployment {
-  id: number
-  status: string
-  commit_sha?: string
-  branch?: string
-  created_at: string
-}
-
 export async function deploy(project: string | undefined, options: DeployOptions): Promise<void> {
   await requireAuth()
+  await setupClient()
 
   newline()
 
@@ -32,44 +32,59 @@ export async function deploy(project: string | undefined, options: DeployOptions
     return
   }
 
-  const client = getClient()
-
   // Fetch project details
   startSpinner('Fetching project details...')
 
-  let projectData: { id: number; name: string; environments?: Array<{ id: number; name: string }> }
+  let projectData: { id: number; name: string }
+  let environments: EnvironmentResponse[] = []
 
   try {
-    const response = await client.get('/api/projects/by-name/{name}' as '/api/projects/{id}', {
-      params: { path: { name: projectName } as never },
+    const { data, error } = await getProjectBySlug({
+      client,
+      path: { slug: projectName },
     })
 
-    if (response.error || !response.data) {
+    if (error || !data) {
       failSpinner(`Project "${projectName}" not found`)
       return
     }
 
-    projectData = response.data as typeof projectData
+    projectData = data
     succeedSpinner(`Found project: ${projectData.name}`)
+
+    // Fetch environments
+    const { data: envData } = await getEnvironments({
+      client,
+      path: { project_id: projectData.id },
+    })
+    environments = envData ?? []
   } catch (err) {
-    failSpinner(`Failed to fetch project`)
+    failSpinner('Failed to fetch project')
     throw err
   }
 
   // Get environment
+  let environmentId: number | undefined
   let environmentName = options.environment
 
-  if (projectData.environments && projectData.environments.length > 0) {
+  if (environments.length > 0) {
     if (!options.environment || options.environment === 'production') {
-      environmentName = await promptSelect({
+      const selectedEnv = await promptSelect({
         message: 'Select environment',
-        choices: projectData.environments.map((env) => ({
+        choices: environments.map((env) => ({
           name: env.name,
-          value: env.name,
-          description: env.name === 'production' ? 'Production environment' : undefined,
+          value: String(env.id),
+          description: env.is_preview ? 'Preview environment' : undefined,
         })),
-        default: 'production',
+        default: String(environments.find(e => e.name === 'production')?.id ?? environments[0].id),
       })
+      environmentId = parseInt(selectedEnv, 10)
+      environmentName = environments.find(e => e.id === environmentId)?.name ?? options.environment
+    } else {
+      const env = environments.find(e => e.name === options.environment)
+      if (env) {
+        environmentId = env.id
+      }
     }
   }
 
@@ -105,28 +120,29 @@ export async function deploy(project: string | undefined, options: DeployOptions
   startSpinner('Starting deployment...')
 
   try {
-    const response = await client.post('/api/deployments' as never, {
+    const { data, error } = await triggerProjectPipeline({
+      client,
+      path: { id: projectData.id },
       body: {
-        project_id: projectData.id,
-        environment: environmentName,
         branch,
+        environment_id: environmentId,
       },
     })
 
-    if (response.error || !response.data) {
+    if (error || !data) {
       failSpinner('Failed to start deployment')
       return
     }
 
-    const deployment = response.data as Deployment
-    succeedSpinner(`Deployment #${deployment.id} started`)
+    succeedSpinner(`Deployment started`)
+    info(data.message ?? 'Pipeline triggered successfully')
 
     if (options.wait !== false) {
-      await waitForDeployment(client, deployment.id)
+      await waitForDeployment(projectData.id, environmentId)
     } else {
       newline()
-      info(`Deployment running in background`)
-      info(`Check status with: temps deployments status ${deployment.id}`)
+      info('Deployment running in background')
+      info(`Check status with: temps deployments list ${projectName}`)
     }
   } catch (err) {
     failSpinner('Deployment failed')
@@ -134,7 +150,7 @@ export async function deploy(project: string | undefined, options: DeployOptions
   }
 }
 
-async function waitForDeployment(client: ReturnType<typeof getClient>, deploymentId: number): Promise<void> {
+async function waitForDeployment(projectId: number, environmentId?: number): Promise<void> {
   const statusMessages: Record<string, string> = {
     pending: 'Waiting in queue...',
     building: 'Building application...',
@@ -145,44 +161,60 @@ async function waitForDeployment(client: ReturnType<typeof getClient>, deploymen
   startSpinner('Waiting for deployment...')
 
   let lastStatus = ''
+  let attempts = 0
+  const maxAttempts = 180 // 6 minutes with 2s intervals
 
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const response = await client.get('/api/deployments/{id}' as never, {
-      params: { path: { id: deploymentId } },
+  while (attempts < maxAttempts) {
+    attempts++
+
+    const { data: deployment, error } = await getLastDeployment({
+      client,
+      path: { id: projectId },
     })
 
-    if (response.error) {
-      failSpinner('Failed to check deployment status')
-      return
+    if (error || !deployment) {
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+      continue
     }
 
-    const deployment = response.data as Deployment
+    // Check if this is the right deployment (for the selected environment)
+    if (environmentId && deployment.environment_id !== environmentId) {
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+      continue
+    }
 
     if (deployment.status !== lastStatus) {
       lastStatus = deployment.status
       updateSpinner(statusMessages[deployment.status] ?? `Status: ${deployment.status}`)
     }
 
-    if (deployment.status === 'success' || deployment.status === 'completed') {
+    if (deployment.status === 'success' || deployment.status === 'completed' || deployment.status === 'deployed') {
       succeedSpinner(`${icons.rocket} Deployment successful!`)
       newline()
       header(`${icons.check} Deployment Complete`)
       keyValue('Deployment ID', deployment.id)
-      keyValue('Commit', deployment.commit_sha?.substring(0, 7))
-      keyValue('Duration', 'calculating...')
+      keyValue('Commit', deployment.commit_hash?.substring(0, 7) ?? '-')
+      if (deployment.url) {
+        keyValue('URL', colors.primary(deployment.url))
+      }
       newline()
       return
     }
 
-    if (deployment.status === 'failed' || deployment.status === 'error') {
+    if (deployment.status === 'failed' || deployment.status === 'error' || deployment.status === 'cancelled') {
       failSpinner('Deployment failed')
       newline()
-      info(`View logs with: temps logs ${deploymentId}`)
+      if (deployment.cancelled_reason) {
+        info(`Reason: ${deployment.cancelled_reason}`)
+      }
+      info(`View logs with: temps logs ${projectId}`)
       return
     }
 
     // Wait before checking again
     await new Promise((resolve) => setTimeout(resolve, 2000))
   }
+
+  failSpinner('Deployment timed out')
+  info('Deployment is still running. Check status with: temps deployments list')
 }

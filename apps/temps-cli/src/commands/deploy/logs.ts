@@ -1,7 +1,14 @@
 import { requireAuth, config } from '../../config/store.js'
+import { setupClient, client } from '../../lib/api-client.js'
+import {
+  getProjectBySlug,
+  getProjectDeployments,
+  getDeploymentJobs,
+  getDeploymentJobLogs,
+} from '../../api/sdk.gen.js'
+import type { DeploymentJobResponse } from '../../api/types.gen.js'
 import { startSpinner, succeedSpinner, failSpinner } from '../../ui/spinner.js'
 import { newline, colors, info, warning } from '../../ui/output.js'
-import { getClient } from '../../api/client.js'
 
 interface LogsOptions {
   environment: string
@@ -11,14 +18,15 @@ interface LogsOptions {
 }
 
 interface LogEntry {
-  timestamp: string
-  level: string
+  timestamp?: string
+  level?: string
   message: string
   line?: number
 }
 
 export async function logs(project: string, options: LogsOptions): Promise<void> {
   await requireAuth()
+  await setupClient()
 
   const projectName = project ?? config.get('defaultProject')
 
@@ -27,37 +35,44 @@ export async function logs(project: string, options: LogsOptions): Promise<void>
     return
   }
 
-  const client = getClient()
+  // Get project ID
+  const { data: projectData, error: projectError } = await getProjectBySlug({
+    client,
+    path: { slug: projectName },
+  })
+
+  if (projectError || !projectData) {
+    warning(`Project "${projectName}" not found`)
+    return
+  }
 
   // Get deployment ID
-  let deploymentId = options.deployment
+  let deploymentId = options.deployment ? parseInt(options.deployment, 10) : undefined
 
   if (!deploymentId) {
     startSpinner('Finding latest deployment...')
 
     try {
-      const response = await client.get('/api/projects/{project}/deployments' as never, {
-        params: {
-          path: { project: projectName },
-          query: {
-            environment: options.environment,
-            limit: 1,
-          },
-        },
+      const { data, error } = await getProjectDeployments({
+        client,
+        path: { id: projectData.id },
       })
 
-      if (response.error || !response.data) {
+      if (error || !data) {
         failSpinner('No deployments found')
         return
       }
 
-      const deployments = response.data as Array<{ id: number }>
+      // Filter by environment if specified
+      const deployments = data.deployments
+        .filter(d => !options.environment || d.environment?.name === options.environment)
+
       if (deployments.length === 0) {
         failSpinner('No deployments found')
         return
       }
 
-      deploymentId = String(deployments[0].id)
+      deploymentId = deployments[0]!.id
       succeedSpinner(`Found deployment #${deploymentId}`)
     } catch (err) {
       failSpinner('Failed to find deployment')
@@ -69,67 +84,110 @@ export async function logs(project: string, options: LogsOptions): Promise<void>
   info(`${colors.muted('Showing logs for deployment')} #${deploymentId}`)
   newline()
 
+  // Get jobs for this deployment
+  const { data: jobs, error: jobsError } = await getDeploymentJobs({
+    client,
+    path: {
+      project_id: projectData.id,
+      deployment_id: deploymentId,
+    },
+  })
+
+  const jobsArray = jobs?.jobs ?? []
+
+  if (jobsError || jobsArray.length === 0) {
+    warning('No jobs found for this deployment')
+    return
+  }
+
+  const jobList = jobsArray
+
   if (options.follow) {
-    await streamLogs(client, deploymentId)
+    await streamLogs(projectData.id, deploymentId, jobList)
   } else {
-    await fetchLogs(client, deploymentId, parseInt(options.lines, 10))
+    await fetchLogs(projectData.id, deploymentId, jobList, parseInt(options.lines, 10))
   }
 }
 
 async function fetchLogs(
-  client: ReturnType<typeof getClient>,
-  deploymentId: string,
+  projectId: number,
+  deploymentId: number,
+  jobs: DeploymentJobResponse[],
   limit: number
 ): Promise<void> {
-  const response = await client.get('/api/deployments/{id}/logs' as never, {
-    params: {
-      path: { id: deploymentId },
-      query: { limit },
-    },
-  })
+  for (const job of jobs) {
+    console.log(colors.bold(`\n=== ${job.name} ===\n`))
 
-  if (response.error) {
-    throw new Error('Failed to fetch logs')
-  }
+    const { data, error } = await getDeploymentJobLogs({
+      client,
+      path: {
+        project_id: projectId,
+        deployment_id: deploymentId,
+        job_id: job.job_id,
+      },
+    })
 
-  const logs = (response.data ?? []) as LogEntry[]
+    if (error || !data) {
+      console.log(colors.muted('No logs available for this job'))
+      continue
+    }
 
-  for (const log of logs) {
-    printLogLine(log)
+    const logs = (Array.isArray(data) ? data : [data]) as LogEntry[]
+    const limitedLogs = logs.slice(-limit)
+
+    for (const log of limitedLogs) {
+      printLogLine(log)
+    }
   }
 }
 
 async function streamLogs(
-  client: ReturnType<typeof getClient>,
-  deploymentId: string
+  projectId: number,
+  deploymentId: number,
+  jobs: DeploymentJobResponse[]
 ): Promise<void> {
   info('Streaming logs (Ctrl+C to stop)...')
   newline()
 
-  let lastLine = 0
+  const lastLines: Record<number, number> = {}
 
-  // Simple polling for logs (would be better with SSE/WebSocket)
+  // Simple polling for logs
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    try {
-      const response = await client.get('/api/deployments/{id}/logs' as never, {
-        params: {
-          path: { id: deploymentId },
-          query: { after_line: lastLine },
-        },
-      })
+    for (const job of jobs) {
+      try {
+        const { data } = await getDeploymentJobLogs({
+          client,
+          path: {
+            project_id: projectId,
+            deployment_id: deploymentId,
+            job_id: job.job_id,
+          },
+        })
 
-      if (response.data) {
-        const logs = response.data as LogEntry[]
-        for (const log of logs) {
-          printLogLine(log)
-          if (log.line && log.line > lastLine) {
-            lastLine = log.line
+        if (data) {
+          const logs = (Array.isArray(data) ? data : [data]) as LogEntry[]
+          const lastLine = lastLines[job.id] || 0
+
+          for (const log of logs) {
+            if (log.line && log.line > lastLine) {
+              console.log(colors.muted(`[${job.name}]`), formatLogMessage(log))
+              lastLines[job.id] = log.line
+            }
+          }
+
+          // If no line numbers, just print new logs based on count
+          if (logs.length > 0 && logs[0]?.line) {
+            const newLogs = logs.slice(lastLine)
+            for (const log of newLogs) {
+              console.log(colors.muted(`[${job.name}]`), formatLogMessage(log))
+            }
+            lastLines[job.id] = logs.length
           }
         }
+      } catch {
+        // Ignore errors in streaming mode
       }
-    } catch {
-      // Ignore errors in streaming mode
     }
 
     await new Promise((resolve) => setTimeout(resolve, 1000))
@@ -137,6 +195,10 @@ async function streamLogs(
 }
 
 function printLogLine(log: LogEntry): void {
+  console.log(formatLogMessage(log))
+}
+
+function formatLogMessage(log: LogEntry): string {
   const levelColors: Record<string, (s: string) => string> = {
     info: colors.info,
     success: colors.success,
@@ -144,8 +206,10 @@ function printLogLine(log: LogEntry): void {
     error: colors.error,
   }
 
-  const colorFn = levelColors[log.level] ?? colors.muted
-  const timestamp = colors.muted(new Date(log.timestamp).toLocaleTimeString())
+  const colorFn = log.level ? (levelColors[log.level] ?? colors.muted) : (s: string) => s
+  const timestamp = log.timestamp
+    ? colors.muted(new Date(log.timestamp).toLocaleTimeString()) + ' '
+    : ''
 
-  console.log(`${timestamp} ${colorFn(log.message)}`)
+  return `${timestamp}${colorFn(log.message)}`
 }

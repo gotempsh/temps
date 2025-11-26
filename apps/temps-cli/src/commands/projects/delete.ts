@@ -2,7 +2,8 @@ import { requireAuth, config } from '../../config/store.js'
 import { promptConfirm } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { success, warning, newline, colors } from '../../ui/output.js'
-import { getClient } from '../../api/client.js'
+import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import { deleteProject, getProjectBySlug } from '../../api/sdk.gen.js'
 
 interface DeleteOptions {
   force?: boolean
@@ -10,6 +11,7 @@ interface DeleteOptions {
 
 export async function remove(projectIdOrName: string, options: DeleteOptions): Promise<void> {
   await requireAuth()
+  await setupClient()
 
   newline()
 
@@ -29,19 +31,23 @@ export async function remove(projectIdOrName: string, options: DeleteOptions): P
     }
   }
 
-  const client = getClient()
-
   await withSpinner('Deleting project...', async () => {
     // Try to parse as ID first
-    const id = parseInt(projectIdOrName, 10)
-    const endpoint = isNaN(id)
-      ? `/api/projects/by-name/${projectIdOrName}`
-      : `/api/projects/${id}`
+    let id = parseInt(projectIdOrName, 10)
 
-    const response = await client.delete(endpoint as '/api/projects/{id}')
+    if (isNaN(id)) {
+      // Get the project by slug to find its ID
+      const { data, error } = await getProjectBySlug({ client, path: { slug: projectIdOrName } })
+      if (error || !data) {
+        throw new Error(`Project "${projectIdOrName}" not found`)
+      }
+      id = data.id
+    }
 
-    if (response.error) {
-      throw new Error(`Failed to delete project "${projectIdOrName}"`)
+    const { error } = await deleteProject({ client, path: { id } })
+
+    if (error) {
+      throw new Error(getErrorMessage(error))
     }
   })
 

@@ -1,27 +1,21 @@
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
+import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import {
+  getEnvironments,
+  createEnvironment,
+  deleteEnvironment,
+  getEnvironmentVariables,
+  createEnvironmentVariable,
+  deleteEnvironmentVariable,
+  updateEnvironmentVariable,
+  getProjectBySlug,
+} from '../../api/sdk.gen.js'
+import type { EnvironmentResponse, EnvironmentVariableResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
-import { promptText, promptConfirm, promptSelect } from '../../ui/prompts.js'
+import { promptText, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, warning, keyValue, info } from '../../ui/output.js'
-import { getClient } from '../../api/client.js'
-
-interface Environment {
-  id: number
-  name: string
-  project_name?: string
-  status: string
-  url?: string
-  branch?: string
-  auto_deploy: boolean
-  created_at: string
-}
-
-interface EnvVar {
-  key: string
-  value: string
-  is_secret: boolean
-}
 
 export function registerEnvironmentsCommands(program: Command): void {
   const environments = program
@@ -42,19 +36,19 @@ export function registerEnvironmentsCommands(program: Command): void {
     .description('Create a new environment')
     .option('-n, --name <name>', 'Environment name')
     .option('-b, --branch <branch>', 'Git branch')
-    .option('--no-auto-deploy', 'Disable auto-deploy')
-    .action(createEnvironment)
+    .option('--preview', 'Set as preview environment')
+    .action(createEnvironmentCmd)
 
   environments
     .command('delete <project> <environment>')
     .alias('rm')
     .description('Delete an environment')
     .option('-f, --force', 'Skip confirmation')
-    .action(deleteEnvironment)
+    .action(deleteEnvironmentCmd)
 
   // Environment variables subcommand
   const vars = environments
-    .command('vars <project> <environment>')
+    .command('vars <project>')
     .description('Manage environment variables')
 
   vars
@@ -64,38 +58,53 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('--show-secrets', 'Show secret values')
     .option('--json', 'Output in JSON format')
     .action((options, cmd) => {
-      const [project, environment] = cmd.parent!.args
-      return listEnvVars(project, environment, options)
+      const project = cmd.parent!.args[0]
+      return listEnvVars(project, options)
     })
 
   vars
     .command('set <key> [value]')
     .description('Set an environment variable')
-    .option('-s, --secret', 'Mark as secret')
+    .option('-e, --env <envIds>', 'Comma-separated environment IDs')
+    .option('--no-preview', 'Exclude from preview environments')
     .action((key, value, options, cmd) => {
-      const [project, environment] = cmd.parent!.parent!.args
-      return setEnvVar(project, environment, key, value, options)
+      const project = cmd.parent!.parent!.args[0]
+      return setEnvVar(project, key, value, options)
     })
 
   vars
-    .command('unset <key>')
+    .command('unset <varId>')
     .alias('rm')
-    .description('Remove an environment variable')
-    .action((key, _options, cmd) => {
-      const [project, environment] = cmd.parent!.parent!.args
-      return unsetEnvVar(project, environment, key)
+    .description('Remove an environment variable by ID')
+    .action((varId, _options, cmd) => {
+      const project = cmd.parent!.parent!.args[0]
+      return unsetEnvVar(project, varId)
     })
+}
+
+async function getProjectId(projectSlug: string): Promise<number> {
+  const { data, error } = await getProjectBySlug({
+    client,
+    path: { slug: projectSlug },
+  })
+  if (error || !data) {
+    throw new Error(`Project "${projectSlug}" not found`)
+  }
+  return data.id
 }
 
 async function listEnvironments(project: string, options: { json?: boolean }): Promise<void> {
   await requireAuth()
-  const client = getClient()
+  await setupClient()
 
   const environments = await withSpinner('Fetching environments...', async () => {
-    const response = await client.get('/api/projects/{project}/environments' as never, {
-      params: { path: { project } },
+    const projectId = await getProjectId(project)
+    const { data, error } = await getEnvironments({
+      client,
+      path: { project_id: projectId },
     })
-    return (response.data ?? []) as Environment[]
+    if (error) throw new Error(getErrorMessage(error))
+    return data ?? []
   })
 
   if (options.json) {
@@ -106,21 +115,21 @@ async function listEnvironments(project: string, options: { json?: boolean }): P
   newline()
   header(`${icons.folder} Environments for ${project} (${environments.length})`)
 
-  const columns: TableColumn<Environment>[] = [
+  const columns: TableColumn<EnvironmentResponse>[] = [
     { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
-    { header: 'Status', accessor: (e) => e.status, color: (v) => statusBadge(v) },
+    { header: 'Slug', key: 'slug' },
     { header: 'Branch', accessor: (e) => e.branch ?? '-' },
-    { header: 'URL', accessor: (e) => e.url ?? '-', color: (v) => colors.primary(v) },
-    { header: 'Auto-deploy', accessor: (e) => e.auto_deploy ? 'Yes' : 'No' },
+    { header: 'Preview', accessor: (e) => e.is_preview ? 'Yes' : 'No' },
+    { header: 'URL', accessor: (e) => e.main_url ?? '-', color: (v) => colors.primary(v) },
   ]
 
   printTable(environments, columns, { style: 'minimal' })
   newline()
 }
 
-async function createEnvironment(
+async function createEnvironmentCmd(
   project: string,
-  options: { name?: string; branch?: string; autoDeploy?: boolean }
+  options: { name?: string; branch?: string; preview?: boolean }
 ): Promise<void> {
   await requireAuth()
 
@@ -135,28 +144,31 @@ async function createEnvironment(
     default: name === 'production' ? 'main' : name,
   })
 
-  const client = getClient()
+  await setupClient()
 
   const environment = await withSpinner('Creating environment...', async () => {
-    const response = await client.post('/api/projects/{project}/environments' as never, {
-      params: { path: { project } },
+    const projectId = await getProjectId(project)
+    const { data, error } = await createEnvironment({
+      client,
+      path: { project_id: projectId },
       body: {
         name,
         branch,
-        auto_deploy: options.autoDeploy !== false,
+        set_as_preview: options.preview,
       },
     })
-    return response.data as Environment
+    if (error) throw new Error(getErrorMessage(error))
+    return data
   })
 
   newline()
   success(`Environment "${name}" created`)
-  if (environment.url) {
-    info(`URL: ${colors.primary(environment.url)}`)
+  if (environment?.main_url) {
+    info(`URL: ${colors.primary(environment.main_url)}`)
   }
 }
 
-async function deleteEnvironment(
+async function deleteEnvironmentCmd(
   project: string,
   environment: string,
   options: { force?: boolean }
@@ -179,12 +191,16 @@ async function deleteEnvironment(
     }
   }
 
-  const client = getClient()
+  await setupClient()
 
   await withSpinner('Deleting environment...', async () => {
-    await client.delete('/api/projects/{project}/environments/{environment}' as never, {
-      params: { path: { project, environment } },
+    const projectId = await getProjectId(project)
+    // Environment can be specified by ID or slug, cast to number for TypeScript
+    const { error } = await deleteEnvironment({
+      client,
+      path: { project_id: projectId, env_id: environment as unknown as number },
     })
+    if (error) throw new Error(getErrorMessage(error))
   })
 
   success(`Environment "${environment}" deleted`)
@@ -192,17 +208,19 @@ async function deleteEnvironment(
 
 async function listEnvVars(
   project: string,
-  environment: string,
   options: { showSecrets?: boolean; json?: boolean }
 ): Promise<void> {
   await requireAuth()
-  const client = getClient()
+  await setupClient()
 
   const vars = await withSpinner('Fetching environment variables...', async () => {
-    const response = await client.get('/api/projects/{project}/environments/{environment}/vars' as never, {
-      params: { path: { project, environment } },
+    const projectId = await getProjectId(project)
+    const { data, error } = await getEnvironmentVariables({
+      client,
+      path: { project_id: projectId },
     })
-    return (response.data ?? []) as EnvVar[]
+    if (error) throw new Error(getErrorMessage(error))
+    return data ?? []
   })
 
   if (options.json) {
@@ -214,10 +232,10 @@ async function listEnvVars(
   header(`${icons.key} Environment Variables (${vars.length})`)
 
   for (const v of vars) {
-    const displayValue = v.is_secret && !options.showSecrets
-      ? colors.muted('********')
-      : v.value
-    keyValue(v.key, displayValue)
+    const displayValue = options.showSecrets ? v.value : colors.muted('********')
+    const envNames = v.environments.map(e => e.name).join(', ')
+    keyValue(`${v.key} (ID: ${v.id})`, displayValue)
+    console.log(`    ${colors.muted(`Environments: ${envNames}`)}`)
   }
 
   newline()
@@ -225,10 +243,9 @@ async function listEnvVars(
 
 async function setEnvVar(
   project: string,
-  environment: string,
   key: string,
   value: string | undefined,
-  options: { secret?: boolean }
+  options: { env?: string; preview?: boolean }
 ): Promise<void> {
   await requireAuth()
 
@@ -237,30 +254,54 @@ async function setEnvVar(
     required: true,
   })
 
-  const client = getClient()
+  await setupClient()
 
   await withSpinner(`Setting ${key}...`, async () => {
-    await client.put('/api/projects/{project}/environments/{environment}/vars/{key}' as never, {
-      params: { path: { project, environment, key } },
+    const projectId = await getProjectId(project)
+
+    // Get environments to find their IDs
+    const { data: envs, error: envsError } = await getEnvironments({
+      client,
+      path: { project_id: projectId },
+    })
+    if (envsError) throw new Error(getErrorMessage(envsError))
+
+    // If env option provided, use those IDs; otherwise use all environments
+    let environmentIds: number[]
+    if (options.env) {
+      environmentIds = options.env.split(',').map(id => parseInt(id.trim(), 10))
+    } else {
+      environmentIds = (envs ?? []).map(e => e.id)
+    }
+
+    const { error } = await createEnvironmentVariable({
+      client,
+      path: { project_id: projectId },
       body: {
+        key,
         value: actualValue,
-        is_secret: options.secret ?? false,
+        environment_ids: environmentIds,
+        include_in_preview: options.preview !== false,
       },
     })
+    if (error) throw new Error(getErrorMessage(error))
   })
 
   success(`Set ${key}`)
 }
 
-async function unsetEnvVar(project: string, environment: string, key: string): Promise<void> {
+async function unsetEnvVar(project: string, varId: string): Promise<void> {
   await requireAuth()
-  const client = getClient()
+  await setupClient()
 
-  await withSpinner(`Removing ${key}...`, async () => {
-    await client.delete('/api/projects/{project}/environments/{environment}/vars/{key}' as never, {
-      params: { path: { project, environment, key } },
+  await withSpinner(`Removing variable...`, async () => {
+    const projectId = await getProjectId(project)
+    const { error } = await deleteEnvironmentVariable({
+      client,
+      path: { project_id: projectId, var_id: parseInt(varId, 10) },
     })
+    if (error) throw new Error(getErrorMessage(error))
   })
 
-  success(`Removed ${key}`)
+  success(`Removed variable ${varId}`)
 }

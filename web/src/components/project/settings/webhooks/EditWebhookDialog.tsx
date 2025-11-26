@@ -38,7 +38,7 @@ const formSchema = z.object({
   url: z.string().min(1, 'URL is required').url('Must be a valid URL'),
   events: z.array(z.string()).min(1, 'Select at least one event'),
   secret: z.string().optional(),
-  enabled: z.boolean().optional().default(true),
+  enabled: z.boolean(),
 })
 
 type FormValues = z.infer<typeof formSchema>

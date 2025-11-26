@@ -1,52 +1,58 @@
 import { requireAuth } from '../../config/store.js'
+import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import {
+  getProjectBySlug,
+  getProjectDeployments,
+  rollbackToDeployment,
+} from '../../api/sdk.gen.js'
 import { promptConfirm, promptSelect } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { success, warning, newline, colors, info, icons, header, keyValue } from '../../ui/output.js'
-import { getClient } from '../../api/client.js'
 
 interface RollbackOptions {
   environment: string
   to?: string
 }
 
-interface Deployment {
-  id: number
-  status: string
-  branch?: string
-  commit_sha?: string
-  created_at: string
-}
-
 export async function rollback(project: string, options: RollbackOptions): Promise<void> {
   await requireAuth()
-
-  const client = getClient()
+  await setupClient()
 
   newline()
   warning(`Rolling back ${colors.bold(project)} in ${colors.bold(options.environment)}`)
   newline()
 
-  let targetDeploymentId = options.to
+  // Get project ID
+  const { data: projectData, error: projectError } = await getProjectBySlug({
+    client,
+    path: { slug: project },
+  })
+
+  if (projectError || !projectData) {
+    throw new Error(`Project "${project}" not found`)
+  }
+
+  let targetDeploymentId = options.to ? parseInt(options.to, 10) : undefined
 
   if (!targetDeploymentId) {
     // Fetch recent successful deployments
     const deployments = await withSpinner('Fetching deployment history...', async () => {
-      const response = await client.get('/api/projects/{project}/deployments' as never, {
-        params: {
-          path: { project },
-          query: {
-            environment: options.environment,
-            status: 'success',
-            limit: 5,
-          },
-        },
+      const { data, error } = await getProjectDeployments({
+        client,
+        path: { id: projectData.id },
       })
 
-      if (response.error) {
-        throw new Error('Failed to fetch deployments')
+      if (error || !data) {
+        throw new Error(getErrorMessage(error))
       }
 
-      return (response.data ?? []) as Deployment[]
+      // Filter by environment and status
+      return data.deployments
+        .filter(d =>
+          d.environment?.name === options.environment &&
+          (d.status === 'success' || d.status === 'completed' || d.status === 'deployed')
+        )
+        .slice(0, 5)
     })
 
     if (deployments.length < 2) {
@@ -57,14 +63,16 @@ export async function rollback(project: string, options: RollbackOptions): Promi
     // Skip current, show previous deployments
     const previousDeployments = deployments.slice(1)
 
-    targetDeploymentId = await promptSelect({
+    const selectedId = await promptSelect({
       message: 'Select deployment to rollback to',
       choices: previousDeployments.map((d) => ({
-        name: `#${d.id} - ${d.branch ?? 'unknown'} (${d.commit_sha?.substring(0, 7) ?? 'unknown'})`,
+        name: `#${d.id} - ${d.branch ?? 'unknown'} (${d.commit_hash?.substring(0, 7) ?? 'unknown'})`,
         value: String(d.id),
-        description: new Date(d.created_at).toLocaleString(),
+        description: new Date(d.created_at * 1000).toLocaleString(),
       })),
     })
+
+    targetDeploymentId = parseInt(selectedId, 10)
   }
 
   const confirmed = await promptConfirm({
@@ -78,15 +86,19 @@ export async function rollback(project: string, options: RollbackOptions): Promi
   }
 
   const newDeployment = await withSpinner('Initiating rollback...', async () => {
-    const response = await client.post('/api/deployments/{id}/rollback' as never, {
-      params: { path: { id: targetDeploymentId } },
+    const { data, error } = await rollbackToDeployment({
+      client,
+      path: {
+        project_id: projectData.id,
+        deployment_id: targetDeploymentId!,
+      },
     })
 
-    if (response.error || !response.data) {
-      throw new Error('Failed to initiate rollback')
+    if (error || !data) {
+      throw new Error(getErrorMessage(error) ?? 'Failed to initiate rollback')
     }
 
-    return response.data as Deployment
+    return data
   })
 
   newline()
@@ -95,5 +107,5 @@ export async function rollback(project: string, options: RollbackOptions): Promi
   keyValue('Status', newDeployment.status)
   newline()
 
-  info(`Track progress with: temps deployments status ${newDeployment.id}`)
+  info(`Track progress with: temps deployments status ${project}:${newDeployment.id}`)
 }

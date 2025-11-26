@@ -1,19 +1,10 @@
 import { requireAuth, config } from '../../config/store.js'
+import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import { getProjectDeployments, getProjectBySlug } from '../../api/sdk.gen.js'
+import type { DeploymentResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { newline, header, icons, json, colors, formatRelativeTime, truncate } from '../../ui/output.js'
-import { getClient } from '../../api/client.js'
-
-interface Deployment {
-  id: number
-  project_name?: string
-  environment?: string
-  status: string
-  branch?: string
-  commit_sha?: string
-  created_at: string
-  finished_at?: string
-}
 
 interface ListOptions {
   environment?: string
@@ -23,30 +14,44 @@ interface ListOptions {
 
 export async function list(project: string | undefined, options: ListOptions): Promise<void> {
   await requireAuth()
+  await setupClient()
 
   const projectName = project ?? config.get('defaultProject')
-  const client = getClient()
+
+  if (!projectName) {
+    throw new Error('No project specified. Use: temps deployments list <project>')
+  }
 
   const deployments = await withSpinner('Fetching deployments...', async () => {
-    const endpoint = projectName
-      ? '/api/projects/{project}/deployments'
-      : '/api/deployments'
-
-    const response = await client.get(endpoint as '/api/deployments', {
-      params: {
-        path: projectName ? { project: projectName } : undefined,
-        query: {
-          environment: options.environment,
-          limit: parseInt(options.limit, 10),
-        },
-      } as never,
+    // Get project ID from slug
+    const { data: projectData, error: projectError } = await getProjectBySlug({
+      client,
+      path: { slug: projectName },
     })
 
-    if (response.error) {
-      throw new Error('Failed to fetch deployments')
+    if (projectError || !projectData) {
+      throw new Error(`Project "${projectName}" not found`)
     }
 
-    return (response.data ?? []) as Deployment[]
+    const { data, error } = await getProjectDeployments({
+      client,
+      path: { id: projectData.id },
+    })
+
+    if (error || !data) {
+      throw new Error(getErrorMessage(error))
+    }
+
+    let result = data.deployments
+
+    // Filter by environment if specified
+    if (options.environment) {
+      result = result.filter(d => d.environment?.name === options.environment)
+    }
+
+    // Apply limit
+    const limit = parseInt(options.limit, 10)
+    return result.slice(0, limit)
   })
 
   if (options.json) {
@@ -55,17 +60,11 @@ export async function list(project: string | undefined, options: ListOptions): P
   }
 
   newline()
-  const title = projectName
-    ? `${icons.rocket} Deployments for ${projectName} (${deployments.length})`
-    : `${icons.rocket} Recent Deployments (${deployments.length})`
-  header(title)
+  header(`${icons.rocket} Deployments for ${projectName} (${deployments.length})`)
 
-  const columns: TableColumn<Deployment>[] = [
+  const columns: TableColumn<DeploymentResponse>[] = [
     { header: 'ID', key: 'id', width: 8 },
-    ...(projectName
-      ? []
-      : [{ header: 'Project', accessor: (d: Deployment) => d.project_name ?? '-' } as TableColumn<Deployment>]),
-    { header: 'Environment', accessor: (d) => d.environment ?? 'production' },
+    { header: 'Environment', accessor: (d) => d.environment?.name ?? 'unknown' },
     {
       header: 'Status',
       accessor: (d) => d.status,
@@ -74,12 +73,12 @@ export async function list(project: string | undefined, options: ListOptions): P
     { header: 'Branch', accessor: (d) => d.branch ?? '-' },
     {
       header: 'Commit',
-      accessor: (d) => (d.commit_sha ? truncate(d.commit_sha, 7) : '-'),
+      accessor: (d) => (d.commit_hash ? truncate(d.commit_hash, 7) : '-'),
       color: (v) => colors.muted(v),
     },
     {
       header: 'Created',
-      accessor: (d) => formatRelativeTime(d.created_at),
+      accessor: (d) => formatRelativeTime(new Date(d.created_at * 1000).toISOString()),
       color: (v) => colors.muted(v),
     },
   ]

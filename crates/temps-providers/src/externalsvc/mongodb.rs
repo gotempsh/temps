@@ -864,15 +864,10 @@ impl ExternalService for MongodbService {
         _subpath_root: &str,
         _pool: &temps_database::DbConnection,
         _external_service: &temps_entities::external_services::Model,
-        _service_config: ServiceConfig,
+        service_config: ServiceConfig,
     ) -> Result<String> {
-        let config = self
-            .config
-            .read()
-            .await
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("MongoDB not configured"))?
-            .clone();
+        // Parse config from the provided service_config parameter (don't rely on in-memory config)
+        let config = self.get_mongodb_config(service_config)?;
 
         let container_name = self.get_container_name();
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
@@ -967,15 +962,10 @@ impl ExternalService for MongodbService {
         s3_client: &aws_sdk_s3::Client,
         backup_location: &str,
         s3_source: &temps_entities::s3_sources::Model,
-        _service_config: ServiceConfig,
+        service_config: ServiceConfig,
     ) -> Result<()> {
-        let config = self
-            .config
-            .read()
-            .await
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("MongoDB not configured"))?
-            .clone();
+        // Parse config from the provided service_config parameter (don't rely on in-memory config)
+        let config = self.get_mongodb_config(service_config)?;
 
         let container_name = self.get_container_name();
 

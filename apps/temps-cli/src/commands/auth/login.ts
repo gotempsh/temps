@@ -1,8 +1,9 @@
 import { credentials, config } from '../../config/store.js'
 import { promptPassword } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
-import { success, info, icons, colors, newline, box } from '../../ui/output.js'
-import { getClient } from '../../api/client.js'
+import { info, icons, colors, newline, box } from '../../ui/output.js'
+import { setupClient, client } from '../../lib/api-client.js'
+import { getCurrentUser } from '../../api/sdk.gen.js'
 import { AuthenticationError } from '../../utils/errors.js'
 
 interface LoginOptions {
@@ -33,34 +34,41 @@ export async function login(options: LoginOptions): Promise<void> {
 }
 
 async function loginWithApiKey(apiKey: string): Promise<void> {
-  const client = getClient()
-
   // Temporarily set the API key to validate it
   await credentials.set('apiKey', apiKey)
+
+  // Setup client with the new credentials
+  await setupClient()
 
   try {
     const result = await withSpinner(
       'Validating API key...',
       async () => {
-        const response = await client.get<{ id: number; email: string }>('/auth/me')
-        return response.data
+        const { data, error } = await getCurrentUser({ client })
+        if (error) {
+          throw new AuthenticationError('Invalid API key')
+        }
+        return data
       },
       { successText: 'API key validated' }
     )
+    if (!result) {
+      throw new AuthenticationError('Invalid API key')
+    }
 
     await credentials.setAll({
       apiKey,
       userId: result.id,
-      email: result.email,
+      email: result.email ?? undefined,
     })
 
     newline()
-    box(
-      `Logged in as ${colors.bold(result.email)}
-API: ${colors.muted(config.get('apiUrl'))}
-Credentials stored in: ${colors.muted(credentials.path)}`,
-      `${icons.sparkles} Welcome to Temps!`
-    )
+    const lines = [
+      result.email ? `Logged in as ${colors.bold(result.email)}` : null,
+      `API: ${colors.muted(config.get('apiUrl'))}`,
+      `Credentials stored in: ${colors.muted(credentials.path)}`,
+    ].filter(Boolean).join('\n')
+    box(lines, `${icons.sparkles} Welcome to Temps!`)
   } catch (err) {
     await credentials.clear()
     throw new AuthenticationError('Invalid API key')

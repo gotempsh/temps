@@ -1,16 +1,19 @@
 {
-  "name": "temps-cli",
-  "version": "0.1.0",
+  "name": "@temps-sdk/cli",
+  "version": "0.1.5",
   "description": "CLI for Temps deployment platform",
-  "module": "src/index.ts",
   "type": "module",
-  "private": true,
   "bin": {
-    "temps": "./bin/temps"
+    "temps": "./dist/index.js"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "dev": "bun run src/index.ts",
-    "build": "bun build src/index.ts --outdir dist --target node",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "bun run clean && bun run build",
+    "build": "bun build src/index.ts --outdir dist --target node && sed -i '' '1s|#!/usr/bin/env bun|#!/usr/bin/env node|' dist/index.js && chmod +x dist/index.js",
     "build:bin": "bun build src/index.ts --compile --outfile bin/temps",
     "generate:api": "bun openapi-ts",
     "typecheck": "tsc --noEmit",

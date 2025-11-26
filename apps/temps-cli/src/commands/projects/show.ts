@@ -1,18 +1,9 @@
 import { requireAuth } from '../../config/store.js'
 import { withSpinner } from '../../ui/spinner.js'
-import { newline, header, icons, json, colors, keyValue, formatDate } from '../../ui/output.js'
+import { newline, header, icons, json, keyValue, formatDate } from '../../ui/output.js'
 import { detailsTable, statusBadge } from '../../ui/table.js'
-import { getClient } from '../../api/client.js'
-
-interface Project {
-  id: number
-  name: string
-  description?: string
-  repository_url?: string
-  status?: string
-  created_at: string
-  updated_at: string
-}
+import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import { getProject, getProjectBySlug } from '../../api/sdk.gen.js'
 
 interface ShowOptions {
   json?: boolean
@@ -20,21 +11,26 @@ interface ShowOptions {
 
 export async function show(projectIdOrName: string, options: ShowOptions): Promise<void> {
   await requireAuth()
-
-  const client = getClient()
+  await setupClient()
 
   const project = await withSpinner('Fetching project...', async () => {
     // Try to parse as ID first
     const id = parseInt(projectIdOrName, 10)
-    const endpoint = isNaN(id) ? `/api/projects/by-name/${projectIdOrName}` : `/api/projects/${id}`
 
-    const response = await client.get(endpoint as '/api/projects/{id}')
-
-    if (response.error || !response.data) {
-      throw new Error(`Project "${projectIdOrName}" not found`)
+    if (!isNaN(id)) {
+      const { data, error } = await getProject({ client, path: { id } })
+      if (error) {
+        throw new Error(`Project "${projectIdOrName}" not found`)
+      }
+      return data
     }
 
-    return response.data as Project
+    // Try by slug
+    const { data, error } = await getProjectBySlug({ client, path: { slug: projectIdOrName } })
+    if (error) {
+      throw new Error(`Project "${projectIdOrName}" not found`)
+    }
+    return data
   })
 
   if (options.json) {
@@ -48,11 +44,14 @@ export async function show(projectIdOrName: string, options: ShowOptions): Promi
   detailsTable({
     ID: project.id,
     Name: project.name,
-    Description: project.description ?? 'No description',
-    Repository: project.repository_url ?? 'Not connected',
-    Status: statusBadge(project.status ?? 'active'),
-    Created: formatDate(project.created_at),
-    Updated: formatDate(project.updated_at),
+    Slug: project.slug,
+    Directory: project.directory,
+    'Main Branch': project.main_branch,
+    Repository: project.repo_name ? `${project.repo_owner}/${project.repo_name}` : 'Not connected',
+    'Attack Mode': project.attack_mode ? 'Enabled' : 'Disabled',
+    'Preview Envs': project.enable_preview_environments ? 'Enabled' : 'Disabled',
+    Created: formatDate(new Date(project.created_at * 1000).toISOString()),
+    Updated: formatDate(new Date(project.updated_at * 1000).toISOString()),
   })
 
   newline()
