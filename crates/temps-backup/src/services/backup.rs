@@ -17,6 +17,7 @@ use temps_entities::backups::Model as Backup;
 use thiserror::Error;
 use tokio::time;
 use tracing::{debug, error, info};
+use urlencoding;
 use uuid::Uuid;
 
 use cron::Schedule;
@@ -504,9 +505,11 @@ impl BackupService {
         let container_name = format!("temps-pg-backup-{}", uuid::Uuid::new_v4());
 
         // Prepare environment variables with proper lifetimes
-        // Escape special characters in the password and wrap in quotes
-        let escaped_password = password.replace('\\', "\\\\").replace('"', "\\\"");
-        let pgpassword_env = format!("PGPASSWORD=\"{}\"", escaped_password);
+        // URL-decode password (it's stored URL-encoded in database for connection strings)
+        let decoded_password = urlencoding::decode(password)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| password.to_string());
+        let pgpassword_env = format!("PGPASSWORD={}", decoded_password);
         let env_vars = vec![pgpassword_env];
 
         // Create container config with version-matched postgres image (includes pg_dump)
@@ -566,9 +569,11 @@ impl BackupService {
         info!("Running pg_dump command in Docker container");
 
         // Create exec instance
-        // Escape special characters in the password and wrap in quotes
-        let escaped_password = password.replace('\\', "\\\\").replace('"', "\\\"");
-        let pgpassword = format!("PGPASSWORD=\"{}\"", escaped_password);
+        // URL-decode password (it's stored URL-encoded in database for connection strings)
+        let decoded_password = urlencoding::decode(password)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| password.to_string());
+        let pgpassword = format!("PGPASSWORD={}", decoded_password);
         let exec = docker
             .create_exec(
                 &container_name,
