@@ -1975,6 +1975,27 @@ export type ExternalImageResponse = {
     size?: number | null;
 };
 
+/**
+ * Response type for external service backup
+ */
+export type ExternalServiceBackupResponse = {
+    backup_id: number;
+    backup_type: string;
+    checksum?: string | null;
+    compression_type: string;
+    created_by: number;
+    error_message?: string | null;
+    expires_at?: string | null;
+    finished_at?: string | null;
+    id: number;
+    metadata: unknown;
+    s3_location: string;
+    service_id: number;
+    size_bytes?: number | null;
+    started_at: string;
+    state: string;
+};
+
 export type ExternalServiceDetails = {
     current_parameters?: {
         [key: string]: string;
@@ -3785,6 +3806,17 @@ export type RunBackupRequest = {
     backup_type: string;
 };
 
+export type RunExternalServiceBackupRequest = {
+    /**
+     * Type of backup to perform (e.g., "full", "incremental")
+     */
+    backup_type?: string | null;
+    /**
+     * ID of the S3 source to store the backup
+     */
+    s3_source_id: number;
+};
+
 /**
  * Response type for S3 source
  */
@@ -5116,6 +5148,10 @@ export type WebhookDeliveryResponse = {
     event_id: string;
     event_type: string;
     id: number;
+    /**
+     * JSON payload that was sent to the webhook endpoint
+     */
+    payload: string;
     response_body?: string | null;
     status_code?: number | null;
     success: boolean;
@@ -6824,6 +6860,41 @@ export type VerifyMfaChallengeResponses = {
 };
 
 export type VerifyMfaChallengeResponse = VerifyMfaChallengeResponses[keyof VerifyMfaChallengeResponses];
+
+export type RunExternalServiceBackupData = {
+    body: RunExternalServiceBackupRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/backups/external-services/{id}/run';
+};
+
+export type RunExternalServiceBackupErrors = {
+    /**
+     * Invalid request
+     */
+    400: ProblemDetails;
+    /**
+     * External service or S3 source not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RunExternalServiceBackupError = RunExternalServiceBackupErrors[keyof RunExternalServiceBackupErrors];
+
+export type RunExternalServiceBackupResponses = {
+    /**
+     * Backup started successfully
+     */
+    200: ExternalServiceBackupResponse;
+};
+
+export type RunExternalServiceBackupResponse = RunExternalServiceBackupResponses[keyof RunExternalServiceBackupResponses];
 
 export type ListS3SourcesData = {
     body?: never;
@@ -15329,6 +15400,54 @@ export type ListDeliveriesResponses = {
 };
 
 export type ListDeliveriesResponse = ListDeliveriesResponses[keyof ListDeliveriesResponses];
+
+export type GetDeliveryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+        /**
+         * Delivery ID
+         */
+        delivery_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}';
+};
+
+export type GetDeliveryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Delivery not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDeliveryResponses = {
+    /**
+     * Delivery details including full payload
+     */
+    200: WebhookDeliveryResponse;
+};
+
+export type GetDeliveryResponse = GetDeliveryResponses[keyof GetDeliveryResponses];
 
 export type RetryDeliveryData = {
     body?: never;

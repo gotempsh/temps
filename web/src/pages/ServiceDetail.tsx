@@ -7,6 +7,7 @@ import {
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
+import { TriggerBackupDialog } from '@/components/storage/TriggerBackupDialog'
 import { UpgradeServiceDialog } from '@/components/storage/UpgradeServiceDialog'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -40,6 +41,7 @@ import {
   Database,
   Eye,
   EyeOff,
+  HardDrive,
   Loader2,
   Pencil,
   RefreshCcw,
@@ -57,6 +59,7 @@ export function ServiceDetail() {
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
   const [isUpgradeDialogOpen, setIsUpgradeDialogOpen] = useState(false)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
+  const [isBackupDialogOpen, setIsBackupDialogOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [visibleParameters, setVisibleParameters] = useState<Set<string>>(
     new Set()
@@ -307,6 +310,15 @@ export function ServiceDetail() {
               Upgrade
             </Button>
             <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setIsBackupDialogOpen(true)}
+              className="gap-2"
+            >
+              <HardDrive className="h-4 w-4" />
+              Backup
+            </Button>
+            <Button
               variant="ghost"
               size="sm"
               onClick={() => setIsDeleteDialogOpen(true)}
@@ -548,6 +560,13 @@ export function ServiceDetail() {
             }).queryKey,
           })
         }}
+      />
+
+      <TriggerBackupDialog
+        open={isBackupDialogOpen}
+        onOpenChange={setIsBackupDialogOpen}
+        serviceId={parseInt(id!)}
+        serviceName={service.service.name}
       />
     </div>
   )

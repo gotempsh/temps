@@ -2057,6 +2057,19 @@ impl BackupService {
         Ok(model)
     }
 
+    /// Get an external service by ID
+    pub async fn get_external_service(
+        &self,
+        service_id: i32,
+    ) -> Result<temps_entities::external_services::Model, BackupError> {
+        temps_entities::external_services::Entity::find_by_id(service_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                BackupError::NotFound(format!("External service with ID {} not found", service_id))
+            })
+    }
+
     pub async fn backup_external_service(
         &self,
         service: &temps_entities::external_services::Model,

@@ -908,11 +908,7 @@ impl PostgresService {
             })?;
 
         // Execute psql to restore the backup with actual credentials
-        // URL-decode password (it's stored URL-encoded in database for connection strings)
-        let decoded_password = urlencoding::decode(password)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| password.to_string());
-        let password_env = format!("PGPASSWORD={}", decoded_password);
+        let password_env = format!("PGPASSWORD={}", password);
         let exec = docker
             .create_exec(
                 container_name,
@@ -1045,10 +1041,7 @@ impl ExternalService for PostgresService {
 
         // Execute pg_dumpall inside the container with actual credentials from config
         // URL-decode password (it's stored URL-encoded in database for connection strings)
-        let decoded_password = urlencoding::decode(&postgres_config.password)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| postgres_config.password.clone());
-        let password_env = format!("PGPASSWORD={}", decoded_password);
+        let password_env = format!("PGPASSWORD={}", postgres_config.password);
         let exec = self
             .docker
             .create_exec(

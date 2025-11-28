@@ -50,6 +50,16 @@ pub struct BackupRunAudit {
     pub backup_type: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceBackupRunAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub service_name: String,
+    pub service_type: String,
+    pub backup_id: i32,
+    pub backup_type: String,
+}
+
 // Implement AuditOperation for S3 Source audit structs
 impl AuditOperation for S3SourceCreatedAudit {
     fn operation_type(&self) -> String {
@@ -147,6 +157,29 @@ impl AuditOperation for BackupScheduleStatusChangedAudit {
 impl AuditOperation for BackupRunAudit {
     fn operation_type(&self) -> String {
         "BACKUP_RUN".to_string()
+    }
+
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for ExternalServiceBackupRunAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_BACKUP_RUN".to_string()
     }
 
     fn user_id(&self) -> i32 {

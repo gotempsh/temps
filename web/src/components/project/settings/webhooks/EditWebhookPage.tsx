@@ -93,12 +93,12 @@ export function EditWebhookPage({ project }: EditWebhookPageProps) {
     if (webhook) {
       form.reset({
         url: webhook.url,
-        events: webhook.events,
+        events: webhook.events || [],
         secret: '',
         enabled: webhook.enabled,
       })
     }
-  }, [webhook, form])
+  }, [webhook])
 
   const updateWebhook = useMutation({
     ...updateWebhookMutation(),
