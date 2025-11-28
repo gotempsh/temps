@@ -1002,7 +1002,7 @@ impl ExternalService for PostgresService {
         pool: &temps_database::DbConnection,
         external_service: &temps_entities::external_services::Model,
         service_config: ServiceConfig,
-    ) -> Result<String> {
+    ) -> anyhow::Result<String> {
         use chrono::Utc;
         use sea_orm::*;
         use std::io::Write;
@@ -1108,17 +1108,31 @@ impl ExternalService for PostgresService {
 
         // Get file size before compression
         let size_bytes = temp_file.as_file().metadata()?.len() as i32;
-
-        // Upload to S3
-        s3_client
+        match s3_client
             .put_object()
             .bucket(&s3_source.bucket_name)
             .key(&backup_key)
             .body(aws_sdk_s3::primitives::ByteStream::from_path(compressed_file.path()).await?)
-            .content_type("application/gzip")
-            .content_encoding("gzip")
+            .content_type("application/x-gzip")
             .send()
-            .await?;
+            .await
+        {
+            Ok(_) => {
+                info!("Successfully uploaded backup to S3");
+                return Ok(backup_key.clone());
+            }
+            Err(e) => {
+                error!(
+                    "Failed to upload backup to S3: {:?} - Message: {}",
+                    e,
+                    e.to_string()
+                );
+                return Err(anyhow::anyhow!(
+                    "Failed to upload backup to S3: {}",
+                    e.to_string()
+                ));
+            }
+        }
 
         // Update backup record with success
         let mut backup_update: external_service_backups::ActiveModel = backup_record.clone().into();
