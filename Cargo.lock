@@ -745,6 +745,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-sesv2"
+version = "1.101.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc52565fa340713fc5b30045912a6cdbf0d5504c957bfbbd6d10fe5cfa73649"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-sso"
 version = "1.87.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10316,6 +10338,37 @@ dependencies = [
  "uuid",
  "webpki-roots 0.26.11",
  "x509-parser 0.18.0",
+]
+
+[[package]]
+name = "temps-email"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-sesv2",
+ "axum 0.8.6",
+ "axum-macros",
+ "chrono",
+ "futures",
+ "reqwest",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "temps-auth",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-migrations",
+ "testcontainers",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "urlencoding",
+ "utoipa",
+ "uuid",
 ]
 
 [[package]]

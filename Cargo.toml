@@ -46,6 +46,7 @@ members = [
     "crates/temps-import-docker",
     "crates/temps-captcha-wasm",
     "crates/temps-webhooks",
+    "crates/temps-email",
 ]
 
 [workspace.package]
@@ -108,7 +109,8 @@ sea-orm = { version = "1.1.14", features = [
     "with-chrono",
     "with-json",
     "with-uuid",
-    "debug-print"
+    "debug-print",
+    "mock"
 ] }
 sea-orm-migration = { version = "1.1", features = [
     "sqlx-sqlite",

@@ -163,6 +163,18 @@ pub enum Permission {
     // Import permissions
     ImportsRead,
     ImportsCreate,
+
+    // Email permissions
+    EmailProvidersRead,
+    EmailProvidersWrite,
+    EmailProvidersCreate,
+    EmailProvidersDelete,
+    EmailDomainsRead,
+    EmailDomainsWrite,
+    EmailDomainsCreate,
+    EmailDomainsDelete,
+    EmailsRead,
+    EmailsSend,
 }
 
 impl fmt::Display for Permission {
@@ -264,6 +276,16 @@ impl fmt::Display for Permission {
             Permission::GitRepositoriesSync => "git_repositories:sync",
             Permission::ImportsRead => "imports:read",
             Permission::ImportsCreate => "imports:create",
+            Permission::EmailProvidersRead => "email_providers:read",
+            Permission::EmailProvidersWrite => "email_providers:write",
+            Permission::EmailProvidersCreate => "email_providers:create",
+            Permission::EmailProvidersDelete => "email_providers:delete",
+            Permission::EmailDomainsRead => "email_domains:read",
+            Permission::EmailDomainsWrite => "email_domains:write",
+            Permission::EmailDomainsCreate => "email_domains:create",
+            Permission::EmailDomainsDelete => "email_domains:delete",
+            Permission::EmailsRead => "emails:read",
+            Permission::EmailsSend => "emails:send",
         };
         write!(f, "{}", name)
     }
@@ -369,6 +391,16 @@ impl Permission {
             "git_repositories:sync" => Some(Permission::GitRepositoriesSync),
             "imports:read" => Some(Permission::ImportsRead),
             "imports:create" => Some(Permission::ImportsCreate),
+            "email_providers:read" => Some(Permission::EmailProvidersRead),
+            "email_providers:write" => Some(Permission::EmailProvidersWrite),
+            "email_providers:create" => Some(Permission::EmailProvidersCreate),
+            "email_providers:delete" => Some(Permission::EmailProvidersDelete),
+            "email_domains:read" => Some(Permission::EmailDomainsRead),
+            "email_domains:write" => Some(Permission::EmailDomainsWrite),
+            "email_domains:create" => Some(Permission::EmailDomainsCreate),
+            "email_domains:delete" => Some(Permission::EmailDomainsDelete),
+            "emails:read" => Some(Permission::EmailsRead),
+            "emails:send" => Some(Permission::EmailsSend),
             _ => None,
         }
     }
@@ -471,6 +503,16 @@ impl Permission {
             Permission::GitRepositoriesSync,
             Permission::ImportsRead,
             Permission::ImportsCreate,
+            Permission::EmailProvidersRead,
+            Permission::EmailProvidersWrite,
+            Permission::EmailProvidersCreate,
+            Permission::EmailProvidersDelete,
+            Permission::EmailDomainsRead,
+            Permission::EmailDomainsWrite,
+            Permission::EmailDomainsCreate,
+            Permission::EmailDomainsDelete,
+            Permission::EmailsRead,
+            Permission::EmailsSend,
         ]
     }
 }
@@ -624,6 +666,16 @@ impl Role {
                 Permission::GitRepositoriesSync,
                 Permission::ImportsRead,
                 Permission::ImportsCreate,
+                Permission::EmailProvidersRead,
+                Permission::EmailProvidersWrite,
+                Permission::EmailProvidersCreate,
+                Permission::EmailProvidersDelete,
+                Permission::EmailDomainsRead,
+                Permission::EmailDomainsWrite,
+                Permission::EmailDomainsCreate,
+                Permission::EmailDomainsDelete,
+                Permission::EmailsRead,
+                Permission::EmailsSend,
             ],
             Role::User => &[
                 Permission::ProjectsRead,
@@ -695,6 +747,14 @@ impl Role {
                 Permission::GitRepositoriesSync,
                 Permission::ImportsRead,
                 Permission::ImportsCreate,
+                Permission::EmailProvidersRead,
+                Permission::EmailProvidersWrite,
+                Permission::EmailProvidersCreate,
+                Permission::EmailDomainsRead,
+                Permission::EmailDomainsWrite,
+                Permission::EmailDomainsCreate,
+                Permission::EmailsRead,
+                Permission::EmailsSend,
             ],
             Role::Reader => &[
                 Permission::ProjectsRead,
@@ -724,6 +784,9 @@ impl Role {
                 Permission::GitConnectionsRead,
                 Permission::GitRepositoriesRead,
                 Permission::ImportsRead,
+                Permission::EmailProvidersRead,
+                Permission::EmailDomainsRead,
+                Permission::EmailsRead,
             ],
             Role::Mcp => &[
                 Permission::ProjectsRead,
@@ -748,5 +811,181 @@ impl Role {
 
     pub fn has_permission(&self, permission: &Permission) -> bool {
         self.permissions().contains(permission)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Email permission tests
+    #[test]
+    fn test_email_permissions_exist() {
+        // Verify all email permissions are defined
+        let email_permissions = vec![
+            Permission::EmailProvidersRead,
+            Permission::EmailProvidersWrite,
+            Permission::EmailProvidersCreate,
+            Permission::EmailProvidersDelete,
+            Permission::EmailDomainsRead,
+            Permission::EmailDomainsWrite,
+            Permission::EmailDomainsCreate,
+            Permission::EmailDomainsDelete,
+            Permission::EmailsRead,
+            Permission::EmailsSend,
+        ];
+
+        for perm in &email_permissions {
+            assert!(
+                Permission::all().contains(perm),
+                "Permission {:?} should be in all()",
+                perm
+            );
+        }
+    }
+
+    #[test]
+    fn test_email_permissions_display() {
+        assert_eq!(
+            format!("{}", Permission::EmailProvidersRead),
+            "email_providers:read"
+        );
+        assert_eq!(
+            format!("{}", Permission::EmailProvidersWrite),
+            "email_providers:write"
+        );
+        assert_eq!(
+            format!("{}", Permission::EmailProvidersCreate),
+            "email_providers:create"
+        );
+        assert_eq!(
+            format!("{}", Permission::EmailProvidersDelete),
+            "email_providers:delete"
+        );
+        assert_eq!(
+            format!("{}", Permission::EmailDomainsRead),
+            "email_domains:read"
+        );
+        assert_eq!(
+            format!("{}", Permission::EmailDomainsWrite),
+            "email_domains:write"
+        );
+        assert_eq!(
+            format!("{}", Permission::EmailDomainsCreate),
+            "email_domains:create"
+        );
+        assert_eq!(
+            format!("{}", Permission::EmailDomainsDelete),
+            "email_domains:delete"
+        );
+        assert_eq!(format!("{}", Permission::EmailsRead), "emails:read");
+        assert_eq!(format!("{}", Permission::EmailsSend), "emails:send");
+    }
+
+    #[test]
+    fn test_email_permissions_from_str() {
+        assert_eq!(
+            Permission::from_str("email_providers:read"),
+            Some(Permission::EmailProvidersRead)
+        );
+        assert_eq!(
+            Permission::from_str("email_providers:write"),
+            Some(Permission::EmailProvidersWrite)
+        );
+        assert_eq!(
+            Permission::from_str("email_providers:create"),
+            Some(Permission::EmailProvidersCreate)
+        );
+        assert_eq!(
+            Permission::from_str("email_providers:delete"),
+            Some(Permission::EmailProvidersDelete)
+        );
+        assert_eq!(
+            Permission::from_str("email_domains:read"),
+            Some(Permission::EmailDomainsRead)
+        );
+        assert_eq!(
+            Permission::from_str("email_domains:write"),
+            Some(Permission::EmailDomainsWrite)
+        );
+        assert_eq!(
+            Permission::from_str("email_domains:create"),
+            Some(Permission::EmailDomainsCreate)
+        );
+        assert_eq!(
+            Permission::from_str("email_domains:delete"),
+            Some(Permission::EmailDomainsDelete)
+        );
+        assert_eq!(
+            Permission::from_str("emails:read"),
+            Some(Permission::EmailsRead)
+        );
+        assert_eq!(
+            Permission::from_str("emails:send"),
+            Some(Permission::EmailsSend)
+        );
+    }
+
+    #[test]
+    fn test_admin_has_all_email_permissions() {
+        let admin_permissions = Role::Admin.permissions();
+
+        // Admin should have all email permissions
+        assert!(admin_permissions.contains(&Permission::EmailProvidersRead));
+        assert!(admin_permissions.contains(&Permission::EmailProvidersWrite));
+        assert!(admin_permissions.contains(&Permission::EmailProvidersCreate));
+        assert!(admin_permissions.contains(&Permission::EmailProvidersDelete));
+        assert!(admin_permissions.contains(&Permission::EmailDomainsRead));
+        assert!(admin_permissions.contains(&Permission::EmailDomainsWrite));
+        assert!(admin_permissions.contains(&Permission::EmailDomainsCreate));
+        assert!(admin_permissions.contains(&Permission::EmailDomainsDelete));
+        assert!(admin_permissions.contains(&Permission::EmailsRead));
+        assert!(admin_permissions.contains(&Permission::EmailsSend));
+    }
+
+    #[test]
+    fn test_user_has_email_permissions() {
+        let user_permissions = Role::User.permissions();
+
+        // User should have all email permissions (except delete for providers)
+        assert!(user_permissions.contains(&Permission::EmailProvidersRead));
+        assert!(user_permissions.contains(&Permission::EmailProvidersWrite));
+        assert!(user_permissions.contains(&Permission::EmailProvidersCreate));
+        assert!(user_permissions.contains(&Permission::EmailDomainsRead));
+        assert!(user_permissions.contains(&Permission::EmailDomainsWrite));
+        assert!(user_permissions.contains(&Permission::EmailDomainsCreate));
+        assert!(user_permissions.contains(&Permission::EmailsRead));
+        assert!(user_permissions.contains(&Permission::EmailsSend));
+    }
+
+    #[test]
+    fn test_reader_has_read_only_email_permissions() {
+        let reader_permissions = Role::Reader.permissions();
+
+        // Reader should only have read permissions
+        assert!(reader_permissions.contains(&Permission::EmailProvidersRead));
+        assert!(reader_permissions.contains(&Permission::EmailDomainsRead));
+        assert!(reader_permissions.contains(&Permission::EmailsRead));
+
+        // Reader should NOT have write/create/delete/send permissions
+        assert!(!reader_permissions.contains(&Permission::EmailProvidersWrite));
+        assert!(!reader_permissions.contains(&Permission::EmailProvidersCreate));
+        assert!(!reader_permissions.contains(&Permission::EmailProvidersDelete));
+        assert!(!reader_permissions.contains(&Permission::EmailDomainsWrite));
+        assert!(!reader_permissions.contains(&Permission::EmailDomainsCreate));
+        assert!(!reader_permissions.contains(&Permission::EmailDomainsDelete));
+        assert!(!reader_permissions.contains(&Permission::EmailsSend));
+    }
+
+    #[test]
+    fn test_role_has_permission_method() {
+        // Admin has email send permission
+        assert!(Role::Admin.has_permission(&Permission::EmailsSend));
+        // User has email send permission
+        assert!(Role::User.has_permission(&Permission::EmailsSend));
+        // Reader does NOT have email send permission
+        assert!(!Role::Reader.has_permission(&Permission::EmailsSend));
+        // MCP does NOT have email permissions
+        assert!(!Role::Mcp.has_permission(&Permission::EmailsSend));
     }
 }
