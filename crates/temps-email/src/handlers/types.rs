@@ -242,6 +242,8 @@ pub struct EmailStatsResponse {
     pub sent: u64,
     pub failed: u64,
     pub queued: u64,
+    /// Emails captured without sending (Mailhog mode - no provider configured)
+    pub captured: u64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

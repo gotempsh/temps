@@ -293,6 +293,7 @@ pub async fn get_email_stats(
         sent: stats.sent,
         failed: stats.failed,
         queued: stats.queued,
+        captured: stats.captured,
     };
 
     Ok(Json(response))

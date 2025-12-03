@@ -26,6 +26,7 @@ import {
   Globe,
   Key,
   LogOut,
+  Mail,
   MoreHorizontal,
   Network,
   ScrollText,
@@ -92,6 +93,11 @@ const data = {
       title: 'Settings',
       url: '/settings',
       icon: Settings,
+    },
+    {
+      title: 'Email',
+      url: '/email',
+      icon: Mail,
     },
     {
       title: 'Notifications',

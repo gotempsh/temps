@@ -7,7 +7,7 @@ use sea_orm::{
 };
 use std::sync::Arc;
 use temps_entities::emails;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::errors::EmailError;
@@ -136,12 +136,67 @@ impl EmailService {
 
         let email_model = email.insert(self.db.as_ref()).await?;
 
-        // Get provider and send
-        let provider = self.provider_service.get(domain.provider_id).await?;
-        let provider_instance = self
+        // Try to get provider - if not configured, store email as "captured" (Mailhog-like behavior)
+        let provider = match self.provider_service.get(domain.provider_id).await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                // No provider configured - capture email without sending (Mailhog mode)
+                info!(
+                    "No provider configured for domain {}, capturing email without sending (Mailhog mode)",
+                    domain.domain
+                );
+                debug!("Provider lookup error: {}", e);
+                None
+            }
+        };
+
+        // If no provider, mark as captured and return success
+        if provider.is_none() {
+            let mut active_model: emails::ActiveModel = email_model.into();
+            active_model.status = Set("captured".to_string());
+            active_model.sent_at = Set(Some(Utc::now()));
+
+            active_model.update(self.db.as_ref()).await?;
+
+            info!(
+                "Email captured (no provider), id: {}, from: {}, to: {:?}",
+                email_id, request.from, request.to
+            );
+
+            return Ok(SendEmailResponse {
+                id: email_id,
+                status: "captured".to_string(),
+                provider_message_id: None,
+            });
+        }
+
+        let provider = provider.unwrap();
+
+        let provider_instance = match self
             .provider_service
             .create_provider_instance(&provider)
-            .await?;
+            .await
+        {
+            Ok(instance) => instance,
+            Err(e) => {
+                // Provider exists but failed to create instance - capture email instead of failing
+                info!(
+                    "Failed to create provider instance, capturing email without sending: {}",
+                    e
+                );
+                let mut active_model: emails::ActiveModel = email_model.into();
+                active_model.status = Set("captured".to_string());
+                active_model.error_message = Set(Some(format!("Provider unavailable: {}", e)));
+                active_model.sent_at = Set(Some(Utc::now()));
+                active_model.update(self.db.as_ref()).await?;
+
+                return Ok(SendEmailResponse {
+                    id: email_id,
+                    status: "captured".to_string(),
+                    provider_message_id: None,
+                });
+            }
+        };
 
         let provider_request = ProviderSendRequest {
             from: request.from,
@@ -178,16 +233,24 @@ impl EmailService {
                 })
             }
             Err(e) => {
-                error!("Failed to send email: {}", e);
+                // Provider send failed - capture email instead of failing
+                info!(
+                    "Failed to send email via provider, capturing instead: {}",
+                    e
+                );
 
-                // Update email with failed status
                 let mut active_model: emails::ActiveModel = email_model.into();
-                active_model.status = Set("failed".to_string());
-                active_model.error_message = Set(Some(e.to_string()));
+                active_model.status = Set("captured".to_string());
+                active_model.error_message = Set(Some(format!("Send failed: {}", e)));
+                active_model.sent_at = Set(Some(Utc::now()));
 
                 active_model.update(self.db.as_ref()).await?;
 
-                Err(e)
+                Ok(SendEmailResponse {
+                    id: email_id,
+                    status: "captured".to_string(),
+                    provider_message_id: None,
+                })
             }
         }
     }
@@ -256,7 +319,13 @@ impl EmailService {
             .await?;
 
         let queued = base_query
+            .clone()
             .filter(emails::Column::Status.eq("queued"))
+            .count(self.db.as_ref())
+            .await?;
+
+        let captured = base_query
+            .filter(emails::Column::Status.eq("captured"))
             .count(self.db.as_ref())
             .await?;
 
@@ -265,6 +334,7 @@ impl EmailService {
             sent,
             failed,
             queued,
+            captured,
         })
     }
 }
@@ -276,6 +346,7 @@ pub struct EmailStats {
     pub sent: u64,
     pub failed: u64,
     pub queued: u64,
+    pub captured: u64,
 }
 
 #[cfg(test)]
@@ -435,15 +506,17 @@ mod tests {
     fn test_email_stats() {
         let stats = EmailStats {
             total: 100,
-            sent: 80,
+            sent: 70,
             failed: 10,
-            queued: 10,
+            queued: 5,
+            captured: 15,
         };
 
         assert_eq!(stats.total, 100);
-        assert_eq!(stats.sent, 80);
+        assert_eq!(stats.sent, 70);
         assert_eq!(stats.failed, 10);
-        assert_eq!(stats.queued, 10);
+        assert_eq!(stats.queued, 5);
+        assert_eq!(stats.captured, 15);
     }
 
     #[test]
@@ -481,17 +554,22 @@ mod tests {
         // Test EmailStats struct construction
         let stats = EmailStats {
             total: 100,
-            sent: 80,
+            sent: 70,
             failed: 10,
-            queued: 10,
+            queued: 5,
+            captured: 15,
         };
 
         assert_eq!(stats.total, 100);
-        assert_eq!(stats.sent, 80);
+        assert_eq!(stats.sent, 70);
         assert_eq!(stats.failed, 10);
-        assert_eq!(stats.queued, 10);
+        assert_eq!(stats.queued, 5);
+        assert_eq!(stats.captured, 15);
         // Verify counts add up
-        assert_eq!(stats.sent + stats.failed + stats.queued, stats.total);
+        assert_eq!(
+            stats.sent + stats.failed + stats.queued + stats.captured,
+            stats.total
+        );
     }
 
     #[test]
@@ -561,6 +639,7 @@ mod tests {
         assert_eq!(stats.sent, 0);
         assert_eq!(stats.failed, 0);
         assert_eq!(stats.queued, 0);
+        assert_eq!(stats.captured, 0);
     }
 
     #[tokio::test]
