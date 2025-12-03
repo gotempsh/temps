@@ -40,7 +40,9 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
-import { Cloud, EllipsisVertical, Loader2, Mail, Plus, Server } from 'lucide-react'
+import { EllipsisVertical, Loader2, Mail, Plus } from 'lucide-react'
+import { AWSIcon } from '@/components/icons/AWSIcon'
+import { ScalewayIcon } from '@/components/icons/ScalewayIcon'
 import { useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -163,9 +165,9 @@ const scalewayRegions = [
 
 function ProviderIcon({ type }: { type: 'ses' | 'scaleway' }) {
   if (type === 'ses') {
-    return <Cloud className="h-5 w-5 text-orange-500" />
+    return <AWSIcon className="h-5 w-5 text-[#FF9900]" />
   }
-  return <Server className="h-5 w-5 text-purple-500" />
+  return <ScalewayIcon className="h-5 w-5 text-[#4F0599]" />
 }
 
 function ProviderCard({
@@ -425,13 +427,13 @@ export function EmailProvidersManagement() {
                       <SelectContent>
                         <SelectItem value="ses">
                           <div className="flex items-center gap-2">
-                            <Cloud className="h-4 w-4 text-orange-500" />
+                            <AWSIcon className="h-4 w-4 text-[#FF9900]" />
                             AWS SES
                           </div>
                         </SelectItem>
                         <SelectItem value="scaleway">
                           <div className="flex items-center gap-2">
-                            <Server className="h-4 w-4 text-purple-500" />
+                            <ScalewayIcon className="h-4 w-4 text-[#4F0599]" />
                             Scaleway
                           </div>
                         </SelectItem>
@@ -457,7 +459,12 @@ export function EmailProvidersManagement() {
                       <SelectContent>
                         {regions.map((region) => (
                           <SelectItem key={region.value} value={region.value}>
-                            {region.label}
+                            <div className="flex items-center justify-between gap-4 w-full">
+                              <span>{region.label}</span>
+                              <span className="font-mono text-xs text-muted-foreground">
+                                {region.value}
+                              </span>
+                            </div>
                           </SelectItem>
                         ))}
                       </SelectContent>
