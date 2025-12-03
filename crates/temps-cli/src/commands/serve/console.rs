@@ -30,6 +30,7 @@ use temps_database::DbConnection;
 use temps_deployer::plugin::DeployerPlugin;
 use temps_deployments::DeploymentsPlugin;
 use temps_domains::DomainsPlugin;
+use temps_email::EmailPlugin;
 use temps_entities::users;
 use temps_environments::EnvironmentsPlugin;
 use temps_error_tracking::ErrorTrackingPlugin;
@@ -583,6 +584,11 @@ pub async fn start_console_api(
     debug!("Registering NotificationsPlugin");
     let notifications_plugin = Box::new(NotificationsPlugin::new());
     plugin_manager.register_plugin(notifications_plugin);
+
+    // 7.1. EmailPlugin - provides email sending and domain management (depends on database and encryption)
+    debug!("Registering EmailPlugin");
+    let email_plugin = Box::new(EmailPlugin::new());
+    plugin_manager.register_plugin(email_plugin);
 
     // 7.5. WebhooksPlugin - provides webhook delivery and management (depends on database and encryption)
     debug!("Registering WebhooksPlugin");

@@ -3,7 +3,7 @@
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { CopyButton } from '@/components/ui/copy-button'
+import { CodeBlock } from '@/components/ui/code-block'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useQuery } from '@tanstack/react-query'
 import {
@@ -43,36 +43,6 @@ async function getEmailStatus(): Promise<{
   }
 }
 
-function CodeBlock({
-  code,
-  language = 'typescript',
-  title,
-}: {
-  code: string
-  language?: string
-  title?: string
-}) {
-  return (
-    <div className="relative rounded-lg border bg-muted/50">
-      {title && (
-        <div className="flex items-center justify-between border-b px-4 py-2 bg-muted/30">
-          <span className="text-sm font-medium">{title}</span>
-          <CopyButton value={code} className="h-7 w-7 p-0" />
-        </div>
-      )}
-      <div className="relative">
-        {!title && (
-          <div className="absolute right-2 top-2">
-            <CopyButton value={code} className="h-7 w-7 p-0" />
-          </div>
-        )}
-        <pre className="p-4 overflow-x-auto text-sm">
-          <code className={`language-${language}`}>{code}</code>
-        </pre>
-      </div>
-    </div>
-  )
-}
 
 function SetupStatus() {
   const { data: status } = useQuery({
@@ -495,7 +465,7 @@ export function SdkDocumentation() {
       {/* Basic Usage */}
       <section className="space-y-4">
         <h3 className="text-xl font-semibold">Basic Usage</h3>
-        <CodeBlock code={basicUsageCode} title="Send a simple email" />
+        <CodeBlock code={basicUsageCode} language="typescript" title="Send a simple email" />
       </section>
 
       {/* Framework Integration */}
@@ -534,11 +504,13 @@ export function SdkDocumentation() {
 
             <CodeBlock
               code={reactEmailCode}
+              language="typescript"
               title="Create email template (emails/WelcomeEmail.tsx)"
             />
 
             <CodeBlock
               code={reactEmailSendCode}
+              language="typescript"
               title="Send with Temps SDK"
             />
           </TabsContent>
@@ -559,10 +531,11 @@ export function SdkDocumentation() {
 
             <CodeBlock
               code={jsxEmailCode}
+              language="typescript"
               title="Create email template (emails/welcome.tsx)"
             />
 
-            <CodeBlock code={jsxEmailSendCode} title="Send with Temps SDK" />
+            <CodeBlock code={jsxEmailSendCode} language="typescript" title="Send with Temps SDK" />
           </TabsContent>
         </Tabs>
       </section>
@@ -583,7 +556,7 @@ export function SdkDocumentation() {
           </TabsList>
 
           <TabsContent value="fetch" className="mt-4">
-            <CodeBlock code={directApiCode} title="Using fetch" />
+            <CodeBlock code={directApiCode} language="typescript" title="Using fetch" />
           </TabsContent>
 
           <TabsContent value="python" className="mt-4">

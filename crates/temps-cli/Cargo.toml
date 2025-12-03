@@ -27,6 +27,7 @@ temps-database = { path = "../temps-database" }
 temps-deployer = { path = "../temps-deployer" }
 temps-deployments = { path = "../temps-deployments" }
 temps-domains = { path = "../temps-domains" }
+temps-email = { path = "../temps-email" }
 temps-entities = { path = "../temps-entities" }
 temps-environments = { path = "../temps-environments" }
 temps-error-tracking = { path = "../temps-error-tracking" }

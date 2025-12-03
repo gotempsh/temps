@@ -14,6 +14,7 @@ interface CodeBlockProps {
     | 'shell'
     | 'text'
     | 'python'
+    | 'go'
   className?: string
   showCopy?: boolean
   title?: string
@@ -484,6 +485,159 @@ export function CodeBlock({
       })
     }
 
+    if (lang === 'go') {
+      const keywords = [
+        'package',
+        'import',
+        'func',
+        'return',
+        'if',
+        'else',
+        'for',
+        'range',
+        'switch',
+        'case',
+        'default',
+        'break',
+        'continue',
+        'goto',
+        'fallthrough',
+        'defer',
+        'go',
+        'chan',
+        'select',
+        'type',
+        'struct',
+        'interface',
+        'map',
+        'var',
+        'const',
+        'nil',
+        'true',
+        'false',
+      ]
+      const types = [
+        'string',
+        'int',
+        'int8',
+        'int16',
+        'int32',
+        'int64',
+        'uint',
+        'uint8',
+        'uint16',
+        'uint32',
+        'uint64',
+        'float32',
+        'float64',
+        'bool',
+        'byte',
+        'rune',
+        'error',
+        'any',
+      ]
+
+      return lines.map((line, lineIdx) => {
+        // Comments
+        if (line.trim().startsWith('//')) {
+          return (
+            <div key={lineIdx} className="flex">
+              {showLineNumbers && (
+                <span className="text-muted-foreground/40 select-none pr-4 text-right min-w-[3ch] inline-block">
+                  {lineIdx + 1}
+                </span>
+              )}
+              <div className="flex-1 text-muted-foreground opacity-70 italic">
+                {line}
+              </div>
+            </div>
+          )
+        }
+
+        // Process each line with a simple tokenizer
+        const tokens: React.ReactNode[] = []
+        let current = ''
+        let inString = false
+        let stringChar = ''
+
+        for (let i = 0; i < line.length; i++) {
+          const char = line[i]
+
+          // Handle strings
+          if ((char === '"' || char === "'" || char === '`') && !inString) {
+            if (current) {
+              tokens.push(renderGoToken(current, keywords, types))
+              current = ''
+            }
+            inString = true
+            stringChar = char
+            current = char
+          } else if (char === stringChar && inString) {
+            current += char
+            tokens.push(
+              <span className="text-green-600 dark:text-green-400">
+                {current}
+              </span>
+            )
+            current = ''
+            inString = false
+            stringChar = ''
+          } else if (inString) {
+            current += char
+          } else if (
+            char === ' ' ||
+            char === '(' ||
+            char === ')' ||
+            char === '{' ||
+            char === '}' ||
+            char === '[' ||
+            char === ']' ||
+            char === ':' ||
+            char === ';' ||
+            char === ',' ||
+            char === '.' ||
+            char === '<' ||
+            char === '>' ||
+            char === '=' ||
+            char === '!' ||
+            char === '&' ||
+            char === '*'
+          ) {
+            if (current) {
+              tokens.push(renderGoToken(current, keywords, types))
+              current = ''
+            }
+            tokens.push(char)
+          } else {
+            current += char
+          }
+        }
+
+        if (current) {
+          if (inString) {
+            tokens.push(
+              <span className="text-green-600 dark:text-green-400">
+                {current}
+              </span>
+            )
+          } else {
+            tokens.push(renderGoToken(current, keywords, types))
+          }
+        }
+
+        return (
+          <div key={lineIdx} className="flex">
+            {showLineNumbers && (
+              <span className="text-muted-foreground/40 select-none pr-4 text-right min-w-[3ch] inline-block">
+                {lineIdx + 1}
+              </span>
+            )}
+            <div className="flex-1">{tokens}</div>
+          </div>
+        )
+      })
+    }
+
     // Default - no highlighting
     return lines.map((line, i) => (
       <div key={i} className="flex">
@@ -495,6 +649,29 @@ export function CodeBlock({
         <div className="flex-1">{line || '\u00A0'}</div>
       </div>
     ))
+  }
+
+  const renderGoToken = (token: string, keywords: string[], types: string[]) => {
+    if (keywords.includes(token)) {
+      return (
+        <span className="text-purple-600 dark:text-purple-400 font-semibold">
+          {token}
+        </span>
+      )
+    }
+    if (types.includes(token)) {
+      return <span className="text-cyan-600 dark:text-cyan-400">{token}</span>
+    }
+    if (/^\d+$/.test(token)) {
+      return (
+        <span className="text-orange-600 dark:text-orange-400">{token}</span>
+      )
+    }
+    // Check if it might be a type (starts with uppercase)
+    if (/^[A-Z]/.test(token)) {
+      return <span className="text-blue-600 dark:text-blue-400">{token}</span>
+    }
+    return token
   }
 
   const renderPythonToken = (
