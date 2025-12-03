@@ -82,33 +82,41 @@ function SetupStatus() {
 }
 
 const installCode = `# Using npm
-npm install @temps/sdk
+npm install @temps-sdk/node-sdk
 
 # Using pnpm
-pnpm add @temps/sdk
+pnpm add @temps-sdk/node-sdk
 
 # Using bun
-bun add @temps/sdk`
+bun add @temps-sdk/node-sdk`
 
-const basicUsageCode = `import { TempsEmail } from '@temps/sdk';
+const basicUsageCode = `import { TempsClient } from '@temps-sdk/node-sdk';
 
 // Initialize the client
-const temps = new TempsEmail({
+const temps = new TempsClient({
+  baseUrl: 'https://your-temps-instance.com',
   apiKey: process.env.TEMPS_API_KEY,
-  baseUrl: 'https://your-temps-instance.com/api',
 });
 
 // Send a simple email
-await temps.send({
-  domainId: 1,  // Your verified domain ID
-  from: 'hello@mail.example.com',
-  fromName: 'My App',
-  to: ['user@example.com'],
-  subject: 'Welcome to our platform!',
-  html: '<h1>Hello World</h1><p>Welcome aboard!</p>',
-  text: 'Hello World - Welcome aboard!',
-  tags: ['welcome', 'onboarding'],
-});`
+const { data, error } = await temps.email.send({
+  body: {
+    domain_id: 1,  // Your verified domain ID
+    from: 'hello@mail.example.com',
+    from_name: 'My App',
+    to: ['user@example.com'],
+    subject: 'Welcome to our platform!',
+    html: '<h1>Hello World</h1><p>Welcome aboard!</p>',
+    text: 'Hello World - Welcome aboard!',
+    tags: ['welcome', 'onboarding'],
+  }
+});
+
+if (error) {
+  console.error('Failed to send email:', error);
+} else {
+  console.log('Email sent:', data.id);
+}`
 
 const reactEmailCode = `// emails/WelcomeEmail.tsx
 import {
@@ -185,12 +193,12 @@ const button = {
 
 const reactEmailSendCode = `// Send the email using Temps SDK
 import { render } from '@react-email/render';
-import { TempsEmail } from '@temps/sdk';
+import { TempsClient } from '@temps-sdk/node-sdk';
 import { WelcomeEmail } from './emails/WelcomeEmail';
 
-const temps = new TempsEmail({
+const temps = new TempsClient({
+  baseUrl: 'https://your-temps-instance.com',
   apiKey: process.env.TEMPS_API_KEY,
-  baseUrl: 'https://your-temps-instance.com/api',
 });
 
 // Render the React Email component to HTML
@@ -202,15 +210,21 @@ const html = await render(
 );
 
 // Send via Temps
-await temps.send({
-  domainId: 1,
-  from: 'hello@mail.example.com',
-  fromName: 'My App',
-  to: ['john@example.com'],
-  subject: 'Welcome to our platform!',
-  html,
-  tags: ['welcome'],
-});`
+const { data, error } = await temps.email.send({
+  body: {
+    domain_id: 1,
+    from: 'hello@mail.example.com',
+    from_name: 'My App',
+    to: ['john@example.com'],
+    subject: 'Welcome to our platform!',
+    html,
+    tags: ['welcome'],
+  }
+});
+
+if (error) {
+  console.error('Failed to send email:', error);
+}`
 
 const jsxEmailCode = `// emails/welcome.tsx
 import {
@@ -270,12 +284,12 @@ export default Welcome;`
 
 const jsxEmailSendCode = `// Send using jsx-email with Temps SDK
 import { render } from 'jsx-email';
-import { TempsEmail } from '@temps/sdk';
+import { TempsClient } from '@temps-sdk/node-sdk';
 import { Welcome } from './emails/welcome';
 
-const temps = new TempsEmail({
+const temps = new TempsClient({
+  baseUrl: 'https://your-temps-instance.com',
   apiKey: process.env.TEMPS_API_KEY,
-  baseUrl: 'https://your-temps-instance.com/api',
 });
 
 // Render the jsx-email template
@@ -284,15 +298,21 @@ const html = await render(
 );
 
 // Send via Temps
-await temps.send({
-  domainId: 1,
-  from: 'noreply@mail.example.com',
-  fromName: 'My App',
-  to: ['jane@example.com'],
-  subject: 'Welcome to My App!',
-  html,
-  tags: ['welcome', 'new-user'],
-});`
+const { data, error } = await temps.email.send({
+  body: {
+    domain_id: 1,
+    from: 'noreply@mail.example.com',
+    from_name: 'My App',
+    to: ['jane@example.com'],
+    subject: 'Welcome to My App!',
+    html,
+    tags: ['welcome', 'new-user'],
+  }
+});
+
+if (error) {
+  console.error('Failed to send email:', error);
+}`
 
 const directApiCode = `// Direct API usage without SDK
 const response = await fetch('https://your-temps-instance.com/api/emails', {
@@ -398,7 +418,7 @@ export function SdkDocumentation() {
           <CardHeader className="pb-2">
             <div className="flex items-center gap-2">
               <Package className="h-5 w-5 text-primary" />
-              <CardTitle className="text-lg">@temps/sdk</CardTitle>
+              <CardTitle className="text-lg">@temps-sdk/node-sdk</CardTitle>
             </div>
           </CardHeader>
           <CardContent>

@@ -1,6 +1,6 @@
 {
   "name": "@temps-sdk/node-sdk",
-  "version": "0.0.1-alpha.4",
+  "version": "0.0.1-alpha.5",
   "private": false,
   "type": "module",
   "main": "./dist/index.js",
@@ -19,11 +19,12 @@
     "test:watch": "vitest --watch",
     "test:coverage": "vitest --coverage",
     "build": "tsc -p tsconfig.build.json",
-    "generate": "npx @hey-api/openapi-ts -i openapi.json -o src/client -c @hey-api/client-fetch"
+    "generate": "npx @hey-api/openapi-ts@0.82.4 -i ./scripts/openapi.json -o src/client -c @hey-api/client-fetch"
   },
   "devDependencies": {
     "@hey-api/openapi-ts": "^0.82.4",
     "@types/bun": "latest",
+    "@types/node": "^24.10.1",
     "@vitest/coverage-v8": "^3.2.4",
     "vitest": "^3.2.4"
   },

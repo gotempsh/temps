@@ -23,6 +23,7 @@ export class TempsClient {
   deployments: Deployments;
   develop: Develop;
   domains: Domains;
+  email: Email;
   externalServices: ExternalServices;
   featureFlags: FeatureFlags;
   files: Files;
@@ -62,6 +63,7 @@ export class TempsClient {
     this.deployments = new Deployments(this.client);
     this.develop = new Develop(this.client);
     this.domains = new Domains(this.client);
+    this.email = new Email(this.client);
     this.externalServices = new ExternalServices(this.client);
     this.featureFlags = new FeatureFlags(this.client);
     this.files = new Files(this.client);
@@ -407,6 +409,52 @@ class Domains {
 
   renewDomain = (options: Parameters<typeof sdk.renewDomain>[0]) =>
     sdk.renewDomain({ ...options, client: this.client });
+}
+
+class Email {
+  constructor(private client: Client) { }
+
+  // Email Providers
+  createProvider = (options: Parameters<typeof sdk.createEmailProvider2>[0]) =>
+    sdk.createEmailProvider2({ ...options, client: this.client });
+
+  listProviders = (options?: Parameters<typeof sdk.listEmailProviders>[0]) =>
+    sdk.listEmailProviders({ ...options, client: this.client });
+
+  getProvider = (options: Parameters<typeof sdk.getEmailProvider>[0]) =>
+    sdk.getEmailProvider({ ...options, client: this.client });
+
+  deleteProvider = (options: Parameters<typeof sdk.deleteEmailProvider>[0]) =>
+    sdk.deleteEmailProvider({ ...options, client: this.client });
+
+  // Email Domains
+  createDomain = (options: Parameters<typeof sdk.createEmailDomain>[0]) =>
+    sdk.createEmailDomain({ ...options, client: this.client });
+
+  listDomains = (options?: Parameters<typeof sdk.listEmailDomains>[0]) =>
+    sdk.listEmailDomains({ ...options, client: this.client });
+
+  getDomain = (options: Parameters<typeof sdk.getEmailDomain>[0]) =>
+    sdk.getEmailDomain({ ...options, client: this.client });
+
+  deleteDomain = (options: Parameters<typeof sdk.deleteEmailDomain>[0]) =>
+    sdk.deleteEmailDomain({ ...options, client: this.client });
+
+  verifyDomain = (options: Parameters<typeof sdk.verifyEmailDomain>[0]) =>
+    sdk.verifyEmailDomain({ ...options, client: this.client });
+
+  // Emails
+  send = (options: Parameters<typeof sdk.sendEmail>[0]) =>
+    sdk.sendEmail({ ...options, client: this.client });
+
+  list = (options?: Parameters<typeof sdk.listEmails>[0]) =>
+    sdk.listEmails({ ...options, client: this.client });
+
+  get = (options: Parameters<typeof sdk.getEmail>[0]) =>
+    sdk.getEmail({ ...options, client: this.client });
+
+  getStats = (options?: Parameters<typeof sdk.getEmailStats>[0]) =>
+    sdk.getEmailStats({ ...options, client: this.client });
 }
 
 class ExternalServices {
