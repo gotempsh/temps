@@ -352,12 +352,19 @@ impl WorkflowExecutionService {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| deployment.branch_ref.clone().unwrap_or("main".to_string()));
 
-                let _commit_sha = config
+                // Get tag_ref from job config (for tag-based deployments)
+                let tag_ref = config
+                    .get("tag_ref")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                // Get commit_sha from job config (for specific commit deployments)
+                let commit_sha = config
                     .get("commit_sha")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
-                let builder = DownloadRepoBuilder::new()
+                let mut builder = DownloadRepoBuilder::new()
                     .job_id(db_job.job_id.clone())
                     .repo_owner(repo_owner.to_string())
                     .repo_name(repo_name.to_string())
@@ -366,10 +373,15 @@ impl WorkflowExecutionService {
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone());
 
-                // // Add commit_sha if present
-                // if let Some(commit) = commit_sha {
-                //     builder = builder.commit_sha(commit);
-                // }
+                // Add tag_ref if present (highest priority in checkout)
+                if let Some(tag) = tag_ref {
+                    builder = builder.tag_ref(tag);
+                }
+
+                // Add commit_sha if present (second priority in checkout)
+                if let Some(commit) = commit_sha {
+                    builder = builder.commit_sha(commit);
+                }
 
                 let job = builder.build(self.git_provider.clone())?;
 

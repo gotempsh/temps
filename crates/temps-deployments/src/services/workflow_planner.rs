@@ -431,6 +431,7 @@ impl WorkflowPlanner {
                 dependencies: vec![],
                 job_config: Some(serde_json::json!({
                     "branch_ref": branch_or_commit,
+                    "tag_ref": deployment.tag_ref,
                     "commit_sha": deployment.commit_sha,
                     "repo_owner": project.repo_owner,
                     "repo_name": project.repo_name,

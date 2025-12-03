@@ -213,7 +213,6 @@ impl DownloadRepoJob {
         &self,
         context: &WorkflowContext,
         git_url: &str,
-        checkout_ref: &str,
         repo_dir: &std::path::Path,
     ) -> Result<(), WorkflowError> {
         self.log(
@@ -222,30 +221,98 @@ impl DownloadRepoJob {
         )
         .await?;
 
-        // Use git clone command directly
-        let output = tokio::process::Command::new("git")
-            .arg("clone")
-            .arg("--depth=1")
-            .arg("--branch")
-            .arg(checkout_ref)
-            .arg(git_url)
-            .arg(repo_dir)
-            .output()
-            .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!("Failed to run git clone: {}", e))
-            })?;
+        // Determine clone strategy based on what ref type we have
+        // commit_sha requires full clone + checkout, branches/tags can use shallow clone with --branch
+        let needs_full_clone = self.commit_sha.is_some() && self.tag_ref.is_none();
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(WorkflowError::JobExecutionFailed(format!(
-                "Failed to clone public repository: {}",
-                stderr
-            )));
-        }
+        if needs_full_clone {
+            let commit_sha = self.commit_sha.as_ref().unwrap();
+            self.log(context, format!("Cloning for commit SHA: {}", commit_sha))
+                .await?;
 
-        self.log(context, "Successfully cloned public repository".to_string())
+            // Clone full history to ensure we have the commit
+            let clone_output = tokio::process::Command::new("git")
+                .arg("clone")
+                .arg(git_url)
+                .arg(repo_dir)
+                .output()
+                .await
+                .map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!("Failed to run git clone: {}", e))
+                })?;
+
+            if !clone_output.status.success() {
+                let stderr = String::from_utf8_lossy(&clone_output.stderr);
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "Failed to clone public repository: {}",
+                    stderr
+                )));
+            }
+
+            // Checkout the specific commit
+            let checkout_output = tokio::process::Command::new("git")
+                .arg("checkout")
+                .arg(commit_sha)
+                .current_dir(repo_dir)
+                .output()
+                .await
+                .map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!("Failed to run git checkout: {}", e))
+                })?;
+
+            if !checkout_output.status.success() {
+                let stderr = String::from_utf8_lossy(&checkout_output.stderr);
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "Failed to checkout commit {}: {}",
+                    commit_sha, stderr
+                )));
+            }
+
+            self.log(
+                context,
+                format!("Successfully cloned and checked out commit: {}", commit_sha),
+            )
             .await?;
+        } else {
+            // For tags and branches, use --branch with shallow clone
+            // Priority: tag_ref > branch_ref > default branch
+            let branch_arg = self
+                .tag_ref
+                .as_ref()
+                .or(self.branch_ref.as_ref())
+                .cloned()
+                .unwrap_or_else(|| "master".to_string());
+
+            self.log(context, format!("Cloning with --branch {}", branch_arg))
+                .await?;
+
+            let output = tokio::process::Command::new("git")
+                .arg("clone")
+                .arg("--depth=1")
+                .arg("--branch")
+                .arg(&branch_arg)
+                .arg(git_url)
+                .arg(repo_dir)
+                .output()
+                .await
+                .map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!("Failed to run git clone: {}", e))
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "Failed to clone public repository: {}",
+                    stderr
+                )));
+            }
+
+            self.log(
+                context,
+                format!("Successfully cloned at ref: {}", branch_arg),
+            )
+            .await?;
+        }
 
         Ok(())
     }
@@ -282,7 +349,7 @@ impl DownloadRepoJob {
         // Handle public repos differently - use direct git clone
         if self.is_public_repo {
             if let Some(ref git_url) = self.git_url {
-                self.clone_public_repository(context, git_url, &checkout_ref, &repo_dir)
+                self.clone_public_repository(context, git_url, &repo_dir)
                     .await?;
                 return Ok(repo_dir);
             } else {
@@ -734,5 +801,62 @@ mod tests {
 
         // Commit should have second priority
         assert_eq!(job_no_tag.get_checkout_ref(&context), "abc123");
+    }
+
+    #[test]
+    fn test_get_checkout_ref_branch_only() {
+        let git_manager: Arc<dyn GitProviderManagerTrait> = Arc::new(MockGitProviderManager);
+
+        // Test with only branch_ref set
+        let job_branch_only = DownloadRepoJob::new(
+            "test".to_string(),
+            "owner".to_string(),
+            "repo".to_string(),
+            1,
+            git_manager.clone(),
+        )
+        .with_branch_ref("feature-branch".to_string());
+
+        let context = crate::test_utils::create_test_context("test".to_string(), 1, 1, 1);
+
+        // Branch should be used when no tag or commit is set
+        assert_eq!(job_branch_only.get_checkout_ref(&context), "feature-branch");
+
+        // Test with no refs set (should fall back to "master")
+        let job_no_refs = DownloadRepoJob::new(
+            "test".to_string(),
+            "owner".to_string(),
+            "repo".to_string(),
+            1,
+            git_manager,
+        );
+
+        // Should fall back to "master" when nothing is set
+        assert_eq!(job_no_refs.get_checkout_ref(&context), "master");
+    }
+
+    #[test]
+    fn test_builder_with_tag_and_commit() {
+        let git_manager: Arc<dyn GitProviderManagerTrait> = Arc::new(MockGitProviderManager);
+
+        let job = DownloadRepoBuilder::new()
+            .job_id("test_download".to_string())
+            .repo_owner("test_owner".to_string())
+            .repo_name("test_repo".to_string())
+            .git_provider_connection_id(1)
+            .branch_ref("main".to_string())
+            .tag_ref("v2.0.0".to_string())
+            .commit_sha("def456".to_string())
+            .build(git_manager)
+            .unwrap();
+
+        assert_eq!(job.job_id(), "test_download");
+        assert_eq!(job.branch_ref, Some("main".to_string()));
+        assert_eq!(job.tag_ref, Some("v2.0.0".to_string()));
+        assert_eq!(job.commit_sha, Some("def456".to_string()));
+
+        // Verify tag has highest priority
+        let context = crate::test_utils::create_test_context("test".to_string(), 1, 1, 1);
+        assert_eq!(job.get_checkout_ref(&context), "v2.0.0");
     }
 }
