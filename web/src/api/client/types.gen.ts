@@ -733,10 +733,32 @@ export type CreateDomainRequest = {
     domain: string;
 };
 
+export type CreateEmailDomainRequest = {
+    /**
+     * Domain name (e.g., "updates.example.com")
+     */
+    domain: string;
+    /**
+     * Provider ID to use for this domain
+     */
+    provider_id: number;
+};
+
 export type CreateEmailProviderRequest = {
-    config: EmailConfig;
-    enabled?: boolean | null;
+    /**
+     * User-friendly name for the provider
+     */
     name: string;
+    /**
+     * Provider type
+     */
+    provider_type: EmailProviderTypeRoute;
+    /**
+     * Cloud region
+     */
+    region: string;
+    scaleway_credentials?: null | ScalewayCredentialsRequest;
+    ses_credentials?: null | SesCredentialsRequest;
 };
 
 export type CreateEnvironmentRequest = {
@@ -1410,6 +1432,25 @@ export type DnsProviderSettingsMasked = {
     provider: string;
 };
 
+export type DnsRecordResponse = {
+    /**
+     * DNS record name (host)
+     */
+    name: string;
+    /**
+     * Priority (for MX records)
+     */
+    priority?: number | null;
+    /**
+     * Record type: TXT, CNAME, MX
+     */
+    record_type: string;
+    /**
+     * DNS record value
+     */
+    value: string;
+};
+
 export type DockerRegistrySettings = {
     ca_certificate?: string | null;
     enabled?: boolean;
@@ -1500,6 +1541,73 @@ export type EmailConfig = {
     tls_mode?: TlsMode;
     to_addresses: Array<string>;
     username: string;
+};
+
+export type EmailDomainResponse = {
+    created_at: string;
+    domain: string;
+    id: number;
+    last_verified_at?: string | null;
+    provider_id: number;
+    status: string;
+    updated_at: string;
+    verification_error?: string | null;
+};
+
+export type EmailDomainWithDnsResponse = {
+    dns_records: Array<DnsRecordResponse>;
+    domain: EmailDomainResponse;
+};
+
+export type EmailProviderResponse = {
+    created_at: string;
+    /**
+     * Masked credentials for display
+     */
+    credentials: unknown;
+    id: number;
+    is_active: boolean;
+    name: string;
+    provider_type: EmailProviderTypeRoute;
+    region: string;
+    updated_at: string;
+};
+
+export type EmailProviderTypeRoute = 'ses' | 'scaleway';
+
+export type EmailResponse = {
+    bcc_addresses?: Array<string> | null;
+    cc_addresses?: Array<string> | null;
+    created_at: string;
+    domain_id: number;
+    error_message?: string | null;
+    from_address: string;
+    from_name?: string | null;
+    headers?: {
+        [key: string]: string;
+    } | null;
+    html_body?: string | null;
+    id: string;
+    project_id?: number | null;
+    provider_message_id?: string | null;
+    reply_to?: string | null;
+    sent_at?: string | null;
+    status: string;
+    subject: string;
+    tags?: Array<string> | null;
+    text_body?: string | null;
+    to_addresses: Array<string>;
+};
+
+export type EmailStatsResponse = {
+    /**
+     * Emails captured without sending (Mailhog mode - no provider configured)
+     */
+    captured: number;
+    failed: number;
+    queued: number;
+    sent: number;
+    total: number;
 };
 
 export type EmailStatusResponse = {
@@ -2974,6 +3082,13 @@ export type PagesComparisonResponse = {
     page_paths: Array<string>;
 };
 
+export type PaginatedEmailsResponse = {
+    data: Array<EmailResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
 export type PaginatedEntitiesResponse = {
     /**
      * Number of entities returned
@@ -3833,6 +3948,11 @@ export type S3SourceResponse = {
     updated_at: number;
 };
 
+export type ScalewayCredentialsRequest = {
+    api_key: string;
+    project_id: string;
+};
+
 export type ScreenshotSettings = {
     enabled?: boolean;
     provider?: string;
@@ -3904,6 +4024,78 @@ export type SecurityHeadersSettings = {
     x_xss_protection?: string;
 };
 
+export type SendEmailRequestBody = {
+    /**
+     * BCC recipients
+     */
+    bcc?: Array<string> | null;
+    /**
+     * CC recipients
+     */
+    cc?: Array<string> | null;
+    /**
+     * Domain ID to send from
+     */
+    domain_id: number;
+    /**
+     * Sender email address
+     */
+    from: string;
+    /**
+     * Sender display name
+     */
+    from_name?: string | null;
+    /**
+     * Custom headers
+     */
+    headers?: {
+        [key: string]: string;
+    } | null;
+    /**
+     * HTML body content
+     */
+    html?: string | null;
+    /**
+     * Optional project ID for tracking
+     */
+    project_id?: number | null;
+    /**
+     * Reply-to address
+     */
+    reply_to?: string | null;
+    /**
+     * Email subject
+     */
+    subject: string;
+    /**
+     * Tags for categorization
+     */
+    tags?: Array<string> | null;
+    /**
+     * Plain text body content
+     */
+    text?: string | null;
+    /**
+     * Recipient email addresses
+     */
+    to: Array<string>;
+};
+
+export type SendEmailResponseBody = {
+    /**
+     * Email ID
+     */
+    id: string;
+    /**
+     * Provider message ID
+     */
+    provider_message_id?: string | null;
+    /**
+     * Email status
+     */
+    status: string;
+};
+
 export type SentryEventRequest = {
     event_id?: string | null;
     message?: string | null;
@@ -3957,6 +4149,11 @@ export type ServiceTypeInfo = {
 };
 
 export type ServiceTypeRoute = 'mongodb' | 'postgres' | 'redis' | 's3';
+
+export type SesCredentialsRequest = {
+    access_key_id: string;
+    secret_access_key: string;
+};
 
 export type SessionDetails = {
     duration_seconds: number;
@@ -4446,6 +4643,28 @@ export type TagInfo = {
 
 export type TagListResponse = {
     tags: Array<TagInfo>;
+};
+
+/**
+ * Response for test email endpoint
+ */
+export type TestEmailResponse = {
+    /**
+     * Error message if the test failed
+     */
+    error?: string | null;
+    /**
+     * Provider message ID if successful
+     */
+    provider_message_id?: string | null;
+    /**
+     * The email address the test was sent to
+     */
+    sent_to: string;
+    /**
+     * Whether the test email was sent successfully
+     */
+    success: boolean;
 };
 
 export type TestProviderResponse = {
@@ -7917,6 +8136,527 @@ export type CheckDomainStatusResponses = {
 
 export type CheckDomainStatusResponse = CheckDomainStatusResponses[keyof CheckDomainStatusResponses];
 
+export type ListDomains2Data = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/email-domains';
+};
+
+export type ListDomains2Errors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDomains2Responses = {
+    /**
+     * List of email domains
+     */
+    200: Array<EmailDomainResponse>;
+};
+
+export type ListDomains2Response = ListDomains2Responses[keyof ListDomains2Responses];
+
+export type CreateDomain2Data = {
+    body: CreateEmailDomainRequest;
+    path?: never;
+    query?: never;
+    url: '/email-domains';
+};
+
+export type CreateDomain2Errors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateDomain2Responses = {
+    /**
+     * Domain created successfully
+     */
+    201: EmailDomainWithDnsResponse;
+};
+
+export type CreateDomain2Response = CreateDomain2Responses[keyof CreateDomain2Responses];
+
+export type DeleteDomain2Data = {
+    body?: never;
+    path: {
+        /**
+         * Domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}';
+};
+
+export type DeleteDomain2Errors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteDomain2Responses = {
+    /**
+     * Domain deleted
+     */
+    204: void;
+};
+
+export type DeleteDomain2Response = DeleteDomain2Responses[keyof DeleteDomain2Responses];
+
+export type GetDomainData = {
+    body?: never;
+    path: {
+        /**
+         * Domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}';
+};
+
+export type GetDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDomainResponses = {
+    /**
+     * Email domain details with DNS records
+     */
+    200: EmailDomainWithDnsResponse;
+};
+
+export type GetDomainResponse = GetDomainResponses[keyof GetDomainResponses];
+
+export type VerifyDomainData = {
+    body?: never;
+    path: {
+        /**
+         * Domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/verify';
+};
+
+export type VerifyDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type VerifyDomainResponses = {
+    /**
+     * Domain verification result
+     */
+    200: EmailDomainResponse;
+};
+
+export type VerifyDomainResponse = VerifyDomainResponses[keyof VerifyDomainResponses];
+
+export type ListProvidersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/email-providers';
+};
+
+export type ListProvidersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListProvidersResponses = {
+    /**
+     * List of email providers
+     */
+    200: Array<EmailProviderResponse>;
+};
+
+export type ListProvidersResponse = ListProvidersResponses[keyof ListProvidersResponses];
+
+export type CreateProviderData = {
+    body: CreateEmailProviderRequest;
+    path?: never;
+    query?: never;
+    url: '/email-providers';
+};
+
+export type CreateProviderErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateProviderResponses = {
+    /**
+     * Provider created successfully
+     */
+    201: EmailProviderResponse;
+};
+
+export type CreateProviderResponse = CreateProviderResponses[keyof CreateProviderResponses];
+
+export type DeleteProviderData = {
+    body?: never;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-providers/{id}';
+};
+
+export type DeleteProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteProviderResponses = {
+    /**
+     * Provider deleted
+     */
+    204: void;
+};
+
+export type DeleteProviderResponse = DeleteProviderResponses[keyof DeleteProviderResponses];
+
+export type GetProviderData = {
+    body?: never;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-providers/{id}';
+};
+
+export type GetProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetProviderResponses = {
+    /**
+     * Email provider details
+     */
+    200: EmailProviderResponse;
+};
+
+export type GetProviderResponse = GetProviderResponses[keyof GetProviderResponses];
+
+export type TestProviderData = {
+    body?: never;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-providers/{id}/test';
+};
+
+export type TestProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type TestProviderResponses = {
+    /**
+     * Test email result
+     */
+    200: TestEmailResponse;
+};
+
+export type TestProviderResponse2 = TestProviderResponses[keyof TestProviderResponses];
+
+export type ListEmailsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        domain_id?: number | null;
+        project_id?: number | null;
+        status?: string | null;
+        from_address?: string | null;
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/emails';
+};
+
+export type ListEmailsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListEmailsResponses = {
+    /**
+     * List of emails
+     */
+    200: PaginatedEmailsResponse;
+};
+
+export type ListEmailsResponse = ListEmailsResponses[keyof ListEmailsResponses];
+
+export type SendEmailData = {
+    body: SendEmailRequestBody;
+    path?: never;
+    query?: never;
+    url: '/emails';
+};
+
+export type SendEmailErrors = {
+    /**
+     * Invalid request or domain not verified
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SendEmailResponses = {
+    /**
+     * Email sent successfully
+     */
+    201: SendEmailResponseBody;
+};
+
+export type SendEmailResponse = SendEmailResponses[keyof SendEmailResponses];
+
+export type GetEmailStatsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Optional domain ID to filter stats
+         */
+        domain_id?: number;
+    };
+    url: '/emails/stats';
+};
+
+export type GetEmailStatsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetEmailStatsResponses = {
+    /**
+     * Email statistics
+     */
+    200: EmailStatsResponse;
+};
+
+export type GetEmailStatsResponse = GetEmailStatsResponses[keyof GetEmailStatsResponses];
+
+export type GetEmailData = {
+    body?: never;
+    path: {
+        /**
+         * Email ID (UUID)
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/emails/{id}';
+};
+
+export type GetEmailErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Email not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetEmailResponses = {
+    /**
+     * Email details
+     */
+    200: EmailResponse;
+};
+
+export type GetEmailResponse = GetEmailResponses[keyof GetEmailResponses];
+
 export type ListServicesData = {
     body?: never;
     path?: never;
@@ -9571,7 +10311,7 @@ export type CreateGitlabPatProviderResponses = {
 
 export type CreateGitlabPatProviderResponse = CreateGitlabPatProviderResponses[keyof CreateGitlabPatProviderResponses];
 
-export type DeleteProviderData = {
+export type DeleteProvider2Data = {
     body?: never;
     path: {
         /**
@@ -9583,7 +10323,7 @@ export type DeleteProviderData = {
     url: '/git-providers/{provider_id}';
 };
 
-export type DeleteProviderErrors = {
+export type DeleteProvider2Errors = {
     /**
      * Provider has connections and cannot be deleted
      */
@@ -9602,14 +10342,14 @@ export type DeleteProviderErrors = {
     500: unknown;
 };
 
-export type DeleteProviderResponses = {
+export type DeleteProvider2Responses = {
     /**
      * Provider deleted successfully
      */
     204: void;
 };
 
-export type DeleteProviderResponse = DeleteProviderResponses[keyof DeleteProviderResponses];
+export type DeleteProvider2Response = DeleteProvider2Responses[keyof DeleteProvider2Responses];
 
 export type GetGitProviderData = {
     body?: never;
@@ -10921,7 +11661,7 @@ export type UpdateSlackProviderResponses = {
 
 export type UpdateSlackProviderResponse = UpdateSlackProviderResponses[keyof UpdateSlackProviderResponses];
 
-export type DeleteProvider2Data = {
+export type DeleteProvider3Data = {
     body?: never;
     path: {
         /**
@@ -10933,7 +11673,7 @@ export type DeleteProvider2Data = {
     url: '/notification-providers/{id}';
 };
 
-export type DeleteProvider2Errors = {
+export type DeleteProvider3Errors = {
     /**
      * Provider not found
      */
@@ -10944,14 +11684,14 @@ export type DeleteProvider2Errors = {
     500: unknown;
 };
 
-export type DeleteProvider2Responses = {
+export type DeleteProvider3Responses = {
     /**
      * Successfully deleted provider
      */
     204: void;
 };
 
-export type DeleteProvider2Response = DeleteProvider2Responses[keyof DeleteProvider2Responses];
+export type DeleteProvider3Response = DeleteProvider3Responses[keyof DeleteProvider3Responses];
 
 export type GetNotificationProviderData = {
     body?: never;
@@ -11017,7 +11757,7 @@ export type UpdateProviderResponses = {
 
 export type UpdateProviderResponse = UpdateProviderResponses[keyof UpdateProviderResponses];
 
-export type TestProviderData = {
+export type TestProvider2Data = {
     body?: never;
     path: {
         /**
@@ -11029,7 +11769,7 @@ export type TestProviderData = {
     url: '/notification-providers/{id}/test';
 };
 
-export type TestProviderErrors = {
+export type TestProvider2Errors = {
     /**
      * Provider not found
      */
@@ -11040,14 +11780,14 @@ export type TestProviderErrors = {
     500: unknown;
 };
 
-export type TestProviderResponses = {
+export type TestProvider2Responses = {
     /**
      * Test result
      */
     200: TestProviderResponse;
 };
 
-export type TestProviderResponse2 = TestProviderResponses[keyof TestProviderResponses];
+export type TestProvider2Response = TestProvider2Responses[keyof TestProvider2Responses];
 
 export type ListOrdersData = {
     body?: never;

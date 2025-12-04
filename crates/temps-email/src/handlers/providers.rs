@@ -22,7 +22,7 @@ use super::audit::{
 };
 use super::types::{
     AppState, CreateEmailProviderRequest, EmailProviderResponse, EmailProviderTypeRoute,
-    TestEmailResponse,
+    TestEmailRequest, TestEmailResponse,
 };
 use crate::providers::{EmailProviderType, ScalewayCredentials, SesCredentials};
 use crate::services::{CreateProviderRequest, ProviderCredentials};
@@ -311,8 +311,10 @@ pub async fn delete_provider(
     tag = "Email Providers",
     post,
     path = "/email-providers/{id}/test",
+    request_body = TestEmailRequest,
     responses(
         (status = 200, description = "Test email result", body = TestEmailResponse),
+        (status = 400, description = "Invalid request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Provider not found"),
@@ -328,8 +330,14 @@ pub async fn test_provider(
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path(id): Path<i32>,
+    Json(request): Json<TestEmailRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EmailProvidersWrite);
+
+    // Validate from address
+    if request.from.is_empty() {
+        return Err(bad_request().detail("From address is required").build());
+    }
 
     // Get the user's email address from the auth context
     let recipient_email = auth.user.email.clone();
@@ -340,10 +348,15 @@ pub async fn test_provider(
         not_found().detail("Provider not found").build()
     })?;
 
-    // Send test email
+    // Send test email with from address from request
     let result = state
         .provider_service
-        .send_test_email(id, &recipient_email)
+        .send_test_email(
+            id,
+            &recipient_email,
+            &request.from,
+            request.from_name.as_deref(),
+        )
         .await
         .map_err(|e| {
             error!("Failed to send test email: {}", e);

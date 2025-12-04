@@ -105,6 +105,17 @@ pub struct EmailProviderResponse {
     pub updated_at: String,
 }
 
+/// Request body for testing an email provider
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct TestEmailRequest {
+    /// Sender email address (must be verified with the provider)
+    #[schema(example = "test@example.com")]
+    pub from: String,
+    /// Sender display name
+    #[schema(example = "My App")]
+    pub from_name: Option<String>,
+}
+
 /// Response for test email endpoint
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TestEmailResponse {

@@ -204,16 +204,24 @@ impl ProviderService {
     /// Note: This bypasses domain verification and sends directly through the provider.
     /// The provider must have the ability to send from any address (e.g., SES sandbox mode
     /// may require verified sender addresses).
+    ///
+    /// # Arguments
+    /// * `provider_id` - The ID of the provider to test
+    /// * `recipient_email` - The email address to send the test email to
+    /// * `from_address` - The sender email address (must be verified with the provider)
+    /// * `from_name` - Optional sender display name
     pub async fn send_test_email(
         &self,
         provider_id: i32,
         recipient_email: &str,
+        from_address: &str,
+        from_name: Option<&str>,
     ) -> Result<TestEmailResult, EmailError> {
         use crate::providers::SendEmailRequest as ProviderSendRequest;
 
         debug!(
-            "Sending test email from provider {} to {}",
-            provider_id, recipient_email
+            "Sending test email from provider {} ({}) to {}",
+            provider_id, from_address, recipient_email
         );
 
         // Get the provider
@@ -222,10 +230,10 @@ impl ProviderService {
         // Create provider instance
         let provider_instance = self.create_provider_instance(&provider).await?;
 
-        // Create a simple test email
+        // Create a simple test email with provided from address
         let test_request = ProviderSendRequest {
-            from: format!("test@temps.example.com"),
-            from_name: Some("Temps Email Test".to_string()),
+            from: from_address.to_string(),
+            from_name: from_name.map(|s| s.to_string()),
             to: vec![recipient_email.to_string()],
             cc: None,
             bcc: None,
@@ -756,7 +764,14 @@ mod tests {
         let (_db, service) = setup_test_env().await;
 
         // Attempt to send test email for non-existent provider
-        let result = service.send_test_email(999999, "test@example.com").await;
+        let result = service
+            .send_test_email(
+                999999,
+                "test@example.com",
+                "sender@example.com",
+                Some("Test Sender"),
+            )
+            .await;
 
         assert!(result.is_err());
         assert!(matches!(
@@ -786,7 +801,12 @@ mod tests {
         // but the send will fail because the credentials are fake
         // The function should return a result with success=false, not an error
         let result = service
-            .send_test_email(provider.id, "test@example.com")
+            .send_test_email(
+                provider.id,
+                "test@example.com",
+                "sender@example.com",
+                Some("Test Sender"),
+            )
             .await;
 
         // The function should succeed (return Ok) but the result should indicate failure
@@ -919,7 +939,12 @@ mod tests {
 
         // Send a test email
         let result = service
-            .send_test_email(provider.id, "recipient@test.example.com")
+            .send_test_email(
+                provider.id,
+                "recipient@test.example.com",
+                "sender@test.example.com",
+                Some("Test Sender"),
+            )
             .await;
 
         // Verify the result

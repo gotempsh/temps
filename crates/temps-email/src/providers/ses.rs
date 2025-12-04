@@ -16,6 +16,45 @@ use super::traits::{
 };
 use crate::errors::EmailError;
 
+/// Extract detailed error information from AWS SES SDK errors
+fn extract_ses_error_details<E: std::fmt::Display + std::fmt::Debug>(
+    e: &aws_sdk_sesv2::error::SdkError<E>,
+) -> String {
+    use aws_sdk_sesv2::error::SdkError;
+
+    match e {
+        SdkError::ServiceError(service_err) => {
+            // Get the underlying service error message
+            let err = service_err.err();
+            format!("{}", err)
+        }
+        SdkError::TimeoutError(_) => {
+            "Request timed out. Please check your network connection and try again.".to_string()
+        }
+        SdkError::DispatchFailure(dispatch_err) => {
+            if dispatch_err.is_io() {
+                format!("Network error: Unable to connect to AWS SES. Please verify your network connection and credentials.")
+            } else if dispatch_err.is_timeout() {
+                "Connection timed out. Please try again.".to_string()
+            } else if dispatch_err.is_user() {
+                format!("Configuration error: {:?}", dispatch_err)
+            } else {
+                format!("Connection failed: {:?}", dispatch_err)
+            }
+        }
+        SdkError::ConstructionFailure(_) => {
+            "Invalid request configuration. Please check your email parameters.".to_string()
+        }
+        SdkError::ResponseError(resp_err) => {
+            format!("Unexpected response from AWS: {:?}", resp_err)
+        }
+        _ => {
+            // Fallback to the debug representation for unknown errors
+            format!("{:?}", e)
+        }
+    }
+}
+
 /// AWS SES credentials configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SesCredentials {
@@ -246,8 +285,10 @@ impl EmailProvider for SesProvider {
         }
 
         let result = send_request.send().await.map_err(|e| {
-            error!("Failed to send email via SES: {}", e);
-            EmailError::AwsSes(format!("Failed to send email: {}", e))
+            // Extract detailed error information from AWS SDK error
+            let error_message = extract_ses_error_details(&e);
+            error!("Failed to send email via SES: {}", error_message);
+            EmailError::AwsSes(error_message)
         })?;
 
         let message_id = result
