@@ -175,6 +175,12 @@ pub enum Permission {
     EmailDomainsDelete,
     EmailsRead,
     EmailsSend,
+
+    // Deployment Token permissions
+    DeploymentTokensRead,
+    DeploymentTokensWrite,
+    DeploymentTokensCreate,
+    DeploymentTokensDelete,
 }
 
 impl fmt::Display for Permission {
@@ -286,6 +292,10 @@ impl fmt::Display for Permission {
             Permission::EmailDomainsDelete => "email_domains:delete",
             Permission::EmailsRead => "emails:read",
             Permission::EmailsSend => "emails:send",
+            Permission::DeploymentTokensRead => "deployment_tokens:read",
+            Permission::DeploymentTokensWrite => "deployment_tokens:write",
+            Permission::DeploymentTokensCreate => "deployment_tokens:create",
+            Permission::DeploymentTokensDelete => "deployment_tokens:delete",
         };
         write!(f, "{}", name)
     }
@@ -401,6 +411,10 @@ impl Permission {
             "email_domains:delete" => Some(Permission::EmailDomainsDelete),
             "emails:read" => Some(Permission::EmailsRead),
             "emails:send" => Some(Permission::EmailsSend),
+            "deployment_tokens:read" => Some(Permission::DeploymentTokensRead),
+            "deployment_tokens:write" => Some(Permission::DeploymentTokensWrite),
+            "deployment_tokens:create" => Some(Permission::DeploymentTokensCreate),
+            "deployment_tokens:delete" => Some(Permission::DeploymentTokensDelete),
             _ => None,
         }
     }
@@ -513,6 +527,10 @@ impl Permission {
             Permission::EmailDomainsDelete,
             Permission::EmailsRead,
             Permission::EmailsSend,
+            Permission::DeploymentTokensRead,
+            Permission::DeploymentTokensWrite,
+            Permission::DeploymentTokensCreate,
+            Permission::DeploymentTokensDelete,
         ]
     }
 }
@@ -676,6 +694,10 @@ impl Role {
                 Permission::EmailDomainsDelete,
                 Permission::EmailsRead,
                 Permission::EmailsSend,
+                Permission::DeploymentTokensRead,
+                Permission::DeploymentTokensWrite,
+                Permission::DeploymentTokensCreate,
+                Permission::DeploymentTokensDelete,
             ],
             Role::User => &[
                 Permission::ProjectsRead,
@@ -755,6 +777,9 @@ impl Role {
                 Permission::EmailDomainsCreate,
                 Permission::EmailsRead,
                 Permission::EmailsSend,
+                Permission::DeploymentTokensRead,
+                Permission::DeploymentTokensWrite,
+                Permission::DeploymentTokensCreate,
             ],
             Role::Reader => &[
                 Permission::ProjectsRead,
@@ -787,6 +812,7 @@ impl Role {
                 Permission::EmailProvidersRead,
                 Permission::EmailDomainsRead,
                 Permission::EmailsRead,
+                Permission::DeploymentTokensRead,
             ],
             Role::Mcp => &[
                 Permission::ProjectsRead,
@@ -987,5 +1013,98 @@ mod tests {
         assert!(!Role::Reader.has_permission(&Permission::EmailsSend));
         // MCP does NOT have email permissions
         assert!(!Role::Mcp.has_permission(&Permission::EmailsSend));
+    }
+
+    // Deployment token permission tests
+    #[test]
+    fn test_deployment_token_permissions_exist() {
+        let deployment_token_permissions = vec![
+            Permission::DeploymentTokensRead,
+            Permission::DeploymentTokensWrite,
+            Permission::DeploymentTokensCreate,
+            Permission::DeploymentTokensDelete,
+        ];
+
+        for perm in &deployment_token_permissions {
+            assert!(
+                Permission::all().contains(perm),
+                "Permission {:?} should be in all()",
+                perm
+            );
+        }
+    }
+
+    #[test]
+    fn test_deployment_token_permissions_display() {
+        assert_eq!(
+            format!("{}", Permission::DeploymentTokensRead),
+            "deployment_tokens:read"
+        );
+        assert_eq!(
+            format!("{}", Permission::DeploymentTokensWrite),
+            "deployment_tokens:write"
+        );
+        assert_eq!(
+            format!("{}", Permission::DeploymentTokensCreate),
+            "deployment_tokens:create"
+        );
+        assert_eq!(
+            format!("{}", Permission::DeploymentTokensDelete),
+            "deployment_tokens:delete"
+        );
+    }
+
+    #[test]
+    fn test_deployment_token_permissions_from_str() {
+        assert_eq!(
+            Permission::from_str("deployment_tokens:read"),
+            Some(Permission::DeploymentTokensRead)
+        );
+        assert_eq!(
+            Permission::from_str("deployment_tokens:write"),
+            Some(Permission::DeploymentTokensWrite)
+        );
+        assert_eq!(
+            Permission::from_str("deployment_tokens:create"),
+            Some(Permission::DeploymentTokensCreate)
+        );
+        assert_eq!(
+            Permission::from_str("deployment_tokens:delete"),
+            Some(Permission::DeploymentTokensDelete)
+        );
+    }
+
+    #[test]
+    fn test_admin_has_all_deployment_token_permissions() {
+        let admin_permissions = Role::Admin.permissions();
+
+        assert!(admin_permissions.contains(&Permission::DeploymentTokensRead));
+        assert!(admin_permissions.contains(&Permission::DeploymentTokensWrite));
+        assert!(admin_permissions.contains(&Permission::DeploymentTokensCreate));
+        assert!(admin_permissions.contains(&Permission::DeploymentTokensDelete));
+    }
+
+    #[test]
+    fn test_user_has_deployment_token_permissions() {
+        let user_permissions = Role::User.permissions();
+
+        // User should have read/write/create but NOT delete
+        assert!(user_permissions.contains(&Permission::DeploymentTokensRead));
+        assert!(user_permissions.contains(&Permission::DeploymentTokensWrite));
+        assert!(user_permissions.contains(&Permission::DeploymentTokensCreate));
+        assert!(!user_permissions.contains(&Permission::DeploymentTokensDelete));
+    }
+
+    #[test]
+    fn test_reader_has_read_only_deployment_token_permissions() {
+        let reader_permissions = Role::Reader.permissions();
+
+        // Reader should only have read permission
+        assert!(reader_permissions.contains(&Permission::DeploymentTokensRead));
+
+        // Reader should NOT have write/create/delete permissions
+        assert!(!reader_permissions.contains(&Permission::DeploymentTokensWrite));
+        assert!(!reader_permissions.contains(&Permission::DeploymentTokensCreate));
+        assert!(!reader_permissions.contains(&Permission::DeploymentTokensDelete));
     }
 }

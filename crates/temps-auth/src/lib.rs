@@ -7,6 +7,7 @@ mod audit;
 mod auth_service;
 pub mod context;
 mod decorators;
+mod deployment_token_service;
 mod email_templates;
 pub mod handlers;
 mod macros;
@@ -37,6 +38,9 @@ pub use plugin::AuthPlugin;
 // Export services
 pub use apikey_service::ApiKeyService;
 pub use auth_service::AuthService;
+pub use deployment_token_service::{
+    DeploymentTokenValidationError, DeploymentTokenValidationService, ValidatedDeploymentToken,
+};
 pub use user_service::UserService;
 
 // Export TempsMiddleware implementation

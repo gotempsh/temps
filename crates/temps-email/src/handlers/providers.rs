@@ -11,7 +11,7 @@ use axum::{
 };
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
-    error_builder::{bad_request, internal_server_error, not_found},
+    error_builder::{bad_request, forbidden, internal_server_error, not_found},
     problemdetails::Problem,
     AuditContext, RequestMetadata,
 };
@@ -340,7 +340,11 @@ pub async fn test_provider(
     }
 
     // Get the user's email address from the auth context
-    let recipient_email = auth.user.email.clone();
+    // Deployment tokens are not allowed as we need a real email to send the test to
+    let user = auth
+        .require_user()
+        .map_err(|msg| forbidden().detail(msg).build())?;
+    let recipient_email = user.email.clone();
 
     // Get provider details for audit log
     let provider = state.provider_service.get(id).await.map_err(|e| {

@@ -71,8 +71,13 @@ async fn gitlab_oauth_callback(
                 .with_detail("No GitLab provider configured in the system")
         })?;
 
-    // For now, we'll use a placeholder user_id (1) - this should be replaced with proper user identification
-    let user_id = auth.user.id;
+    // Get user ID - deployment tokens are not allowed for OAuth callbacks
+    let user = auth.require_user().map_err(|msg| {
+        problem_new(StatusCode::FORBIDDEN)
+            .with_title("User Required")
+            .with_detail(msg)
+    })?;
+    let user_id = user.id;
 
     // Handle the OAuth callback
     let connection = state

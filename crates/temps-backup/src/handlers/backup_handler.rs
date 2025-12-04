@@ -902,7 +902,7 @@ async fn run_backup_for_source(
 
     let backup = app_state
         .backup_service
-        .run_backup_for_source(id, &request.backup_type, auth.user.id)
+        .run_backup_for_source(id, &request.backup_type, auth.user_id())
         .await
         .map_err(Problem::from)?;
 
@@ -1075,7 +1075,7 @@ async fn run_external_service_backup(
     // Run the backup
     let backup = app_state
         .backup_service
-        .backup_external_service(&service, request.s3_source_id, backup_type, auth.user.id)
+        .backup_external_service(&service, request.s3_source_id, backup_type, auth.user_id())
         .await
         .map_err(Problem::from)?;
 

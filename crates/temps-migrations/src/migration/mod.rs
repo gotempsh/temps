@@ -9,6 +9,7 @@ mod m20250205_000003_add_projects_route_trigger;
 mod m20251115_000001_add_preview_environments_support;
 mod m20251121_000001_create_webhooks;
 mod m20251203_000001_create_email_tables;
+mod m20251204_000001_create_deployment_tokens;
 
 pub struct Migrator;
 
@@ -25,6 +26,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20251115_000001_add_preview_environments_support::Migration),
             Box::new(m20251121_000001_create_webhooks::Migration),
             Box::new(m20251203_000001_create_email_tables::Migration),
+            Box::new(m20251204_000001_create_deployment_tokens::Migration),
         ]
     }
 }

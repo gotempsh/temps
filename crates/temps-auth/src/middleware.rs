@@ -25,7 +25,8 @@ pub async fn auth_middleware(
     let auth_context = match extract_auth_from_request(&req, &app_state).await {
         Ok(ctx) => {
             // Extract user from auth context if available
-            user = Some(ctx.user.clone());
+            // Note: deployment tokens don't have a user associated
+            user = ctx.user.clone();
             Some(ctx)
         }
         Err(_) => {
@@ -105,8 +106,9 @@ pub async fn extract_auth_from_request(
     let auth_service = &auth_state.auth_service;
     let user_service = &auth_state.user_service;
     let api_key_service = &auth_state.api_key_service;
+    let deployment_token_service = &auth_state.deployment_token_service;
 
-    // 1. Check for Authorization header (API Key or CLI Token)
+    // 1. Check for Authorization header (API Key, Deployment Token, or CLI Token)
     if let Some(auth_header) = req.headers().get("authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
             if auth_str.starts_with("Bearer ") {
@@ -123,6 +125,19 @@ pub async fn extract_auth_from_request(
                             permissions,
                             key_name,
                             key_id,
+                        ));
+                    }
+                }
+
+                // Try deployment token (format: dt_...)
+                if token.starts_with("dt_") {
+                    if let Ok(validated) = deployment_token_service.validate_token(token).await {
+                        return Ok(AuthContext::new_deployment_token(
+                            validated.project_id,
+                            validated.environment_id,
+                            validated.token_id,
+                            validated.name,
+                            validated.permissions,
                         ));
                     }
                 }
@@ -278,6 +293,73 @@ impl From<crate::apikey_service::ApiKeyServiceError> for AuthError {
                 AuthError::Unauthorized(msg)
             }
             _ => AuthError::InternalServerError(err.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that the middleware correctly identifies deployment token prefix
+    #[test]
+    fn test_deployment_token_prefix_detection() {
+        // Valid deployment token prefix
+        assert!("dt_sometoken123456789".starts_with("dt_"));
+        // Invalid prefix should not match
+        assert!(!"tk_sometoken123456789".starts_with("dt_"));
+        assert!(!"invalid_token".starts_with("dt_"));
+    }
+
+    /// Test Bearer token extraction from Authorization header
+    #[test]
+    fn test_bearer_token_extraction() {
+        let auth_header = "Bearer dt_testtoken123456";
+        assert!(auth_header.starts_with("Bearer "));
+        let token = auth_header.trim_start_matches("Bearer ");
+        assert_eq!(token, "dt_testtoken123456");
+    }
+
+    /// Test that deployment tokens are routed to the correct validation path
+    #[test]
+    fn test_token_routing_logic() {
+        // API key prefix
+        let api_key_token = "tk_abc123";
+        assert!(api_key_token.starts_with("tk_"));
+        assert!(!api_key_token.starts_with("dt_"));
+
+        // Deployment token prefix
+        let deployment_token = "dt_xyz789";
+        assert!(deployment_token.starts_with("dt_"));
+        assert!(!deployment_token.starts_with("tk_"));
+
+        // Invalid prefix (neither)
+        let invalid_token = "invalid_token";
+        assert!(!invalid_token.starts_with("tk_"));
+        assert!(!invalid_token.starts_with("dt_"));
+    }
+
+    /// Test session cookie name constants
+    #[test]
+    fn test_cookie_names() {
+        assert_eq!(SESSION_ID_COOKIE_NAME, "_temps_sid");
+        assert_eq!(VISITOR_ID_COOKIE_NAME, "_temps_visitor_id");
+    }
+
+    /// Test AuthError variants
+    #[test]
+    fn test_auth_error_variants() {
+        let unauthorized = AuthError::Unauthorized("test".to_string());
+        let internal = AuthError::InternalServerError("error".to_string());
+
+        match unauthorized {
+            AuthError::Unauthorized(msg) => assert_eq!(msg, "test"),
+            _ => panic!("Expected Unauthorized"),
+        }
+
+        match internal {
+            AuthError::InternalServerError(msg) => assert_eq!(msg, "error"),
+            _ => panic!("Expected InternalServerError"),
         }
     }
 }

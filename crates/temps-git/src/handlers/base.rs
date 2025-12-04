@@ -1398,9 +1398,15 @@ pub async fn handle_git_provider_oauth_callback(
             format!("{}://{}/api", scheme, host)
         });
 
+    let user = auth.require_user().map_err(|msg| {
+        temps_core::problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("User Required")
+            .with_detail(msg)
+    })?;
+
     let connection = state
         .git_provider_manager
-        .handle_oauth_callback(provider_id, code, oauth_state, auth.user.id, host)
+        .handle_oauth_callback(provider_id, code, oauth_state, user.id, host)
         .await?;
 
     // Redirect to success page or dashboard
@@ -1576,7 +1582,7 @@ pub async fn create_github_pat_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersCreate);
 
-    let user_id = auth.user.id;
+    let user_id = auth.user_id();
 
     let provider = state
         .git_provider_manager
@@ -1622,7 +1628,7 @@ pub async fn create_gitlab_pat_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersCreate);
 
-    let user_id = auth.user.id;
+    let user_id = auth.user_id();
 
     let provider = state
         .git_provider_manager

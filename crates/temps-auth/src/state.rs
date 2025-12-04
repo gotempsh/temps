@@ -1,4 +1,7 @@
-use crate::{apikey_service::ApiKeyService, auth_service::AuthService, user_service::UserService};
+use crate::{
+    apikey_service::ApiKeyService, auth_service::AuthService,
+    deployment_token_service::DeploymentTokenValidationService, user_service::UserService,
+};
 use sea_orm::DatabaseConnection;
 use std::sync::Arc;
 use temps_core::notifications::DynNotificationService;
@@ -21,6 +24,8 @@ pub struct AuthState {
     pub user_service: Arc<UserService>,
     /// Cookie crypto service
     pub cookie_crypto: Arc<CookieCrypto>,
+    /// Deployment token validation service
+    pub deployment_token_service: Arc<DeploymentTokenValidationService>,
 }
 
 impl AuthState {
@@ -35,6 +40,7 @@ impl AuthState {
         let auth_service = Arc::new(AuthService::new(db.clone(), notification_service));
         let api_key_service = Arc::new(ApiKeyService::new(db.clone()));
         let user_service = Arc::new(UserService::new(db.clone()));
+        let deployment_token_service = Arc::new(DeploymentTokenValidationService::new(db.clone()));
         Self {
             db,
             auth_service,
@@ -43,6 +49,7 @@ impl AuthState {
             encryption_service,
             user_service,
             cookie_crypto,
+            deployment_token_service,
         }
     }
 }

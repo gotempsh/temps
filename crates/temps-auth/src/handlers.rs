@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 pub use temps_core::AuditContext;
-use temps_core::RequestMetadata;
+use temps_core::{problemdetails, RequestMetadata};
 use temps_entities::types::RoleType;
 use tracing::{debug, error, info, warn};
 use utoipa::{OpenApi, ToSchema};
@@ -51,7 +51,13 @@ use temps_core::problemdetails::{new as problem_new, Problem};
     tag = "Authentication"
 )]
 pub async fn get_current_user(RequireAuth(auth): RequireAuth) -> impl IntoResponse {
-    let user = auth.user;
+    // Require a user for this endpoint (deployment tokens not allowed)
+    let user = match auth.require_user() {
+        Ok(u) => u,
+        Err(msg) => {
+            return (StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response();
+        }
+    };
     let user_response = UserResponse {
         id: user.id,
         username: user.name.clone(),
@@ -85,7 +91,13 @@ pub async fn logout(
     Extension(metadata): Extension<RequestMetadata>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let user = auth.user;
+    // Require a user for this endpoint (deployment tokens not allowed)
+    let user = match auth.require_user() {
+        Ok(u) => u,
+        Err(msg) => {
+            return (StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response();
+        }
+    };
     let audit_context = AuditContext {
         user_id: user.id,
         ip_address: Some(metadata.ip_address.to_string()),
@@ -1607,6 +1619,13 @@ async fn verify_and_enable_mfa(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, UsersWrite);
 
+    // Require a user for this endpoint (deployment tokens not allowed)
+    let user = auth.require_user().map_err(|msg| {
+        problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("User Required")
+            .with_detail(msg)
+    })?;
+
     app_state
         .user_service
         .verify_and_enable_mfa(auth.user_id(), &req.code)
@@ -1620,7 +1639,7 @@ async fn verify_and_enable_mfa(
 
     let mfa_audit = MfaEnabledAudit {
         context: audit_context,
-        username: auth.user.name.clone(),
+        username: user.name.clone(),
     };
 
     if let Err(e) = app_state.audit_service.create_audit_log(&mfa_audit).await {
@@ -1653,6 +1672,13 @@ async fn disable_mfa(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, UsersWrite);
 
+    // Require a user for this endpoint (deployment tokens not allowed)
+    let user = auth.require_user().map_err(|msg| {
+        problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("User Required")
+            .with_detail(msg)
+    })?;
+
     // First verify code and then disable MFA
     app_state
         .user_service
@@ -1667,7 +1693,7 @@ async fn disable_mfa(
 
     let mfa_audit = MfaDisabledAudit {
         context: audit_context,
-        username: auth.user.name.clone(),
+        username: user.name.clone(),
     };
 
     if let Err(e) = app_state.audit_service.create_audit_log(&mfa_audit).await {

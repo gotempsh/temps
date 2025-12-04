@@ -12,6 +12,7 @@ pub mod deployment_config;
 pub mod deployment_containers;
 pub mod deployment_domains;
 pub mod deployment_jobs;
+pub mod deployment_tokens;
 pub mod deployments;
 pub mod domains;
 pub mod email_domains;

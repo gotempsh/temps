@@ -250,7 +250,14 @@ async fn create_domain(
     permission_guard!(auth, DomainsCreate);
 
     // Validate that the user has an email configured
-    let user_email = &auth.user.email;
+    // Deployment tokens are not allowed as we need a user email for Let's Encrypt
+    let user = auth.require_user().map_err(|msg| {
+        ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("User Required")
+            .detail(msg)
+            .build()
+    })?;
+    let user_email = &user.email;
     if user_email.is_empty() {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Email Required")
@@ -455,7 +462,14 @@ async fn provision_domain(
     permission_guard!(auth, DomainsWrite);
 
     // Validate that the user has an email configured
-    let user_email = &auth.user.email;
+    // Deployment tokens are not allowed as we need a user email for Let's Encrypt
+    let user = auth.require_user().map_err(|msg| {
+        ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("User Required")
+            .detail(msg)
+            .build()
+    })?;
+    let user_email = &user.email;
     if user_email.is_empty() {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Email Required")
@@ -609,7 +623,14 @@ async fn finalize_order(
     permission_guard!(auth, DomainsWrite);
 
     // Validate that the user has an email configured
-    let user_email = &auth.user.email;
+    // Deployment tokens are not allowed as we need a user email for Let's Encrypt
+    let user = auth.require_user().map_err(|msg| {
+        ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("User Required")
+            .detail(msg)
+            .build()
+    })?;
+    let user_email = &user.email;
     if user_email.is_empty() {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Email Required")
@@ -827,7 +848,14 @@ async fn renew_domain(
     permission_guard!(auth, DomainsWrite);
 
     // Validate that the user has an email configured
-    let user_email = &auth.user.email;
+    // Deployment tokens are not allowed as we need a user email for Let's Encrypt
+    let user = auth.require_user().map_err(|msg| {
+        ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("User Required")
+            .detail(msg)
+            .build()
+    })?;
+    let user_email = &user.email;
     if user_email.is_empty() {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Email Required")
@@ -1080,7 +1108,14 @@ async fn create_or_recreate_order(
     permission_guard!(auth, DomainsWrite);
 
     // Validate that the user has an email configured
-    let user_email = &auth.user.email;
+    // Deployment tokens are not allowed as we need a user email for Let's Encrypt
+    let user = auth.require_user().map_err(|msg| {
+        ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("User Required")
+            .detail(msg)
+            .build()
+    })?;
+    let user_email = &user.email;
     if user_email.is_empty() {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Email Required")

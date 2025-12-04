@@ -20,6 +20,8 @@ pub struct JobDefinition {
     pub required_for_completion: bool,
 }
 
+use super::deployment_token_service::DeploymentTokenService;
+
 /// Plans and creates workflow jobs based on project configuration
 pub struct WorkflowPlanner {
     db: Arc<DatabaseConnection>,
@@ -27,6 +29,7 @@ pub struct WorkflowPlanner {
     external_service_manager: Arc<temps_providers::ExternalServiceManager>,
     config_service: Arc<temps_config::ConfigService>,
     dsn_service: Arc<temps_error_tracking::DSNService>,
+    deployment_token_service: Arc<DeploymentTokenService>,
 }
 
 impl WorkflowPlanner {
@@ -37,12 +40,14 @@ impl WorkflowPlanner {
         config_service: Arc<temps_config::ConfigService>,
         dsn_service: Arc<temps_error_tracking::DSNService>,
     ) -> Self {
+        let deployment_token_service = Arc::new(DeploymentTokenService::new(db.clone()));
         Self {
             db,
             log_service,
             external_service_manager,
             config_service,
             dsn_service,
+            deployment_token_service,
         }
     }
 
@@ -51,6 +56,7 @@ impl WorkflowPlanner {
     /// 1. Environment variables from the env_vars table for the specific environment (via env_var_environments junction table)
     /// 2. Runtime environment variables from external services linked to the project
     /// 3. Sentry DSN environment variables (SENTRY_DSN and NEXT_PUBLIC_SENTRY_DSN) - auto-generated per project/environment
+    /// 4. Deployment token environment variables (TEMPS_API_URL and TEMPS_API_TOKEN) - for API access from deployed apps
     ///
     /// IMPORTANT: If any external service fails to provide env vars, the entire deployment will fail
     /// with a meaningful error message. This prevents silent failures where containers would be
@@ -222,6 +228,60 @@ impl WorkflowPlanner {
                 tracing::error!(
                     "Failed to get external URL from config: {}. \
                     Sentry DSN environment variables will NOT be included.",
+                    e
+                );
+            }
+        }
+
+        // 4. Get or create deployment token for API access
+        // This provides TEMPS_API_URL and TEMPS_API_TOKEN environment variables
+        // allowing deployed applications to access Temps APIs for:
+        // - Enriching visitor data
+        // - Sending emails
+        // - Other platform features
+        debug!(
+            "🔑 Getting or creating deployment token for project {} environment {}",
+            project.id, environment.id
+        );
+
+        match self.config_service.get_external_url_or_default().await {
+            Ok(base_url) => {
+                // Set the API URL - this is always available
+                env_vars_map.insert("TEMPS_API_URL".to_string(), format!("{}/api", base_url));
+
+                // Get or create the deployment token
+                match self
+                    .deployment_token_service
+                    .get_or_create_deployment_token(project.id, Some(environment.id))
+                    .await
+                {
+                    Ok(token) => {
+                        debug!(
+                            "Got deployment token for project {} environment {} (prefix: {}...)",
+                            project.id,
+                            environment.id,
+                            &token[..8.min(token.len())]
+                        );
+                        env_vars_map.insert("TEMPS_API_TOKEN".to_string(), token);
+                    }
+                    Err(e) => {
+                        // Warn about deployment token failure but don't fail the deployment
+                        // Deployment tokens are optional for API access
+                        tracing::warn!(
+                            "Failed to get or create deployment token for project {} environment {}: {}. \
+                            TEMPS_API_TOKEN environment variable will NOT be included.",
+                            project.id,
+                            environment.id,
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                // Warn about external URL failure but don't fail the deployment
+                tracing::warn!(
+                    "Failed to get external URL from config: {}. \
+                    TEMPS_API_URL and TEMPS_API_TOKEN environment variables will NOT be included.",
                     e
                 );
             }
