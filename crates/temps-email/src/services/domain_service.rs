@@ -336,6 +336,7 @@ mod tests {
             credentials: ProviderCredentials::Ses(SesCredentials {
                 access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
                 secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                endpoint_url: None,
             }),
         };
         service.create(request).await.unwrap()

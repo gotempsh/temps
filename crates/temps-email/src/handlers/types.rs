@@ -105,6 +105,20 @@ pub struct EmailProviderResponse {
     pub updated_at: String,
 }
 
+/// Response for test email endpoint
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TestEmailResponse {
+    /// Whether the test email was sent successfully
+    pub success: bool,
+    /// The email address the test was sent to
+    #[schema(example = "user@example.com")]
+    pub sent_to: String,
+    /// Provider message ID if successful
+    pub provider_message_id: Option<String>,
+    /// Error message if the test failed
+    pub error: Option<String>,
+}
+
 // ========================================
 // Domain Types
 // ========================================

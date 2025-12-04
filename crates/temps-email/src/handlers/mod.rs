@@ -28,6 +28,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         providers::list_providers,
         providers::get_provider,
         providers::delete_provider,
+        providers::test_provider,
         // Domains
         domains::create_domain,
         domains::list_domains,
@@ -48,6 +49,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             types::EmailProviderTypeRoute,
             types::SesCredentialsRequest,
             types::ScalewayCredentialsRequest,
+            types::TestEmailResponse,
             // Domain types
             types::CreateEmailDomainRequest,
             types::EmailDomainResponse,

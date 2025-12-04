@@ -8,4 +8,6 @@ pub use domain_service::{CreateDomainRequest, DomainService, DomainWithDnsRecord
 pub use email_service::{
     EmailService, EmailStats, ListEmailsOptions, SendEmailRequest, SendEmailResponse,
 };
-pub use provider_service::{CreateProviderRequest, ProviderCredentials, ProviderService};
+pub use provider_service::{
+    CreateProviderRequest, ProviderCredentials, ProviderService, TestEmailResult,
+};

@@ -21,6 +21,9 @@ use crate::errors::EmailError;
 pub struct SesCredentials {
     pub access_key_id: String,
     pub secret_access_key: String,
+    /// Optional custom endpoint URL (for LocalStack or other AWS-compatible services)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_url: Option<String>,
 }
 
 /// AWS SES provider implementation
@@ -40,11 +43,16 @@ impl SesProvider {
             "temps-email",
         );
 
-        let config = aws_config::defaults(BehaviorVersion::latest())
+        let mut config_builder = aws_config::defaults(BehaviorVersion::latest())
             .region(Region::new(region.to_string()))
-            .credentials_provider(creds)
-            .load()
-            .await;
+            .credentials_provider(creds);
+
+        // If a custom endpoint URL is provided (e.g., for LocalStack), use it
+        if let Some(ref endpoint_url) = credentials.endpoint_url {
+            config_builder = config_builder.endpoint_url(endpoint_url);
+        }
+
+        let config = config_builder.load().await;
 
         let client = Client::new(&config);
 
@@ -266,13 +274,35 @@ mod tests {
         let creds = SesCredentials {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            endpoint_url: None,
         };
 
         let json = serde_json::to_string(&creds).unwrap();
         assert!(json.contains("access_key_id"));
         assert!(json.contains("secret_access_key"));
+        // endpoint_url should not be serialized when None
+        assert!(!json.contains("endpoint_url"));
 
         let deserialized: SesCredentials = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.access_key_id, creds.access_key_id);
+    }
+
+    #[test]
+    fn test_ses_credentials_with_endpoint_serialization() {
+        let creds = SesCredentials {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            endpoint_url: Some("http://localhost:4566".to_string()),
+        };
+
+        let json = serde_json::to_string(&creds).unwrap();
+        assert!(json.contains("endpoint_url"));
+        assert!(json.contains("http://localhost:4566"));
+
+        let deserialized: SesCredentials = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deserialized.endpoint_url,
+            Some("http://localhost:4566".to_string())
+        );
     }
 }

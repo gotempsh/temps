@@ -17,9 +17,12 @@ use temps_core::{
 };
 use tracing::error;
 
-use super::audit::{EmailProviderCreatedAudit, EmailProviderDeletedAudit};
+use super::audit::{
+    EmailProviderCreatedAudit, EmailProviderDeletedAudit, EmailProviderTestedAudit,
+};
 use super::types::{
     AppState, CreateEmailProviderRequest, EmailProviderResponse, EmailProviderTypeRoute,
+    TestEmailResponse,
 };
 use crate::providers::{EmailProviderType, ScalewayCredentials, SesCredentials};
 use crate::services::{CreateProviderRequest, ProviderCredentials};
@@ -35,6 +38,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/email-providers/{id}",
             get(get_provider).delete(delete_provider),
         )
+        .route("/email-providers/{id}/test", post(test_provider))
 }
 
 /// Create a new email provider
@@ -71,6 +75,7 @@ pub async fn create_provider(
             ProviderCredentials::Ses(SesCredentials {
                 access_key_id: ses_creds.access_key_id,
                 secret_access_key: ses_creds.secret_access_key,
+                endpoint_url: None, // Custom endpoints not supported via API
             })
         }
         EmailProviderTypeRoute::Scaleway => {
@@ -299,4 +304,76 @@ pub async fn delete_provider(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Test an email provider by sending a test email to the logged-in user
+#[utoipa::path(
+    tag = "Email Providers",
+    post,
+    path = "/email-providers/{id}/test",
+    responses(
+        (status = 200, description = "Test email result", body = TestEmailResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Provider not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "Provider ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn test_provider(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EmailProvidersWrite);
+
+    // Get the user's email address from the auth context
+    let recipient_email = auth.user.email.clone();
+
+    // Get provider details for audit log
+    let provider = state.provider_service.get(id).await.map_err(|e| {
+        error!("Failed to get email provider: {}", e);
+        not_found().detail("Provider not found").build()
+    })?;
+
+    // Send test email
+    let result = state
+        .provider_service
+        .send_test_email(id, &recipient_email)
+        .await
+        .map_err(|e| {
+            error!("Failed to send test email: {}", e);
+            internal_server_error()
+                .detail(format!("Failed to send test email: {}", e))
+                .build()
+        })?;
+
+    // Create audit log
+    let audit = EmailProviderTestedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        provider_id: provider.id,
+        name: provider.name,
+        recipient_email: recipient_email.clone(),
+        success: result.success,
+        error: result.error.clone(),
+    };
+
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    Ok(Json(TestEmailResponse {
+        success: result.success,
+        sent_to: result.recipient_email,
+        provider_message_id: result.provider_message_id,
+        error: result.error,
+    }))
 }

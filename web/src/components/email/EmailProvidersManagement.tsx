@@ -40,7 +40,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
-import { EllipsisVertical, Loader2, Mail, Plus } from 'lucide-react'
+import { EllipsisVertical, Loader2, Mail, Plus, Send } from 'lucide-react'
 import { AWSIcon } from '@/components/icons/AWSIcon'
 import { ScalewayIcon } from '@/components/icons/ScalewayIcon'
 import { useState } from 'react'
@@ -139,6 +139,26 @@ async function deleteEmailProvider(id: number): Promise<void> {
   }
 }
 
+interface TestEmailResponse {
+  success: boolean
+  sent_to: string
+  provider_message_id: string | null
+  error: string | null
+}
+
+async function testEmailProvider(id: number): Promise<TestEmailResponse> {
+  const response = await fetch(`/api/email-providers/${id}/test`, {
+    method: 'POST',
+  })
+
+  if (!response.ok) {
+    const error = await response.json()
+    throw new Error(error.detail || 'Failed to send test email')
+  }
+
+  return response.json()
+}
+
 // AWS regions for SES
 const awsRegions = [
   { value: 'us-east-1', label: 'US East (N. Virginia)' },
@@ -173,9 +193,13 @@ function ProviderIcon({ type }: { type: 'ses' | 'scaleway' }) {
 function ProviderCard({
   provider,
   onDelete,
+  onTest,
+  isTesting,
 }: {
   provider: EmailProvider
   onDelete: (id: number) => void
+  onTest: (id: number) => void
+  isTesting: boolean
 }) {
   const [isDeleting, setIsDeleting] = useState(false)
 
@@ -213,6 +237,22 @@ function ProviderCard({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
+              <DropdownMenuItem
+                onClick={() => onTest(provider.id)}
+                disabled={isTesting}
+              >
+                {isTesting ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Sending...
+                  </>
+                ) : (
+                  <>
+                    <Send className="mr-2 h-4 w-4" />
+                    Send Test Email
+                  </>
+                )}
+              </DropdownMenuItem>
               <DropdownMenuItem disabled>Edit</DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem
@@ -307,6 +347,26 @@ export function EmailProvidersManagement() {
     },
   })
 
+  const testMutation = useMutation({
+    mutationFn: testEmailProvider,
+    onSuccess: (data) => {
+      if (data.success) {
+        toast.success('Test email sent successfully!', {
+          description: `A test email was sent to ${data.sent_to}. Please check your inbox.`,
+        })
+      } else {
+        toast.error('Test email failed', {
+          description: data.error || 'Unknown error occurred',
+        })
+      }
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to send test email', {
+        description: error.message,
+      })
+    },
+  })
+
   const form = useForm<CreateProviderFormData>({
     resolver: zodResolver(createProviderSchema),
     defaultValues: {
@@ -329,6 +389,10 @@ export function EmailProvidersManagement() {
 
   const handleDelete = (id: number) => {
     deleteMutation.mutate(id)
+  }
+
+  const handleTest = (id: number) => {
+    testMutation.mutate(id)
   }
 
   const hasProviders = providers && providers.length > 0
@@ -372,6 +436,8 @@ export function EmailProvidersManagement() {
               key={provider.id}
               provider={provider}
               onDelete={handleDelete}
+              onTest={handleTest}
+              isTesting={testMutation.isPending}
             />
           ))}
         </div>

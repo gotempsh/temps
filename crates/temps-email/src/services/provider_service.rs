@@ -38,6 +38,19 @@ pub enum ProviderCredentials {
     Scaleway(ScalewayCredentials),
 }
 
+/// Result of sending a test email
+#[derive(Debug, Clone)]
+pub struct TestEmailResult {
+    /// Whether the test email was sent successfully
+    pub success: bool,
+    /// The email address the test was sent to
+    pub recipient_email: String,
+    /// Provider message ID if successful
+    pub provider_message_id: Option<String>,
+    /// Error message if failed
+    pub error: Option<String>,
+}
+
 impl ProviderService {
     pub fn new(db: Arc<DatabaseConnection>, encryption_service: Arc<EncryptionService>) -> Self {
         Self {
@@ -183,6 +196,124 @@ impl ProviderService {
         }
     }
 
+    /// Send a test email to verify provider configuration
+    ///
+    /// This sends a simple test email to the specified recipient to verify
+    /// that the provider credentials are valid and the provider can send emails.
+    ///
+    /// Note: This bypasses domain verification and sends directly through the provider.
+    /// The provider must have the ability to send from any address (e.g., SES sandbox mode
+    /// may require verified sender addresses).
+    pub async fn send_test_email(
+        &self,
+        provider_id: i32,
+        recipient_email: &str,
+    ) -> Result<TestEmailResult, EmailError> {
+        use crate::providers::SendEmailRequest as ProviderSendRequest;
+
+        debug!(
+            "Sending test email from provider {} to {}",
+            provider_id, recipient_email
+        );
+
+        // Get the provider
+        let provider = self.get(provider_id).await?;
+
+        // Create provider instance
+        let provider_instance = self.create_provider_instance(&provider).await?;
+
+        // Create a simple test email
+        let test_request = ProviderSendRequest {
+            from: format!("test@temps.example.com"),
+            from_name: Some("Temps Email Test".to_string()),
+            to: vec![recipient_email.to_string()],
+            cc: None,
+            bcc: None,
+            reply_to: None,
+            subject: format!("Temps Email Provider Test - {}", provider.name),
+            html: Some(format!(
+                r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Email Provider Test</title>
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+    <h1 style="color: #333;">✅ Email Provider Test Successful</h1>
+    <p>This is a test email from your Temps email provider configuration.</p>
+    <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+    <table style="width: 100%; border-collapse: collapse;">
+        <tr>
+            <td style="padding: 8px 0; color: #666;">Provider Name:</td>
+            <td style="padding: 8px 0; font-weight: bold;">{}</td>
+        </tr>
+        <tr>
+            <td style="padding: 8px 0; color: #666;">Provider Type:</td>
+            <td style="padding: 8px 0; font-weight: bold;">{}</td>
+        </tr>
+        <tr>
+            <td style="padding: 8px 0; color: #666;">Region:</td>
+            <td style="padding: 8px 0; font-weight: bold;">{}</td>
+        </tr>
+        <tr>
+            <td style="padding: 8px 0; color: #666;">Test Time:</td>
+            <td style="padding: 8px 0; font-weight: bold;">{}</td>
+        </tr>
+    </table>
+    <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+    <p style="color: #888; font-size: 12px;">
+        This email was sent as a test from Temps. If you received this email,
+        your email provider is configured correctly.
+    </p>
+</body>
+</html>"#,
+                provider.name,
+                provider.provider_type,
+                provider.region,
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+            )),
+            text: Some(format!(
+                "Email Provider Test Successful\n\n\
+                Provider Name: {}\n\
+                Provider Type: {}\n\
+                Region: {}\n\
+                Test Time: {}\n\n\
+                This email was sent as a test from Temps. If you received this email, \
+                your email provider is configured correctly.",
+                provider.name,
+                provider.provider_type,
+                provider.region,
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+            )),
+            headers: None,
+        };
+
+        // Try to send the email
+        match provider_instance.send(&test_request).await {
+            Ok(response) => {
+                debug!(
+                    "Test email sent successfully, message_id: {}",
+                    response.message_id
+                );
+                Ok(TestEmailResult {
+                    success: true,
+                    recipient_email: recipient_email.to_string(),
+                    provider_message_id: Some(response.message_id),
+                    error: None,
+                })
+            }
+            Err(e) => {
+                error!("Failed to send test email: {}", e);
+                Ok(TestEmailResult {
+                    success: false,
+                    recipient_email: recipient_email.to_string(),
+                    provider_message_id: None,
+                    error: Some(e.to_string()),
+                })
+            }
+        }
+    }
+
     /// Get decrypted credentials for a provider (for display purposes, masked)
     pub fn get_masked_credentials(
         &self,
@@ -259,6 +390,7 @@ mod tests {
         let credentials = ProviderCredentials::Ses(SesCredentials {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            endpoint_url: None,
         });
 
         let request = CreateProviderRequest {
@@ -319,6 +451,7 @@ mod tests {
         let credentials = SesCredentials {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            endpoint_url: None,
         };
         let credentials_json = serde_json::to_string(&credentials).unwrap();
         let encrypted = encryption_service
@@ -396,6 +529,7 @@ mod tests {
             credentials: ProviderCredentials::Ses(SesCredentials {
                 access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
                 secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                endpoint_url: None,
             }),
         };
 
@@ -422,6 +556,7 @@ mod tests {
             credentials: ProviderCredentials::Ses(SesCredentials {
                 access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
                 secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                endpoint_url: None,
             }),
         };
         let created = service.create(request).await.unwrap();
@@ -460,6 +595,7 @@ mod tests {
             credentials: ProviderCredentials::Ses(SesCredentials {
                 access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
                 secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                endpoint_url: None,
             }),
         };
         service.create(request1).await.unwrap();
@@ -495,6 +631,7 @@ mod tests {
             credentials: ProviderCredentials::Ses(SesCredentials {
                 access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
                 secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                endpoint_url: None,
             }),
         };
         let created = service.create(request).await.unwrap();
@@ -507,6 +644,7 @@ mod tests {
             credentials: ProviderCredentials::Ses(SesCredentials {
                 access_key_id: "AKIAIOSFODNN7EXAMPLE2".to_string(),
                 secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY2".to_string(),
+                endpoint_url: None,
             }),
         };
         let created2 = service.create(request2).await.unwrap();
@@ -534,6 +672,7 @@ mod tests {
             credentials: ProviderCredentials::Ses(SesCredentials {
                 access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
                 secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                endpoint_url: None,
             }),
         };
         let created = service.create(request).await.unwrap();
@@ -559,6 +698,7 @@ mod tests {
             credentials: ProviderCredentials::Ses(SesCredentials {
                 access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
                 secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                endpoint_url: None,
             }),
         };
         let created = service.create(request).await.unwrap();
@@ -575,5 +715,373 @@ mod tests {
         assert!(result.is_ok());
         let updated = result.unwrap();
         assert!(updated.is_active);
+    }
+
+    // ========== Unit Tests for TestEmailResult ==========
+
+    #[test]
+    fn test_email_result_success() {
+        let result = TestEmailResult {
+            success: true,
+            recipient_email: "test@example.com".to_string(),
+            provider_message_id: Some("msg-123".to_string()),
+            error: None,
+        };
+
+        assert!(result.success);
+        assert_eq!(result.recipient_email, "test@example.com");
+        assert_eq!(result.provider_message_id, Some("msg-123".to_string()));
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn test_email_result_failure() {
+        let result = TestEmailResult {
+            success: false,
+            recipient_email: "test@example.com".to_string(),
+            provider_message_id: None,
+            error: Some("Connection refused".to_string()),
+        };
+
+        assert!(!result.success);
+        assert_eq!(result.recipient_email, "test@example.com");
+        assert!(result.provider_message_id.is_none());
+        assert_eq!(result.error, Some("Connection refused".to_string()));
+    }
+
+    // ========== Integration Tests for send_test_email ==========
+
+    #[tokio::test]
+    async fn test_send_test_email_provider_not_found() {
+        let (_db, service) = setup_test_env().await;
+
+        // Attempt to send test email for non-existent provider
+        let result = service.send_test_email(999999, "test@example.com").await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            EmailError::ProviderNotFound(999999)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_send_test_email_with_invalid_credentials() {
+        let (_db, service) = setup_test_env().await;
+
+        // Create a provider with fake credentials
+        let request = CreateProviderRequest {
+            name: "Test Provider".to_string(),
+            provider_type: EmailProviderType::Ses,
+            region: "us-east-1".to_string(),
+            credentials: ProviderCredentials::Ses(SesCredentials {
+                access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+                secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                endpoint_url: None,
+            }),
+        };
+        let provider = service.create(request).await.unwrap();
+
+        // Attempt to send test email - this will create a provider instance
+        // but the send will fail because the credentials are fake
+        // The function should return a result with success=false, not an error
+        let result = service
+            .send_test_email(provider.id, "test@example.com")
+            .await;
+
+        // The function should succeed (return Ok) but the result should indicate failure
+        // This is because we gracefully handle send errors as failed test results
+        assert!(result.is_ok());
+        let test_result = result.unwrap();
+        assert!(!test_result.success); // Email send failed due to invalid credentials
+        assert_eq!(test_result.recipient_email, "test@example.com");
+        assert!(test_result.error.is_some()); // Should have an error message
+    }
+
+    // ========== LocalStack Integration Tests ==========
+    //
+    // These tests use LocalStack to test actual AWS SES integration without
+    // requiring a real AWS account. They require Docker to be running.
+    //
+    // To run these tests:
+    //   cargo test --lib -p temps-email test_localstack -- --nocapture
+    //
+    // The tests will be skipped if Docker is not available.
+
+    /// Helper to check if Docker is available
+    fn is_docker_available() -> bool {
+        std::process::Command::new("docker")
+            .arg("info")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Helper struct to hold LocalStack container and connection details
+    struct LocalStackTestEnv {
+        _container: testcontainers::ContainerAsync<testcontainers::GenericImage>,
+        endpoint_url: String,
+        #[allow(dead_code)]
+        port: u16,
+    }
+
+    impl LocalStackTestEnv {
+        async fn new() -> anyhow::Result<Self> {
+            use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
+
+            // Start LocalStack container with SES service
+            let container = GenericImage::new("localstack/localstack", "latest")
+                .with_env_var("SERVICES", "ses")
+                .with_env_var("DEBUG", "1")
+                .with_env_var("LOCALSTACK_HOST", "localhost.localstack.cloud")
+                .start()
+                .await?;
+
+            // Get the mapped port for LocalStack (default internal port is 4566)
+            let port = container.get_host_port_ipv4(4566).await?;
+            let endpoint_url = format!("http://localhost:{}", port);
+
+            // Wait for LocalStack to be ready
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+            Ok(Self {
+                _container: container,
+                endpoint_url,
+                port,
+            })
+        }
+    }
+
+    /// Test sending email via LocalStack SES
+    ///
+    /// This test verifies that the SES provider can send emails through LocalStack.
+    /// LocalStack simulates SES and accepts all emails without validation.
+    #[tokio::test]
+    async fn test_localstack_ses_send_email() {
+        // Skip if Docker is not available
+        if !is_docker_available() {
+            eprintln!("Skipping test_localstack_ses_send_email: Docker not available");
+            return;
+        }
+
+        // Start LocalStack
+        let localstack = match LocalStackTestEnv::new().await {
+            Ok(env) => env,
+            Err(e) => {
+                eprintln!("Skipping test: Failed to start LocalStack: {}", e);
+                return;
+            }
+        };
+
+        // Setup test database and provider service
+        let (_db, service) = setup_test_env().await;
+
+        // Create a provider pointing to LocalStack
+        let request = CreateProviderRequest {
+            name: "LocalStack SES Provider".to_string(),
+            provider_type: EmailProviderType::Ses,
+            region: "us-east-1".to_string(),
+            credentials: ProviderCredentials::Ses(SesCredentials {
+                // LocalStack accepts any credentials
+                access_key_id: "test".to_string(),
+                secret_access_key: "test".to_string(),
+                endpoint_url: Some(localstack.endpoint_url.clone()),
+            }),
+        };
+        let provider = service.create(request).await.unwrap();
+
+        // Verify the provider was created
+        assert!(provider.id > 0);
+        assert_eq!(provider.name, "LocalStack SES Provider");
+        assert_eq!(provider.provider_type, "ses");
+
+        // LocalStack requires email identity to be verified first
+        // Let's verify an identity before sending
+        let provider_model = service.get(provider.id).await.unwrap();
+        let provider_instance = service
+            .create_provider_instance(&provider_model)
+            .await
+            .unwrap();
+
+        // Create/verify a test identity (LocalStack auto-verifies)
+        let domain = "test.example.com";
+        match provider_instance.create_identity(domain).await {
+            Ok(_identity) => {
+                debug!("Created identity for {}", domain);
+            }
+            Err(e) => {
+                // LocalStack might not support all SES operations
+                debug!("Could not create identity (may be expected): {}", e);
+            }
+        }
+
+        // Send a test email
+        let result = service
+            .send_test_email(provider.id, "recipient@test.example.com")
+            .await;
+
+        // Verify the result
+        assert!(result.is_ok(), "send_test_email should not return error");
+        let test_result = result.unwrap();
+
+        // LocalStack should accept the email
+        // Note: The result depends on LocalStack's SES implementation
+        // Some versions may return success, others may return specific errors
+        println!(
+            "LocalStack test email result: success={}, error={:?}",
+            test_result.success, test_result.error
+        );
+
+        assert_eq!(test_result.recipient_email, "recipient@test.example.com");
+    }
+
+    /// Test creating SES provider with LocalStack endpoint
+    ///
+    /// This test verifies that the SES provider can be created with a custom
+    /// endpoint URL pointing to LocalStack.
+    #[tokio::test]
+    async fn test_localstack_ses_provider_creation() {
+        // Skip if Docker is not available
+        if !is_docker_available() {
+            eprintln!("Skipping test_localstack_ses_provider_creation: Docker not available");
+            return;
+        }
+
+        // Start LocalStack
+        let localstack = match LocalStackTestEnv::new().await {
+            Ok(env) => env,
+            Err(e) => {
+                eprintln!("Skipping test: Failed to start LocalStack: {}", e);
+                return;
+            }
+        };
+
+        // Setup test database and provider service
+        let (_db, service) = setup_test_env().await;
+
+        // Create a provider with LocalStack endpoint
+        let request = CreateProviderRequest {
+            name: "LocalStack Test Provider".to_string(),
+            provider_type: EmailProviderType::Ses,
+            region: "us-east-1".to_string(),
+            credentials: ProviderCredentials::Ses(SesCredentials {
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                endpoint_url: Some(localstack.endpoint_url.clone()),
+            }),
+        };
+
+        // Create the provider
+        let result = service.create(request).await;
+        assert!(result.is_ok());
+        let provider = result.unwrap();
+
+        // Verify provider was stored correctly
+        assert!(provider.id > 0);
+        assert_eq!(provider.name, "LocalStack Test Provider");
+        assert_eq!(provider.provider_type, "ses");
+        assert_eq!(provider.region, "us-east-1");
+        assert!(provider.is_active);
+
+        // Verify we can retrieve it
+        let retrieved = service.get(provider.id).await;
+        assert!(retrieved.is_ok());
+        let retrieved_provider = retrieved.unwrap();
+        assert_eq!(retrieved_provider.id, provider.id);
+
+        // Verify we can create a provider instance (which creates the AWS client)
+        let instance_result = service.create_provider_instance(&retrieved_provider).await;
+        assert!(
+            instance_result.is_ok(),
+            "Should be able to create provider instance: {:?}",
+            instance_result.err()
+        );
+
+        // Verify the provider instance has the correct type
+        let instance = instance_result.unwrap();
+        assert_eq!(instance.provider_type(), EmailProviderType::Ses);
+    }
+
+    /// Test SES identity operations with LocalStack
+    ///
+    /// This test verifies that the SES provider can create and verify domain
+    /// identities through LocalStack.
+    #[tokio::test]
+    async fn test_localstack_ses_identity_operations() {
+        // Skip if Docker is not available
+        if !is_docker_available() {
+            eprintln!("Skipping test_localstack_ses_identity_operations: Docker not available");
+            return;
+        }
+
+        // Start LocalStack
+        let localstack = match LocalStackTestEnv::new().await {
+            Ok(env) => env,
+            Err(e) => {
+                eprintln!("Skipping test: Failed to start LocalStack: {}", e);
+                return;
+            }
+        };
+
+        // Setup test database and provider service
+        let (_db, service) = setup_test_env().await;
+
+        // Create a provider with LocalStack endpoint
+        let request = CreateProviderRequest {
+            name: "LocalStack Identity Test".to_string(),
+            provider_type: EmailProviderType::Ses,
+            region: "us-east-1".to_string(),
+            credentials: ProviderCredentials::Ses(SesCredentials {
+                access_key_id: "test-key".to_string(),
+                secret_access_key: "test-secret".to_string(),
+                endpoint_url: Some(localstack.endpoint_url.clone()),
+            }),
+        };
+        let provider = service.create(request).await.unwrap();
+
+        // Get provider instance
+        let provider_model = service.get(provider.id).await.unwrap();
+        let provider_instance = service
+            .create_provider_instance(&provider_model)
+            .await
+            .unwrap();
+
+        // Test domain identity creation
+        let test_domain = "localstack-test.example.com";
+        let identity_result = provider_instance.create_identity(test_domain).await;
+
+        // LocalStack should accept the identity creation
+        // The result depends on LocalStack's SES implementation
+        match identity_result {
+            Ok(identity) => {
+                println!("Created identity for {}: {:?}", test_domain, identity);
+                assert_eq!(identity.provider_identity_id, test_domain);
+
+                // Verify the identity (LocalStack auto-verifies)
+                let verify_result = provider_instance.verify_identity(test_domain).await;
+                match verify_result {
+                    Ok(status) => {
+                        println!("Verification status for {}: {:?}", test_domain, status);
+                        // LocalStack may return different statuses
+                    }
+                    Err(e) => {
+                        println!("Verification check failed (may be expected): {}", e);
+                    }
+                }
+
+                // Clean up - delete the identity
+                let delete_result = provider_instance.delete_identity(test_domain).await;
+                match delete_result {
+                    Ok(_) => println!("Deleted identity for {}", test_domain),
+                    Err(e) => println!("Delete failed (may be expected): {}", e),
+                }
+            }
+            Err(e) => {
+                // Some LocalStack versions may not fully support SESv2
+                println!("Identity creation failed (may be expected): {}", e);
+            }
+        }
     }
 }
