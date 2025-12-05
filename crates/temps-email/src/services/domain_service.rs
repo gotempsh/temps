@@ -9,7 +9,7 @@ use temps_entities::email_domains;
 use tracing::{debug, error, info};
 
 use crate::errors::EmailError;
-use crate::providers::{DnsRecord, VerificationStatus};
+use crate::providers::{DnsRecord, DnsRecordStatus, DomainIdentityDetails, VerificationStatus};
 use crate::services::ProviderService;
 
 /// Service for managing email domains
@@ -123,17 +123,102 @@ impl DomainService {
             .ok_or(EmailError::DomainNotFound(id))
     }
 
-    /// Get a domain with its DNS records
+    /// Get a domain with its DNS records (fetches fresh verification status from provider)
+    /// The domain status is computed dynamically based on DNS record verification
     pub async fn get_with_dns_records(&self, id: i32) -> Result<DomainWithDnsRecords, EmailError> {
-        let domain = self.get(id).await?;
+        let mut domain = self.get(id).await?;
 
-        // Build DNS records from stored data
-        let dns_records = self.build_dns_records(&domain);
+        // Get the provider to fetch fresh verification status
+        let provider = self.provider_service.get(domain.provider_id).await?;
+
+        // Create provider instance
+        let provider_instance = self
+            .provider_service
+            .create_provider_instance(&provider)
+            .await?;
+
+        // Fetch fresh DNS records with verification status from the provider API
+        let details = provider_instance
+            .get_identity_details(&domain.domain)
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to get identity details from provider, falling back to stored data: {}",
+                    e
+                );
+                e
+            });
+
+        // Build DNS records and compute status based on verification results
+        let (dns_records, computed_status) = match details {
+            Ok(identity_details) => {
+                let mut records = Vec::new();
+
+                if let Some(spf) = identity_details.spf_record.clone() {
+                    records.push(spf);
+                }
+
+                records.extend(identity_details.dkim_records.clone());
+
+                if let Some(mx) = identity_details.mx_record.clone() {
+                    records.push(mx);
+                }
+
+                // Compute status based on all DNS records being verified
+                let all_verified = Self::are_all_records_verified(&identity_details);
+                let status = if all_verified {
+                    "verified".to_string()
+                } else {
+                    // Check if any records failed
+                    let any_failed = records.iter().any(|r| r.status == DnsRecordStatus::Failed);
+                    if any_failed {
+                        "failed".to_string()
+                    } else {
+                        "pending".to_string()
+                    }
+                };
+
+                (records, status)
+            }
+            Err(_) => {
+                // Fallback to stored data without status information
+                (self.build_dns_records(&domain), domain.status.clone())
+            }
+        };
+
+        // Override the domain status with computed status
+        domain.status = computed_status;
 
         Ok(DomainWithDnsRecords {
             domain,
             dns_records,
         })
+    }
+
+    /// Check if all DNS records are verified
+    fn are_all_records_verified(details: &DomainIdentityDetails) -> bool {
+        // Check SPF record
+        if let Some(ref spf) = details.spf_record {
+            if spf.status != DnsRecordStatus::Verified {
+                return false;
+            }
+        }
+
+        // Check DKIM records
+        for dkim in &details.dkim_records {
+            if dkim.status != DnsRecordStatus::Verified {
+                return false;
+            }
+        }
+
+        // Check MX record (if present)
+        if let Some(ref mx) = details.mx_record {
+            if mx.status != DnsRecordStatus::Verified {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// List all domains
@@ -171,8 +256,8 @@ impl DomainService {
         Ok(domains)
     }
 
-    /// Verify a domain's DNS configuration
-    pub async fn verify(&self, id: i32) -> Result<email_domains::Model, EmailError> {
+    /// Verify a domain's DNS configuration and return the domain with DNS records
+    pub async fn verify(&self, id: i32) -> Result<DomainWithDnsRecords, EmailError> {
         let domain = self.get(id).await?;
 
         debug!("Verifying domain: {}", domain.domain);
@@ -186,16 +271,48 @@ impl DomainService {
             .create_provider_instance(&provider)
             .await?;
 
-        // Verify with provider
-        let status = provider_instance
-            .verify_identity(&domain.domain)
+        // Get identity details with DNS verification
+        let identity_details = provider_instance
+            .get_identity_details(&domain.domain)
             .await
             .map_err(|e| {
-                error!("Failed to verify domain: {}", e);
+                error!("Failed to get identity details: {}", e);
                 e
             })?;
 
-        // Update domain status
+        // Build DNS records list for response
+        let mut dns_records = Vec::new();
+
+        if let Some(spf) = &identity_details.spf_record {
+            dns_records.push(spf.clone());
+        }
+
+        dns_records.extend(identity_details.dkim_records.clone());
+
+        if let Some(mx) = &identity_details.mx_record {
+            dns_records.push(mx.clone());
+        }
+
+        // Check if all DNS records are verified
+        let all_dns_verified = Self::are_all_records_verified(&identity_details);
+
+        // Check if any records failed
+        let any_failed = dns_records
+            .iter()
+            .any(|r| r.status == DnsRecordStatus::Failed);
+
+        // Determine final status based on DNS record verification
+        let status = if all_dns_verified {
+            debug!("All DNS records verified via DNS lookup, marking domain as verified");
+            VerificationStatus::Verified
+        } else if any_failed {
+            VerificationStatus::Failed("Some DNS records failed verification".to_string())
+        } else {
+            // Use the provider's overall status for pending/other states
+            identity_details.overall_status
+        };
+
+        // Update domain status in database
         let mut active_model: email_domains::ActiveModel = domain.into();
 
         match &status {
@@ -228,7 +345,10 @@ impl DomainService {
 
         let result = active_model.update(self.db.as_ref()).await?;
 
-        Ok(result)
+        Ok(DomainWithDnsRecords {
+            domain: result,
+            dns_records,
+        })
     }
 
     /// Delete a domain
@@ -264,7 +384,7 @@ impl DomainService {
         Ok(())
     }
 
-    /// Build DNS records from stored domain data
+    /// Build DNS records from stored domain data (fallback when provider API unavailable)
     fn build_dns_records(&self, domain: &email_domains::Model) -> Vec<DnsRecord> {
         let mut records = Vec::new();
 
@@ -275,6 +395,7 @@ impl DomainService {
                 name: name.clone(),
                 value: value.clone(),
                 priority: None,
+                status: DnsRecordStatus::Unknown,
             });
         }
 
@@ -285,6 +406,7 @@ impl DomainService {
                 name: name.clone(),
                 value: value.clone(),
                 priority: None,
+                status: DnsRecordStatus::Unknown,
             });
         }
 
@@ -295,6 +417,7 @@ impl DomainService {
                 name: name.clone(),
                 value: value.clone(),
                 priority: domain.mx_record_priority.map(|p| p as u16),
+                status: DnsRecordStatus::Unknown,
             });
         }
 
@@ -305,7 +428,7 @@ impl DomainService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{EmailProviderType, SesCredentials};
+    use crate::providers::{DnsRecordStatus, EmailProviderType, SesCredentials};
     use crate::services::provider_service::{CreateProviderRequest, ProviderCredentials};
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_core::EncryptionService;
@@ -362,11 +485,13 @@ mod tests {
             name: "_dmarc.example.com".to_string(),
             value: "v=DMARC1; p=none".to_string(),
             priority: None,
+            status: DnsRecordStatus::Unknown,
         };
 
         assert_eq!(record.record_type, "TXT");
         assert_eq!(record.name, "_dmarc.example.com");
         assert!(record.priority.is_none());
+        assert_eq!(record.status, DnsRecordStatus::Unknown);
     }
 
     #[test]
@@ -376,10 +501,12 @@ mod tests {
             name: "example.com".to_string(),
             value: "mail.example.com".to_string(),
             priority: Some(10),
+            status: DnsRecordStatus::Verified,
         };
 
         assert_eq!(record.record_type, "MX");
         assert_eq!(record.priority, Some(10));
+        assert_eq!(record.status, DnsRecordStatus::Verified);
     }
 
     #[test]
@@ -426,6 +553,7 @@ mod tests {
             name: "test.com".to_string(),
             value: "v=spf1 -all".to_string(),
             priority: None,
+            status: DnsRecordStatus::Pending,
         }];
 
         let domain_with_records = DomainWithDnsRecords {

@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use crate::errors::EmailError;
 use crate::providers::{
-    DnsRecord, DomainIdentity, EmailProvider, EmailProviderType, SendEmailRequest,
-    SendEmailResponse, VerificationStatus,
+    DnsRecord, DnsRecordStatus, DomainIdentity, DomainIdentityDetails, EmailProvider,
+    EmailProviderType, SendEmailRequest, SendEmailResponse, VerificationStatus,
 };
 
 /// Mock email provider for testing
@@ -81,27 +81,35 @@ impl EmailProvider for MockEmailProvider {
     async fn create_identity(&self, domain: &str) -> Result<DomainIdentity, EmailError> {
         self.create_identity_count.fetch_add(1, Ordering::SeqCst);
 
+        let mail_from_domain = format!("send.{}", domain);
         Ok(DomainIdentity {
             provider_identity_id: format!("mock-identity-{}", domain),
+            // SPF on MAIL FROM subdomain (send.domain.com)
             spf_record: Some(DnsRecord {
                 record_type: "TXT".to_string(),
-                name: domain.to_string(),
+                name: mail_from_domain.clone(),
                 value: "v=spf1 include:mock.example.com ~all".to_string(),
                 priority: None,
+                status: DnsRecordStatus::Pending,
             }),
+            // DKIM on root domain
             dkim_records: vec![DnsRecord {
-                record_type: "TXT".to_string(),
+                record_type: "CNAME".to_string(),
                 name: format!("mock._domainkey.{}", domain),
-                value: "v=DKIM1; k=rsa; p=MOCKPUBLICKEY".to_string(),
+                value: "mock.dkim.example.com".to_string(),
                 priority: None,
+                status: DnsRecordStatus::Pending,
             }],
             dkim_selector: Some("mock".to_string()),
+            // MX on MAIL FROM subdomain (send.domain.com)
             mx_record: Some(DnsRecord {
                 record_type: "MX".to_string(),
-                name: domain.to_string(),
+                name: mail_from_domain,
                 value: "feedback-smtp.mock.example.com".to_string(),
                 priority: Some(10),
+                status: DnsRecordStatus::Pending,
             }),
+            mail_from_subdomain: Some("send".to_string()),
         })
     }
 
@@ -115,6 +123,49 @@ impl EmailProvider for MockEmailProvider {
         }
 
         Ok(self.verification_status.clone())
+    }
+
+    async fn get_identity_details(
+        &self,
+        domain: &str,
+    ) -> Result<DomainIdentityDetails, EmailError> {
+        // Map verification status to DNS record status
+        let record_status = match &self.verification_status {
+            VerificationStatus::Verified => DnsRecordStatus::Verified,
+            VerificationStatus::Pending => DnsRecordStatus::Pending,
+            VerificationStatus::Failed(_) => DnsRecordStatus::Failed,
+            _ => DnsRecordStatus::Unknown,
+        };
+
+        let mail_from_domain = format!("send.{}", domain);
+        Ok(DomainIdentityDetails {
+            overall_status: self.verification_status.clone(),
+            // SPF on MAIL FROM subdomain (send.domain.com)
+            spf_record: Some(DnsRecord {
+                record_type: "TXT".to_string(),
+                name: mail_from_domain.clone(),
+                value: "v=spf1 include:mock.example.com ~all".to_string(),
+                priority: None,
+                status: record_status,
+            }),
+            // DKIM on root domain
+            dkim_records: vec![DnsRecord {
+                record_type: "CNAME".to_string(),
+                name: format!("mock._domainkey.{}", domain),
+                value: "mock.dkim.example.com".to_string(),
+                priority: None,
+                status: record_status,
+            }],
+            // MX on MAIL FROM subdomain (send.domain.com)
+            mx_record: Some(DnsRecord {
+                record_type: "MX".to_string(),
+                name: mail_from_domain,
+                value: "feedback-smtp.mock.example.com".to_string(),
+                priority: Some(10),
+                status: record_status,
+            }),
+            mail_from_subdomain: Some("send".to_string()),
+        })
     }
 
     async fn delete_identity(&self, _domain: &str) -> Result<(), EmailError> {

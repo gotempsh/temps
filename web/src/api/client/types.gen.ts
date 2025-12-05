@@ -4646,6 +4646,20 @@ export type TagListResponse = {
 };
 
 /**
+ * Request body for testing an email provider
+ */
+export type TestEmailRequest = {
+    /**
+     * Sender email address (must be verified with the provider)
+     */
+    from: string;
+    /**
+     * Sender display name
+     */
+    from_name?: string | null;
+};
+
+/**
  * Response for test email endpoint
  */
 export type TestEmailResponse = {
@@ -8469,7 +8483,7 @@ export type GetProviderResponses = {
 export type GetProviderResponse = GetProviderResponses[keyof GetProviderResponses];
 
 export type TestProviderData = {
-    body?: never;
+    body: TestEmailRequest;
     path: {
         /**
          * Provider ID
@@ -8481,6 +8495,10 @@ export type TestProviderData = {
 };
 
 export type TestProviderErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
     /**
      * Unauthorized
      */

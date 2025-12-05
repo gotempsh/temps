@@ -11,9 +11,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 
 use super::traits::{
-    DnsRecord, DomainIdentity, EmailProvider, EmailProviderType, SendEmailRequest,
-    SendEmailResponse, VerificationStatus,
+    DnsRecord, DnsRecordStatus, DomainIdentity, DomainIdentityDetails, EmailProvider,
+    EmailProviderType, SendEmailRequest, SendEmailResponse, VerificationStatus,
+    DEFAULT_MAIL_FROM_SUBDOMAIN,
 };
+use crate::dns::DnsVerifier;
 use crate::errors::EmailError;
 
 /// Extract detailed error information from AWS SES SDK errors
@@ -109,10 +111,19 @@ impl SesProvider {
 
 #[async_trait]
 impl EmailProvider for SesProvider {
+    /// Create identity with split architecture (Resend-like):
+    /// - Root domain: DKIM records (allows sending FROM @domain.com)
+    /// - send.domain.com: SPF + MX records (handles bounces via Custom MAIL FROM)
     async fn create_identity(&self, domain: &str) -> Result<DomainIdentity, EmailError> {
-        debug!("Creating SES identity for domain: {}", domain);
+        debug!(
+            "Creating SES identity for domain: {} with split architecture",
+            domain
+        );
 
-        // Create email identity in SES
+        let mail_from_subdomain = DEFAULT_MAIL_FROM_SUBDOMAIN;
+        let mail_from_domain = format!("{}.{}", mail_from_subdomain, domain);
+
+        // Step 1: Create email identity for the ROOT domain in SES
         let result = self
             .client
             .create_email_identity()
@@ -121,10 +132,32 @@ impl EmailProvider for SesProvider {
             .await
             .map_err(|e| EmailError::AwsSes(format!("Failed to create identity: {}", e)))?;
 
-        // Extract DKIM attributes
+        // Step 2: Configure Custom MAIL FROM domain (send.domain.com)
+        // This enables the split architecture where bounces go to the subdomain
+        debug!(
+            "Configuring Custom MAIL FROM: {} for domain: {}",
+            mail_from_domain, domain
+        );
+
+        if let Err(e) = self
+            .client
+            .put_email_identity_mail_from_attributes()
+            .email_identity(domain)
+            .mail_from_domain(&mail_from_domain)
+            .send()
+            .await
+        {
+            // Log but don't fail - MAIL FROM can be configured later
+            error!(
+                "Failed to configure Custom MAIL FROM (will retry on verify): {}",
+                e
+            );
+        }
+
+        // Extract DKIM attributes - these go on the ROOT domain
         let dkim_attributes = result.dkim_attributes();
 
-        // SES returns DKIM tokens that need to be set up as CNAME records
+        // DKIM records: CNAME records on ROOT domain pointing to amazonses.com
         let dkim_records: Vec<DnsRecord> =
             if let Some(tokens) = dkim_attributes.as_ref().and_then(|a| a.tokens.as_ref()) {
                 tokens
@@ -134,26 +167,29 @@ impl EmailProvider for SesProvider {
                         name: format!("{}._domainkey.{}", token, domain),
                         value: format!("{}.dkim.amazonses.com", token),
                         priority: None,
+                        status: DnsRecordStatus::Pending,
                     })
                     .collect()
             } else {
                 Vec::new()
             };
 
-        // Build SPF record for SES
+        // SPF record: Goes on the MAIL FROM subdomain (send.domain.com)
         let spf_record = Some(DnsRecord {
             record_type: "TXT".to_string(),
-            name: domain.to_string(),
+            name: mail_from_domain.clone(),
             value: "v=spf1 include:amazonses.com ~all".to_string(),
             priority: None,
+            status: DnsRecordStatus::Pending,
         });
 
-        // MX record for receiving bounces/complaints
+        // MX record: Goes on the MAIL FROM subdomain (send.domain.com) for bounce handling
         let mx_record = Some(DnsRecord {
             record_type: "MX".to_string(),
-            name: domain.to_string(),
+            name: mail_from_domain.clone(),
             value: format!("feedback-smtp.{}.amazonses.com", self.region),
             priority: Some(10),
+            status: DnsRecordStatus::Pending,
         });
 
         Ok(DomainIdentity {
@@ -162,6 +198,7 @@ impl EmailProvider for SesProvider {
             dkim_records,
             dkim_selector: None, // SES uses its own selectors
             mx_record,
+            mail_from_subdomain: Some(mail_from_subdomain.to_string()),
         })
     }
 
@@ -204,6 +241,122 @@ impl EmailProvider for SesProvider {
                 Ok(VerificationStatus::NotStarted)
             }
         }
+    }
+
+    async fn get_identity_details(
+        &self,
+        domain: &str,
+    ) -> Result<DomainIdentityDetails, EmailError> {
+        debug!("Getting SES identity details for domain: {}", domain);
+
+        let result = self
+            .client
+            .get_email_identity()
+            .email_identity(domain)
+            .send()
+            .await
+            .map_err(|e| EmailError::AwsSes(format!("Failed to get identity: {}", e)))?;
+
+        // Get the configured MAIL FROM subdomain (default to "send" if not set)
+        let mail_from_subdomain = result
+            .mail_from_attributes()
+            .map(|attrs| {
+                let full_domain = &attrs.mail_from_domain;
+                if full_domain.is_empty() {
+                    DEFAULT_MAIL_FROM_SUBDOMAIN.to_string()
+                } else {
+                    // Extract subdomain from "send.domain.com" -> "send"
+                    full_domain
+                        .strip_suffix(&format!(".{}", domain))
+                        .unwrap_or(DEFAULT_MAIL_FROM_SUBDOMAIN)
+                        .to_string()
+                }
+            })
+            .unwrap_or_else(|| DEFAULT_MAIL_FROM_SUBDOMAIN.to_string());
+
+        let mail_from_domain = format!("{}.{}", mail_from_subdomain, domain);
+
+        // Determine overall verification status
+        let verified = result.verified_for_sending_status();
+        let overall_status = if verified {
+            VerificationStatus::Verified
+        } else if let Some(dkim_attrs) = result.dkim_attributes() {
+            match dkim_attrs.status() {
+                Some(status) => match status.as_str() {
+                    "SUCCESS" => VerificationStatus::Verified,
+                    "PENDING" => VerificationStatus::Pending,
+                    "FAILED" => VerificationStatus::Failed("DKIM verification failed".to_string()),
+                    "TEMPORARY_FAILURE" => VerificationStatus::TemporaryFailure,
+                    "NOT_STARTED" => VerificationStatus::NotStarted,
+                    _ => VerificationStatus::Pending,
+                },
+                None => VerificationStatus::NotStarted,
+            }
+        } else {
+            VerificationStatus::NotStarted
+        };
+
+        // Create DNS verifier for record verification
+        let dns_verifier = DnsVerifier::new();
+
+        // Build DKIM records with DNS-verified status
+        // DKIM CNAME records go on the ROOT domain
+        let mut dkim_records: Vec<DnsRecord> = Vec::new();
+        if let Some(tokens) = result
+            .dkim_attributes()
+            .and_then(|attrs| attrs.tokens.as_ref())
+        {
+            for token in tokens {
+                let dkim_name = format!("{}._domainkey.{}", token, domain);
+                let dkim_value = format!("{}.dkim.amazonses.com", token);
+
+                // Verify DKIM CNAME record via DNS lookup
+                let dkim_status = dns_verifier
+                    .verify_cname_record(&dkim_name, &dkim_value)
+                    .await;
+
+                dkim_records.push(DnsRecord {
+                    record_type: "CNAME".to_string(),
+                    name: dkim_name,
+                    value: dkim_value,
+                    priority: None,
+                    status: dkim_status,
+                });
+            }
+        }
+
+        // SPF record - goes on MAIL FROM subdomain (send.domain.com)
+        let spf_status = dns_verifier
+            .verify_spf_record(&mail_from_domain, "amazonses.com")
+            .await;
+        let spf_record = Some(DnsRecord {
+            record_type: "TXT".to_string(),
+            name: mail_from_domain.clone(),
+            value: "v=spf1 include:amazonses.com ~all".to_string(),
+            priority: None,
+            status: spf_status,
+        });
+
+        // MX record for bounce handling - goes on MAIL FROM subdomain (send.domain.com)
+        let mx_value = format!("feedback-smtp.{}.amazonses.com", self.region);
+        let mx_status = dns_verifier
+            .verify_mx_record(&mail_from_domain, &mx_value, Some(10))
+            .await;
+        let mx_record = Some(DnsRecord {
+            record_type: "MX".to_string(),
+            name: mail_from_domain,
+            value: mx_value,
+            priority: Some(10),
+            status: mx_status,
+        });
+
+        Ok(DomainIdentityDetails {
+            overall_status,
+            spf_record,
+            dkim_records,
+            mx_record,
+            mail_from_subdomain: Some(mail_from_subdomain),
+        })
     }
 
     async fn delete_identity(&self, domain: &str) -> Result<(), EmailError> {

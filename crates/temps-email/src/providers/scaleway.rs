@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 
 use super::traits::{
-    DnsRecord, DomainIdentity, EmailProvider, EmailProviderType, SendEmailRequest,
-    SendEmailResponse, VerificationStatus,
+    DnsRecord, DnsRecordStatus, DomainIdentity, DomainIdentityDetails, EmailProvider,
+    EmailProviderType, SendEmailRequest, SendEmailResponse, VerificationStatus,
 };
+use crate::dns::DnsVerifier;
 use crate::errors::EmailError;
 
 /// Scaleway TEM credentials configuration
@@ -145,6 +146,7 @@ impl EmailProvider for ScalewayProvider {
             name: domain.to_string(),
             value: spf,
             priority: None,
+            status: DnsRecordStatus::Pending,
         });
 
         // Parse DKIM config
@@ -154,6 +156,7 @@ impl EmailProvider for ScalewayProvider {
                 name: format!("scw._domainkey.{}", domain),
                 value: dkim,
                 priority: None,
+                status: DnsRecordStatus::Pending,
             }]
         } else {
             Vec::new()
@@ -165,6 +168,8 @@ impl EmailProvider for ScalewayProvider {
             dkim_records,
             dkim_selector: Some("scw".to_string()),
             mx_record: None,
+            // Scaleway doesn't support custom MAIL FROM - SPF/DKIM go directly on root domain
+            mail_from_subdomain: None,
         })
     }
 
@@ -228,6 +233,96 @@ impl EmailProvider for ScalewayProvider {
             )),
             _ => Ok(VerificationStatus::NotStarted),
         }
+    }
+
+    async fn get_identity_details(
+        &self,
+        domain: &str,
+    ) -> Result<DomainIdentityDetails, EmailError> {
+        debug!("Getting Scaleway identity details for domain: {}", domain);
+
+        // Get the domain status from Scaleway
+        let response = self
+            .client
+            .get(self.api_url(&format!("/domains/{}", urlencoding::encode(domain))))
+            .header("X-Auth-Token", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| EmailError::Scaleway(format!("Failed to get domain: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(EmailError::Scaleway(format!(
+                "Failed to get domain ({}): {}",
+                status, body
+            )));
+        }
+
+        let domain_response: ScalewayDomainResponse = response
+            .json()
+            .await
+            .map_err(|e| EmailError::Scaleway(format!("Failed to parse domain response: {}", e)))?;
+
+        // Determine overall verification status
+        let overall_status = match domain_response.status.as_str() {
+            "checked" | "verified" => VerificationStatus::Verified,
+            "pending" | "unchecked" => VerificationStatus::Pending,
+            "invalid" => VerificationStatus::Failed(
+                domain_response
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "DNS verification failed".to_string()),
+            ),
+            _ => VerificationStatus::NotStarted,
+        };
+
+        // Verify records via DNS lookup for accurate per-record status
+        let dns_verifier = DnsVerifier::new();
+
+        // Build SPF record with DNS-verified status
+        let spf_record = if let Some(spf) = domain_response.spf_config {
+            // Scaleway SPF includes "include:_spf.scw-tem.cloud"
+            let spf_status = dns_verifier
+                .verify_spf_record(domain, "_spf.scw-tem.cloud")
+                .await;
+            Some(DnsRecord {
+                record_type: "TXT".to_string(),
+                name: domain.to_string(),
+                value: spf,
+                priority: None,
+                status: spf_status,
+            })
+        } else {
+            None
+        };
+
+        // Build DKIM record with DNS-verified status
+        let dkim_records = if let Some(dkim) = domain_response.dkim_config {
+            let dkim_name = format!("scw._domainkey.{}", domain);
+            let dkim_status = dns_verifier.verify_txt_record(&dkim_name, &dkim).await;
+            vec![DnsRecord {
+                record_type: "TXT".to_string(),
+                name: dkim_name,
+                value: dkim,
+                priority: None,
+                status: dkim_status,
+            }]
+        } else {
+            Vec::new()
+        };
+
+        Ok(DomainIdentityDetails {
+            overall_status,
+            spf_record,
+            dkim_records,
+            mx_record: None, // Scaleway doesn't use MX records
+            // Scaleway doesn't support custom MAIL FROM - all records on root domain
+            mail_from_subdomain: None,
+        })
     }
 
     async fn delete_identity(&self, domain: &str) -> Result<(), EmailError> {

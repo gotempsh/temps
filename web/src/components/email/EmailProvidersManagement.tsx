@@ -146,9 +146,16 @@ interface TestEmailResponse {
   error: string | null
 }
 
-async function testEmailProvider(id: number): Promise<TestEmailResponse> {
+interface TestEmailRequest {
+  from: string
+  from_name?: string
+}
+
+async function testEmailProvider(id: number, request: TestEmailRequest): Promise<TestEmailResponse> {
   const response = await fetch(`/api/email-providers/${id}/test`, {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
   })
 
   if (!response.ok) {
@@ -158,6 +165,14 @@ async function testEmailProvider(id: number): Promise<TestEmailResponse> {
 
   return response.json()
 }
+
+// Test email form schema
+const testEmailSchema = z.object({
+  from: z.string().email('Please enter a valid email address'),
+  from_name: z.string().optional(),
+})
+
+type TestEmailFormData = z.infer<typeof testEmailSchema>
 
 // AWS regions for SES
 const awsRegions = [
@@ -190,23 +205,142 @@ function ProviderIcon({ type }: { type: 'ses' | 'scaleway' }) {
   return <ScalewayIcon className="h-5 w-5 text-[#4F0599]" />
 }
 
+function TestEmailDialog({
+  open,
+  onOpenChange,
+  providerId,
+  onSuccess,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  providerId: number | null
+  onSuccess: () => void
+}) {
+  const form = useForm<TestEmailFormData>({
+    resolver: zodResolver(testEmailSchema),
+    defaultValues: {
+      from: '',
+      from_name: '',
+    },
+  })
+
+  const testMutation = useMutation({
+    mutationFn: (data: TestEmailFormData) => testEmailProvider(providerId!, data),
+    onSuccess: (data) => {
+      if (data.success) {
+        toast.success('Test email sent successfully!', {
+          description: `A test email was sent to ${data.sent_to}. Please check your inbox.`,
+        })
+        onOpenChange(false)
+        form.reset()
+        onSuccess()
+      } else {
+        toast.error('Test email failed', {
+          description: data.error || 'Unknown error occurred',
+        })
+      }
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to send test email', {
+        description: error.message,
+      })
+    },
+  })
+
+  const onSubmit = (data: TestEmailFormData) => {
+    testMutation.mutate(data)
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Send Test Email</DialogTitle>
+          <DialogDescription>
+            Enter the sender details to send a test email. The &quot;From&quot; address must be
+            verified with your email provider.
+          </DialogDescription>
+        </DialogHeader>
+
+        <Form {...form}>
+          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+            <FormField
+              control={form.control}
+              name="from"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>From Email Address</FormLabel>
+                  <FormControl>
+                    <Input
+                      placeholder="noreply@yourdomain.com"
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    The email address to send from. Must be verified with AWS SES or your domain must be verified with Scaleway.
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <FormField
+              control={form.control}
+              name="from_name"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>From Name (Optional)</FormLabel>
+                  <FormControl>
+                    <Input
+                      placeholder="My Application"
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    The display name shown in the recipient&apos;s email client.
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => onOpenChange(false)}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={testMutation.isPending}>
+                {testMutation.isPending && (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                )}
+                Send Test Email
+              </Button>
+            </DialogFooter>
+          </form>
+        </Form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function ProviderCard({
   provider,
   onDelete,
-  onTest,
-  isTesting,
+  onTestClick,
 }: {
   provider: EmailProvider
   onDelete: (id: number) => void
-  onTest: (id: number) => void
-  isTesting: boolean
+  onTestClick: (id: number) => void
 }) {
   const [isDeleting, setIsDeleting] = useState(false)
 
-  const handleDelete = async () => {
+  const handleDelete = () => {
     setIsDeleting(true)
     try {
-      await onDelete(provider.id)
+      onDelete(provider.id)
     } finally {
       setIsDeleting(false)
     }
@@ -238,20 +372,10 @@ function ProviderCard({
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuItem
-                onClick={() => onTest(provider.id)}
-                disabled={isTesting}
+                onClick={() => onTestClick(provider.id)}
               >
-                {isTesting ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Sending...
-                  </>
-                ) : (
-                  <>
-                    <Send className="mr-2 h-4 w-4" />
-                    Send Test Email
-                  </>
-                )}
+                <Send className="mr-2 h-4 w-4" />
+                Send Test Email
               </DropdownMenuItem>
               <DropdownMenuItem disabled>Edit</DropdownMenuItem>
               <DropdownMenuSeparator />
@@ -312,6 +436,8 @@ function LoadingSkeleton() {
 
 export function EmailProvidersManagement() {
   const [isDialogOpen, setIsDialogOpen] = useState(false)
+  const [isTestDialogOpen, setIsTestDialogOpen] = useState(false)
+  const [testingProviderId, setTestingProviderId] = useState<number | null>(null)
   const queryClient = useQueryClient()
 
   const { data: providers, isLoading } = useQuery({
@@ -347,26 +473,6 @@ export function EmailProvidersManagement() {
     },
   })
 
-  const testMutation = useMutation({
-    mutationFn: testEmailProvider,
-    onSuccess: (data) => {
-      if (data.success) {
-        toast.success('Test email sent successfully!', {
-          description: `A test email was sent to ${data.sent_to}. Please check your inbox.`,
-        })
-      } else {
-        toast.error('Test email failed', {
-          description: data.error || 'Unknown error occurred',
-        })
-      }
-    },
-    onError: (error: Error) => {
-      toast.error('Failed to send test email', {
-        description: error.message,
-      })
-    },
-  })
-
   const form = useForm<CreateProviderFormData>({
     resolver: zodResolver(createProviderSchema),
     defaultValues: {
@@ -391,8 +497,9 @@ export function EmailProvidersManagement() {
     deleteMutation.mutate(id)
   }
 
-  const handleTest = (id: number) => {
-    testMutation.mutate(id)
+  const handleTestClick = (id: number) => {
+    setTestingProviderId(id)
+    setIsTestDialogOpen(true)
   }
 
   const hasProviders = providers && providers.length > 0
@@ -436,8 +543,7 @@ export function EmailProvidersManagement() {
               key={provider.id}
               provider={provider}
               onDelete={handleDelete}
-              onTest={handleTest}
-              isTesting={testMutation.isPending}
+              onTestClick={handleTestClick}
             />
           ))}
         </div>
@@ -646,6 +752,15 @@ export function EmailProvidersManagement() {
           </Form>
         </DialogContent>
       </Dialog>
+
+      <TestEmailDialog
+        open={isTestDialogOpen}
+        onOpenChange={setIsTestDialogOpen}
+        providerId={testingProviderId}
+        onSuccess={() => {
+          queryClient.invalidateQueries({ queryKey: ['email-providers'] })
+        }}
+      />
     </div>
   )
 }

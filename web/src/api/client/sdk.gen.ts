@@ -1296,7 +1296,11 @@ export const testProvider = <ThrowOnError extends boolean = false>(options: Opti
             }
         ],
         url: '/email-providers/{id}/test',
-        ...options
+        ...options,
+        headers: {
+            'Content-Type': 'application/json',
+            ...options.headers
+        }
     });
 };
 

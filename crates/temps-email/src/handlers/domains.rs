@@ -106,6 +106,7 @@ pub async fn create_domain(
                 name: r.name,
                 value: r.value,
                 priority: r.priority,
+                status: r.status.into(),
             })
             .collect(),
     };
@@ -208,6 +209,7 @@ pub async fn get_domain(
                 name: r.name,
                 value: r.value,
                 priority: r.priority,
+                status: r.status.into(),
             })
             .collect(),
     };
@@ -221,7 +223,7 @@ pub async fn get_domain(
     post,
     path = "/email-domains/{id}/verify",
     responses(
-        (status = 200, description = "Domain verification result", body = EmailDomainResponse),
+        (status = 200, description = "Domain verification result with DNS records", body = EmailDomainWithDnsResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Domain not found"),
@@ -240,7 +242,7 @@ pub async fn verify_domain(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EmailDomainsWrite);
 
-    let domain = state.domain_service.verify(id).await.map_err(|e| {
+    let result = state.domain_service.verify(id).await.map_err(|e| {
         error!("Failed to verify email domain: {}", e);
         internal_server_error()
             .detail(format!("Failed to verify domain: {}", e))
@@ -254,24 +256,37 @@ pub async fn verify_domain(
             ip_address: Some(metadata.ip_address.clone()),
             user_agent: metadata.user_agent.clone(),
         },
-        domain_id: domain.id,
-        domain: domain.domain.clone(),
-        status: domain.status.clone(),
+        domain_id: result.domain.id,
+        domain: result.domain.domain.clone(),
+        status: result.domain.status.clone(),
     };
 
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         error!("Failed to create audit log: {}", e);
     }
 
-    let response = EmailDomainResponse {
-        id: domain.id,
-        provider_id: domain.provider_id,
-        domain: domain.domain,
-        status: domain.status,
-        last_verified_at: domain.last_verified_at.map(|dt| dt.to_rfc3339()),
-        verification_error: domain.verification_error,
-        created_at: domain.created_at.to_rfc3339(),
-        updated_at: domain.updated_at.to_rfc3339(),
+    let response = EmailDomainWithDnsResponse {
+        domain: EmailDomainResponse {
+            id: result.domain.id,
+            provider_id: result.domain.provider_id,
+            domain: result.domain.domain,
+            status: result.domain.status,
+            last_verified_at: result.domain.last_verified_at.map(|dt| dt.to_rfc3339()),
+            verification_error: result.domain.verification_error,
+            created_at: result.domain.created_at.to_rfc3339(),
+            updated_at: result.domain.updated_at.to_rfc3339(),
+        },
+        dns_records: result
+            .dns_records
+            .into_iter()
+            .map(|r| DnsRecordResponse {
+                record_type: r.record_type,
+                name: r.name,
+                value: r.value,
+                priority: r.priority,
+                status: r.status.into(),
+            })
+            .collect(),
     };
 
     Ok(Json(response))

@@ -9,6 +9,7 @@
 //! - Email sending with storage
 //! - Provider credential encryption
 
+pub mod dns;
 pub mod errors;
 pub mod handlers;
 pub mod plugin;

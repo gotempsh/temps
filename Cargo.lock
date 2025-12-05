@@ -10355,6 +10355,7 @@ dependencies = [
  "axum-macros",
  "chrono",
  "futures",
+ "hickory-resolver",
  "reqwest",
  "sea-orm",
  "serde",

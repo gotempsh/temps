@@ -105,11 +105,6 @@ const data = {
       icon: Bell,
     },
     {
-      title: 'External Connectivity',
-      url: '/setup/connectivity',
-      icon: Network,
-    },
-    {
       title: 'API Keys',
       url: '/keys',
       icon: Key,

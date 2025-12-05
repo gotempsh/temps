@@ -157,6 +157,30 @@ pub struct DnsRecordResponse {
     /// Priority (for MX records)
     #[schema(example = "10")]
     pub priority: Option<u16>,
+    /// Verification status: unknown, verified, pending, failed
+    #[schema(example = "verified")]
+    pub status: DnsRecordStatusResponse,
+}
+
+/// DNS record verification status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsRecordStatusResponse {
+    Unknown,
+    Verified,
+    Pending,
+    Failed,
+}
+
+impl From<crate::providers::DnsRecordStatus> for DnsRecordStatusResponse {
+    fn from(status: crate::providers::DnsRecordStatus) -> Self {
+        match status {
+            crate::providers::DnsRecordStatus::Unknown => DnsRecordStatusResponse::Unknown,
+            crate::providers::DnsRecordStatus::Verified => DnsRecordStatusResponse::Verified,
+            crate::providers::DnsRecordStatus::Pending => DnsRecordStatusResponse::Pending,
+            crate::providers::DnsRecordStatus::Failed => DnsRecordStatusResponse::Failed,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]

@@ -35,6 +35,21 @@ impl EmailProviderType {
     }
 }
 
+/// DNS record verification status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsRecordStatus {
+    /// Record not yet checked
+    #[default]
+    Unknown,
+    /// Record is properly configured
+    Verified,
+    /// Record is pending verification
+    Pending,
+    /// Record verification failed
+    Failed,
+}
+
 /// DNS record for domain verification
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DnsRecord {
@@ -50,21 +65,47 @@ pub struct DnsRecord {
     /// Priority (for MX records)
     #[schema(example = "10")]
     pub priority: Option<u16>,
+    /// Verification status of this specific record
+    #[serde(default)]
+    pub status: DnsRecordStatus,
 }
 
 /// Domain identity with required DNS records
+/// Supports "split architecture" where:
+/// - Root domain is verified for DKIM (allows sending FROM @domain.com)
+/// - Subdomain (e.g., send.domain.com) is used for MAIL FROM/Return-Path (handles bounces)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DomainIdentity {
     /// Provider-specific identity ID
     pub provider_identity_id: String,
-    /// SPF record
+    /// SPF record for the MAIL FROM subdomain (e.g., send.domain.com)
     pub spf_record: Option<DnsRecord>,
-    /// DKIM records (SES has multiple CNAME records)
+    /// DKIM records for the root domain (allows sending FROM root)
     pub dkim_records: Vec<DnsRecord>,
     /// DKIM selector
     pub dkim_selector: Option<String>,
-    /// MX record for bounce handling
+    /// MX record for the MAIL FROM subdomain (handles bounces)
     pub mx_record: Option<DnsRecord>,
+    /// MAIL FROM subdomain (e.g., "send" for send.domain.com)
+    /// When set, enables split architecture: send FROM root, bounces TO subdomain
+    #[serde(default)]
+    pub mail_from_subdomain: Option<String>,
+}
+
+/// Detailed domain identity info with verification status for each record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainIdentityDetails {
+    /// Overall verification status
+    pub overall_status: VerificationStatus,
+    /// SPF record with verification status (on MAIL FROM subdomain)
+    pub spf_record: Option<DnsRecord>,
+    /// DKIM records with verification status (on root domain)
+    pub dkim_records: Vec<DnsRecord>,
+    /// MX record with verification status (on MAIL FROM subdomain)
+    pub mx_record: Option<DnsRecord>,
+    /// MAIL FROM subdomain (e.g., "send" for send.domain.com)
+    #[serde(default)]
+    pub mail_from_subdomain: Option<String>,
 }
 
 /// Domain verification status
@@ -127,14 +168,26 @@ pub struct SendEmailResponse {
     pub message_id: String,
 }
 
+/// Default MAIL FROM subdomain used for split architecture
+pub const DEFAULT_MAIL_FROM_SUBDOMAIN: &str = "send";
+
 /// Email provider trait for abstracting different email services
 #[async_trait]
 pub trait EmailProvider: Send + Sync {
-    /// Register a domain and get the required DNS records
+    /// Register a domain with automatic split architecture (Resend-like):
+    /// - Root domain gets DKIM records (enables sending FROM @domain.com)
+    /// - `send.{domain}` subdomain gets SPF/MX records for bounces
+    ///
+    /// The user only needs to add the returned DNS records - they can then
+    /// send emails from @domain.com without knowing about the internal architecture.
     async fn create_identity(&self, domain: &str) -> Result<DomainIdentity, EmailError>;
 
     /// Verify domain DNS configuration
     async fn verify_identity(&self, domain: &str) -> Result<VerificationStatus, EmailError>;
+
+    /// Get detailed identity info with per-record verification status
+    async fn get_identity_details(&self, domain: &str)
+        -> Result<DomainIdentityDetails, EmailError>;
 
     /// Delete domain identity
     async fn delete_identity(&self, domain: &str) -> Result<(), EmailError>;
