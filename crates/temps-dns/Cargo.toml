@@ -1,0 +1,55 @@
+[package]
+name = "temps-dns"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-core = { path = "../temps-core" }
+temps-database = { path = "../temps-database" }
+temps-entities = { path = "../temps-entities" }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Database
+sea-orm = { workspace = true }
+
+# HTTP client for DNS APIs
+reqwest = { workspace = true }
+
+# Cloudflare API client
+cloudflare = "0.14"
+
+# Web framework
+axum = { workspace = true }
+axum-macros = { workspace = true }
+
+# OpenAPI
+utoipa = { workspace = true }
+
+# Error handling & logging
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Utilities
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+testcontainers = { workspace = true }
+temps-migrations = { path = "../temps-migrations" }
+wiremock = "0.6"
+mockall = "0.13"

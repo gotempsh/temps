@@ -14,6 +14,8 @@ pub mod deployment_domains;
 pub mod deployment_jobs;
 pub mod deployment_tokens;
 pub mod deployments;
+pub mod dns_managed_domains;
+pub mod dns_providers;
 pub mod domains;
 pub mod email_domains;
 pub mod email_providers;

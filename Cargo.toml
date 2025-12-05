@@ -47,6 +47,7 @@ members = [
     "crates/temps-captcha-wasm",
     "crates/temps-webhooks",
     "crates/temps-email",
+    "crates/temps-dns",
 ]
 
 [workspace.package]
