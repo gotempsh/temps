@@ -64,6 +64,7 @@ ${colors.bold('Examples:')}
   ${colors.muted('$')} temps projects list            ${colors.muted('# List all projects')}
   ${colors.muted('$')} temps deploy my-app            ${colors.muted('# Deploy a project')}
   ${colors.muted('$')} temps logs my-app --follow     ${colors.muted('# Stream deployment logs')}
+  ${colors.muted('$')} temps env vars my-app list     ${colors.muted('# List environment variables')}
 
 ${colors.bold('Documentation:')}
   ${colors.primary('https://temps.dev/docs')}

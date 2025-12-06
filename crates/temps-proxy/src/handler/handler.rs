@@ -12,7 +12,7 @@ use tracing::{error, info};
 use utoipa::OpenApi;
 
 use super::types::AppState;
-use super::types::{CreateRouteRequest, RouteResponse, UpdateRouteRequest};
+use super::types::{parse_route_type, CreateRouteRequest, RouteResponse, UpdateRouteRequest};
 use temps_core::{error_builder::ErrorBuilder, problemdetails::Problem};
 
 #[derive(OpenApi)]
@@ -60,10 +60,14 @@ pub async fn create_route(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, LoadBalancerWrite);
 
-    info!("Creating route for domain: {}", req.domain);
+    info!(
+        "Creating route for domain: {} (type: {:?})",
+        req.domain, req.route_type
+    );
+    let route_type = parse_route_type(req.route_type.as_ref());
     match app_state
         .lb_service
-        .create_route(req.domain, req.host, req.port)
+        .create_route(req.domain, req.host, req.port, route_type)
         .await
     {
         Ok(route) => Ok((StatusCode::CREATED, Json(RouteResponse::from(route))).into_response()),
@@ -159,9 +163,10 @@ pub async fn update_route(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, LoadBalancerWrite);
 
+    let route_type = parse_route_type(req.route_type.as_ref());
     match app_state
         .lb_service
-        .update_route(&domain, req.host.clone(), req.port, req.enabled)
+        .update_route(&domain, req.host.clone(), req.port, req.enabled, route_type)
         .await
     {
         Ok(route) => Ok((StatusCode::OK, Json(RouteResponse::from(route))).into_response()),

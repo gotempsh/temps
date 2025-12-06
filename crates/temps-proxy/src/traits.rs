@@ -80,8 +80,18 @@ impl Default for CookieConfig {
 /// Trait for resolving upstream peers based on host and request information
 #[async_trait]
 pub trait UpstreamResolver: Send + Sync {
-    /// Resolve the upstream peer for a given host and path
-    async fn resolve_peer(&self, host: &str, path: &str) -> PingoraResult<Box<HttpPeer>>;
+    /// Resolve the upstream peer for a given host, path, and optional SNI hostname
+    ///
+    /// The resolver will:
+    /// 1. First try SNI-based routing if sni_hostname is provided (for TLS routes)
+    /// 2. Then try HTTP Host-based routing (for HTTP routes)
+    /// 3. Fall back to console address if no route is found
+    async fn resolve_peer(
+        &self,
+        host: &str,
+        path: &str,
+        sni_hostname: Option<&str>,
+    ) -> PingoraResult<Box<HttpPeer>>;
 
     /// Check if a host has custom routing configured
     async fn has_custom_route(&self, host: &str) -> bool;

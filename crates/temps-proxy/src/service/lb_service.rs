@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use sea_orm::*;
 use std::net::IpAddr;
+use temps_entities::custom_routes::RouteType;
 use tracing::{error, info};
 
 #[derive(Error, Debug)]
@@ -87,8 +88,12 @@ impl LbService {
         domain: String,
         host: String,
         port: i32,
+        route_type: Option<RouteType>,
     ) -> Result<temps_entities::custom_routes::Model, LbServiceError> {
-        info!("Creating new route for domain: {}", domain);
+        info!(
+            "Creating new route for domain: {} (type: {:?})",
+            domain, route_type
+        );
         // Check if route already exists
         match self.get_route(&domain).await {
             Ok(_) => {
@@ -114,6 +119,7 @@ impl LbService {
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             enabled: Set(true),
+            route_type: Set(route_type.unwrap_or_default()),
             ..Default::default()
         };
 
@@ -176,18 +182,26 @@ impl LbService {
         host_val: String,
         port_val: i32,
         enabled_val: bool,
+        route_type: Option<RouteType>,
     ) -> Result<temps_entities::custom_routes::Model> {
         use temps_entities::custom_routes;
 
+        let mut update_model = custom_routes::ActiveModel {
+            updated_at: Set(Utc::now()),
+            enabled: Set(enabled_val),
+            host: Set(host_val),
+            port: Set(port_val),
+            ..Default::default()
+        };
+
+        // Only update route_type if provided
+        if let Some(rt) = route_type {
+            update_model.route_type = Set(rt);
+        }
+
         custom_routes::Entity::update_many()
             .filter(custom_routes::Column::Domain.eq(domain_val))
-            .set(custom_routes::ActiveModel {
-                updated_at: Set(Utc::now()),
-                enabled: Set(enabled_val),
-                host: Set(host_val),
-                port: Set(port_val),
-                ..Default::default()
-            })
+            .set(update_model)
             .exec(self.db.as_ref())
             .await
             .map_err(LbServiceError::DatabaseError)?;

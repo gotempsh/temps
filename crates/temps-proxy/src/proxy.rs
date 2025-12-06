@@ -83,6 +83,8 @@ pub struct ProxyContext {
     pub tls_fingerprint: Option<String>,
     pub tls_version: Option<String>,
     pub tls_cipher: Option<String>,
+    /// SNI hostname from TLS handshake (for SNI-based routing)
+    pub sni_hostname: Option<String>,
 }
 
 impl ProxyContext {
@@ -239,6 +241,10 @@ impl LoadBalancer {
                 // Extract TLS version and cipher for logging
                 ctx.tls_version = Some(ssl_digest.version.to_string());
                 ctx.tls_cipher = Some(ssl_digest.cipher.to_string());
+
+                // Note: SNI hostname is not available in SslDigest in pingora-core 0.6.0
+                // The SNI is captured during the TLS handshake callback in server.rs
+                // For TLS routes, we use the HTTP Host header which typically matches the SNI
 
                 debug!(
                     "TLS connection: {} with cipher {} for request_id={}",
@@ -1502,6 +1508,7 @@ impl ProxyHttp for LoadBalancer {
             tls_fingerprint: None,
             tls_version: None,
             tls_cipher: None,
+            sni_hostname: None,
         }
     }
 
@@ -2305,7 +2312,11 @@ impl ProxyHttp for LoadBalancer {
         );
 
         // Use the upstream resolver trait
-        let peer = self.upstream_resolver.resolve_peer(&domain, &path).await?;
+        // Pass SNI hostname for TLS-based routing
+        let peer = self
+            .upstream_resolver
+            .resolve_peer(&domain, &path, ctx.sni_hostname.as_deref())
+            .await?;
 
         // Populate context with upstream information
         // Use the Peer trait's address() method

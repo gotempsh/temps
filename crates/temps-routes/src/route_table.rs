@@ -3,13 +3,29 @@
 //! This module provides a cached routing table that maps hostnames to backend addresses
 //! and project IDs. The cache is automatically kept in sync with the database using
 //! PostgreSQL triggers and LISTEN/NOTIFY.
+//!
+//! ## Route Types
+//!
+//! Routes can be of two types:
+//! - **HTTP**: Match on HTTP Host header (Layer 7) - default for most routes
+//! - **TLS**: Match on TLS SNI hostname (Layer 4/5) - for TCP passthrough
+//!
+//! ## Wildcard Support
+//!
+//! Wildcard patterns like `*.example.com` are supported for both route types.
+//! Matching follows DNS/Cloudflare conventions:
+//! - `*.example.com` matches `api.example.com` ✓
+//! - `*.example.com` does NOT match `sub.api.example.com` ✗
+//! - `*.example.com` does NOT match `example.com` ✗
 
+use crate::wildcard_matcher::WildcardMatcher;
 use parking_lot::RwLock;
 use sea_orm::DatabaseConnection;
 use sqlx::postgres::{PgListener, PgPool};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use temps_entities::custom_routes::RouteType;
 use temps_entities::{deployments, environments, projects};
 use tracing::{debug, error, info, warn};
 
@@ -107,9 +123,31 @@ impl RouteInfo {
 }
 
 /// In-memory routing table with O(1) lookup
+///
+/// Routes are organized into four categories:
+/// - `http_routes`: Exact hostname matches for HTTP Host header routing
+/// - `tls_routes`: Exact hostname matches for TLS SNI routing
+/// - `http_wildcards`: Wildcard patterns for HTTP Host header routing
+/// - `tls_wildcards`: Wildcard patterns for TLS SNI routing
 pub struct CachedPeerTable {
-    /// Hostname -> RouteInfo mapping
+    /// Exact hostname -> RouteInfo for HTTP routes (route_type = 'http')
+    /// Used for matching on HTTP Host header (Layer 7)
+    http_routes: Arc<RwLock<HashMap<String, RouteInfo>>>,
+
+    /// Exact hostname -> RouteInfo for TLS routes (route_type = 'tls')
+    /// Used for matching on TLS SNI hostname (Layer 4/5)
+    tls_routes: Arc<RwLock<HashMap<String, RouteInfo>>>,
+
+    /// Wildcard patterns for HTTP routes
+    http_wildcards: Arc<RwLock<WildcardMatcher>>,
+
+    /// Wildcard patterns for TLS routes
+    tls_wildcards: Arc<RwLock<WildcardMatcher>>,
+
+    /// Legacy routes map (for backward compatibility during transition)
+    /// Contains all environment domains, project custom domains, etc.
     routes: Arc<RwLock<HashMap<String, RouteInfo>>>,
+
     /// Database connection for loading routes
     db: Arc<DatabaseConnection>,
 }
@@ -117,9 +155,50 @@ pub struct CachedPeerTable {
 impl CachedPeerTable {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self {
+            http_routes: Arc::new(RwLock::new(HashMap::new())),
+            tls_routes: Arc::new(RwLock::new(HashMap::new())),
+            http_wildcards: Arc::new(RwLock::new(WildcardMatcher::new())),
+            tls_wildcards: Arc::new(RwLock::new(WildcardMatcher::new())),
             routes: Arc::new(RwLock::new(HashMap::new())),
             db,
         }
+    }
+
+    /// Get route by HTTP Host header
+    ///
+    /// Used for route_type = 'http' routes.
+    /// Checks exact matches first, then wildcard patterns.
+    pub fn get_route_by_host(&self, host: &str) -> Option<RouteInfo> {
+        // 1. Try exact match in HTTP routes
+        if let Some(route) = self.http_routes.read().get(host) {
+            return Some(route.clone());
+        }
+
+        // 2. Try wildcard match in HTTP wildcards
+        if let Some(route) = self.http_wildcards.read().match_domain(host) {
+            return Some(route.clone());
+        }
+
+        // 3. Fall back to legacy routes (for non-custom_routes entries)
+        self.routes.read().get(host).cloned()
+    }
+
+    /// Get route by TLS SNI hostname
+    ///
+    /// Used for route_type = 'tls' routes.
+    /// Checks exact matches first, then wildcard patterns.
+    pub fn get_route_by_sni(&self, sni: &str) -> Option<RouteInfo> {
+        // 1. Try exact match in TLS routes
+        if let Some(route) = self.tls_routes.read().get(sni) {
+            return Some(route.clone());
+        }
+
+        // 2. Try wildcard match in TLS wildcards
+        if let Some(route) = self.tls_wildcards.read().match_domain(sni) {
+            return Some(route.clone());
+        }
+
+        None
     }
 
     /// Load all routes from the database into the cache with full models
@@ -265,6 +344,7 @@ impl CachedPeerTable {
         }
 
         // 2. Load custom_routes (custom domain mappings with host:port)
+        // These are separated into HTTP and TLS routes based on route_type
         let custom_routes_data = custom_routes::Entity::find()
             .filter(custom_routes::Column::Enabled.eq(true))
             .all(self.db.as_ref())
@@ -275,26 +355,67 @@ impl CachedPeerTable {
             custom_routes_data.len()
         );
 
+        // Prepare route caches for custom_routes
+        let mut http_routes_map: HashMap<String, RouteInfo> = HashMap::new();
+        let mut tls_routes_map: HashMap<String, RouteInfo> = HashMap::new();
+        let mut http_wildcards_matcher = WildcardMatcher::new();
+        let mut tls_wildcards_matcher = WildcardMatcher::new();
+
         for custom_route in custom_routes_data {
             let backend_addr = format!("{}:{}", custom_route.host, custom_route.port);
-            routes.insert(
-                custom_route.domain.clone(),
-                RouteInfo {
-                    backend: BackendType::Upstream {
-                        addresses: vec![backend_addr.clone()],
-                        round_robin_counter: Arc::new(AtomicUsize::new(0)),
-                    },
-                    redirect_to: None,
-                    status_code: None,
-                    project: None, // Custom routes don't have project context
-                    environment: None,
-                    deployment: None,
+            let route_info = RouteInfo {
+                backend: BackendType::Upstream {
+                    addresses: vec![backend_addr.clone()],
+                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
                 },
-            );
-            debug!(
-                "Loaded custom route: {} -> {}",
-                custom_route.domain, backend_addr
-            );
+                redirect_to: None,
+                status_code: None,
+                project: None, // Custom routes don't have project context
+                environment: None,
+                deployment: None,
+            };
+
+            let is_wildcard = custom_route.domain.starts_with("*.");
+            let route_type_str = match custom_route.route_type {
+                RouteType::Http => "http",
+                RouteType::Tls => "tls",
+            };
+
+            match custom_route.route_type {
+                RouteType::Http => {
+                    if is_wildcard {
+                        http_wildcards_matcher.insert(&custom_route.domain, route_info.clone());
+                        debug!(
+                            "Loaded HTTP wildcard custom route: {} -> {} (type={})",
+                            custom_route.domain, backend_addr, route_type_str
+                        );
+                    } else {
+                        http_routes_map.insert(custom_route.domain.clone(), route_info.clone());
+                        debug!(
+                            "Loaded HTTP custom route: {} -> {} (type={})",
+                            custom_route.domain, backend_addr, route_type_str
+                        );
+                    }
+                }
+                RouteType::Tls => {
+                    if is_wildcard {
+                        tls_wildcards_matcher.insert(&custom_route.domain, route_info.clone());
+                        debug!(
+                            "Loaded TLS wildcard custom route: {} -> {} (type={})",
+                            custom_route.domain, backend_addr, route_type_str
+                        );
+                    } else {
+                        tls_routes_map.insert(custom_route.domain.clone(), route_info.clone());
+                        debug!(
+                            "Loaded TLS custom route: {} -> {} (type={})",
+                            custom_route.domain, backend_addr, route_type_str
+                        );
+                    }
+                }
+            }
+
+            // Also add to legacy routes map for backward compatibility
+            routes.insert(custom_route.domain.clone(), route_info);
         }
 
         // 3. Load project_custom_domains (custom domains with redirects or environment mapping)
@@ -680,11 +801,26 @@ impl CachedPeerTable {
         debug!("Loaded all active deployments. Final cache: {} projects, {} environments, {} deployments",
             projects_cache.len(), environments_cache.len(), deployments_cache.len());
 
-        // Atomically replace the entire route table
+        // Atomically replace all route tables
         let route_count = routes.len();
+        let http_routes_count = http_routes_map.len();
+        let tls_routes_count = tls_routes_map.len();
+        let http_wildcards_count = http_wildcards_matcher.len();
+        let tls_wildcards_count = tls_wildcards_matcher.len();
+
+        // Replace legacy routes
         *self.routes.write() = routes;
 
-        debug!("Route table loaded with {} entries", route_count);
+        // Replace HTTP and TLS route caches
+        *self.http_routes.write() = http_routes_map;
+        *self.tls_routes.write() = tls_routes_map;
+        *self.http_wildcards.write() = http_wildcards_matcher;
+        *self.tls_wildcards.write() = tls_wildcards_matcher;
+
+        debug!(
+            "Route table loaded with {} total entries ({} HTTP exact, {} TLS exact, {} HTTP wildcards, {} TLS wildcards)",
+            route_count, http_routes_count, tls_routes_count, http_wildcards_count, tls_wildcards_count
+        );
         Ok(())
     }
 

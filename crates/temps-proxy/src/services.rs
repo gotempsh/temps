@@ -50,8 +50,16 @@ impl UpstreamResolverImpl {
 
 #[async_trait]
 impl UpstreamResolver for UpstreamResolverImpl {
-    async fn resolve_peer(&self, host: &str, path: &str) -> PingoraResult<Box<HttpPeer>> {
-        debug!("Resolving peer for host: {}, path: {}", host, path);
+    async fn resolve_peer(
+        &self,
+        host: &str,
+        path: &str,
+        sni_hostname: Option<&str>,
+    ) -> PingoraResult<Box<HttpPeer>> {
+        debug!(
+            "Resolving peer for host: {}, path: {}, sni: {:?}",
+            host, path, sni_hostname
+        );
 
         // Check if it's a temps API route first
         if path.starts_with(ROUTE_PREFIX_TEMPS) {
@@ -67,18 +75,47 @@ impl UpstreamResolver for UpstreamResolverImpl {
             return Ok(peer);
         }
 
-        // Use O(1) route table lookup
-        if let Some(route_info) = self.route_table.get_route(host) {
+        // 1. First try TLS/SNI-based routing
+        // Note: In pingora-core 0.6.0, SNI is not available in SslDigest
+        // We use the Host header which typically matches the SNI for TLS connections
+        // If SNI was provided (from future pingora versions), use it; otherwise use host
+        let sni_or_host = sni_hostname.unwrap_or(host);
+        if let Some(route_info) = self.route_table.get_route_by_sni(sni_or_host) {
+            let backend_addr = route_info.get_backend_addr();
+            debug!(
+                "Found TLS route via SNI/Host {} -> {}",
+                sni_or_host, backend_addr
+            );
+            let peer = Box::new(HttpPeer::new(backend_addr, false, "".to_string()));
+            return Ok(peer);
+        }
+
+        // 2. Try HTTP Host-based routing (HTTP routes)
+        if let Some(route_info) = self.route_table.get_route_by_host(host) {
             let project_id = route_info.project.as_ref().map(|p| p.id);
             let env_id = route_info.environment.as_ref().map(|e| e.id);
             let backend_addr = route_info.get_backend_addr(); // Get next backend using round-robin
             debug!(
-                "Found route in table for {} -> {} (project_id: {:?}, env_id: {:?})",
+                "Found HTTP route for {} -> {} (project_id: {:?}, env_id: {:?})",
                 host, backend_addr, project_id, env_id
             );
 
             // Note: Redirects are now handled in proxy.rs request_filter before peer resolution
             // If we reach here, no redirect is configured and we route to backend normally
+
+            let peer = Box::new(HttpPeer::new(backend_addr, false, "".to_string()));
+            return Ok(peer);
+        }
+
+        // 3. Legacy: Check the old get_route method for backwards compatibility
+        if let Some(route_info) = self.route_table.get_route(host) {
+            let project_id = route_info.project.as_ref().map(|p| p.id);
+            let env_id = route_info.environment.as_ref().map(|e| e.id);
+            let backend_addr = route_info.get_backend_addr();
+            debug!(
+                "Found legacy route for {} -> {} (project_id: {:?}, env_id: {:?})",
+                host, backend_addr, project_id, env_id
+            );
 
             let peer = Box::new(HttpPeer::new(backend_addr, false, "".to_string()));
             return Ok(peer);
