@@ -4,6 +4,15 @@ use async_trait::async_trait;
 use tracing::debug;
 use std::path::Path;
 
+/// Google's distroless Node.js image - contains ONLY Node.js runtime.
+/// No shell, no package manager, no OS utilities = maximum security.
+/// See: https://github.com/GoogleContainerTools/distroless
+const DISTROLESS_NODEJS: &str = "gcr.io/distroless/nodejs22-debian12:nonroot";
+
+/// Debug variant of distroless (has shell for debugging - NOT recommended for production)
+#[allow(dead_code)]
+const DISTROLESS_NODEJS_DEBUG: &str = "gcr.io/distroless/nodejs22-debian12:debug-nonroot";
+
 pub struct NextJs;
 
 #[async_trait]
@@ -54,20 +63,21 @@ impl Preset for NextJs {
             build_cmd = build_cmd.replace("bun ", "/root/.bun/bin/bun ");
         }
 
-        // Use the package manager to run the start script
-        // This ensures node_modules/.bin is in PATH and scripts work correctly
-        let start_cmd = match package_manager {
-            PackageManager::Bun => "npm start".to_string(),
-            PackageManager::Yarn => "npm start".to_string(),
-            PackageManager::Pnpm => "npm start".to_string(),
-            _ => "npm run start".to_string(),
+        // For distroless, we run the standalone server directly
+        // Distroless has `node` as entrypoint, so CMD only needs the script path
+        // Next.js standalone output creates server.js at the root
+        let start_cmd = "server.js".to_string();
+
+        // Build stage uses full Node.js image with package managers
+        // Production stage uses distroless for maximum security
+        let base_image = match package_manager {
+            PackageManager::Bun => "node:22",  // Bun needs apt for installation
+            PackageManager::Yarn => "node:22-alpine",
+            _ => "node:22",
         };
 
-        let (base_image, run_image) = match package_manager {
-            PackageManager::Bun => ("node:22", "node:22-alpine"),
-            PackageManager::Yarn => ("node:22-alpine", "node:22-alpine"),
-            _ => ("node:22", "node:22-alpine"),
-        };
+        // Use distroless for production - no shell, no package manager, no attack surface
+        let run_image = DISTROLESS_NODEJS;
 
         // Determine cache path based on whether it's a monorepo subproject
         let cache_path = if !relative_path.is_empty() {
@@ -207,11 +217,15 @@ WORKDIR /{project_slug}
 # Build the application
 {}
 
-# Stage 2: Production
-FROM {run_image}
+# Stage 2: Production using Google's Distroless image
+# Distroless contains ONLY the Node.js runtime - no shell, no package manager, no attack surface
+# This is the most secure option for running Next.js in production
+# See: https://github.com/GoogleContainerTools/distroless
+FROM {run_image} AS runner
 WORKDIR /{project_slug}
 
-RUN apk update && apk add curl
+# Distroless :nonroot tag already runs as non-root user (uid 65532)
+# No RUN commands possible - distroless has no shell
 
 "#,
             build_cmd_line,
@@ -220,20 +234,21 @@ RUN apk update && apk add curl
         ));
 
         // For monorepos, we need to copy only the specific project's built files
+        // Distroless uses uid 65532 (nonroot user) - use --chown=65532:65532
         match build_system.monorepo_tool {
             MonorepoTool::None => {
                 dockerfile.push_str(&format!(
-                    "# Copy built files from build stage\nCOPY --from=build /{project_slug}/ /{project_slug}/\n",
+                    "# Copy built files from build stage (owned by nonroot user)\nCOPY --from=build --chown=65532:65532 /{project_slug}/ /{project_slug}/\n",
                     project_slug = project_slug
                 ));
                 // Copy lock file in production stage if present
                 match package_manager {
                     PackageManager::Bun => dockerfile.push_str(&format!(
-                        "COPY --from=build /{project_slug}/bun.lock* /{project_slug}/bun.lock*\n",
+                        "COPY --from=build --chown=65532:65532 /{project_slug}/bun.lock* /{project_slug}/bun.lock*\n",
                         project_slug = project_slug
                     )),
                     PackageManager::Yarn => dockerfile.push_str(&format!(
-                        "COPY --from=build /{project_slug}/yarn.lock /{project_slug}/yarn.lock\n",
+                        "COPY --from=build --chown=65532:65532 /{project_slug}/yarn.lock /{project_slug}/yarn.lock\n",
                         project_slug = project_slug
                     )),
                     _ => {}
@@ -243,8 +258,8 @@ RUN apk update && apk add curl
                 let project_path = format!("/{project_slug}");
 
                 dockerfile.push_str(&format!(
-                    r#"# Copy the entire monorepo project
-COPY --from=build {project_path} /{project_slug}
+                    r#"# Copy the entire monorepo project (owned by nonroot user)
+COPY --from=build --chown=65532:65532 {project_path} /{project_slug}
 
 # Set working directory to the project path
 WORKDIR /{project_slug}/{relative_path}
@@ -256,8 +271,7 @@ WORKDIR /{project_slug}/{relative_path}
             }
         }
 
-
-
+        // Distroless :nonroot already runs as non-root (uid 65532), no USER directive needed
         dockerfile.push_str(
             r#"
 # Set production environment
@@ -278,31 +292,32 @@ EXPOSE 3000
     }
 
     async fn dockerfile_with_build_dir(&self, _local_path: &Path) -> DockerfileWithArgs {
-        let content = r#"
-# Use a lightweight Node.js image as the base
-FROM node:22-alpine AS runner
+        // Use distroless for maximum security - no shell, no package manager, no attack surface
+        let content = format!(r#"
+# Use Google's Distroless Node.js image - contains ONLY Node.js runtime
+# No shell, no package manager, no OS utilities = maximum security
+# See: https://github.com/GoogleContainerTools/distroless
+FROM {distroless} AS runner
 
 WORKDIR /app
 
-# Add curl for health checks
-RUN apk add --no-cache curl
-
 # Set environment to production
-ENV NODE_ENV production
+ENV NODE_ENV=production
 
-# Copy the built Next.js application
-COPY .next/standalone ./
-COPY .next/static ./.next/static
-COPY public ./public
-COPY next.config.* ./
+# Copy the built Next.js standalone application
+# Distroless :nonroot runs as uid 65532
+COPY --chown=65532:65532 .next/standalone ./
+COPY --chown=65532:65532 .next/static ./.next/static
+COPY --chown=65532:65532 public ./public
 
 # Expose the port the app runs on
 EXPOSE 3000
 
 # Start the Next.js application
-CMD ["node", "server.js"]
-"#;
-        DockerfileWithArgs::new(content.to_string())
+# Note: Distroless nodejs images automatically use node as entrypoint
+CMD ["server.js"]
+"#, distroless = DISTROLESS_NODEJS);
+        DockerfileWithArgs::new(content)
     }
 
     fn install_command(&self, local_path: &Path) -> String {
@@ -468,8 +483,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_npm_uses_npm_run_start() {
-        let temp_dir = std::env::temp_dir().join("test_nextjs_npm_start");
+    async fn test_npm_project_uses_distroless() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_npm_distroless");
         std::fs::create_dir_all(&temp_dir).unwrap();
         std::fs::write(temp_dir.join("package-lock.json"), "").unwrap();
 
@@ -485,16 +500,20 @@ mod tests {
             project_slug: "test-project",
         }).await;
 
-        // Verify npm run start is used
-        assert!(result.content.contains(r#"CMD ["npm", "run", "start"]"#));
+        // Verify distroless is used for runner stage
+        assert!(result.content.contains("gcr.io/distroless/nodejs22-debian12:nonroot"));
+        // Verify CMD runs server.js directly (distroless has node as entrypoint)
+        assert!(result.content.contains(r#"CMD ["server.js"]"#));
+        // Verify npm is used in build stage
+        assert!(result.content.contains("npm install") || result.content.contains("npm ci"));
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 
     #[tokio::test]
-    async fn test_bun_uses_bun_run_start() {
-        let temp_dir = std::env::temp_dir().join("test_nextjs_bun_start");
+    async fn test_bun_project_uses_distroless() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_bun_distroless");
         std::fs::create_dir_all(&temp_dir).unwrap();
         std::fs::write(temp_dir.join("bun.lock"), "").unwrap();
 
@@ -510,16 +529,20 @@ mod tests {
             project_slug: "test-project",
         }).await;
 
-        // Verify bun run start is used
-        assert!(result.content.contains(r#"CMD ["bun", "run", "start"]"#));
+        // Verify distroless is used for runner stage
+        assert!(result.content.contains("gcr.io/distroless/nodejs22-debian12:nonroot"));
+        // Verify CMD runs server.js directly (distroless has node as entrypoint)
+        assert!(result.content.contains(r#"CMD ["server.js"]"#));
+        // Verify bun is installed in build stage
+        assert!(result.content.contains("curl -fsSL https://bun.sh/install | bash"));
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 
     #[tokio::test]
-    async fn test_yarn_uses_yarn_start() {
-        let temp_dir = std::env::temp_dir().join("test_nextjs_yarn_start");
+    async fn test_yarn_project_uses_distroless() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_yarn_distroless");
         std::fs::create_dir_all(&temp_dir).unwrap();
         std::fs::write(temp_dir.join("yarn.lock"), "").unwrap();
 
@@ -535,8 +558,12 @@ mod tests {
             project_slug: "test-project",
         }).await;
 
-        // Verify yarn start is used
-        assert!(result.content.contains(r#"CMD ["yarn", "start"]"#));
+        // Verify distroless is used for runner stage
+        assert!(result.content.contains("gcr.io/distroless/nodejs22-debian12:nonroot"));
+        // Verify CMD runs server.js directly (distroless has node as entrypoint)
+        assert!(result.content.contains(r#"CMD ["server.js"]"#));
+        // Verify corepack is enabled for yarn in build stage
+        assert!(result.content.contains("corepack enable"));
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).ok();
@@ -563,6 +590,77 @@ mod tests {
         // Verify custom commands are used with full bun path
         assert!(result.content.contains("/root/.bun/bin/bun install --frozen-lockfile"));
         assert!(result.content.contains("/root/.bun/bin/bun run build:prod"));
+
+        // Cleanup
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_dockerfile_uses_distroless() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_distroless");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let preset = NextJs;
+        let result = preset.dockerfile(DockerfileConfig {
+            use_buildkit: true,
+            root_local_path: &temp_dir,
+            local_path: &temp_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        }).await;
+
+        // Security: Uses Google's distroless image
+        assert!(
+            result.content.contains("gcr.io/distroless/nodejs22-debian12:nonroot"),
+            "Should use distroless Node.js image"
+        );
+
+        // Security: Distroless :nonroot runs as uid 65532
+        assert!(
+            result.content.contains("--chown=65532:65532"),
+            "Should copy files with distroless nonroot user ownership"
+        );
+
+        // Security: No shell commands in production stage (distroless has no shell)
+        // The production stage should NOT contain RUN commands after FROM distroless
+        let production_stage = result.content.split("FROM gcr.io/distroless").nth(1).unwrap_or("");
+        assert!(
+            !production_stage.contains("\nRUN "),
+            "Distroless stage should not have RUN commands (no shell available)"
+        );
+
+        // Cleanup
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_dockerfile_with_build_dir_uses_distroless() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_build_dir_distroless");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let preset = NextJs;
+        let result = preset.dockerfile_with_build_dir(&temp_dir).await;
+
+        // Security: Uses Google's distroless image
+        assert!(
+            result.content.contains("gcr.io/distroless/nodejs22-debian12:nonroot"),
+            "Should use distroless Node.js image"
+        );
+
+        // Security: Files are copied with distroless nonroot user ownership
+        assert!(
+            result.content.contains("--chown=65532:65532"),
+            "Should copy files with distroless nonroot user ownership"
+        );
+
+        // Security: No RUN commands (distroless has no shell)
+        assert!(
+            !result.content.contains("\nRUN "),
+            "Distroless Dockerfile should not have RUN commands"
+        );
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).ok();

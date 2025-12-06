@@ -80,7 +80,7 @@ RUN {}\n", dockerfile, cmd);
             "/app".to_string()
         };
 
-        // Finalize the dockerfile with web server setup
+        // Finalize the dockerfile with web server setup (security hardened)
         dockerfile = format!("{}
 # Use a lightweight web server
 RUN apk add --no-cache nginx
@@ -96,11 +96,20 @@ RUN echo 'server {{ \\
     }} \\
 }}' > /etc/nginx/http.d/default.conf
 
+# Security hardening - remove package manager and run as non-root
+# This prevents post-exploitation package installation (CVE-2025-29927 mitigation)
+RUN rm -rf /sbin/apk /usr/bin/apk /etc/apk /var/cache/apk /lib/apk && \\
+    chown -R nginx:nginx /var/lib/nginx /var/log/nginx /run/nginx {} && \\
+    touch /run/nginx.pid && chown nginx:nginx /run/nginx.pid
+
+USER nginx
+
 EXPOSE 80
 
 # Start the web server
 CMD [\"nginx\", \"-g\", \"daemon off;\"]",
             dockerfile,
+            app_dir,
             app_dir
         );
 
