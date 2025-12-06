@@ -69,7 +69,9 @@ export function LastDeployment({
                     <p className="text-gray-400 text-lg">
                       {deployment.status === 'completed'
                         ? 'Generating screenshot...'
-                        : 'Building...'}
+                        : deployment.status === 'running'
+                          ? 'Deployment in progress...'
+                          : 'Waiting for deployment...'}
                     </p>
                   </CardContent>
                 </Card>

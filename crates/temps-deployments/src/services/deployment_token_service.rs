@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
+use temps_core::EncryptionService;
 use temps_core::UtcDateTime;
 use temps_database::DbConnection;
 use temps_entities::deployment_tokens::{
@@ -186,11 +187,15 @@ impl DeploymentTokenServiceError {
 
 pub struct DeploymentTokenService {
     db: Arc<DbConnection>,
+    encryption_service: Arc<EncryptionService>,
 }
 
 impl DeploymentTokenService {
-    pub fn new(db: Arc<DbConnection>) -> Self {
-        Self { db }
+    pub fn new(db: Arc<DbConnection>, encryption_service: Arc<EncryptionService>) -> Self {
+        Self {
+            db,
+            encryption_service,
+        }
     }
 
     /// Create a new deployment token for a project
@@ -239,6 +244,17 @@ impl DeploymentTokenService {
         let token_hash = self.hash_token(&token);
         let token_prefix = token.chars().take(8).collect::<String>();
 
+        // Encrypt the token for storage (so we can retrieve it for deployments)
+        let encrypted_token = self
+            .encryption_service
+            .encrypt_string(&token)
+            .map_err(|e| {
+                DeploymentTokenServiceError::InternalServerError(format!(
+                    "Failed to encrypt token: {}",
+                    e
+                ))
+            })?;
+
         let now = Utc::now();
         let expires_at = request.expires_at.or_else(|| {
             // Default expiration: never (None)
@@ -251,6 +267,7 @@ impl DeploymentTokenService {
             name: Set(request.name.clone()),
             token_hash: Set(token_hash),
             token_prefix: Set(token_prefix.clone()),
+            encrypted_token: Set(Some(encrypted_token)),
             permissions: Set(permissions_json.clone()),
             is_active: Set(true),
             expires_at: Set(expires_at),
@@ -505,27 +522,67 @@ impl DeploymentTokenService {
         let existing_token = query.one(self.db.as_ref()).await?;
 
         if let Some(token_model) = existing_token {
-            // We have an existing token, but we need to return the actual token value
-            // Since we only store the hash, we can't retrieve the original token
-            // The caller should use this method during token creation, not retrieval
-            // For retrieval, we need to generate a new token or use a stored encrypted value
+            // Decrypt and return the stored token value
+            if let Some(ref encrypted_token) = token_model.encrypted_token {
+                let decrypted_token = self
+                    .encryption_service
+                    .decrypt_string(encrypted_token)
+                    .map_err(|e| {
+                        DeploymentTokenServiceError::InternalServerError(format!(
+                            "Failed to decrypt token: {}",
+                            e
+                        ))
+                    })?;
+                return Ok(decrypted_token);
+            } else {
+                // Token exists but encrypted_token is not stored (legacy token)
+                // We need to regenerate and update the token
+                tracing::warn!(
+                    "Token ID {} exists but has no encrypted value stored. Regenerating token.",
+                    token_model.id
+                );
 
-            // Actually, for deployment tokens, we should generate a new one each time
-            // OR store the encrypted token value
-            // For now, let's create a new token if none exists for deployment
+                // Generate new token
+                let new_token = self.generate_token();
+                let new_hash = self.hash_token(&new_token);
+                let new_prefix = new_token.chars().take(8).collect::<String>();
+                let encrypted_token =
+                    self.encryption_service
+                        .encrypt_string(&new_token)
+                        .map_err(|e| {
+                            DeploymentTokenServiceError::InternalServerError(format!(
+                                "Failed to encrypt token: {}",
+                                e
+                            ))
+                        })?;
 
-            // Return a placeholder - the actual implementation should either:
-            // 1. Store encrypted tokens (not just hashes)
-            // 2. Or regenerate tokens when needed
-            return Err(DeploymentTokenServiceError::InternalServerError(
-                format!("Existing token found (ID: {}), but cannot retrieve value. Use get_token_value_for_deployment instead.", token_model.id)
-            ));
+                // Update the existing token with new values
+                let mut token_active: DeploymentTokenActiveModel = token_model.into();
+                token_active.token_hash = Set(new_hash);
+                token_active.token_prefix = Set(new_prefix);
+                token_active.encrypted_token = Set(Some(encrypted_token));
+                token_active.updated_at = Set(Utc::now());
+                token_active.update(self.db.as_ref()).await?;
+
+                return Ok(new_token);
+            }
         }
 
         // No token exists, create a default one
         let token = self.generate_token();
         let token_hash = self.hash_token(&token);
         let token_prefix = token.chars().take(8).collect::<String>();
+
+        // Encrypt the token for storage
+        let encrypted_token = self
+            .encryption_service
+            .encrypt_string(&token)
+            .map_err(|e| {
+                DeploymentTokenServiceError::InternalServerError(format!(
+                    "Failed to encrypt token: {}",
+                    e
+                ))
+            })?;
 
         let default_name = if let Some(env_id) = environment_id {
             format!("Auto-generated for environment {}", env_id)
@@ -539,6 +596,7 @@ impl DeploymentTokenService {
             name: Set(default_name),
             token_hash: Set(token_hash),
             token_prefix: Set(token_prefix),
+            encrypted_token: Set(Some(encrypted_token)),
             permissions: Set(Some(serde_json::json!(["*"]))), // Full access by default
             is_active: Set(true),
             expires_at: Set(None), // Never expires
@@ -604,7 +662,15 @@ mod tests {
         };
         let project = project.insert(db.db.as_ref()).await.unwrap();
 
-        let service = DeploymentTokenService::new(db.db.clone());
+        // Create encryption service with test key
+        let encryption_service = Arc::new(
+            EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        );
+
+        let service = DeploymentTokenService::new(db.db.clone(), encryption_service);
         (db, service, project)
     }
 

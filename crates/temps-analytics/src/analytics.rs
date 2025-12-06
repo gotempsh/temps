@@ -10,19 +10,16 @@ use sea_orm::{
     QueryFilter, QueryOrder, Statement,
 };
 use std::sync::Arc;
-use temps_core::{EncryptionService, UtcDateTime};
+use temps_core::{CookieCrypto, UtcDateTime};
 use temps_entities::{events, request_sessions, visitor};
 
 pub struct AnalyticsService {
     db: Arc<DatabaseConnection>,
-    encryption_service: Arc<EncryptionService>,
+    cookie_crypto: Arc<CookieCrypto>,
 }
 impl AnalyticsService {
-    pub fn new(db: Arc<DatabaseConnection>, encryption_service: Arc<EncryptionService>) -> Self {
-        AnalyticsService {
-            db,
-            encryption_service,
-        }
+    pub fn new(db: Arc<DatabaseConnection>, cookie_crypto: Arc<CookieCrypto>) -> Self {
+        AnalyticsService { db, cookie_crypto }
     }
 }
 
@@ -1176,6 +1173,78 @@ impl Analytics for AnalyticsService {
         })
     }
 
+    /// Enrich visitor by GUID (visitor_id string, may be encrypted with enc_ prefix)
+    async fn enrich_visitor_by_guid(
+        &self,
+        visitor_guid: &str,
+        enrichment_data: serde_json::Value,
+    ) -> Result<EnrichVisitorResponse, AnalyticsError> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_entities::visitor;
+
+        // Handle encrypted visitor ID (enc_ prefix)
+        let actual_visitor_id = if let Some(encrypted) = visitor_guid.strip_prefix("enc_") {
+            match self.cookie_crypto.decrypt(encrypted) {
+                Ok(decrypted) => decrypted,
+                Err(_) => {
+                    return Err(AnalyticsError::InvalidVisitorId(visitor_guid.to_string()));
+                }
+            }
+        } else {
+            visitor_guid.to_string()
+        };
+
+        // Find the visitor by visitor_id (guid)
+        let visitor = visitor::Entity::find()
+            .filter(visitor::Column::VisitorId.eq(&actual_visitor_id))
+            .one(self.db.as_ref())
+            .await
+            .map_err(AnalyticsError::from)?;
+
+        // Early return if visitor not found
+        let Some(visitor_model) = visitor else {
+            return Ok(EnrichVisitorResponse {
+                success: false,
+                visitor_id: actual_visitor_id,
+                message: "Visitor not found".to_string(),
+            });
+        };
+
+        let mut active_model: visitor::ActiveModel = visitor_model.into();
+
+        // Merge enrichment_data with existing custom_data (if any)
+        let merged_custom_data = match &active_model.custom_data {
+            sea_orm::ActiveValue::Set(Some(existing_json)) => {
+                let mut existing_map = match existing_json.as_object() {
+                    Some(map) => map.clone(),
+                    None => serde_json::Map::new(),
+                };
+                if let Some(new_map) = enrichment_data.as_object() {
+                    for (k, v) in new_map {
+                        existing_map.insert(k.clone(), v.clone());
+                    }
+                }
+                serde_json::Value::Object(existing_map)
+            }
+            _ => enrichment_data.clone(),
+        };
+
+        // Set the merged custom_data as serde_json::Value
+        active_model.custom_data = Set(Some(merged_custom_data));
+
+        // Save the updated visitor
+        active_model
+            .update(self.db.as_ref())
+            .await
+            .map_err(AnalyticsError::from)?;
+
+        Ok(EnrichVisitorResponse {
+            success: true,
+            visitor_id: actual_visitor_id,
+            message: "Visitor enriched successfully".to_string(),
+        })
+    }
+
     /// Check if analytics events exist
     async fn has_analytics_events(
         &self,
@@ -1633,12 +1702,10 @@ WHERE project_id = $1
         use temps_entities::{ip_geolocations, visitor};
 
         // Handle encrypted visitor IDs (enc_ prefix)
-        let actual_visitor_id = if visitor_id.starts_with("enc_") {
-            match self.encryption_service.decrypt(visitor_id) {
-                Ok(decrypted_bytes) => match String::from_utf8(decrypted_bytes) {
-                    Ok(s) => s,
-                    Err(_) => return Err(AnalyticsError::InvalidVisitorId(visitor_id.to_string())),
-                },
+        let actual_visitor_id = if let Some(encrypted) = visitor_id.strip_prefix("enc_") {
+            // Strip the enc_ prefix and decrypt using CookieCrypto
+            match self.cookie_crypto.decrypt(encrypted) {
+                Ok(decrypted) => decrypted,
                 Err(_) => return Err(AnalyticsError::InvalidVisitorId(visitor_id.to_string())),
             }
         } else {
@@ -1884,8 +1951,9 @@ mod tests {
         let db = AnalyticsTestUtils::create_test_db("test_analytics_service_creation")
             .await
             .unwrap();
-        let encryption_service = Arc::new(EncryptionService::new_from_password("test_password"));
-        let service = AnalyticsService::new(db, encryption_service);
+        let cookie_crypto =
+            Arc::new(temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap());
+        let service = AnalyticsService::new(db, cookie_crypto);
 
         // Test that the service was created successfully
         assert!(std::ptr::addr_of!(service) as usize != 0);

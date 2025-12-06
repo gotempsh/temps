@@ -24,6 +24,7 @@ import {
   Globe,
   Home,
   Key,
+  Mail,
   Monitor,
   Network,
   ScrollText,
@@ -87,6 +88,12 @@ const mainNavItems: NavigationItem[] = [
     url: '/monitoring',
     icon: Activity,
     keywords: ['metrics', 'performance', 'analytics', 'stats'],
+  },
+  {
+    title: 'Emails',
+    url: '/email',
+    icon: Mail,
+    keywords: ['email', 'mail', 'smtp', 'transactional', 'send'],
   },
 ]
 

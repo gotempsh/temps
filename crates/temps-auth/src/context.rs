@@ -152,9 +152,26 @@ impl AuthContext {
     }
 
     pub fn has_permission(&self, permission: &Permission) -> bool {
-        // Deployment tokens don't have standard Permission checks
-        // They use DeploymentTokenPermission instead
+        // For deployment tokens, check if the deployment token permission matches
         if self.is_deployment_token() {
+            if let Some(ref dt_permissions) = self.deployment_token_permissions {
+                // FullAccess grants all permissions
+                if dt_permissions.contains(&DeploymentTokenPermission::FullAccess) {
+                    return true;
+                }
+
+                // Map standard Permission to DeploymentTokenPermission
+                let dt_permission = match permission {
+                    Permission::AnalyticsRead => Some(DeploymentTokenPermission::AnalyticsRead),
+                    Permission::AnalyticsWrite => Some(DeploymentTokenPermission::VisitorsEnrich),
+                    // Add other mappings as needed
+                    _ => None,
+                };
+
+                if let Some(required_dt_perm) = dt_permission {
+                    return dt_permissions.contains(&required_dt_perm);
+                }
+            }
             return false;
         }
 

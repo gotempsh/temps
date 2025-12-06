@@ -569,7 +569,7 @@ pub async fn get_session_logs(
     put,
     path = "/analytics/visitors/{visitor_id}/enrich",
     params(
-        ("visitor_id" = i32, Path, description = "Visitor numeric ID"),
+        ("visitor_id" = String, Path, description = "Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx)"),
         ("project_id" = i32, Query, description = "Project ID or slug"),
     ),
     request_body = EnrichVisitorRequest,
@@ -586,19 +586,32 @@ pub async fn get_session_logs(
 pub async fn enrich_visitor(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
-    axum::extract::Path(visitor_id): axum::extract::Path<i32>,
-
+    axum::extract::Path(visitor_id): axum::extract::Path<String>,
     Json(request): Json<EnrichVisitorRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsWrite);
 
-    match app_state
-        .analytics_service
-        .enrich_visitor_by_id(visitor_id, request.custom_data)
-        .await
-    {
-        Ok(response) => Ok(Json(response)),
-        Err(e) => Err(handle_analytics_error(e)),
+    // Check if visitor_id is a numeric ID or a GUID/encrypted GUID
+    if let Ok(numeric_id) = visitor_id.parse::<i32>() {
+        // Numeric ID - use enrich_visitor_by_id
+        match app_state
+            .analytics_service
+            .enrich_visitor_by_id(numeric_id, request.custom_data)
+            .await
+        {
+            Ok(response) => Ok(Json(response)),
+            Err(e) => Err(handle_analytics_error(e)),
+        }
+    } else {
+        // GUID or encrypted GUID (enc_xxx) - use enrich_visitor_by_guid
+        match app_state
+            .analytics_service
+            .enrich_visitor_by_guid(&visitor_id, request.custom_data)
+            .await
+        {
+            Ok(response) => Ok(Json(response)),
+            Err(e) => Err(handle_analytics_error(e)),
+        }
     }
 }
 

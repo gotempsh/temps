@@ -15,7 +15,8 @@ pub struct Model {
     pub ip_address_id: Option<i32>,
     pub is_crawler: bool,
     pub crawler_name: Option<String>,
-    pub custom_data: Option<serde_json::Value>, // JSON string containing user-provided data
+    #[sea_orm(column_type = "JsonBinary")]
+    pub custom_data: Option<serde_json::Value>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

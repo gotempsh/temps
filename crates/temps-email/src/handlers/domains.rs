@@ -28,7 +28,12 @@ use crate::services::CreateDomainRequest;
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/email-domains", post(create_domain).get(list_domains))
+        .route("/email-domains/by-domain/{domain}", get(get_domain_by_name))
         .route("/email-domains/{id}", get(get_domain).delete(delete_domain))
+        .route(
+            "/email-domains/{id}/dns-records",
+            get(get_domain_dns_records),
+        )
         .route("/email-domains/{id}/verify", post(verify_domain))
 }
 
@@ -215,6 +220,128 @@ pub async fn get_domain(
     };
 
     Ok(Json(response))
+}
+
+/// Get an email domain by domain name with DNS records
+#[utoipa::path(
+    tag = "Email Domains",
+    get,
+    path = "/email-domains/by-domain/{domain}",
+    responses(
+        (status = 200, description = "Email domain details with DNS records", body = EmailDomainWithDnsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Domain not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("domain" = String, Path, description = "Domain name (e.g., 'mail.example.com')")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_domain_by_name(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(domain): Path<String>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EmailDomainsRead);
+
+    let domain_model = state
+        .domain_service
+        .find_by_domain_name(&domain)
+        .await
+        .map_err(|e| {
+            error!("Failed to get email domain by name: {}", e);
+            internal_server_error()
+                .detail("Failed to get domain")
+                .build()
+        })?
+        .ok_or_else(|| not_found().detail("Domain not found").build())?;
+
+    let result = state
+        .domain_service
+        .get_with_dns_records(domain_model.id)
+        .await
+        .map_err(|e| {
+            error!("Failed to get email domain DNS records: {}", e);
+            internal_server_error()
+                .detail("Failed to get domain DNS records")
+                .build()
+        })?;
+
+    let response = EmailDomainWithDnsResponse {
+        domain: EmailDomainResponse {
+            id: result.domain.id,
+            provider_id: result.domain.provider_id,
+            domain: result.domain.domain,
+            status: result.domain.status,
+            last_verified_at: result.domain.last_verified_at.map(|dt| dt.to_rfc3339()),
+            verification_error: result.domain.verification_error,
+            created_at: result.domain.created_at.to_rfc3339(),
+            updated_at: result.domain.updated_at.to_rfc3339(),
+        },
+        dns_records: result
+            .dns_records
+            .into_iter()
+            .map(|r| DnsRecordResponse {
+                record_type: r.record_type,
+                name: r.name,
+                value: r.value,
+                priority: r.priority,
+                status: r.status.into(),
+            })
+            .collect(),
+    };
+
+    Ok(Json(response))
+}
+
+/// Get DNS records for an email domain
+#[utoipa::path(
+    tag = "Email Domains",
+    get,
+    path = "/email-domains/{id}/dns-records",
+    responses(
+        (status = 200, description = "DNS records for the domain", body = Vec<DnsRecordResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Domain not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "Domain ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_domain_dns_records(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EmailDomainsRead);
+
+    let result = state
+        .domain_service
+        .get_with_dns_records(id)
+        .await
+        .map_err(|e| {
+            error!("Failed to get email domain DNS records: {}", e);
+            not_found().detail("Domain not found").build()
+        })?;
+
+    let dns_records: Vec<DnsRecordResponse> = result
+        .dns_records
+        .into_iter()
+        .map(|r| DnsRecordResponse {
+            record_type: r.record_type,
+            name: r.name,
+            value: r.value,
+            priority: r.priority,
+            status: r.status.into(),
+        })
+        .collect();
+
+    Ok(Json(dns_records))
 }
 
 /// Verify an email domain's DNS configuration

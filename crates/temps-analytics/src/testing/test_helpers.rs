@@ -33,10 +33,9 @@ impl AnalyticsTestHelper {
     pub async fn new_with_name(_test_name: &str) -> anyhow::Result<Self> {
         let test_database = temps_database::test_utils::TestDatabase::with_migrations().await?;
         let db = test_database.db.clone();
-        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
-            "test_password",
-        ));
-        let service = AnalyticsService::new(db.clone(), encryption_service);
+        let cookie_crypto =
+            Arc::new(temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap());
+        let service = AnalyticsService::new(db.clone(), cookie_crypto);
 
         Ok(Self {
             service,

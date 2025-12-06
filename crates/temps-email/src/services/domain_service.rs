@@ -123,6 +123,19 @@ impl DomainService {
             .ok_or(EmailError::DomainNotFound(id))
     }
 
+    /// Find a domain by domain name
+    pub async fn find_by_domain_name(
+        &self,
+        domain_name: &str,
+    ) -> Result<Option<email_domains::Model>, EmailError> {
+        let domain = email_domains::Entity::find()
+            .filter(email_domains::Column::Domain.eq(domain_name))
+            .one(self.db.as_ref())
+            .await?;
+
+        Ok(domain)
+    }
+
     /// Get a domain with its DNS records (fetches fresh verification status from provider)
     /// The domain status is computed dynamically based on DNS record verification
     pub async fn get_with_dns_records(&self, id: i32) -> Result<DomainWithDnsRecords, EmailError> {

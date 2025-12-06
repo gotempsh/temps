@@ -13,7 +13,10 @@ use temps_core::plugin::{
     MiddlewareCondition, MiddlewarePriority, PluginContext, PluginError, TempsMiddleware,
 };
 
-use crate::{apikey_service::ApiKeyService, auth_service::AuthService, user_service::UserService};
+use crate::{
+    apikey_service::ApiKeyService, auth_service::AuthService,
+    deployment_token_service::DeploymentTokenValidationService, user_service::UserService,
+};
 use temps_core::CookieCrypto;
 
 /// Authentication middleware that implements TempsMiddleware
@@ -23,6 +26,7 @@ pub struct AuthMiddleware {
     user_service: Arc<UserService>,
     cookie_crypto: Arc<CookieCrypto>,
     db: Arc<sea_orm::DatabaseConnection>,
+    deployment_token_service: DeploymentTokenValidationService,
 }
 
 impl AuthMiddleware {
@@ -33,12 +37,14 @@ impl AuthMiddleware {
         cookie_crypto: Arc<CookieCrypto>,
         db: Arc<sea_orm::DatabaseConnection>,
     ) -> Self {
+        let deployment_token_service = DeploymentTokenValidationService::new(db.clone());
         Self {
             api_key_service,
             auth_service,
             user_service,
             cookie_crypto,
             db,
+            deployment_token_service,
         }
     }
 }
@@ -113,6 +119,21 @@ impl AuthMiddleware {
                                 permissions,
                                 key_name,
                                 key_id,
+                            ))
+                        } else {
+                            None
+                        }
+                    } else if token.starts_with("dt_") {
+                        // Try deployment token (they have a specific format: dt_...)
+                        if let Ok(validated) =
+                            self.deployment_token_service.validate_token(token).await
+                        {
+                            Some(crate::context::AuthContext::new_deployment_token(
+                                validated.project_id,
+                                validated.environment_id,
+                                validated.token_id,
+                                validated.name,
+                                validated.permissions,
                             ))
                         } else {
                             None

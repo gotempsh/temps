@@ -113,6 +113,14 @@ export type AddEventsResponse = {
     message: string;
 };
 
+/**
+ * Request to add a managed domain
+ */
+export type AddManagedDomainApiRequest = {
+    auto_manage?: boolean;
+    domain: string;
+};
+
 export type AggregatedBucketItem = {
     count: number;
     timestamp: string;
@@ -553,6 +561,14 @@ export type ConnectionResponse = {
 };
 
 /**
+ * Connection test result
+ */
+export type ConnectionTestResult = {
+    message: string;
+    success: boolean;
+};
+
+/**
  * Response indicating success of container state change
  */
 export type ContainerActionResponse = {
@@ -723,6 +739,28 @@ export type CreateDsnRequest = {
     deployment_id?: number | null;
     environment_id?: number | null;
     name?: string | null;
+};
+
+/**
+ * Request to create a new DNS provider
+ */
+export type CreateDnsProviderRequest = {
+    /**
+     * Provider credentials
+     */
+    credentials: DnsProviderCredentials;
+    /**
+     * Optional description
+     */
+    description?: string | null;
+    /**
+     * User-friendly name
+     */
+    name: string;
+    /**
+     * Provider type
+     */
+    provider_type: DnsProviderType;
 };
 
 export type CreateDomainRequest = {
@@ -1419,6 +1457,40 @@ export type DnsLookupResponse = {
     records: Array<string>;
 };
 
+/**
+ * DNS provider credentials (API-facing)
+ */
+export type DnsProviderCredentials = {
+    account_id?: string | null;
+    api_token: string;
+    type: 'cloudflare';
+} | {
+    api_key: string;
+    api_user: string;
+    client_ip?: string | null;
+    sandbox?: boolean;
+    type: 'namecheap';
+};
+
+/**
+ * DNS provider response
+ */
+export type DnsProviderResponse = {
+    created_at: string;
+    /**
+     * Masked credentials for display
+     */
+    credentials: unknown;
+    description?: string | null;
+    id: number;
+    is_active: boolean;
+    last_error?: string | null;
+    last_used_at?: string | null;
+    name: string;
+    provider_type: string;
+    updated_at: string;
+};
+
 export type DnsProviderSettings = {
     cloudflare_api_key?: string | null;
     provider?: string;
@@ -1430,6 +1502,134 @@ export type DnsProviderSettings = {
 export type DnsProviderSettingsMasked = {
     cloudflare_api_key?: string | null;
     provider: string;
+};
+
+/**
+ * Supported DNS provider types
+ */
+export type DnsProviderType = 'cloudflare' | 'namecheap' | 'route53' | 'digitalocean' | 'manual';
+
+/**
+ * A DNS record
+ */
+export type DnsRecord = {
+    /**
+     * Record content
+     */
+    content: DnsRecordContent;
+    /**
+     * Fully qualified domain name
+     */
+    fqdn: string;
+    /**
+     * Provider-specific record ID (if exists)
+     */
+    id?: string | null;
+    /**
+     * Provider-specific metadata
+     */
+    metadata?: {
+        [key: string]: string;
+    };
+    /**
+     * Record name (without zone, e.g., "www" or "@" for root)
+     */
+    name: string;
+    /**
+     * Whether this record is proxied (Cloudflare-specific)
+     */
+    proxied?: boolean;
+    /**
+     * Time to live in seconds
+     */
+    ttl: number;
+    /**
+     * Zone/domain this record belongs to
+     */
+    zone: string;
+};
+
+/**
+ * DNS record content - varies by record type
+ */
+export type DnsRecordContent = {
+    type: 'A';
+    /**
+     * A record - IPv4 address (as string, e.g., "192.0.2.1")
+     */
+    value: {
+        address: string;
+    };
+} | {
+    type: 'AAAA';
+    /**
+     * AAAA record - IPv6 address (as string, e.g., "2001:db8::1")
+     */
+    value: {
+        address: string;
+    };
+} | {
+    type: 'CNAME';
+    /**
+     * CNAME record - canonical name
+     */
+    value: {
+        target: string;
+    };
+} | {
+    type: 'TXT';
+    /**
+     * TXT record - text content
+     */
+    value: {
+        content: string;
+    };
+} | {
+    type: 'MX';
+    /**
+     * MX record - mail exchange
+     */
+    value: {
+        priority: number;
+        target: string;
+    };
+} | {
+    type: 'NS';
+    /**
+     * NS record - nameserver
+     */
+    value: {
+        nameserver: string;
+    };
+} | {
+    type: 'SRV';
+    /**
+     * SRV record - service
+     */
+    value: {
+        port: number;
+        priority: number;
+        target: string;
+        weight: number;
+    };
+} | {
+    type: 'CAA';
+    /**
+     * CAA record - certification authority authorization
+     */
+    value: {
+        flags: number;
+        tag: string;
+        value: string;
+    };
+} | {
+    type: 'PTR';
+    /**
+     * PTR record - pointer
+     */
+    value: {
+        target: string;
+    };
 };
 
 export type DnsRecordResponse = {
@@ -1446,9 +1646,46 @@ export type DnsRecordResponse = {
      */
     record_type: string;
     /**
+     * Verification status: unknown, verified, pending, failed
+     */
+    status: DnsRecordStatusResponse;
+    /**
      * DNS record value
      */
     value: string;
+};
+
+/**
+ * DNS record verification status
+ */
+export type DnsRecordStatusResponse = 'unknown' | 'verified' | 'pending' | 'failed';
+
+/**
+ * A DNS zone (domain managed by the provider)
+ */
+export type DnsZone = {
+    /**
+     * Provider-specific zone ID
+     */
+    id: string;
+    /**
+     * Provider-specific metadata
+     */
+    metadata?: {
+        [key: string]: string;
+    };
+    /**
+     * Zone name (domain)
+     */
+    name: string;
+    /**
+     * Nameservers for this zone
+     */
+    nameservers: Array<string>;
+    /**
+     * Zone status
+     */
+    status: string;
 };
 
 export type DockerRegistrySettings = {
@@ -1579,7 +1816,7 @@ export type EmailResponse = {
     bcc_addresses?: Array<string> | null;
     cc_addresses?: Array<string> | null;
     created_at: string;
-    domain_id: number;
+    domain_id?: number | null;
     error_message?: string | null;
     from_address: string;
     from_name?: string | null;
@@ -2839,6 +3076,22 @@ export type MagicLinkRequest = {
     email: string;
 };
 
+/**
+ * Managed domain response
+ */
+export type ManagedDomainResponse = {
+    auto_manage: boolean;
+    created_at: string;
+    domain: string;
+    id: number;
+    provider_id: number;
+    updated_at: string;
+    verification_error?: string | null;
+    verified: boolean;
+    verified_at?: string | null;
+    zone_id?: string | null;
+};
+
 export type MetricsOverTimeResponse = {
     cls: Array<number | null>;
     cls_p75?: number | null;
@@ -3751,6 +4004,13 @@ export type RateLimitSettings = {
     whitelist_ips?: Array<string>;
 };
 
+/**
+ * Record list response
+ */
+export type RecordListResponse = {
+    records: Array<DnsRecord>;
+};
+
 export type ReferrerCount = {
     count: number;
     percentage: number;
@@ -4034,11 +4294,7 @@ export type SendEmailRequestBody = {
      */
     cc?: Array<string> | null;
     /**
-     * Domain ID to send from
-     */
-    domain_id: number;
-    /**
-     * Sender email address
+     * Sender email address (domain will be auto-extracted for lookup)
      */
     from: string;
     /**
@@ -4055,10 +4311,6 @@ export type SendEmailRequestBody = {
      * HTML body content
      */
     html?: string | null;
-    /**
-     * Optional project ID for tracking
-     */
-    project_id?: number | null;
     /**
      * Reply-to address
      */
@@ -4837,6 +5089,25 @@ export type UpdateDeploymentConfigRequest = {
     sessionRecordingEnabled?: boolean | null;
 };
 
+/**
+ * Request to update a DNS provider
+ */
+export type UpdateDnsProviderRequest = {
+    credentials?: null | DnsProviderCredentials;
+    /**
+     * New description
+     */
+    description?: string | null;
+    /**
+     * Active status
+     */
+    is_active?: boolean | null;
+    /**
+     * New name
+     */
+    name?: string | null;
+};
+
 export type UpdateEmailProviderRequest = {
     config: EmailConfig;
     enabled?: boolean | null;
@@ -5452,6 +5723,13 @@ export type WorkloadStatus = 'running' | 'paused' | 'stopped' | 'exited' | 'fail
  * Workload type
  */
 export type WorkloadType = 'container' | 'function' | 'static-site' | 'server-side-app' | 'worker' | 'database' | 'message-queue' | 'cache' | 'other';
+
+/**
+ * Zone list response
+ */
+export type ZoneListResponse = {
+    zones: Array<DnsZone>;
+};
 
 /**
  * Response type for S3 source
@@ -7634,6 +7912,371 @@ export type GetActivityGraphResponses = {
 
 export type GetActivityGraphResponse = GetActivityGraphResponses[keyof GetActivityGraphResponses];
 
+export type ListProvidersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/dns-providers';
+};
+
+export type ListProvidersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type ListProvidersResponses = {
+    /**
+     * List of DNS providers
+     */
+    200: Array<DnsProviderResponse>;
+};
+
+export type ListProvidersResponse = ListProvidersResponses[keyof ListProvidersResponses];
+
+export type CreateProviderData = {
+    body: CreateDnsProviderRequest;
+    path?: never;
+    query?: never;
+    url: '/dns-providers';
+};
+
+export type CreateProviderErrors = {
+    /**
+     * Invalid request or connection test failed
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type CreateProviderResponses = {
+    /**
+     * DNS provider created
+     */
+    201: DnsProviderResponse;
+};
+
+export type CreateProviderResponse = CreateProviderResponses[keyof CreateProviderResponses];
+
+export type DeleteProviderData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}';
+};
+
+export type DeleteProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type DeleteProviderResponses = {
+    /**
+     * DNS provider deleted
+     */
+    204: void;
+};
+
+export type DeleteProviderResponse = DeleteProviderResponses[keyof DeleteProviderResponses];
+
+export type GetProviderData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}';
+};
+
+export type GetProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type GetProviderResponses = {
+    /**
+     * DNS provider details
+     */
+    200: DnsProviderResponse;
+};
+
+export type GetProviderResponse = GetProviderResponses[keyof GetProviderResponses];
+
+export type UpdateProviderData = {
+    body: UpdateDnsProviderRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}';
+};
+
+export type UpdateProviderErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type UpdateProviderResponses = {
+    /**
+     * DNS provider updated
+     */
+    200: DnsProviderResponse;
+};
+
+export type UpdateProviderResponse = UpdateProviderResponses[keyof UpdateProviderResponses];
+
+export type ListManagedDomainsData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}/domains';
+};
+
+export type ListManagedDomainsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type ListManagedDomainsResponses = {
+    /**
+     * List of managed domains
+     */
+    200: Array<ManagedDomainResponse>;
+};
+
+export type ListManagedDomainsResponse = ListManagedDomainsResponses[keyof ListManagedDomainsResponses];
+
+export type AddManagedDomainData = {
+    body: AddManagedDomainApiRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}/domains';
+};
+
+export type AddManagedDomainErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type AddManagedDomainResponses = {
+    /**
+     * Managed domain added
+     */
+    201: ManagedDomainResponse;
+};
+
+export type AddManagedDomainResponse = AddManagedDomainResponses[keyof AddManagedDomainResponses];
+
+export type TestProviderConnectionData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}/test';
+};
+
+export type TestProviderConnectionErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type TestProviderConnectionResponses = {
+    /**
+     * Connection test result
+     */
+    200: ConnectionTestResult;
+};
+
+export type TestProviderConnectionResponse = TestProviderConnectionResponses[keyof TestProviderConnectionResponses];
+
+export type ListProviderZonesData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}/zones';
+};
+
+export type ListProviderZonesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type ListProviderZonesResponses = {
+    /**
+     * List of zones
+     */
+    200: ZoneListResponse;
+};
+
+export type ListProviderZonesResponse = ListProviderZonesResponses[keyof ListProviderZonesResponses];
+
+export type RemoveManagedDomainData = {
+    body?: never;
+    path: {
+        provider_id: number;
+        domain: string;
+    };
+    query?: never;
+    url: '/dns-providers/{provider_id}/domains/{domain}';
+};
+
+export type RemoveManagedDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type RemoveManagedDomainResponses = {
+    /**
+     * Managed domain removed
+     */
+    204: void;
+};
+
+export type RemoveManagedDomainResponse = RemoveManagedDomainResponses[keyof RemoveManagedDomainResponses];
+
+export type VerifyManagedDomainData = {
+    body?: never;
+    path: {
+        provider_id: number;
+        domain: string;
+    };
+    query?: never;
+    url: '/dns-providers/{provider_id}/domains/{domain}/verify';
+};
+
+export type VerifyManagedDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type VerifyManagedDomainResponses = {
+    /**
+     * Domain verification result
+     */
+    200: ManagedDomainResponse;
+};
+
+export type VerifyManagedDomainResponse = VerifyManagedDomainResponses[keyof VerifyManagedDomainResponses];
+
 export type LookupDnsARecordsData = {
     body?: never;
     path?: never;
@@ -8329,21 +8972,21 @@ export type VerifyDomainErrors = {
 
 export type VerifyDomainResponses = {
     /**
-     * Domain verification result
+     * Domain verification result with DNS records
      */
-    200: EmailDomainResponse;
+    200: EmailDomainWithDnsResponse;
 };
 
 export type VerifyDomainResponse = VerifyDomainResponses[keyof VerifyDomainResponses];
 
-export type ListProvidersData = {
+export type ListProviders2Data = {
     body?: never;
     path?: never;
     query?: never;
     url: '/email-providers';
 };
 
-export type ListProvidersErrors = {
+export type ListProviders2Errors = {
     /**
      * Unauthorized
      */
@@ -8358,23 +9001,23 @@ export type ListProvidersErrors = {
     500: unknown;
 };
 
-export type ListProvidersResponses = {
+export type ListProviders2Responses = {
     /**
      * List of email providers
      */
     200: Array<EmailProviderResponse>;
 };
 
-export type ListProvidersResponse = ListProvidersResponses[keyof ListProvidersResponses];
+export type ListProviders2Response = ListProviders2Responses[keyof ListProviders2Responses];
 
-export type CreateProviderData = {
+export type CreateProvider2Data = {
     body: CreateEmailProviderRequest;
     path?: never;
     query?: never;
     url: '/email-providers';
 };
 
-export type CreateProviderErrors = {
+export type CreateProvider2Errors = {
     /**
      * Invalid request
      */
@@ -8393,16 +9036,16 @@ export type CreateProviderErrors = {
     500: unknown;
 };
 
-export type CreateProviderResponses = {
+export type CreateProvider2Responses = {
     /**
      * Provider created successfully
      */
     201: EmailProviderResponse;
 };
 
-export type CreateProviderResponse = CreateProviderResponses[keyof CreateProviderResponses];
+export type CreateProvider2Response = CreateProvider2Responses[keyof CreateProvider2Responses];
 
-export type DeleteProviderData = {
+export type DeleteProvider2Data = {
     body?: never;
     path: {
         /**
@@ -8414,7 +9057,7 @@ export type DeleteProviderData = {
     url: '/email-providers/{id}';
 };
 
-export type DeleteProviderErrors = {
+export type DeleteProvider2Errors = {
     /**
      * Unauthorized
      */
@@ -8433,16 +9076,16 @@ export type DeleteProviderErrors = {
     500: unknown;
 };
 
-export type DeleteProviderResponses = {
+export type DeleteProvider2Responses = {
     /**
      * Provider deleted
      */
     204: void;
 };
 
-export type DeleteProviderResponse = DeleteProviderResponses[keyof DeleteProviderResponses];
+export type DeleteProvider2Response = DeleteProvider2Responses[keyof DeleteProvider2Responses];
 
-export type GetProviderData = {
+export type GetProvider2Data = {
     body?: never;
     path: {
         /**
@@ -8454,7 +9097,7 @@ export type GetProviderData = {
     url: '/email-providers/{id}';
 };
 
-export type GetProviderErrors = {
+export type GetProvider2Errors = {
     /**
      * Unauthorized
      */
@@ -8473,14 +9116,14 @@ export type GetProviderErrors = {
     500: unknown;
 };
 
-export type GetProviderResponses = {
+export type GetProvider2Responses = {
     /**
      * Email provider details
      */
     200: EmailProviderResponse;
 };
 
-export type GetProviderResponse = GetProviderResponses[keyof GetProviderResponses];
+export type GetProvider2Response = GetProvider2Responses[keyof GetProvider2Responses];
 
 export type TestProviderData = {
     body: TestEmailRequest;
@@ -10329,7 +10972,7 @@ export type CreateGitlabPatProviderResponses = {
 
 export type CreateGitlabPatProviderResponse = CreateGitlabPatProviderResponses[keyof CreateGitlabPatProviderResponses];
 
-export type DeleteProvider2Data = {
+export type DeleteProvider3Data = {
     body?: never;
     path: {
         /**
@@ -10341,7 +10984,7 @@ export type DeleteProvider2Data = {
     url: '/git-providers/{provider_id}';
 };
 
-export type DeleteProvider2Errors = {
+export type DeleteProvider3Errors = {
     /**
      * Provider has connections and cannot be deleted
      */
@@ -10360,14 +11003,14 @@ export type DeleteProvider2Errors = {
     500: unknown;
 };
 
-export type DeleteProvider2Responses = {
+export type DeleteProvider3Responses = {
     /**
      * Provider deleted successfully
      */
     204: void;
 };
 
-export type DeleteProvider2Response = DeleteProvider2Responses[keyof DeleteProvider2Responses];
+export type DeleteProvider3Response = DeleteProvider3Responses[keyof DeleteProvider3Responses];
 
 export type GetGitProviderData = {
     body?: never;
@@ -11679,7 +12322,7 @@ export type UpdateSlackProviderResponses = {
 
 export type UpdateSlackProviderResponse = UpdateSlackProviderResponses[keyof UpdateSlackProviderResponses];
 
-export type DeleteProvider3Data = {
+export type DeleteProvider4Data = {
     body?: never;
     path: {
         /**
@@ -11691,7 +12334,7 @@ export type DeleteProvider3Data = {
     url: '/notification-providers/{id}';
 };
 
-export type DeleteProvider3Errors = {
+export type DeleteProvider4Errors = {
     /**
      * Provider not found
      */
@@ -11702,14 +12345,14 @@ export type DeleteProvider3Errors = {
     500: unknown;
 };
 
-export type DeleteProvider3Responses = {
+export type DeleteProvider4Responses = {
     /**
      * Successfully deleted provider
      */
     204: void;
 };
 
-export type DeleteProvider3Response = DeleteProvider3Responses[keyof DeleteProvider3Responses];
+export type DeleteProvider4Response = DeleteProvider4Responses[keyof DeleteProvider4Responses];
 
 export type GetNotificationProviderData = {
     body?: never;
@@ -11743,7 +12386,7 @@ export type GetNotificationProviderResponses = {
 
 export type GetNotificationProviderResponse = GetNotificationProviderResponses[keyof GetNotificationProviderResponses];
 
-export type UpdateProviderData = {
+export type UpdateProvider2Data = {
     body: UpdateProviderRequest;
     path: {
         /**
@@ -11755,7 +12398,7 @@ export type UpdateProviderData = {
     url: '/notification-providers/{id}';
 };
 
-export type UpdateProviderErrors = {
+export type UpdateProvider2Errors = {
     /**
      * Provider not found
      */
@@ -11766,14 +12409,14 @@ export type UpdateProviderErrors = {
     500: unknown;
 };
 
-export type UpdateProviderResponses = {
+export type UpdateProvider2Responses = {
     /**
      * Successfully updated provider
      */
     200: NotificationProviderResponse;
 };
 
-export type UpdateProviderResponse = UpdateProviderResponses[keyof UpdateProviderResponses];
+export type UpdateProvider2Response = UpdateProvider2Responses[keyof UpdateProvider2Responses];
 
 export type TestProvider2Data = {
     body?: never;

@@ -70,8 +70,6 @@ pub async fn send_email(
     }
 
     let send_request = SendEmailRequest {
-        domain_id: request.domain_id,
-        project_id: request.project_id,
         from: request.from.clone(),
         from_name: request.from_name.clone(),
         to: request.to.clone(),
@@ -109,7 +107,6 @@ pub async fn send_email(
         from: request.from,
         to: request.to,
         subject: request.subject,
-        domain_id: request.domain_id,
     };
 
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {

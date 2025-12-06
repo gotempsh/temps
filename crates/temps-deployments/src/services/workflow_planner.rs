@@ -5,6 +5,7 @@
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use serde_json;
 use std::sync::Arc;
+use temps_core::EncryptionService;
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
 use temps_logs::LogService;
 use tracing::{debug, info};
@@ -39,8 +40,10 @@ impl WorkflowPlanner {
         external_service_manager: Arc<temps_providers::ExternalServiceManager>,
         config_service: Arc<temps_config::ConfigService>,
         dsn_service: Arc<temps_error_tracking::DSNService>,
+        encryption_service: Arc<EncryptionService>,
     ) -> Self {
-        let deployment_token_service = Arc::new(DeploymentTokenService::new(db.clone()));
+        let deployment_token_service =
+            Arc::new(DeploymentTokenService::new(db.clone(), encryption_service));
         Self {
             db,
             log_service,
@@ -770,14 +773,22 @@ mod tests {
     fn create_test_external_service_manager(
         db: Arc<DatabaseConnection>,
     ) -> Arc<temps_providers::ExternalServiceManager> {
-        let encryption_service =
-            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+        let encryption_service = create_test_encryption_service();
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().ok().unwrap());
         Arc::new(temps_providers::ExternalServiceManager::new(
             db,
             encryption_service,
             docker,
         ))
+    }
+
+    fn create_test_encryption_service() -> Arc<EncryptionService> {
+        Arc::new(
+            EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        )
     }
 
     async fn create_test_project(
@@ -849,6 +860,7 @@ mod tests {
             external_service_manager,
             config_service,
             dsn_service,
+            create_test_encryption_service(),
         );
 
         let (_project, _environment, deployment) =
@@ -896,6 +908,7 @@ mod tests {
             external_service_manager,
             config_service,
             dsn_service,
+            create_test_encryption_service(),
         );
 
         // Create project without git info
@@ -977,6 +990,7 @@ mod tests {
             external_service_manager,
             config_service,
             dsn_service,
+            create_test_encryption_service(),
         );
 
         let (_project, _environment, deployment) =
@@ -1023,6 +1037,7 @@ mod tests {
             external_service_manager,
             config_service,
             dsn_service,
+            create_test_encryption_service(),
         );
 
         let (_project, _environment, deployment) =
@@ -1065,6 +1080,7 @@ mod tests {
             external_service_manager,
             config_service,
             dsn_service,
+            create_test_encryption_service(),
         );
 
         let (_project, _environment, deployment) =
@@ -1111,6 +1127,7 @@ mod tests {
             external_service_manager,
             config_service,
             dsn_service,
+            create_test_encryption_service(),
         );
 
         let (project, environment, deployment) =

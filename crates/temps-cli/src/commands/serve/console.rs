@@ -29,6 +29,7 @@ use temps_core::{CookieCrypto, EncryptionService};
 use temps_database::DbConnection;
 use temps_deployer::plugin::DeployerPlugin;
 use temps_deployments::DeploymentsPlugin;
+use temps_dns::DnsPlugin;
 use temps_domains::DomainsPlugin;
 use temps_email::EmailPlugin;
 use temps_entities::users;
@@ -599,6 +600,11 @@ pub async fn start_console_api(
     debug!("Registering DomainsPlugin");
     let domains_plugin = Box::new(DomainsPlugin::new());
     plugin_manager.register_plugin(domains_plugin);
+
+    // 4.5. DnsPlugin - provides DNS provider management (depends on database and encryption)
+    debug!("Registering DnsPlugin");
+    let dns_plugin = Box::new(DnsPlugin::new());
+    plugin_manager.register_plugin(dns_plugin);
 
     // 5. ProvidersPlugin - provides external service management (depends on database and encryption)
     debug!("Registering ProvidersPlugin");

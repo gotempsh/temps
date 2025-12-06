@@ -134,6 +134,9 @@ impl TempsPlugin for DeploymentsPlugin {
             // Get DSN service for automatic Sentry DSN generation (required)
             let dsn_service = context.require_service::<temps_error_tracking::DSNService>();
 
+            // Get encryption service for deployment token encryption
+            let encryption_service = context.require_service::<temps_core::EncryptionService>();
+
             // Create JobProcessor with workflow execution capability
             let job_receiver = queue_service.subscribe();
             let workflow_planner = Arc::new(WorkflowPlanner::new(
@@ -142,6 +145,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 external_service_manager.clone(),
                 config_service.clone(),
                 dsn_service,
+                encryption_service,
             ));
 
             let mut job_processor = JobProcessorService::with_external_service_manager(

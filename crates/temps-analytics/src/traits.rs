@@ -112,6 +112,13 @@ pub trait Analytics: Send + Sync {
         enrichment_data: serde_json::Value,
     ) -> Result<EnrichVisitorResponse, AnalyticsError>;
 
+    /// Enrich visitor by GUID (visitor_id string, may be encrypted with enc_ prefix)
+    async fn enrich_visitor_by_guid(
+        &self,
+        visitor_guid: &str,
+        enrichment_data: serde_json::Value,
+    ) -> Result<EnrichVisitorResponse, AnalyticsError>;
+
     /// Check if analytics events exist
     async fn has_analytics_events(
         &self,

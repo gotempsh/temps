@@ -24,8 +24,7 @@ pub struct EmailService {
 /// Request to send an email
 #[derive(Debug, Clone)]
 pub struct SendEmailRequest {
-    pub domain_id: i32,
-    pub project_id: Option<i32>,
+    /// Sender email address (domain will be auto-extracted for lookup)
     pub from: String,
     pub from_name: Option<String>,
     pub to: Vec<String>,
@@ -72,41 +71,34 @@ impl EmailService {
     }
 
     /// Send an email
+    ///
+    /// The flow is:
+    /// 1. Extract domain from 'from' email address
+    /// 2. Look up domain in database by domain name
+    /// 3. Always store the email in the database for visualization
+    /// 4. If domain is configured and verified, send via provider and mark as "sent"
+    /// 5. If domain is not configured or not verified, mark as "captured" (Mailhog-like behavior)
     pub async fn send(&self, request: SendEmailRequest) -> Result<SendEmailResponse, EmailError> {
         debug!("Sending email from {} to {:?}", request.from, request.to);
 
-        // Validate the domain is verified
-        let domain = self.domain_service.get(request.domain_id).await?;
-
-        if domain.status != "verified" {
-            return Err(EmailError::DomainNotVerified(format!(
-                "Domain {} is not verified (status: {})",
-                domain.domain, domain.status
-            )));
-        }
-
-        // Validate from address matches domain
+        // Extract domain from 'from' address
         let from_domain = request
             .from
             .split('@')
             .nth(1)
             .ok_or_else(|| EmailError::Validation("Invalid from address".to_string()))?;
 
-        if from_domain != domain.domain {
-            return Err(EmailError::Validation(format!(
-                "From address domain '{}' does not match verified domain '{}'",
-                from_domain, domain.domain
-            )));
-        }
+        // Look up domain by extracted domain name
+        let domain = self.domain_service.find_by_domain_name(from_domain).await?;
 
         // Generate email ID
         let email_id = Uuid::new_v4();
 
-        // Create email record with queued status
+        // Create email record - always store for visualization
         let email = emails::ActiveModel {
             id: Set(email_id),
-            domain_id: Set(request.domain_id),
-            project_id: Set(request.project_id),
+            domain_id: Set(domain.as_ref().map(|d| d.id)),
+            project_id: Set(None),
             from_address: Set(request.from.clone()),
             from_name: Set(request.from_name.clone()),
             to_addresses: Set(serde_json::to_value(&request.to)?),
@@ -136,13 +128,64 @@ impl EmailService {
 
         let email_model = email.insert(self.db.as_ref()).await?;
 
-        // Try to get provider - if not configured, store email as "captured" (Mailhog-like behavior)
+        // If no domain configured, capture email without sending (Mailhog-like behavior)
+        let domain = match domain {
+            Some(d) => d,
+            None => {
+                info!(
+                    "No domain configured for '{}', capturing email without sending (Mailhog mode)",
+                    from_domain
+                );
+
+                let mut active_model: emails::ActiveModel = email_model.into();
+                active_model.status = Set("captured".to_string());
+                active_model.sent_at = Set(Some(Utc::now()));
+
+                active_model.update(self.db.as_ref()).await?;
+
+                info!(
+                    "Email captured (no domain configured), id: {}, from: {}, to: {:?}",
+                    email_id, request.from, request.to
+                );
+
+                return Ok(SendEmailResponse {
+                    id: email_id,
+                    status: "captured".to_string(),
+                    provider_message_id: None,
+                });
+            }
+        };
+
+        // Check if domain is verified
+        if domain.status != "verified" {
+            info!(
+                "Domain '{}' is not verified (status: {}), capturing email without sending",
+                domain.domain, domain.status
+            );
+
+            let mut active_model: emails::ActiveModel = email_model.into();
+            active_model.status = Set("captured".to_string());
+            active_model.error_message = Set(Some(format!(
+                "Domain '{}' not verified (status: {})",
+                domain.domain, domain.status
+            )));
+            active_model.sent_at = Set(Some(Utc::now()));
+
+            active_model.update(self.db.as_ref()).await?;
+
+            return Ok(SendEmailResponse {
+                id: email_id,
+                status: "captured".to_string(),
+                provider_message_id: None,
+            });
+        }
+
+        // Try to get provider - if not configured, capture email
         let provider = match self.provider_service.get(domain.provider_id).await {
             Ok(p) => Some(p),
             Err(e) => {
-                // No provider configured - capture email without sending (Mailhog mode)
                 info!(
-                    "No provider configured for domain {}, capturing email without sending (Mailhog mode)",
+                    "No provider configured for domain '{}', capturing email without sending (Mailhog mode)",
                     domain.domain
                 );
                 debug!("Provider lookup error: {}", e);
@@ -430,8 +473,6 @@ mod tests {
     #[test]
     fn test_send_email_request_builder() {
         let request = SendEmailRequest {
-            domain_id: 1,
-            project_id: Some(100),
             from: "sender@example.com".to_string(),
             from_name: Some("Sender Name".to_string()),
             to: vec!["recipient@example.com".to_string()],
@@ -448,8 +489,6 @@ mod tests {
             tags: Some(vec!["tag1".to_string(), "tag2".to_string()]),
         };
 
-        assert_eq!(request.domain_id, 1);
-        assert_eq!(request.project_id, Some(100));
         assert_eq!(request.from, "sender@example.com");
         assert_eq!(request.from_name, Some("Sender Name".to_string()));
         assert_eq!(request.to, vec!["recipient@example.com".to_string()]);
@@ -649,12 +688,10 @@ mod tests {
 
         // Create a provider and domain (domain will be in pending status by default)
         let provider = create_test_provider(&provider_service).await;
-        let domain = create_test_domain(&db.db, provider.id, "test-pending.example.com").await;
+        let _domain = create_test_domain(&db.db, provider.id, "test-pending.example.com").await;
 
-        // Try to send email - should fail because domain is not verified
+        // Try to send email - should be captured because domain is not verified
         let request = SendEmailRequest {
-            domain_id: domain.id,
-            project_id: None,
             from: "sender@test-pending.example.com".to_string(),
             from_name: None,
             to: vec!["recipient@test.com".to_string()],
@@ -670,32 +707,19 @@ mod tests {
 
         let result = email_service.send(request).await;
 
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            EmailError::DomainNotVerified(_)
-        ));
+        // Email should be captured (not an error), since domain exists but is not verified
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.status, "captured");
     }
 
     #[tokio::test]
-    async fn test_send_email_from_domain_mismatch() {
-        let (db, email_service, provider_service, _domain_service) = setup_test_env().await;
+    async fn test_send_email_no_domain_configured() {
+        let (_db, email_service, _provider_service, _domain_service) = setup_test_env().await;
 
-        // Create a provider and domain
-        let provider = create_test_provider(&provider_service).await;
-        let domain = create_test_domain(&db.db, provider.id, "verified.example.com").await;
-
-        // Manually update domain to verified status for this test
-        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        let mut active_model: temps_entities::email_domains::ActiveModel = domain.into();
-        active_model.status = Set("verified".to_string());
-        let domain = active_model.update(db.db.as_ref()).await.unwrap();
-
-        // Try to send email with wrong from domain
+        // Try to send email from a domain that doesn't exist - should be captured
         let request = SendEmailRequest {
-            domain_id: domain.id,
-            project_id: None,
-            from: "sender@otherdomain.com".to_string(), // Wrong domain!
+            from: "sender@unconfigured-domain.com".to_string(),
             from_name: None,
             to: vec!["recipient@test.com".to_string()],
             cc: None,
@@ -710,8 +734,10 @@ mod tests {
 
         let result = email_service.send(request).await;
 
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EmailError::Validation(_)));
+        // Email should be captured (Mailhog mode), not an error
+        assert!(result.is_ok());
+        let response = result.unwrap();
+        assert_eq!(response.status, "captured");
     }
 
     #[tokio::test]

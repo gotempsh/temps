@@ -130,15 +130,20 @@ export function ProjectOverview({
     enabled: !!project.id,
     refetchInterval: (query) => {
       const data = query.state.data
+      // Keep polling while deployment is in progress
       if (
         !data ||
-        data.status === 'failed' ||
         data.status === 'pending' ||
+        data.status === 'running' ||
         data.status === 'building'
       ) {
         return 2500 // 2.5 seconds
       }
-      return false // Stop polling when deployment is successful
+      // Also poll if deployment is completed but screenshot is not yet available
+      if (data.status === 'completed' && !data.screenshot_location) {
+        return 3000 // 3 seconds while waiting for screenshot
+      }
+      return false // Stop polling when deployment has screenshot or failed
     },
   })
 

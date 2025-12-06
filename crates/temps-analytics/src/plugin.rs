@@ -13,7 +13,7 @@ use std::sync::Arc;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use temps_core::EncryptionService;
+use temps_core::CookieCrypto;
 use utoipa::{openapi::OpenApi, OpenApi as OpenApiTrait};
 
 use crate::handler::{configure_routes, AnalyticsApiDoc, AppState};
@@ -46,12 +46,10 @@ impl TempsPlugin for AnalyticsPlugin {
         Box::pin(async move {
             // Get required dependencies from the service registry
             let db = context.require_service::<sea_orm::DatabaseConnection>();
-            let encryption_service = context.require_service::<EncryptionService>();
+            let cookie_crypto = context.require_service::<CookieCrypto>();
             // Create AnalyticsService
-            let analytics_service = Arc::new(AnalyticsService::new(
-                db.clone(),
-                encryption_service.clone(),
-            ));
+            let analytics_service =
+                Arc::new(AnalyticsService::new(db.clone(), cookie_crypto.clone()));
 
             // Register the service with both the concrete type and trait
             context.register_service(analytics_service.clone());

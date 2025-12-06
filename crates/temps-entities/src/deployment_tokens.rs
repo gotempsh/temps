@@ -26,6 +26,9 @@ pub struct Model {
     pub token_hash: String,
     /// First 8 characters for identification in UI
     pub token_prefix: String,
+    /// Encrypted token value for retrieval during deployments
+    /// Encrypted with platform's encryption key, can be decrypted to get the original token
+    pub encrypted_token: Option<String>,
     /// JSON array of permission strings (e.g., ["visitors:enrich", "emails:send"])
     pub permissions: Option<Json>,
     pub is_active: bool,

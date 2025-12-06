@@ -10156,6 +10156,7 @@ dependencies = [
  "temps-database",
  "temps-deployer",
  "temps-deployments",
+ "temps-dns",
  "temps-domains",
  "temps-email",
  "temps-entities",

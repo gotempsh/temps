@@ -2070,14 +2070,22 @@ mod tests {
     fn create_test_external_service_manager(
         db: Arc<temps_database::DbConnection>,
     ) -> Arc<temps_providers::ExternalServiceManager> {
-        let encryption_service =
-            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+        let encryption_service = create_test_encryption_service();
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().ok().unwrap());
         Arc::new(temps_providers::ExternalServiceManager::new(
             db,
             encryption_service,
             docker,
         ))
+    }
+
+    fn create_test_encryption_service() -> Arc<EncryptionService> {
+        Arc::new(
+            EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        )
     }
 
     async fn setup_test_data(
@@ -2631,6 +2639,7 @@ mod tests {
             external_service_manager.clone(),
             config_service,
             dsn_service,
+            create_test_encryption_service(),
         );
 
         // Create deployment jobs using workflow planner
@@ -2722,6 +2731,7 @@ mod tests {
             external_service_manager.clone(),
             config_service,
             dsn_service,
+            create_test_encryption_service(),
         );
 
         // Create deployment jobs

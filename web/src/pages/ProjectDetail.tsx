@@ -83,8 +83,12 @@ export function ProjectDetail() {
     refetchInterval: (query) => {
       const data = query.state.data
       // Poll more frequently for active deployments
-      if (data && (data.status === 'pending' || data.status === 'building')) {
+      if (data && (data.status === 'pending' || data.status === 'running' || data.status === 'building')) {
         return 2500 // 2.5 seconds for active deployments
+      }
+      // Poll while waiting for screenshot to be generated
+      if (data && data.status === 'completed' && !data.screenshot_location) {
+        return 3000 // 3 seconds while waiting for screenshot
       }
       // Keep checking periodically for new deployments
       return 10000 // 10 seconds for completed/failed deployments

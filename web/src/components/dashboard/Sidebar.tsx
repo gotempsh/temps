@@ -19,6 +19,7 @@ import {
   BadgeCheck,
   Bell,
   ChevronsUpDown,
+  Cloud,
   Database,
   DatabaseBackup,
   Folder,
@@ -123,6 +124,11 @@ const data = {
       title: 'Git providers',
       url: '/git-sources',
       icon: GitBranch,
+    },
+    {
+      title: 'DNS providers',
+      url: '/dns-providers',
+      icon: Cloud,
     },
     {
       title: 'Backups',

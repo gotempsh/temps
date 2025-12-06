@@ -211,11 +211,7 @@ pub struct EmailDomainWithDnsResponse {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SendEmailRequestBody {
-    /// Domain ID to send from
-    pub domain_id: i32,
-    /// Optional project ID for tracking
-    pub project_id: Option<i32>,
-    /// Sender email address
+    /// Sender email address (domain will be auto-extracted for lookup)
     #[schema(example = "hello@updates.example.com")]
     pub from: String,
     /// Sender display name
@@ -262,7 +258,7 @@ pub struct SendEmailResponseBody {
 pub struct EmailResponse {
     #[schema(example = "550e8400-e29b-41d4-a716-446655440000")]
     pub id: String,
-    pub domain_id: i32,
+    pub domain_id: Option<i32>,
     pub project_id: Option<i32>,
     #[schema(example = "hello@updates.example.com")]
     pub from_address: String,

@@ -266,8 +266,9 @@ macro_rules! create_test_analytics_service {
         $crate::testing::test_utils::AnalyticsTestUtils::insert_test_data(&test_db.db)
             .await
             .unwrap();
-        let encryption_service = Arc::new(EncryptionService::new_from_password("test_password"));
-        let service = $crate::AnalyticsService::new(test_db.db.clone(), encryption_service);
+        let cookie_crypto =
+            Arc::new(temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap());
+        let service = $crate::AnalyticsService::new(test_db.db.clone(), cookie_crypto);
         (service, test_db.db.clone(), test_db) // Return the TestDatabase to keep container alive
     }};
 }

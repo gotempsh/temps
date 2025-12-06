@@ -164,8 +164,13 @@ impl WorkflowTask for TakeScreenshotJob {
     }
 
     async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
-        // it takes a bit of time for the route table to be ready
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        // Wait for the application to fully initialize after deployment
+        // The route table needs time to be ready, and the application needs to start serving content.
+        // 15 seconds provides enough time for most applications to complete their startup sequence
+        // and avoids capturing "building" or "loading" states in the screenshot.
+        self.log("Waiting for application to fully initialize...".to_string())
+            .await?;
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         self.log(format!(
             "Taking screenshot for deployment ID: {}",
             self.deployment_id

@@ -99,10 +99,10 @@ const temps = new TempsClient({
 });
 
 // Send a simple email
+// The domain is automatically extracted from the 'from' address
 const { data, error } = await temps.email.send({
   body: {
-    domain_id: 1,  // Your verified domain ID
-    from: 'hello@mail.example.com',
+    from: 'hello@mail.example.com',  // Domain extracted automatically
     from_name: 'My App',
     to: ['user@example.com'],
     subject: 'Welcome to our platform!',
@@ -212,7 +212,6 @@ const html = await render(
 // Send via Temps
 const { data, error } = await temps.email.send({
   body: {
-    domain_id: 1,
     from: 'hello@mail.example.com',
     from_name: 'My App',
     to: ['john@example.com'],
@@ -300,7 +299,6 @@ const html = await render(
 // Send via Temps
 const { data, error } = await temps.email.send({
   body: {
-    domain_id: 1,
     from: 'noreply@mail.example.com',
     from_name: 'My App',
     to: ['jane@example.com'],
@@ -315,6 +313,7 @@ if (error) {
 }`
 
 const directApiCode = `// Direct API usage without SDK
+// Domain is automatically extracted from the 'from' address
 const response = await fetch('https://your-temps-instance.com/api/emails', {
   method: 'POST',
   headers: {
@@ -322,7 +321,6 @@ const response = await fetch('https://your-temps-instance.com/api/emails', {
     'Authorization': 'Bearer YOUR_API_KEY',
   },
   body: JSON.stringify({
-    domain_id: 1,
     from: 'hello@mail.example.com',
     from_name: 'My App',
     to: ['user@example.com'],
@@ -339,6 +337,7 @@ console.log('Email sent:', result.id);`
 const pythonCode = `import httpx
 
 async def send_email():
+    # Domain is automatically extracted from the 'from' address
     async with httpx.AsyncClient() as client:
         response = await client.post(
             "https://your-temps-instance.com/api/emails",
@@ -347,7 +346,6 @@ async def send_email():
                 "Content-Type": "application/json",
             },
             json={
-                "domain_id": 1,
                 "from": "hello@mail.example.com",
                 "from_name": "My App",
                 "to": ["user@example.com"],
@@ -365,8 +363,8 @@ import (
     "net/http"
 )
 
+// Domain is automatically extracted from the 'from' address
 type SendEmailRequest struct {
-    DomainID  int      \`json:"domain_id"\`
     From      string   \`json:"from"\`
     FromName  string   \`json:"from_name"\`
     To        []string \`json:"to"\`
@@ -376,7 +374,6 @@ type SendEmailRequest struct {
 
 func sendEmail() error {
     payload := SendEmailRequest{
-        DomainID: 1,
         From:     "hello@mail.example.com",
         FromName: "My App",
         To:       []string{"user@example.com"},
@@ -601,7 +598,8 @@ export function SdkDocumentation() {
           </CardHeader>
           <CardContent className="space-y-4">
             <p className="text-sm text-muted-foreground">
-              Send an email through a verified domain.
+              Send an email. The domain is automatically extracted from the sender address.
+              If the domain is verified, the email is sent; otherwise, it's captured for viewing.
             </p>
 
             <div className="space-y-2">
@@ -618,16 +616,10 @@ export function SdkDocumentation() {
                   </thead>
                   <tbody>
                     <tr className="border-t">
-                      <td className="p-3 font-mono">domain_id</td>
-                      <td className="p-3">number</td>
-                      <td className="p-3">Yes</td>
-                      <td className="p-3 text-muted-foreground">ID of the verified domain</td>
-                    </tr>
-                    <tr className="border-t">
                       <td className="p-3 font-mono">from</td>
                       <td className="p-3">string</td>
                       <td className="p-3">Yes</td>
-                      <td className="p-3 text-muted-foreground">Sender email address</td>
+                      <td className="p-3 text-muted-foreground">Sender email address (domain auto-extracted)</td>
                     </tr>
                     <tr className="border-t">
                       <td className="p-3 font-mono">from_name</td>

@@ -9,7 +9,7 @@ use temps_core::DBDateTime;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
-    pub domain_id: i32,
+    pub domain_id: Option<i32>,
     pub project_id: Option<i32>,
     pub from_address: String,
     pub from_name: Option<String>,

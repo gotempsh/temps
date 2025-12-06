@@ -72,12 +72,18 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     }),
     enabled: !!project.slug && !!deploymentId,
     refetchInterval: (query) => {
-      // Only auto-refresh if deployment is in a non-final state
-      const status = query.state.data?.status
+      const data = query.state.data
+      const status = data?.status
+      // Auto-refresh if deployment is in a non-final state
       if (status === 'pending' || status === 'running') {
         return 5000 // Refresh every 5 seconds
       }
-      return false // Don't refresh for completed, failed, cancelled, or paused deployments
+      // Also refresh if deployment is completed but screenshot is not yet available
+      // (screenshot job runs after deployment is marked complete)
+      if (status === 'completed' && !data?.screenshot_location) {
+        return 3000 // Refresh every 3 seconds while waiting for screenshot
+      }
+      return false // Don't refresh for completed (with screenshot), failed, cancelled, or paused deployments
     },
   })
 
@@ -580,7 +586,9 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
                           <p className="text-muted-foreground">
                             {deployment.status === 'completed'
                               ? 'Generating screenshot...'
-                              : 'Building...'}
+                              : deployment.status === 'running'
+                                ? 'Deployment in progress...'
+                                : 'Waiting for deployment...'}
                           </p>
                         </CardContent>
                       </Card>
@@ -657,6 +665,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           defaultBranch={deployment?.branch || ''}
           defaultCommit={deployment?.commit_hash || ''}
           defaultTag={deployment?.tag || ''}
+          defaultType="commit"
           defaultEnvironment={deployment?.environment_id || 0}
           isLoading={createDeployment.isPending}
         />

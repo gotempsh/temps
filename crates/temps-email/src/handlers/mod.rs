@@ -33,6 +33,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         domains::create_domain,
         domains::list_domains,
         domains::get_domain,
+        domains::get_domain_by_name,
+        domains::get_domain_dns_records,
         domains::verify_domain,
         domains::delete_domain,
         // Emails

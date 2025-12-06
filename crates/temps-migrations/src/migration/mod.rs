@@ -11,6 +11,9 @@ mod m20251121_000001_create_webhooks;
 mod m20251203_000001_create_email_tables;
 mod m20251204_000001_create_deployment_tokens;
 mod m20251205_000001_create_dns_providers;
+mod m20251206_000001_make_email_domain_id_optional;
+mod m20251206_000002_add_encrypted_token_to_deployment_tokens;
+mod m20251206_000003_alter_visitor_custom_data_to_jsonb;
 
 pub struct Migrator;
 
@@ -29,6 +32,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20251203_000001_create_email_tables::Migration),
             Box::new(m20251204_000001_create_deployment_tokens::Migration),
             Box::new(m20251205_000001_create_dns_providers::Migration),
+            Box::new(m20251206_000001_make_email_domain_id_optional::Migration),
+            Box::new(m20251206_000002_add_encrypted_token_to_deployment_tokens::Migration),
+            Box::new(m20251206_000003_alter_visitor_custom_data_to_jsonb::Migration),
         ]
     }
 }

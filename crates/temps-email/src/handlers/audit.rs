@@ -201,7 +201,6 @@ impl AuditOperation for EmailDomainDeletedAudit {
 pub struct EmailSentAudit {
     pub context: AuditContext,
     pub email_id: uuid::Uuid,
-    pub domain_id: i32,
     pub from: String,
     pub to: Vec<String>,
     pub subject: String,

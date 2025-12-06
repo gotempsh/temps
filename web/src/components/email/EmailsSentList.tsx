@@ -3,12 +3,6 @@
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Input } from '@/components/ui/input'
 import {
@@ -28,7 +22,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useQuery } from '@tanstack/react-query'
-import { format, formatDistanceToNow } from 'date-fns'
+import { formatDistanceToNow } from 'date-fns'
 import {
   AlertCircle,
   Archive,
@@ -41,6 +35,7 @@ import {
   Search,
 } from 'lucide-react'
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 
 // Types
 interface Email {
@@ -116,14 +111,6 @@ async function getEmailStats(domainId?: number): Promise<EmailStats> {
   return response.json()
 }
 
-async function getEmail(id: string): Promise<Email> {
-  const response = await fetch(`/api/emails/${id}`)
-  if (!response.ok) {
-    throw new Error('Failed to fetch email')
-  }
-  return response.json()
-}
-
 async function listEmailDomains(): Promise<EmailDomain[]> {
   const response = await fetch('/api/email-domains')
   if (!response.ok) {
@@ -194,105 +181,6 @@ function StatsCard({
   )
 }
 
-function EmailDetailContent({ email }: { email: Email }) {
-  return (
-    <div className="space-y-6">
-      <div className="grid grid-cols-2 gap-4">
-        <div>
-          <h4 className="text-sm font-medium text-muted-foreground">From</h4>
-          <p className="text-sm">
-            {email.from_name ? `${email.from_name} <${email.from_address}>` : email.from_address}
-          </p>
-        </div>
-        <div>
-          <h4 className="text-sm font-medium text-muted-foreground">Status</h4>
-          <div className="mt-1">
-            <StatusBadge status={email.status} />
-          </div>
-        </div>
-        <div>
-          <h4 className="text-sm font-medium text-muted-foreground">To</h4>
-          <p className="text-sm">{email.to_addresses.join(', ')}</p>
-        </div>
-        <div>
-          <h4 className="text-sm font-medium text-muted-foreground">Date</h4>
-          <p className="text-sm">
-            {email.sent_at
-              ? format(new Date(email.sent_at), 'PPpp')
-              : format(new Date(email.created_at), 'PPpp')}
-          </p>
-        </div>
-        {email.cc_addresses && email.cc_addresses.length > 0 && (
-          <div>
-            <h4 className="text-sm font-medium text-muted-foreground">CC</h4>
-            <p className="text-sm">{email.cc_addresses.join(', ')}</p>
-          </div>
-        )}
-        {email.reply_to && (
-          <div>
-            <h4 className="text-sm font-medium text-muted-foreground">Reply-To</h4>
-            <p className="text-sm">{email.reply_to}</p>
-          </div>
-        )}
-      </div>
-
-      <div>
-        <h4 className="text-sm font-medium text-muted-foreground mb-2">Subject</h4>
-        <p className="text-sm font-medium">{email.subject}</p>
-      </div>
-
-      {email.error_message && (
-        <div className="bg-destructive/10 border border-destructive/30 rounded-lg p-4">
-          <h4 className="text-sm font-medium text-destructive mb-1">Error</h4>
-          <p className="text-sm text-destructive">{email.error_message}</p>
-        </div>
-      )}
-
-      {email.tags && email.tags.length > 0 && (
-        <div>
-          <h4 className="text-sm font-medium text-muted-foreground mb-2">Tags</h4>
-          <div className="flex flex-wrap gap-1">
-            {email.tags.map((tag) => (
-              <Badge key={tag} variant="outline">
-                {tag}
-              </Badge>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {email.provider_message_id && (
-        <div>
-          <h4 className="text-sm font-medium text-muted-foreground mb-1">
-            Provider Message ID
-          </h4>
-          <p className="text-xs font-mono text-muted-foreground break-all">
-            {email.provider_message_id}
-          </p>
-        </div>
-      )}
-
-      {(email.html_body || email.text_body) && (
-        <div>
-          <h4 className="text-sm font-medium text-muted-foreground mb-2">
-            Preview
-          </h4>
-          {email.html_body ? (
-            <div
-              className="border rounded-lg p-4 bg-white text-black max-h-[400px] overflow-y-auto"
-              dangerouslySetInnerHTML={{ __html: email.html_body }}
-            />
-          ) : (
-            <pre className="border rounded-lg p-4 bg-muted/50 text-sm whitespace-pre-wrap max-h-[400px] overflow-y-auto">
-              {email.text_body}
-            </pre>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
-
 function LoadingSkeleton() {
   return (
     <div className="space-y-4">
@@ -319,7 +207,7 @@ function LoadingSkeleton() {
 }
 
 export function EmailsSentList() {
-  const [selectedEmailId, setSelectedEmailId] = useState<string | null>(null)
+  const navigate = useNavigate()
   const [filters, setFilters] = useState({
     domain_id: undefined as number | undefined,
     status: undefined as string | undefined,
@@ -340,12 +228,6 @@ export function EmailsSentList() {
   const { data: domains } = useQuery({
     queryKey: ['email-domains'],
     queryFn: listEmailDomains,
-  })
-
-  const { data: selectedEmail } = useQuery({
-    queryKey: ['email', selectedEmailId],
-    queryFn: () => (selectedEmailId ? getEmail(selectedEmailId) : null),
-    enabled: !!selectedEmailId,
   })
 
   const totalPages = emails ? Math.ceil(emails.total / filters.page_size) : 0
@@ -482,7 +364,7 @@ export function EmailsSentList() {
                   <TableRow
                     key={email.id}
                     className="cursor-pointer hover:bg-muted/50"
-                    onClick={() => setSelectedEmailId(email.id)}
+                    onClick={() => navigate(`/email/${email.id}`)}
                   >
                     <TableCell className="max-w-[300px]">
                       <div className="font-medium truncate">{email.subject}</div>
@@ -543,27 +425,6 @@ export function EmailsSentList() {
           )}
         </>
       )}
-
-      {/* Email Detail Dialog */}
-      <Dialog
-        open={!!selectedEmailId}
-        onOpenChange={(open) => !open && setSelectedEmailId(null)}
-      >
-        <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
-          <DialogHeader>
-            <DialogTitle>Email Details</DialogTitle>
-          </DialogHeader>
-          {selectedEmail ? (
-            <EmailDetailContent email={selectedEmail} />
-          ) : (
-            <div className="space-y-4">
-              <Skeleton className="h-4 w-full" />
-              <Skeleton className="h-4 w-3/4" />
-              <Skeleton className="h-32 w-full" />
-            </div>
-          )}
-        </DialogContent>
-      </Dialog>
     </div>
   )
 }

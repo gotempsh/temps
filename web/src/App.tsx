@@ -70,6 +70,13 @@ const AddGitProvider = lazy(() =>
   import('./pages/AddGitProvider').then((m) => ({ default: m.AddGitProvider }))
 )
 const GitProviderDetail = lazy(() => import('./pages/GitProviderDetail'))
+const DnsProviders = lazy(() =>
+  import('./pages/DnsProviders').then((m) => ({ default: m.DnsProviders }))
+)
+const AddDnsProvider = lazy(() =>
+  import('./pages/AddDnsProvider').then((m) => ({ default: m.AddDnsProvider }))
+)
+const DnsProviderDetail = lazy(() => import('./pages/DnsProviderDetail'))
 const Domains = lazy(() =>
   import('./pages/Domains').then((m) => ({ default: m.Domains }))
 )
@@ -110,6 +117,9 @@ const Notifications = lazy(() =>
 )
 const Email = lazy(() =>
   import('./pages/Email').then((m) => ({ default: m.Email }))
+)
+const EmailDetail = lazy(() =>
+  import('./pages/EmailDetail').then((m) => ({ default: m.EmailDetail }))
 )
 const ExternalConnectivitySetup = lazy(() =>
   import('./pages/ExternalConnectivitySetup').then((m) => ({
@@ -306,6 +316,18 @@ const AppContent = () => {
                                     element={<GitProviderDetail />}
                                   />
                                   <Route
+                                    path="/dns-providers"
+                                    element={<DnsProviders />}
+                                  />
+                                  <Route
+                                    path="/dns-providers/add"
+                                    element={<AddDnsProvider />}
+                                  />
+                                  <Route
+                                    path="/dns-providers/:id"
+                                    element={<DnsProviderDetail />}
+                                  />
+                                  <Route
                                     path="/domains"
                                     element={<Domains />}
                                   />
@@ -384,6 +406,10 @@ const AppContent = () => {
                                   <Route
                                     path="/email"
                                     element={<Email />}
+                                  />
+                                  <Route
+                                    path="/email/:id"
+                                    element={<EmailDetail />}
                                   />
                                   <Route
                                     path="/settings/audit-logs"

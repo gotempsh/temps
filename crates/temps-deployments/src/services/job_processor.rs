@@ -1102,6 +1102,7 @@ mod tests {
             external_service_manager,
             config_service,
             dsn_service,
+            encryption_service.clone(),
         ));
 
         // Create test project, environment, and deployment
@@ -1182,6 +1183,7 @@ mod tests {
             external_service_manager,
             config_service,
             dsn_service,
+            encryption_service.clone(),
         ));
 
         // Create project without git info (empty repo_owner and repo_name)
@@ -1283,6 +1285,7 @@ mod tests {
             external_service_manager,
             config_service,
             dsn_service,
+            encryption_service.clone(),
         ));
 
         // Create test setup
