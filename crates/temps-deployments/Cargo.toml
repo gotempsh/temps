@@ -21,6 +21,7 @@ temps-queue = { path = "../temps-queue" }
 temps-providers = { path = "../temps-providers" }
 temps-presets = { path = "../temps-presets" }
 temps-screenshots = { path = "../temps-screenshots" }
+temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 serde = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

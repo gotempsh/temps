@@ -49,6 +49,7 @@ temps-queue = { path = "../temps-queue" }
 temps-screenshots = { path = "../temps-screenshots" }
 temps-status-page = { path = "../temps-status-page" }
 temps-static-files = { path = "../temps-static-files" }
+temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 temps-webhooks = { path = "../temps-webhooks" }
 tokio-util = { workspace = true }
 

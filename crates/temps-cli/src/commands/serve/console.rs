@@ -48,6 +48,7 @@ use temps_queue::QueuePlugin;
 use temps_screenshots::ScreenshotsPlugin;
 use temps_static_files::StaticFilesPlugin;
 use temps_status_page::StatusPagePlugin;
+use temps_vulnerability_scanner::VulnerabilityScannerPlugin;
 use temps_webhooks::WebhooksPlugin;
 use tokio::net::TcpListener;
 use tracing::{debug, info};
@@ -674,6 +675,11 @@ pub async fn start_console_api(
     debug!("Registering StaticFilesPlugin");
     let static_files_plugin = Box::new(StaticFilesPlugin::new());
     plugin_manager.register_plugin(static_files_plugin);
+
+    // 15. VulnerabilityScannerPlugin - provides vulnerability scanning (depends on database and audit)
+    debug!("Registering VulnerabilityScannerPlugin");
+    let vulnerability_scanner_plugin = Box::new(VulnerabilityScannerPlugin::new());
+    plugin_manager.register_plugin(vulnerability_scanner_plugin);
 
     // Initialize all plugins
     debug!("Initializing plugins");

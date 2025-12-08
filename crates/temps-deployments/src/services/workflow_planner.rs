@@ -735,6 +735,36 @@ impl WorkflowPlanner {
             debug!("Skipping screenshot job - screenshots are disabled in config");
         }
 
+        // Job 7: Scan for vulnerabilities (only if git info is available)
+        // This runs in parallel with other post-deployment jobs AFTER deployment is marked complete
+        // NOT required for deployment completion - if it fails, deployment still succeeds
+        if has_git_info {
+            jobs.push(JobDefinition {
+                job_id: "scan_vulnerabilities".to_string(),
+                job_type: "ScanVulnerabilitiesJob".to_string(),
+                name: "Scan Vulnerabilities".to_string(),
+                description: Some(
+                    "Scan deployed application for security vulnerabilities".to_string(),
+                ),
+                // Depends on mark_deployment_complete - ensures deployment is live before scanning
+                dependencies: vec!["mark_deployment_complete".to_string()],
+                job_config: Some(serde_json::json!({
+                    "deployment_id": deployment.id,
+                    "project_id": project.id,
+                    "environment_id": deployment.environment_id,
+                    "branch": deployment.branch_ref,
+                    "commit_hash": deployment.commit_sha,
+                    "download_job_id": "download_repo"
+                })),
+                required_for_completion: false, // Post-deployment job - not required for deployment success
+            });
+            debug!(
+                "Added scan_vulnerabilities job to workflow (runs after deployment is marked complete)"
+            );
+        } else {
+            debug!("Skipping vulnerability scan job - no git info available");
+        }
+
         info!("Planned {} jobs for project {}", jobs.len(), project.name);
         Ok(jobs)
     }

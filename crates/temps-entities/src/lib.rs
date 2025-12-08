@@ -77,4 +77,8 @@ pub mod status_monitors;
 pub mod webhook_deliveries;
 pub mod webhooks;
 
+// Vulnerability scanner entities
+pub mod vulnerabilities;
+pub mod vulnerability_scans;
+
 pub mod prelude;

@@ -15,6 +15,7 @@ mod m20251206_000001_make_email_domain_id_optional;
 mod m20251206_000002_add_encrypted_token_to_deployment_tokens;
 mod m20251206_000003_alter_visitor_custom_data_to_jsonb;
 mod m20251206_000004_add_route_type_to_custom_routes;
+mod m20251208_000001_create_vulnerability_scans;
 
 pub struct Migrator;
 
@@ -37,6 +38,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20251206_000002_add_encrypted_token_to_deployment_tokens::Migration),
             Box::new(m20251206_000003_alter_visitor_custom_data_to_jsonb::Migration),
             Box::new(m20251206_000004_add_route_type_to_custom_routes::Migration),
+            Box::new(m20251208_000001_create_vulnerability_scans::Migration),
         ]
     }
 }

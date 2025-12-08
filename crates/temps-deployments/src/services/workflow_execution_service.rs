@@ -638,6 +638,82 @@ impl WorkflowExecutionService {
                 Ok(Arc::new(job))
             }
 
+            "ScanVulnerabilitiesJob" => {
+                let config = db_job.job_config.as_ref().ok_or_else(|| {
+                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
+                })?;
+
+                let deployment_id = config
+                    .get("deployment_id")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "deployment_id is required".to_string(),
+                        )
+                    })? as i32;
+
+                let project_id = config
+                    .get("project_id")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "project_id is required".to_string(),
+                        )
+                    })? as i32;
+
+                let environment_id = config
+                    .get("environment_id")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "environment_id is required".to_string(),
+                        )
+                    })? as i32;
+
+                let branch = config
+                    .get("branch")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig("branch is required".to_string())
+                    })?
+                    .to_string();
+
+                let commit_hash = config
+                    .get("commit_hash")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "commit_hash is required".to_string(),
+                        )
+                    })?
+                    .to_string();
+
+                let download_job_id = config
+                    .get("download_job_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "download_job_id is required".to_string(),
+                        )
+                    })?
+                    .to_string();
+
+                let job = crate::jobs::ScanVulnerabilitiesJob::new(
+                    db_job.job_id.clone(),
+                    deployment_id,
+                    project_id,
+                    environment_id,
+                    branch,
+                    commit_hash,
+                    download_job_id,
+                    self.db.clone(),
+                )
+                .with_log_id(db_job.log_id.clone())
+                .with_log_service(self.log_service.clone());
+
+                Ok(Arc::new(job))
+            }
+
             "DeployStaticJob" => {
                 let config = db_job.job_config.as_ref().ok_or_else(|| {
                     WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())

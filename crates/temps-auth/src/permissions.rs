@@ -181,6 +181,12 @@ pub enum Permission {
     DeploymentTokensWrite,
     DeploymentTokensCreate,
     DeploymentTokensDelete,
+
+    // Vulnerability Scanner permissions
+    VulnerabilityScansRead,
+    VulnerabilityScansWrite,
+    VulnerabilityScansCreate,
+    VulnerabilityScansDelete,
 }
 
 impl fmt::Display for Permission {
@@ -296,6 +302,10 @@ impl fmt::Display for Permission {
             Permission::DeploymentTokensWrite => "deployment_tokens:write",
             Permission::DeploymentTokensCreate => "deployment_tokens:create",
             Permission::DeploymentTokensDelete => "deployment_tokens:delete",
+            Permission::VulnerabilityScansRead => "vulnerability_scans:read",
+            Permission::VulnerabilityScansWrite => "vulnerability_scans:write",
+            Permission::VulnerabilityScansCreate => "vulnerability_scans:create",
+            Permission::VulnerabilityScansDelete => "vulnerability_scans:delete",
         };
         write!(f, "{}", name)
     }
@@ -415,6 +425,10 @@ impl Permission {
             "deployment_tokens:write" => Some(Permission::DeploymentTokensWrite),
             "deployment_tokens:create" => Some(Permission::DeploymentTokensCreate),
             "deployment_tokens:delete" => Some(Permission::DeploymentTokensDelete),
+            "vulnerability_scans:read" => Some(Permission::VulnerabilityScansRead),
+            "vulnerability_scans:write" => Some(Permission::VulnerabilityScansWrite),
+            "vulnerability_scans:create" => Some(Permission::VulnerabilityScansCreate),
+            "vulnerability_scans:delete" => Some(Permission::VulnerabilityScansDelete),
             _ => None,
         }
     }
@@ -531,6 +545,10 @@ impl Permission {
             Permission::DeploymentTokensWrite,
             Permission::DeploymentTokensCreate,
             Permission::DeploymentTokensDelete,
+            Permission::VulnerabilityScansRead,
+            Permission::VulnerabilityScansWrite,
+            Permission::VulnerabilityScansCreate,
+            Permission::VulnerabilityScansDelete,
         ]
     }
 }
@@ -698,6 +716,10 @@ impl Role {
                 Permission::DeploymentTokensWrite,
                 Permission::DeploymentTokensCreate,
                 Permission::DeploymentTokensDelete,
+                Permission::VulnerabilityScansRead,
+                Permission::VulnerabilityScansWrite,
+                Permission::VulnerabilityScansCreate,
+                Permission::VulnerabilityScansDelete,
             ],
             Role::User => &[
                 Permission::ProjectsRead,
@@ -780,6 +802,9 @@ impl Role {
                 Permission::DeploymentTokensRead,
                 Permission::DeploymentTokensWrite,
                 Permission::DeploymentTokensCreate,
+                Permission::VulnerabilityScansRead,
+                Permission::VulnerabilityScansWrite,
+                Permission::VulnerabilityScansCreate,
             ],
             Role::Reader => &[
                 Permission::ProjectsRead,
@@ -813,6 +838,7 @@ impl Role {
                 Permission::EmailDomainsRead,
                 Permission::EmailsRead,
                 Permission::DeploymentTokensRead,
+                Permission::VulnerabilityScansRead,
             ],
             Role::Mcp => &[
                 Permission::ProjectsRead,
