@@ -71,6 +71,49 @@ pub struct ImageOutput {
     pub dockerfile_path: PathBuf,
 }
 
+impl ImageOutput {
+    /// Extract ImageOutput from WorkflowContext
+    pub fn from_context(
+        context: &WorkflowContext,
+        build_job_id: &str,
+    ) -> Result<Self, WorkflowError> {
+        let image_tag: String =
+            context
+                .get_output(build_job_id, "image_tag")?
+                .ok_or_else(|| {
+                    WorkflowError::JobValidationFailed("image_tag output not found".to_string())
+                })?;
+        let image_id: String = context
+            .get_output(build_job_id, "image_id")?
+            .ok_or_else(|| {
+                WorkflowError::JobValidationFailed("image_id output not found".to_string())
+            })?;
+        let size_bytes: u64 = context
+            .get_output(build_job_id, "size_bytes")?
+            .ok_or_else(|| {
+                WorkflowError::JobValidationFailed("size_bytes output not found".to_string())
+            })?;
+        let build_context_str: String = context
+            .get_output(build_job_id, "build_context")?
+            .ok_or_else(|| {
+                WorkflowError::JobValidationFailed("build_context output not found".to_string())
+            })?;
+        let dockerfile_path_str: String = context
+            .get_output(build_job_id, "dockerfile_path")?
+            .ok_or_else(|| {
+                WorkflowError::JobValidationFailed("dockerfile_path output not found".to_string())
+            })?;
+
+        Ok(Self {
+            image_tag,
+            image_id,
+            size_bytes,
+            build_context: PathBuf::from(build_context_str),
+            dockerfile_path: PathBuf::from(dockerfile_path_str),
+        })
+    }
+}
+
 /// Configuration for building images
 #[derive(Debug, Clone)]
 pub struct BuildConfig {

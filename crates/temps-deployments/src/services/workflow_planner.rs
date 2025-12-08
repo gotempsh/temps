@@ -743,18 +743,17 @@ impl WorkflowPlanner {
                 job_id: "scan_vulnerabilities".to_string(),
                 job_type: "ScanVulnerabilitiesJob".to_string(),
                 name: "Scan Vulnerabilities".to_string(),
-                description: Some(
-                    "Scan deployed application for security vulnerabilities".to_string(),
-                ),
-                // Depends on mark_deployment_complete - ensures deployment is live before scanning
-                dependencies: vec!["mark_deployment_complete".to_string()],
+                description: Some("Scan Docker image for security vulnerabilities".to_string()),
+                // Depends on build_image - needs the Docker image to scan
+                dependencies: vec!["build_image".to_string()],
                 job_config: Some(serde_json::json!({
                     "deployment_id": deployment.id,
                     "project_id": project.id,
                     "environment_id": deployment.environment_id,
                     "branch": deployment.branch_ref,
                     "commit_hash": deployment.commit_sha,
-                    "download_job_id": "download_repo"
+                    "download_job_id": "download_repo",
+                    "build_job_id": "build_image"
                 })),
                 required_for_completion: false, // Post-deployment job - not required for deployment success
             });

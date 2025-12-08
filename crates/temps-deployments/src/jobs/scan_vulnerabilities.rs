@@ -15,7 +15,7 @@ use temps_vulnerability_scanner::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::jobs::RepositoryOutput;
+use crate::jobs::{ImageOutput, RepositoryOutput};
 
 /// Output from ScanVulnerabilitiesJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +37,7 @@ pub struct ScanVulnerabilitiesJob {
     branch: String,
     commit_hash: String,
     download_job_id: String,
+    build_job_id: String,
     db: Arc<DbConnection>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
@@ -51,6 +52,7 @@ impl std::fmt::Debug for ScanVulnerabilitiesJob {
             .field("environment_id", &self.environment_id)
             .field("branch", &self.branch)
             .field("commit_hash", &self.commit_hash)
+            .field("build_job_id", &self.build_job_id)
             .finish()
     }
 }
@@ -64,6 +66,7 @@ impl ScanVulnerabilitiesJob {
         branch: String,
         commit_hash: String,
         download_job_id: String,
+        build_job_id: String,
         db: Arc<DbConnection>,
     ) -> Self {
         Self {
@@ -74,6 +77,7 @@ impl ScanVulnerabilitiesJob {
             branch,
             commit_hash,
             download_job_id,
+            build_job_id,
             db,
             log_id: None,
             log_service: None,
@@ -147,19 +151,11 @@ impl WorkflowTask for ScanVulnerabilitiesJob {
         self.log("🔍 Starting vulnerability scan...".to_string())
             .await?;
 
-        // Get repo path from download job output
-        let repo_output = RepositoryOutput::from_context(&context, &self.download_job_id)?;
-        let repo_path = &repo_output.repo_dir;
+        // Get image tag from build job output
+        let image_output = ImageOutput::from_context(&context, &self.build_job_id)?;
+        let image_tag = &image_output.image_tag;
 
-        // Verify repo path exists
-        if !repo_path.exists() {
-            let error_msg = format!("Repository path does not exist: {}", repo_path.display());
-            error!("{}", error_msg);
-            self.log(format!("❌ {}", error_msg)).await?;
-            return Err(WorkflowError::JobValidationFailed(error_msg));
-        }
-
-        self.log(format!("Scanning repository at: {}", repo_path.display()))
+        self.log(format!("Scanning Docker image: {}", image_tag))
             .await?;
 
         // Initialize Trivy scanner
@@ -219,11 +215,11 @@ impl WorkflowTask for ScanVulnerabilitiesJob {
 
         let scan_id = scan.id;
 
-        // Execute scan (this handles everything: scanning, saving vulnerabilities, updating scan record)
-        self.log("Running Trivy scan (this may take a few minutes)...".to_string())
+        // Execute image scan (this handles everything: scanning, saving vulnerabilities, updating scan record)
+        self.log("Running Trivy image scan (this may take a few minutes)...".to_string())
             .await?;
 
-        let scan_result = match scan_service.execute_scan(scan_id, repo_path).await {
+        let scan_result = match scan_service.execute_image_scan(scan_id, image_tag).await {
             Ok(result) => {
                 self.log(format!(
                     "✅ Scan complete - Found {} vulnerabilities",
@@ -233,7 +229,7 @@ impl WorkflowTask for ScanVulnerabilitiesJob {
                 result
             }
             Err(e) => {
-                let error_msg = format!("Scan execution failed: {}", e);
+                let error_msg = format!("Image scan execution failed: {}", e);
                 error!("{}", error_msg);
                 self.log(format!("❌ {}", error_msg)).await?;
                 return Err(WorkflowError::JobExecutionFailed(error_msg));

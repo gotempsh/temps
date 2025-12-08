@@ -636,7 +636,13 @@ pub async fn start_console_api(
     let error_tracking_plugin = Box::new(ErrorTrackingPlugin::new());
     plugin_manager.register_plugin(error_tracking_plugin);
 
-    // 9. DeploymentsPlugin - provides deployment orchestration (depends on deployer and screenshots)
+    // 8.5. VulnerabilityScannerPlugin - provides vulnerability scanning (depends on database and audit)
+    // MUST be registered before DeploymentsPlugin since deployments depend on vulnerability scanner services
+    debug!("Registering VulnerabilityScannerPlugin");
+    let vulnerability_scanner_plugin = Box::new(VulnerabilityScannerPlugin::new());
+    plugin_manager.register_plugin(vulnerability_scanner_plugin);
+
+    // 9. DeploymentsPlugin - provides deployment orchestration (depends on deployer, screenshots, and vulnerability scanner)
     debug!("Registering DeploymentsPlugin");
     let deployments_plugin = Box::new(DeploymentsPlugin::new());
     plugin_manager.register_plugin(deployments_plugin);
@@ -675,11 +681,6 @@ pub async fn start_console_api(
     debug!("Registering StaticFilesPlugin");
     let static_files_plugin = Box::new(StaticFilesPlugin::new());
     plugin_manager.register_plugin(static_files_plugin);
-
-    // 15. VulnerabilityScannerPlugin - provides vulnerability scanning (depends on database and audit)
-    debug!("Registering VulnerabilityScannerPlugin");
-    let vulnerability_scanner_plugin = Box::new(VulnerabilityScannerPlugin::new());
-    plugin_manager.register_plugin(vulnerability_scanner_plugin);
 
     // Initialize all plugins
     debug!("Initializing plugins");

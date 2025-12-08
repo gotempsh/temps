@@ -698,6 +698,16 @@ impl WorkflowExecutionService {
                     })?
                     .to_string();
 
+                let build_job_id = config
+                    .get("build_job_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "build_job_id is required".to_string(),
+                        )
+                    })?
+                    .to_string();
+
                 let job = crate::jobs::ScanVulnerabilitiesJob::new(
                     db_job.job_id.clone(),
                     deployment_id,
@@ -706,6 +716,7 @@ impl WorkflowExecutionService {
                     branch,
                     commit_hash,
                     download_job_id,
+                    build_job_id,
                     self.db.clone(),
                 )
                 .with_log_id(db_job.log_id.clone())
