@@ -385,6 +385,12 @@ impl BuildImageJob {
             .map(|(key, _)| key.clone())
             .collect();
 
+        // Get repository output to extract repo name for project slug
+        let repo_output = RepositoryOutput::from_context(context, &self.download_job_id)?;
+
+        // Use repo name as project slug (sanitized: lowercase, hyphens to underscores)
+        let project_slug = repo_output.repo_name.replace("-", "_").to_lowercase();
+
         // Generate Dockerfile content with build args
         // Use build_context_dir as both root and local path so preset detection works correctly
         // TODO: Get use_buildkit from ImageBuilder configuration
@@ -396,7 +402,7 @@ impl BuildImageJob {
                 build_command: None,           // auto-detect
                 output_dir: None,              // auto-detect
                 build_vars: Some(&build_vars), // ARG directives for env vars
-                project_slug: "deployment",
+                project_slug: &project_slug,
                 use_buildkit: true, // Enable BuildKit for faster builds and caching
             })
             .await;

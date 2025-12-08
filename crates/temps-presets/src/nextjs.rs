@@ -209,6 +209,18 @@ WORKDIR /{project_slug}
             format!("RUN {}", build_cmd)
         };
 
+        // Generate prune command based on detected package manager
+        let prune_cmd = match package_manager {
+            PackageManager::Npm => "npm prune --production",
+            PackageManager::Pnpm => "pnpm prune --prod",
+            PackageManager::Yarn => "yarn install --production --ignore-scripts",
+            PackageManager::Bun => {
+                // Bun doesn't have a built-in prune command, but we can remove devDependencies manually
+                // Using a single-line rm command that works with /root/.bun/bin/bun path
+                "/root/.bun/bin/bun pm cache rm && rm -rf node_modules && /root/.bun/bin/bun install --production"
+            }
+        };
+
         dockerfile.push_str(&format!(
             r#"
 # Build the application
@@ -218,7 +230,7 @@ WORKDIR /{project_slug}
 RUN mkdir -p public
 
 # Prune dev dependencies for smaller production image
-RUN npm prune --production 2>/dev/null || yarn install --production --ignore-scripts 2>/dev/null || true
+RUN {}
 
 # Stage 2: Production using Google's Distroless image
 # No shell, no wget, no package managers = maximum security
@@ -229,6 +241,7 @@ WORKDIR /{project_slug}
 
 "#,
             build_cmd_line,
+            prune_cmd,
             project_slug = project_slug,
             run_image = run_image,
         ));
