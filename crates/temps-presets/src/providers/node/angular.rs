@@ -57,6 +57,7 @@ impl PresetProvider for AngularPresetProvider {
             port: 80,
             is_static: build_config.static_serve,
             build_env: Vec::new(),
+            is_nextjs_standalone: false,
         };
 
         Ok(generate_node_dockerfile(app, dockerfile_config))

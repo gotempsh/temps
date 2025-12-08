@@ -1,5 +1,7 @@
 import {
+  enrichVisitorMutation,
   getVisitorDetailsOptions,
+  getVisitorDetailsQueryKey,
   getVisitorSessions2Options,
   getVisitorSessionsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -31,7 +33,18 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { useQuery } from '@tanstack/react-query'
+import { Textarea } from '@/components/ui/textarea'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Label } from '@/components/ui/label'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 import { format } from 'date-fns'
 import {
   Activity,
@@ -42,8 +55,11 @@ import {
   ChevronRight,
   Clock,
   Globe as MapPinIcon,
+  Loader2,
   Monitor,
+  Pencil,
   PlayCircle,
+  Plus,
   Smartphone,
   Users as UserIcon,
 } from 'lucide-react'
@@ -163,9 +179,13 @@ function BrowserDeviceInfo({
 
 export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const [searchParams, setSearchParams] = useSearchParams()
   const [page, setPage] = React.useState(1)
   const [limit, setLimit] = React.useState(25)
+  const [isEnrichDialogOpen, setIsEnrichDialogOpen] = React.useState(false)
+  const [enrichJsonValue, setEnrichJsonValue] = React.useState('')
+  const [enrichJsonError, setEnrichJsonError] = React.useState<string | null>(null)
 
   // Get the active tab from URL or default to 'sessions'
   const activeTab = searchParams.get('tab') || 'sessions'
@@ -223,6 +243,64 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
     }),
     enabled: !!visitorDetails?.id,
   })
+
+  // Mutation for enriching visitor data
+  const enrichMutation = useMutation({
+    ...enrichVisitorMutation(),
+    onSuccess: () => {
+      toast.success('Visitor data enriched successfully')
+      setIsEnrichDialogOpen(false)
+      setEnrichJsonValue('')
+      setEnrichJsonError(null)
+      // Invalidate the visitor details query to refetch
+      queryClient.invalidateQueries({
+        queryKey: getVisitorDetailsQueryKey({
+          path: { visitor_id: visitorId },
+          query: { project_id: project.id },
+        }),
+      })
+    },
+    onError: (error: any) => {
+      toast.error('Failed to enrich visitor data', {
+        description: error?.message || 'Please try again',
+      })
+    },
+  })
+
+  // Handle opening the enrich dialog
+  const handleOpenEnrichDialog = () => {
+    // Pre-populate with existing custom_data if available
+    if (visitorDetails?.custom_data && Object.keys(visitorDetails.custom_data).length > 0) {
+      setEnrichJsonValue(JSON.stringify(visitorDetails.custom_data, null, 2))
+    } else {
+      setEnrichJsonValue('{\n  \n}')
+    }
+    setEnrichJsonError(null)
+    setIsEnrichDialogOpen(true)
+  }
+
+  // Handle submitting the enrich form
+  const handleEnrichSubmit = () => {
+    try {
+      const parsedData = JSON.parse(enrichJsonValue)
+      if (typeof parsedData !== 'object' || parsedData === null || Array.isArray(parsedData)) {
+        setEnrichJsonError('Custom data must be a JSON object (not an array or primitive)')
+        return
+      }
+      setEnrichJsonError(null)
+
+      // Use visitor_id GUID if available, otherwise use numeric ID
+      const visitorIdToUse = visitorDetails?.visitor_id || visitorId.toString()
+
+      enrichMutation.mutate({
+        path: { visitor_id: visitorIdToUse },
+        query: { project_id: project.id },
+        body: { custom_data: parsedData },
+      })
+    } catch {
+      setEnrichJsonError('Invalid JSON format')
+    }
+  }
 
   const formatDuration = (seconds: number) => {
     if (seconds < 60) return `${Math.round(seconds)}s`
@@ -284,6 +362,16 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
           </h2>
           <p className="text-muted-foreground">ID: {visitorId}</p>
         </div>
+        {visitorDetails && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleOpenEnrichDialog}
+          >
+            <Pencil className="h-4 w-4 mr-2" />
+            Enrich Visitor
+          </Button>
+        )}
       </div>
 
       {/* Visitor Info Section - Independent error handling */}
@@ -831,6 +919,73 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
           </Card>
         </TabsContent>
       </Tabs>
+
+      {/* Enrich Visitor Dialog */}
+      <Dialog open={isEnrichDialogOpen} onOpenChange={setIsEnrichDialogOpen}>
+        <DialogContent className="sm:max-w-[600px]">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Pencil className="h-5 w-5" />
+              Enrich Visitor Data
+            </DialogTitle>
+            <DialogDescription>
+              Add or update custom data for this visitor. The data will be merged with existing custom data.
+              Enter valid JSON object format.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <Label htmlFor="custom_data">Custom Data (JSON)</Label>
+              <Textarea
+                id="custom_data"
+                value={enrichJsonValue}
+                onChange={(e) => {
+                  setEnrichJsonValue(e.target.value)
+                  setEnrichJsonError(null)
+                }}
+                placeholder='{"email": "user@example.com", "name": "John Doe", "plan": "premium"}'
+                className="font-mono text-sm min-h-[200px]"
+              />
+              {enrichJsonError && (
+                <p className="text-sm text-destructive">{enrichJsonError}</p>
+              )}
+            </div>
+            <div className="text-sm text-muted-foreground">
+              <p className="font-medium mb-1">Examples:</p>
+              <ul className="list-disc list-inside space-y-1">
+                <li><code className="bg-muted px-1 rounded">{`{"email": "user@example.com"}`}</code></li>
+                <li><code className="bg-muted px-1 rounded">{`{"company": "Acme Inc", "role": "admin"}`}</code></li>
+                <li><code className="bg-muted px-1 rounded">{`{"userId": 12345, "isPremium": true}`}</code></li>
+              </ul>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setIsEnrichDialogOpen(false)}
+              disabled={enrichMutation.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleEnrichSubmit}
+              disabled={enrichMutation.isPending || !enrichJsonValue.trim()}
+            >
+              {enrichMutation.isPending ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Saving...
+                </>
+              ) : (
+                <>
+                  <Plus className="h-4 w-4 mr-2" />
+                  Enrich Visitor
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

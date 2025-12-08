@@ -63,6 +63,9 @@ const Users = lazy(() =>
 const CustomRoutes = lazy(() =>
   import('./pages/Routes').then((m) => ({ default: m.Routes }))
 )
+const AddRoute = lazy(() =>
+  import('./pages/AddRoute').then((m) => ({ default: m.AddRoute }))
+)
 const GitSources = lazy(() =>
   import('./pages/GitSources').then((m) => ({ default: m.GitSources }))
 )
@@ -302,6 +305,10 @@ const AppContent = () => {
                                   <Route
                                     path="/load-balancer"
                                     element={<CustomRoutes />}
+                                  />
+                                  <Route
+                                    path="/load-balancer/add"
+                                    element={<AddRoute />}
                                   />
                                   <Route
                                     path="/git-sources"

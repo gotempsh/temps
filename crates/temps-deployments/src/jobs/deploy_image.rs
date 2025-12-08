@@ -862,6 +862,34 @@ impl DeployImageJob {
                 ));
             }
 
+            // Check if container is still running (it may have crashed)
+            // This prevents waiting 5 minutes for a container that already exited
+            if let Ok(container_info) = self
+                .container_deployer
+                .get_container_info(&deploy_result.container_id)
+                .await
+            {
+                match container_info.status {
+                    DeployerContainerStatus::Exited | DeployerContainerStatus::Dead => {
+                        self.log(
+                            context,
+                            "❌ Container crashed during startup - application failed to start"
+                                .to_string(),
+                        )
+                        .await?;
+                        // Clean up crashed container
+                        self.cleanup_container(context).await?;
+                        return Err(WorkflowError::JobExecutionFailed(
+                            "Container crashed during startup - check container logs for details"
+                                .to_string(),
+                        ));
+                    }
+                    _ => {
+                        // Container is still running, continue with connectivity checks
+                    }
+                }
+            }
+
             match client.get(&health_check_url).send().await {
                 Ok(response) => {
                     // Any response (including 404, 500, etc.) means the server is responding

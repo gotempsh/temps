@@ -41,6 +41,8 @@ pub struct NodeDockerfileConfig {
     pub is_static: bool,
     /// Additional environment variables for build stage
     pub build_env: Vec<(String, String)>,
+    /// Whether this is a Next.js standalone build (uses server.js)
+    pub is_nextjs_standalone: bool,
 }
 
 impl NodeDockerfileConfig {
@@ -63,6 +65,7 @@ impl NodeDockerfileConfig {
             port,
             is_static,
             build_env: Vec::new(),
+            is_nextjs_standalone: false,
         }
     }
 }
@@ -179,7 +182,8 @@ CMD ["nginx", "-g", "daemon off;"]
     } else {
         // Server build with Node.js runtime using Google's Distroless for maximum security
         // Distroless has NO shell, NO package manager, NO attack surface
-        let start_cmd_formatted = format_start_command_distroless(&config.start_cmd);
+        let is_standalone = config.is_nextjs_standalone || is_nextjs_standalone(&config.output_dir);
+        let start_cmd_formatted = format_start_command_distroless(&config.start_cmd, is_standalone);
 
         format!(
             r#"# syntax=docker/dockerfile:1
@@ -232,11 +236,6 @@ ENV NODE_ENV=production
 # Distroless :nonroot tag already runs as non-root user (uid 65532)
 # No RUN commands possible - distroless has no shell
 
-# Copy necessary files (owned by nonroot user uid 65532)
-COPY --from=builder --chown=65532:65532 /app/package.json ./
-COPY --from=builder --chown=65532:65532 /app/node_modules ./node_modules
-
-# Copy built application
 {copy_output}
 
 EXPOSE {port}
@@ -253,11 +252,7 @@ CMD {start_cmd}
             build_env = build_env_lines,
             build_cmd = config.build_cmd,
             distroless = DISTROLESS_NODEJS,
-            copy_output = if let Some(ref output_dir) = config.output_dir {
-                format!("COPY --from=builder --chown=65532:65532 /app/{} ./{}", output_dir, output_dir)
-            } else {
-                "COPY --from=builder --chown=65532:65532 /app/dist ./dist".to_string()
-            },
+            copy_output = generate_copy_output(&config.output_dir),
             port = config.port,
             start_cmd = start_cmd_formatted
         )
@@ -266,16 +261,21 @@ CMD {start_cmd}
 
 /// Format start command for Distroless Docker CMD
 /// Distroless nodejs images have `node` as the entrypoint, so we only pass args
-fn format_start_command_distroless(cmd: &str) -> String {
+fn format_start_command_distroless(cmd: &str, is_nextjs_standalone: bool) -> String {
     // Strip "node " prefix if present since distroless has node as entrypoint
     let cmd = cmd.strip_prefix("node ").unwrap_or(cmd);
 
-    // Handle npm/yarn/pnpm start commands - these need node to run the script
+    // For Next.js standalone builds, use server.js directly
+    if is_nextjs_standalone {
+        return "[\"server.js\"]".to_string();
+    }
+
+    // Handle npm/yarn/pnpm/npx start commands - these need node to run the script
     // For distroless, we need to specify the actual script path
-    if cmd.starts_with("npm ") || cmd.starts_with("yarn ") || cmd.starts_with("pnpm ") {
-        // For package manager commands, we run the start script directly
-        // This works for apps that have a proper start script in package.json
-        return "[\"./node_modules/.bin/next\", \"start\"]".to_string();
+    if cmd.starts_with("npm ") || cmd.starts_with("yarn ") || cmd.starts_with("pnpm ") || cmd.starts_with("npx ") {
+        // For Next.js non-standalone, we run next start via the installed binary
+        // The path is relative to node_modules which is copied to the image
+        return "[\"./node_modules/next/dist/bin/next\", \"start\"]".to_string();
     }
 
     if cmd.contains(' ') {
@@ -294,6 +294,61 @@ fn format_start_command_distroless(cmd: &str) -> String {
     }
 }
 
+/// Check if the output directory indicates a Next.js standalone build
+fn is_nextjs_standalone(output_dir: &Option<String>) -> bool {
+    output_dir.as_ref().is_some_and(|d| d.contains(".next/standalone"))
+}
+
+/// Generate the COPY instructions for the production stage
+/// Handles special cases like Next.js standalone and non-standalone builds
+fn generate_copy_output(output_dir: &Option<String>) -> String {
+    if is_nextjs_standalone(output_dir) {
+        // Next.js standalone builds require special handling:
+        // 1. Copy the standalone directory contents (including server.js) to /app
+        // 2. Copy the static files to .next/static (required for Next.js)
+        // 3. Copy public files if they exist
+        // See: https://nextjs.org/docs/app/api-reference/next-config-js/output#automatically-copying-traced-files
+        r#"# Copy Next.js standalone build - server.js and dependencies
+COPY --from=builder --chown=65532:65532 /app/.next/standalone ./
+# Copy static assets (required for Next.js to serve static files)
+COPY --from=builder --chown=65532:65532 /app/.next/static ./.next/static
+# Copy public folder if it exists (Next.js requires this for public assets)
+COPY --from=builder --chown=65532:65532 /app/public ./public"#.to_string()
+    } else if output_dir.as_ref().is_some_and(|d| d == ".next") {
+        // Next.js non-standalone build - needs node_modules to run `next start`
+        // This follows the pattern from the distroless example:
+        // https://github.com/vercel/next.js/tree/canary/examples/with-docker
+        r#"# Copy Next.js config and dependencies for non-standalone build
+COPY --from=builder --chown=65532:65532 /app/next.config.js* ./
+COPY --from=builder --chown=65532:65532 /app/next.config.mjs* ./
+COPY --from=builder --chown=65532:65532 /app/next.config.ts* ./
+COPY --from=builder --chown=65532:65532 /app/package.json ./
+# Copy node_modules (required for next start command)
+COPY --from=builder --chown=65532:65532 /app/node_modules ./node_modules
+# Copy built Next.js application
+COPY --from=builder --chown=65532:65532 /app/.next ./.next
+# Copy public folder if it exists
+COPY --from=builder --chown=65532:65532 /app/public ./public"#.to_string()
+    } else if let Some(ref dir) = output_dir {
+        // Regular server build - copy the output directory
+        format!(
+            r#"# Copy necessary files (owned by nonroot user uid 65532)
+COPY --from=builder --chown=65532:65532 /app/package.json ./
+COPY --from=builder --chown=65532:65532 /app/node_modules ./node_modules
+# Copy built application
+COPY --from=builder --chown=65532:65532 /app/{} ./{}"#,
+            dir, dir
+        )
+    } else {
+        // Default: copy dist folder
+        r#"# Copy necessary files (owned by nonroot user uid 65532)
+COPY --from=builder --chown=65532:65532 /app/package.json ./
+COPY --from=builder --chown=65532:65532 /app/node_modules ./node_modules
+# Copy built application
+COPY --from=builder --chown=65532:65532 /app/dist ./dist"#.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,9 +358,29 @@ mod tests {
     #[test]
     fn test_format_start_command_distroless() {
         // Distroless strips "node " since node is the entrypoint
-        assert_eq!(format_start_command_distroless("node server.js"), "[\"server.js\"]");
-        assert_eq!(format_start_command_distroless("server.js"), "[\"server.js\"]");
-        assert_eq!(format_start_command_distroless("node server.js --port 3000"), "[\"server.js\", \"--port\", \"3000\"]");
+        assert_eq!(format_start_command_distroless("node server.js", false), "[\"server.js\"]");
+        assert_eq!(format_start_command_distroless("server.js", false), "[\"server.js\"]");
+        assert_eq!(format_start_command_distroless("node server.js --port 3000", false), "[\"server.js\", \"--port\", \"3000\"]");
+    }
+
+    #[test]
+    fn test_format_start_command_distroless_nextjs_standalone() {
+        // Next.js standalone mode uses server.js directly
+        assert_eq!(format_start_command_distroless("node server.js", true), "[\"server.js\"]");
+        assert_eq!(format_start_command_distroless("npx next start", true), "[\"server.js\"]");
+    }
+
+    #[test]
+    fn test_format_start_command_distroless_nextjs_non_standalone() {
+        // Next.js non-standalone mode uses next start via node_modules
+        assert_eq!(
+            format_start_command_distroless("npx next start", false),
+            "[\"./node_modules/next/dist/bin/next\", \"start\"]"
+        );
+        assert_eq!(
+            format_start_command_distroless("npm run start", false),
+            "[\"./node_modules/next/dist/bin/next\", \"start\"]"
+        );
     }
 
     #[test]
@@ -513,6 +588,100 @@ mod tests {
         assert!(
             NGINX_SECURITY_HARDENING.contains("rm -rf /sbin/apk"),
             "Nginx hardening should remove package manager"
+        );
+    }
+
+    #[test]
+    fn test_generate_nextjs_non_standalone_dockerfile() {
+        let mut files = HashMap::new();
+        files.insert("package.json".to_string(), r#"{"dependencies":{"next":"14.0.0"}}"#.to_string());
+        files.insert("package-lock.json".to_string(), "".to_string());
+
+        let app = App::from_tree(PathBuf::from("/test"), files);
+
+        // Simulate Next.js non-standalone config
+        let config = NodeDockerfileConfig {
+            install_cmd: "npm ci".to_string(),
+            build_cmd: "npm run build".to_string(),
+            start_cmd: "npx next start".to_string(),
+            output_dir: Some(".next".to_string()), // Non-standalone uses .next
+            port: 3000,
+            is_static: false,
+            build_env: Vec::new(),
+            is_nextjs_standalone: false,
+        };
+
+        let dockerfile = generate_node_dockerfile(&app, config);
+
+        // Should use distroless
+        assert!(
+            dockerfile.contains("gcr.io/distroless/nodejs22-debian12:nonroot"),
+            "Should use distroless image"
+        );
+
+        // Should copy node_modules for next start
+        assert!(
+            dockerfile.contains("COPY --from=builder --chown=65532:65532 /app/node_modules ./node_modules"),
+            "Should copy node_modules for non-standalone Next.js"
+        );
+
+        // Should copy .next directory
+        assert!(
+            dockerfile.contains("COPY --from=builder --chown=65532:65532 /app/.next ./.next"),
+            "Should copy .next directory"
+        );
+
+        // Should use next start via node_modules
+        assert!(
+            dockerfile.contains("CMD [\"./node_modules/next/dist/bin/next\", \"start\"]"),
+            "Should run next start via node_modules path"
+        );
+    }
+
+    #[test]
+    fn test_generate_nextjs_standalone_dockerfile() {
+        let mut files = HashMap::new();
+        files.insert("package.json".to_string(), r#"{"dependencies":{"next":"14.0.0"}}"#.to_string());
+        files.insert("package-lock.json".to_string(), "".to_string());
+
+        let app = App::from_tree(PathBuf::from("/test"), files);
+
+        // Simulate Next.js standalone config
+        let config = NodeDockerfileConfig {
+            install_cmd: "npm ci".to_string(),
+            build_cmd: "npm run build".to_string(),
+            start_cmd: "node server.js".to_string(),
+            output_dir: Some(".next/standalone".to_string()), // Standalone output
+            port: 3000,
+            is_static: false,
+            build_env: Vec::new(),
+            is_nextjs_standalone: true,
+        };
+
+        let dockerfile = generate_node_dockerfile(&app, config);
+
+        // Should use distroless
+        assert!(
+            dockerfile.contains("gcr.io/distroless/nodejs22-debian12:nonroot"),
+            "Should use distroless image"
+        );
+
+        // Should copy standalone directory
+        assert!(
+            dockerfile.contains("COPY --from=builder --chown=65532:65532 /app/.next/standalone ./"),
+            "Should copy standalone directory"
+        );
+
+        // Should copy static files
+        assert!(
+            dockerfile.contains("COPY --from=builder --chown=65532:65532 /app/.next/static ./.next/static"),
+            "Should copy static files"
+        );
+
+        // Should run server.js directly
+        assert!(
+            dockerfile.contains("CMD [\"server.js\"]"),
+            "Should run server.js directly for standalone build"
         );
     }
 }

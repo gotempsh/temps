@@ -82,6 +82,10 @@ impl PresetProvider for NextJsPresetProvider {
             anyhow::anyhow!("Failed to get build config for Next.js")
         })?;
 
+        // Check if using standalone output mode
+        let is_standalone = build_config.output_dir.as_ref()
+            .is_some_and(|d| d.contains(".next/standalone"));
+
         // Use shared Node.js Dockerfile generation
         use super::node_base::{NodeDockerfileConfig, generate_node_dockerfile};
 
@@ -93,6 +97,7 @@ impl PresetProvider for NextJsPresetProvider {
             port: build_config.port,
             is_static: build_config.static_serve,
             build_env: Vec::new(),
+            is_nextjs_standalone: is_standalone,
         };
 
         Ok(generate_node_dockerfile(app, dockerfile_config))

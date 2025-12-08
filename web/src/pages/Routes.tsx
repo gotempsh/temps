@@ -3,7 +3,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { listDomains, listRoutes } from '@/api/client'
+import { listRoutes } from '@/api/client'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { AlertCircle } from 'lucide-react'
 
@@ -12,21 +12,12 @@ export function Routes() {
 
   const {
     data: routes,
-    isLoading: isRoutesLoading,
-    error: routesError,
+    isLoading,
+    error,
     refetch: refetchRoutes,
   } = useQuery({
     queryKey: ['routes'],
     queryFn: () => listRoutes(),
-  })
-
-  const {
-    data: domains,
-    isLoading: isDomainsLoading,
-    error: domainsError,
-  } = useQuery({
-    queryKey: ['active-domains'],
-    queryFn: () => listDomains(),
   })
 
   useEffect(() => {
@@ -38,7 +29,7 @@ export function Routes() {
 
   usePageTitle('Routes')
 
-  if (routesError || domainsError) {
+  if (error) {
     return (
       <Alert variant="destructive">
         <AlertCircle className="h-4 w-4" />
@@ -56,8 +47,7 @@ export function Routes() {
       <div className="space-y-6">
         <RoutesManagement
           routes={routes?.data || []}
-          domains={domains?.data}
-          isLoading={isRoutesLoading || isDomainsLoading}
+          isLoading={isLoading}
           reloadRoutes={refetchRoutes}
         />
       </div>

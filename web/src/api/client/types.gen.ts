@@ -987,6 +987,11 @@ export type CreateRouteRequest = {
     domain: string;
     host: string;
     port: number;
+    /**
+     * Route type: "http" (default) matches on HTTP Host header,
+     * "tls" matches on TLS SNI hostname for TCP passthrough
+     */
+    route_type?: string | null;
 };
 
 export type CreateS3SourceRequest = {
@@ -4149,6 +4154,10 @@ export type RouteResponse = {
     host: string;
     id: number;
     port: number;
+    /**
+     * Route type: "http" or "tls"
+     */
+    route_type: string;
     updated_at: number;
 };
 
@@ -5226,6 +5235,11 @@ export type UpdateRouteRequest = {
     enabled: boolean;
     host: string;
     port: number;
+    /**
+     * Route type: "http" (default) matches on HTTP Host header,
+     * "tls" matches on TLS SNI hostname for TCP passthrough
+     */
+    route_type?: string | null;
 };
 
 export type UpdateS3SourceRequest = {
@@ -6563,9 +6577,9 @@ export type EnrichVisitorData = {
     body: EnrichVisitorRequest;
     path: {
         /**
-         * Visitor numeric ID
+         * Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx)
          */
-        visitor_id: number;
+        visitor_id: string;
     };
     query: {
         /**
@@ -8859,6 +8873,46 @@ export type CreateDomain2Responses = {
 
 export type CreateDomain2Response = CreateDomain2Responses[keyof CreateDomain2Responses];
 
+export type GetDomainByNameData = {
+    body?: never;
+    path: {
+        /**
+         * Domain name (e.g., 'mail.example.com')
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/email-domains/by-domain/{domain}';
+};
+
+export type GetDomainByNameErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDomainByNameResponses = {
+    /**
+     * Email domain details with DNS records
+     */
+    200: EmailDomainWithDnsResponse;
+};
+
+export type GetDomainByNameResponse = GetDomainByNameResponses[keyof GetDomainByNameResponses];
+
 export type DeleteDomain2Data = {
     body?: never;
     path: {
@@ -8938,6 +8992,46 @@ export type GetDomainResponses = {
 };
 
 export type GetDomainResponse = GetDomainResponses[keyof GetDomainResponses];
+
+export type GetDomainDnsRecordsData = {
+    body?: never;
+    path: {
+        /**
+         * Domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/dns-records';
+};
+
+export type GetDomainDnsRecordsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDomainDnsRecordsResponses = {
+    /**
+     * DNS records for the domain
+     */
+    200: Array<DnsRecordResponse>;
+};
+
+export type GetDomainDnsRecordsResponse = GetDomainDnsRecordsResponses[keyof GetDomainDnsRecordsResponses];
 
 export type VerifyDomainData = {
     body?: never;
