@@ -10241,6 +10241,7 @@ dependencies = [
  "tokio",
  "tower-http 0.6.6",
  "tracing",
+ "url",
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
@@ -11171,6 +11172,7 @@ dependencies = [
  "tokio-test",
  "tower 0.5.2",
  "tracing",
+ "url",
  "utoipa",
  "uuid",
 ]

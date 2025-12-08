@@ -100,6 +100,15 @@ impl PackageManager {
         }
     }
 
+    pub fn start_command(&self) -> &'static str {
+        match self {
+            PackageManager::Bun => "[\"bun\", \"start\"]",
+            PackageManager::Yarn => "[\"yarn\", \"start\"]",
+            PackageManager::Npm => "[\"npm\", \"start\"]",
+            PackageManager::Pnpm => "[\"pnpm\", \"start\"]",
+        }
+    }
+
     pub fn base_image(&self) -> &'static str {
         match self {
             PackageManager::Bun => "oven/bun:1.2",

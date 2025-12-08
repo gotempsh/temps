@@ -44,6 +44,7 @@ interface RedeploymentModalProps {
   defaultCommit?: string
   defaultTag?: string
   isLoading?: boolean
+  mode?: 'new' | 'redeploy' // 'new' = full form, 'redeploy' = simple confirmation
 }
 
 export function RedeploymentModal({
@@ -57,6 +58,7 @@ export function RedeploymentModal({
   defaultTag,
   defaultType,
   isLoading,
+  mode = 'new',
 }: RedeploymentModalProps) {
   // Fetch project details to get repo info and main branch
   const projectQuery = useQuery({
@@ -104,6 +106,18 @@ export function RedeploymentModal({
   const effectiveBranch = selectedBranch || initialBranch
   const effectiveEnvironment = selectedEnvironment ?? initialEnvironment
 
+  // Reset form state when modal opens or default values change
+  useEffect(() => {
+    if (isOpen) {
+      setSelectedBranch('')
+      setSelectedEnvironment(null)
+      setSelectedCommit(defaultCommit || '')
+      setSelectedTag(defaultTag || '')
+      setDeploymentType(defaultType || 'branch')
+      setBranchNotFound(false)
+    }
+  }, [isOpen, defaultCommit, defaultTag, defaultType])
+
   // When environment selection changes, automatically select its branch
   useEffect(() => {
     if (!selectedEnvironment || !environmentsQuery.data) return
@@ -135,6 +149,23 @@ export function RedeploymentModal({
   }
 
   const handleConfirm = async () => {
+    // In redeploy mode, use the default values directly
+    if (mode === 'redeploy') {
+      if (!defaultEnvironment) {
+        toast.error('No environment specified for redeployment')
+        return
+      }
+
+      await onConfirm({
+        branch: defaultType === 'branch' ? defaultBranch : undefined,
+        commit: defaultType === 'commit' ? defaultCommit : undefined,
+        tag: defaultType === 'tag' ? defaultTag : undefined,
+        environmentId: defaultEnvironment,
+      })
+      return
+    }
+
+    // In new mode, validate and use selected/effective values
     if (deploymentType === 'commit' && !validateCommit(selectedCommit)) {
       toast.error('Invalid commit hash')
       return
@@ -159,121 +190,183 @@ export function RedeploymentModal({
     })
   }
 
+  // Get environment name for redeploy mode
+  const environmentName = environmentsQuery.data?.find(
+    (env: EnvironmentResponse) => env.id === defaultEnvironment
+  )?.name || environmentsQuery.data?.find(
+    (env: EnvironmentResponse) => env.id === defaultEnvironment
+  )?.slug
+
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Deploy Project</DialogTitle>
+          <DialogTitle>
+            {mode === 'redeploy' ? 'Redeploy' : 'Deploy Project'}
+          </DialogTitle>
         </DialogHeader>
-        <div className="space-y-4">
-          <div className="space-y-2">
-            <Label>Deploy from</Label>
-            <Tabs
-              value={deploymentType}
-              onValueChange={(v) =>
-                setDeploymentType(v as 'branch' | 'commit' | 'tag')
-              }
-            >
-              <TabsList className="grid w-full grid-cols-3">
-                <TabsTrigger value="branch">Branch</TabsTrigger>
-                <TabsTrigger value="commit">Commit</TabsTrigger>
-                <TabsTrigger value="tag">Tag</TabsTrigger>
-              </TabsList>
-              <TabsContent value="branch" className="space-y-2">
-                {branchNotFound && (
-                  <Alert className="border-amber-200 bg-amber-50">
-                    <AlertTriangle className="h-4 w-4 text-amber-600" />
-                    <AlertDescription className="text-amber-800">
-                      The branch "{selectedBranch}" for this environment was not found in the repository.
-                      You can continue with the current branch name, or switch to deploy by commit hash.
-                    </AlertDescription>
-                  </Alert>
-                )}
-                {deploymentType === 'branch' && selectedEnvironment && !availableBranches.includes(selectedBranch) && availableBranches.length > 0 ? (
-                  <div className="space-y-2">
-                    <Input
-                      value={selectedBranch}
-                      onChange={(e) => setSelectedBranch(e.target.value)}
-                      placeholder="Enter branch name manually"
-                      disabled={isLoading}
-                    />
-                  </div>
-                ) : (
-                  <BranchSelector
-                    repoOwner={projectQuery.data?.repo_owner || ''}
-                    repoName={projectQuery.data?.repo_name || ''}
-                    connectionId={
-                      projectQuery.data?.git_provider_connection_id || 0
-                    }
-                    defaultBranch={projectQuery.data?.main_branch}
-                    value={selectedBranch}
-                    onChange={(branch) => {
-                      setSelectedBranch(branch)
-                      setBranchNotFound(false)
-                    }}
-                    onBranchesLoaded={(branches) => setAvailableBranches(branches)}
-                    disabled={isLoading}
-                  />
-                )}
-              </TabsContent>
-              <TabsContent value="commit">
-                <Input
-                  value={selectedCommit}
-                  onChange={(e) => setSelectedCommit(e.target.value)}
-                  placeholder="Enter commit hash"
-                />
-              </TabsContent>
-              <TabsContent value="tag">
-                <Input
-                  value={selectedTag}
-                  onChange={(e) => setSelectedTag(e.target.value)}
-                  placeholder="Enter tag name"
-                />
-              </TabsContent>
-            </Tabs>
-          </div>
 
-          <div className="space-y-2">
-            <Label htmlFor="environment">Environment</Label>
-            <Select
-              value={effectiveEnvironment?.toString() || ''}
-              onValueChange={(value) =>
-                setSelectedEnvironment(value ? parseInt(value) : null)
-              }
-              disabled={environmentsQuery.isLoading}
-            >
-              <SelectTrigger>
-                <SelectValue
-                  placeholder={
-                    environmentsQuery.isLoading
-                      ? 'Loading...'
-                      : 'Select environment'
-                  }
-                />
-              </SelectTrigger>
-              <SelectContent>
-                {environmentsQuery.data?.map((env: EnvironmentResponse) => (
-                  <SelectItem key={env.id} value={env.id.toString()}>
-                    {env.name || env.slug}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+        {/* Simplified view for redeploy mode */}
+        {mode === 'redeploy' ? (
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              This will redeploy using the following configuration:
+            </p>
+            <div className="space-y-3 border rounded-md p-4 bg-muted/50">
+              <div className="grid grid-cols-2 gap-2">
+                <div className="text-sm font-medium">Deploy from:</div>
+                <div className="text-sm">
+                  {defaultType === 'branch' && (
+                    <span className="font-mono">{defaultBranch || 'N/A'}</span>
+                  )}
+                  {defaultType === 'commit' && (
+                    <span className="font-mono">{defaultCommit || 'N/A'}</span>
+                  )}
+                  {defaultType === 'tag' && (
+                    <span className="font-mono">{defaultTag || 'N/A'}</span>
+                  )}
+                </div>
+
+                <div className="text-sm font-medium">Type:</div>
+                <div className="text-sm capitalize">{defaultType}</div>
+
+                {/* Show commit hash if available */}
+                {defaultCommit && (
+                  <>
+                    <div className="text-sm font-medium">Commit:</div>
+                    <div className="text-sm font-mono text-muted-foreground">
+                      {defaultCommit.substring(0, 7)}
+                    </div>
+                  </>
+                )}
+
+                <div className="text-sm font-medium">Environment:</div>
+                <div className="text-sm">{environmentName || 'Loading...'}</div>
+              </div>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={onClose} disabled={isLoading}>
+                Cancel
+              </Button>
+              <Button onClick={handleConfirm} disabled={isLoading || !defaultEnvironment}>
+                {isLoading ? 'Redeploying...' : 'Redeploy'}
+              </Button>
+            </DialogFooter>
           </div>
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button
-            onClick={handleConfirm}
-            disabled={
-              isLoading || !effectiveEnvironment || environmentsQuery.isLoading
-            }
-          >
-            {isLoading ? 'Deploying...' : 'Deploy'}
-          </Button>
-        </DialogFooter>
+        ) : (
+          /* Full form for new deployment mode */
+          <>
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <Label>Deploy from</Label>
+                <Tabs
+                  value={deploymentType}
+                  onValueChange={(v) =>
+                    setDeploymentType(v as 'branch' | 'commit' | 'tag')
+                  }
+                >
+                  <TabsList className="grid w-full grid-cols-3">
+                    <TabsTrigger value="branch">Branch</TabsTrigger>
+                    <TabsTrigger value="commit">Commit</TabsTrigger>
+                    <TabsTrigger value="tag">Tag</TabsTrigger>
+                  </TabsList>
+                  <TabsContent value="branch" className="space-y-2">
+                    {branchNotFound && (
+                      <Alert className="border-amber-200 bg-amber-50">
+                        <AlertTriangle className="h-4 w-4 text-amber-600" />
+                        <AlertDescription className="text-amber-800">
+                          The branch "{selectedBranch}" for this environment was not found in the repository.
+                          You can continue with the current branch name, or switch to deploy by commit hash.
+                        </AlertDescription>
+                      </Alert>
+                    )}
+                    {deploymentType === 'branch' && selectedEnvironment && !availableBranches.includes(selectedBranch) && availableBranches.length > 0 ? (
+                      <div className="space-y-2">
+                        <Input
+                          value={selectedBranch}
+                          onChange={(e) => setSelectedBranch(e.target.value)}
+                          placeholder="Enter branch name manually"
+                          disabled={isLoading}
+                        />
+                      </div>
+                    ) : (
+                      <BranchSelector
+                        repoOwner={projectQuery.data?.repo_owner || ''}
+                        repoName={projectQuery.data?.repo_name || ''}
+                        connectionId={
+                          projectQuery.data?.git_provider_connection_id || 0
+                        }
+                        defaultBranch={initialBranch || projectQuery.data?.main_branch}
+                        value={selectedBranch}
+                        onChange={(branch) => {
+                          setSelectedBranch(branch)
+                          setBranchNotFound(false)
+                        }}
+                        onBranchesLoaded={(branches) => setAvailableBranches(branches)}
+                        disabled={isLoading}
+                      />
+                    )}
+                  </TabsContent>
+                  <TabsContent value="commit">
+                    <Input
+                      value={selectedCommit}
+                      onChange={(e) => setSelectedCommit(e.target.value)}
+                      placeholder="Enter commit hash"
+                    />
+                  </TabsContent>
+                  <TabsContent value="tag">
+                    <Input
+                      value={selectedTag}
+                      onChange={(e) => setSelectedTag(e.target.value)}
+                      placeholder="Enter tag name"
+                    />
+                  </TabsContent>
+                </Tabs>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="environment">Environment</Label>
+                <Select
+                  value={effectiveEnvironment?.toString() || ''}
+                  onValueChange={(value) =>
+                    setSelectedEnvironment(value ? parseInt(value) : null)
+                  }
+                  disabled={environmentsQuery.isLoading}
+                >
+                  <SelectTrigger>
+                    <SelectValue
+                      placeholder={
+                        environmentsQuery.isLoading
+                          ? 'Loading...'
+                          : 'Select environment'
+                      }
+                    />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {environmentsQuery.data?.map((env: EnvironmentResponse) => (
+                      <SelectItem key={env.id} value={env.id.toString()}>
+                        {env.name || env.slug}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={onClose}>
+                Cancel
+              </Button>
+              <Button
+                onClick={handleConfirm}
+                disabled={
+                  isLoading || !effectiveEnvironment || environmentsQuery.isLoading
+                }
+              >
+                {isLoading ? 'Deploying...' : 'Deploy'}
+              </Button>
+            </DialogFooter>
+          </>
+        )}
       </DialogContent>
     </Dialog>
   )

@@ -19,6 +19,7 @@ pub mod repo_config;
 mod request_metadata;
 pub mod stages;
 pub mod types;
+pub mod url_validation;
 pub mod utils;
 pub mod workflow;
 pub mod workflow_executor;

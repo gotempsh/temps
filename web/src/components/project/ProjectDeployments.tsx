@@ -297,11 +297,31 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             setSelectedDeployment(null)
           }}
           onConfirm={handleRedeploy}
+          mode={selectedDeployment ? 'redeploy' : 'new'}
           defaultBranch={
             deploymentsData?.deployments.find(
               (d) => d.id === selectedDeployment
             )?.branch ?? project.main_branch
           }
+          defaultCommit={
+            deploymentsData?.deployments.find(
+              (d) => d.id === selectedDeployment
+            )?.commit_hash ?? ''
+          }
+          defaultTag={
+            deploymentsData?.deployments.find(
+              (d) => d.id === selectedDeployment
+            )?.tag ?? ''
+          }
+          defaultType={(() => {
+            const deployment = deploymentsData?.deployments.find(
+              (d) => d.id === selectedDeployment,
+            )
+            if (!deployment) return 'branch' // Default to branch for new deployments
+            if (deployment?.tag) return 'tag'
+            if (deployment?.branch) return 'branch'
+            return 'commit'
+          })()}
           defaultEnvironment={
             deploymentsData?.deployments.find(
               (d) => d.id === selectedDeployment
@@ -354,10 +374,28 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           setSelectedDeployment(null)
         }}
         onConfirm={handleRedeploy}
+        mode={selectedDeployment ? 'redeploy' : 'new'}
         defaultBranch={
           deploymentsData?.deployments.find((d) => d.id === selectedDeployment)
             ?.branch ?? project.main_branch
         }
+        defaultCommit={
+          deploymentsData?.deployments.find((d) => d.id === selectedDeployment)
+            ?.commit_hash ?? ''
+        }
+        defaultTag={
+          deploymentsData?.deployments.find((d) => d.id === selectedDeployment)
+            ?.tag ?? ''
+        }
+        defaultType={(() => {
+          const deployment = deploymentsData?.deployments.find(
+            (d) => d.id === selectedDeployment,
+          )
+          if (!deployment) return 'branch' // Default to branch for new deployments
+          if (deployment?.tag) return 'tag'
+          if (deployment?.branch) return 'branch'
+          return 'commit'
+        })()}
         defaultEnvironment={
           deploymentsData?.deployments.find((d) => d.id === selectedDeployment)
             ?.environment_id ?? undefined

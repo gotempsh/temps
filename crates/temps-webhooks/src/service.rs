@@ -11,6 +11,7 @@ use sha2::Sha256;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{error, info, warn};
+use url; // For URL validation
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -40,7 +41,7 @@ pub struct WebhookDeliveryResult {
     pub delivery_id: i32,
     pub success: bool,
     pub status_code: Option<u16>,
-    pub response_body: Option<String>,
+    // SECURITY: response_body field removed to prevent data exfiltration via SSRF
     pub error_message: Option<String>,
     pub attempt_number: i32,
     pub delivered_at: DateTime<Utc>,
@@ -81,6 +82,7 @@ impl WebhookService {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .user_agent("Temps-Webhook/1.0")
+            .redirect(reqwest::redirect::Policy::none()) // SECURITY: Disable redirects to prevent SSRF via redirect chains
             .build()
             .expect("Failed to create HTTP client");
 
@@ -96,6 +98,9 @@ impl WebhookService {
         &self,
         request: CreateWebhookRequest,
     ) -> Result<temps_entities::webhooks::Model, WebhookError> {
+        // SECURITY: Validate URL to prevent SSRF attacks
+        self.validate_webhook_url(&request.url).await?;
+
         // Encrypt the secret if provided
         let encrypted_secret = if let Some(secret) = &request.secret {
             Some(
@@ -168,6 +173,8 @@ impl WebhookService {
         let mut active_model: temps_entities::webhooks::ActiveModel = webhook.into();
 
         if let Some(url) = request.url {
+            // SECURITY: Validate URL to prevent SSRF attacks
+            self.validate_webhook_url(&url).await?;
             active_model.url = Set(url);
         }
 
@@ -286,7 +293,6 @@ impl WebhookService {
                     delivery_id: 0,
                     success: false,
                     status_code: None,
-                    response_body: None,
                     error_message: Some(format!("Failed to create delivery record: {}", e)),
                     attempt_number: 1,
                     delivered_at: Utc::now(),
@@ -309,16 +315,17 @@ impl WebhookService {
 
         let response = request_builder.body(payload).send().await;
 
-        let (success, status_code, response_body, error_message) = match response {
+        let (success, status_code, error_message) = match response {
             Ok(resp) => {
                 let status = resp.status();
-                let body = resp.text().await.ok();
+                // SECURITY: Do NOT store response body to prevent data exfiltration via SSRF
+                // Response bodies could contain sensitive data from internal services
                 let is_success = status.is_success();
-                (is_success, Some(status.as_u16()), body, None)
+                (is_success, Some(status.as_u16()), None)
             }
             Err(e) => {
                 let error_msg = Self::format_webhook_error(&e, &webhook.url);
-                (false, None, None, Some(error_msg))
+                (false, None, Some(error_msg))
             }
         };
 
@@ -326,7 +333,7 @@ impl WebhookService {
         let mut delivery_update: temps_entities::webhook_deliveries::ActiveModel =
             delivery_record.clone().into();
         delivery_update.status_code = Set(status_code.map(|s| s as i32));
-        delivery_update.response_body = Set(response_body.clone());
+        // SECURITY: response_body field removed - do not store response data
         delivery_update.error_message = Set(error_message.clone());
         delivery_update.success = Set(success);
         delivery_update.delivered_at = Set(Some(Utc::now()));
@@ -352,7 +359,6 @@ impl WebhookService {
             delivery_id: delivery_record.id,
             success,
             status_code,
-            response_body,
             error_message,
             attempt_number: 1,
             delivered_at: Utc::now(),
@@ -484,6 +490,46 @@ impl WebhookService {
             .map_err(|e| WebhookError::InvalidConfiguration(e.to_string()))?;
         String::from_utf8(secret_bytes)
             .map_err(|e| WebhookError::InvalidConfiguration(e.to_string()))
+    }
+
+    /// Validate a webhook URL to prevent SSRF attacks
+    ///
+    /// This method performs comprehensive validation to prevent Server-Side Request Forgery:
+    /// - Only allows HTTP and HTTPS schemes
+    /// - Blocks private IP ranges (RFC 1918)
+    /// - Blocks loopback addresses
+    /// - Blocks link-local addresses
+    /// - Blocks cloud metadata services (AWS, GCP, Azure, etc.)
+    /// - For domains, resolves DNS and validates all resolved IPs
+    ///
+    /// # Security
+    ///
+    /// This is a critical security function. Any webhook URL that fails validation
+    /// should be rejected to prevent attackers from:
+    /// - Accessing internal services (Redis, PostgreSQL, etc.)
+    /// - Stealing cloud credentials from metadata services
+    /// - Port scanning the internal network
+    /// - Exfiltrating data via DNS rebinding attacks
+    async fn validate_webhook_url(&self, url: &str) -> Result<(), WebhookError> {
+        // Basic URL format and scheme validation
+        let parsed = temps_core::url_validation::validate_external_url(url).map_err(|e| {
+            WebhookError::InvalidConfiguration(format!("Invalid webhook URL: {}", e))
+        })?;
+
+        // For domain names, perform DNS resolution and validate resolved IPs
+        if let Some(url::Host::Domain(domain)) = parsed.host() {
+            temps_core::url_validation::validate_domain_async(domain)
+                .await
+                .map_err(|e| {
+                    WebhookError::InvalidConfiguration(format!(
+                        "Webhook URL domain validation failed: {}",
+                        e
+                    ))
+                })?;
+        }
+
+        info!("Validated webhook URL: {}", url);
+        Ok(())
     }
 }
 

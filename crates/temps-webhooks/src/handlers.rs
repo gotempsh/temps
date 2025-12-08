@@ -134,7 +134,8 @@ pub struct WebhookDeliveryResponse {
     pub payload: String,
     pub success: bool,
     pub status_code: Option<i32>,
-    pub response_body: Option<String>,
+    // SECURITY: response_body field removed to prevent data exfiltration via SSRF
+    // This prevents attackers from reading responses from internal services
     pub error_message: Option<String>,
     pub attempt_number: i32,
     #[schema(example = "2025-10-12T12:15:47.609192Z")]
@@ -152,7 +153,7 @@ impl From<temps_entities::webhook_deliveries::Model> for WebhookDeliveryResponse
             payload: delivery.payload,
             success: delivery.success,
             status_code: delivery.status_code,
-            response_body: delivery.response_body,
+            // SECURITY: response_body not included in API response
             error_message: delivery.error_message,
             attempt_number: delivery.attempt_number,
             created_at: delivery.created_at,

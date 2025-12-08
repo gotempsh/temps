@@ -17,6 +17,9 @@ pub struct Model {
     pub payload: String,
     pub success: bool,
     pub status_code: Option<i32>,
+    // SECURITY: response_body field deprecated and should be removed in future migration
+    // Kept for backward compatibility with existing databases but should NEVER be populated
+    #[deprecated(note = "SECURITY: Do not use - removed to prevent SSRF data exfiltration")]
     #[sea_orm(column_type = "Text", nullable)]
     pub response_body: Option<String>,
     pub error_message: Option<String>,

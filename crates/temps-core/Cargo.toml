@@ -35,5 +35,6 @@ sha2 = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
 once_cell = { workspace = true }
+url = "2.5"  # For URL validation and SSRF prevention
 
 # Internal dependencies - only core dependencies to avoid cycles

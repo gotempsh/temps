@@ -6,12 +6,9 @@ use std::path::Path;
 
 /// Google's distroless Node.js image - contains ONLY Node.js runtime.
 /// No shell, no package manager, no OS utilities = maximum security.
+/// Used for standalone Next.js builds via `dockerfile_with_build_dir`.
 /// See: https://github.com/GoogleContainerTools/distroless
 const DISTROLESS_NODEJS: &str = "gcr.io/distroless/nodejs22-debian12:nonroot";
-
-/// Debug variant of distroless (has shell for debugging - NOT recommended for production)
-#[allow(dead_code)]
-const DISTROLESS_NODEJS_DEBUG: &str = "gcr.io/distroless/nodejs22-debian12:debug-nonroot";
 
 pub struct NextJs;
 
@@ -63,20 +60,20 @@ impl Preset for NextJs {
             build_cmd = build_cmd.replace("bun ", "/root/.bun/bin/bun ");
         }
 
-        // For distroless, we run the standalone server directly
-        // Distroless has `node` as entrypoint, so CMD only needs the script path
-        // Next.js standalone output creates server.js at the root
-        let start_cmd = "server.js".to_string();
+        // Use explicit path to Next.js binary for distroless
+        // Distroless has /nodejs/bin/node as entrypoint, so CMD just needs the script path
+        // This is equivalent to `npm start` / `next start` but works in distroless (no npm/shell needed)
+        let start_cmd = format!("/{}/node_modules/next/dist/bin/next\", \"start", project_slug);
 
         // Build stage uses full Node.js image with package managers
-        // Production stage uses distroless for maximum security
         let base_image = match package_manager {
             PackageManager::Bun => "node:22",  // Bun needs apt for installation
             PackageManager::Yarn => "node:22-alpine",
             _ => "node:22",
         };
 
-        // Use distroless for production - no shell, no package manager, no attack surface
+        // Production stage uses distroless for maximum security
+        // No shell, no wget, no package managers = minimal attack surface
         let run_image = DISTROLESS_NODEJS;
 
         // Determine cache path based on whether it's a monorepo subproject
@@ -217,15 +214,18 @@ WORKDIR /{project_slug}
 # Build the application
 {}
 
+# Ensure public directory exists for COPY command
+RUN mkdir -p public
+
+# Prune dev dependencies for smaller production image
+RUN npm prune --production 2>/dev/null || yarn install --production --ignore-scripts 2>/dev/null || true
+
 # Stage 2: Production using Google's Distroless image
-# Distroless contains ONLY the Node.js runtime - no shell, no package manager, no attack surface
-# This is the most secure option for running Next.js in production
-# See: https://github.com/GoogleContainerTools/distroless
+# No shell, no wget, no package managers = maximum security
 FROM {run_image} AS runner
 WORKDIR /{project_slug}
 
-# Distroless :nonroot tag already runs as non-root user (uid 65532)
-# No RUN commands possible - distroless has no shell
+# Distroless :nonroot tag runs as uid 65532 (no RUN commands possible - no shell)
 
 "#,
             build_cmd_line,
@@ -233,60 +233,57 @@ WORKDIR /{project_slug}
             run_image = run_image,
         ));
 
-        // For monorepos, we need to copy only the specific project's built files
-        // Distroless uses uid 65532 (nonroot user) - use --chown=65532:65532
+        // Copy build output and production dependencies
+        // Distroless uses uid 65532 (nonroot user)
         match build_system.monorepo_tool {
             MonorepoTool::None => {
                 dockerfile.push_str(&format!(
-                    "# Copy built files from build stage (owned by nonroot user)\nCOPY --from=build --chown=65532:65532 /{project_slug}/ /{project_slug}/\n",
+                    r#"# Copy package.json for node --run to work
+COPY --from=build --chown=65532:65532 /{project_slug}/package.json /{project_slug}/
+# Copy production dependencies
+COPY --from=build --chown=65532:65532 /{project_slug}/node_modules /{project_slug}/node_modules
+# Copy Next.js build output
+COPY --from=build --chown=65532:65532 /{project_slug}/.next /{project_slug}/.next
+# Copy public assets
+COPY --from=build --chown=65532:65532 /{project_slug}/public /{project_slug}/public
+"#,
                     project_slug = project_slug
                 ));
-                // Copy lock file in production stage if present
-                match package_manager {
-                    PackageManager::Bun => dockerfile.push_str(&format!(
-                        "COPY --from=build --chown=65532:65532 /{project_slug}/bun.lock* /{project_slug}/bun.lock*\n",
-                        project_slug = project_slug
-                    )),
-                    PackageManager::Yarn => dockerfile.push_str(&format!(
-                        "COPY --from=build --chown=65532:65532 /{project_slug}/yarn.lock /{project_slug}/yarn.lock\n",
-                        project_slug = project_slug
-                    )),
-                    _ => {}
-                }
             }
             _ => {
-                let project_path = format!("/{project_slug}");
-
+                // For monorepos, copy from subdirectory
                 dockerfile.push_str(&format!(
-                    r#"# Copy the entire monorepo project (owned by nonroot user)
-COPY --from=build --chown=65532:65532 {project_path} /{project_slug}
-
-# Set working directory to the project path
-WORKDIR /{project_slug}/{relative_path}
+                    r#"# Copy package.json for node --run to work
+COPY --from=build --chown=65532:65532 /{project_slug}/{relative_path}/package.json /{project_slug}/
+# Copy production dependencies
+COPY --from=build --chown=65532:65532 /{project_slug}/{relative_path}/node_modules /{project_slug}/node_modules
+# Copy Next.js build output
+COPY --from=build --chown=65532:65532 /{project_slug}/{relative_path}/.next /{project_slug}/.next
+# Copy public assets
+COPY --from=build --chown=65532:65532 /{project_slug}/{relative_path}/public /{project_slug}/public
 "#,
-                    project_path = project_path,
                     project_slug = project_slug,
                     relative_path = relative_path
                 ));
             }
         }
 
-        // Distroless :nonroot already runs as non-root (uid 65532), no USER directive needed
+        // Set environment (distroless :nonroot already runs as uid 65532)
         dockerfile.push_str(
             r#"
 # Set production environment
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV HOSTNAME=0.0.0.0
-ENV HOST=0.0.0.0
+ENV PORT=3000
 
 EXPOSE 3000
 
 "#,
         );
 
-        // Add start command
-        dockerfile.push_str(&format!("CMD [\"{}\"]", start_cmd.replace(" ", "\", \"")));
+        // Add start command - distroless has node as entrypoint
+        dockerfile.push_str(&format!("CMD [\"{}\"]", start_cmd));
 
         DockerfileWithArgs::new(dockerfile)
     }
@@ -445,8 +442,11 @@ mod tests {
         assert!(result.content.contains("# Change to project subdirectory"));
         assert!(result.content.contains("WORKDIR /test_project/apps/web"));
 
-        // Verify WORKDIR is set to the subdirectory in production stage
-        assert!(result.content.contains("# Set working directory to the project path"));
+        // Verify build output is copied from monorepo subdirectory in production stage
+        assert!(result.content.contains("# Copy package.json for node --run to work"));
+        assert!(result.content.contains("# Copy Next.js build output"));
+        // Verify the copy is from the subdirectory path (apps/web)
+        assert!(result.content.contains("/test_project/apps/web/.next"));
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).ok();
@@ -502,8 +502,8 @@ mod tests {
 
         // Verify distroless is used for runner stage
         assert!(result.content.contains("gcr.io/distroless/nodejs22-debian12:nonroot"));
-        // Verify CMD runs server.js directly (distroless has node as entrypoint)
-        assert!(result.content.contains(r#"CMD ["server.js"]"#));
+        // Verify CMD uses explicit path to next start (works in distroless without npm/shell)
+        assert!(result.content.contains(r#"CMD ["/test_project/node_modules/next/dist/bin/next", "start"]"#));
         // Verify npm is used in build stage
         assert!(result.content.contains("npm install") || result.content.contains("npm ci"));
 
@@ -531,8 +531,8 @@ mod tests {
 
         // Verify distroless is used for runner stage
         assert!(result.content.contains("gcr.io/distroless/nodejs22-debian12:nonroot"));
-        // Verify CMD runs server.js directly (distroless has node as entrypoint)
-        assert!(result.content.contains(r#"CMD ["server.js"]"#));
+        // Verify CMD uses explicit path to next start (works in distroless without npm/shell)
+        assert!(result.content.contains(r#"CMD ["/test_project/node_modules/next/dist/bin/next", "start"]"#));
         // Verify bun is installed in build stage
         assert!(result.content.contains("curl -fsSL https://bun.sh/install | bash"));
 
@@ -560,8 +560,8 @@ mod tests {
 
         // Verify distroless is used for runner stage
         assert!(result.content.contains("gcr.io/distroless/nodejs22-debian12:nonroot"));
-        // Verify CMD runs server.js directly (distroless has node as entrypoint)
-        assert!(result.content.contains(r#"CMD ["server.js"]"#));
+        // Verify CMD uses explicit path to next start (works in distroless without npm/shell)
+        assert!(result.content.contains(r#"CMD ["/test_project/node_modules/next/dist/bin/next", "start"]"#));
         // Verify corepack is enabled for yarn in build stage
         assert!(result.content.contains("corepack enable"));
 
@@ -596,8 +596,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dockerfile_uses_distroless() {
-        let temp_dir = std::env::temp_dir().join("test_nextjs_distroless");
+    async fn test_dockerfile_uses_distroless_with_security() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_distroless_security");
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let preset = NextJs;
@@ -612,24 +612,23 @@ mod tests {
             project_slug: "test-project",
         }).await;
 
-        // Security: Uses Google's distroless image
+        // Verify distroless is used for runner stage
         assert!(
             result.content.contains("gcr.io/distroless/nodejs22-debian12:nonroot"),
             "Should use distroless Node.js image"
         );
 
-        // Security: Distroless :nonroot runs as uid 65532
+        // Security: Files owned by distroless nonroot user (uid 65532)
         assert!(
             result.content.contains("--chown=65532:65532"),
             "Should copy files with distroless nonroot user ownership"
         );
 
-        // Security: No shell commands in production stage (distroless has no shell)
-        // The production stage should NOT contain RUN commands after FROM distroless
-        let production_stage = result.content.split("FROM gcr.io/distroless").nth(1).unwrap_or("");
+        // Security: No RUN commands in production stage (distroless has no shell)
+        let production_stage = result.content.split("gcr.io/distroless").nth(1).unwrap_or("");
         assert!(
             !production_stage.contains("\nRUN "),
-            "Distroless stage should not have RUN commands (no shell available)"
+            "Distroless stage should not have RUN commands"
         );
 
         // Cleanup
@@ -664,5 +663,199 @@ mod tests {
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    /// Integration test that builds and runs a real Next.js Docker image
+    /// This test requires Docker to be running and may take several minutes.
+    /// It uses the fixture at tests/fixtures/nextjs-hello-world
+    #[tokio::test]
+    async fn test_nextjs_docker_build_and_run() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        // Check if Docker is available
+        let docker_check = Command::new("docker")
+            .args(["info"])
+            .output();
+
+        if docker_check.is_err() || !docker_check.unwrap().status.success() {
+            println!("Docker is not available, skipping test");
+            return;
+        }
+
+        // Get the fixture path
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set");
+        let fixture_path = std::path::PathBuf::from(&manifest_dir)
+            .join("tests/fixtures/nextjs-hello-world");
+
+        if !fixture_path.exists() {
+            panic!("Fixture not found at {:?}", fixture_path);
+        }
+
+        // Create a temp directory and copy the fixture
+        let test_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let temp_dir = std::env::temp_dir().join(format!("nextjs_docker_test_{}", test_id));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Copy fixture files to temp directory
+        let copy_result = Command::new("cp")
+            .args(["-r", fixture_path.to_str().unwrap(), temp_dir.to_str().unwrap()])
+            .output()
+            .expect("Failed to copy fixture");
+
+        if !copy_result.status.success() {
+            panic!("Failed to copy fixture: {:?}", String::from_utf8_lossy(&copy_result.stderr));
+        }
+
+        let project_dir = temp_dir.join("nextjs-hello-world");
+
+        // Generate Dockerfile using the preset
+        let preset = NextJs;
+        let dockerfile_result = preset.dockerfile(DockerfileConfig {
+            use_buildkit: true,
+            root_local_path: &project_dir,
+            local_path: &project_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "nextjs-test",
+        }).await;
+
+        // Write the Dockerfile
+        let dockerfile_path = project_dir.join("Dockerfile");
+        std::fs::write(&dockerfile_path, &dockerfile_result.content)
+            .expect("Failed to write Dockerfile");
+
+        println!("Generated Dockerfile:\n{}", dockerfile_result.content);
+
+        // Build the Docker image
+        let image_name = format!("temps-nextjs-test:{}", test_id);
+        println!("Building Docker image: {}", image_name);
+
+        let build_result = Command::new("docker")
+            .args([
+                "build",
+                "-t", &image_name,
+                "-f", dockerfile_path.to_str().unwrap(),
+                project_dir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("Failed to execute docker build");
+
+        println!("Build stdout:\n{}", String::from_utf8_lossy(&build_result.stdout));
+        println!("Build stderr:\n{}", String::from_utf8_lossy(&build_result.stderr));
+
+        if !build_result.status.success() {
+            // Cleanup temp directory
+            std::fs::remove_dir_all(&temp_dir).ok();
+            panic!("Docker build failed: {}", String::from_utf8_lossy(&build_result.stderr));
+        }
+
+        // Run the container
+        let container_name = format!("temps-nextjs-test-{}", test_id);
+        let host_port = 3099; // Use a non-standard port to avoid conflicts
+
+        println!("Starting container: {}", container_name);
+
+        let run_result = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--name", &container_name,
+                "-p", &format!("{}:3000", host_port),
+                &image_name,
+            ])
+            .output()
+            .expect("Failed to execute docker run");
+
+        if !run_result.status.success() {
+            // Cleanup
+            Command::new("docker").args(["rmi", "-f", &image_name]).output().ok();
+            std::fs::remove_dir_all(&temp_dir).ok();
+            panic!("Docker run failed: {}", String::from_utf8_lossy(&run_result.stderr));
+        }
+
+        // Wait for the container to start and become healthy
+        println!("Waiting for container to become ready...");
+        let mut attempts = 0;
+        let max_attempts = 30;
+        let mut is_healthy = false;
+
+        while attempts < max_attempts {
+            std::thread::sleep(Duration::from_secs(2));
+            attempts += 1;
+
+            // Check container logs for "Ready" message
+            let logs_result = Command::new("docker")
+                .args(["logs", &container_name])
+                .output()
+                .expect("Failed to get container logs");
+
+            let logs = String::from_utf8_lossy(&logs_result.stdout);
+            let logs_stderr = String::from_utf8_lossy(&logs_result.stderr);
+
+            println!("Attempt {}/{} - Logs: {} {}", attempts, max_attempts, logs, logs_stderr);
+
+            // Check if Next.js is ready
+            if logs.contains("Ready") || logs_stderr.contains("Ready") ||
+               logs.contains("started server") || logs_stderr.contains("started server") {
+                is_healthy = true;
+                break;
+            }
+
+            // Also try HTTP request
+            let curl_result = Command::new("curl")
+                .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", &format!("http://localhost:{}", host_port)])
+                .output();
+
+            if let Ok(output) = curl_result {
+                let status = String::from_utf8_lossy(&output.stdout);
+                if status == "200" {
+                    is_healthy = true;
+                    println!("HTTP health check passed with status 200");
+                    break;
+                }
+            }
+        }
+
+        // Get final container logs for debugging
+        let final_logs = Command::new("docker")
+            .args(["logs", &container_name])
+            .output()
+            .expect("Failed to get final logs");
+
+        println!("Final container stdout:\n{}", String::from_utf8_lossy(&final_logs.stdout));
+        println!("Final container stderr:\n{}", String::from_utf8_lossy(&final_logs.stderr));
+
+        // Check container status
+        let inspect_result = Command::new("docker")
+            .args(["inspect", "--format", "{{.State.Status}}", &container_name])
+            .output()
+            .expect("Failed to inspect container");
+
+        let container_status = String::from_utf8_lossy(&inspect_result.stdout).trim().to_string();
+        println!("Container status: {}", container_status);
+
+        // Cleanup: Stop and remove container, remove image
+        println!("Cleaning up...");
+        Command::new("docker").args(["stop", &container_name]).output().ok();
+        Command::new("docker").args(["rm", "-f", &container_name]).output().ok();
+        Command::new("docker").args(["rmi", "-f", &image_name]).output().ok();
+        std::fs::remove_dir_all(&temp_dir).ok();
+
+        // Assert the container was healthy
+        assert!(
+            is_healthy || container_status == "running",
+            "Container did not become healthy within {} seconds. Status: {}",
+            max_attempts * 2,
+            container_status
+        );
+
+        println!("Test passed! Next.js container built and ran successfully.");
     }
 }

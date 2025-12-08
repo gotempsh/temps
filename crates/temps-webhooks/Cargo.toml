@@ -28,6 +28,7 @@ thiserror = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }
 hex = { workspace = true }
+url = "2.5"  # For URL validation and SSRF prevention
 
 [dev-dependencies]
 tokio-test = "0.4"

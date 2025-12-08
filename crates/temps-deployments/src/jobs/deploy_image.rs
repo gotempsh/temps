@@ -847,8 +847,11 @@ impl DeployImageJob {
 
         let mut consecutive_successes = 0;
         let required_successes = 2; // Require 2 consecutive successful connections
+        let mut first_error_time: Option<std::time::Instant> = None;
+        let max_error_duration = std::time::Duration::from_secs(60); // Only retry errors for 60 seconds
 
         loop {
+            // Check for overall timeout (5 minutes)
             if start_time.elapsed() > max_wait_time {
                 self.log(
                     context,
@@ -860,6 +863,22 @@ impl DeployImageJob {
                 return Err(WorkflowError::JobExecutionFailed(
                     "Application timeout - connectivity checks did not pass in time".to_string(),
                 ));
+            }
+
+            // Check for error timeout (60 seconds of consecutive 4xx/5xx errors)
+            if let Some(error_start) = first_error_time {
+                if error_start.elapsed() > max_error_duration {
+                    self.log(
+                        context,
+                        "⏱️  Application health check failed - server returning errors for too long".to_string(),
+                    )
+                    .await?;
+                    // Clean up container on health check failure
+                    self.cleanup_container(context).await?;
+                    return Err(WorkflowError::JobExecutionFailed(
+                        "Application health check failed - server returned error status codes for 60 seconds".to_string(),
+                    ));
+                }
             }
 
             // Check if container is still running (it may have crashed)
@@ -892,31 +911,62 @@ impl DeployImageJob {
 
             match client.get(&health_check_url).send().await {
                 Ok(response) => {
-                    // Any response (including 404, 500, etc.) means the server is responding
-                    consecutive_successes += 1;
-                    self.log(
-                        context,
-                        format!(
-                            "Connectivity check passed - server responding with status {} ({}/{})",
-                            response.status(),
-                            consecutive_successes,
-                            required_successes
-                        ),
-                    )
-                    .await?;
+                    let status = response.status();
 
-                    if consecutive_successes >= required_successes {
-                        self.log(context, "Application is ready and responding!".to_string())
-                            .await?;
-                        break;
+                    // Only 2xx and 3xx are considered healthy
+                    if status.is_success() || status.is_redirection() {
+                        consecutive_successes += 1;
+                        first_error_time = None; // Reset error timer on success
+
+                        let message = format!(
+                            "✅ Health check passed - server healthy with status {} ({}/{})",
+                            status, consecutive_successes, required_successes
+                        );
+                        if let (Some(ref log_id), Some(ref log_service)) =
+                            (&self.log_id, &self.log_service)
+                        {
+                            log_service
+                                .append_structured_log(log_id, LogLevel::Success, message.clone())
+                                .await
+                                .map_err(|e| {
+                                    WorkflowError::Other(format!("Failed to write log: {}", e))
+                                })?;
+                        }
+                        context.log(&message).await?;
+
+                        if consecutive_successes >= required_successes {
+                            self.log(context, "✅ Application is ready and healthy!".to_string())
+                                .await?;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    } else {
+                        // 4xx, 5xx = application error
+                        consecutive_successes = 0;
+
+                        // Start error timer if this is the first error
+                        if first_error_time.is_none() {
+                            first_error_time = Some(std::time::Instant::now());
+                        }
+
+                        let elapsed = first_error_time.unwrap().elapsed().as_secs();
+                        self.log(
+                            context,
+                            format!(
+                                "❌ Health check failed - server returned error status {} (not healthy), retrying... ({}/60s)",
+                                status, elapsed
+                            ),
+                        )
+                        .await?;
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
                 Err(e) => {
                     consecutive_successes = 0; // Reset counter on connection error
+                    first_error_time = None; // Reset error timer - connection errors are expected during startup
                     self.log(
                         context,
-                        format!("Connectivity check failed ({}), retrying...", e),
+                        format!("⏳ Connectivity check failed ({}), retrying...", e),
                     )
                     .await?;
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;

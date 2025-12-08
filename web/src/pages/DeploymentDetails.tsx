@@ -662,10 +662,17 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           isOpen={isRedeployModalOpen}
           onClose={() => setIsRedeployModalOpen(false)}
           onConfirm={handleRedeploy}
+          mode="redeploy"
           defaultBranch={deployment?.branch || ''}
           defaultCommit={deployment?.commit_hash || ''}
           defaultTag={deployment?.tag || ''}
-          defaultType="commit"
+          defaultType={
+            deployment?.tag
+              ? 'tag'
+              : deployment?.branch
+                ? 'branch'
+                : 'commit'
+          }
           defaultEnvironment={deployment?.environment_id || 0}
           isLoading={createDeployment.isPending}
         />
