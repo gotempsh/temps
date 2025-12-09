@@ -246,34 +246,25 @@ WORKDIR /{project_slug}
             run_image = run_image,
         ));
 
-        // Copy build output and production dependencies
+        // Copy entire project from build stage
+        // This ensures all runtime files are available (drizzle, config, mydata, locales, etc.)
         // Distroless uses uid 65532 (nonroot user)
         match build_system.monorepo_tool {
             MonorepoTool::None => {
                 dockerfile.push_str(&format!(
-                    r#"# Copy package.json for node --run to work
-COPY --from=build --chown=65532:65532 /{project_slug}/package.json /{project_slug}/
-# Copy production dependencies
-COPY --from=build --chown=65532:65532 /{project_slug}/node_modules /{project_slug}/node_modules
-# Copy Next.js build output
-COPY --from=build --chown=65532:65532 /{project_slug}/.next /{project_slug}/.next
-# Copy public assets
-COPY --from=build --chown=65532:65532 /{project_slug}/public /{project_slug}/public
+                    r#"# Copy entire project directory to ensure all runtime files are available
+# This includes: node_modules, .next, public, and ANY custom directories (drizzle, mydata, etc.)
+COPY --from=build --chown=65532:65532 /{project_slug} /{project_slug}
 "#,
                     project_slug = project_slug
                 ));
             }
             _ => {
-                // For monorepos, copy from subdirectory
+                // For monorepos, copy the subdirectory
                 dockerfile.push_str(&format!(
-                    r#"# Copy package.json for node --run to work
-COPY --from=build --chown=65532:65532 /{project_slug}/{relative_path}/package.json /{project_slug}/
-# Copy production dependencies
-COPY --from=build --chown=65532:65532 /{project_slug}/{relative_path}/node_modules /{project_slug}/node_modules
-# Copy Next.js build output
-COPY --from=build --chown=65532:65532 /{project_slug}/{relative_path}/.next /{project_slug}/.next
-# Copy public assets
-COPY --from=build --chown=65532:65532 /{project_slug}/{relative_path}/public /{project_slug}/public
+                    r#"# Copy entire project directory to ensure all runtime files are available
+# This includes: node_modules, .next, public, and ANY custom directories (drizzle, mydata, etc.)
+COPY --from=build --chown=65532:65532 /{project_slug}/{relative_path} /{project_slug}
 "#,
                     project_slug = project_slug,
                     relative_path = relative_path

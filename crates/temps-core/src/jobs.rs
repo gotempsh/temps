@@ -162,6 +162,21 @@ pub struct DomainProvisionedJob {
     pub domain_name: String,
 }
 
+/// Job for when a vulnerability scan is completed
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VulnerabilityScanCompletedJob {
+    pub scan_id: i32,
+    pub project_id: i32,
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
+    pub total_vulnerabilities: i32,
+    pub critical_count: i32,
+    pub high_count: i32,
+    pub medium_count: i32,
+    pub low_count: i32,
+    pub status: String,
+}
+
 /// Core job enum containing all possible job types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Job {
@@ -191,6 +206,8 @@ pub enum Job {
     // Domain events
     DomainCreated(DomainCreatedJob),
     DomainProvisioned(DomainProvisionedJob),
+    // Vulnerability scan events
+    VulnerabilityScanCompleted(VulnerabilityScanCompletedJob),
 }
 
 impl fmt::Display for Job {
@@ -228,6 +245,7 @@ impl fmt::Display for Job {
             Job::DeploymentReady(job) => write!(f, "DeploymentReady(id: {}, env: {}, project: {}, url: {:?})", job.deployment_id, job.environment_id, job.project_id, job.url),
             Job::DomainCreated(job) => write!(f, "DomainCreated(id: {}, name: {}, project: {})", job.domain_id, job.domain_name, job.project_id),
             Job::DomainProvisioned(job) => write!(f, "DomainProvisioned(id: {}, name: {}, project: {})", job.domain_id, job.domain_name, job.project_id),
+            Job::VulnerabilityScanCompleted(job) => write!(f, "VulnerabilityScanCompleted(id: {}, project: {}, env: {:?}, total: {}, critical: {}, high: {})", job.scan_id, job.project_id, job.environment_id, job.total_vulnerabilities, job.critical_count, job.high_count),
         }
     }
 }
