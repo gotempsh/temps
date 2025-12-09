@@ -24,6 +24,9 @@ import { ErrorTracking } from '@/components/projects/ErrorTracking'
 import { EnvironmentsTabsView } from './EnvironmentsTabsView'
 import { Confetti } from '@/components/ui/confetti'
 import { Skeleton } from '@/components/ui/skeleton'
+import { SecurityOverview } from './security/SecurityOverview'
+import { ScanDetail } from './security/ScanDetail'
+import { VulnerabilityDetailPage } from './security/VulnerabilityDetailPage'
 
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -362,6 +365,15 @@ export function ProjectDetail() {
               <Route
                 path="errors/:errorGroupId/event/:eventId"
                 element={<ErrorEventDetail project={project} />}
+              />
+              <Route
+                path="security"
+                element={<SecurityOverview project={project} />}
+              />
+              <Route path="security/scans/:scanId" element={<ScanDetail />} />
+              <Route
+                path="security/scans/:scanId/vulnerabilities/:vulnId"
+                element={<VulnerabilityDetailPage />}
               />
               <Route
                 path="environments/*"

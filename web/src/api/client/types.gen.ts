@@ -3029,6 +3029,17 @@ export type ListPresetsResponse = {
     total: number;
 };
 
+export type ListScansQuery = {
+    page?: number | null;
+    page_size?: number | null;
+};
+
+export type ListVulnerabilitiesQuery = {
+    page?: number | null;
+    page_size?: number | null;
+    severity?: string | null;
+};
+
 export type LiveVisitorInfo = {
     city?: string | null;
     country?: string | null;
@@ -4220,6 +4231,29 @@ export type S3SourceResponse = {
 export type ScalewayCredentialsRequest = {
     api_key: string;
     project_id: string;
+};
+
+export type ScanResponse = {
+    branch?: string | null;
+    commit_hash?: string | null;
+    completed_at?: string | null;
+    created_at: string;
+    critical_count: number;
+    deployment_id?: number | null;
+    environment_id?: number | null;
+    error_message?: string | null;
+    high_count: number;
+    id: number;
+    low_count: number;
+    medium_count: number;
+    project_id: number;
+    scanner_type: string;
+    scanner_version?: string | null;
+    started_at: string;
+    status: string;
+    total_count: number;
+    unknown_count: number;
+    updated_at: string;
 };
 
 export type ScreenshotSettings = {
@@ -5658,6 +5692,24 @@ export type VolumeMount = {
  */
 export type VolumeType = 'bind' | 'volume' | 'tmpfs';
 
+export type VulnerabilityResponse = {
+    created_at: string;
+    cvss_score?: number | null;
+    description?: string | null;
+    fixed_version?: string | null;
+    id: number;
+    installed_version: string;
+    last_modified_date?: string | null;
+    package_name: string;
+    primary_url?: string | null;
+    published_date?: string | null;
+    references?: unknown;
+    scan_id: number;
+    severity: string;
+    title: string;
+    vulnerability_id: string;
+};
+
 export type WebhookDeliveryResponse = {
     attempt_number: number;
     created_at: string;
@@ -5670,7 +5722,6 @@ export type WebhookDeliveryResponse = {
      * JSON payload that was sent to the webhook endpoint
      */
     payload: string;
-    response_body?: string | null;
     status_code?: number | null;
     success: boolean;
     webhook_id: number;
@@ -7925,6 +7976,48 @@ export type GetActivityGraphResponses = {
 };
 
 export type GetActivityGraphResponse = GetActivityGraphResponses[keyof GetActivityGraphResponses];
+
+export type GetScanByDeploymentData = {
+    body?: never;
+    path: {
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+    };
+    query?: never;
+    url: '/deployments/{deployment_id}/vulnerability-scan';
+};
+
+export type GetScanByDeploymentErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No scan found for deployment
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetScanByDeploymentError = GetScanByDeploymentErrors[keyof GetScanByDeploymentErrors];
+
+export type GetScanByDeploymentResponses = {
+    /**
+     * Scan for the specified deployment
+     */
+    200: ScanResponse;
+};
+
+export type GetScanByDeploymentResponse = GetScanByDeploymentResponses[keyof GetScanByDeploymentResponses];
 
 export type ListProvidersData = {
     body?: never;
@@ -16639,6 +16732,138 @@ export type GetUniqueCountsResponses = {
 
 export type GetUniqueCountsResponse = GetUniqueCountsResponses[keyof GetUniqueCountsResponses];
 
+export type ListProjectScansData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Page number (default: 1)
+         */
+        page?: number;
+        /**
+         * Page size (default: 20, max: 100)
+         */
+        page_size?: number;
+    };
+    url: '/projects/{project_id}/vulnerability-scans';
+};
+
+export type ListProjectScansErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListProjectScansError = ListProjectScansErrors[keyof ListProjectScansErrors];
+
+export type ListProjectScansResponses = {
+    /**
+     * List of vulnerability scans
+     */
+    200: Array<ScanResponse>;
+};
+
+export type ListProjectScansResponse = ListProjectScansResponses[keyof ListProjectScansResponses];
+
+export type GetLatestScansPerEnvironmentData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/vulnerability-scans/environments';
+};
+
+export type GetLatestScansPerEnvironmentErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetLatestScansPerEnvironmentError = GetLatestScansPerEnvironmentErrors[keyof GetLatestScansPerEnvironmentErrors];
+
+export type GetLatestScansPerEnvironmentResponses = {
+    /**
+     * Latest scans per environment for current deployments
+     */
+    200: Array<ScanResponse>;
+};
+
+export type GetLatestScansPerEnvironmentResponse = GetLatestScansPerEnvironmentResponses[keyof GetLatestScansPerEnvironmentResponses];
+
+export type GetLatestScanData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Filter by environment ID
+         */
+        environment_id?: number;
+    };
+    url: '/projects/{project_id}/vulnerability-scans/latest';
+};
+
+export type GetLatestScanErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No scans found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetLatestScanError = GetLatestScanErrors[keyof GetLatestScanErrors];
+
+export type GetLatestScanResponses = {
+    /**
+     * Latest scan for project
+     */
+    200: ScanResponse;
+};
+
+export type GetLatestScanResponse = GetLatestScanResponses[keyof GetLatestScanResponses];
+
 export type ListWebhooksData = {
     body?: never;
     path: {
@@ -18598,6 +18823,145 @@ export type AddEventsResponses = {
 };
 
 export type AddEventsResponse2 = AddEventsResponses[keyof AddEventsResponses];
+
+export type DeleteScanData = {
+    body?: never;
+    path: {
+        /**
+         * Scan ID
+         */
+        scan_id: number;
+    };
+    query?: never;
+    url: '/vulnerability-scans/{scan_id}';
+};
+
+export type DeleteScanErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Scan not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteScanError = DeleteScanErrors[keyof DeleteScanErrors];
+
+export type DeleteScanResponses = {
+    /**
+     * Scan deleted
+     */
+    204: void;
+};
+
+export type DeleteScanResponse = DeleteScanResponses[keyof DeleteScanResponses];
+
+export type GetScanData = {
+    body?: never;
+    path: {
+        /**
+         * Scan ID
+         */
+        scan_id: number;
+    };
+    query?: never;
+    url: '/vulnerability-scans/{scan_id}';
+};
+
+export type GetScanErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Scan not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetScanError = GetScanErrors[keyof GetScanErrors];
+
+export type GetScanResponses = {
+    /**
+     * Scan details
+     */
+    200: ScanResponse;
+};
+
+export type GetScanResponse = GetScanResponses[keyof GetScanResponses];
+
+export type GetScanVulnerabilitiesData = {
+    body?: never;
+    path: {
+        /**
+         * Scan ID
+         */
+        scan_id: number;
+    };
+    query?: {
+        /**
+         * Page number (default: 1)
+         */
+        page?: number;
+        /**
+         * Page size (default: 20, max: 100)
+         */
+        page_size?: number;
+        /**
+         * Filter by severity (CRITICAL, HIGH, MEDIUM, LOW)
+         */
+        severity?: string;
+    };
+    url: '/vulnerability-scans/{scan_id}/vulnerabilities';
+};
+
+export type GetScanVulnerabilitiesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Scan not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetScanVulnerabilitiesError = GetScanVulnerabilitiesErrors[keyof GetScanVulnerabilitiesErrors];
+
+export type GetScanVulnerabilitiesResponses = {
+    /**
+     * List of vulnerabilities
+     */
+    200: Array<VulnerabilityResponse>;
+};
+
+export type GetScanVulnerabilitiesResponse = GetScanVulnerabilitiesResponses[keyof GetScanVulnerabilitiesResponses];
 
 export type ListEventTypesData = {
     body?: never;

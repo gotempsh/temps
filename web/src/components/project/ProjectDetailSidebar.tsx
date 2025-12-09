@@ -13,6 +13,7 @@ import {
   ScrollText,
   Settings,
   Shield,
+  ShieldAlert,
   Key,
   Globe,
 } from 'lucide-react'
@@ -119,6 +120,11 @@ const baseNavItems: NavItem[] = [
     url: 'errors',
     icon: Shield,
     kbd: 'E',
+  },
+  {
+    title: 'Security',
+    url: 'security',
+    icon: Shield,
   },
   {
     title: 'Monitors',
