@@ -737,6 +737,16 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
             CustomDomainError::DuplicateDomain(msg) => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Duplicate Domain")
                 .with_detail(msg),
+            CustomDomainError::CircularRedirect(msg) => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Circular Redirect")
+                    .with_detail(msg)
+            }
+            CustomDomainError::InvalidRedirectUrl(msg) => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Redirect URL")
+                    .with_detail(msg)
+            }
             CustomDomainError::Internal(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")

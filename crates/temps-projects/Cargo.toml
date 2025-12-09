@@ -40,3 +40,4 @@ flate2 = { workspace = true }
 http = { workspace = true }
 futures-util = { workspace = true }
 slug = { workspace = true }
+url = { workspace = true }
