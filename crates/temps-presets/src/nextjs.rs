@@ -438,11 +438,16 @@ mod tests {
         assert!(result.content.contains("# Change to project subdirectory"));
         assert!(result.content.contains("WORKDIR /test_project/apps/web"));
 
-        // Verify build output is copied from monorepo subdirectory in production stage
-        assert!(result.content.contains("# Copy package.json for node --run to work"));
-        assert!(result.content.contains("# Copy Next.js build output"));
+        // Verify entire project directory is copied in production stage (not selective files)
+        assert!(result.content.contains("# Copy entire project directory to ensure all runtime files are available"));
+        assert!(result.content.contains("# This includes: node_modules, .next, public, and ANY custom directories (drizzle, mydata, etc.)"));
         // Verify the copy is from the subdirectory path (apps/web)
-        assert!(result.content.contains("/test_project/apps/web/.next"));
+        assert!(result.content.contains("COPY --from=build --chown=65532:65532 /test_project/apps/web /test_project"));
+
+        // Verify we do NOT prune devDependencies (TypeScript needed at runtime)
+        assert!(result.content.contains("# NOTE: We do NOT prune devDependencies for Next.js projects"));
+        assert!(!result.content.contains("npm prune --production"));
+        assert!(!result.content.contains("yarn install --production"));
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).ok();

@@ -68,27 +68,40 @@ impl ProjectChangeListener {
         }
     }
 
-    /// Handle a project change notification
+    /// Handle a route change notification (project or environment)
     async fn handle_project_change(&self, payload: &str) {
-        match serde_json::from_str::<ProjectChangePayload>(payload) {
+        // Try to parse as RouteChangePayload which handles both project and environment changes
+        match serde_json::from_str::<RouteChangePayload>(payload) {
             Ok(change) => {
-                info!(
-                    "Project route change: action={}, project_id={}, is_deleted={}, slug={}",
-                    change.action, change.project_id, change.is_deleted, change.slug
-                );
+                match change {
+                    RouteChangePayload::Project(project_change) => {
+                        info!(
+                            "Project route change: action={}, project_id={}, is_deleted={}, slug={}",
+                            project_change.action,
+                            project_change.project_id,
+                            project_change.is_deleted,
+                            project_change.slug
+                        );
+                    }
+                    RouteChangePayload::Environment(env_change) => {
+                        info!(
+                            "Environment route change: action={}, environment_id={}, project_id={}, deployment_id={:?}",
+                            env_change.action,
+                            env_change.environment_id,
+                            env_change.project_id,
+                            env_change.deployment_id
+                        );
+                    }
+                }
 
-                // Reload all routes when a project changes
-                // (since project slug affects preview domain routing)
+                // Reload all routes when any change happens
                 if let Err(e) = self.peer_table.load_routes().await {
-                    error!(
-                        "Failed to reload routes after project change (project_id={}): {}",
-                        change.project_id, e
-                    );
+                    error!("Failed to reload routes after change: {}", e);
                 }
             }
             Err(e) => {
                 error!(
-                    "Failed to parse project_route_change payload: {}. Payload: {}",
+                    "Failed to parse route change payload: {}. Payload: {}",
                     e, payload
                 );
             }
@@ -96,7 +109,15 @@ impl ProjectChangeListener {
     }
 }
 
-/// The payload structure sent by the PostgreSQL trigger
+/// Unified payload structure for route changes (project or environment)
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum RouteChangePayload {
+    Project(ProjectChangePayload),
+    Environment(EnvironmentChangePayload),
+}
+
+/// Payload from project triggers
 #[derive(Debug, serde::Deserialize)]
 struct ProjectChangePayload {
     action: String, // INSERT, UPDATE, or DELETE
@@ -107,6 +128,17 @@ struct ProjectChangePayload {
     timestamp: String, // Included for debugging/auditing
 }
 
+/// Payload from environment triggers (when current_deployment_id changes)
+#[derive(Debug, serde::Deserialize)]
+struct EnvironmentChangePayload {
+    action: String, // ENVIRONMENT_UPDATE
+    environment_id: i32,
+    project_id: i32,
+    deployment_id: Option<i32>,
+    #[allow(dead_code)]
+    timestamp: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,17 +146,55 @@ mod tests {
     #[test]
     fn test_parse_project_change_payload() {
         let payload = r#"{"action":"UPDATE","project_id":1,"is_deleted":false,"slug":"my-project","timestamp":"2025-11-06T10:30:00Z"}"#;
-        let change: ProjectChangePayload = serde_json::from_str(payload).unwrap();
-        assert_eq!(change.project_id, 1);
-        assert_eq!(change.action, "UPDATE");
-        assert!(!change.is_deleted);
+        let change: RouteChangePayload = serde_json::from_str(payload).unwrap();
+        match change {
+            RouteChangePayload::Project(project) => {
+                assert_eq!(project.project_id, 1);
+                assert_eq!(project.action, "UPDATE");
+                assert!(!project.is_deleted);
+            }
+            _ => panic!("Expected Project payload"),
+        }
     }
 
     #[test]
     fn test_parse_deleted_project() {
         let payload = r#"{"action":"UPDATE","project_id":2,"is_deleted":true,"slug":"old-project","timestamp":"2025-11-06T10:30:00Z"}"#;
-        let change: ProjectChangePayload = serde_json::from_str(payload).unwrap();
-        assert_eq!(change.project_id, 2);
-        assert!(change.is_deleted);
+        let change: RouteChangePayload = serde_json::from_str(payload).unwrap();
+        match change {
+            RouteChangePayload::Project(project) => {
+                assert_eq!(project.project_id, 2);
+                assert!(project.is_deleted);
+            }
+            _ => panic!("Expected Project payload"),
+        }
+    }
+
+    #[test]
+    fn test_parse_environment_change_payload() {
+        let payload = r#"{"action":"ENVIRONMENT_UPDATE","environment_id":5,"project_id":1,"deployment_id":42,"timestamp":"2025-12-09T12:00:00Z"}"#;
+        let change: RouteChangePayload = serde_json::from_str(payload).unwrap();
+        match change {
+            RouteChangePayload::Environment(env) => {
+                assert_eq!(env.action, "ENVIRONMENT_UPDATE");
+                assert_eq!(env.environment_id, 5);
+                assert_eq!(env.project_id, 1);
+                assert_eq!(env.deployment_id, Some(42));
+            }
+            _ => panic!("Expected Environment payload"),
+        }
+    }
+
+    #[test]
+    fn test_parse_environment_change_null_deployment() {
+        let payload = r#"{"action":"ENVIRONMENT_UPDATE","environment_id":5,"project_id":1,"deployment_id":null,"timestamp":"2025-12-09T12:00:00Z"}"#;
+        let change: RouteChangePayload = serde_json::from_str(payload).unwrap();
+        match change {
+            RouteChangePayload::Environment(env) => {
+                assert_eq!(env.environment_id, 5);
+                assert_eq!(env.deployment_id, None);
+            }
+            _ => panic!("Expected Environment payload"),
+        }
     }
 }

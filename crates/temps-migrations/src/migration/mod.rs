@@ -17,6 +17,7 @@ mod m20251206_000003_alter_visitor_custom_data_to_jsonb;
 mod m20251206_000004_add_route_type_to_custom_routes;
 mod m20251208_000001_create_vulnerability_scans;
 mod m20251208_000002_add_deployment_id_to_scans;
+mod m20251209_000001_add_environments_route_trigger;
 
 pub struct Migrator;
 
@@ -41,6 +42,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20251206_000004_add_route_type_to_custom_routes::Migration),
             Box::new(m20251208_000001_create_vulnerability_scans::Migration),
             Box::new(m20251208_000002_add_deployment_id_to_scans::Migration),
+            Box::new(m20251209_000001_add_environments_route_trigger::Migration),
         ]
     }
 }
