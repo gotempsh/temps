@@ -15,7 +15,7 @@ use temps_vulnerability_scanner::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::jobs::{ImageOutput, RepositoryOutput};
+use crate::jobs::ImageOutput;
 
 /// Output from ScanVulnerabilitiesJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +195,7 @@ impl WorkflowTask for ScanVulnerabilitiesJob {
             .create_scan(
                 self.project_id,
                 Some(self.environment_id),
+                Some(self.deployment_id),
                 Some(self.branch.clone()),
                 Some(self.commit_hash.clone()),
             )
