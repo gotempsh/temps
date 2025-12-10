@@ -31,6 +31,21 @@ reqwest = { workspace = true }
 # Cloudflare API client
 cloudflare = "0.14"
 
+# AWS Signature V4 signing for Route53
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+# GCP service account authentication
+rsa = "0.9"
+base64 = "0.22"
+
+# XML parsing for Route53
+quick-xml = { version = "0.37", features = ["serialize"] }
+
+# URL encoding
+urlencoding = "2.1"
+
 # Web framework
 axum = { workspace = true }
 axum-macros = { workspace = true }

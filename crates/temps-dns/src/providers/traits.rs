@@ -23,6 +23,10 @@ pub enum DnsProviderType {
     Route53,
     /// DigitalOcean DNS (API Token)
     DigitalOcean,
+    /// Google Cloud DNS (Service Account)
+    Gcp,
+    /// Azure DNS (Service Principal)
+    Azure,
     /// Manual DNS (user sets records manually)
     Manual,
 }
@@ -34,6 +38,8 @@ impl std::fmt::Display for DnsProviderType {
             DnsProviderType::Namecheap => write!(f, "namecheap"),
             DnsProviderType::Route53 => write!(f, "route53"),
             DnsProviderType::DigitalOcean => write!(f, "digitalocean"),
+            DnsProviderType::Gcp => write!(f, "gcp"),
+            DnsProviderType::Azure => write!(f, "azure"),
             DnsProviderType::Manual => write!(f, "manual"),
         }
     }
@@ -46,6 +52,8 @@ impl DnsProviderType {
             "namecheap" | "nc" => Ok(DnsProviderType::Namecheap),
             "route53" | "aws" | "r53" => Ok(DnsProviderType::Route53),
             "digitalocean" | "do" => Ok(DnsProviderType::DigitalOcean),
+            "gcp" | "google" | "googlecloud" | "google-cloud" => Ok(DnsProviderType::Gcp),
+            "azure" | "az" => Ok(DnsProviderType::Azure),
             "manual" => Ok(DnsProviderType::Manual),
             _ => Err(DnsError::InvalidProviderType(s.to_string())),
         }
@@ -58,6 +66,16 @@ impl DnsProviderType {
             DnsProviderType::Namecheap => vec!["api_user", "api_key"],
             DnsProviderType::Route53 => vec!["access_key_id", "secret_access_key"],
             DnsProviderType::DigitalOcean => vec!["api_token"],
+            DnsProviderType::Gcp => vec!["service_account_email", "private_key", "project_id"],
+            DnsProviderType::Azure => {
+                vec![
+                    "tenant_id",
+                    "client_id",
+                    "client_secret",
+                    "subscription_id",
+                    "resource_group",
+                ]
+            }
             DnsProviderType::Manual => vec![],
         }
     }
@@ -69,6 +87,8 @@ impl DnsProviderType {
             DnsProviderType::Namecheap => vec!["client_ip", "sandbox"],
             DnsProviderType::Route53 => vec!["session_token", "region"],
             DnsProviderType::DigitalOcean => vec![],
+            DnsProviderType::Gcp => vec![],
+            DnsProviderType::Azure => vec![],
             DnsProviderType::Manual => vec![],
         }
     }
@@ -512,6 +532,14 @@ mod tests {
             DnsProviderType::DigitalOcean
         );
         assert_eq!(
+            DnsProviderType::from_str("gcp").unwrap(),
+            DnsProviderType::Gcp
+        );
+        assert_eq!(
+            DnsProviderType::from_str("azure").unwrap(),
+            DnsProviderType::Azure
+        );
+        assert_eq!(
             DnsProviderType::from_str("manual").unwrap(),
             DnsProviderType::Manual
         );
@@ -541,6 +569,22 @@ mod tests {
             DnsProviderType::from_str("do").unwrap(),
             DnsProviderType::DigitalOcean
         );
+        assert_eq!(
+            DnsProviderType::from_str("google").unwrap(),
+            DnsProviderType::Gcp
+        );
+        assert_eq!(
+            DnsProviderType::from_str("googlecloud").unwrap(),
+            DnsProviderType::Gcp
+        );
+        assert_eq!(
+            DnsProviderType::from_str("google-cloud").unwrap(),
+            DnsProviderType::Gcp
+        );
+        assert_eq!(
+            DnsProviderType::from_str("az").unwrap(),
+            DnsProviderType::Azure
+        );
     }
 
     #[test]
@@ -565,6 +609,8 @@ mod tests {
         assert_eq!(DnsProviderType::Namecheap.to_string(), "namecheap");
         assert_eq!(DnsProviderType::Route53.to_string(), "route53");
         assert_eq!(DnsProviderType::DigitalOcean.to_string(), "digitalocean");
+        assert_eq!(DnsProviderType::Gcp.to_string(), "gcp");
+        assert_eq!(DnsProviderType::Azure.to_string(), "azure");
         assert_eq!(DnsProviderType::Manual.to_string(), "manual");
     }
 
@@ -586,6 +632,20 @@ mod tests {
             DnsProviderType::DigitalOcean.required_credentials(),
             vec!["api_token"]
         );
+        assert_eq!(
+            DnsProviderType::Gcp.required_credentials(),
+            vec!["service_account_email", "private_key", "project_id"]
+        );
+        assert_eq!(
+            DnsProviderType::Azure.required_credentials(),
+            vec![
+                "tenant_id",
+                "client_id",
+                "client_secret",
+                "subscription_id",
+                "resource_group"
+            ]
+        );
         assert!(DnsProviderType::Manual.required_credentials().is_empty());
     }
 
@@ -606,6 +666,8 @@ mod tests {
         assert!(DnsProviderType::DigitalOcean
             .optional_credentials()
             .is_empty());
+        assert!(DnsProviderType::Gcp.optional_credentials().is_empty());
+        assert!(DnsProviderType::Azure.optional_credentials().is_empty());
         assert!(DnsProviderType::Manual.optional_credentials().is_empty());
     }
 

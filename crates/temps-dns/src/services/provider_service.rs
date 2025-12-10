@@ -17,8 +17,8 @@ use tracing::{debug, error, info};
 
 use crate::errors::DnsError;
 use crate::providers::{
-    CloudflareProvider, DnsProvider, DnsProviderType, ManualDnsProvider, NamecheapProvider,
-    ProviderCredentials,
+    AzureProvider, CloudflareProvider, DigitalOceanProvider, DnsProvider, DnsProviderType,
+    GcpProvider, ManualDnsProvider, NamecheapProvider, ProviderCredentials, Route53Provider,
 };
 
 /// Service for managing DNS providers
@@ -135,16 +135,62 @@ impl DnsProviderService {
                     ))
                 }
             },
-            DnsProviderType::Route53 => {
-                return Err(DnsError::NotSupported(
-                    "Route53 provider not yet implemented".to_string(),
-                ))
-            }
-            DnsProviderType::DigitalOcean => {
-                return Err(DnsError::NotSupported(
-                    "DigitalOcean provider not yet implemented".to_string(),
-                ))
-            }
+            DnsProviderType::Route53 => match credentials {
+                ProviderCredentials::Route53(r53_creds) => {
+                    let r53_provider = Route53Provider::new(r53_creds.clone()).map_err(|e| {
+                        error!("Failed to create Route53 provider for testing: {}", e);
+                        e
+                    })?;
+                    Box::new(r53_provider)
+                }
+                _ => {
+                    return Err(DnsError::InvalidCredentials(
+                        "Expected Route53 credentials".to_string(),
+                    ))
+                }
+            },
+            DnsProviderType::DigitalOcean => match credentials {
+                ProviderCredentials::DigitalOcean(do_creds) => {
+                    let do_provider = DigitalOceanProvider::new(do_creds.clone()).map_err(|e| {
+                        error!("Failed to create DigitalOcean provider for testing: {}", e);
+                        e
+                    })?;
+                    Box::new(do_provider)
+                }
+                _ => {
+                    return Err(DnsError::InvalidCredentials(
+                        "Expected DigitalOcean credentials".to_string(),
+                    ))
+                }
+            },
+            DnsProviderType::Gcp => match credentials {
+                ProviderCredentials::Gcp(gcp_creds) => {
+                    let gcp_provider = GcpProvider::new(gcp_creds.clone()).map_err(|e| {
+                        error!("Failed to create GCP provider for testing: {}", e);
+                        e
+                    })?;
+                    Box::new(gcp_provider)
+                }
+                _ => {
+                    return Err(DnsError::InvalidCredentials(
+                        "Expected GCP credentials".to_string(),
+                    ))
+                }
+            },
+            DnsProviderType::Azure => match credentials {
+                ProviderCredentials::Azure(azure_creds) => {
+                    let azure_provider = AzureProvider::new(azure_creds.clone()).map_err(|e| {
+                        error!("Failed to create Azure provider for testing: {}", e);
+                        e
+                    })?;
+                    Box::new(azure_provider)
+                }
+                _ => {
+                    return Err(DnsError::InvalidCredentials(
+                        "Expected Azure credentials".to_string(),
+                    ))
+                }
+            },
             DnsProviderType::Manual => {
                 // Manual provider doesn't need connection testing
                 debug!("Manual provider - skipping connection test");
@@ -314,16 +360,64 @@ impl DnsProviderService {
                 }
             }
             DnsProviderType::Route53 => {
-                // Route53 implementation would go here
-                Err(DnsError::NotSupported(
-                    "Route53 provider not yet implemented".to_string(),
-                ))
+                let credentials: ProviderCredentials = serde_json::from_str(&credentials_json)?;
+                match credentials {
+                    ProviderCredentials::Route53(r53_creds) => {
+                        let r53_provider = Route53Provider::new(r53_creds).map_err(|e| {
+                            error!("Failed to create Route53 provider: {}", e);
+                            e
+                        })?;
+                        Ok(Box::new(r53_provider))
+                    }
+                    _ => Err(DnsError::InvalidCredentials(
+                        "Expected Route53 credentials".to_string(),
+                    )),
+                }
             }
             DnsProviderType::DigitalOcean => {
-                // DigitalOcean implementation would go here
-                Err(DnsError::NotSupported(
-                    "DigitalOcean provider not yet implemented".to_string(),
-                ))
+                let credentials: ProviderCredentials = serde_json::from_str(&credentials_json)?;
+                match credentials {
+                    ProviderCredentials::DigitalOcean(do_creds) => {
+                        let do_provider = DigitalOceanProvider::new(do_creds).map_err(|e| {
+                            error!("Failed to create DigitalOcean provider: {}", e);
+                            e
+                        })?;
+                        Ok(Box::new(do_provider))
+                    }
+                    _ => Err(DnsError::InvalidCredentials(
+                        "Expected DigitalOcean credentials".to_string(),
+                    )),
+                }
+            }
+            DnsProviderType::Gcp => {
+                let credentials: ProviderCredentials = serde_json::from_str(&credentials_json)?;
+                match credentials {
+                    ProviderCredentials::Gcp(gcp_creds) => {
+                        let gcp_provider = GcpProvider::new(gcp_creds).map_err(|e| {
+                            error!("Failed to create GCP provider: {}", e);
+                            e
+                        })?;
+                        Ok(Box::new(gcp_provider))
+                    }
+                    _ => Err(DnsError::InvalidCredentials(
+                        "Expected GCP credentials".to_string(),
+                    )),
+                }
+            }
+            DnsProviderType::Azure => {
+                let credentials: ProviderCredentials = serde_json::from_str(&credentials_json)?;
+                match credentials {
+                    ProviderCredentials::Azure(azure_creds) => {
+                        let azure_provider = AzureProvider::new(azure_creds).map_err(|e| {
+                            error!("Failed to create Azure provider: {}", e);
+                            e
+                        })?;
+                        Ok(Box::new(azure_provider))
+                    }
+                    _ => Err(DnsError::InvalidCredentials(
+                        "Expected Azure credentials".to_string(),
+                    )),
+                }
             }
             DnsProviderType::Manual => Ok(Box::new(ManualDnsProvider::new())),
         }

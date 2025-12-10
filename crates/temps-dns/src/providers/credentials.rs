@@ -85,6 +85,53 @@ pub struct DigitalOceanCredentials {
     pub api_token: String,
 }
 
+/// Google Cloud DNS credentials
+///
+/// GCP uses service account credentials for authentication.
+/// Create a service account with DNS Administrator role.
+/// Download the JSON key file from the GCP Console.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GcpCredentials {
+    /// Service account email (from JSON key file)
+    #[schema(example = "dns-admin@myproject.iam.gserviceaccount.com")]
+    pub service_account_email: String,
+
+    /// Private key (PEM format, from JSON key file)
+    #[schema(example = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----")]
+    pub private_key: String,
+
+    /// GCP Project ID
+    #[schema(example = "my-gcp-project")]
+    pub project_id: String,
+}
+
+/// Azure DNS credentials
+///
+/// Azure uses service principal (app registration) credentials.
+/// Create an app registration with DNS Zone Contributor role.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AzureCredentials {
+    /// Azure Tenant ID (Directory ID)
+    #[schema(example = "00000000-0000-0000-0000-000000000000")]
+    pub tenant_id: String,
+
+    /// Client ID (Application ID)
+    #[schema(example = "00000000-0000-0000-0000-000000000000")]
+    pub client_id: String,
+
+    /// Client Secret
+    #[schema(example = "your-client-secret")]
+    pub client_secret: String,
+
+    /// Azure Subscription ID
+    #[schema(example = "00000000-0000-0000-0000-000000000000")]
+    pub subscription_id: String,
+
+    /// Resource Group name containing DNS zones
+    #[schema(example = "my-resource-group")]
+    pub resource_group: String,
+}
+
 /// Unified provider credentials enum
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -93,6 +140,8 @@ pub enum ProviderCredentials {
     Namecheap(NamecheapCredentials),
     Route53(Route53Credentials),
     DigitalOcean(DigitalOceanCredentials),
+    Gcp(GcpCredentials),
+    Azure(AzureCredentials),
 }
 
 impl ProviderCredentials {
@@ -127,6 +176,24 @@ impl ProviderCredentials {
                 serde_json::json!({
                     "type": "digitalocean",
                     "api_token": mask_string(&c.api_token),
+                })
+            }
+            ProviderCredentials::Gcp(c) => {
+                serde_json::json!({
+                    "type": "gcp",
+                    "service_account_email": c.service_account_email.clone(),
+                    "private_key": "***",
+                    "project_id": c.project_id.clone(),
+                })
+            }
+            ProviderCredentials::Azure(c) => {
+                serde_json::json!({
+                    "type": "azure",
+                    "tenant_id": mask_string(&c.tenant_id),
+                    "client_id": mask_string(&c.client_id),
+                    "client_secret": "***",
+                    "subscription_id": mask_string(&c.subscription_id),
+                    "resource_group": c.resource_group.clone(),
                 })
             }
         }
