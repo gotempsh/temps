@@ -21,6 +21,10 @@ pub struct Model {
     pub primary_url: Option<String>,
     pub published_date: Option<DBDateTime>,
     pub last_modified_date: Option<DBDateTime>,
+    pub class: Option<String>,
+    #[sea_orm(column_name = "type")]
+    pub vuln_type: Option<String>,
+    pub target: Option<String>,
     pub created_at: DBDateTime,
 }
 

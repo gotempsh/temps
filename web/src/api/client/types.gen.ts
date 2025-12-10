@@ -5065,6 +5065,19 @@ export type TriggerPipelineResponse = {
     tag?: string | null;
 };
 
+export type TriggerScanRequest = {
+    /**
+     * Environment ID to scan (uses the current deployment for this environment)
+     */
+    environment_id: number;
+};
+
+export type TriggerScanResponse = {
+    message: string;
+    scan_id: number;
+    status: string;
+};
+
 export type TxtRecord = {
     name: string;
     value: string;
@@ -5693,6 +5706,7 @@ export type VolumeMount = {
 export type VolumeType = 'bind' | 'volume' | 'tmpfs';
 
 export type VulnerabilityResponse = {
+    class?: string | null;
     created_at: string;
     cvss_score?: number | null;
     description?: string | null;
@@ -5706,7 +5720,9 @@ export type VulnerabilityResponse = {
     references?: unknown;
     scan_id: number;
     severity: string;
+    target?: string | null;
     title: string;
+    type?: string | null;
     vulnerability_id: string;
 };
 
@@ -16778,6 +16794,48 @@ export type ListProjectScansResponses = {
 };
 
 export type ListProjectScansResponse = ListProjectScansResponses[keyof ListProjectScansResponses];
+
+export type TriggerScanData = {
+    body: TriggerScanRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/vulnerability-scans';
+};
+
+export type TriggerScanErrors = {
+    /**
+     * Invalid request
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type TriggerScanError = TriggerScanErrors[keyof TriggerScanErrors];
+
+export type TriggerScanResponses = {
+    /**
+     * Scan triggered successfully
+     */
+    202: TriggerScanResponse;
+};
+
+export type TriggerScanResponse2 = TriggerScanResponses[keyof TriggerScanResponses];
 
 export type GetLatestScansPerEnvironmentData = {
     body?: never;
