@@ -13,6 +13,7 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{self, AppState, EmailApiDoc};
 use crate::services::{DomainService, EmailService, ProviderService};
+use temps_dns::services::DnsProviderService;
 
 /// Email Plugin for managing email providers, domains, and sending emails
 pub struct EmailPlugin;
@@ -63,12 +64,16 @@ impl TempsPlugin for EmailPlugin {
             // Get AuditService dependency from other plugins
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
+            // Try to get DnsProviderService if available (optional dependency)
+            let dns_provider_service = context.get_service::<DnsProviderService>();
+
             // Create AppState for handlers
             let app_state = Arc::new(AppState {
                 provider_service,
                 domain_service,
                 email_service,
                 audit_service,
+                dns_provider_service,
             });
             context.register_service(app_state);
 

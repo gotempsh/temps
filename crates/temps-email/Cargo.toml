@@ -11,6 +11,7 @@ homepage.workspace = true
 temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
+temps-dns = { path = "../temps-dns" }
 temps-entities = { path = "../temps-entities" }
 
 # Async runtime

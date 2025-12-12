@@ -10460,6 +10460,7 @@ dependencies = [
  "temps-auth",
  "temps-core",
  "temps-database",
+ "temps-dns",
  "temps-entities",
  "temps-migrations",
  "testcontainers",

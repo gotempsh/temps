@@ -1,5 +1,10 @@
 'use client'
 
+import {
+  listProviders as listDnsProviders,
+  type DnsProviderResponse,
+} from '@/api/client'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -38,6 +43,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -60,6 +66,8 @@ import {
   Loader2,
   Plus,
   RefreshCw,
+  Settings2,
+  Wand2,
 } from 'lucide-react'
 import { useState } from 'react'
 import { useForm } from 'react-hook-form'
@@ -177,6 +185,38 @@ async function listEmailProviders(): Promise<EmailProvider[]> {
   if (!response.ok) {
     throw new Error('Failed to fetch email providers')
   }
+  return response.json()
+}
+
+// DNS setup types
+interface DnsRecordSetupResult {
+  record_type: string
+  name: string
+  success: boolean
+  automatic: boolean
+  message: string
+}
+
+interface SetupDnsResponse {
+  success: boolean
+  records_created: number
+  total_records: number
+  results: DnsRecordSetupResult[]
+  message: string
+}
+
+async function setupDnsRecords(domainId: number, dnsProviderId: number): Promise<SetupDnsResponse> {
+  const response = await fetch(`/api/email-domains/${domainId}/setup-dns`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dns_provider_id: dnsProviderId }),
+  })
+
+  if (!response.ok) {
+    const error = await response.json()
+    throw new Error(error.detail || 'Failed to setup DNS records')
+  }
+
   return response.json()
 }
 
@@ -468,6 +508,8 @@ function LoadingSkeleton() {
 export function EmailDomainsManagement() {
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [selectedDomainId, setSelectedDomainId] = useState<number | null>(null)
+  const [selectedDnsProviderId, setSelectedDnsProviderId] = useState<number | null>(null)
+  const [dnsSetupResult, setDnsSetupResult] = useState<SetupDnsResponse | null>(null)
   const queryClient = useQueryClient()
 
   const { data: domains, isLoading: isLoadingDomains } = useQuery({
@@ -478,6 +520,15 @@ export function EmailDomainsManagement() {
   const { data: providers, isLoading: isLoadingProviders } = useQuery({
     queryKey: ['email-providers'],
     queryFn: listEmailProviders,
+  })
+
+  // Query for DNS providers (from temps-dns crate)
+  const { data: dnsProviders } = useQuery({
+    queryKey: ['dns-providers'],
+    queryFn: async () => {
+      const response = await listDnsProviders()
+      return response.data as DnsProviderResponse[]
+    },
   })
 
   const { data: selectedDomainDetails } = useQuery({
@@ -566,6 +617,36 @@ export function EmailDomainsManagement() {
     },
   })
 
+  const setupDnsMutation = useMutation({
+    mutationFn: ({ domainId, dnsProviderId }: { domainId: number; dnsProviderId: number }) =>
+      setupDnsRecords(domainId, dnsProviderId),
+    onSuccess: (data) => {
+      setDnsSetupResult(data)
+      if (data.success) {
+        toast.success('DNS records created successfully', {
+          description: `${data.records_created} of ${data.total_records} records were created automatically.`,
+        })
+        // Trigger verification after successful DNS setup
+        if (selectedDomainId) {
+          verifyMutation.mutate(selectedDomainId)
+        }
+      } else if (data.records_created > 0) {
+        toast.warning('Some DNS records created', {
+          description: `${data.records_created} of ${data.total_records} records were created. Check the results for details.`,
+        })
+      } else {
+        toast.error('Failed to create DNS records', {
+          description: data.message,
+        })
+      }
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to setup DNS records', {
+        description: error.message,
+      })
+    },
+  })
+
   const form = useForm<CreateDomainFormData>({
     resolver: zodResolver(createDomainSchema),
     defaultValues: {
@@ -587,9 +668,21 @@ export function EmailDomainsManagement() {
 
   const handleViewDetails = (id: number) => {
     setSelectedDomainId(id)
+    setSelectedDnsProviderId(null)
+    setDnsSetupResult(null)
+  }
+
+  const handleSetupDns = () => {
+    if (selectedDomainId && selectedDnsProviderId) {
+      setupDnsMutation.mutate({
+        domainId: selectedDomainId,
+        dnsProviderId: selectedDnsProviderId,
+      })
+    }
   }
 
   const hasDomains = domains && domains.length > 0
+  const hasDnsProviders = dnsProviders && dnsProviders.length > 0
   const hasProviders = providers && providers.length > 0
 
   return (
@@ -779,25 +872,128 @@ export function EmailDomainsManagement() {
               <DnsRecordsTable records={selectedDomainDetails.dns_records} />
 
               {selectedDomainDetails.domain.status !== 'verified' && (
-                <div className="bg-muted/50 p-4 rounded-lg">
-                  <h4 className="font-medium mb-2">How to configure DNS:</h4>
-                  <ol className="list-decimal list-inside space-y-1 text-sm text-muted-foreground">
-                    <li>
-                      Log in to your domain registrar or DNS provider (e.g.,
-                      Cloudflare, Route53, GoDaddy)
-                    </li>
-                    <li>Navigate to the DNS management section</li>
-                    <li>Add each record shown above with the exact values</li>
-                    <li>
-                      Wait for DNS propagation (can take up to 48 hours, usually
-                      much faster)
-                    </li>
-                    <li>
-                      Click "Verify DNS" to check if the records are properly
-                      configured
-                    </li>
-                  </ol>
-                </div>
+                <>
+                  {/* Automatic DNS Setup Section */}
+                  {hasDnsProviders && (
+                    <div className="border rounded-lg p-4 space-y-4">
+                      <div className="flex items-center gap-2">
+                        <Wand2 className="h-5 w-5 text-primary" />
+                        <h4 className="font-medium">Automatic DNS Setup</h4>
+                      </div>
+                      <p className="text-sm text-muted-foreground">
+                        If you have a DNS provider configured, you can automatically create the required DNS records.
+                      </p>
+
+                      <div className="flex flex-col sm:flex-row gap-3">
+                        <Select
+                          value={selectedDnsProviderId?.toString() || ''}
+                          onValueChange={(value) => setSelectedDnsProviderId(parseInt(value))}
+                        >
+                          <SelectTrigger className="w-full sm:w-[280px]">
+                            <SelectValue placeholder="Select DNS provider" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {dnsProviders?.map((provider) => (
+                              <SelectItem key={provider.id} value={provider.id.toString()}>
+                                <div className="flex items-center gap-2">
+                                  <Settings2 className="h-4 w-4" />
+                                  <span>{provider.name}</span>
+                                  <Badge variant="outline" className="ml-1 text-xs">
+                                    {provider.provider_type}
+                                  </Badge>
+                                </div>
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+
+                        <Button
+                          onClick={handleSetupDns}
+                          disabled={!selectedDnsProviderId || setupDnsMutation.isPending}
+                        >
+                          {setupDnsMutation.isPending ? (
+                            <>
+                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                              Setting up...
+                            </>
+                          ) : (
+                            <>
+                              <Wand2 className="mr-2 h-4 w-4" />
+                              Setup DNS Automatically
+                            </>
+                          )}
+                        </Button>
+                      </div>
+
+                      {/* DNS Setup Results */}
+                      {dnsSetupResult && (
+                        <div className="space-y-3 mt-4">
+                          <Separator />
+                          <Alert variant={dnsSetupResult.success ? 'default' : 'destructive'}>
+                            {dnsSetupResult.success ? (
+                              <CheckCircle2 className="h-4 w-4" />
+                            ) : (
+                              <AlertCircle className="h-4 w-4" />
+                            )}
+                            <AlertTitle>
+                              {dnsSetupResult.success ? 'DNS Setup Complete' : 'DNS Setup Incomplete'}
+                            </AlertTitle>
+                            <AlertDescription>
+                              {dnsSetupResult.message}
+                            </AlertDescription>
+                          </Alert>
+
+                          <div className="space-y-2">
+                            {dnsSetupResult.results.map((result, index) => (
+                              <div
+                                key={index}
+                                className={`flex items-center gap-2 p-2 rounded text-sm ${
+                                  result.success
+                                    ? 'bg-green-50 dark:bg-green-950/30 text-green-700 dark:text-green-400'
+                                    : 'bg-red-50 dark:bg-red-950/30 text-red-700 dark:text-red-400'
+                                }`}
+                              >
+                                {result.success ? (
+                                  <CheckCircle2 className="h-4 w-4 flex-shrink-0" />
+                                ) : (
+                                  <AlertCircle className="h-4 w-4 flex-shrink-0" />
+                                )}
+                                <Badge variant="outline" className="text-xs">
+                                  {result.record_type}
+                                </Badge>
+                                <span className="font-mono text-xs truncate">{result.name}</span>
+                                <span className="text-xs ml-auto">{result.message}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <Separator />
+
+                  {/* Manual Setup Instructions */}
+                  <div className="bg-muted/50 p-4 rounded-lg">
+                    <h4 className="font-medium mb-2">Manual DNS Configuration:</h4>
+                    <ol className="list-decimal list-inside space-y-1 text-sm text-muted-foreground">
+                      <li>
+                        Log in to your domain registrar or DNS provider (e.g.,
+                        Cloudflare, Route53, GoDaddy)
+                      </li>
+                      <li>Navigate to the DNS management section</li>
+                      <li>Add each record shown above with the exact values</li>
+                      <li>
+                        Wait for DNS propagation (can take up to 48 hours, usually
+                        much faster)
+                      </li>
+                      <li>
+                        Click "Verify DNS" to check if the records are properly
+                        configured
+                      </li>
+                    </ol>
+                  </div>
+                </>
               )}
             </div>
           ) : (

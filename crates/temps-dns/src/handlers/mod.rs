@@ -18,8 +18,8 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::errors::DnsError;
 use crate::providers::{
-    CloudflareCredentials, DnsProviderType, DnsRecord, DnsZone, NamecheapCredentials,
-    ProviderCredentials,
+    AzureCredentials, CloudflareCredentials, DigitalOceanCredentials, DnsProviderType, DnsRecord,
+    DnsZone, GcpCredentials, NamecheapCredentials, ProviderCredentials, Route53Credentials,
 };
 use crate::services::{
     AddManagedDomainRequest, CreateProviderRequest, DnsProviderService, DnsRecordService,
@@ -81,6 +81,39 @@ pub enum DnsProviderCredentials {
         #[serde(default)]
         sandbox: bool,
     },
+    Route53 {
+        #[schema(example = "AKIAIOSFODNN7EXAMPLE")]
+        access_key_id: String,
+        #[schema(example = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")]
+        secret_access_key: String,
+        session_token: Option<String>,
+        #[schema(example = "us-east-1")]
+        region: Option<String>,
+    },
+    #[serde(rename = "digitalocean")]
+    DigitalOcean {
+        #[schema(example = "dop_v1_your-token")]
+        api_token: String,
+    },
+    Gcp {
+        #[schema(example = "dns-admin@myproject.iam.gserviceaccount.com")]
+        service_account_email: String,
+        #[schema(example = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----")]
+        private_key: String,
+        #[schema(example = "my-gcp-project")]
+        project_id: String,
+    },
+    Azure {
+        #[schema(example = "00000000-0000-0000-0000-000000000000")]
+        tenant_id: String,
+        #[schema(example = "00000000-0000-0000-0000-000000000000")]
+        client_id: String,
+        client_secret: String,
+        #[schema(example = "00000000-0000-0000-0000-000000000000")]
+        subscription_id: String,
+        #[schema(example = "my-resource-group")]
+        resource_group: String,
+    },
 }
 
 impl From<DnsProviderCredentials> for ProviderCredentials {
@@ -103,6 +136,42 @@ impl From<DnsProviderCredentials> for ProviderCredentials {
                 api_key,
                 client_ip,
                 sandbox,
+            }),
+            DnsProviderCredentials::Route53 {
+                access_key_id,
+                secret_access_key,
+                session_token,
+                region,
+            } => ProviderCredentials::Route53(Route53Credentials {
+                access_key_id,
+                secret_access_key,
+                session_token,
+                region,
+            }),
+            DnsProviderCredentials::DigitalOcean { api_token } => {
+                ProviderCredentials::DigitalOcean(DigitalOceanCredentials { api_token })
+            }
+            DnsProviderCredentials::Gcp {
+                service_account_email,
+                private_key,
+                project_id,
+            } => ProviderCredentials::Gcp(GcpCredentials {
+                service_account_email,
+                private_key,
+                project_id,
+            }),
+            DnsProviderCredentials::Azure {
+                tenant_id,
+                client_id,
+                client_secret,
+                subscription_id,
+                resource_group,
+            } => ProviderCredentials::Azure(AzureCredentials {
+                tenant_id,
+                client_id,
+                client_secret,
+                subscription_id,
+                resource_group,
             }),
         }
     }

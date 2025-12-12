@@ -1,3 +1,16 @@
+import {
+  addManagedDomain,
+  deleteProvider,
+  getProvider,
+  listManagedDomains,
+  listProviderZones,
+  removeManagedDomain,
+  testProviderConnection,
+  updateProvider,
+  verifyManagedDomain,
+  type ManagedDomainResponse,
+  type UpdateDnsProviderRequest,
+} from '@/api/client'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   AlertDialog,
@@ -65,179 +78,6 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
-// Types based on the backend API
-interface DnsProviderResponse {
-  id: number
-  name: string
-  provider_type: string
-  credentials: Record<string, unknown>
-  is_active: boolean
-  description: string | null
-  last_used_at: string | null
-  last_error: string | null
-  created_at: string
-  updated_at: string
-}
-
-interface ManagedDomainResponse {
-  id: number
-  provider_id: number
-  domain: string
-  zone_id: string | null
-  auto_manage: boolean
-  verified: boolean
-  verified_at: string | null
-  verification_error: string | null
-  created_at: string
-  updated_at: string
-}
-
-interface DnsZone {
-  id: string
-  name: string
-  status: string
-}
-
-interface ConnectionTestResult {
-  success: boolean
-  message: string
-}
-
-// API functions using fetch
-async function getDnsProvider(id: number): Promise<DnsProviderResponse> {
-  const response = await fetch(`/dns-providers/${id}`, {
-    credentials: 'include',
-  })
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}))
-    throw new Error(error.detail || 'Failed to fetch DNS provider')
-  }
-  return response.json()
-}
-
-async function updateDnsProvider(
-  id: number,
-  data: {
-    name?: string
-    description?: string
-    is_active?: boolean
-    credentials?: Record<string, unknown>
-  }
-): Promise<DnsProviderResponse> {
-  const response = await fetch(`/dns-providers/${id}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'include',
-    body: JSON.stringify(data),
-  })
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}))
-    throw new Error(error.detail || 'Failed to update DNS provider')
-  }
-  return response.json()
-}
-
-async function deleteDnsProvider(id: number): Promise<void> {
-  const response = await fetch(`/dns-providers/${id}`, {
-    method: 'DELETE',
-    credentials: 'include',
-  })
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}))
-    throw new Error(error.detail || 'Failed to delete DNS provider')
-  }
-}
-
-async function testDnsProviderConnection(
-  id: number
-): Promise<ConnectionTestResult> {
-  const response = await fetch(`/dns-providers/${id}/test`, {
-    method: 'POST',
-    credentials: 'include',
-  })
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}))
-    throw new Error(error.detail || 'Failed to test DNS provider')
-  }
-  return response.json()
-}
-
-async function listProviderZones(id: number): Promise<{ zones: DnsZone[] }> {
-  const response = await fetch(`/dns-providers/${id}/zones`, {
-    credentials: 'include',
-  })
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}))
-    throw new Error(error.detail || 'Failed to list zones')
-  }
-  return response.json()
-}
-
-async function listManagedDomains(
-  id: number
-): Promise<ManagedDomainResponse[]> {
-  const response = await fetch(`/dns-providers/${id}/domains`, {
-    credentials: 'include',
-  })
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}))
-    throw new Error(error.detail || 'Failed to list managed domains')
-  }
-  return response.json()
-}
-
-async function addManagedDomain(
-  providerId: number,
-  data: { domain: string; auto_manage: boolean }
-): Promise<ManagedDomainResponse> {
-  const response = await fetch(`/dns-providers/${providerId}/domains`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'include',
-    body: JSON.stringify(data),
-  })
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}))
-    throw new Error(error.detail || 'Failed to add managed domain')
-  }
-  return response.json()
-}
-
-async function removeManagedDomain(
-  providerId: number,
-  domain: string
-): Promise<void> {
-  const response = await fetch(
-    `/dns-providers/${providerId}/domains/${encodeURIComponent(domain)}`,
-    {
-      method: 'DELETE',
-      credentials: 'include',
-    }
-  )
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}))
-    throw new Error(error.detail || 'Failed to remove managed domain')
-  }
-}
-
-async function verifyManagedDomain(
-  providerId: number,
-  domain: string
-): Promise<ManagedDomainResponse> {
-  const response = await fetch(
-    `/dns-providers/${providerId}/domains/${encodeURIComponent(domain)}/verify`,
-    {
-      method: 'POST',
-      credentials: 'include',
-    }
-  )
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({}))
-    throw new Error(error.detail || 'Failed to verify domain')
-  }
-  return response.json()
-}
-
 // Helper function to get provider icon
 function getProviderIcon(providerType: string) {
   switch (providerType.toLowerCase()) {
@@ -304,26 +144,42 @@ export default function DnsProviderDetail() {
     refetch,
   } = useQuery({
     queryKey: ['dnsProvider', providerId],
-    queryFn: () => getDnsProvider(providerId),
+    queryFn: async () => {
+      const response = await getProvider({ path: { id: providerId } })
+      return response.data
+    },
     enabled: !!providerId,
   })
 
   const { data: managedDomains, refetch: refetchDomains } = useQuery({
     queryKey: ['dnsProviderDomains', providerId],
-    queryFn: () => listManagedDomains(providerId),
+    queryFn: async () => {
+      const response = await listManagedDomains({ path: { id: providerId } })
+      return response.data
+    },
     enabled: !!providerId,
   })
 
   const { data: zones } = useQuery({
     queryKey: ['dnsProviderZones', providerId],
-    queryFn: () => listProviderZones(providerId),
+    queryFn: async () => {
+      const response = await listProviderZones({ path: { id: providerId } })
+      return response.data
+    },
     enabled: !!providerId && !!provider?.is_active,
   })
 
   // Mutations
   const updateProviderMut = useMutation({
-    mutationFn: (data: Partial<EditFormData>) =>
-      updateDnsProvider(providerId, data),
+    mutationFn: async (data: Partial<EditFormData>) => {
+      const body: UpdateDnsProviderRequest = {
+        name: data.name,
+        description: data.description,
+        is_active: data.is_active,
+      }
+      const response = await updateProvider({ path: { id: providerId }, body })
+      return response.data
+    },
     onSuccess: () => {
       toast.success('Provider updated successfully')
       queryClient.invalidateQueries({ queryKey: ['dnsProvider', providerId] })
@@ -338,7 +194,7 @@ export default function DnsProviderDetail() {
   })
 
   const deleteProviderMut = useMutation({
-    mutationFn: () => deleteDnsProvider(providerId),
+    mutationFn: () => deleteProvider({ path: { id: providerId } }),
     onSuccess: () => {
       toast.success('Provider deleted successfully')
       queryClient.invalidateQueries({ queryKey: ['dnsProviders'] })
@@ -352,15 +208,18 @@ export default function DnsProviderDetail() {
   })
 
   const testConnectionMut = useMutation({
-    mutationFn: () => testDnsProviderConnection(providerId),
+    mutationFn: async () => {
+      const response = await testProviderConnection({ path: { id: providerId } })
+      return response.data
+    },
     onSuccess: (result) => {
-      if (result.success) {
+      if (result?.success) {
         toast.success('Connection test successful', {
           description: result.message,
         })
       } else {
         toast.error('Connection test failed', {
-          description: result.message,
+          description: result?.message,
         })
       }
       refetch()
@@ -373,8 +232,13 @@ export default function DnsProviderDetail() {
   })
 
   const addDomainMut = useMutation({
-    mutationFn: (data: AddDomainFormData) =>
-      addManagedDomain(providerId, data),
+    mutationFn: async (data: AddDomainFormData) => {
+      const response = await addManagedDomain({
+        path: { id: providerId },
+        body: { domain: data.domain, auto_manage: data.auto_manage },
+      })
+      return response.data
+    },
     onSuccess: () => {
       toast.success('Domain added successfully')
       refetchDomains()
@@ -389,7 +253,10 @@ export default function DnsProviderDetail() {
   })
 
   const removeDomainMut = useMutation({
-    mutationFn: (domain: string) => removeManagedDomain(providerId, domain),
+    mutationFn: (domain: string) =>
+      removeManagedDomain({
+        path: { provider_id: providerId, domain },
+      }),
     onSuccess: () => {
       toast.success('Domain removed successfully')
       refetchDomains()
@@ -403,7 +270,10 @@ export default function DnsProviderDetail() {
   })
 
   const verifyDomainMut = useMutation({
-    mutationFn: (domain: string) => verifyManagedDomain(providerId, domain),
+    mutationFn: (domain: string) =>
+      verifyManagedDomain({
+        path: { provider_id: providerId, domain },
+      }),
     onSuccess: () => {
       toast.success('Domain verified successfully')
       refetchDomains()
@@ -599,7 +469,9 @@ export default function DnsProviderDetail() {
           </CardHeader>
           <CardContent>
             <div className="grid gap-4 sm:grid-cols-2">
-              {Object.entries(provider.credentials).map(([key, value]) => (
+              {Object.entries(
+                provider.credentials as Record<string, unknown>
+              ).map(([key, value]) => (
                 <div key={key} className="space-y-1">
                   <p className="text-sm font-medium">{key}</p>
                   <p className="text-sm text-muted-foreground font-mono">

@@ -37,6 +37,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         domains::get_domain_dns_records,
         domains::verify_domain,
         domains::delete_domain,
+        domains::setup_dns,
         // Emails
         emails::send_email,
         emails::list_emails,
@@ -57,6 +58,9 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             types::EmailDomainResponse,
             types::DnsRecordResponse,
             types::EmailDomainWithDnsResponse,
+            types::SetupDnsRequest,
+            types::SetupDnsResponse,
+            types::DnsRecordSetupResult,
             // Email types
             types::SendEmailRequestBody,
             types::SendEmailResponseBody,

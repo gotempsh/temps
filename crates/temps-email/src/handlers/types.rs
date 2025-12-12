@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use temps_core::AuditLogger;
+use temps_dns::services::DnsProviderService;
 use utoipa::{IntoParams, ToSchema};
 
 /// Application state for email handlers
@@ -14,6 +15,8 @@ pub struct AppState {
     pub domain_service: Arc<DomainService>,
     pub email_service: Arc<EmailService>,
     pub audit_service: Arc<dyn AuditLogger>,
+    /// DNS provider service for automatic DNS record setup
+    pub dns_provider_service: Option<Arc<DnsProviderService>>,
 }
 
 // ========================================
@@ -203,6 +206,43 @@ pub struct EmailDomainResponse {
 pub struct EmailDomainWithDnsResponse {
     pub domain: EmailDomainResponse,
     pub dns_records: Vec<DnsRecordResponse>,
+}
+
+/// Request to setup DNS records using a configured DNS provider
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetupDnsRequest {
+    /// The ID of the DNS provider to use for creating records
+    pub dns_provider_id: i32,
+}
+
+/// Result of a single DNS record creation
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DnsRecordSetupResult {
+    /// Record type (TXT, CNAME, MX)
+    pub record_type: String,
+    /// Record name
+    pub name: String,
+    /// Whether the record was created successfully
+    pub success: bool,
+    /// Whether the operation was automatic or manual
+    pub automatic: bool,
+    /// Human-readable message
+    pub message: String,
+}
+
+/// Response from DNS setup operation
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SetupDnsResponse {
+    /// Overall success status
+    pub success: bool,
+    /// Number of records that were successfully created
+    pub records_created: u32,
+    /// Total number of records attempted
+    pub total_records: u32,
+    /// Results for each individual record
+    pub results: Vec<DnsRecordSetupResult>,
+    /// Human-readable summary message
+    pub message: String,
 }
 
 // ========================================

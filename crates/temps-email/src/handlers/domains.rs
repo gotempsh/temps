@@ -11,16 +11,17 @@ use axum::{
 };
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
-    error_builder::{internal_server_error, not_found},
+    error_builder::{bad_request, internal_server_error, not_found},
     problemdetails::Problem,
     AuditContext, RequestMetadata,
 };
-use tracing::error;
+use temps_dns::providers::{DnsProvider, DnsRecordContent, DnsRecordRequest};
+use tracing::{error, info, warn};
 
 use super::audit::{EmailDomainCreatedAudit, EmailDomainDeletedAudit, EmailDomainVerifiedAudit};
 use super::types::{
-    AppState, CreateEmailDomainRequest, DnsRecordResponse, EmailDomainResponse,
-    EmailDomainWithDnsResponse,
+    AppState, CreateEmailDomainRequest, DnsRecordResponse, DnsRecordSetupResult,
+    EmailDomainResponse, EmailDomainWithDnsResponse, SetupDnsRequest, SetupDnsResponse,
 };
 use crate::services::CreateDomainRequest;
 
@@ -35,6 +36,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(get_domain_dns_records),
         )
         .route("/email-domains/{id}/verify", post(verify_domain))
+        .route("/email-domains/{id}/setup-dns", post(setup_dns))
 }
 
 /// Create a new email domain
@@ -473,4 +475,218 @@ pub async fn delete_domain(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Setup DNS records for an email domain using a configured DNS provider
+#[utoipa::path(
+    tag = "Email Domains",
+    post,
+    path = "/email-domains/{id}/setup-dns",
+    request_body = SetupDnsRequest,
+    responses(
+        (status = 200, description = "DNS records setup result", body = SetupDnsResponse),
+        (status = 400, description = "Invalid request or DNS provider not configured"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Domain not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "Email Domain ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn setup_dns(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Json(request): Json<SetupDnsRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EmailDomainsWrite);
+
+    // Check if DNS provider service is available
+    let dns_provider_service = state.dns_provider_service.as_ref().ok_or_else(|| {
+        bad_request()
+            .detail("DNS provider service is not configured")
+            .build()
+    })?;
+
+    // Get the email domain with its DNS records
+    let domain_with_dns = state
+        .domain_service
+        .get_with_dns_records(id)
+        .await
+        .map_err(|e| {
+            error!("Failed to get email domain: {}", e);
+            not_found().detail("Email domain not found").build()
+        })?;
+
+    // Get the DNS provider
+    let dns_provider = dns_provider_service
+        .get(request.dns_provider_id)
+        .await
+        .map_err(|e| {
+            error!("Failed to get DNS provider: {}", e);
+            not_found().detail("DNS provider not found").build()
+        })?;
+
+    // Create DNS provider instance
+    let provider_instance = dns_provider_service
+        .create_provider_instance(&dns_provider)
+        .map_err(|e| {
+            error!("Failed to create DNS provider instance: {}", e);
+            internal_server_error()
+                .detail(format!("Failed to initialize DNS provider: {}", e))
+                .build()
+        })?;
+
+    // Extract the base domain (e.g., "example.com" from "mail.example.com")
+    let email_domain = &domain_with_dns.domain.domain;
+    let base_domain = extract_base_domain(email_domain);
+
+    info!(
+        "Setting up {} DNS records for {} using provider {}",
+        domain_with_dns.dns_records.len(),
+        email_domain,
+        dns_provider.name
+    );
+
+    let mut results = Vec::new();
+    let mut records_created: u32 = 0;
+
+    // Create each DNS record
+    for dns_record in &domain_with_dns.dns_records {
+        let result = create_dns_record(provider_instance.as_ref(), &base_domain, dns_record).await;
+
+        if result.success {
+            records_created += 1;
+        }
+
+        results.push(result);
+    }
+
+    let total_records = domain_with_dns.dns_records.len() as u32;
+    let all_success = records_created == total_records;
+
+    let message = if all_success {
+        format!(
+            "Successfully created all {} DNS records for {}",
+            total_records, email_domain
+        )
+    } else {
+        format!(
+            "Created {} of {} DNS records for {}. Some records may need manual configuration.",
+            records_created, total_records, email_domain
+        )
+    };
+
+    info!("{}", message);
+
+    let response = SetupDnsResponse {
+        success: all_success,
+        records_created,
+        total_records,
+        results,
+        message,
+    };
+
+    Ok(Json(response))
+}
+
+/// Extract the base domain from a full domain name
+fn extract_base_domain(domain: &str) -> String {
+    let parts: Vec<&str> = domain.split('.').collect();
+    if parts.len() >= 2 {
+        parts[parts.len() - 2..].join(".")
+    } else {
+        domain.to_string()
+    }
+}
+
+/// Create a single DNS record using the provider
+async fn create_dns_record(
+    provider: &dyn DnsProvider,
+    base_domain: &str,
+    record: &crate::providers::DnsRecord,
+) -> DnsRecordSetupResult {
+    // Convert the record type and value to DNS provider format
+    let content = match record.record_type.to_uppercase().as_str() {
+        "TXT" => DnsRecordContent::TXT {
+            content: record.value.clone(),
+        },
+        "CNAME" => DnsRecordContent::CNAME {
+            target: record.value.clone(),
+        },
+        "MX" => DnsRecordContent::MX {
+            priority: record.priority.unwrap_or(10),
+            target: record.value.clone(),
+        },
+        _ => {
+            warn!(
+                "Unsupported record type for automatic setup: {}",
+                record.record_type
+            );
+            return DnsRecordSetupResult {
+                record_type: record.record_type.clone(),
+                name: record.name.clone(),
+                success: false,
+                automatic: false,
+                message: format!(
+                    "Unsupported record type: {}. Please configure manually.",
+                    record.record_type
+                ),
+            };
+        }
+    };
+
+    // Convert the record name to relative format (remove base domain suffix if present)
+    let relative_name = if record.name.ends_with(base_domain) {
+        let without_suffix = record
+            .name
+            .trim_end_matches(base_domain)
+            .trim_end_matches('.');
+        if without_suffix.is_empty() {
+            "@".to_string()
+        } else {
+            without_suffix.to_string()
+        }
+    } else {
+        record.name.clone()
+    };
+
+    let request = DnsRecordRequest {
+        name: relative_name.clone(),
+        content,
+        ttl: Some(300), // 5 minutes TTL
+        proxied: false,
+    };
+
+    match provider.set_record(base_domain, request).await {
+        Ok(_) => {
+            info!(
+                "Successfully created {} record for {} in {}",
+                record.record_type, record.name, base_domain
+            );
+            DnsRecordSetupResult {
+                record_type: record.record_type.clone(),
+                name: record.name.clone(),
+                success: true,
+                automatic: true,
+                message: format!("Successfully created {} record", record.record_type),
+            }
+        }
+        Err(e) => {
+            warn!(
+                "Failed to create {} record for {}: {}",
+                record.record_type, record.name, e
+            );
+            DnsRecordSetupResult {
+                record_type: record.record_type.clone(),
+                name: record.name.clone(),
+                success: false,
+                automatic: false,
+                message: format!("Failed to create record: {}", e),
+            }
+        }
+    }
 }

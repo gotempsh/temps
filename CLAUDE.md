@@ -16,6 +16,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Use plain text logging** - ALWAYS use structured logging with `append_structured_log()` or helper methods (`log_info`, `log_success`, `log_warning`, `log_error`)
 - **Create markdown documentation files (*.md) unless explicitly requested** - No README files, no documentation files unless the user asks
 - **Auto-generate documentation without explicit request** - Store any auto-generated docs in `thoughts/` directory instead of root
+- **Mark tests with `#[ignore]` when they require Docker/testcontainers** - Docker tests MUST run as part of normal test suite
 
 ### ✅ ALWAYS
 - Run `cargo check --lib` after every modification
@@ -212,17 +213,20 @@ cargo test -p temps-deployments
 cargo test -- --ignored
 ```
 
-### Docker Tests (Always Executed)
+### Docker Tests (Always Executed - NEVER Ignore)
 
-Some tests in the codebase require Docker to be running but are NOT marked with `#[ignore]`. These tests run as part of the standard `cargo test` command:
+**CRITICAL RULE:** Tests requiring Docker/testcontainers MUST NOT be marked with `#[ignore]`. They must run as part of the standard test suite.
 
-**Important:** Docker tests (without `#[ignore]`) will skip gracefully if Docker is not available. They detect Docker availability at runtime and exit early with informational output if Docker cannot be accessed.
+Some tests in the codebase require Docker to be running and run as part of the standard `cargo test` command:
+
+**Important:** Docker tests will skip gracefully if Docker is not available. They detect Docker availability at runtime and exit early with informational output if Docker cannot be accessed.
 
 **Examples:**
 - `test_postgres_v16_to_v17_actual_upgrade()` in `temps-providers/src/externalsvc/postgres.rs` - Creates PostgreSQL 16 container, upgrades to v17, and verifies via SQL
+- `test_vulnerability_notification_with_mailpit()` in `temps-notifications/src/vulnerability_notifications.rs` - Tests email notifications using Mailpit container
 
 **Characteristics:**
-- ✅ No `#[ignore]` attribute
+- ✅ No `#[ignore]` attribute - runs in normal test suite
 - ✅ Execute in normal `cargo test` runs
 - ✅ Skip gracefully if Docker unavailable (no test failure)
 - ✅ Create real Docker containers for end-to-end testing
@@ -236,9 +240,16 @@ cargo test --lib
 
 # Run specific Docker test
 cargo test --lib test_postgres_v16_to_v17_actual_upgrade -- --nocapture
+cargo test --lib test_vulnerability_notification_with_mailpit -- --nocapture
 
 # Docker tests are always part of test suite - no special flag needed
 ```
+
+**Why NOT to use `#[ignore]`:**
+- Docker tests validate critical functionality (SMTP, databases, external services)
+- They should run in CI/CD pipelines automatically
+- Developers should know immediately if Docker-dependent features break
+- Graceful skipping when Docker is unavailable prevents false failures
 
 ### Integration Tests with Pebble (Let's Encrypt ACME)
 

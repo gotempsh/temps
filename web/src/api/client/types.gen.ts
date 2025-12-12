@@ -1475,6 +1475,27 @@ export type DnsProviderCredentials = {
     client_ip?: string | null;
     sandbox?: boolean;
     type: 'namecheap';
+} | {
+    access_key_id: string;
+    region?: string | null;
+    secret_access_key: string;
+    session_token?: string | null;
+    type: 'route53';
+} | {
+    api_token: string;
+    type: 'digitalocean';
+} | {
+    private_key: string;
+    project_id: string;
+    service_account_email: string;
+    type: 'gcp';
+} | {
+    client_id: string;
+    client_secret: string;
+    resource_group: string;
+    subscription_id: string;
+    tenant_id: string;
+    type: 'azure';
 };
 
 /**
@@ -1512,7 +1533,7 @@ export type DnsProviderSettingsMasked = {
 /**
  * Supported DNS provider types
  */
-export type DnsProviderType = 'cloudflare' | 'namecheap' | 'route53' | 'digitalocean' | 'manual';
+export type DnsProviderType = 'cloudflare' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure' | 'manual';
 
 /**
  * A DNS record
