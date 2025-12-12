@@ -81,6 +81,7 @@ serde_json = { workspace = true }
 flate2 = "1.0"
 indicatif = "0.17"
 tar = { workspace = true }
+reqwest = { workspace = true }
 
 [build-dependencies]
 chrono = { workspace = true }
