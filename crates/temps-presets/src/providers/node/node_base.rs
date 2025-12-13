@@ -4,15 +4,26 @@
 //! - Package manager detection and installation in Dockerfile
 //! - Multi-stage Docker builds
 //! - Common build patterns
-//! - Security hardening using distroless images
+//! - Security hardening using Alpine images with package manager removal
 
 use crate::providers::app::App;
 use super::package_manager::PackageManager;
 
-/// Google's distroless Node.js image - contains ONLY Node.js runtime.
-/// No shell, no package manager, no OS utilities = maximum security.
-/// See: https://github.com/GoogleContainerTools/distroless
-const DISTROLESS_NODEJS: &str = "gcr.io/distroless/nodejs22-debian12:nonroot";
+/// Security hardening for Node.js Alpine runner
+/// This approach provides security while maintaining compatibility:
+/// - Removes package managers to prevent runtime package installation
+/// - Creates a dedicated non-root user (nodejs:nodejs with UID/GID 1001)
+/// - Keeps CA certificates for HTTPS support (unlike distroless)
+/// - Maintains shell access for debugging if needed
+const NODEJS_ALPINE_SECURITY_HARDENING: &str = r#"# Security hardening - remove package manager and run as non-root
+# Create non-root user for running the application
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nodejs && \
+    # Remove package managers to prevent runtime package installation
+    rm -rf /sbin/apk /usr/bin/apk /etc/apk /var/cache/apk /lib/apk && \
+    rm -rf /var/lib/apt /usr/bin/apt* /usr/bin/dpkg* 2>/dev/null || true
+
+USER nodejs"#;
 
 /// Security hardening for nginx Alpine runner
 /// Note: nginx doesn't have a distroless variant, so we harden Alpine instead
@@ -180,10 +191,13 @@ CMD ["nginx", "-g", "daemon off;"]
             port = config.port
         )
     } else {
-        // Server build with Node.js runtime using Google's Distroless for maximum security
-        // Distroless has NO shell, NO package manager, NO attack surface
+        // Server build with hardened Alpine Node.js runner
+        // Secure: removes package managers and runs as non-root
+        // Benefits over distroless:
+        // - Full CA certificates for HTTPS fetch calls
+        // - Shell access for debugging if needed
         let is_standalone = config.is_nextjs_standalone || is_nextjs_standalone(&config.output_dir);
-        let start_cmd_formatted = format_start_command_distroless(&config.start_cmd, is_standalone);
+        let start_cmd_formatted = format_start_command_alpine(&config.start_cmd, is_standalone);
 
         format!(
             r#"# syntax=docker/dockerfile:1
@@ -224,17 +238,14 @@ COPY . .
 # Build application
 RUN {build_cmd}
 
-# Production stage using Google's Distroless image
-# Distroless contains ONLY the Node.js runtime - no shell, no package manager, no attack surface
-# This is the most secure option for running Node.js in production
-# See: https://github.com/GoogleContainerTools/distroless
-FROM {distroless} AS runner
+# Production stage using hardened Alpine Node.js
+# Secure: non-root user, package manager removed, full CA certificates
+FROM node:22-alpine AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
 
-# Distroless :nonroot tag already runs as non-root user (uid 65532)
-# No RUN commands possible - distroless has no shell
+{alpine_hardening}
 
 {copy_output}
 
@@ -244,53 +255,17 @@ ENV PORT={port}
 ENV HOSTNAME="0.0.0.0"
 ENV HOST="0.0.0.0"
 
-# Distroless nodejs images use node as entrypoint, so we just specify the script
 CMD {start_cmd}
 "#,
             base_image = base_image,
             install_cmd = config.install_cmd,
             build_env = build_env_lines,
             build_cmd = config.build_cmd,
-            distroless = DISTROLESS_NODEJS,
-            copy_output = generate_copy_output(&config.output_dir),
+            alpine_hardening = NODEJS_ALPINE_SECURITY_HARDENING,
+            copy_output = generate_copy_output_alpine(&config.output_dir),
             port = config.port,
             start_cmd = start_cmd_formatted
         )
-    }
-}
-
-/// Format start command for Distroless Docker CMD
-/// Distroless nodejs images have `node` as the entrypoint, so we only pass args
-fn format_start_command_distroless(cmd: &str, is_nextjs_standalone: bool) -> String {
-    // Strip "node " prefix if present since distroless has node as entrypoint
-    let cmd = cmd.strip_prefix("node ").unwrap_or(cmd);
-
-    // For Next.js standalone builds, use server.js directly
-    if is_nextjs_standalone {
-        return "[\"server.js\"]".to_string();
-    }
-
-    // Handle npm/yarn/pnpm/npx start commands - these need node to run the script
-    // For distroless, we need to specify the actual script path
-    if cmd.starts_with("npm ") || cmd.starts_with("yarn ") || cmd.starts_with("pnpm ") || cmd.starts_with("npx ") {
-        // For Next.js non-standalone, we run next start via the installed binary
-        // The path is relative to node_modules which is copied to the image
-        return "[\"./node_modules/next/dist/bin/next\", \"start\"]".to_string();
-    }
-
-    if cmd.contains(' ') {
-        // Parse "server.js --port 3000" -> ["server.js", "--port", "3000"]
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        format!(
-            "[{}]",
-            parts
-                .iter()
-                .map(|s| format!("\"{}\"", s))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    } else {
-        format!("[\"{}\"]", cmd)
     }
 }
 
@@ -299,53 +274,73 @@ fn is_nextjs_standalone(output_dir: &Option<String>) -> bool {
     output_dir.as_ref().is_some_and(|d| d.contains(".next/standalone"))
 }
 
-/// Generate the COPY instructions for the production stage
-/// Handles special cases like Next.js standalone and non-standalone builds
-fn generate_copy_output(output_dir: &Option<String>) -> String {
+/// Format start command for Alpine Docker CMD (standard shell form)
+/// Alpine has a shell, so we can use standard command syntax
+fn format_start_command_alpine(cmd: &str, is_nextjs_standalone: bool) -> String {
+    // For Next.js standalone builds, use node server.js
+    if is_nextjs_standalone {
+        return "[\"node\", \"server.js\"]".to_string();
+    }
+
+    // Handle npm/yarn/pnpm/npx start commands
+    if cmd.starts_with("npm ") || cmd.starts_with("yarn ") || cmd.starts_with("pnpm ") || cmd.starts_with("npx ") {
+        // For Next.js non-standalone, run next start via node_modules
+        return "[\"node\", \"./node_modules/next/dist/bin/next\", \"start\"]".to_string();
+    }
+
+    // Convert command to exec form
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    format!(
+        "[{}]",
+        parts
+            .iter()
+            .map(|s| format!("\"{}\"", s))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Generate the COPY instructions for Alpine production stage
+/// Uses nodejs:nodejs user (uid 1001) instead of distroless nonroot (uid 65532)
+fn generate_copy_output_alpine(output_dir: &Option<String>) -> String {
     if is_nextjs_standalone(output_dir) {
-        // Next.js standalone builds require special handling:
-        // 1. Copy the standalone directory contents (including server.js) to /app
-        // 2. Copy the static files to .next/static (required for Next.js)
-        // 3. Copy public files if they exist
-        // See: https://nextjs.org/docs/app/api-reference/next-config-js/output#automatically-copying-traced-files
+        // Next.js standalone builds require special handling
         r#"# Copy Next.js standalone build - server.js and dependencies
-COPY --from=builder --chown=65532:65532 /app/.next/standalone ./
+COPY --from=builder --chown=nodejs:nodejs /app/.next/standalone ./
 # Copy static assets (required for Next.js to serve static files)
-COPY --from=builder --chown=65532:65532 /app/.next/static ./.next/static
+COPY --from=builder --chown=nodejs:nodejs /app/.next/static ./.next/static
 # Copy public folder if it exists (Next.js requires this for public assets)
-COPY --from=builder --chown=65532:65532 /app/public ./public"#.to_string()
+COPY --from=builder --chown=nodejs:nodejs /app/public ./public"#.to_string()
     } else if output_dir.as_ref().is_some_and(|d| d == ".next") {
         // Next.js non-standalone build - needs node_modules to run `next start`
-        // This follows the pattern from the distroless example:
-        // https://github.com/vercel/next.js/tree/canary/examples/with-docker
         r#"# Copy Next.js config and dependencies for non-standalone build
-COPY --from=builder --chown=65532:65532 /app/next.config.js* ./
-COPY --from=builder --chown=65532:65532 /app/next.config.mjs* ./
-COPY --from=builder --chown=65532:65532 /app/next.config.ts* ./
-COPY --from=builder --chown=65532:65532 /app/package.json ./
+COPY --from=builder --chown=nodejs:nodejs /app/next.config.js* ./
+COPY --from=builder --chown=nodejs:nodejs /app/next.config.mjs* ./
+COPY --from=builder --chown=nodejs:nodejs /app/next.config.ts* ./
+COPY --from=builder --chown=nodejs:nodejs /app/package.json ./
 # Copy node_modules (required for next start command)
-COPY --from=builder --chown=65532:65532 /app/node_modules ./node_modules
+COPY --from=builder --chown=nodejs:nodejs /app/node_modules ./node_modules
 # Copy built Next.js application
-COPY --from=builder --chown=65532:65532 /app/.next ./.next
+COPY --from=builder --chown=nodejs:nodejs /app/.next ./.next
 # Copy public folder if it exists
-COPY --from=builder --chown=65532:65532 /app/public ./public"#.to_string()
+COPY --from=builder --chown=nodejs:nodejs /app/public ./public"#.to_string()
     } else if let Some(ref dir) = output_dir {
         // Regular server build - copy the output directory
         format!(
-            r#"# Copy necessary files (owned by nonroot user uid 65532)
-COPY --from=builder --chown=65532:65532 /app/package.json ./
-COPY --from=builder --chown=65532:65532 /app/node_modules ./node_modules
+            r#"# Copy necessary files (owned by nodejs user)
+COPY --from=builder --chown=nodejs:nodejs /app/package.json ./
+COPY --from=builder --chown=nodejs:nodejs /app/node_modules ./node_modules
 # Copy built application
-COPY --from=builder --chown=65532:65532 /app/{} ./{}"#,
+COPY --from=builder --chown=nodejs:nodejs /app/{} ./{}"#,
             dir, dir
         )
     } else {
         // Default: copy dist folder
-        r#"# Copy necessary files (owned by nonroot user uid 65532)
-COPY --from=builder --chown=65532:65532 /app/package.json ./
-COPY --from=builder --chown=65532:65532 /app/node_modules ./node_modules
+        r#"# Copy necessary files (owned by nodejs user)
+COPY --from=builder --chown=nodejs:nodejs /app/package.json ./
+COPY --from=builder --chown=nodejs:nodejs /app/node_modules ./node_modules
 # Copy built application
-COPY --from=builder --chown=65532:65532 /app/dist ./dist"#.to_string()
+COPY --from=builder --chown=nodejs:nodejs /app/dist ./dist"#.to_string()
     }
 }
 
@@ -356,30 +351,30 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn test_format_start_command_distroless() {
-        // Distroless strips "node " since node is the entrypoint
-        assert_eq!(format_start_command_distroless("node server.js", false), "[\"server.js\"]");
-        assert_eq!(format_start_command_distroless("server.js", false), "[\"server.js\"]");
-        assert_eq!(format_start_command_distroless("node server.js --port 3000", false), "[\"server.js\", \"--port\", \"3000\"]");
+    fn test_format_start_command_alpine() {
+        // Alpine uses node explicitly in the command
+        assert_eq!(format_start_command_alpine("node server.js", false), "[\"node\", \"server.js\"]");
+        assert_eq!(format_start_command_alpine("server.js", false), "[\"server.js\"]");
+        assert_eq!(format_start_command_alpine("node server.js --port 3000", false), "[\"node\", \"server.js\", \"--port\", \"3000\"]");
     }
 
     #[test]
-    fn test_format_start_command_distroless_nextjs_standalone() {
-        // Next.js standalone mode uses server.js directly
-        assert_eq!(format_start_command_distroless("node server.js", true), "[\"server.js\"]");
-        assert_eq!(format_start_command_distroless("npx next start", true), "[\"server.js\"]");
+    fn test_format_start_command_alpine_nextjs_standalone() {
+        // Next.js standalone mode uses node server.js
+        assert_eq!(format_start_command_alpine("node server.js", true), "[\"node\", \"server.js\"]");
+        assert_eq!(format_start_command_alpine("npx next start", true), "[\"node\", \"server.js\"]");
     }
 
     #[test]
-    fn test_format_start_command_distroless_nextjs_non_standalone() {
+    fn test_format_start_command_alpine_nextjs_non_standalone() {
         // Next.js non-standalone mode uses next start via node_modules
         assert_eq!(
-            format_start_command_distroless("npx next start", false),
-            "[\"./node_modules/next/dist/bin/next\", \"start\"]"
+            format_start_command_alpine("npx next start", false),
+            "[\"node\", \"./node_modules/next/dist/bin/next\", \"start\"]"
         );
         assert_eq!(
-            format_start_command_distroless("npm run start", false),
-            "[\"./node_modules/next/dist/bin/next\", \"start\"]"
+            format_start_command_alpine("npm run start", false),
+            "[\"node\", \"./node_modules/next/dist/bin/next\", \"start\"]"
         );
     }
 
@@ -452,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_server_dockerfile_uses_distroless() {
+    fn test_generate_server_dockerfile_uses_alpine() {
         let mut files = HashMap::new();
         files.insert("package.json".to_string(), "{}".to_string());
         files.insert("pnpm-lock.yaml".to_string(), "".to_string());
@@ -476,19 +471,19 @@ mod tests {
         assert!(dockerfile.contains("pnpm install --frozen-lockfile"));
         assert!(dockerfile.contains("pnpm run build"));
 
-        // Production stage uses distroless
+        // Production stage uses hardened Alpine
         assert!(
-            dockerfile.contains("gcr.io/distroless/nodejs22-debian12:nonroot"),
-            "Should use distroless Node.js image for production"
+            dockerfile.contains("FROM node:22-alpine AS runner"),
+            "Should use Node.js Alpine image for production"
         );
 
-        // Distroless strips "node" from command since it's the entrypoint
-        assert!(dockerfile.contains("CMD [\"server.js\"]"));
+        // Alpine uses node explicitly in the command
+        assert!(dockerfile.contains("CMD [\"node\""));
         assert!(dockerfile.contains("EXPOSE 3000"));
     }
 
     #[test]
-    fn test_generate_server_dockerfile_distroless_security() {
+    fn test_generate_server_dockerfile_alpine_security() {
         let mut files = HashMap::new();
         files.insert("package.json".to_string(), "{}".to_string());
         files.insert("package-lock.json".to_string(), "".to_string());
@@ -506,28 +501,39 @@ mod tests {
 
         let dockerfile = generate_node_dockerfile(&app, config);
 
-        // Security: Uses distroless (no shell, no package manager)
+        // Security: Uses hardened Alpine
         assert!(
-            dockerfile.contains("gcr.io/distroless/nodejs22-debian12:nonroot"),
-            "Should use distroless image"
+            dockerfile.contains("FROM node:22-alpine AS runner"),
+            "Should use Alpine image"
         );
 
-        // Security: Distroless nonroot uses uid 65532
+        // Security: Creates non-root user with UID 1001
         assert!(
-            dockerfile.contains("--chown=65532:65532"),
-            "Should copy files with distroless nonroot user ownership"
+            dockerfile.contains("adduser --system --uid 1001 nodejs"),
+            "Should create nodejs user with UID 1001"
         );
 
-        // Security: No RUN commands in production stage (distroless has no shell)
-        let production_stage = dockerfile.split("FROM gcr.io/distroless").nth(1).unwrap_or("");
+        // Security: Files owned by nodejs user
         assert!(
-            !production_stage.contains("\nRUN "),
-            "Distroless stage should not have RUN commands (no shell available)"
+            dockerfile.contains("--chown=nodejs:nodejs"),
+            "Should copy files with nodejs user ownership"
+        );
+
+        // Security: Runs as non-root user
+        assert!(
+            dockerfile.contains("USER nodejs"),
+            "Should run as nodejs user"
+        );
+
+        // Security: Package manager removal
+        assert!(
+            dockerfile.contains("rm -rf /sbin/apk"),
+            "Should remove apk package manager"
         );
     }
 
     #[test]
-    fn test_generate_dockerfile_with_bun_uses_distroless() {
+    fn test_generate_dockerfile_with_bun_uses_alpine() {
         let mut files = HashMap::new();
         files.insert("package.json".to_string(), "{}".to_string());
         files.insert("bun.lockb".to_string(), "".to_string());
@@ -552,31 +558,39 @@ mod tests {
         assert!(dockerfile.contains("bun install"));
         assert!(dockerfile.contains("bun run build"));
 
-        // Production stage uses distroless
+        // Production stage uses hardened Alpine
         assert!(
-            dockerfile.contains("gcr.io/distroless/nodejs22-debian12:nonroot"),
-            "Bun Dockerfile should also use distroless for production"
+            dockerfile.contains("FROM node:22-alpine AS runner"),
+            "Bun Dockerfile should use Alpine for production"
         );
 
-        // Distroless nonroot user
+        // Nodejs user ownership
         assert!(
-            dockerfile.contains("--chown=65532:65532"),
-            "Bun Dockerfile should use distroless nonroot ownership"
+            dockerfile.contains("--chown=nodejs:nodejs"),
+            "Bun Dockerfile should use nodejs user ownership"
         );
     }
 
     #[test]
-    fn test_distroless_constant() {
-        // Verify the distroless constant is set correctly
+    fn test_alpine_hardening_constants() {
+        // Verify Alpine hardening for Node.js
         assert!(
-            DISTROLESS_NODEJS.contains("gcr.io/distroless/nodejs22-debian12:nonroot"),
-            "Distroless constant should point to nonroot nodejs image"
+            NODEJS_ALPINE_SECURITY_HARDENING.contains("USER nodejs"),
+            "Alpine hardening should set nodejs user"
+        );
+        assert!(
+            NODEJS_ALPINE_SECURITY_HARDENING.contains("adduser --system --uid 1001 nodejs"),
+            "Alpine hardening should create nodejs user with UID 1001"
+        );
+        assert!(
+            NODEJS_ALPINE_SECURITY_HARDENING.contains("rm -rf /sbin/apk"),
+            "Alpine hardening should remove package manager"
         );
     }
 
     #[test]
     fn test_nginx_hardening_constants() {
-        // Verify nginx hardening (nginx doesn't have distroless variant)
+        // Verify nginx hardening
         assert!(
             NGINX_SECURITY_HARDENING.contains("USER nginx"),
             "Nginx hardening should set user"
@@ -613,28 +627,28 @@ mod tests {
 
         let dockerfile = generate_node_dockerfile(&app, config);
 
-        // Should use distroless
+        // Should use hardened Alpine
         assert!(
-            dockerfile.contains("gcr.io/distroless/nodejs22-debian12:nonroot"),
-            "Should use distroless image"
+            dockerfile.contains("FROM node:22-alpine AS runner"),
+            "Should use Alpine image"
         );
 
         // Should copy node_modules for next start
         assert!(
-            dockerfile.contains("COPY --from=builder --chown=65532:65532 /app/node_modules ./node_modules"),
+            dockerfile.contains("COPY --from=builder --chown=nodejs:nodejs /app/node_modules ./node_modules"),
             "Should copy node_modules for non-standalone Next.js"
         );
 
         // Should copy .next directory
         assert!(
-            dockerfile.contains("COPY --from=builder --chown=65532:65532 /app/.next ./.next"),
+            dockerfile.contains("COPY --from=builder --chown=nodejs:nodejs /app/.next ./.next"),
             "Should copy .next directory"
         );
 
-        // Should use next start via node_modules
+        // Should use next start via node_modules with node
         assert!(
-            dockerfile.contains("CMD [\"./node_modules/next/dist/bin/next\", \"start\"]"),
-            "Should run next start via node_modules path"
+            dockerfile.contains("CMD [\"node\", \"./node_modules/next/dist/bin/next\", \"start\"]"),
+            "Should run next start via node_modules path with node"
         );
     }
 
@@ -660,28 +674,28 @@ mod tests {
 
         let dockerfile = generate_node_dockerfile(&app, config);
 
-        // Should use distroless
+        // Should use hardened Alpine
         assert!(
-            dockerfile.contains("gcr.io/distroless/nodejs22-debian12:nonroot"),
-            "Should use distroless image"
+            dockerfile.contains("FROM node:22-alpine AS runner"),
+            "Should use Alpine image"
         );
 
         // Should copy standalone directory
         assert!(
-            dockerfile.contains("COPY --from=builder --chown=65532:65532 /app/.next/standalone ./"),
+            dockerfile.contains("COPY --from=builder --chown=nodejs:nodejs /app/.next/standalone ./"),
             "Should copy standalone directory"
         );
 
         // Should copy static files
         assert!(
-            dockerfile.contains("COPY --from=builder --chown=65532:65532 /app/.next/static ./.next/static"),
+            dockerfile.contains("COPY --from=builder --chown=nodejs:nodejs /app/.next/static ./.next/static"),
             "Should copy static files"
         );
 
-        // Should run server.js directly
+        // Should run node server.js
         assert!(
-            dockerfile.contains("CMD [\"server.js\"]"),
-            "Should run server.js directly for standalone build"
+            dockerfile.contains("CMD [\"node\", \"server.js\"]"),
+            "Should run node server.js for standalone build"
         );
     }
 }
