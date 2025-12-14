@@ -3,7 +3,9 @@ import {
   promptText,
   promptConfirm,
   promptSelect,
+  promptSearch,
   type SelectOption,
+  type SearchOption,
 } from '../../ui/prompts.js'
 import { withSpinner, startSpinner, succeedSpinner, failSpinner } from '../../ui/spinner.js'
 import {
@@ -207,24 +209,6 @@ async function selectGitConnection(): Promise<ConnectionResponse | null> {
  * Step 2: Select Repository
  */
 async function selectRepository(connectionId: number): Promise<RepositoryResponse | null> {
-  // Offer to sync repositories first
-  const shouldSync = await promptConfirm({
-    message: 'Sync repositories from provider? (recommended for first use)',
-    default: false,
-  })
-
-  if (shouldSync) {
-    await withSpinner('Syncing repositories...', async () => {
-      const { error: syncError } = await syncRepositories({
-        client,
-        path: { connection_id: connectionId },
-      })
-      if (syncError) {
-        throw new Error(getErrorMessage(syncError))
-      }
-    })
-  }
-
   const spinner = startSpinner('Loading repositories...')
 
   const { data, error: apiError } = await listRepositoriesByConnection({
@@ -240,58 +224,62 @@ async function selectRepository(connectionId: number): Promise<RepositoryRespons
 
   succeedSpinner('Repositories loaded')
 
-  const repositories = data?.repositories || []
+  let repositories = data?.repositories || []
 
+  // Auto-sync if no repositories found
   if (repositories.length === 0) {
-    newline()
-    warning('No repositories found. Try syncing your repositories.')
-    return null
+    info('No repositories found. Syncing from provider...')
+    await withSpinner('Syncing repositories...', async () => {
+      const { error: syncError } = await syncRepositories({
+        client,
+        path: { connection_id: connectionId },
+      })
+      if (syncError) {
+        throw new Error(getErrorMessage(syncError))
+      }
+    })
+
+    // Reload after sync
+    const { data: reloadedData, error: reloadError } = await listRepositoriesByConnection({
+      client,
+      path: { connection_id: connectionId },
+      query: { per_page: 100 },
+    })
+
+    if (reloadError) {
+      throw new Error(getErrorMessage(reloadError))
+    }
+
+    repositories = reloadedData?.repositories || []
+
+    if (repositories.length === 0) {
+      warning('No repositories found after syncing. Check your Git provider permissions.')
+      return null
+    }
   }
 
   newline()
 
-  // Allow search/filter
-  const searchTerm = await promptText({
-    message: 'Search repositories (leave empty to show all)',
-    default: '',
-  })
-
-  let filteredRepos = repositories
-  if (searchTerm) {
-    const term = searchTerm.toLowerCase()
-    filteredRepos = repositories.filter(
-      (r) =>
-        r.name.toLowerCase().includes(term) ||
-        r.owner.toLowerCase().includes(term) ||
-        (r.description?.toLowerCase() || '').includes(term)
-    )
-  }
-
-  if (filteredRepos.length === 0) {
-    warning('No repositories match your search.')
-    return null
-  }
-
-  // Limit choices for usability
-  const displayRepos = filteredRepos.slice(0, 30)
-  if (filteredRepos.length > 30) {
-    info(`Showing first 30 of ${filteredRepos.length} repositories. Use search to narrow down.`)
-  }
-
-  const choices: SelectOption<number>[] = displayRepos.map((repo) => ({
+  // Build search choices from all repositories
+  const choices: SearchOption<number>[] = repositories.map((repo) => ({
     name: `${repo.owner}/${repo.name}`,
     value: repo.id,
-    description: repo.description
-      ? repo.description.slice(0, 50) + (repo.description.length > 50 ? '...' : '')
-      : repo.language || 'No description',
+    description: [
+      repo.language,
+      repo.description?.slice(0, 60),
+    ].filter(Boolean).join(' • ') || undefined,
   }))
 
-  const selectedId = await promptSelect({
+  info(`${repositories.length} repositories available. Type to search...`)
+  newline()
+
+  const selectedId = await promptSearch({
     message: 'Select repository',
     choices,
+    pageSize: 15,
   })
 
-  return filteredRepos.find((r) => r.id === selectedId) || null
+  return repositories.find((r) => r.id === selectedId) || null
 }
 
 /**

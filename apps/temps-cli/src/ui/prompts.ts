@@ -6,6 +6,7 @@ import {
   checkbox,
   editor,
 } from '@inquirer/prompts'
+import search from '@inquirer/search'
 import { colors, icons } from './output.js'
 
 export interface TextPromptOptions {
@@ -200,5 +201,44 @@ export async function wizard<T extends Record<string, unknown>>(
     result[step.name] = await step.prompt()
   }
 
+  return result as T
+}
+
+export interface SearchOption<T = string> {
+  name: string
+  value: T
+  description?: string
+}
+
+export interface SearchPromptOptions<T = string> {
+  message: string
+  choices: SearchOption<T>[]
+  pageSize?: number
+}
+
+/**
+ * Interactive search prompt with fuzzy filtering
+ */
+export async function promptSearch<T = string>(options: SearchPromptOptions<T>): Promise<T> {
+  const result = await search({
+    message: options.message,
+    pageSize: options.pageSize ?? 10,
+    source: async (term) => {
+      if (!term) {
+        // Show first items when no search term
+        return options.choices.slice(0, options.pageSize ?? 10)
+      }
+
+      const searchTerm = term.toLowerCase()
+      return options.choices.filter(
+        (choice) =>
+          choice.name.toLowerCase().includes(searchTerm) ||
+          (choice.description?.toLowerCase() || '').includes(searchTerm)
+      )
+    },
+    theme: {
+      prefix: colors.primary('?'),
+    },
+  })
   return result as T
 }

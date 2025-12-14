@@ -179,4 +179,139 @@ mod tests {
         assert!(dockerfile.contains("EXPOSE 3000"));
         assert!(dockerfile.contains("npm ci"));
     }
+
+    #[test]
+    fn test_nextjs_dockerfile_uses_alpine_runner() {
+        let mut files = HashMap::new();
+        files.insert(
+            "package.json".to_string(),
+            r#"{"dependencies":{"next":"14.0.0"}}"#.to_string(),
+        );
+
+        let app = create_test_app(files);
+        let provider = NextJsPresetProvider;
+        let dockerfile = provider.generate_dockerfile(&app).unwrap();
+
+        // Should use hardened Alpine for production runner
+        assert!(
+            dockerfile.contains("FROM node:22-alpine AS runner"),
+            "Next.js should use Alpine runner for production"
+        );
+
+        // Should NOT use distroless
+        assert!(
+            !dockerfile.contains("gcr.io/distroless"),
+            "Next.js should NOT use distroless images"
+        );
+    }
+
+    #[test]
+    fn test_nextjs_dockerfile_security_hardening() {
+        let mut files = HashMap::new();
+        files.insert(
+            "package.json".to_string(),
+            r#"{"dependencies":{"next":"14.0.0"}}"#.to_string(),
+        );
+
+        let app = create_test_app(files);
+        let provider = NextJsPresetProvider;
+        let dockerfile = provider.generate_dockerfile(&app).unwrap();
+
+        // Security: Creates non-root user nodejs with UID 1001
+        assert!(
+            dockerfile.contains("adduser --system --uid 1001 nodejs"),
+            "Should create nodejs user with UID 1001"
+        );
+
+        // Security: Runs as non-root user
+        assert!(
+            dockerfile.contains("USER nodejs"),
+            "Should run as nodejs user"
+        );
+
+        // Security: Package manager removal
+        assert!(
+            dockerfile.contains("rm -rf /sbin/apk"),
+            "Should remove apk package manager"
+        );
+
+        // Security: Files owned by nodejs user
+        assert!(
+            dockerfile.contains("--chown=nodejs:nodejs"),
+            "Files should be owned by nodejs user"
+        );
+    }
+
+    #[test]
+    fn test_nextjs_standalone_dockerfile() {
+        let mut files = HashMap::new();
+        files.insert(
+            "package.json".to_string(),
+            r#"{"dependencies":{"next":"14.0.0"}}"#.to_string(),
+        );
+        files.insert(
+            "next.config.js".to_string(),
+            "module.exports = { output: 'standalone' }".to_string(),
+        );
+
+        let app = create_test_app(files);
+        let provider = NextJsPresetProvider;
+        let dockerfile = provider.generate_dockerfile(&app).unwrap();
+
+        // Should use Alpine runner
+        assert!(
+            dockerfile.contains("FROM node:22-alpine AS runner"),
+            "Standalone Next.js should use Alpine runner"
+        );
+
+        // Should copy standalone directory with nodejs user
+        assert!(
+            dockerfile.contains("COPY --from=builder --chown=nodejs:nodejs /app/.next/standalone"),
+            "Should copy standalone directory with nodejs ownership"
+        );
+
+        // Should run node server.js
+        assert!(
+            dockerfile.contains("CMD [\"node\", \"server.js\"]"),
+            "Standalone should run node server.js"
+        );
+    }
+
+    #[test]
+    fn test_nextjs_non_standalone_dockerfile() {
+        let mut files = HashMap::new();
+        files.insert(
+            "package.json".to_string(),
+            r#"{"dependencies":{"next":"14.0.0"}}"#.to_string(),
+        );
+        // No standalone config
+
+        let app = create_test_app(files);
+        let provider = NextJsPresetProvider;
+        let dockerfile = provider.generate_dockerfile(&app).unwrap();
+
+        // Should use Alpine runner
+        assert!(
+            dockerfile.contains("FROM node:22-alpine AS runner"),
+            "Non-standalone Next.js should use Alpine runner"
+        );
+
+        // Should copy node_modules with nodejs user
+        assert!(
+            dockerfile.contains("COPY --from=builder --chown=nodejs:nodejs /app/node_modules"),
+            "Should copy node_modules with nodejs ownership"
+        );
+
+        // Should copy .next directory with nodejs user
+        assert!(
+            dockerfile.contains("COPY --from=builder --chown=nodejs:nodejs /app/.next"),
+            "Should copy .next directory with nodejs ownership"
+        );
+
+        // Should run next start via node
+        assert!(
+            dockerfile.contains("CMD [\"node\", \"./node_modules/next/dist/bin/next\", \"start\"]"),
+            "Non-standalone should run next start via node"
+        );
+    }
 }

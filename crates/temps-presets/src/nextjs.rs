@@ -4,11 +4,21 @@ use async_trait::async_trait;
 use tracing::debug;
 use std::path::Path;
 
-/// Google's distroless Node.js image - contains ONLY Node.js runtime.
-/// No shell, no package manager, no OS utilities = maximum security.
-/// Used for standalone Next.js builds via `dockerfile_with_build_dir`.
-/// See: https://github.com/GoogleContainerTools/distroless
-const DISTROLESS_NODEJS: &str = "gcr.io/distroless/nodejs22-debian12:nonroot";
+/// Security hardening for Node.js Alpine runner
+/// This approach provides security while maintaining compatibility:
+/// - Removes package managers to prevent runtime package installation
+/// - Creates a dedicated non-root user (nodejs:nodejs with UID/GID 1001)
+/// - Keeps CA certificates for HTTPS support (unlike distroless)
+/// - Maintains shell access for debugging if needed
+const NODEJS_ALPINE_SECURITY_HARDENING: &str = r#"# Security hardening - remove package manager and run as non-root
+# Create non-root user for running the application
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nodejs && \
+    # Remove package managers to prevent runtime package installation
+    rm -rf /sbin/apk /usr/bin/apk /etc/apk /var/cache/apk /lib/apk && \
+    rm -rf /var/lib/apt /usr/bin/apt* /usr/bin/dpkg* 2>/dev/null || true
+
+USER nodejs"#;
 
 pub struct NextJs;
 
@@ -60,10 +70,9 @@ impl Preset for NextJs {
             build_cmd = build_cmd.replace("bun ", "/root/.bun/bin/bun ");
         }
 
-        // Use explicit path to Next.js binary for distroless
-        // Distroless has /nodejs/bin/node as entrypoint, so CMD just needs the script path
-        // This is equivalent to `npm start` / `next start` but works in distroless (no npm/shell needed)
-        let start_cmd = format!("/{}/node_modules/next/dist/bin/next\", \"start", project_slug);
+        // Use explicit path to Next.js binary with node
+        // Alpine has node available, so we use exec form with node
+        let start_cmd = format!("node\", \"/{}/node_modules/next/dist/bin/next\", \"start", project_slug);
 
         // Build stage uses full Node.js image with package managers
         let base_image = match package_manager {
@@ -72,9 +81,9 @@ impl Preset for NextJs {
             _ => "node:22",
         };
 
-        // Production stage uses distroless for maximum security
-        // No shell, no wget, no package managers = minimal attack surface
-        let run_image = DISTROLESS_NODEJS;
+        // Production stage uses hardened Alpine for security with full CA certificate support
+        // Secure: non-root user, package manager removed, proper HTTPS support
+        let run_image = "node:22-alpine";
 
         // Determine cache path based on whether it's a monorepo subproject
         let cache_path = if !relative_path.is_empty() {
@@ -222,31 +231,30 @@ RUN mkdir -p public
 # - next.config.ts (requires typescript)
 # - ESLint configs
 # - Custom build tools
-# Since we're using distroless (no shell/npm), Next.js cannot auto-install missing packages.
-# The slight increase in image size is acceptable given we're already using ultra-secure distroless base.
 
-# Stage 2: Production using Google's Distroless image
-# No shell, no wget, no package managers = maximum security
+# Stage 2: Production using hardened Alpine Node.js
+# Secure: non-root user, package manager removed, full CA certificates for HTTPS
 FROM {run_image} AS runner
 WORKDIR /{project_slug}
 
-# Distroless :nonroot tag runs as uid 65532 (no RUN commands possible - no shell)
+{alpine_hardening}
 
 "#,
             build_cmd_line,
             project_slug = project_slug,
             run_image = run_image,
+            alpine_hardening = NODEJS_ALPINE_SECURITY_HARDENING,
         ));
 
         // Copy entire project from build stage
         // This ensures all runtime files are available (drizzle, config, mydata, locales, etc.)
-        // Distroless uses uid 65532 (nonroot user)
+        // Alpine uses nodejs:nodejs user (uid 1001)
         match build_system.monorepo_tool {
             MonorepoTool::None => {
                 dockerfile.push_str(&format!(
                     r#"# Copy entire project directory to ensure all runtime files are available
 # This includes: node_modules, .next, public, and ANY custom directories (drizzle, mydata, etc.)
-COPY --from=build --chown=65532:65532 /{project_slug} /{project_slug}
+COPY --from=build --chown=nodejs:nodejs /{project_slug} /{project_slug}
 "#,
                     project_slug = project_slug
                 ));
@@ -256,7 +264,7 @@ COPY --from=build --chown=65532:65532 /{project_slug} /{project_slug}
                 dockerfile.push_str(&format!(
                     r#"# Copy entire project directory to ensure all runtime files are available
 # This includes: node_modules, .next, public, and ANY custom directories (drizzle, mydata, etc.)
-COPY --from=build --chown=65532:65532 /{project_slug}/{relative_path} /{project_slug}
+COPY --from=build --chown=nodejs:nodejs /{project_slug}/{relative_path} /{project_slug}
 "#,
                     project_slug = project_slug,
                     relative_path = relative_path
@@ -264,7 +272,7 @@ COPY --from=build --chown=65532:65532 /{project_slug}/{relative_path} /{project_
             }
         }
 
-        // Set environment (distroless :nonroot already runs as uid 65532)
+        // Set environment (already running as nodejs user via USER directive)
         dockerfile.push_str(
             r#"
 # Set production environment
@@ -285,31 +293,31 @@ EXPOSE 3000
     }
 
     async fn dockerfile_with_build_dir(&self, _local_path: &Path) -> DockerfileWithArgs {
-        // Use distroless for maximum security - no shell, no package manager, no attack surface
+        // Use hardened Alpine for security with full CA certificate support
         let content = format!(r#"
-# Use Google's Distroless Node.js image - contains ONLY Node.js runtime
-# No shell, no package manager, no OS utilities = maximum security
-# See: https://github.com/GoogleContainerTools/distroless
-FROM {distroless} AS runner
+# Use hardened Alpine Node.js image
+# Secure: non-root user, package manager removed, full CA certificates for HTTPS
+FROM node:22-alpine AS runner
 
 WORKDIR /app
 
 # Set environment to production
 ENV NODE_ENV=production
 
+{alpine_hardening}
+
 # Copy the built Next.js standalone application
-# Distroless :nonroot runs as uid 65532
-COPY --chown=65532:65532 .next/standalone ./
-COPY --chown=65532:65532 .next/static ./.next/static
-COPY --chown=65532:65532 public ./public
+# Alpine uses nodejs:nodejs user (uid 1001)
+COPY --chown=nodejs:nodejs .next/standalone ./
+COPY --chown=nodejs:nodejs .next/static ./.next/static
+COPY --chown=nodejs:nodejs public ./public
 
 # Expose the port the app runs on
 EXPOSE 3000
 
 # Start the Next.js application
-# Note: Distroless nodejs images automatically use node as entrypoint
-CMD ["server.js"]
-"#, distroless = DISTROLESS_NODEJS);
+CMD ["node", "server.js"]
+"#, alpine_hardening = NODEJS_ALPINE_SECURITY_HARDENING);
         DockerfileWithArgs::new(content)
     }
 
@@ -441,8 +449,8 @@ mod tests {
         // Verify entire project directory is copied in production stage (not selective files)
         assert!(result.content.contains("# Copy entire project directory to ensure all runtime files are available"));
         assert!(result.content.contains("# This includes: node_modules, .next, public, and ANY custom directories (drizzle, mydata, etc.)"));
-        // Verify the copy is from the subdirectory path (apps/web)
-        assert!(result.content.contains("COPY --from=build --chown=65532:65532 /test_project/apps/web /test_project"));
+        // Verify the copy is from the subdirectory path (apps/web) with nodejs user ownership
+        assert!(result.content.contains("COPY --from=build --chown=nodejs:nodejs /test_project/apps/web /test_project"));
 
         // Verify we do NOT prune devDependencies (TypeScript needed at runtime)
         assert!(result.content.contains("# NOTE: We do NOT prune devDependencies for Next.js projects"));
@@ -484,8 +492,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_npm_project_uses_distroless() {
-        let temp_dir = std::env::temp_dir().join("test_nextjs_npm_distroless");
+    async fn test_npm_project_uses_alpine() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_npm_alpine");
         std::fs::create_dir_all(&temp_dir).unwrap();
         std::fs::write(temp_dir.join("package-lock.json"), "").unwrap();
 
@@ -501,10 +509,10 @@ mod tests {
             project_slug: "test-project",
         }).await;
 
-        // Verify distroless is used for runner stage
-        assert!(result.content.contains("gcr.io/distroless/nodejs22-debian12:nonroot"));
-        // Verify CMD uses explicit path to next start (works in distroless without npm/shell)
-        assert!(result.content.contains(r#"CMD ["/test_project/node_modules/next/dist/bin/next", "start"]"#));
+        // Verify Alpine is used for runner stage
+        assert!(result.content.contains("FROM node:22-alpine AS runner"));
+        // Verify CMD uses node with explicit path to next start
+        assert!(result.content.contains(r#"CMD ["node", "/test_project/node_modules/next/dist/bin/next", "start"]"#));
         // Verify npm is used in build stage
         assert!(result.content.contains("npm install") || result.content.contains("npm ci"));
 
@@ -513,8 +521,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bun_project_uses_distroless() {
-        let temp_dir = std::env::temp_dir().join("test_nextjs_bun_distroless");
+    async fn test_bun_project_uses_alpine() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_bun_alpine");
         std::fs::create_dir_all(&temp_dir).unwrap();
         std::fs::write(temp_dir.join("bun.lock"), "").unwrap();
 
@@ -530,10 +538,10 @@ mod tests {
             project_slug: "test-project",
         }).await;
 
-        // Verify distroless is used for runner stage
-        assert!(result.content.contains("gcr.io/distroless/nodejs22-debian12:nonroot"));
-        // Verify CMD uses explicit path to next start (works in distroless without npm/shell)
-        assert!(result.content.contains(r#"CMD ["/test_project/node_modules/next/dist/bin/next", "start"]"#));
+        // Verify Alpine is used for runner stage
+        assert!(result.content.contains("FROM node:22-alpine AS runner"));
+        // Verify CMD uses node with explicit path to next start
+        assert!(result.content.contains(r#"CMD ["node", "/test_project/node_modules/next/dist/bin/next", "start"]"#));
         // Verify bun is installed in build stage
         assert!(result.content.contains("curl -fsSL https://bun.sh/install | bash"));
 
@@ -542,8 +550,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_yarn_project_uses_distroless() {
-        let temp_dir = std::env::temp_dir().join("test_nextjs_yarn_distroless");
+    async fn test_yarn_project_uses_alpine() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_yarn_alpine");
         std::fs::create_dir_all(&temp_dir).unwrap();
         std::fs::write(temp_dir.join("yarn.lock"), "").unwrap();
 
@@ -559,10 +567,10 @@ mod tests {
             project_slug: "test-project",
         }).await;
 
-        // Verify distroless is used for runner stage
-        assert!(result.content.contains("gcr.io/distroless/nodejs22-debian12:nonroot"));
-        // Verify CMD uses explicit path to next start (works in distroless without npm/shell)
-        assert!(result.content.contains(r#"CMD ["/test_project/node_modules/next/dist/bin/next", "start"]"#));
+        // Verify Alpine is used for runner stage
+        assert!(result.content.contains("FROM node:22-alpine AS runner"));
+        // Verify CMD uses node with explicit path to next start
+        assert!(result.content.contains(r#"CMD ["node", "/test_project/node_modules/next/dist/bin/next", "start"]"#));
         // Verify corepack is enabled for yarn in build stage
         assert!(result.content.contains("corepack enable"));
 
@@ -597,8 +605,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dockerfile_uses_distroless_with_security() {
-        let temp_dir = std::env::temp_dir().join("test_nextjs_distroless_security");
+    async fn test_dockerfile_uses_alpine_with_security() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_alpine_security");
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let preset = NextJs;
@@ -613,23 +621,34 @@ mod tests {
             project_slug: "test-project",
         }).await;
 
-        // Verify distroless is used for runner stage
+        // Verify Alpine is used for runner stage
         assert!(
-            result.content.contains("gcr.io/distroless/nodejs22-debian12:nonroot"),
-            "Should use distroless Node.js image"
+            result.content.contains("FROM node:22-alpine AS runner"),
+            "Should use Alpine Node.js image for runner"
         );
 
-        // Security: Files owned by distroless nonroot user (uid 65532)
+        // Security: Creates non-root user nodejs with UID 1001
         assert!(
-            result.content.contains("--chown=65532:65532"),
-            "Should copy files with distroless nonroot user ownership"
+            result.content.contains("adduser --system --uid 1001 nodejs"),
+            "Should create nodejs user with UID 1001"
         );
 
-        // Security: No RUN commands in production stage (distroless has no shell)
-        let production_stage = result.content.split("gcr.io/distroless").nth(1).unwrap_or("");
+        // Security: Runs as non-root user
         assert!(
-            !production_stage.contains("\nRUN "),
-            "Distroless stage should not have RUN commands"
+            result.content.contains("USER nodejs"),
+            "Should run as nodejs user"
+        );
+
+        // Security: Package manager removal
+        assert!(
+            result.content.contains("rm -rf /sbin/apk"),
+            "Should remove apk package manager"
+        );
+
+        // Security: Files owned by nodejs user
+        assert!(
+            result.content.contains("--chown=nodejs:nodejs"),
+            "Should copy files with nodejs user ownership"
         );
 
         // Cleanup
@@ -637,29 +656,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dockerfile_with_build_dir_uses_distroless() {
-        let temp_dir = std::env::temp_dir().join("test_nextjs_build_dir_distroless");
+    async fn test_dockerfile_with_build_dir_uses_alpine_with_security() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_build_dir_alpine");
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let preset = NextJs;
         let result = preset.dockerfile_with_build_dir(&temp_dir).await;
 
-        // Security: Uses Google's distroless image
+        // Verify Alpine is used for runner stage
         assert!(
-            result.content.contains("gcr.io/distroless/nodejs22-debian12:nonroot"),
-            "Should use distroless Node.js image"
+            result.content.contains("FROM node:22-alpine AS runner"),
+            "Should use Alpine Node.js image for runner"
         );
 
-        // Security: Files are copied with distroless nonroot user ownership
+        // Security: Creates non-root user nodejs with UID 1001
         assert!(
-            result.content.contains("--chown=65532:65532"),
-            "Should copy files with distroless nonroot user ownership"
+            result.content.contains("adduser --system --uid 1001 nodejs"),
+            "Should create nodejs user with UID 1001"
         );
 
-        // Security: No RUN commands (distroless has no shell)
+        // Security: Runs as non-root user
         assert!(
-            !result.content.contains("\nRUN "),
-            "Distroless Dockerfile should not have RUN commands"
+            result.content.contains("USER nodejs"),
+            "Should run as nodejs user"
+        );
+
+        // Security: Package manager removal
+        assert!(
+            result.content.contains("rm -rf /sbin/apk"),
+            "Should remove apk package manager"
+        );
+
+        // Security: Files owned by nodejs user
+        assert!(
+            result.content.contains("--chown=nodejs:nodejs"),
+            "Should copy files with nodejs user ownership"
         );
 
         // Cleanup

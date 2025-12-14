@@ -29,7 +29,6 @@ export function createProgram(): Command {
     .name('temps')
     .description('CLI for Temps deployment platform')
     .version(VERSION, '-v, --version', 'Display version number')
-    .option('--json', 'Output in JSON format')
     .option('--no-color', 'Disable colored output')
     .option('--debug', 'Enable debug output')
     .hook('preAction', (thisCommand) => {
