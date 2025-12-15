@@ -5,14 +5,21 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   ListPromptsRequestSchema,
   GetPromptRequestSchema,
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 
-import { listPrompts, getPrompt } from './handlers/index.js';
+import {
+  listPrompts,
+  getPrompt,
+  listTools,
+  callTool,
+} from './handlers/index.js';
 
 /**
  * Temps MCP Server
  *
- * Provides MCP prompts for Temps platform operations
+ * Provides MCP prompts and tools for Temps platform operations
  */
 
 const server = new Server(
@@ -23,6 +30,7 @@ const server = new Server(
   {
     capabilities: {
       prompts: {},
+      tools: {},
     },
   }
 );
@@ -43,13 +51,31 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
 });
 
 /**
+ * List available tools
+ */
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  return listTools();
+});
+
+/**
+ * Call a tool
+ */
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+  return await callTool(name, args || {});
+});
+
+/**
  * Start the server
  */
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  console.error('Temps MCP Server (Prompts Only) running on stdio');
+  console.error('Temps MCP Server running on stdio');
+  console.error(
+    `API URL: ${process.env.TEMPS_API_URL || '(not configured)'}`
+  );
 }
 
 main().catch((error) => {

@@ -33,6 +33,22 @@ impl CustomDomainService {
         Self { db }
     }
 
+    /// Normalizes a redirect URL by adding https:// scheme if missing
+    ///
+    /// This handles cases where users provide just a domain name (e.g., "example.com")
+    /// instead of a full URL (e.g., "https://example.com").
+    fn normalize_redirect_url(redirect_url: &str) -> String {
+        let trimmed = redirect_url.trim();
+
+        // If the URL already has a scheme, return as-is
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            return trimmed.to_string();
+        }
+
+        // Add https:// scheme by default
+        format!("https://{}", trimmed)
+    }
+
     /// Validates a redirect URL to prevent SSRF and circular redirects
     ///
     /// This method checks:
@@ -43,20 +59,23 @@ impl CustomDomainService {
     ///
     /// # Arguments
     /// * `domain` - The source domain being configured
-    /// * `redirect_url` - The target URL to redirect to
+    /// * `redirect_url` - The target URL to redirect to (can be domain-only like "example.com")
     /// * `exclude_id` - Optional domain ID to exclude from circular check (for updates)
     ///
     /// # Returns
-    /// * `Ok(())` if the redirect is valid
+    /// * `Ok(String)` - The normalized redirect URL if valid
     /// * `Err(CustomDomainError)` if validation fails
     async fn validate_redirect_url(
         &self,
         domain: &str,
         redirect_url: &str,
         exclude_id: Option<i32>,
-    ) -> Result<(), CustomDomainError> {
+    ) -> Result<String, CustomDomainError> {
+        // Normalize the URL by adding https:// if no scheme is present
+        let normalized_url = Self::normalize_redirect_url(redirect_url);
+
         // Validate URL format and prevent SSRF
-        let parsed_url = url_validation::validate_external_url(redirect_url).map_err(|e| {
+        let parsed_url = url_validation::validate_external_url(&normalized_url).map_err(|e| {
             CustomDomainError::InvalidRedirectUrl(format!(
                 "Invalid redirect URL '{}': {}",
                 redirect_url, e
@@ -85,7 +104,7 @@ impl CustomDomainService {
         self.detect_redirect_chain(&redirect_host, domain, exclude_id, 10)
             .await?;
 
-        Ok(())
+        Ok(normalized_url)
     }
 
     /// Detects circular redirect chains by following the redirect chain
@@ -193,19 +212,25 @@ impl CustomDomainService {
             )));
         }
 
-        // Validate redirect URL if provided
-        if let Some(ref redirect_url) = redirect_to {
+        // Validate and normalize redirect URL if provided
+        let normalized_redirect = if let Some(ref redirect_url) = redirect_to {
             if !redirect_url.is_empty() {
-                self.validate_redirect_url(&domain, redirect_url, None)
-                    .await?;
+                Some(
+                    self.validate_redirect_url(&domain, redirect_url, None)
+                        .await?,
+                )
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         let new_custom_domain = project_custom_domains::ActiveModel {
             project_id: Set(project_id),
             environment_id: Set(environment_id),
             domain: Set(domain.clone()),
-            redirect_to: Set(redirect_to),
+            redirect_to: Set(normalized_redirect),
             status_code: Set(status_code),
             branch: Set(branch),
             status: Set("pending".to_string()),
@@ -324,10 +349,11 @@ impl CustomDomainService {
             if redirect.is_empty() {
                 active_model.redirect_to = Set(None);
             } else {
-                // Validate redirect URL before updating
-                self.validate_redirect_url(final_domain, &redirect, Some(id))
+                // Validate and normalize redirect URL before updating
+                let normalized_redirect = self
+                    .validate_redirect_url(final_domain, &redirect, Some(id))
                     .await?;
-                active_model.redirect_to = Set(Some(redirect));
+                active_model.redirect_to = Set(Some(normalized_redirect));
             }
         }
         if let Some(code) = status_code {
@@ -900,6 +926,66 @@ mod tests {
             Some("https://target.example.com".to_string())
         );
         assert_eq!(domain.status_code, Some(301));
+    }
+
+    #[tokio::test]
+    async fn test_create_domain_with_redirect_without_scheme_normalizes_to_https() {
+        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+            .await
+            .unwrap();
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (project_id, env_id) = setup_test_data(&test_db.db).await;
+
+        // Redirect URL without scheme should be normalized to https://
+        let domain = service
+            .create_custom_domain(
+                project_id,
+                env_id,
+                "www.example.com".to_string(),
+                Some("example.com".to_string()), // No https:// prefix
+                Some(301),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(domain.domain, "www.example.com");
+        // Should be normalized to include https:// scheme
+        assert_eq!(domain.redirect_to, Some("https://example.com".to_string()));
+        assert_eq!(domain.status_code, Some(301));
+    }
+
+    #[tokio::test]
+    async fn test_normalize_redirect_url() {
+        // Test without scheme - should add https://
+        assert_eq!(
+            CustomDomainService::normalize_redirect_url("example.com"),
+            "https://example.com"
+        );
+
+        // Test with https:// - should remain unchanged
+        assert_eq!(
+            CustomDomainService::normalize_redirect_url("https://example.com"),
+            "https://example.com"
+        );
+
+        // Test with http:// - should remain unchanged
+        assert_eq!(
+            CustomDomainService::normalize_redirect_url("http://example.com"),
+            "http://example.com"
+        );
+
+        // Test with whitespace - should trim and add https://
+        assert_eq!(
+            CustomDomainService::normalize_redirect_url("  example.com  "),
+            "https://example.com"
+        );
+
+        // Test with path - should add https://
+        assert_eq!(
+            CustomDomainService::normalize_redirect_url("example.com/path"),
+            "https://example.com/path"
+        );
     }
 
     #[tokio::test]

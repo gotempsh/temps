@@ -9,7 +9,7 @@
     "temps-mcp": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && cp -r src/prompts/templates dist/prompts/",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "type-check": "tsc --noEmit",

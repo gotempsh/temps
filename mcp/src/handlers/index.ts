@@ -1,6 +1,7 @@
 /**
  * Handlers registry
- * Exports prompt handlers only
+ * Exports prompt and tools handlers
  */
 
 export * from './prompts-handler.js';
+export * from './tools-handler.js';
