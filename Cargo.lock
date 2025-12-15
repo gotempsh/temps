@@ -10429,6 +10429,7 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-database",
+ "temps-dns",
  "temps-entities",
  "testcontainers",
  "thiserror 2.0.17",

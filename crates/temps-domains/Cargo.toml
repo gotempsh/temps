@@ -12,6 +12,7 @@ temps-auth = { path = "../temps-auth" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
+temps-dns = { path = "../temps-dns" }
 temps-entities = { path = "../temps-entities" }
 axum = { workspace = true }
 tracing = { workspace = true }

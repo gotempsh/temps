@@ -22,7 +22,9 @@ pub use tls::{
 pub use plugin::DomainsPlugin;
 
 // Export handlers state for use in other contexts
-pub use handlers::{configure_routes, create_domain_app_state, DomainAppState};
+pub use handlers::{
+    configure_routes, create_domain_app_state, create_domain_app_state_with_dns, DomainAppState,
+};
 
 // Export domain service
 pub use domain_service::{ChallengeData, DomainService, DomainServiceError};

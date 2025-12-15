@@ -1,6 +1,7 @@
 use crate::{CertificateRepository, DomainService, TlsService};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use temps_dns::services::DnsProviderService;
 
 use utoipa::ToSchema;
 
@@ -8,6 +9,8 @@ pub struct DomainAppState {
     pub tls_service: Arc<TlsService>,
     pub repository: Arc<dyn CertificateRepository>,
     pub domain_service: Arc<DomainService>,
+    /// DNS provider service for automatic DNS record setup (optional)
+    pub dns_provider_service: Option<Arc<DnsProviderService>>,
 }
 
 pub fn create_domain_app_state(
@@ -19,6 +22,21 @@ pub fn create_domain_app_state(
         tls_service,
         repository,
         domain_service,
+        dns_provider_service: None,
+    })
+}
+
+pub fn create_domain_app_state_with_dns(
+    tls_service: Arc<TlsService>,
+    repository: Arc<dyn CertificateRepository>,
+    domain_service: Arc<DomainService>,
+    dns_provider_service: Arc<DnsProviderService>,
+) -> Arc<DomainAppState> {
+    Arc::new(DomainAppState {
+        tls_service,
+        repository,
+        domain_service,
+        dns_provider_service: Some(dns_provider_service),
     })
 }
 
@@ -265,4 +283,45 @@ impl From<crate::tls::models::AcmeOrder> for AcmeOrderResponse {
             challenge_validation: None, // Will be populated by fetching from Let's Encrypt
         }
     }
+}
+
+// ========================================
+// DNS Challenge Auto-Provisioning Types
+// ========================================
+
+/// Request to setup DNS challenge records using a configured DNS provider
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetupDnsChallengeRequest {
+    /// The ID of the DNS provider to use for creating the TXT records
+    pub dns_provider_id: i32,
+}
+
+/// Result of a single DNS TXT record creation for ACME challenge
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DnsChallengeRecordResult {
+    /// TXT record name (e.g., "_acme-challenge.example.com")
+    #[schema(example = "_acme-challenge.example.com")]
+    pub name: String,
+    /// TXT record value (the ACME challenge token)
+    #[schema(example = "abc123...")]
+    pub value: String,
+    /// Whether the record was created successfully
+    pub success: bool,
+    /// Human-readable message about the operation
+    pub message: String,
+}
+
+/// Response from DNS challenge setup operation
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SetupDnsChallengeResponse {
+    /// Overall success status (true if all records were created)
+    pub success: bool,
+    /// Number of TXT records that were successfully created
+    pub records_created: u32,
+    /// Total number of TXT records required for the challenge
+    pub total_records: u32,
+    /// Results for each individual TXT record
+    pub results: Vec<DnsChallengeRecordResult>,
+    /// Human-readable summary message
+    pub message: String,
 }
