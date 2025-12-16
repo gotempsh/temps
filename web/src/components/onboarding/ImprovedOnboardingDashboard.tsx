@@ -23,7 +23,7 @@ import { ExternalUrlStep } from './ExternalUrlStep'
 import { ScreenshotSetupStep } from './ScreenshotSetupStep'
 
 // Import existing components for git/project setup
-import { GitProviderFlow } from '@/components/git-providers/GitProviderFlow'
+import { GitConnectionStep } from './GitConnectionStep'
 import { Button } from '@/components/ui/button'
 import { useSettings } from '@/hooks/useSettings'
 import { ProjectOnboardingStep } from './ProjectOnboardingStep'
@@ -120,6 +120,10 @@ export function ImprovedOnboardingDashboard() {
     domains?.domains?.some(
       (domain) => domain.status !== 'active' && domain.status !== 'failed'
     ) || false
+  // Check for active wildcard domain specifically
+  const activeWildcardDomain = domains?.domains?.find(
+    (domain) => domain.status === 'active' && domain.is_wildcard
+  )
 
   // Auto-reset onboarding if user refreshes with no resources
   useEffect(() => {
@@ -241,6 +245,57 @@ export function ImprovedOnboardingDashboard() {
       })
     }
   }, [domains, currentStep, hasActiveDomain])
+
+  // Auto-skip to screenshot-setup when active wildcard domain exists
+  // This handles the case where user already has a provisioned wildcard domain
+  useEffect(() => {
+    if (!activeWildcardDomain) return
+
+    // Steps that should be skipped when wildcard domain is already provisioned
+    const stepsBeforeScreenshots: OnboardingStep[] = [
+      'exposure',
+      'base-domain',
+      'network-mode',
+      'network-setup',
+      'domain-challenge',
+      'external-url',
+    ]
+
+    if (stepsBeforeScreenshots.includes(currentStep)) {
+      queueMicrotask(() => {
+        // Mark all domain-related steps as completed
+        const domainSteps: OnboardingStep[] = [
+          'exposure',
+          'base-domain',
+          'network-mode',
+          'network-setup',
+          'domain-challenge',
+        ]
+
+        // Also mark external-url if it's configured
+        if (hasExternalUrl) {
+          domainSteps.push('external-url')
+        }
+
+        setCompletedSteps((prev) => [
+          ...Array.from(new Set<OnboardingStep>([...prev, ...domainSteps])),
+        ])
+
+        // Set domain state from the active wildcard domain
+        setCreatedDomain(activeWildcardDomain)
+        const domainName = activeWildcardDomain.domain.replace(/^\*\./, '')
+        setBaseDomain(domainName)
+        setWantsExpose(true)
+
+        // Skip to screenshot-setup (or external-url if not configured)
+        if (hasExternalUrl) {
+          setCurrentStep('screenshot-setup')
+        } else {
+          setCurrentStep('external-url')
+        }
+      })
+    }
+  }, [activeWildcardDomain, currentStep, hasExternalUrl])
 
   // Auto-advance from git-provider to project if connections already exist
   // Only auto-advance if we've already marked earlier steps as complete
@@ -471,23 +526,12 @@ export function ImprovedOnboardingDashboard() {
           )}
 
           {currentStep === 'git-provider' && (
-            <div className="space-y-6">
-              {!hasConnections ? (
-                <GitProviderFlow
-                  onSuccess={() => {
-                    completeStep('git-provider', 'project')
-                  }}
-                  onCancel={() => {}}
-                  mode="onboarding"
-                />
-              ) : (
-                <div className="text-center space-y-4">
-                  <p className="text-muted-foreground">
-                    Git provider configured!
-                  </p>
-                </div>
-              )}
-            </div>
+            <GitConnectionStep
+              onSuccess={() => {
+                completeStep('git-provider', 'project')
+              }}
+              onBack={() => setCurrentStep('screenshot-setup')}
+            />
           )}
 
           {currentStep === 'project' && (

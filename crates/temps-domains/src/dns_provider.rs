@@ -154,20 +154,78 @@ impl DnsProviderService for CloudflareDnsProvider {
         }
     }
     async fn set_txt_record(&self, domain: &str, name: &str, value: &str) -> Result<()> {
-        // delete record if it exists
-        match self.remove_txt_record(domain, name).await {
-            Ok(_) => (),
-            Err(e) => {
-                info!("Failed to remove TXT record {}: {:?}", name, e);
+        let zone_id = self.get_zone_id(domain).await?;
+
+        // Extract the base domain (zone name)
+        let base_domain = domain
+            .split('.')
+            .rev()
+            .take(2)
+            .collect::<Vec<&str>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<&str>>()
+            .join(".");
+
+        info!(
+            "Setting TXT record for zone: {} base_domain: {} name: {} value: {}",
+            zone_id, base_domain, name, value
+        );
+
+        // Get all existing TXT records with this name (try both full name and relative name)
+        let existing_records = self.get_txt_records_by_full_name(&zone_id, name).await?;
+
+        // Check if a record with the exact same value already exists
+        for record in &existing_records {
+            if let dns::DnsContent::TXT { content } = &record.content {
+                if content == value {
+                    info!(
+                        "TXT record already exists with same value, skipping creation: {}",
+                        name
+                    );
+                    return Ok(());
+                }
             }
         }
-        let zone_id = self.get_zone_id(domain).await?;
+
+        // Remove any existing TXT records with the same name but different values
+        for record in &existing_records {
+            if let dns::DnsContent::TXT { content } = &record.content {
+                if content != value {
+                    info!(
+                        "Removing existing TXT record with different value: {} = {}",
+                        name, content
+                    );
+                    let delete_endpoint = dns::DeleteDnsRecord {
+                        zone_identifier: &zone_id,
+                        identifier: &record.id,
+                    };
+                    match self.client.request(&delete_endpoint).await {
+                        Ok(_) => info!("Removed TXT record: {}", record.id),
+                        Err(e) => warn!("Failed to remove TXT record {}: {:?}", record.id, e),
+                    }
+                }
+            }
+        }
+
+        // Calculate the relative name (without zone suffix) for creation
+        // Cloudflare accepts both, but relative names are more reliable
+        let relative_name = if name.ends_with(&format!(".{}", base_domain)) {
+            name.strip_suffix(&format!(".{}", base_domain))
+                .unwrap_or(name)
+                .to_string()
+        } else {
+            name.to_string()
+        };
+
         info!(
-            "Setting TXT record for zone: {} domain: {} name: {} value: {}",
-            zone_id, domain, name, value
+            "Creating TXT record with relative name: {} (full: {})",
+            relative_name, name
         );
+
+        // Create the new TXT record using the relative name
         let params = dns::CreateDnsRecordParams {
-            name,
+            name: &relative_name,
             content: dns::DnsContent::TXT {
                 content: value.to_string(),
             },
@@ -181,14 +239,29 @@ impl DnsProviderService for CloudflareDnsProvider {
             params,
         };
 
-        let response = self
-            .client
-            .request(&endpoint)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create TXT record: {:?}", e))?;
-
-        info!("TXT record created: {:?}", response);
-        Ok(())
+        match self.client.request(&endpoint).await {
+            Ok(response) => {
+                info!("TXT record created successfully: {:?}", response);
+                Ok(())
+            }
+            Err(e) => {
+                // If creation failed, check if the record now exists (race condition)
+                warn!("Create failed, checking if record exists: {:?}", e);
+                let check_records = self.get_txt_records_by_full_name(&zone_id, name).await?;
+                for record in &check_records {
+                    if let dns::DnsContent::TXT { content } = &record.content {
+                        if content == value {
+                            info!(
+                                "Record was created by another process, continuing: {}",
+                                name
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(anyhow::anyhow!("Failed to create TXT record: {:?}", e))
+            }
+        }
     }
 
     async fn remove_txt_record(&self, domain: &str, name: &str) -> Result<()> {
@@ -197,33 +270,26 @@ impl DnsProviderService for CloudflareDnsProvider {
             "Removing TXT record for zone: {} domain: {} name: {}",
             zone_id, domain, name
         );
-        let base_domain = domain
-            .split('.')
-            .rev()
-            .take(2)
-            .collect::<Vec<&str>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<&str>>()
-            .join(".");
-        // Remove domain from name if it exists
-        let record_name = if name.ends_with(&base_domain) {
-            name[..name.len() - base_domain.len() - 1].to_string()
-        } else {
-            name.to_string()
-        };
-        info!("Record name: {}", record_name);
 
-        let records = self.get_records(&zone_id, &record_name).await?;
+        // Use the full name to search for records
+        let records = self.get_txt_records_by_full_name(&zone_id, name).await?;
+
+        if records.is_empty() {
+            info!("No TXT records found with name: {}", name);
+            return Ok(());
+        }
+
         for record in records {
+            info!("Deleting TXT record: {} (id: {})", record.name, record.id);
             let endpoint = dns::DeleteDnsRecord {
                 zone_identifier: &zone_id,
                 identifier: &record.id,
             };
 
-            let response = self.client.request(&endpoint).await?;
-
-            info!("TXT record removed: {:?}", response);
+            match self.client.request(&endpoint).await {
+                Ok(response) => info!("TXT record removed: {:?}", response),
+                Err(e) => warn!("Failed to remove TXT record {}: {:?}", record.id, e),
+            }
         }
         Ok(())
     }
@@ -393,6 +459,7 @@ impl CloudflareDnsProvider {
             })
             .map(Self::map_cloudflare_record_to_custom)
     }
+    #[allow(dead_code)]
     async fn get_records(&self, zone_id: &str, name: &str) -> Result<Vec<CFDnsRecord>> {
         let endpoint = dns::ListDnsRecords {
             zone_identifier: zone_id,
@@ -416,6 +483,53 @@ impl CloudflareDnsProvider {
             .into_iter()
             .map(|cf_record| Self::map_cloudflare_record_to_custom(&cf_record))
             .collect())
+    }
+
+    /// Get TXT records by full DNS name (without stripping domain)
+    /// Returns the raw Cloudflare DnsRecord objects for more detailed inspection
+    async fn get_txt_records_by_full_name(
+        &self,
+        zone_id: &str,
+        full_name: &str,
+    ) -> Result<Vec<cloudflare::endpoints::dns::dns::DnsRecord>> {
+        info!("Searching for TXT records with full name: {}", full_name);
+
+        // Search by name only (don't filter by record_type in the API call)
+        // The record_type filter with empty content can cause issues
+        let endpoint = dns::ListDnsRecords {
+            zone_identifier: zone_id,
+            params: dns::ListDnsRecordsParams {
+                name: Some(full_name.to_string()),
+                ..Default::default()
+            },
+        };
+
+        let response = self
+            .client
+            .request(&endpoint)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list TXT records: {:?}", e))?;
+
+        // Filter for TXT records client-side
+        let txt_records: Vec<_> = response
+            .result
+            .into_iter()
+            .filter(|r| matches!(r.content, dns::DnsContent::TXT { .. }))
+            .collect();
+
+        info!(
+            "Found {} TXT record(s) for name: {}",
+            txt_records.len(),
+            full_name
+        );
+
+        for record in &txt_records {
+            if let dns::DnsContent::TXT { content } = &record.content {
+                info!("  - TXT record id={} value={}", record.id, content);
+            }
+        }
+
+        Ok(txt_records)
     }
 
     pub async fn test_api_access(&self) -> Result<bool> {

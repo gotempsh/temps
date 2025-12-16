@@ -984,11 +984,29 @@ impl PostgresService {
     }
 }
 
+/// Internal port used by PostgreSQL inside the container
+const POSTGRES_INTERNAL_PORT: &str = "5432";
+
 #[async_trait]
 impl ExternalService for PostgresService {
     fn get_local_address(&self, service_config: ServiceConfig) -> Result<String> {
         let config = self.get_postgres_config(service_config)?;
         Ok(format!("localhost:{}", config.port))
+    }
+
+    fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
+        let config = self.get_postgres_config(service_config)?;
+
+        if temps_core::DeploymentMode::is_docker() {
+            // Docker mode: use container name and internal port
+            Ok((
+                self.get_container_name(),
+                POSTGRES_INTERNAL_PORT.to_string(),
+            ))
+        } else {
+            // Baremetal mode: use localhost and exposed port
+            Ok(("localhost".to_string(), config.port))
+        }
     }
 
     /// Backup PostgreSQL data to S3
@@ -1238,7 +1256,18 @@ impl ExternalService for PostgresService {
             .await?;
         let config: PostgresConfig = self.get_postgres_config(service_config)?;
         let mut env_vars = HashMap::new();
-        let container_name = self.get_container_name();
+
+        // Get effective host and port based on deployment mode
+        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
+            // Docker mode: use container name and internal port
+            (
+                self.get_container_name(),
+                POSTGRES_INTERNAL_PORT.to_string(),
+            )
+        } else {
+            // Baremetal mode: use localhost and exposed port
+            ("localhost".to_string(), config.port.clone())
+        };
 
         // Database-specific variable
         env_vars.insert("POSTGRES_DATABASE".to_string(), resource_name.clone());
@@ -1250,15 +1279,15 @@ impl ExternalService for PostgresService {
                 "postgresql://{}:{}@{}:{}/{}",
                 urlencoding::encode(&config.username),
                 urlencoding::encode(&config.password),
-                container_name,
-                5432,
+                effective_host,
+                effective_port,
                 resource_name
             ),
         );
 
-        // Individual connection parameters (same as get_docker_environment_variables)
-        env_vars.insert("POSTGRES_HOST".to_string(), container_name);
-        env_vars.insert("POSTGRES_PORT".to_string(), "5432".to_string());
+        // Individual connection parameters
+        env_vars.insert("POSTGRES_HOST".to_string(), effective_host);
+        env_vars.insert("POSTGRES_PORT".to_string(), effective_port);
         env_vars.insert("POSTGRES_NAME".to_string(), resource_name.clone());
         env_vars.insert("POSTGRES_USER".to_string(), config.username.clone());
         env_vars.insert("POSTGRES_PASSWORD".to_string(), config.password.clone());
@@ -1270,8 +1299,8 @@ impl ExternalService for PostgresService {
         parameters: &HashMap<String, String>,
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
-        let container_name = self.get_container_name();
 
+        let port = parameters.get("port").context("Missing port parameter")?;
         let username = parameters
             .get("username")
             .context("Missing username parameter")?;
@@ -1282,18 +1311,30 @@ impl ExternalService for PostgresService {
             .get("database")
             .context("Missing database parameter")?;
 
+        // Get effective host and port based on deployment mode
+        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
+            // Docker mode: use container name and internal port
+            (
+                self.get_container_name(),
+                POSTGRES_INTERNAL_PORT.to_string(),
+            )
+        } else {
+            // Baremetal mode: use localhost and exposed port
+            ("localhost".to_string(), port.clone())
+        };
+
         let url = format!(
             "postgresql://{}:{}@{}:{}/{}",
             urlencoding::encode(username),
             urlencoding::encode(password),
-            container_name,
-            5432,
+            effective_host,
+            effective_port,
             database
         );
 
         env_vars.insert("POSTGRES_URL".to_string(), url);
-        env_vars.insert("POSTGRES_HOST".to_string(), container_name);
-        env_vars.insert("POSTGRES_PORT".to_string(), "5432".to_string());
+        env_vars.insert("POSTGRES_HOST".to_string(), effective_host);
+        env_vars.insert("POSTGRES_PORT".to_string(), effective_port);
         env_vars.insert("POSTGRES_NAME".to_string(), database.clone());
         env_vars.insert("POSTGRES_USER".to_string(), username.clone());
         env_vars.insert("POSTGRES_PASSWORD".to_string(), password.clone());
@@ -1501,7 +1542,6 @@ impl ExternalService for PostgresService {
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
 
-        let host = parameters.get("host").context("Missing host parameter")?;
         let port = parameters.get("port").context("Missing port parameter")?;
         let database = parameters
             .get("database")
@@ -1513,18 +1553,30 @@ impl ExternalService for PostgresService {
             .get("password")
             .context("Missing password parameter")?;
 
+        // Get effective host and port based on deployment mode
+        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
+            // Docker mode: use container name and internal port
+            (
+                self.get_container_name(),
+                POSTGRES_INTERNAL_PORT.to_string(),
+            )
+        } else {
+            // Baremetal mode: use localhost and exposed port
+            ("localhost".to_string(), port.clone())
+        };
+
         let url = format!(
             "postgresql://{}:{}@{}:{}/{}",
             urlencoding::encode(username),
             urlencoding::encode(password),
-            host,
-            port,
+            effective_host,
+            effective_port,
             database
         );
 
         env_vars.insert("POSTGRES_URL".to_string(), url);
-        env_vars.insert("POSTGRES_HOST".to_string(), host.clone());
-        env_vars.insert("POSTGRES_PORT".to_string(), port.clone());
+        env_vars.insert("POSTGRES_HOST".to_string(), effective_host);
+        env_vars.insert("POSTGRES_PORT".to_string(), effective_port);
         env_vars.insert("POSTGRES_NAME".to_string(), database.clone());
         env_vars.insert("POSTGRES_USER".to_string(), username.clone());
         env_vars.insert("POSTGRES_PASSWORD".to_string(), password.clone());
@@ -2890,5 +2942,170 @@ mod tests {
         let _ = minio.cleanup().await;
 
         println!("✅ PostgreSQL backup and restore test passed!");
+    }
+
+    #[test]
+    fn test_get_effective_address_baremetal_mode() {
+        // Clear Docker mode to ensure baremetal mode
+        std::env::remove_var("DEPLOYMENT_MODE");
+
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresService::new("test-effective-addr".to_string(), docker);
+
+        let config = ServiceConfig {
+            name: "test-postgres".to_string(),
+            service_type: super::ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "5432",
+                "database": "testdb",
+                "username": "postgres",
+                "password": "testpass",
+                "max_connections": 100,
+            }),
+        };
+
+        let (host, port) = service.get_effective_address(config).unwrap();
+
+        // In baremetal mode, should return localhost with exposed port
+        assert_eq!(host, "localhost");
+        assert_eq!(port, "5432");
+    }
+
+    #[test]
+    fn test_get_effective_address_docker_mode() {
+        // Set Docker mode
+        std::env::set_var("DEPLOYMENT_MODE", "docker");
+
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresService::new("test-effective-addr-docker".to_string(), docker);
+
+        let config = ServiceConfig {
+            name: "test-postgres".to_string(),
+            service_type: super::ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "5432",
+                "database": "testdb",
+                "username": "postgres",
+                "password": "testpass",
+                "max_connections": 100,
+            }),
+        };
+
+        let (host, port) = service.get_effective_address(config).unwrap();
+
+        // In Docker mode, should return container name with internal port
+        assert_eq!(host, "postgres-test-effective-addr-docker");
+        assert_eq!(port, "5432"); // Internal port
+
+        // Clean up
+        std::env::remove_var("DEPLOYMENT_MODE");
+    }
+
+    #[test]
+    fn test_get_environment_variables_baremetal_mode() {
+        // Clear Docker mode to ensure baremetal mode
+        std::env::remove_var("DEPLOYMENT_MODE");
+
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresService::new("test-env-vars".to_string(), docker);
+
+        let mut params = HashMap::new();
+        params.insert("port".to_string(), "5433".to_string());
+        params.insert("database".to_string(), "testdb".to_string());
+        params.insert("username".to_string(), "testuser".to_string());
+        params.insert("password".to_string(), "testpass".to_string());
+
+        let env_vars = service.get_environment_variables(&params).unwrap();
+
+        // In baremetal mode, should use localhost
+        assert_eq!(env_vars.get("POSTGRES_HOST").unwrap(), "localhost");
+        assert_eq!(env_vars.get("POSTGRES_PORT").unwrap(), "5433");
+        assert!(env_vars
+            .get("POSTGRES_URL")
+            .unwrap()
+            .contains("localhost:5433"));
+    }
+
+    #[test]
+    fn test_get_environment_variables_docker_mode() {
+        // Set Docker mode
+        std::env::set_var("DEPLOYMENT_MODE", "docker");
+
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresService::new("test-env-vars-docker".to_string(), docker);
+
+        let mut params = HashMap::new();
+        params.insert("port".to_string(), "5433".to_string());
+        params.insert("database".to_string(), "testdb".to_string());
+        params.insert("username".to_string(), "testuser".to_string());
+        params.insert("password".to_string(), "testpass".to_string());
+
+        let env_vars = service.get_environment_variables(&params).unwrap();
+
+        // In Docker mode, should use container name and internal port
+        assert_eq!(
+            env_vars.get("POSTGRES_HOST").unwrap(),
+            "postgres-test-env-vars-docker"
+        );
+        assert_eq!(env_vars.get("POSTGRES_PORT").unwrap(), "5432"); // Internal port
+        assert!(env_vars
+            .get("POSTGRES_URL")
+            .unwrap()
+            .contains("postgres-test-env-vars-docker:5432"));
+
+        // Clean up
+        std::env::remove_var("DEPLOYMENT_MODE");
+    }
+
+    #[test]
+    fn test_get_docker_environment_variables_baremetal_mode() {
+        // Clear Docker mode to ensure baremetal mode
+        std::env::remove_var("DEPLOYMENT_MODE");
+
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresService::new("test-docker-env".to_string(), docker);
+
+        let mut params = HashMap::new();
+        params.insert("port".to_string(), "5434".to_string());
+        params.insert("database".to_string(), "testdb".to_string());
+        params.insert("username".to_string(), "testuser".to_string());
+        params.insert("password".to_string(), "testpass".to_string());
+
+        let env_vars = service.get_docker_environment_variables(&params).unwrap();
+
+        // In baremetal mode, should use localhost with exposed port
+        assert_eq!(env_vars.get("POSTGRES_HOST").unwrap(), "localhost");
+        assert_eq!(env_vars.get("POSTGRES_PORT").unwrap(), "5434");
+    }
+
+    #[test]
+    fn test_get_docker_environment_variables_docker_mode() {
+        // Set Docker mode
+        std::env::set_var("DEPLOYMENT_MODE", "docker");
+
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresService::new("test-docker-env-mode".to_string(), docker);
+
+        let mut params = HashMap::new();
+        params.insert("port".to_string(), "5434".to_string());
+        params.insert("database".to_string(), "testdb".to_string());
+        params.insert("username".to_string(), "testuser".to_string());
+        params.insert("password".to_string(), "testpass".to_string());
+
+        let env_vars = service.get_docker_environment_variables(&params).unwrap();
+
+        // In Docker mode, should use container name and internal port
+        assert_eq!(
+            env_vars.get("POSTGRES_HOST").unwrap(),
+            "postgres-test-docker-env-mode"
+        );
+        assert_eq!(env_vars.get("POSTGRES_PORT").unwrap(), "5432"); // Internal port
+
+        // Clean up
+        std::env::remove_var("DEPLOYMENT_MODE");
     }
 }

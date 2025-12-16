@@ -454,8 +454,23 @@ impl MongodbService {
     }
 }
 
+/// Internal port used by MongoDB inside the container
+const MONGODB_INTERNAL_PORT: &str = "27017";
+
 #[async_trait]
 impl ExternalService for MongodbService {
+    fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
+        let config = self.get_mongodb_config(service_config)?;
+
+        if temps_core::DeploymentMode::is_docker() {
+            // Docker mode: use container name and internal port
+            Ok((self.get_container_name(), MONGODB_INTERNAL_PORT.to_string()))
+        } else {
+            // Baremetal mode: use localhost and exposed port
+            Ok(("localhost".to_string(), config.port))
+        }
+    }
+
     async fn init(&self, service_config: ServiceConfig) -> Result<HashMap<String, String>> {
         // Parse input config and transform to runtime config
         let mongodb_config = self.get_mongodb_config(service_config.clone())?;
@@ -654,9 +669,6 @@ impl ExternalService for MongodbService {
         &self,
         parameters: &HashMap<String, String>,
     ) -> Result<HashMap<String, String>> {
-        let host = parameters
-            .get("host")
-            .ok_or_else(|| anyhow::anyhow!("Missing host parameter"))?;
         let port = parameters
             .get("port")
             .ok_or_else(|| anyhow::anyhow!("Missing port parameter"))?;
@@ -670,9 +682,18 @@ impl ExternalService for MongodbService {
             .get("password")
             .ok_or_else(|| anyhow::anyhow!("Missing password parameter"))?;
 
+        // Get effective host and port based on deployment mode
+        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
+            // Docker mode: use container name and internal port
+            (self.get_container_name(), MONGODB_INTERNAL_PORT.to_string())
+        } else {
+            // Baremetal mode: use localhost and exposed port
+            ("localhost".to_string(), port.clone())
+        };
+
         let mut env_vars = HashMap::new();
-        env_vars.insert("MONGODB_HOST".to_string(), host.clone());
-        env_vars.insert("MONGODB_PORT".to_string(), port.clone());
+        env_vars.insert("MONGODB_HOST".to_string(), effective_host.clone());
+        env_vars.insert("MONGODB_PORT".to_string(), effective_port.clone());
         env_vars.insert("MONGODB_DATABASE".to_string(), database.clone());
         env_vars.insert("MONGODB_USERNAME".to_string(), username.clone());
         env_vars.insert("MONGODB_PASSWORD".to_string(), password.clone());
@@ -682,8 +703,8 @@ impl ExternalService for MongodbService {
                 "mongodb://{}:{}@{}:{}/{}",
                 urlencoding::encode(username),
                 urlencoding::encode(password),
-                host,
-                port,
+                effective_host,
+                effective_port,
                 database
             ),
         );
@@ -695,6 +716,9 @@ impl ExternalService for MongodbService {
         &self,
         parameters: &HashMap<String, String>,
     ) -> Result<HashMap<String, String>> {
+        let port = parameters
+            .get("port")
+            .ok_or_else(|| anyhow::anyhow!("Missing port parameter"))?;
         let database = parameters
             .get("database")
             .ok_or_else(|| anyhow::anyhow!("Missing database parameter"))?;
@@ -705,21 +729,29 @@ impl ExternalService for MongodbService {
             .get("password")
             .ok_or_else(|| anyhow::anyhow!("Missing password parameter"))?;
 
-        let container_name = self.get_container_name();
+        // Get effective host and port based on deployment mode
+        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
+            // Docker mode: use container name and internal port
+            (self.get_container_name(), MONGODB_INTERNAL_PORT.to_string())
+        } else {
+            // Baremetal mode: use localhost and exposed port
+            ("localhost".to_string(), port.clone())
+        };
 
         let mut env_vars = HashMap::new();
-        env_vars.insert("MONGODB_HOST".to_string(), container_name.clone());
-        env_vars.insert("MONGODB_PORT".to_string(), "27017".to_string());
+        env_vars.insert("MONGODB_HOST".to_string(), effective_host.clone());
+        env_vars.insert("MONGODB_PORT".to_string(), effective_port.clone());
         env_vars.insert("MONGODB_DATABASE".to_string(), database.clone());
         env_vars.insert("MONGODB_USERNAME".to_string(), username.clone());
         env_vars.insert("MONGODB_PASSWORD".to_string(), password.clone());
         env_vars.insert(
             "MONGODB_URL".to_string(),
             format!(
-                "mongodb://{}:{}@{}:27017/{}",
+                "mongodb://{}:{}@{}:{}/{}",
                 urlencoding::encode(username),
                 urlencoding::encode(password),
-                container_name,
+                effective_host,
+                effective_port,
                 database
             ),
         );
@@ -823,22 +855,29 @@ impl ExternalService for MongodbService {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("MongoDB not configured"))?;
 
-        // Use container name as the Docker hostname for inter-container communication
-        let container_name = self.get_container_name();
+        // Get effective host and port based on deployment mode
+        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
+            // Docker mode: use container name and internal port
+            (self.get_container_name(), MONGODB_INTERNAL_PORT.to_string())
+        } else {
+            // Baremetal mode: use localhost and exposed port
+            ("localhost".to_string(), config.port.clone())
+        };
 
         let mut env_vars = HashMap::new();
-        env_vars.insert("MONGODB_HOST".to_string(), container_name.clone());
-        env_vars.insert("MONGODB_PORT".to_string(), "27017".to_string());
+        env_vars.insert("MONGODB_HOST".to_string(), effective_host.clone());
+        env_vars.insert("MONGODB_PORT".to_string(), effective_port.clone());
         env_vars.insert("MONGODB_DATABASE".to_string(), db_name.clone());
         env_vars.insert("MONGODB_USERNAME".to_string(), config.username.clone());
         env_vars.insert("MONGODB_PASSWORD".to_string(), config.password.clone());
         env_vars.insert(
             "MONGODB_URL".to_string(),
             format!(
-                "mongodb://{}:{}@{}:27017/{}",
+                "mongodb://{}:{}@{}:{}/{}",
                 urlencoding::encode(&config.username),
                 urlencoding::encode(&config.password),
-                container_name,
+                effective_host,
+                effective_port,
                 db_name
             ),
         );

@@ -537,8 +537,15 @@ impl DatabaseCronConfigService {
             env_id: cron.environment_id,
         })?;
 
-        // Use container port to construct URL
-        Ok(format!("http://localhost:{}", container.container_port))
+        // Use deployment mode to determine the correct host/port for container access
+        let host_port = container.host_port.unwrap_or(container.container_port) as u16;
+        let url = temps_core::DeploymentMode::build_container_url(
+            &container.container_name,
+            container.container_port as u16,
+            host_port,
+            None,
+        );
+        Ok(url)
     }
 
     async fn execute_cron(

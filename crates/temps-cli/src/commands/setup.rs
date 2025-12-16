@@ -11,18 +11,25 @@ use argon2::{Argon2, PasswordHasher};
 use clap::Args;
 use colored::Colorize;
 use rand::Rng;
+use rustls::crypto::CryptoProvider;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use temps_auth::UserService;
 use temps_core::EncryptionService;
 use temps_dns::providers::credentials::{
     AzureCredentials, CloudflareCredentials, DigitalOceanCredentials, GcpCredentials,
     ProviderCredentials, Route53Credentials,
 };
-use temps_domains::dns_provider::CloudflareDnsProvider;
-use temps_entities::{dns_providers, domains, git_providers, roles, user_roles, users};
-use tracing::{debug, info};
+use temps_domains::dns_provider::{CloudflareDnsProvider, DnsProviderService};
+use temps_domains::tls::providers::LetsEncryptProvider;
+use temps_domains::tls::repository::DefaultCertificateRepository;
+use temps_domains::DomainService;
+use temps_entities::{
+    dns_providers, domains, git_provider_connections, git_providers, roles, user_roles, users,
+};
+use tracing::{debug, info, warn};
 
 /// Supported DNS providers
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -60,17 +67,17 @@ pub struct SetupCommand {
     #[arg(long)]
     pub admin_email: String,
 
-    /// Domain pattern for SSL certificate (e.g., "*.app.example.com")
+    /// Wildcard domain pattern for SSL certificate (e.g., "*.app.example.com")
     #[arg(long)]
-    pub domain: Option<String>,
+    pub wildcard_domain: String,
 
-    /// DNS provider type
+    /// DNS provider type (required for wildcard domain certificate provisioning)
     #[arg(long, value_enum)]
-    pub dns_provider: Option<DnsProviderType>,
+    pub dns_provider: DnsProviderType,
 
-    /// Cloudflare API token (for Cloudflare DNS provider)
+    /// Cloudflare API token (required for Cloudflare DNS provider)
     #[arg(long, env = "CLOUDFLARE_API_TOKEN")]
-    pub cloudflare_token: Option<String>,
+    pub cloudflare_token: String,
 
     /// AWS Access Key ID (for Route53 DNS provider)
     #[arg(long, env = "AWS_ACCESS_KEY_ID")]
@@ -120,13 +127,17 @@ pub struct SetupCommand {
     #[arg(long, env = "GCP_PROJECT_ID")]
     pub gcp_project_id: Option<String>,
 
-    /// GitHub Personal Access Token
+    /// GitHub Personal Access Token (required for Git provider integration)
     #[arg(long, env = "GITHUB_TOKEN")]
-    pub github_token: Option<String>,
+    pub github_token: String,
 
     /// Skip interactive prompts and use defaults
     #[arg(long, default_value = "false")]
     pub non_interactive: bool,
+
+    /// Server public IP address for DNS A records (auto-detected if not provided)
+    #[arg(long, env = "SERVER_IP")]
+    pub server_ip: Option<String>,
 }
 
 fn generate_secure_password() -> String {
@@ -171,24 +182,17 @@ fn setup_encryption_key(data_dir: &PathBuf) -> anyhow::Result<String> {
     }
 }
 
+/// Result type indicating whether the user was created or password was reset
+pub enum AdminUserResult {
+    Created(users::Model, String),
+    PasswordReset(users::Model, String),
+}
+
 async fn create_admin_user(
     conn: &sea_orm::DatabaseConnection,
     email: &str,
-) -> anyhow::Result<(users::Model, String)> {
+) -> anyhow::Result<AdminUserResult> {
     let email_lower = email.to_lowercase();
-
-    // Check if user exists
-    let existing_user = users::Entity::find()
-        .filter(users::Column::Email.eq(&email_lower))
-        .one(conn)
-        .await?;
-
-    if existing_user.is_some() {
-        return Err(anyhow::anyhow!(
-            "User with email {} already exists. Use 'temps reset-admin-password' to reset the password.",
-            email_lower
-        ));
-    }
 
     // Generate secure password
     let password = generate_secure_password();
@@ -201,7 +205,52 @@ async fn create_admin_user(
         .map_err(|e| anyhow::anyhow!("Password hashing failed: {}", e))?
         .to_string();
 
-    // Create user
+    // Check if user exists
+    let existing_user = users::Entity::find()
+        .filter(users::Column::Email.eq(&email_lower))
+        .one(conn)
+        .await?;
+
+    if let Some(existing) = existing_user {
+        // User exists - reset password
+        let mut user_update: users::ActiveModel = existing.into();
+        user_update.password_hash = Set(Some(password_hash));
+        user_update.updated_at = Set(chrono::Utc::now());
+        let updated_user = user_update.update(conn).await?;
+
+        // Ensure user has admin role
+        let admin_role = roles::Entity::find()
+            .filter(roles::Column::Name.eq("admin"))
+            .one(conn)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Admin role not found. Database may not be properly initialized.")
+            })?;
+
+        // Check if user already has admin role
+        let has_admin_role = user_roles::Entity::find()
+            .filter(user_roles::Column::UserId.eq(updated_user.id))
+            .filter(user_roles::Column::RoleId.eq(admin_role.id))
+            .one(conn)
+            .await?;
+
+        if has_admin_role.is_none() {
+            // Assign admin role
+            let user_role = user_roles::ActiveModel {
+                user_id: Set(updated_user.id),
+                role_id: Set(admin_role.id),
+                created_at: Set(chrono::Utc::now()),
+                updated_at: Set(chrono::Utc::now()),
+                ..Default::default()
+            };
+            user_role.insert(conn).await?;
+        }
+
+        debug!("Reset password for admin user: {}", email_lower);
+        return Ok(AdminUserResult::PasswordReset(updated_user, password));
+    }
+
+    // Create new user
     let new_user = users::ActiveModel {
         email: Set(email_lower.clone()),
         name: Set("Admin".to_string()),
@@ -243,7 +292,7 @@ async fn create_admin_user(
     user_role.insert(conn).await?;
 
     debug!("Created admin user: {}", email_lower);
-    Ok((user, password))
+    Ok(AdminUserResult::Created(user, password))
 }
 
 async fn create_dns_provider(
@@ -292,11 +341,19 @@ async fn create_dns_provider(
     Ok(provider)
 }
 
+/// Result of git provider creation
+pub struct GitProviderCreationResult {
+    #[allow(dead_code)] // Provider is available for future use (e.g., repository sync)
+    pub provider: git_providers::Model,
+    pub connection: git_provider_connections::Model,
+}
+
 async fn create_git_provider(
     conn: &sea_orm::DatabaseConnection,
     encryption_service: &EncryptionService,
     token: &str,
-) -> anyhow::Result<git_providers::Model> {
+    github_username: &str,
+) -> anyhow::Result<GitProviderCreationResult> {
     // Check if GitHub provider already exists
     let existing = git_providers::Entity::find()
         .filter(git_providers::Column::ProviderType.eq("github"))
@@ -304,85 +361,84 @@ async fn create_git_provider(
         .one(conn)
         .await?;
 
-    if let Some(provider) = existing {
+    let provider = if let Some(provider) = existing {
         info!("GitHub provider already exists");
-        return Ok(provider);
-    }
+        provider
+    } else {
+        // Encrypt the token in auth_config
+        let auth_config = serde_json::json!({
+            "token": encryption_service.encrypt_string(token)
+                .map_err(|e| anyhow::anyhow!("Failed to encrypt token: {}", e))?
+        });
 
-    // Encrypt the token in auth_config
-    let auth_config = serde_json::json!({
-        "token": encryption_service.encrypt_string(token)
-            .map_err(|e| anyhow::anyhow!("Failed to encrypt token: {}", e))?
-    });
+        // Generate webhook secret
+        let mut webhook_secret_bytes = [0u8; 32];
+        rand::thread_rng().fill(&mut webhook_secret_bytes);
+        let webhook_secret = hex::encode(webhook_secret_bytes);
 
-    // Generate webhook secret
-    let mut webhook_secret_bytes = [0u8; 32];
-    rand::thread_rng().fill(&mut webhook_secret_bytes);
-    let webhook_secret = hex::encode(webhook_secret_bytes);
+        // Create provider
+        let new_provider = git_providers::ActiveModel {
+            name: Set("GitHub".to_string()),
+            provider_type: Set("github".to_string()),
+            base_url: Set(Some("https://github.com".to_string())),
+            api_url: Set(Some("https://api.github.com".to_string())),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(auth_config),
+            webhook_secret: Set(Some(webhook_secret)),
+            is_active: Set(true),
+            is_default: Set(true),
+            ..Default::default()
+        };
 
-    // Create provider
-    let new_provider = git_providers::ActiveModel {
-        name: Set("GitHub".to_string()),
-        provider_type: Set("github".to_string()),
-        base_url: Set(Some("https://github.com".to_string())),
-        api_url: Set(Some("https://api.github.com".to_string())),
-        auth_method: Set("pat".to_string()),
-        auth_config: Set(auth_config),
-        webhook_secret: Set(Some(webhook_secret)),
-        is_active: Set(true),
-        is_default: Set(true),
-        ..Default::default()
+        let provider = new_provider.insert(conn).await?;
+        debug!("Created GitHub provider with PAT authentication");
+        provider
     };
 
-    let provider = new_provider.insert(conn).await?;
-    debug!("Created GitHub provider with PAT authentication");
-    Ok(provider)
-}
-
-async fn create_domain(
-    conn: &sea_orm::DatabaseConnection,
-    domain_name: &str,
-) -> anyhow::Result<domains::Model> {
-    // Check if domain already exists
-    let existing = domains::Entity::find()
-        .filter(domains::Column::Domain.eq(domain_name))
+    // Check if connection for this username already exists
+    let existing_connection = git_provider_connections::Entity::find()
+        .filter(git_provider_connections::Column::ProviderId.eq(provider.id))
+        .filter(git_provider_connections::Column::AccountName.eq(github_username))
         .one(conn)
         .await?;
 
-    if let Some(domain) = existing {
-        info!("Domain '{}' already exists", domain_name);
-        return Ok(domain);
-    }
+    let connection = if let Some(connection) = existing_connection {
+        info!("GitHub connection for '{}' already exists", github_username);
+        connection
+    } else {
+        // Encrypt the PAT token for the connection
+        let encrypted_token = encryption_service
+            .encrypt_string(token)
+            .map_err(|e| anyhow::anyhow!("Failed to encrypt token for connection: {}", e))?;
 
-    let is_wildcard = domain_name.starts_with("*.");
+        // Create connection
+        let new_connection = git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(None), // No user in CLI setup
+            account_name: Set(github_username.to_string()),
+            account_type: Set("User".to_string()),
+            access_token: Set(Some(encrypted_token)),
+            refresh_token: Set(None),
+            token_expires_at: Set(None),
+            refresh_token_expires_at: Set(None),
+            installation_id: Set(None),
+            metadata: Set(None),
+            is_active: Set(true),
+            is_expired: Set(false),
+            syncing: Set(false),
+            last_synced_at: Set(None),
+            ..Default::default()
+        };
 
-    // Create domain record (using dns-01 for wildcard domains, http-01 otherwise)
-    let verification_method = if is_wildcard { "dns-01" } else { "http-01" };
-
-    let new_domain = domains::ActiveModel {
-        domain: Set(domain_name.to_string()),
-        status: Set("pending".to_string()),
-        is_wildcard: Set(is_wildcard),
-        verification_method: Set(verification_method.to_string()),
-        dns_challenge_token: Set(None),
-        dns_challenge_value: Set(None),
-        http_challenge_token: Set(None),
-        http_challenge_key_authorization: Set(None),
-        certificate: Set(None),
-        private_key: Set(None),
-        expiration_time: Set(None),
-        last_renewed: Set(None),
-        last_error: Set(None),
-        last_error_type: Set(None),
-        ..Default::default()
+        let connection = new_connection.insert(conn).await?;
+        debug!("Created GitHub connection for user '{}'", github_username);
+        connection
     };
 
-    let domain = new_domain.insert(conn).await?;
-    debug!(
-        "Created domain '{}' with {} verification",
-        domain_name, verification_method
-    );
-    Ok(domain)
+    Ok(GitProviderCreationResult {
+        provider,
+        connection,
+    })
 }
 
 async fn verify_cloudflare_token(token: &str) -> anyhow::Result<bool> {
@@ -396,7 +452,13 @@ async fn verify_cloudflare_token(token: &str) -> anyhow::Result<bool> {
     }
 }
 
-async fn verify_github_token(token: &str) -> anyhow::Result<bool> {
+/// GitHub user info returned from the API
+#[derive(Debug, Clone)]
+pub struct GitHubUserInfo {
+    pub username: String,
+}
+
+async fn verify_github_token(token: &str) -> anyhow::Result<GitHubUserInfo> {
     let client = reqwest::Client::new();
     let response = client
         .get("https://api.github.com/user")
@@ -408,13 +470,61 @@ async fn verify_github_token(token: &str) -> anyhow::Result<bool> {
         .map_err(|e| anyhow::anyhow!("Failed to verify GitHub token: {}", e))?;
 
     if response.status().is_success() {
-        Ok(true)
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse GitHub user response: {}", e))?;
+
+        let username = json
+            .get("login")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("GitHub response missing 'login' field"))?
+            .to_string();
+
+        Ok(GitHubUserInfo { username })
     } else {
         Err(anyhow::anyhow!(
             "GitHub token is invalid or does not have required permissions (status: {})",
             response.status()
         ))
     }
+}
+
+/// Auto-detect the server's public IP address using external services
+async fn detect_public_ip() -> anyhow::Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    // Try multiple services
+    let services = vec![
+        ("https://api.ipify.org?format=json", "ip"),
+        ("https://ipinfo.io/json", "ip"),
+        ("https://api.myip.com", "ip"),
+    ];
+
+    for (url, field) in services {
+        match client.get(url).send().await {
+            Ok(response) => {
+                if let Ok(json) = response.json::<serde_json::Value>().await {
+                    if let Some(ip) = json.get(field).and_then(|v| v.as_str()) {
+                        // Validate it looks like an IP address
+                        if ip.parse::<std::net::IpAddr>().is_ok() {
+                            return Ok(ip.to_string());
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Failed to get IP from {}: {}", url, e);
+                continue;
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Unable to auto-detect public IP. Please provide --server-ip manually."
+    ))
 }
 
 fn print_header() {
@@ -461,6 +571,40 @@ fn print_info(label: &str, value: &str) {
     );
 }
 
+fn print_step(step: u32, total: u32, description: &str) {
+    println!(
+        "   {} {}",
+        format!("[{}/{}]", step, total).bright_cyan().bold(),
+        description.bright_white()
+    );
+}
+
+fn print_substep(description: &str) {
+    println!("       {} {}", "→".bright_cyan(), description);
+}
+
+fn print_progress_bar(label: &str, progress: u32, total: u32) {
+    let percentage = (progress as f32 / total as f32 * 100.0) as u32;
+    let filled = (progress as f32 / total as f32 * 20.0) as usize;
+    let empty = 20 - filled;
+    let bar = format!(
+        "[{}{}]",
+        "█".repeat(filled).bright_green(),
+        "░".repeat(empty).bright_black()
+    );
+    print!("\r       {} {} {}%  ", label, bar, percentage);
+    std::io::stdout().flush().ok();
+}
+
+fn print_spinner_step(description: &str) {
+    print!("       {} {}... ", "⏳".bright_yellow(), description);
+    std::io::stdout().flush().ok();
+}
+
+fn print_spinner_done() {
+    println!("{}", "done".bright_green());
+}
+
 fn ask_confirmation(prompt: &str) -> anyhow::Result<bool> {
     print!("{} ", prompt.bright_white().bold());
     io::stdout().flush()?;
@@ -470,6 +614,73 @@ fn ask_confirmation(prompt: &str) -> anyhow::Result<bool> {
     let response = response.trim().to_lowercase();
 
     Ok(response == "y" || response == "yes")
+}
+
+/// Check if GeoLite2-City.mmdb exists and warn if missing
+/// This database is required to run the application but not for setup
+fn check_geolite2_database(data_dir: &PathBuf) {
+    let geo_db_path = data_dir.join("GeoLite2-City.mmdb");
+    let current_dir_path = PathBuf::from("./GeoLite2-City.mmdb");
+
+    // Check both locations
+    if geo_db_path.exists() || current_dir_path.exists() {
+        print_success("GeoLite2 database found");
+        return;
+    }
+
+    // Database not found - show warning with download instructions
+    print_warning("GeoLite2 database not found");
+    println!();
+    println!(
+        "{}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_yellow()
+    );
+    println!(
+        "   {} {}",
+        "📍".bright_yellow(),
+        "GeoLite2-City.mmdb is required to run the application".bright_white()
+    );
+    println!(
+        "{}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_yellow()
+    );
+    println!();
+    println!(
+        "   {} {}",
+        "📥".bright_cyan(),
+        "Download instructions:".bright_white().bold()
+    );
+    println!(
+        "   {}",
+        "1. Visit: https://www.maxmind.com/en/geolite2/geolite2-free-data-sources".bright_white()
+    );
+    println!(
+        "   {}",
+        "2. Create a free MaxMind account (if needed)".bright_white()
+    );
+    println!(
+        "   {}",
+        "3. Download 'GeoLite2-City' (GZIP format: .tar.gz)".bright_white()
+    );
+    println!("   {}", "4. Extract and copy the database:".bright_white());
+    println!();
+    println!("      {} tar xzf GeoLite2-City_*.tar.gz", "$".bright_cyan());
+    println!(
+        "      {} cp GeoLite2-City_*/GeoLite2-City.mmdb {}",
+        "$".bright_cyan(),
+        data_dir.display()
+    );
+    println!();
+    println!(
+        "   {} Setup can continue, but {} will fail without this file.",
+        "ℹ️ ".bright_blue(),
+        "temps serve".bright_cyan()
+    );
+    println!(
+        "{}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_yellow()
+    );
+    println!();
 }
 
 impl SetupCommand {
@@ -496,6 +707,9 @@ impl SetupCommand {
 
         print_success("Encryption key configured");
 
+        // Check for GeoLite2 database (warning only - not required for setup)
+        check_geolite2_database(&data_dir);
+
         // Create tokio runtime for async operations
         let rt = tokio::runtime::Runtime::new()?;
 
@@ -506,297 +720,652 @@ impl SetupCommand {
         let db = rt.block_on(temps_database::establish_connection(&self.database_url))?;
         print_success("Database connected and migrations applied");
 
-        // Create admin user
+        // Initialize roles (admin, user)
+        print_section("Initializing Roles");
+        let user_service = UserService::new(db.clone());
+        rt.block_on(user_service.initialize_roles())
+            .map_err(|e| anyhow::anyhow!("Failed to initialize roles: {}", e))?;
+        print_success("Default roles initialized (admin, user)");
+
+        // Create admin user (or reset password if user exists)
         print_section("Admin User Setup");
-        let (user, password) = match rt.block_on(create_admin_user(db.as_ref(), &self.admin_email))
-        {
-            Ok((user, password)) => {
-                print_success("Admin user created");
-                (user, password)
-            }
-            Err(e) => {
-                if e.to_string().contains("already exists") {
-                    print_warning(&e.to_string());
-                    println!();
-                    // Continue with setup even if user exists
-                    (
-                        users::Model {
-                            id: 0,
-                            email: self.admin_email.clone(),
-                            name: "Admin".to_string(),
-                            password_hash: None,
-                            email_verified: true,
-                            mfa_enabled: false,
-                            mfa_secret: None,
-                            mfa_recovery_codes: None,
-                            deleted_at: None,
-                            email_verification_token: None,
-                            email_verification_expires: None,
-                            password_reset_token: None,
-                            password_reset_expires: None,
-                            created_at: chrono::Utc::now(),
-                            updated_at: chrono::Utc::now(),
-                        },
-                        String::new(),
-                    )
-                } else {
-                    return Err(e);
+        let (user, password) =
+            match rt.block_on(create_admin_user(db.as_ref(), &self.admin_email))? {
+                AdminUserResult::Created(user, password) => {
+                    print_success("Admin user created");
+                    (user, password)
                 }
-            }
-        };
-
-        // DNS Provider setup
-        if let Some(ref provider_type) = self.dns_provider {
-            print_section("DNS Provider Setup");
-
-            let credentials = match provider_type {
-                DnsProviderType::Cloudflare => {
-                    let token = self.cloudflare_token.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "--cloudflare-token is required for Cloudflare DNS provider"
-                        )
-                    })?;
-
-                    println!("   Verifying Cloudflare API token...");
-                    rt.block_on(verify_cloudflare_token(token))?;
-                    print_success("Cloudflare token verified");
-
-                    ProviderCredentials::Cloudflare(CloudflareCredentials {
-                        api_token: token.clone(),
-                        account_id: None,
-                    })
-                }
-                DnsProviderType::Route53 => {
-                    let access_key = self.aws_access_key_id.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("--aws-access-key-id is required for Route53 DNS provider")
-                    })?;
-                    let secret_key = self.aws_secret_access_key.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "--aws-secret-access-key is required for Route53 DNS provider"
-                        )
-                    })?;
-
-                    ProviderCredentials::Route53(Route53Credentials {
-                        access_key_id: access_key.clone(),
-                        secret_access_key: secret_key.clone(),
-                        session_token: None,
-                        region: Some(self.aws_region.clone()),
-                    })
-                }
-                DnsProviderType::DigitalOcean => {
-                    let token = self.digitalocean_token.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "--digitalocean-token is required for DigitalOcean DNS provider"
-                        )
-                    })?;
-
-                    ProviderCredentials::DigitalOcean(DigitalOceanCredentials {
-                        api_token: token.clone(),
-                    })
-                }
-                DnsProviderType::Azure => {
-                    let tenant_id = self.azure_tenant_id.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("--azure-tenant-id is required for Azure DNS provider")
-                    })?;
-                    let client_id = self.azure_client_id.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("--azure-client-id is required for Azure DNS provider")
-                    })?;
-                    let client_secret = self.azure_client_secret.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("--azure-client-secret is required for Azure DNS provider")
-                    })?;
-                    let subscription_id = self.azure_subscription_id.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "--azure-subscription-id is required for Azure DNS provider"
-                        )
-                    })?;
-                    let resource_group = self.azure_resource_group.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("--azure-resource-group is required for Azure DNS provider")
-                    })?;
-
-                    ProviderCredentials::Azure(AzureCredentials {
-                        tenant_id: tenant_id.clone(),
-                        client_id: client_id.clone(),
-                        client_secret: client_secret.clone(),
-                        subscription_id: subscription_id.clone(),
-                        resource_group: resource_group.clone(),
-                    })
-                }
-                DnsProviderType::Gcp => {
-                    let email = self.gcp_service_account_email.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "--gcp-service-account-email is required for GCP DNS provider"
-                        )
-                    })?;
-                    let private_key = self.gcp_private_key.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("--gcp-private-key is required for GCP DNS provider")
-                    })?;
-                    let project_id = self.gcp_project_id.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("--gcp-project-id is required for GCP DNS provider")
-                    })?;
-
-                    ProviderCredentials::Gcp(GcpCredentials {
-                        service_account_email: email.clone(),
-                        private_key: private_key.clone(),
-                        project_id: project_id.clone(),
-                    })
+                AdminUserResult::PasswordReset(user, password) => {
+                    print_success("Admin user password reset");
+                    (user, password)
                 }
             };
 
-            rt.block_on(create_dns_provider(
-                db.as_ref(),
-                &encryption_service,
-                provider_type,
-                credentials,
-            ))?;
-            print_success(&format!("{} DNS provider configured", provider_type));
+        // DNS Provider setup (required)
+        print_section("DNS Provider Setup");
+
+        let credentials = match &self.dns_provider {
+            DnsProviderType::Cloudflare => {
+                println!("   Verifying Cloudflare API token...");
+                rt.block_on(verify_cloudflare_token(&self.cloudflare_token))?;
+                print_success("Cloudflare token verified");
+
+                ProviderCredentials::Cloudflare(CloudflareCredentials {
+                    api_token: self.cloudflare_token.clone(),
+                    account_id: None,
+                })
+            }
+            DnsProviderType::Route53 => {
+                let access_key = self.aws_access_key_id.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--aws-access-key-id is required for Route53 DNS provider")
+                })?;
+                let secret_key = self.aws_secret_access_key.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--aws-secret-access-key is required for Route53 DNS provider")
+                })?;
+
+                ProviderCredentials::Route53(Route53Credentials {
+                    access_key_id: access_key.clone(),
+                    secret_access_key: secret_key.clone(),
+                    session_token: None,
+                    region: Some(self.aws_region.clone()),
+                })
+            }
+            DnsProviderType::DigitalOcean => {
+                let token = self.digitalocean_token.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--digitalocean-token is required for DigitalOcean DNS provider"
+                    )
+                })?;
+
+                ProviderCredentials::DigitalOcean(DigitalOceanCredentials {
+                    api_token: token.clone(),
+                })
+            }
+            DnsProviderType::Azure => {
+                let tenant_id = self.azure_tenant_id.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--azure-tenant-id is required for Azure DNS provider")
+                })?;
+                let client_id = self.azure_client_id.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--azure-client-id is required for Azure DNS provider")
+                })?;
+                let client_secret = self.azure_client_secret.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--azure-client-secret is required for Azure DNS provider")
+                })?;
+                let subscription_id = self.azure_subscription_id.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--azure-subscription-id is required for Azure DNS provider")
+                })?;
+                let resource_group = self.azure_resource_group.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--azure-resource-group is required for Azure DNS provider")
+                })?;
+
+                ProviderCredentials::Azure(AzureCredentials {
+                    tenant_id: tenant_id.clone(),
+                    client_id: client_id.clone(),
+                    client_secret: client_secret.clone(),
+                    subscription_id: subscription_id.clone(),
+                    resource_group: resource_group.clone(),
+                })
+            }
+            DnsProviderType::Gcp => {
+                let email = self.gcp_service_account_email.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--gcp-service-account-email is required for GCP DNS provider")
+                })?;
+                let private_key = self.gcp_private_key.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--gcp-private-key is required for GCP DNS provider")
+                })?;
+                let project_id = self.gcp_project_id.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--gcp-project-id is required for GCP DNS provider")
+                })?;
+
+                ProviderCredentials::Gcp(GcpCredentials {
+                    service_account_email: email.clone(),
+                    private_key: private_key.clone(),
+                    project_id: project_id.clone(),
+                })
+            }
+        };
+
+        let _dns_provider = rt.block_on(create_dns_provider(
+            db.as_ref(),
+            &encryption_service,
+            &self.dns_provider,
+            credentials.clone(),
+        ))?;
+        print_success(&format!("{} DNS provider configured", self.dns_provider));
+
+        // GitHub Provider setup (required)
+        print_section("Git Provider Setup");
+
+        println!("   Verifying GitHub token...");
+        let github_user = rt.block_on(verify_github_token(&self.github_token))?;
+        print_success(&format!(
+            "GitHub token verified (user: {})",
+            github_user.username
+        ));
+
+        let git_result = rt.block_on(create_git_provider(
+            db.as_ref(),
+            &encryption_service,
+            &self.github_token,
+            &github_user.username,
+        ))?;
+        print_success("GitHub provider configured");
+        print_success(&format!(
+            "GitHub connection created for '{}'",
+            git_result.connection.account_name
+        ));
+
+        // Wildcard Domain setup (required)
+        print_section("Wildcard Domain Setup");
+
+        // Validate domain format
+        if !self.wildcard_domain.starts_with("*.") {
+            return Err(anyhow::anyhow!(
+                "Domain must be a wildcard domain (e.g., *.app.example.com)"
+            ));
         }
 
-        // GitHub Provider setup
-        if let Some(ref token) = self.github_token {
-            print_section("Git Provider Setup");
+        // SSL Certificate Provisioning
+        print_section("SSL Certificate Provisioning");
+        println!(
+            "   {} Provisioning wildcard SSL certificate for: {}",
+            "🔐".bright_yellow(),
+            self.wildcard_domain.bright_cyan().bold()
+        );
+        println!();
 
-            println!("   Verifying GitHub token...");
-            rt.block_on(verify_github_token(token))?;
-            print_success("GitHub token verified");
+        // Initialize TLS crypto provider (required by rustls)
+        let _ = CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
-            rt.block_on(create_git_provider(db.as_ref(), &encryption_service, token))?;
-            print_success("GitHub provider configured");
+        // Step 1: Verify Cloudflare zone and detect server IP
+        print_step(1, 8, "Verifying Cloudflare zone and detecting server IP");
+        let cf_provider = CloudflareDnsProvider::new(self.cloudflare_token.clone());
+
+        // Extract base domain from wildcard (e.g., "*.app.example.com" -> "example.com")
+        let base_domain = self
+            .wildcard_domain
+            .trim_start_matches("*.")
+            .split('.')
+            .rev()
+            .take(2)
+            .collect::<Vec<&str>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<&str>>()
+            .join(".");
+
+        // Extract the subdomain prefix (e.g., "*.app.example.com" -> "app", "*.example.com" -> "")
+        let subdomain_prefix = {
+            let without_wildcard = self.wildcard_domain.trim_start_matches("*.");
+            let parts: Vec<&str> = without_wildcard.split('.').collect();
+            if parts.len() > 2 {
+                // Has subdomain prefix: app.example.com -> "app"
+                parts[..parts.len() - 2].join(".")
+            } else {
+                // No subdomain prefix: example.com -> ""
+                String::new()
+            }
+        };
+
+        print_substep(&format!("Checking zone for '{}'", base_domain));
+        let zone_exists = rt.block_on(cf_provider.supports_automatic_challenges(&base_domain));
+        if !zone_exists {
+            println!();
+            return Err(anyhow::anyhow!(
+                "❌ Cloudflare zone not found for domain '{}'. \n\
+                 Please ensure the domain '{}' is added to your Cloudflare account \n\
+                 and the API token has DNS Edit permissions for this zone.",
+                base_domain,
+                base_domain
+            ));
+        }
+        print_substep(&format!("{} Zone verified", "✓".bright_green()));
+
+        // Detect or use provided server IP
+        let server_ip = if let Some(ip) = &self.server_ip {
+            print_substep(&format!("Using provided server IP: {}", ip.bright_cyan()));
+            ip.clone()
+        } else {
+            print_spinner_step("Auto-detecting public IP");
+            match rt.block_on(detect_public_ip()) {
+                Ok(detected_ip) => {
+                    print_spinner_done();
+                    print_substep(&format!(
+                        "Detected public IP: {}",
+                        detected_ip.bright_cyan()
+                    ));
+
+                    // Always ask for confirmation - IP is critical for DNS setup
+                    println!();
+                    if !ask_confirmation(&format!(
+                        "   Is {} the correct public IP for this server? (y/n):",
+                        detected_ip.bright_cyan()
+                    ))? {
+                        println!();
+                        print!("   {} ", "Enter the correct IP address:".bright_white());
+                        io::stdout().flush()?;
+                        let mut custom_ip = String::new();
+                        io::stdin().read_line(&mut custom_ip)?;
+                        let custom_ip = custom_ip.trim().to_string();
+
+                        // Validate the IP
+                        if custom_ip.parse::<std::net::IpAddr>().is_err() {
+                            return Err(anyhow::anyhow!("❌ Invalid IP address: {}", custom_ip));
+                        }
+                        custom_ip
+                    } else {
+                        detected_ip
+                    }
+                }
+                Err(e) => {
+                    println!("failed");
+                    println!();
+                    return Err(anyhow::anyhow!(
+                        "❌ {}\n\
+                         Please provide the server's public IP using --server-ip=<IP>",
+                        e
+                    ));
+                }
+            }
+        };
+        println!();
+
+        // Step 2: Initialize certificate services
+        print_step(2, 8, "Initializing certificate services");
+        let encryption_service_arc = std::sync::Arc::new(encryption_service);
+        let repository: std::sync::Arc<dyn temps_domains::tls::CertificateRepository> =
+            std::sync::Arc::new(DefaultCertificateRepository::new(
+                db.clone(),
+                encryption_service_arc.clone(),
+            ));
+        let cert_provider: std::sync::Arc<dyn temps_domains::tls::CertificateProvider> =
+            std::sync::Arc::new(LetsEncryptProvider::new(repository.clone()));
+        let domain_service = DomainService::new(
+            db.clone(),
+            cert_provider,
+            repository,
+            encryption_service_arc,
+        );
+        print_substep(&format!("{} Services ready", "✓".bright_green()));
+        println!();
+
+        // Step 3: Create or get existing domain
+        print_step(3, 8, "Creating domain record");
+        let domain =
+            match rt.block_on(domain_service.create_domain(&self.wildcard_domain, "dns-01")) {
+                Ok(d) => {
+                    print_substep(&format!(
+                        "{} Domain '{}' registered",
+                        "✓".bright_green(),
+                        self.wildcard_domain
+                    ));
+                    d
+                }
+                Err(e) => {
+                    // Domain might already exist
+                    if e.to_string().contains("already exists") {
+                        print_substep(&format!(
+                            "{} Domain already exists, using existing record",
+                            "ℹ".bright_blue()
+                        ));
+                        rt.block_on(async {
+                            domains::Entity::find()
+                                .filter(domains::Column::Domain.eq(&self.wildcard_domain))
+                                .one(db.as_ref())
+                                .await
+                        })?
+                        .ok_or_else(|| anyhow::anyhow!("Domain not found after creation error"))?
+                    } else {
+                        println!();
+                        return Err(anyhow::anyhow!("Failed to create domain: {}", e));
+                    }
+                }
+            };
+        println!();
+
+        // Check if domain already has a valid certificate
+        if domain.status == "active" && domain.certificate.is_some() {
+            println!(
+                "   {} Domain '{}' already has a valid certificate!",
+                "🎉".bright_green(),
+                self.wildcard_domain.bright_cyan()
+            );
+            println!();
+            return finish_setup(
+                &user,
+                &password,
+                &self.wildcard_domain,
+                self.non_interactive,
+            );
         }
 
-        // Domain setup
-        if let Some(ref domain_name) = self.domain {
-            print_section("Domain Setup");
+        // Step 4: Request DNS-01 challenge from Let's Encrypt
+        print_step(4, 8, "Requesting Let's Encrypt DNS-01 challenge");
+        print_spinner_step("Contacting Let's Encrypt ACME server");
+        let challenge_data = rt
+            .block_on(domain_service.request_challenge(&self.wildcard_domain, &self.admin_email))?;
+        print_spinner_done();
 
-            rt.block_on(create_domain(db.as_ref(), domain_name))?;
+        if challenge_data.status == "completed" {
+            println!(
+                "   {} Certificate provisioned immediately!",
+                "🎉".bright_green()
+            );
+            println!();
+            return finish_setup(
+                &user,
+                &password,
+                &self.wildcard_domain,
+                self.non_interactive,
+            );
+        }
 
-            let is_wildcard = domain_name.starts_with("*.");
-            print_success(&format!("Domain '{}' created", domain_name));
+        print_substep(&format!(
+            "{} Challenge received - {} TXT record(s) required",
+            "✓".bright_green(),
+            challenge_data.txt_records.len()
+        ));
+        println!();
 
-            if is_wildcard {
-                println!();
-                print_warning("Wildcard domains require DNS-01 challenge validation.");
-                println!(
-                    "   After starting the server, use the API to request and complete the challenge:"
-                );
-                println!();
-                println!(
-                    "   {} POST /api/domains/{}/order",
-                    "1.".bright_cyan(),
-                    "domain_id"
-                );
-                println!("   {} Add TXT record to DNS", "2.".bright_cyan());
-                println!(
-                    "   {} POST /api/domains/{}/finalize",
-                    "3.".bright_cyan(),
-                    "domain_id"
-                );
+        // Step 5: Auto-provision DNS TXT records via Cloudflare
+        print_step(5, 8, "Creating DNS TXT records via Cloudflare");
+        for (idx, txt_record) in challenge_data.txt_records.iter().enumerate() {
+            print_substep(&format!(
+                "Adding TXT record {}/{}: {}",
+                idx + 1,
+                challenge_data.txt_records.len(),
+                txt_record.name.bright_cyan()
+            ));
+            rt.block_on(cf_provider.set_txt_record(
+                &base_domain,
+                &txt_record.name,
+                &txt_record.value,
+            ))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create DNS TXT record '{}': {}",
+                    txt_record.name,
+                    e
+                )
+            })?;
+        }
+        print_substep(&format!("{} All TXT records created", "✓".bright_green()));
+        println!();
+
+        // Step 6: Wait for DNS propagation with progress bar
+        print_step(6, 8, "Waiting for DNS propagation");
+        let propagation_seconds = 60u32; // Increased to 60 seconds for better reliability
+        for i in 0..=propagation_seconds {
+            print_progress_bar("DNS propagation", i, propagation_seconds);
+            if i < propagation_seconds {
+                std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
-
-        // Print summary
-        print_section("Setup Complete!");
-
-        println!();
-        println!(
-            "{}",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_green()
-        );
-        println!("{}", "   🎉 Temps is ready to use!".bright_white().bold());
-        println!(
-            "{}",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_green()
-        );
+        println!(); // New line after progress bar
+        print_substep(&format!("{} DNS propagation complete", "✓".bright_green()));
         println!();
 
-        if !password.is_empty() {
-            println!(
-                "{} {}",
-                "Admin Email:".bright_white().bold(),
-                user.email.bright_cyan()
-            );
-            println!(
-                "{} {}",
-                "Admin Password:".bright_white().bold(),
-                password.bright_yellow().bold()
-            );
-            println!();
-            println!(
-                "{}",
-                "⚠️  IMPORTANT: Save this password now!"
-                    .bright_yellow()
-                    .bold()
-            );
-            println!(
-                "{}",
-                "This is the only time it will be displayed.".bright_white()
-            );
-            println!();
+        // Step 7: Complete challenge and get certificate (with retries)
+        print_step(7, 8, "Completing DNS challenge with Let's Encrypt");
 
-            if !self.non_interactive {
-                loop {
-                    if ask_confirmation("Have you saved the password? (y/n):")? {
-                        break;
+        let mut certificate_success = false;
+        let max_retries = 3;
+        let retry_wait_seconds = 30;
+
+        for attempt in 1..=max_retries {
+            if attempt > 1 {
+                print_substep(&format!(
+                    "Retry {}/{} - waiting {} seconds for DNS propagation...",
+                    attempt, max_retries, retry_wait_seconds
+                ));
+                for i in 0..=retry_wait_seconds {
+                    print_progress_bar("Waiting", i, retry_wait_seconds);
+                    if i < retry_wait_seconds {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
                     }
-                    println!();
-                    println!(
-                        "{} {}",
-                        "Password:".bright_white().bold(),
-                        password.bright_yellow().bold()
-                    );
-                    println!();
+                }
+                println!();
+            }
+
+            print_spinner_step(&format!(
+                "Requesting certificate issuance (attempt {}/{})",
+                attempt, max_retries
+            ));
+            match rt.block_on(
+                domain_service.complete_challenge(&self.wildcard_domain, &self.admin_email),
+            ) {
+                Ok(completed_domain) => {
+                    print_spinner_done();
+                    if completed_domain.status == "active" && completed_domain.certificate.is_some()
+                    {
+                        print_substep(&format!(
+                            "{} SSL certificate issued successfully!",
+                            "✓".bright_green()
+                        ));
+                        certificate_success = true;
+                        println!();
+
+                        // Clean up DNS TXT records
+                        print_substep("Cleaning up DNS TXT records...");
+                        for txt_record in &challenge_data.txt_records {
+                            if let Err(e) = rt.block_on(
+                                cf_provider.remove_txt_record(&base_domain, &txt_record.name),
+                            ) {
+                                warn!("Failed to remove TXT record {}: {}", txt_record.name, e);
+                            }
+                        }
+                        print_substep(&format!("{} DNS cleanup completed", "✓".bright_green()));
+                        println!();
+                        break;
+                    } else {
+                        print_substep(&format!(
+                            "{} Certificate not ready yet (status: {})",
+                            "⚠".bright_yellow(),
+                            completed_domain.status
+                        ));
+                        if attempt == max_retries {
+                            println!();
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("failed");
+                    if attempt < max_retries {
+                        print_substep(&format!(
+                            "{} Attempt {} failed: {}",
+                            "⚠".bright_yellow(),
+                            attempt,
+                            e
+                        ));
+                    } else {
+                        print_substep(&format!(
+                            "{} All {} attempts failed. Certificate provisioning will need to be completed manually.",
+                            "⚠".bright_yellow(),
+                            max_retries
+                        ));
+                        println!();
+                    }
                 }
             }
         }
 
-        println!();
-        println!("{}", "Next steps:".bright_white().bold());
-        println!();
-        println!("   {} Start the server:", "1.".bright_cyan());
-        println!(
-            "      {} temps serve --database-url=<URL>",
-            "$".bright_cyan()
-        );
+        // Step 8: Create DNS A records for routing traffic (ALWAYS do this)
+        print_step(8, 8, "Creating DNS A records for routing traffic");
+
+        // Create wildcard A record (e.g., "*.app" for *.app.example.com)
+        let wildcard_record_name = if subdomain_prefix.is_empty() {
+            "*".to_string()
+        } else {
+            format!("*.{}", subdomain_prefix)
+        };
+        print_substep(&format!(
+            "Creating A record: {} → {}",
+            format!("{}.{}", wildcard_record_name, base_domain).bright_cyan(),
+            server_ip.bright_yellow()
+        ));
+        if let Err(e) =
+            rt.block_on(cf_provider.set_a_record(&base_domain, &wildcard_record_name, &server_ip))
+        {
+            warn!("Failed to create wildcard A record: {}", e);
+            print_substep(&format!(
+                "{} Failed to create wildcard A record: {}",
+                "⚠".bright_yellow(),
+                e
+            ));
+        } else {
+            print_substep(&format!("{} Wildcard A record created", "✓".bright_green()));
+        }
+
+        // Create base subdomain A record (e.g., "app" for app.example.com)
+        // This allows direct access to the subdomain without wildcard
+        if !subdomain_prefix.is_empty() {
+            print_substep(&format!(
+                "Creating A record: {} → {}",
+                format!("{}.{}", subdomain_prefix, base_domain).bright_cyan(),
+                server_ip.bright_yellow()
+            ));
+            if let Err(e) =
+                rt.block_on(cf_provider.set_a_record(&base_domain, &subdomain_prefix, &server_ip))
+            {
+                warn!("Failed to create subdomain A record: {}", e);
+                print_substep(&format!(
+                    "{} Failed to create subdomain A record: {}",
+                    "⚠".bright_yellow(),
+                    e
+                ));
+            } else {
+                print_substep(&format!(
+                    "{} Subdomain A record created",
+                    "✓".bright_green()
+                ));
+            }
+        }
         println!();
 
-        if self.domain.is_some()
-            && self
-                .domain
-                .as_ref()
-                .map(|d| d.starts_with("*."))
-                .unwrap_or(false)
-        {
+        // Show warning if certificate wasn't provisioned but continue with setup
+        if !certificate_success {
             println!(
-                "   {} Complete SSL certificate provisioning via the API",
-                "2.".bright_cyan()
+                "{}",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_yellow()
+            );
+            println!(
+                "   {} {}",
+                "⚠".bright_yellow(),
+                "SSL certificate provisioning was not completed.".bright_yellow()
+            );
+            println!(
+                "   {}",
+                "You can complete it later via the admin panel.".bright_white()
+            );
+            println!(
+                "   {}",
+                "DNS TXT records have been left in place for retry.".bright_white()
+            );
+            println!(
+                "{}",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_yellow()
             );
             println!();
         }
 
+        finish_setup(
+            &user,
+            &password,
+            &self.wildcard_domain,
+            self.non_interactive,
+        )
+    }
+}
+
+fn finish_setup(
+    user: &users::Model,
+    password: &str,
+    wildcard_domain: &str,
+    non_interactive: bool,
+) -> anyhow::Result<()> {
+    // Print summary
+    print_section("Setup Complete!");
+
+    println!();
+    println!(
+        "{}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_green()
+    );
+    println!("{}", "   🎉 Temps is ready to use!".bright_white().bold());
+    println!(
+        "{}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_green()
+    );
+    println!();
+
+    println!(
+        "{} {}",
+        "Wildcard Domain:".bright_white().bold(),
+        wildcard_domain.bright_cyan()
+    );
+
+    if !password.is_empty() {
         println!(
-            "   {} Access the admin panel at http://localhost:3000",
-            if self.domain.is_some()
-                && self
-                    .domain
-                    .as_ref()
-                    .map(|d| d.starts_with("*."))
-                    .unwrap_or(false)
-            {
-                "3."
-            } else {
-                "2."
-            }
-            .bright_cyan()
+            "{} {}",
+            "Admin Email:".bright_white().bold(),
+            user.email.bright_cyan()
+        );
+        println!(
+            "{} {}",
+            "Admin Password:".bright_white().bold(),
+            password.bright_yellow().bold()
         );
         println!();
         println!(
             "{}",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_green()
+            "⚠️  IMPORTANT: Save this password now!"
+                .bright_yellow()
+                .bold()
+        );
+        println!(
+            "{}",
+            "This is the only time it will be displayed.".bright_white()
         );
         println!();
 
-        info!("Setup completed successfully");
-        Ok(())
+        if !non_interactive {
+            loop {
+                if ask_confirmation("Have you saved the password? (y/n):")? {
+                    break;
+                }
+                println!();
+                println!(
+                    "{} {}",
+                    "Password:".bright_white().bold(),
+                    password.bright_yellow().bold()
+                );
+                println!();
+            }
+        }
     }
+
+    println!();
+    println!("{}", "Next steps:".bright_white().bold());
+    println!();
+    println!("   {} Start the server:", "1.".bright_cyan());
+    println!(
+        "      {} temps serve --database-url=<URL>",
+        "$".bright_cyan()
+    );
+    println!();
+    println!(
+        "   {} Access the admin panel at http://localhost:3000",
+        "2.".bright_cyan()
+    );
+    println!();
+    println!(
+        "{}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_green()
+    );
+    println!();
+
+    info!("Setup completed successfully");
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1554,13 +1554,14 @@ fn extract_base_domain(domain: &str) -> String {
 }
 
 /// Create a single ACME challenge TXT record using the DNS provider
+/// This will first remove any existing TXT records with the same name before creating the new one
 async fn create_acme_txt_record(
     provider: &dyn temps_dns::providers::DnsProvider,
     base_domain: &str,
     name: &str,
     value: &str,
 ) -> DnsChallengeRecordResult {
-    use temps_dns::providers::{DnsRecordContent, DnsRecordRequest};
+    use temps_dns::providers::{DnsRecordContent, DnsRecordRequest, DnsRecordType};
 
     // Extract the record name relative to the base domain
     // e.g., "_acme-challenge.example.com" for base domain "example.com" -> "_acme-challenge"
@@ -1579,6 +1580,27 @@ async fn create_acme_txt_record(
         name, record_name, value, base_domain
     );
 
+    // First, try to remove any existing TXT record with the same name
+    // This is important for ACME challenges as old tokens can interfere with validation
+    match provider
+        .remove_record(base_domain, &record_name, DnsRecordType::TXT)
+        .await
+    {
+        Ok(()) => {
+            debug!(
+                "Removed existing TXT record {} for {} before creating new one",
+                record_name, base_domain
+            );
+        }
+        Err(e) => {
+            // It's okay if removal fails (record might not exist)
+            debug!(
+                "No existing TXT record to remove for {} (or removal failed: {})",
+                record_name, e
+            );
+        }
+    }
+
     let request = DnsRecordRequest {
         name: record_name.clone(),
         content: DnsRecordContent::TXT {
@@ -1588,7 +1610,7 @@ async fn create_acme_txt_record(
         proxied: false,
     };
 
-    match provider.set_record(base_domain, request).await {
+    match provider.create_record(base_domain, request).await {
         Ok(_record) => {
             info!(
                 "Successfully created TXT record {} = {} for {}",

@@ -206,6 +206,11 @@ pub trait ExternalService: Send + Sync {
     }
     fn get_local_address(&self, service_config: ServiceConfig) -> Result<String>;
 
+    /// Get the effective host and port for connecting to this service
+    /// In Docker mode, returns (container_name, internal_port)
+    /// In Baremetal mode, returns (localhost, exposed_port)
+    fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)>;
+
     /// Backup the service data to an S3 location
     /// s3_source: The S3 source configuration to use for backup
     /// subpath: The subpath within the S3 bucket where the backup should be stored

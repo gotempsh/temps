@@ -528,11 +528,26 @@ impl S3Service {
     }
 }
 
+/// Internal port used by MinIO inside the container
+const S3_INTERNAL_PORT: &str = "9000";
+
 #[async_trait]
 impl ExternalService for S3Service {
     fn get_local_address(&self, service_config: ServiceConfig) -> Result<String> {
         let config = self.get_s3_config(service_config)?;
         Ok(format!("localhost:{}", config.port))
+    }
+
+    fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
+        let config = self.get_s3_config(service_config)?;
+
+        if temps_core::DeploymentMode::is_docker() {
+            // Docker mode: use container name and internal port
+            Ok((self.get_container_name(), S3_INTERNAL_PORT.to_string()))
+        } else {
+            // Baremetal mode: use localhost and exposed port
+            Ok(("localhost".to_string(), config.port))
+        }
     }
 
     async fn init(&self, config: ServiceConfig) -> Result<HashMap<String, String>> {
@@ -728,14 +743,24 @@ impl ExternalService for S3Service {
             .to_lowercase();
         // Create the bucket
         self.create_bucket(config.clone(), &bucket_name).await?;
-        let container_name = self.get_container_name();
+
+        let s3_config = self.get_s3_config(config.clone())?;
         let mut env_vars = HashMap::new();
+
+        // Get effective host and port based on deployment mode
+        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
+            // Docker mode: use container name and internal port
+            (self.get_container_name(), S3_INTERNAL_PORT.to_string())
+        } else {
+            // Baremetal mode: use localhost and exposed port
+            ("localhost".to_string(), s3_config.port.clone())
+        };
 
         // Bucket name (specific to this project/environment)
         env_vars.insert("S3_BUCKET".to_string(), bucket_name);
 
         // Endpoint
-        let endpoint = format!("http://{}:{}", container_name, 9000);
+        let endpoint = format!("http://{}:{}", effective_host, effective_port);
         env_vars.insert("S3_ENDPOINT".to_string(), endpoint.clone());
 
         // Get access keys from service config
@@ -750,7 +775,9 @@ impl ExternalService for S3Service {
             .and_then(|v| v.as_str())
             .context("Missing secret key parameter")?;
 
-        // S3-style environment variables (same as get_docker_environment_variables)
+        // S3-style environment variables
+        env_vars.insert("S3_HOST".to_string(), effective_host.clone());
+        env_vars.insert("S3_PORT".to_string(), effective_port);
         env_vars.insert("S3_ACCESS_KEY".to_string(), access_key.to_string());
         env_vars.insert("S3_SECRET_KEY".to_string(), secret_key.to_string());
         env_vars.insert("S3_REGION".to_string(), "us-east-1".to_string());
@@ -827,10 +854,18 @@ impl ExternalService for S3Service {
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
 
-        // Build endpoint from host and port
-        let host = parameters.get("host").context("Missing host parameter")?;
         let port = parameters.get("port").context("Missing port parameter")?;
-        let endpoint = format!("http://{}:{}", host, port);
+
+        // Get effective host and port based on deployment mode
+        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
+            // Docker mode: use container name and internal port
+            (self.get_container_name(), S3_INTERNAL_PORT.to_string())
+        } else {
+            // Baremetal mode: use localhost and exposed port
+            ("localhost".to_string(), port.clone())
+        };
+
+        let endpoint = format!("http://{}:{}", effective_host, effective_port);
 
         let access_key = parameters
             .get("access_key")
@@ -842,8 +877,8 @@ impl ExternalService for S3Service {
         let region = parameters.get("region").unwrap_or(&region_val);
 
         env_vars.insert("S3_ENDPOINT".to_string(), endpoint.clone());
-        env_vars.insert("S3_HOST".to_string(), host.clone());
-        env_vars.insert("S3_PORT".to_string(), port.clone());
+        env_vars.insert("S3_HOST".to_string(), effective_host);
+        env_vars.insert("S3_PORT".to_string(), effective_port);
         env_vars.insert("S3_ACCESS_KEY".to_string(), access_key.clone());
         env_vars.insert("S3_SECRET_KEY".to_string(), secret_key.clone());
         env_vars.insert("S3_REGION".to_string(), region.clone());
@@ -861,7 +896,16 @@ impl ExternalService for S3Service {
         parameters: &HashMap<String, String>,
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
-        let container_name = self.get_container_name();
+        let port = parameters.get("port").context("Missing port parameter")?;
+
+        // Get effective host and port based on deployment mode
+        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
+            // Docker mode: use container name and internal port
+            (self.get_container_name(), S3_INTERNAL_PORT.to_string())
+        } else {
+            // Baremetal mode: use localhost and exposed port
+            ("localhost".to_string(), port.clone())
+        };
 
         let access_key = parameters
             .get("access_key")
@@ -869,9 +913,11 @@ impl ExternalService for S3Service {
         let secret_key = parameters
             .get("secret_key")
             .context("Missing secret key parameter")?;
-        let endpoint = format!("http://{container_name}:9000");
+        let endpoint = format!("http://{}:{}", effective_host, effective_port);
 
         env_vars.insert("S3_ENDPOINT".to_string(), endpoint.clone());
+        env_vars.insert("S3_HOST".to_string(), effective_host);
+        env_vars.insert("S3_PORT".to_string(), effective_port);
         env_vars.insert("S3_ACCESS_KEY".to_string(), access_key.clone());
         env_vars.insert("S3_SECRET_KEY".to_string(), secret_key.clone());
         env_vars.insert("S3_REGION".to_string(), "us-east-1".to_string());

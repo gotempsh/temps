@@ -10150,6 +10150,7 @@ dependencies = [
  "mime_guess",
  "rand 0.8.5",
  "reqwest",
+ "rustls 0.23.34",
  "sea-orm",
  "serde",
  "serde_json",

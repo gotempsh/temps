@@ -304,11 +304,17 @@ impl LetsEncryptProvider {
     }
 
     async fn wait_for_order_ready(&self, order: &mut Order) -> Result<(), ProviderError> {
-        const MAX_ATTEMPTS: u8 = 5;
-        const RETRY_DELAY_SECS: u64 = 1;
+        const MAX_ATTEMPTS: u8 = 6;
+        const BASE_DELAY_SECS: u64 = 1;
+        const MAX_DELAY_SECS: u64 = 30;
 
         for attempt in 1..=MAX_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
+            // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (capped)
+            let delay_secs = std::cmp::min(
+                BASE_DELAY_SECS * 2u64.pow((attempt - 1) as u32),
+                MAX_DELAY_SECS,
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
             let state = order.refresh().await?;
 
             match state.status {
@@ -323,9 +329,13 @@ impl LetsEncryptProvider {
                 }
                 _ => {
                     if attempt < MAX_ATTEMPTS {
+                        let next_delay = std::cmp::min(
+                            BASE_DELAY_SECS * 2u64.pow(attempt as u32),
+                            MAX_DELAY_SECS,
+                        );
                         info!(
                             "Order not ready yet (attempt {}/{}), retrying in {}s",
-                            attempt, MAX_ATTEMPTS, RETRY_DELAY_SECS
+                            attempt, MAX_ATTEMPTS, next_delay
                         );
                     } else {
                         let error_msg =

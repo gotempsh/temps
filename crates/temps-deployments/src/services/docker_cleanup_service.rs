@@ -32,14 +32,24 @@ pub struct DefaultDockerClient;
 #[async_trait::async_trait]
 impl DockerClient for DefaultDockerClient {
     async fn prune_images(&self, _force: bool) -> Result<PruneStats, String> {
-        // Use bollard to interact with Docker daemon
-        use bollard::query_parameters::PruneImagesOptions;
+        use bollard::query_parameters::PruneImagesOptionsBuilder;
         use bollard::Docker;
+        use std::collections::HashMap;
 
         let docker = Docker::connect_with_unix_defaults()
             .map_err(|e| format!("Failed to connect to Docker daemon: {}", e))?;
 
-        match docker.prune_images(None::<PruneImagesOptions>).await {
+        // Only prune images older than 7 days (168 hours)
+        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        filters.insert("until".to_string(), vec!["168h".to_string()]);
+        // Also only prune dangling images (not tagged)
+        filters.insert("dangling".to_string(), vec!["true".to_string()]);
+
+        let options = PruneImagesOptionsBuilder::default()
+            .filters(&filters)
+            .build();
+
+        match docker.prune_images(Some(options)).await {
             Ok(result) => {
                 let space_mb = result.space_reclaimed.unwrap_or(0) / (1024 * 1024);
                 let count = result.images_deleted.map(|v| v.len()).unwrap_or(0) as u64;
@@ -53,33 +63,39 @@ impl DockerClient for DefaultDockerClient {
     }
 
     async fn prune_builder_cache(&self, max_unused_days: i64) -> Result<String, String> {
-        // Docker builder prune removes build cache
-        // Unfortunately, bollard doesn't have a direct prune_builder_cache method,
-        // so we'll use docker CLI as a workaround
-        use std::process::Command;
+        use bollard::query_parameters::PruneBuildOptionsBuilder;
+        use bollard::Docker;
+        use std::collections::HashMap;
 
-        // Calculate max_unused filter for docker builder prune
-        // Docker uses "duration" format (e.g., "168h" for 7 days)
+        let docker = Docker::connect_with_unix_defaults()
+            .map_err(|e| format!("Failed to connect to Docker daemon: {}", e))?;
+
+        // Calculate duration filter (e.g., "168h" for 7 days)
         let duration = format!("{}h", max_unused_days * 24);
 
-        let output = Command::new("docker")
-            .args(&[
-                "builder",
-                "prune",
-                "-f",
-                "--keep-state",
-                "--filter",
-                &format!("unused-for={}", duration),
-            ])
-            .output()
-            .map_err(|e| format!("Failed to execute docker builder prune: {}", e))?;
+        // Build filters with "until" to prune cache older than the specified duration
+        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+        filters.insert("until".to_string(), vec![duration]);
 
-        if output.status.success() {
-            String::from_utf8(output.stdout)
-                .map_err(|e| format!("Failed to parse docker builder prune output: {}", e))
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(format!("Docker builder prune failed: {}", stderr))
+        let options = PruneBuildOptionsBuilder::default()
+            .filters(&filters)
+            .build();
+
+        match docker.prune_build(Some(options)).await {
+            Ok(result) => {
+                let space_mb = result.space_reclaimed.unwrap_or(0) / (1024 * 1024);
+                let caches_deleted = result.caches_deleted.map(|v| v.len()).unwrap_or(0);
+
+                if caches_deleted > 0 || space_mb > 0 {
+                    Ok(format!(
+                        "removed {} build cache entries, freed {} MB",
+                        caches_deleted, space_mb
+                    ))
+                } else {
+                    Ok(String::new())
+                }
+            }
+            Err(e) => Err(format!("Failed to prune build cache: {}", e)),
         }
     }
 }

@@ -10,10 +10,11 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::{
-    handlers::{self, create_domain_app_state, DomainAppState},
+    handlers::{self, create_domain_app_state_with_dns, DomainAppState},
     tls::{repository::DefaultCertificateRepository, TlsServiceBuilder},
 };
 use rustls::crypto::CryptoProvider;
+use temps_dns::services::DnsProviderService;
 
 /// Domains Plugin for managing DNS records and TLS certificates
 pub struct DomainsPlugin;
@@ -121,8 +122,16 @@ impl TempsPlugin for DomainsPlugin {
                 encryption_service.clone(),
             ));
 
+            // Get DnsProviderService (requires dns plugin to be registered first)
+            let dns_provider_service = context.require_service::<DnsProviderService>();
+
             // Create DomainAppState for handlers
-            let domain_app_state = create_domain_app_state(tls_service, repository, domain_service);
+            let domain_app_state = create_domain_app_state_with_dns(
+                tls_service,
+                repository,
+                domain_service,
+                dns_provider_service,
+            );
             context.register_service(domain_app_state);
 
             tracing::debug!("Domains plugin services registered successfully");

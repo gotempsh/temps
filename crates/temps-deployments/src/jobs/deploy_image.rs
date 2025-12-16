@@ -830,10 +830,11 @@ impl DeployImageJob {
             "Waiting for application to be ready...".to_string(),
         )
         .await?;
-        let health_check_url = format!(
-            "http://localhost:{}{}",
-            host_port,
-            self.config.health_check_path.as_deref().unwrap_or("/")
+        let health_check_url = temps_core::DeploymentMode::build_container_url(
+            &deploy_result.container_name,
+            deploy_result.container_port,
+            deploy_result.host_port,
+            self.config.health_check_path.as_deref(),
         );
         self.log(context, format!("Health check URL: {}", health_check_url))
             .await?;
@@ -974,7 +975,12 @@ impl DeployImageJob {
             }
         }
 
-        let endpoint_url = format!("http://localhost:{}", deploy_result.host_port);
+        let endpoint_url = temps_core::DeploymentMode::build_container_url(
+            &deploy_result.container_name,
+            deploy_result.container_port,
+            deploy_result.host_port,
+            None,
+        );
         self.log(
             context,
             format!("✅ Replica {} ready at {}", replica_index + 1, endpoint_url),

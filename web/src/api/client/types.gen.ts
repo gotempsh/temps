@@ -1411,6 +1411,28 @@ export type DiscoverResponse = {
     workloads: Array<WorkloadDescriptor>;
 };
 
+/**
+ * Result of a single DNS TXT record creation for ACME challenge
+ */
+export type DnsChallengeRecordResult = {
+    /**
+     * Human-readable message about the operation
+     */
+    message: string;
+    /**
+     * TXT record name (e.g., "_acme-challenge.example.com")
+     */
+    name: string;
+    /**
+     * Whether the record was created successfully
+     */
+    success: boolean;
+    /**
+     * TXT record value (the ACME challenge token)
+     */
+    value: string;
+};
+
 export type DnsCompletionResponse = {
     domain: string;
     status: string;
@@ -1679,6 +1701,32 @@ export type DnsRecordResponse = {
      * DNS record value
      */
     value: string;
+};
+
+/**
+ * Result of a single DNS record creation
+ */
+export type DnsRecordSetupResult = {
+    /**
+     * Whether the operation was automatic or manual
+     */
+    automatic: boolean;
+    /**
+     * Human-readable message
+     */
+    message: string;
+    /**
+     * Record name
+     */
+    name: string;
+    /**
+     * Record type (TXT, CNAME, MX)
+     */
+    record_type: string;
+    /**
+     * Whether the record was created successfully
+     */
+    success: boolean;
 };
 
 /**
@@ -4646,6 +4694,78 @@ export type SessionSummary = {
  */
 export type SettingsUpdateResponse = {
     message: string;
+};
+
+/**
+ * Request to setup DNS challenge records using a configured DNS provider
+ */
+export type SetupDnsChallengeRequest = {
+    /**
+     * The ID of the DNS provider to use for creating the TXT records
+     */
+    dns_provider_id: number;
+};
+
+/**
+ * Response from DNS challenge setup operation
+ */
+export type SetupDnsChallengeResponse = {
+    /**
+     * Human-readable summary message
+     */
+    message: string;
+    /**
+     * Number of TXT records that were successfully created
+     */
+    records_created: number;
+    /**
+     * Results for each individual TXT record
+     */
+    results: Array<DnsChallengeRecordResult>;
+    /**
+     * Overall success status (true if all records were created)
+     */
+    success: boolean;
+    /**
+     * Total number of TXT records required for the challenge
+     */
+    total_records: number;
+};
+
+/**
+ * Request to setup DNS records using a configured DNS provider
+ */
+export type SetupDnsRequest = {
+    /**
+     * The ID of the DNS provider to use for creating records
+     */
+    dns_provider_id: number;
+};
+
+/**
+ * Response from DNS setup operation
+ */
+export type SetupDnsResponse = {
+    /**
+     * Human-readable summary message
+     */
+    message: string;
+    /**
+     * Number of records that were successfully created
+     */
+    records_created: number;
+    /**
+     * Results for each individual record
+     */
+    results: Array<DnsRecordSetupResult>;
+    /**
+     * Overall success status
+     */
+    success: boolean;
+    /**
+     * Total number of records attempted
+     */
+    total_records: number;
 };
 
 export type SlackConfig = {
@@ -8689,6 +8809,50 @@ export type FinalizeOrderResponses = {
 
 export type FinalizeOrderResponse = FinalizeOrderResponses[keyof FinalizeOrderResponses];
 
+export type SetupDnsChallengeData = {
+    body: SetupDnsChallengeRequest;
+    path: {
+        /**
+         * Domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/domains/{domain_id}/setup-dns';
+};
+
+export type SetupDnsChallengeErrors = {
+    /**
+     * Bad request - DNS provider not configured or no challenge pending
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain or DNS provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetupDnsChallengeResponses = {
+    /**
+     * DNS records created successfully
+     */
+    200: SetupDnsChallengeResponse;
+};
+
+export type SetupDnsChallengeResponse2 = SetupDnsChallengeResponses[keyof SetupDnsChallengeResponses];
+
 export type DeleteDomainData = {
     body?: never;
     path: {
@@ -9162,6 +9326,50 @@ export type GetDomainDnsRecordsResponses = {
 };
 
 export type GetDomainDnsRecordsResponse = GetDomainDnsRecordsResponses[keyof GetDomainDnsRecordsResponses];
+
+export type SetupDnsData = {
+    body: SetupDnsRequest;
+    path: {
+        /**
+         * Email Domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/setup-dns';
+};
+
+export type SetupDnsErrors = {
+    /**
+     * Invalid request or DNS provider not configured
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetupDnsResponses = {
+    /**
+     * DNS records setup result
+     */
+    200: SetupDnsResponse;
+};
+
+export type SetupDnsResponse2 = SetupDnsResponses[keyof SetupDnsResponses];
 
 export type VerifyDomainData = {
     body?: never;

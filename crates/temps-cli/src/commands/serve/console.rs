@@ -587,16 +587,16 @@ pub async fn start_console_api(
     let notifications_plugin = Box::new(NotificationsPlugin::new());
     plugin_manager.register_plugin(notifications_plugin);
 
-    // 4. DomainsPlugin - provides DNS and TLS certificate management (depends on config and database)
-    debug!("Registering DomainsPlugin");
-    let domains_plugin = Box::new(DomainsPlugin::new());
-    plugin_manager.register_plugin(domains_plugin);
-
-    // 4.5. DnsPlugin - provides DNS provider management (depends on database and encryption)
-    // Must be registered before EmailPlugin so DnsProviderService is available for email domain DNS setup
+    // 4. DnsPlugin - provides DNS provider management (depends on database and encryption)
+    // Must be registered before DomainsPlugin and EmailPlugin so DnsProviderService is available
     debug!("Registering DnsPlugin");
     let dns_plugin = Box::new(DnsPlugin::new());
     plugin_manager.register_plugin(dns_plugin);
+
+    // 4.5. DomainsPlugin - provides TLS certificate management (depends on config, database, and DnsProviderService)
+    debug!("Registering DomainsPlugin");
+    let domains_plugin = Box::new(DomainsPlugin::new());
+    plugin_manager.register_plugin(domains_plugin);
 
     // 7.1. EmailPlugin - provides email sending and domain management (depends on database, encryption, and optionally DnsProviderService)
     debug!("Registering EmailPlugin");

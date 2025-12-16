@@ -25,9 +25,27 @@ use sqlx::postgres::{PgListener, PgPool};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use temps_core::DeploymentMode;
 use temps_entities::custom_routes::RouteType;
 use temps_entities::{deployments, environments, projects};
 use tracing::{debug, error, info, warn};
+
+/// Build a backend address for a container based on deployment mode
+///
+/// In Docker mode: Returns container_name:container_port for container-to-container communication
+/// In Baremetal mode: Returns 127.0.0.1:host_port for host-based access
+fn build_container_backend_addr(
+    container_name: &str,
+    container_port: i32,
+    host_port: Option<i32>,
+) -> String {
+    let (host, port) = DeploymentMode::get_effective_host_port(
+        container_name,
+        container_port as u16,
+        host_port.unwrap_or(container_port) as u16,
+    );
+    format!("{}:{}", host, port)
+}
 
 /// Backend type for a route
 #[derive(Clone, Debug)]
@@ -300,7 +318,11 @@ impl CachedPeerTable {
                             let backend_addrs: Vec<String> = containers
                                 .iter()
                                 .map(|c| {
-                                    format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port))
+                                    build_container_backend_addr(
+                                        &c.container_name,
+                                        c.container_port,
+                                        c.host_port,
+                                    )
                                 })
                                 .collect();
                             BackendType::Upstream {
@@ -487,7 +509,11 @@ impl CachedPeerTable {
                             let backend_addrs: Vec<String> = containers
                                 .iter()
                                 .map(|c| {
-                                    format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port))
+                                    build_container_backend_addr(
+                                        &c.container_name,
+                                        c.container_port,
+                                        c.host_port,
+                                    )
                                 })
                                 .collect();
                             BackendType::Upstream {
@@ -605,7 +631,11 @@ impl CachedPeerTable {
                         let backend_addrs: Vec<String> = containers
                             .iter()
                             .map(|c| {
-                                format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port))
+                                build_container_backend_addr(
+                                    &c.container_name,
+                                    c.container_port,
+                                    c.host_port,
+                                )
                             })
                             .collect();
                         BackendType::Upstream {
@@ -751,7 +781,11 @@ impl CachedPeerTable {
                         let backend_addrs: Vec<String> = containers
                             .iter()
                             .map(|c| {
-                                format!("127.0.0.1:{}", c.host_port.unwrap_or(c.container_port))
+                                build_container_backend_addr(
+                                    &c.container_name,
+                                    c.container_port,
+                                    c.host_port,
+                                )
                             })
                             .collect();
                         BackendType::Upstream {
