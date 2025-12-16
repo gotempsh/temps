@@ -7,4 +7,5 @@ pub mod git_service;
 pub mod github;
 pub mod github_provider;
 pub mod gitlab_provider;
+pub mod public_repo;
 pub mod repository;

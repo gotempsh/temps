@@ -116,6 +116,13 @@ async function saveSecrets(secrets: Record<string, string>): Promise<void> {
 
 export const config = {
   get<K extends keyof TempsConfig>(key: K): TempsConfig[K] {
+    // Check environment variables first
+    if (key === 'apiUrl') {
+      const envUrl = process.env.TEMPS_API_URL
+      if (envUrl) {
+        return envUrl as TempsConfig[K]
+      }
+    }
     return configStore.get(key)
   },
 
@@ -205,11 +212,21 @@ export const credentials = {
   },
 
   async isAuthenticated(): Promise<boolean> {
+    // Check environment variable first (for CI/CD)
+    const envToken = process.env.TEMPS_API_TOKEN || process.env.TEMPS_API_KEY
+    if (envToken) {
+      return true
+    }
     const secrets = await loadSecrets()
     return !!secrets[SECRET_KEYS.apiKey]
   },
 
   async getApiKey(): Promise<string | undefined> {
+    // Check environment variable first (for CI/CD)
+    const envToken = process.env.TEMPS_API_TOKEN || process.env.TEMPS_API_KEY
+    if (envToken) {
+      return envToken
+    }
     const secrets = await loadSecrets()
     return secrets[SECRET_KEYS.apiKey]
   },

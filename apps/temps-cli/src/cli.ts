@@ -12,6 +12,7 @@ import { registerDomainsCommands } from './commands/domains/index.js'
 import { registerEnvironmentsCommands } from './commands/environments/index.js'
 import { registerProvidersCommands } from './commands/providers/index.js'
 import { registerBackupsCommands } from './commands/backups/index.js'
+import { registerRuntimeLogsCommand } from './commands/runtime-logs.js'
 
 const VERSION = '0.1.0'
 
@@ -50,6 +51,7 @@ export function createProgram(): Command {
   registerEnvironmentsCommands(program)
   registerProvidersCommands(program)
   registerBackupsCommands(program)
+  registerRuntimeLogsCommand(program)
 
   // Custom help
   program.addHelpText('beforeAll', LOGO)

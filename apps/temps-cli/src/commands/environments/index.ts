@@ -5,12 +5,14 @@ import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
   getEnvironments,
+  getEnvironment,
   createEnvironment,
   deleteEnvironment,
   getEnvironmentVariables,
   createEnvironmentVariable,
   deleteEnvironmentVariable,
   updateEnvironmentVariable,
+  updateEnvironmentSettings,
   getProjectBySlug,
 } from '../../api/sdk.gen.js'
 import type { EnvironmentResponse, EnvironmentVariableResponse } from '../../api/types.gen.js'
@@ -116,6 +118,24 @@ export function registerEnvironmentsCommands(program: Command): void {
       const project = cmd.parent!.parent!.args[0]
       return exportEnvVars(project, options)
     })
+
+  // Resources subcommand
+  environments
+    .command('resources <project> <environment>')
+    .description('View or set CPU/memory resources for an environment')
+    .option('--cpu <millicores>', 'CPU limit in millicores (e.g., 500 = 0.5 CPU)')
+    .option('--memory <mb>', 'Memory limit in MB (e.g., 512)')
+    .option('--cpu-request <millicores>', 'CPU request in millicores (guaranteed minimum)')
+    .option('--memory-request <mb>', 'Memory request in MB (guaranteed minimum)')
+    .option('--json', 'Output in JSON format')
+    .action(resourcesCmd)
+
+  // Scale subcommand
+  environments
+    .command('scale <project> <environment> [replicas]')
+    .description('View or set the number of replicas for an environment')
+    .option('--json', 'Output in JSON format')
+    .action(scaleCmd)
 }
 
 async function getProjectId(projectSlug: string): Promise<number> {
@@ -842,6 +862,273 @@ async function exportEnvVars(
   } else {
     // Output to stdout
     console.log(envContent)
+  }
+}
+
+// ============ Resources Command ============
+
+interface ResourcesOptions {
+  cpu?: string
+  memory?: string
+  cpuRequest?: string
+  memoryRequest?: string
+  json?: boolean
+}
+
+async function resourcesCmd(
+  project: string,
+  environment: string,
+  options: ResourcesOptions
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = await getProjectId(project)
+
+  // Find environment by slug
+  const envs = await withSpinner('Fetching environments...', async () => {
+    const { data, error } = await getEnvironments({
+      client,
+      path: { project_id: projectId },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data ?? []
+  })
+
+  const targetEnv = envs.find(
+    e => e.slug === environment || e.name.toLowerCase() === environment.toLowerCase()
+  )
+
+  if (!targetEnv) {
+    errorOutput(`Environment "${environment}" not found`)
+    info(`Available environments: ${envs.map(e => e.slug).join(', ')}`)
+    return
+  }
+
+  // Check if any resource options are provided
+  const hasResourceOptions = options.cpu || options.memory || options.cpuRequest || options.memoryRequest
+
+  if (hasResourceOptions) {
+    // Update resources
+    const updateBody: {
+      cpu_limit?: number | null
+      cpu_request?: number | null
+      memory_limit?: number | null
+      memory_request?: number | null
+    } = {}
+
+    // Parse CPU limit
+    let cpuLimit: number | undefined
+    if (options.cpu) {
+      cpuLimit = parseInt(options.cpu, 10)
+      if (isNaN(cpuLimit) || cpuLimit <= 0) {
+        errorOutput('CPU must be a positive number (millicores)')
+        return
+      }
+      updateBody.cpu_limit = cpuLimit
+    }
+
+    // Parse memory limit
+    let memoryLimit: number | undefined
+    if (options.memory) {
+      memoryLimit = parseInt(options.memory, 10)
+      if (isNaN(memoryLimit) || memoryLimit <= 0) {
+        errorOutput('Memory must be a positive number (MB)')
+        return
+      }
+      updateBody.memory_limit = memoryLimit
+    }
+
+    // Parse CPU request (or default to limit)
+    if (options.cpuRequest) {
+      const cpuRequest = parseInt(options.cpuRequest, 10)
+      if (isNaN(cpuRequest) || cpuRequest <= 0) {
+        errorOutput('CPU request must be a positive number (millicores)')
+        return
+      }
+      updateBody.cpu_request = cpuRequest
+    } else if (cpuLimit !== undefined) {
+      // Default request to same as limit when setting limit
+      updateBody.cpu_request = cpuLimit
+    }
+
+    // Parse memory request (or default to limit)
+    if (options.memoryRequest) {
+      const memoryRequest = parseInt(options.memoryRequest, 10)
+      if (isNaN(memoryRequest) || memoryRequest <= 0) {
+        errorOutput('Memory request must be a positive number (MB)')
+        return
+      }
+      updateBody.memory_request = memoryRequest
+    } else if (memoryLimit !== undefined) {
+      // Default request to same as limit when setting limit
+      updateBody.memory_request = memoryLimit
+    }
+
+    const updatedEnv = await withSpinner('Updating resources...', async () => {
+      const { data, error } = await updateEnvironmentSettings({
+        client,
+        path: { project_id: projectId, env_id: targetEnv.id },
+        body: updateBody,
+      })
+      if (error) throw new Error(getErrorMessage(error))
+      return data
+    })
+
+    if (options.json) {
+      const config = updatedEnv?.deployment_config
+      json({
+        environment: updatedEnv?.slug,
+        cpu_limit: config?.cpuLimit,
+        cpu_request: config?.cpuRequest,
+        memory_limit: config?.memoryLimit,
+        memory_request: config?.memoryRequest,
+      })
+      return
+    }
+
+    newline()
+    success(`Resources updated for ${project}/${environment}`)
+    newline()
+    displayResources(updatedEnv)
+  } else {
+    // Display current resources
+    if (options.json) {
+      const config = targetEnv.deployment_config
+      json({
+        environment: targetEnv.slug,
+        cpu_limit: config?.cpuLimit,
+        cpu_request: config?.cpuRequest,
+        memory_limit: config?.memoryLimit,
+        memory_request: config?.memoryRequest,
+      })
+      return
+    }
+
+    newline()
+    header(`${icons.folder} Resources for ${project}/${environment}`)
+    newline()
+    displayResources(targetEnv)
+  }
+}
+
+function displayResources(env: EnvironmentResponse | null | undefined): void {
+  if (!env) return
+
+  const config = env.deployment_config
+
+  const formatCpu = (millicores: number | null | undefined): string => {
+    if (millicores == null) return colors.muted('not set')
+    const cores = millicores / 1000
+    return `${millicores}m (${cores} CPU)`
+  }
+
+  const formatMemory = (mb: number | null | undefined): string => {
+    if (mb == null) return colors.muted('not set')
+    if (mb >= 1024) {
+      return `${mb}MB (${(mb / 1024).toFixed(1)}GB)`
+    }
+    return `${mb}MB`
+  }
+
+  keyValue('CPU Limit', formatCpu(config?.cpuLimit))
+  keyValue('CPU Request', formatCpu(config?.cpuRequest))
+  keyValue('Memory Limit', formatMemory(config?.memoryLimit))
+  keyValue('Memory Request', formatMemory(config?.memoryRequest))
+  newline()
+
+  info(`${colors.bold('Limits')} = maximum resources the container can use`)
+  info(`${colors.bold('Requests')} = guaranteed minimum resources`)
+  newline()
+  info(`Example: ${colors.muted('temps env resources my-project production --cpu 1000 --memory 512')}`)
+}
+
+// ============ Scale Command ============
+
+async function scaleCmd(
+  project: string,
+  environment: string,
+  replicas: string | undefined,
+  options: { json?: boolean }
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = await getProjectId(project)
+
+  // Find environment by slug
+  const envs = await withSpinner('Fetching environments...', async () => {
+    const { data, error } = await getEnvironments({
+      client,
+      path: { project_id: projectId },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data ?? []
+  })
+
+  const targetEnv = envs.find(
+    e => e.slug === environment || e.name.toLowerCase() === environment.toLowerCase()
+  )
+
+  if (!targetEnv) {
+    errorOutput(`Environment "${environment}" not found`)
+    info(`Available environments: ${envs.map(e => e.slug).join(', ')}`)
+    return
+  }
+
+  if (replicas !== undefined) {
+    // Set replicas
+    const replicaCount = parseInt(replicas, 10)
+    if (isNaN(replicaCount) || replicaCount < 0) {
+      errorOutput('Replicas must be a non-negative number')
+      return
+    }
+
+    if (replicaCount > 10) {
+      warning(`Setting ${replicaCount} replicas. This may consume significant resources.`)
+    }
+
+    const updatedEnv = await withSpinner(`Scaling to ${replicaCount} replica${replicaCount !== 1 ? 's' : ''}...`, async () => {
+      const { data, error } = await updateEnvironmentSettings({
+        client,
+        path: { project_id: projectId, env_id: targetEnv.id },
+        body: { replicas: replicaCount },
+      })
+      if (error) throw new Error(getErrorMessage(error))
+      return data
+    })
+
+    if (options.json) {
+      json({
+        environment: updatedEnv?.slug,
+        replicas: updatedEnv?.deployment_config?.replicas ?? 1,
+      })
+      return
+    }
+
+    newline()
+    success(`Scaled ${project}/${environment} to ${replicaCount} replica${replicaCount !== 1 ? 's' : ''}`)
+    newline()
+    info(`Note: Scaling takes effect on the next deployment or restart`)
+  } else {
+    // Display current replicas
+    const currentReplicas = targetEnv.deployment_config?.replicas ?? 1
+
+    if (options.json) {
+      json({
+        environment: targetEnv.slug,
+        replicas: currentReplicas,
+      })
+      return
+    }
+
+    newline()
+    header(`${icons.folder} Scale for ${project}/${environment}`)
+    newline()
+    keyValue('Current Replicas', String(currentReplicas))
+    newline()
+    info(`To scale: ${colors.muted(`temps env scale ${project} ${environment} <replicas>`)}`)
+    info(`Example: ${colors.muted(`temps env scale ${project} ${environment} 3`)}`)
   }
 }
 

@@ -19,7 +19,7 @@ use temps_core::{EncryptionService, JobQueue};
 use tracing;
 use utoipa::{openapi::OpenApi, OpenApi as OpenApiTrait};
 
-use crate::handlers::{self, GitProvidersApiDoc};
+use crate::handlers::{self, GitProvidersApiDoc, PublicRepositoriesApiDoc};
 use crate::services::{
     git_provider_manager::GitProviderManager, github::GithubAppService,
     repository::RepositoryService,
@@ -142,7 +142,9 @@ impl TempsPlugin for GitPlugin {
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        Some(GitProvidersApiDoc::openapi())
+        let mut schema = GitProvidersApiDoc::openapi();
+        schema.merge(PublicRepositoriesApiDoc::openapi());
+        Some(schema)
     }
 }
 

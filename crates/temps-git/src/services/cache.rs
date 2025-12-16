@@ -159,6 +159,55 @@ impl CommitCacheKey {
     }
 }
 
+/// Cache key for public repository branches (no connection_id required)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PublicBranchCacheKey {
+    pub provider: String,
+    pub owner: String,
+    pub repo: String,
+}
+
+impl PublicBranchCacheKey {
+    pub fn new(provider: String, owner: String, repo: String) -> Self {
+        Self {
+            provider,
+            owner,
+            repo,
+        }
+    }
+}
+
+/// Cache key for public repository preset detection
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PublicPresetCacheKey {
+    pub provider: String,
+    pub owner: String,
+    pub repo: String,
+    pub branch: String,
+}
+
+impl PublicPresetCacheKey {
+    pub fn new(provider: String, owner: String, repo: String, branch: String) -> Self {
+        Self {
+            provider,
+            owner,
+            repo,
+            branch,
+        }
+    }
+}
+
+/// Preset info for public repository cache
+#[derive(Debug, Clone)]
+pub struct CachedPresetInfo {
+    pub path: String,
+    pub preset: String,
+    pub preset_label: String,
+    pub exposed_port: Option<i32>,
+    pub icon_url: Option<String>,
+    pub project_type: String,
+}
+
 /// Aggregated cache manager for all Git provider caches
 pub struct GitProviderCacheManager {
     /// Cache for repository branches (60 minutes TTL)
@@ -169,6 +218,13 @@ pub struct GitProviderCacheManager {
 
     /// Cache for commit existence checks (30 minutes TTL)
     pub commits: GitProviderCache<CommitCacheKey, bool>,
+
+    /// Cache for public repository branches (15 minutes TTL - shorter due to rate limits)
+    pub public_branches:
+        GitProviderCache<PublicBranchCacheKey, Vec<crate::services::git_provider::Branch>>,
+
+    /// Cache for public repository presets (30 minutes TTL)
+    pub public_presets: GitProviderCache<PublicPresetCacheKey, Vec<CachedPresetInfo>>,
 }
 
 impl GitProviderCacheManager {
@@ -177,6 +233,8 @@ impl GitProviderCacheManager {
             branches: GitProviderCache::new(60), // 60 minutes for branches
             tags: GitProviderCache::new(60),     // 60 minutes for tags
             commits: GitProviderCache::new(30),  // 30 minutes for commits
+            public_branches: GitProviderCache::new(15), // 15 minutes for public branches (rate limit aware)
+            public_presets: GitProviderCache::new(30),  // 30 minutes for public presets
         }
     }
 
@@ -185,6 +243,8 @@ impl GitProviderCacheManager {
         self.branches.cleanup_expired().await;
         self.tags.cleanup_expired().await;
         self.commits.cleanup_expired().await;
+        self.public_branches.cleanup_expired().await;
+        self.public_presets.cleanup_expired().await;
     }
 
     /// Clear all caches
@@ -192,6 +252,8 @@ impl GitProviderCacheManager {
         self.branches.clear().await;
         self.tags.clear().await;
         self.commits.clear().await;
+        self.public_branches.clear().await;
+        self.public_presets.clear().await;
     }
 }
 

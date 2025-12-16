@@ -1,11 +1,14 @@
 import type { Command } from 'commander'
-import { config, type TempsConfig } from '../config/store.js'
-import { promptUrl, promptSelect, promptConfirm, wizard } from '../ui/prompts.js'
+import { config, credentials, type TempsConfig } from '../config/store.js'
+import { promptUrl, promptSelect, promptConfirm, promptPassword } from '../ui/prompts.js'
 import { success, info, colors, newline, header, keyValue, icons, box } from '../ui/output.js'
 import { shouldBeInteractive } from '../utils/tty.js'
+import { setupClient, client } from '../lib/api-client.js'
+import { getCurrentUser } from '../api/sdk.gen.js'
 
 interface ConfigureOptions {
   apiUrl?: string
+  apiToken?: string
   outputFormat?: 'table' | 'json' | 'minimal'
   enableColors?: boolean
   interactive?: boolean  // --no-interactive sets this to false
@@ -16,6 +19,7 @@ export function registerConfigureCommand(program: Command): void {
     .command('configure')
     .description('Configure CLI settings (AWS-style wizard)')
     .option('--api-url <url>', 'API URL')
+    .option('--api-token <token>', 'API token for authentication')
     .option('--output-format <format>', 'Output format (table, json, minimal)')
     .option('--enable-colors', 'Enable colored output in config')
     .option('--disable-colors', 'Disable colored output in config')
@@ -46,6 +50,8 @@ export function registerConfigureCommand(program: Command): void {
 
 async function runConfigureWizard(options: ConfigureOptions & { disableColors?: boolean }): Promise<void> {
   const currentConfig = config.getAll()
+  const isAuthenticated = await credentials.isAuthenticated()
+  const currentEmail = await credentials.get('email')
 
   // Use shouldBeInteractive utility for TTY detection with explicit flag override
   const isInteractive = shouldBeInteractive(options.interactive)
@@ -69,9 +75,22 @@ async function runConfigureWizard(options: ConfigureOptions & { disableColors?: 
 
     config.setAll({ apiUrl, outputFormat, colorEnabled })
 
+    // Handle API token if provided
+    if (options.apiToken) {
+      const tokenValid = await validateAndSaveToken(options.apiToken, apiUrl)
+      if (!tokenValid) {
+        process.exit(1)
+      }
+    }
+
+    const authStatus = await credentials.isAuthenticated()
+      ? `Authenticated as ${await credentials.get('email') ?? 'unknown'}`
+      : 'Not authenticated'
+
     newline()
     box(
       `API URL: ${apiUrl}\n` +
+        `API Token: ${authStatus}\n` +
         `Output Format: ${outputFormat}\n` +
         `Colors: ${colorEnabled ? 'enabled' : 'disabled'}`,
       `${icons.check} Configuration saved`
@@ -89,6 +108,64 @@ async function runConfigureWizard(options: ConfigureOptions & { disableColors?: 
     `API URL [${colors.muted(currentConfig.apiUrl)}]`,
     currentConfig.apiUrl
   )
+
+  // Save API URL first (needed for token validation)
+  config.set('apiUrl', apiUrl)
+
+  // API Token configuration
+  let authStatus = 'Not authenticated'
+  if (options.apiToken) {
+    // Token provided via flag
+    const tokenValid = await validateAndSaveToken(options.apiToken, apiUrl)
+    if (tokenValid) {
+      authStatus = `Authenticated as ${await credentials.get('email') ?? 'unknown'}`
+    }
+  } else if (isAuthenticated) {
+    // Already authenticated, ask if they want to update
+    console.log(colors.muted(`\nCurrently authenticated as: ${colors.bold(currentEmail ?? 'unknown')}`))
+    const updateToken = await promptConfirm({
+      message: 'Update API token?',
+      default: false,
+    })
+    if (updateToken) {
+      const newToken = await promptPassword({
+        message: 'API Token',
+        validate: (value) => {
+          if (!value || value.trim().length === 0) {
+            return 'API token is required'
+          }
+          return true
+        },
+      })
+      const tokenValid = await validateAndSaveToken(newToken, apiUrl)
+      if (tokenValid) {
+        authStatus = `Authenticated as ${await credentials.get('email') ?? 'unknown'}`
+      }
+    } else {
+      authStatus = `Authenticated as ${currentEmail ?? 'unknown'}`
+    }
+  } else {
+    // Not authenticated, prompt for token
+    const configureToken = await promptConfirm({
+      message: 'Configure API token now?',
+      default: true,
+    })
+    if (configureToken) {
+      const newToken = await promptPassword({
+        message: 'API Token',
+        validate: (value) => {
+          if (!value || value.trim().length === 0) {
+            return 'API token is required'
+          }
+          return true
+        },
+      })
+      const tokenValid = await validateAndSaveToken(newToken, apiUrl)
+      if (tokenValid) {
+        authStatus = `Authenticated as ${await credentials.get('email') ?? 'unknown'}`
+      }
+    }
+  }
 
   // Output format (skip prompt if provided via flag)
   const outputFormat = options.outputFormat ?? await promptSelect<'table' | 'json' | 'minimal'>({
@@ -117,6 +194,7 @@ async function runConfigureWizard(options: ConfigureOptions & { disableColors?: 
   newline()
   box(
     `API URL: ${apiUrl}\n` +
+      `API Token: ${authStatus}\n` +
       `Output Format: ${outputFormat}\n` +
       `Colors: ${colorEnabled ? 'enabled' : 'disabled'}`,
     `${icons.check} Configuration saved`
@@ -124,6 +202,7 @@ async function runConfigureWizard(options: ConfigureOptions & { disableColors?: 
 
   newline()
   info(`Configuration file: ${colors.muted(config.path)}`)
+  info(`Credentials file: ${colors.muted(credentials.path)}`)
 }
 
 function getConfigValue(key: string): void {
@@ -197,4 +276,39 @@ async function resetConfig(): Promise<void> {
 
   config.reset()
   success('Configuration reset to defaults')
+}
+
+/**
+ * Validate an API token and save credentials if valid
+ */
+async function validateAndSaveToken(apiToken: string, apiUrl: string): Promise<boolean> {
+  // Temporarily set the API key to validate it
+  await credentials.set('apiKey', apiToken)
+
+  // Setup client with the new credentials
+  await setupClient()
+
+  try {
+    console.log(colors.muted('Validating API token...'))
+    const { data, error } = await getCurrentUser({ client })
+
+    if (error || !data) {
+      console.error(colors.error('Invalid API token'))
+      await credentials.clear()
+      return false
+    }
+
+    await credentials.setAll({
+      apiKey: apiToken,
+      userId: data.id,
+      email: data.email ?? undefined,
+    })
+
+    console.log(colors.success(`${icons.check} API token validated`))
+    return true
+  } catch (err) {
+    console.error(colors.error('Failed to validate API token'))
+    await credentials.clear()
+    return false
+  }
 }
