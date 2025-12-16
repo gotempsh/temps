@@ -744,17 +744,11 @@ impl ExternalService for S3Service {
         // Create the bucket
         self.create_bucket(config.clone(), &bucket_name).await?;
 
-        let s3_config = self.get_s3_config(config.clone())?;
         let mut env_vars = HashMap::new();
 
-        // Get effective host and port based on deployment mode
-        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
-            // Docker mode: use container name and internal port
-            (self.get_container_name(), S3_INTERNAL_PORT.to_string())
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            ("localhost".to_string(), s3_config.port.clone())
-        };
+        // Always use container name and internal port for container-to-container communication
+        let effective_host = self.get_container_name();
+        let effective_port = S3_INTERNAL_PORT.to_string();
 
         // Bucket name (specific to this project/environment)
         env_vars.insert("S3_BUCKET".to_string(), bucket_name);
@@ -854,16 +848,9 @@ impl ExternalService for S3Service {
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
 
-        let port = parameters.get("port").context("Missing port parameter")?;
-
-        // Get effective host and port based on deployment mode
-        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
-            // Docker mode: use container name and internal port
-            (self.get_container_name(), S3_INTERNAL_PORT.to_string())
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            ("localhost".to_string(), port.clone())
-        };
+        // Always use container name and internal port for container-to-container communication
+        let effective_host = self.get_container_name();
+        let effective_port = S3_INTERNAL_PORT.to_string();
 
         let endpoint = format!("http://{}:{}", effective_host, effective_port);
 
@@ -896,16 +883,10 @@ impl ExternalService for S3Service {
         parameters: &HashMap<String, String>,
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
-        let port = parameters.get("port").context("Missing port parameter")?;
 
-        // Get effective host and port based on deployment mode
-        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
-            // Docker mode: use container name and internal port
-            (self.get_container_name(), S3_INTERNAL_PORT.to_string())
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            ("localhost".to_string(), port.clone())
-        };
+        // Always use container name and internal port for container-to-container communication
+        let effective_host = self.get_container_name();
+        let effective_port = S3_INTERNAL_PORT.to_string();
 
         let access_key = parameters
             .get("access_key")

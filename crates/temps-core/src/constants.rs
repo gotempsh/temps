@@ -47,7 +47,7 @@ impl DeploymentMode {
     /// Get the effective host and port for accessing a container
     ///
     /// In Docker mode: Returns (container_name, container_port) for container-to-container communication
-    /// In Baremetal mode: Returns ("localhost", host_port) for host-based access
+    /// In Baremetal mode: Returns ("127.0.0.1", host_port) for host-based access (IPv4 to avoid IPv6 issues)
     ///
     /// # Arguments
     /// * `container_name` - The Docker container name
@@ -64,7 +64,10 @@ impl DeploymentMode {
         if Self::is_docker() {
             (container_name.to_string(), container_port)
         } else {
-            ("localhost".to_string(), host_port)
+            // Use 127.0.0.1 instead of localhost to avoid IPv6 resolution issues
+            // Pingora may try ::1 first when resolving "localhost", but apps typically
+            // only listen on 127.0.0.1
+            ("127.0.0.1".to_string(), host_port)
         }
     }
 
@@ -195,7 +198,7 @@ mod tests {
         env::remove_var("DEPLOYMENT_MODE");
 
         let (host, port) = DeploymentMode::get_effective_host_port("my-container", 3000, 49152);
-        assert_eq!(host, "localhost");
+        assert_eq!(host, "127.0.0.1"); // IPv4 to avoid IPv6 resolution issues
         assert_eq!(port, 49152);
     }
 
@@ -215,10 +218,10 @@ mod tests {
         env::remove_var("DEPLOYMENT_MODE");
 
         let url = DeploymentMode::build_container_url("my-container", 3000, 49152, Some("/health"));
-        assert_eq!(url, "http://localhost:49152/health");
+        assert_eq!(url, "http://127.0.0.1:49152/health");
 
         let url_no_path = DeploymentMode::build_container_url("my-container", 3000, 49152, None);
-        assert_eq!(url_no_path, "http://localhost:49152");
+        assert_eq!(url_no_path, "http://127.0.0.1:49152");
     }
 
     #[test]

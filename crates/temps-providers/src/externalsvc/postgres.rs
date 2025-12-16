@@ -1257,17 +1257,9 @@ impl ExternalService for PostgresService {
         let config: PostgresConfig = self.get_postgres_config(service_config)?;
         let mut env_vars = HashMap::new();
 
-        // Get effective host and port based on deployment mode
-        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
-            // Docker mode: use container name and internal port
-            (
-                self.get_container_name(),
-                POSTGRES_INTERNAL_PORT.to_string(),
-            )
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            ("localhost".to_string(), config.port.clone())
-        };
+        // Always use container name and internal port for container-to-container communication
+        let effective_host = self.get_container_name();
+        let effective_port = POSTGRES_INTERNAL_PORT.to_string();
 
         // Database-specific variable
         env_vars.insert("POSTGRES_DATABASE".to_string(), resource_name.clone());
@@ -1300,7 +1292,6 @@ impl ExternalService for PostgresService {
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
 
-        let port = parameters.get("port").context("Missing port parameter")?;
         let username = parameters
             .get("username")
             .context("Missing username parameter")?;
@@ -1311,17 +1302,9 @@ impl ExternalService for PostgresService {
             .get("database")
             .context("Missing database parameter")?;
 
-        // Get effective host and port based on deployment mode
-        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
-            // Docker mode: use container name and internal port
-            (
-                self.get_container_name(),
-                POSTGRES_INTERNAL_PORT.to_string(),
-            )
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            ("localhost".to_string(), port.clone())
-        };
+        // Always use container name and internal port for container-to-container communication
+        let effective_host = self.get_container_name();
+        let effective_port = POSTGRES_INTERNAL_PORT.to_string();
 
         let url = format!(
             "postgresql://{}:{}@{}:{}/{}",
@@ -1542,7 +1525,6 @@ impl ExternalService for PostgresService {
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
 
-        let port = parameters.get("port").context("Missing port parameter")?;
         let database = parameters
             .get("database")
             .context("Missing database parameter")?;
@@ -1553,17 +1535,9 @@ impl ExternalService for PostgresService {
             .get("password")
             .context("Missing password parameter")?;
 
-        // Get effective host and port based on deployment mode
-        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
-            // Docker mode: use container name and internal port
-            (
-                self.get_container_name(),
-                POSTGRES_INTERNAL_PORT.to_string(),
-            )
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            ("localhost".to_string(), port.clone())
-        };
+        // Always use container name and internal port for container-to-container communication
+        let effective_host = self.get_container_name();
+        let effective_port = POSTGRES_INTERNAL_PORT.to_string();
 
         let url = format!(
             "postgresql://{}:{}@{}:{}/{}",

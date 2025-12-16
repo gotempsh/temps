@@ -656,16 +656,10 @@ impl ExternalService for RedisService {
         let db_number = self.calculate_database_number(&resource_name);
 
         let mut env_vars = HashMap::new();
-        let redis_config = self.get_redis_config(config.clone())?;
 
-        // Get effective host and port based on deployment mode
-        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
-            // Docker mode: use container name and internal port
-            (self.get_container_name(), REDIS_INTERNAL_PORT.to_string())
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            ("localhost".to_string(), redis_config.port.clone())
-        };
+        // Always use container name and internal port for container-to-container communication
+        let effective_host = self.get_container_name();
+        let effective_port = REDIS_INTERNAL_PORT.to_string();
 
         // Database number (specific to this project/environment)
         env_vars.insert("REDIS_DATABASE".to_string(), db_number.to_string());
@@ -842,17 +836,11 @@ impl ExternalService for RedisService {
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
 
-        let port = parameters.get("port").context("Missing port parameter")?;
         let password = parameters.get("password");
 
-        // Get effective host and port based on deployment mode
-        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
-            // Docker mode: use container name and internal port
-            (self.get_container_name(), REDIS_INTERNAL_PORT.to_string())
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            ("localhost".to_string(), port.clone())
-        };
+        // Always use container name and internal port for container-to-container communication
+        let effective_host = self.get_container_name();
+        let effective_port = REDIS_INTERNAL_PORT.to_string();
 
         let url = if let Some(pass) = password {
             format!(

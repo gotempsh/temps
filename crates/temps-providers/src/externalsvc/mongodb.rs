@@ -669,9 +669,6 @@ impl ExternalService for MongodbService {
         &self,
         parameters: &HashMap<String, String>,
     ) -> Result<HashMap<String, String>> {
-        let port = parameters
-            .get("port")
-            .ok_or_else(|| anyhow::anyhow!("Missing port parameter"))?;
         let database = parameters
             .get("database")
             .ok_or_else(|| anyhow::anyhow!("Missing database parameter"))?;
@@ -682,14 +679,9 @@ impl ExternalService for MongodbService {
             .get("password")
             .ok_or_else(|| anyhow::anyhow!("Missing password parameter"))?;
 
-        // Get effective host and port based on deployment mode
-        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
-            // Docker mode: use container name and internal port
-            (self.get_container_name(), MONGODB_INTERNAL_PORT.to_string())
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            ("localhost".to_string(), port.clone())
-        };
+        // Always use container name and internal port for container-to-container communication
+        let effective_host = self.get_container_name();
+        let effective_port = MONGODB_INTERNAL_PORT.to_string();
 
         let mut env_vars = HashMap::new();
         env_vars.insert("MONGODB_HOST".to_string(), effective_host.clone());
@@ -716,9 +708,6 @@ impl ExternalService for MongodbService {
         &self,
         parameters: &HashMap<String, String>,
     ) -> Result<HashMap<String, String>> {
-        let port = parameters
-            .get("port")
-            .ok_or_else(|| anyhow::anyhow!("Missing port parameter"))?;
         let database = parameters
             .get("database")
             .ok_or_else(|| anyhow::anyhow!("Missing database parameter"))?;
@@ -729,14 +718,9 @@ impl ExternalService for MongodbService {
             .get("password")
             .ok_or_else(|| anyhow::anyhow!("Missing password parameter"))?;
 
-        // Get effective host and port based on deployment mode
-        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
-            // Docker mode: use container name and internal port
-            (self.get_container_name(), MONGODB_INTERNAL_PORT.to_string())
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            ("localhost".to_string(), port.clone())
-        };
+        // Always use container name and internal port for container-to-container communication
+        let effective_host = self.get_container_name();
+        let effective_port = MONGODB_INTERNAL_PORT.to_string();
 
         let mut env_vars = HashMap::new();
         env_vars.insert("MONGODB_HOST".to_string(), effective_host.clone());
@@ -855,14 +839,9 @@ impl ExternalService for MongodbService {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("MongoDB not configured"))?;
 
-        // Get effective host and port based on deployment mode
-        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
-            // Docker mode: use container name and internal port
-            (self.get_container_name(), MONGODB_INTERNAL_PORT.to_string())
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            ("localhost".to_string(), config.port.clone())
-        };
+        // Always use container name and internal port for container-to-container communication
+        let effective_host = self.get_container_name();
+        let effective_port = MONGODB_INTERNAL_PORT.to_string();
 
         let mut env_vars = HashMap::new();
         env_vars.insert("MONGODB_HOST".to_string(), effective_host.clone());
