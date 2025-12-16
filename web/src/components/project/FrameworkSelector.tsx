@@ -6,7 +6,6 @@ import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Skeleton } from '@/components/ui/skeleton'
 import type {
-  RepositoryPresetResponse,
   ProjectPresetResponse,
   PresetResponse,
 } from '@/api/client'
@@ -21,8 +20,11 @@ function normalizePath(path: string | undefined | null): string {
   return path
 }
 
+/** Flexible type that accepts either full RepositoryPresetResponse or just { presets } */
+type PresetDataType = { presets: ProjectPresetResponse[] } | undefined
+
 interface FrameworkSelectorProps {
-  presetData: RepositoryPresetResponse | undefined
+  presetData: PresetDataType
   isLoading: boolean
   error?: Error | null
   selectedPreset: string
@@ -357,7 +359,7 @@ function DetectedPresetCard({
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 mb-1">
               <h3 className="font-semibold text-sm truncate">
-                {project.preset_label || presetInfo?.label || project.preset}
+                {project.presetLabel || presetInfo?.label || project.preset}
               </h3>
               <Badge variant="secondary" className="text-xs flex-shrink-0">
                 {presetInfo?.project_type || 'Server'}

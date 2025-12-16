@@ -6,6 +6,8 @@ import {
   getRepositoryBranchesOptions,
   getRepositoryPresetLiveOptions,
   createProjectMutation,
+  getPublicBranchesOptions,
+  detectPublicPresetsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import {
@@ -22,9 +24,68 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { ProjectConfigurator } from '@/components/project/ProjectConfigurator'
 import { RepositoryList } from '@/components/repositories/RepositoryList'
 import type { RepositoryResponse } from '@/api/client/types.gen'
-import { GitBranch, ChevronLeft, Link as LinkIcon } from 'lucide-react'
+import { GitBranch, ChevronLeft, Link as LinkIcon, Loader2, Gitlab } from 'lucide-react'
 import Github from '@/icons/Github'
 import { toast } from 'sonner'
+import { Badge } from '@/components/ui/badge'
+
+/** Parsed git URL info for public repositories */
+interface ParsedGitUrl {
+  provider: 'github' | 'gitlab'
+  owner: string
+  repo: string
+}
+
+/**
+ * Parse a git URL to extract provider, owner, and repo name
+ * Supports: https://github.com/owner/repo, https://gitlab.com/owner/repo, etc.
+ */
+function parseGitUrl(url: string): ParsedGitUrl | null {
+  try {
+    // Clean up the URL
+    const cleanUrl = url.trim().replace(/\.git$/, '')
+
+    // Try to parse as URL
+    let hostname: string
+    let pathname: string
+
+    if (cleanUrl.startsWith('http://') || cleanUrl.startsWith('https://')) {
+      const parsed = new URL(cleanUrl)
+      hostname = parsed.hostname.toLowerCase()
+      pathname = parsed.pathname
+    } else if (cleanUrl.includes('@') && cleanUrl.includes(':')) {
+      // SSH URL format: git@github.com:owner/repo
+      const match = cleanUrl.match(/@([^:]+):(.+)/)
+      if (!match) return null
+      hostname = match[1].toLowerCase()
+      pathname = '/' + match[2]
+    } else {
+      return null
+    }
+
+    // Determine provider
+    let provider: 'github' | 'gitlab'
+    if (hostname.includes('github')) {
+      provider = 'github'
+    } else if (hostname.includes('gitlab')) {
+      provider = 'gitlab'
+    } else {
+      return null
+    }
+
+    // Extract owner and repo from pathname
+    const parts = pathname.split('/').filter(Boolean)
+    if (parts.length < 2) return null
+
+    return {
+      provider,
+      owner: parts[0],
+      repo: parts[1],
+    }
+  } catch {
+    return null
+  }
+}
 
 interface GitImportCloneProps {
   mode?: 'navigation' | 'inline'
@@ -42,6 +103,8 @@ export function GitImportClone({
     useState<RepositoryResponse | null>(null)
   const [gitUrl, setGitUrl] = useState('')
   const [useGitUrl, setUseGitUrl] = useState(false)
+  const [parsedPublicRepo, setParsedPublicRepo] = useState<ParsedGitUrl | null>(null)
+  const [isValidatingUrl, setIsValidatingUrl] = useState(false)
   const navigate = useNavigate()
   const [isInitialLoad, setIsInitialLoad] = useState(true)
 
@@ -66,7 +129,11 @@ export function GitImportClone({
   // Parse owner/repo from full_name
   const [owner, repo] = (selectedRepository?.full_name || '/').split('/')
 
-  const { data: branches } = useQuery({
+  // Note: Public repository info is fetched in handleGitUrlSubmit instead of using a query
+  // to have better control over the loading state and error handling
+
+  // Query for branches from authenticated connection
+  const { data: authenticatedBranches } = useQuery({
     ...getRepositoryBranchesOptions({
       path: {
         owner: owner || '',
@@ -76,17 +143,60 @@ export function GitImportClone({
         connection_id: Number(selectedConnection),
       },
     }),
-    enabled: !!selectedRepository && !!selectedConnection && !!owner && !!repo,
+    enabled: !useGitUrl && !!selectedRepository && !!selectedConnection && !!owner && !!repo,
   })
 
-  const { data: presetData } = useQuery({
+  // Query for branches from public repository
+  const { data: publicBranches } = useQuery({
+    ...getPublicBranchesOptions({
+      path: {
+        provider: parsedPublicRepo?.provider || 'github',
+        owner: parsedPublicRepo?.owner || '',
+        repo: parsedPublicRepo?.repo || '',
+      },
+    }),
+    enabled: useGitUrl && !!parsedPublicRepo && !!selectedRepository,
+  })
+
+  // Use the appropriate branches based on whether it's a public repo
+  const branches = useGitUrl ? publicBranches : authenticatedBranches
+
+  // Query for presets from authenticated connection
+  const { data: authenticatedPresetData } = useQuery({
     ...getRepositoryPresetLiveOptions({
       path: {
         repository_id: selectedRepository?.id || 0,
       },
     }),
-    enabled: !!selectedRepository && !!selectedRepository?.id,
+    enabled: !useGitUrl && !!selectedRepository && !!selectedRepository?.id,
   })
+
+  // Query for presets from public repository
+  const { data: publicPresetData } = useQuery({
+    ...detectPublicPresetsOptions({
+      path: {
+        provider: parsedPublicRepo?.provider || 'github',
+        owner: parsedPublicRepo?.owner || '',
+        repo: parsedPublicRepo?.repo || '',
+      },
+      query: {
+        branch: selectedRepository?.default_branch,
+      },
+    }),
+    enabled: useGitUrl && !!parsedPublicRepo && !!selectedRepository,
+  })
+
+  // Transform public preset data to match ProjectPresetResponse format (camelCase)
+  const presetData = useGitUrl
+    ? publicPresetData?.presets?.map(p => ({
+        preset: p.preset,
+        presetLabel: p.preset_label,
+        exposedPort: p.exposed_port,
+        iconUrl: p.icon_url,
+        projectType: p.project_type,
+        path: p.path,
+      }))
+    : authenticatedPresetData?.presets
 
   const createProjectMutationM = useMutation({
     ...createProjectMutation(),
@@ -188,37 +298,73 @@ export function GitImportClone({
     )
   }
 
-  const handleGitUrlSubmit = () => {
+  const handleGitUrlSubmit = async () => {
     if (!gitUrl.trim()) {
       toast.error('Please enter a git URL')
       return
     }
 
-    // Extract repository name from URL (e.g., https://github.com/owner/repo.git -> repo)
-    const urlParts = gitUrl.replace('.git', '').split('/')
-    const repoName = urlParts[urlParts.length - 1]
-    const owner = urlParts[urlParts.length - 2]
-
-    // Create a mock repository object for public repo
-    const mockRepo: RepositoryResponse = {
-      id: 0, // Use 0 for public repos
-      name: repoName,
-      full_name: `${owner}/${repoName}`,
-      owner: owner,
-      private: false,
-      default_branch: 'main',
-      description: null,
-      language: null,
-      clone_url: gitUrl,
-      ssh_url: null,
-      created_at: new Date().toISOString(),
-      pushed_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-      preset: null,
+    // Parse the git URL
+    const parsed = parseGitUrl(gitUrl)
+    if (!parsed) {
+      toast.error('Invalid git URL. Please use a GitHub or GitLab repository URL.')
+      return
     }
 
-    setSelectedRepository(mockRepo)
-    setUseGitUrl(true)
+    setParsedPublicRepo(parsed)
+    setIsValidatingUrl(true)
+
+    try {
+      // Fetch real repository info from public API
+      const response = await fetch(
+        `/api/git/public/${parsed.provider}/${parsed.owner}/${parsed.repo}`
+      )
+
+      if (!response.ok) {
+        if (response.status === 404) {
+          toast.error('Repository not found or is not public')
+        } else if (response.status === 429) {
+          toast.error('Rate limit exceeded. Please try again later.')
+        } else {
+          toast.error('Failed to fetch repository information')
+        }
+        setParsedPublicRepo(null)
+        setIsValidatingUrl(false)
+        return
+      }
+
+      const repoInfo = await response.json()
+
+      // Create repository object from real data
+      const repoFromApi: RepositoryResponse = {
+        id: 0, // Use 0 for public repos (no database ID)
+        name: repoInfo.name,
+        full_name: repoInfo.full_name,
+        owner: repoInfo.owner,
+        private: false,
+        default_branch: repoInfo.default_branch,
+        description: repoInfo.description,
+        language: repoInfo.language,
+        clone_url: gitUrl,
+        ssh_url: null,
+        created_at: new Date().toISOString(),
+        pushed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        preset: null,
+        // Extra fields for display
+        stars: repoInfo.stars,
+        forks: repoInfo.forks,
+      } as RepositoryResponse & { stars?: number; forks?: number }
+
+      setSelectedRepository(repoFromApi)
+      setUseGitUrl(true)
+      toast.success(`Found repository: ${repoInfo.full_name}`)
+    } catch (error) {
+      toast.error('Failed to validate repository URL')
+      setParsedPublicRepo(null)
+    } finally {
+      setIsValidatingUrl(false)
+    }
   }
 
   return (
@@ -308,26 +454,68 @@ export function GitImportClone({
               <Input
                 id="git-url"
                 type="url"
-                placeholder="https://github.com/owner/repository.git"
+                placeholder="https://github.com/owner/repository"
                 value={gitUrl}
                 onChange={(e) => setGitUrl(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
+                  if (e.key === 'Enter' && !isValidatingUrl) {
                     handleGitUrlSubmit()
                   }
                 }}
+                disabled={isValidatingUrl}
               />
-              <p className="text-xs text-muted-foreground">
-                Enter the HTTPS URL of a public git repository. For example:{' '}
-                <code className="text-xs bg-muted px-1 py-0.5 rounded">
-                  https://github.com/vercel/next.js.git
-                </code>
-              </p>
+              <div className="flex items-center gap-4 text-xs text-muted-foreground">
+                <div className="flex items-center gap-1">
+                  <Github className="h-3 w-3" />
+                  <span>GitHub</span>
+                </div>
+                <div className="flex items-center gap-1">
+                  <Gitlab className="h-3 w-3" />
+                  <span>GitLab</span>
+                </div>
+                <span className="text-muted-foreground/60">supported</span>
+              </div>
             </div>
-            <Button onClick={handleGitUrlSubmit} className="w-full">
-              <LinkIcon className="h-4 w-4 mr-2" />
-              Continue with URL
+            <Button
+              onClick={handleGitUrlSubmit}
+              className="w-full"
+              disabled={isValidatingUrl || !gitUrl.trim()}
+            >
+              {isValidatingUrl ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Validating repository...
+                </>
+              ) : (
+                <>
+                  <LinkIcon className="h-4 w-4 mr-2" />
+                  Continue with URL
+                </>
+              )}
             </Button>
+
+            {/* Show parsed URL preview */}
+            {gitUrl && !isValidatingUrl && (() => {
+              const parsed = parseGitUrl(gitUrl)
+              if (parsed) {
+                return (
+                  <div className="p-3 bg-muted/50 rounded-md text-sm">
+                    <div className="flex items-center gap-2">
+                      {parsed.provider === 'github' ? (
+                        <Github className="h-4 w-4" />
+                      ) : (
+                        <Gitlab className="h-4 w-4" />
+                      )}
+                      <span className="font-medium">{parsed.owner}/{parsed.repo}</span>
+                      <Badge variant="secondary" className="text-xs">
+                        {parsed.provider}
+                      </Badge>
+                    </div>
+                  </div>
+                )
+              }
+              return null
+            })()}
           </TabsContent>
         </Tabs>
       </CardContent>

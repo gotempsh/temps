@@ -8,10 +8,9 @@ import {
 import {
   RepositoryResponse,
   ServiceTypeRoute,
-  RepositoryPresetResponse,
+  ProjectPresetResponse,
   BranchInfo,
   ExternalServiceInfo,
-  ProjectPresetResponse,
 } from '@/api/client/types.gen'
 import { CreateServiceDialog } from '@/components/storage/CreateServiceDialog'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -168,10 +167,12 @@ const _STEP_CONFIG = {
 interface ProjectConfiguratorProps {
   // Repository data
   repository: RepositoryResponse
-  connectionId: number
+  connectionId?: number  // Optional for public repos
 
   // Optional data
   branches?: BranchInfo[]
+  /** Pre-loaded preset data (for public repos or when already fetched) */
+  presetData?: ProjectPresetResponse[]
 
   // Display modes
   mode?: 'wizard' | 'inline' | 'compact'
@@ -190,6 +191,7 @@ export function ProjectConfigurator({
   repository,
   connectionId,
   branches,
+  presetData: providedPresetData,
   mode: _mode = 'wizard',
   onSubmit,
   onCancel,
@@ -240,13 +242,13 @@ export function ProjectConfigurator({
     ...listPresetsOptions({}),
   })
 
-  // Fetch branches if not provided
+  // Fetch branches if not provided (only for authenticated connections)
   const { data: branchesData } = useQuery({
     ...getRepositoryBranchesOptions({
-      query: { connection_id: connectionId },
+      query: { connection_id: connectionId! },
       path: { owner: repository.owner || '', repo: repository.name || '' },
     }),
-    enabled: !branches && !!repository.owner && !!repository.name,
+    enabled: !branches && !!connectionId && !!repository.owner && !!repository.name,
   })
 
   const effectiveBranches = useMemo(
@@ -261,8 +263,9 @@ export function ProjectConfigurator({
   })
 
   // Fetch preset data (will refetch when branch changes due to query key)
+  // Skip fetching if presetData is already provided (e.g., for public repos)
   const {
-    data: presetData,
+    data: fetchedPresetData,
     isLoading: presetLoading,
     error: presetError,
     refetch: refetchPresets,
@@ -271,9 +274,18 @@ export function ProjectConfigurator({
       path: { repository_id: repository.id || 0 },
       query: { branch: selectedBranch },
     }),
-    enabled: !!repository.id && !!selectedBranch,
+    enabled: !providedPresetData && !!repository.id && !!selectedBranch,
     // Key includes branch, so React Query will refetch when branch changes
   })
+
+  // Use provided presets or fetched presets
+  // Transform providedPresetData to match the expected structure { presets: [...] }
+  const presetData = useMemo(() => {
+    if (providedPresetData) {
+      return { presets: providedPresetData }
+    }
+    return fetchedPresetData
+  }, [providedPresetData, fetchedPresetData])
 
   // Default project creation mutation
   const projectMutation = useMutation({

@@ -968,9 +968,16 @@ mod tests {
                 assert!(has_master, "Cache should contain master branch");
             }
             Err(PublicRepoError::RateLimitExceeded) => {
-                eprintln!("Skipping test due to rate limit");
+                eprintln!("Skipping test due to rate limit.");
             }
-            Err(e) => panic!("Unexpected error: {:?}", e),
+            Err(e) => {
+                let error_str = e.to_string();
+                if error_str.contains("rate limit") || error_str.contains("403") {
+                    eprintln!("Skipping test due to GitHub rate limit");
+                } else {
+                    panic!("Unexpected error: {}", e);
+                }
+            }
         }
     }
 }

@@ -3634,6 +3634,36 @@ export type PortMapping = {
  */
 export type PresetConfigSchema = DockerfilePresetConfig | NixpacksPresetConfig | StaticPresetConfig;
 
+/**
+ * Detected preset information
+ */
+export type PresetInfo = {
+    /**
+     * Default exposed port for this preset
+     */
+    exposed_port?: number | null;
+    /**
+     * Icon URL for this preset
+     */
+    icon_url?: string | null;
+    /**
+     * Path where preset was detected (empty for root)
+     */
+    path: string;
+    /**
+     * Preset slug (e.g., "nextjs", "fastapi")
+     */
+    preset: string;
+    /**
+     * Human-readable preset label
+     */
+    preset_label: string;
+    /**
+     * Project type (e.g., "frontend", "backend", "fullstack")
+     */
+    project_type: string;
+};
+
 export type PresetResponse = {
     /**
      * Default port the application listens on (None for static sites)
@@ -4003,6 +4033,58 @@ export type ProxyLogsPaginatedResponse = {
     page_size: number;
     total: number;
     total_pages: number;
+};
+
+/**
+ * Response for preset detection
+ */
+export type PublicPresetResponse = {
+    /**
+     * Branch name where presets were detected
+     */
+    branch: string;
+    /**
+     * List of detected presets
+     */
+    presets: Array<PresetInfo>;
+};
+
+/**
+ * Public repository information
+ */
+export type PublicRepositoryInfo = {
+    /**
+     * Default branch name
+     */
+    default_branch: string;
+    /**
+     * Repository description
+     */
+    description?: string | null;
+    /**
+     * Fork count
+     */
+    forks: number;
+    /**
+     * Full repository name (owner/repo)
+     */
+    full_name: string;
+    /**
+     * Primary programming language
+     */
+    language?: string | null;
+    /**
+     * Repository name
+     */
+    name: string;
+    /**
+     * Repository owner
+     */
+    owner: string;
+    /**
+     * Star count
+     */
+    stars: number;
 };
 
 /**
@@ -11710,6 +11792,164 @@ export type DeleteProviderSafelyResponses = {
 };
 
 export type DeleteProviderSafelyResponse = DeleteProviderSafelyResponses[keyof DeleteProviderSafelyResponses];
+
+export type GetPublicRepositoryData = {
+    body?: never;
+    path: {
+        /**
+         * Git provider (github or gitlab)
+         */
+        provider: string;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query?: never;
+    url: '/git/public/{provider}/{owner}/{repo}';
+};
+
+export type GetPublicRepositoryErrors = {
+    /**
+     * Provider not supported
+     */
+    400: unknown;
+    /**
+     * Repository not found
+     */
+    404: unknown;
+    /**
+     * API rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPublicRepositoryResponses = {
+    /**
+     * Repository information
+     */
+    200: PublicRepositoryInfo;
+};
+
+export type GetPublicRepositoryResponse = GetPublicRepositoryResponses[keyof GetPublicRepositoryResponses];
+
+export type GetPublicBranchesData = {
+    body?: never;
+    path: {
+        /**
+         * Git provider (github or gitlab)
+         */
+        provider: string;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query?: {
+        /**
+         * Force fetch fresh data, bypassing cache (default: false)
+         */
+        fresh?: boolean;
+    };
+    url: '/git/public/{provider}/{owner}/{repo}/branches';
+};
+
+export type GetPublicBranchesErrors = {
+    /**
+     * Provider not supported
+     */
+    400: unknown;
+    /**
+     * Repository not found
+     */
+    404: unknown;
+    /**
+     * API rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPublicBranchesResponses = {
+    /**
+     * List of branches
+     */
+    200: BranchListResponse;
+};
+
+export type GetPublicBranchesResponse = GetPublicBranchesResponses[keyof GetPublicBranchesResponses];
+
+export type DetectPublicPresetsData = {
+    body?: never;
+    path: {
+        /**
+         * Git provider (github or gitlab)
+         */
+        provider: string;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query?: {
+        /**
+         * Branch name to detect presets for (default: repository's default branch)
+         */
+        branch?: string | null;
+        /**
+         * Force fetch fresh data, bypassing cache (default: false)
+         */
+        fresh?: boolean;
+    };
+    url: '/git/public/{provider}/{owner}/{repo}/presets';
+};
+
+export type DetectPublicPresetsErrors = {
+    /**
+     * Provider not supported
+     */
+    400: unknown;
+    /**
+     * Repository or branch not found
+     */
+    404: unknown;
+    /**
+     * API rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DetectPublicPresetsResponses = {
+    /**
+     * Detected presets
+     */
+    200: PublicPresetResponse;
+};
+
+export type DetectPublicPresetsResponse = DetectPublicPresetsResponses[keyof DetectPublicPresetsResponses];
 
 export type DiscoverWorkloadsData = {
     body: DiscoverRequest;

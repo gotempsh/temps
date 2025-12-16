@@ -19,13 +19,15 @@ import { Link } from 'react-router-dom'
 interface BranchSelectorProps {
   repoOwner: string
   repoName: string
-  connectionId: number
+  connectionId?: number  // Optional for public repos
   defaultBranch?: string
   value?: string
   onChange: (branch: string) => void
   onError?: (error: string | null) => void
   onBranchesLoaded?: (branches: string[]) => void
   disabled?: boolean
+  /** Pre-loaded branches (for public repos or when already fetched) */
+  branches?: Array<{ name: string; is_default?: boolean }>
 }
 
 export function BranchSelector({
@@ -38,11 +40,12 @@ export function BranchSelector({
   onError,
   onBranchesLoaded,
   disabled = false,
+  branches: providedBranches,
 }: BranchSelectorProps) {
   const [isCustomBranch, setIsCustomBranch] = useState(false)
   const queryClient = useQueryClient()
 
-  // Fetch branches from repository (always with fresh=false for caching)
+  // Fetch branches from repository (only if not provided and connectionId exists)
   const branchesQuery = useQuery({
     ...getRepositoryBranchesOptions({
       path: {
@@ -50,15 +53,18 @@ export function BranchSelector({
         repo: repoName,
       },
       query: {
-        connection_id: connectionId,
+        connection_id: connectionId!,
         fresh: false,
       },
     }),
-    enabled: !!repoOwner && !!repoName && !!connectionId,
+    enabled: !providedBranches && !!repoOwner && !!repoName && !!connectionId,
     retry: false,
   })
 
   const handleRefresh = async () => {
+    // Only refresh when connectionId is available
+    if (!connectionId) return
+
     // Fetch fresh data and update the cache
     const freshData = await queryClient.fetchQuery({
       ...getRepositoryBranchesOptions({
@@ -97,9 +103,10 @@ export function BranchSelector({
 
   // Sort branches: default branch first, then alphabetically
   const sortedBranches = useMemo(() => {
-    if (!branchesQuery.data?.branches) return []
+    const branchList = providedBranches || branchesQuery.data?.branches
+    if (!branchList) return []
 
-    return [...branchesQuery.data.branches].sort((a, b) => {
+    return [...branchList].sort((a, b) => {
       // Default branch always comes first
       if (a.name === defaultBranch) return -1
       if (b.name === defaultBranch) return 1
@@ -115,7 +122,7 @@ export function BranchSelector({
       // Then alphabetically
       return a.name.localeCompare(b.name)
     })
-  }, [branchesQuery.data, defaultBranch])
+  }, [providedBranches, branchesQuery.data, defaultBranch])
 
   const effectiveBranch = value || defaultBranch || ''
 
