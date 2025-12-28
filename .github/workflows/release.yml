@@ -100,7 +100,7 @@ jobs:
 
   build-darwin-amd64:
     name: Build macOS AMD64
-    runs-on: macos-13
+    runs-on: macos-15-intel
     permissions:
       contents: write
     steps:
