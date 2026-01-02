@@ -1,7 +1,7 @@
 //! Handler types for the email service
 
 use crate::providers::EmailProviderType;
-use crate::services::{DomainService, EmailService, ProviderService};
+use crate::services::{DomainService, EmailService, ProviderService, ValidationService};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,6 +14,7 @@ pub struct AppState {
     pub provider_service: Arc<ProviderService>,
     pub domain_service: Arc<DomainService>,
     pub email_service: Arc<EmailService>,
+    pub validation_service: Arc<ValidationService>,
     pub audit_service: Arc<dyn AuditLogger>,
     /// DNS provider service for automatic DNS record setup
     pub dns_provider_service: Option<Arc<DnsProviderService>>,

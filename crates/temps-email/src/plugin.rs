@@ -12,7 +12,9 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{self, AppState, EmailApiDoc};
-use crate::services::{DomainService, EmailService, ProviderService};
+use crate::services::{
+    DomainService, EmailService, ProviderService, ValidationConfig, ValidationService,
+};
 use temps_dns::services::DnsProviderService;
 
 /// Email Plugin for managing email providers, domains, and sending emails
@@ -61,6 +63,10 @@ impl TempsPlugin for EmailPlugin {
             ));
             context.register_service(email_service.clone());
 
+            // Create ValidationService with default config
+            let validation_service = Arc::new(ValidationService::new(ValidationConfig::default()));
+            context.register_service(validation_service.clone());
+
             // Get AuditService dependency from other plugins
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
@@ -72,6 +78,7 @@ impl TempsPlugin for EmailPlugin {
                 provider_service,
                 domain_service,
                 email_service,
+                validation_service,
                 audit_service,
                 dns_provider_service,
             });

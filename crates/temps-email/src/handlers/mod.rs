@@ -5,6 +5,7 @@ mod domains;
 mod emails;
 mod providers;
 mod types;
+mod validation;
 
 pub use types::AppState;
 
@@ -18,6 +19,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .merge(providers::routes())
         .merge(domains::routes())
         .merge(emails::routes())
+        .merge(validation::routes())
 }
 
 #[derive(OpenApi)]
@@ -43,6 +45,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         emails::list_emails,
         emails::get_email,
         emails::get_email_stats,
+        // Validation
+        validation::validate_email,
     ),
     components(
         schemas(
@@ -67,12 +71,22 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             types::EmailResponse,
             types::EmailStatsResponse,
             types::PaginatedEmailsResponse,
+            // Validation types
+            validation::ValidateEmailRequest,
+            validation::ValidateEmailResponse,
+            validation::ProxyRequest,
+            validation::ReachabilityStatus,
+            validation::SyntaxResult,
+            validation::MxResult,
+            validation::MiscResult,
+            validation::SmtpResult,
         )
     ),
     tags(
         (name = "Email Providers", description = "Email provider management endpoints"),
         (name = "Email Domains", description = "Email domain management and verification"),
-        (name = "Emails", description = "Email sending and retrieval")
+        (name = "Emails", description = "Email sending and retrieval"),
+        (name = "Email Validation", description = "Email address validation and verification")
     )
 )]
 pub struct EmailApiDoc;

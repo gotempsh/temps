@@ -204,6 +204,7 @@ export type ApiKeyResponse = {
  */
 export type AppSettings = {
     allow_readonly_external_access?: boolean;
+    disk_space_alert?: DiskSpaceAlertSettings;
     dns_provider?: DnsProviderSettings;
     docker_registry?: DockerRegistrySettings;
     external_url?: string | null;
@@ -1409,6 +1410,28 @@ export type DiscoverResponse = {
      * Discovered workloads
      */
     workloads: Array<WorkloadDescriptor>;
+};
+
+/**
+ * Disk space alert settings for monitoring disk usage
+ */
+export type DiskSpaceAlertSettings = {
+    /**
+     * Interval in seconds between disk space checks
+     */
+    check_interval_seconds?: number;
+    /**
+     * Whether disk space alerts are enabled
+     */
+    enabled?: boolean;
+    /**
+     * Path to monitor (defaults to data directory)
+     */
+    monitor_path?: string | null;
+    /**
+     * Threshold percentage (0-100) at which to trigger alerts
+     */
+    threshold_percent?: number;
 };
 
 /**
@@ -3234,6 +3257,28 @@ export type MfaVerificationRequest = {
     code: string;
 };
 
+/**
+ * Miscellaneous validation result
+ */
+export type MiscResult = {
+    /**
+     * Gravatar URL if available
+     */
+    gravatar_url?: string | null;
+    /**
+     * Whether the email provider is a B2C (consumer) email provider
+     */
+    is_b2c: boolean;
+    /**
+     * Whether the email is from a disposable email provider
+     */
+    is_disposable: boolean;
+    /**
+     * Whether the email is a role-based account (e.g., admin@, info@)
+     */
+    is_role_account: boolean;
+};
+
 export type MonitorResponse = {
     check_interval_seconds: number;
     created_at: string;
@@ -3252,6 +3297,24 @@ export type MonitorStatus = {
     current_status: string;
     monitor: MonitorResponse;
     uptime_percentage: number;
+};
+
+/**
+ * MX (Mail Exchange) validation result
+ */
+export type MxResult = {
+    /**
+     * Whether the domain accepts mail
+     */
+    accepts_mail: boolean;
+    /**
+     * Error message if MX lookup failed
+     */
+    error?: string | null;
+    /**
+     * List of MX records for the domain
+     */
+    records: Array<string>;
 };
 
 /**
@@ -4036,6 +4099,28 @@ export type ProxyLogsPaginatedResponse = {
 };
 
 /**
+ * Proxy configuration for email validation
+ */
+export type ProxyRequest = {
+    /**
+     * Proxy host
+     */
+    host: string;
+    /**
+     * Optional proxy password
+     */
+    password?: string | null;
+    /**
+     * Proxy port
+     */
+    port: number;
+    /**
+     * Optional proxy username
+     */
+    username?: string | null;
+};
+
+/**
  * Response for preset detection
  */
 export type PublicPresetResponse = {
@@ -4170,6 +4255,11 @@ export type RateLimitSettings = {
     max_requests_per_minute?: number;
     whitelist_ips?: Array<string>;
 };
+
+/**
+ * Email reachability status
+ */
+export type ReachabilityStatus = 'safe' | 'risky' | 'invalid' | 'unknown';
 
 /**
  * Record list response
@@ -4938,6 +5028,36 @@ export type SmartFilter = {
 };
 
 /**
+ * SMTP validation result
+ */
+export type SmtpResult = {
+    /**
+     * Whether we could connect to the SMTP server
+     */
+    can_connect_smtp: boolean;
+    /**
+     * Error message if SMTP check failed
+     */
+    error?: string | null;
+    /**
+     * Whether the mailbox appears to have a full inbox
+     */
+    has_full_inbox: boolean;
+    /**
+     * Whether this is a catch-all domain
+     */
+    is_catch_all: boolean;
+    /**
+     * Whether the email is deliverable
+     */
+    is_deliverable: boolean;
+    /**
+     * Whether the mailbox is disabled
+     */
+    is_disabled: boolean;
+};
+
+/**
  * Entry in the source backup index
  */
 export type SourceBackupEntry = {
@@ -5152,6 +5272,28 @@ export type SyncedRepositoryListQuery = {
     private?: boolean | null;
     search?: string | null;
     sort?: string | null;
+};
+
+/**
+ * Syntax validation result
+ */
+export type SyntaxResult = {
+    /**
+     * The domain part of the email
+     */
+    domain?: string | null;
+    /**
+     * Whether the email syntax is valid
+     */
+    is_valid_syntax: boolean;
+    /**
+     * Suggested email correction if available
+     */
+    suggestion?: string | null;
+    /**
+     * The username part of the email
+     */
+    username?: string | null;
 };
 
 export type TagInfo = {
@@ -5642,6 +5784,47 @@ export type UserResponse = {
     mfa_enabled: boolean;
     name: string;
     username: string;
+};
+
+/**
+ * Request body for validating an email address
+ */
+export type ValidateEmailRequest = {
+    /**
+     * Email address to validate
+     */
+    email: string;
+    proxy?: null | ProxyRequest;
+};
+
+/**
+ * Complete email validation response
+ */
+export type ValidateEmailResponse = {
+    /**
+     * The email address that was validated
+     */
+    email: string;
+    /**
+     * Overall reachability status: safe, risky, invalid, or unknown
+     */
+    is_reachable: ReachabilityStatus;
+    /**
+     * Miscellaneous validation result
+     */
+    misc: MiscResult;
+    /**
+     * MX record validation result
+     */
+    mx: MxResult;
+    /**
+     * SMTP validation result
+     */
+    smtp: SmtpResult;
+    /**
+     * Syntax validation result
+     */
+    syntax: SyntaxResult;
 };
 
 /**
@@ -9791,6 +9974,41 @@ export type GetEmailStatsResponses = {
 };
 
 export type GetEmailStatsResponse = GetEmailStatsResponses[keyof GetEmailStatsResponses];
+
+export type ValidateEmailData = {
+    body: ValidateEmailRequest;
+    path?: never;
+    query?: never;
+    url: '/emails/validate';
+};
+
+export type ValidateEmailErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ValidateEmailResponses = {
+    /**
+     * Email validation result
+     */
+    200: ValidateEmailResponse;
+};
+
+export type ValidateEmailResponse2 = ValidateEmailResponses[keyof ValidateEmailResponses];
 
 export type GetEmailData = {
     body?: never;

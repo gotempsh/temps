@@ -7,6 +7,7 @@ use sea_orm::{
 };
 use temps_core::{Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob};
 use temps_entities::projects;
+use temps_git::services::public_repo::PublicRepoProviderFactory;
 
 use serde::Serialize;
 
@@ -1465,7 +1466,7 @@ impl ProjectService {
         let commit_to_use = if let Some(commit) = commit {
             commit
         } else if let Some(connection_id) = project.git_provider_connection_id {
-            // Fetch latest commit from the branch
+            // Fetch latest commit from the branch using authenticated git provider
             match self
                 .git_provider_manager
                 .get_branch_latest_commit(
@@ -1491,6 +1492,65 @@ impl ProjectService {
                     format!("manual-trigger-{}", chrono::Utc::now().timestamp())
                 }
             }
+        } else if project.is_public_repo {
+            // For public repos without git provider connection, fetch from public API
+            let provider_name = if let Some(ref git_url) = project.git_url {
+                if git_url.contains("github.com") {
+                    "github"
+                } else if git_url.contains("gitlab.com") {
+                    "gitlab"
+                } else {
+                    return Err(ProjectError::InvalidInput(format!(
+                        "Unknown git provider for public repo URL: {}. Only GitHub and GitLab public repos are supported.",
+                        git_url
+                    )));
+                }
+            } else {
+                // No git_url, try to infer from repo structure (assume GitHub for public repos)
+                "github"
+            };
+
+            let provider = PublicRepoProviderFactory::create(provider_name).map_err(|e| {
+                ProjectError::Other(format!(
+                    "Failed to create public repo provider for {}: {}",
+                    provider_name, e
+                ))
+            })?;
+
+            let branches = provider
+                .list_branches(&project.repo_owner, &project.repo_name)
+                .await
+                .map_err(|e| {
+                    ProjectError::Other(format!(
+                        "Failed to fetch branches from public repo {}/{}: {}. The repository may not exist, be private, or the provider API may be unavailable.",
+                        project.repo_owner, project.repo_name, e
+                    ))
+                })?;
+
+            // Find the target branch
+            let branch_info = branches
+                .iter()
+                .find(|b| b.name == branch_to_use)
+                .ok_or_else(|| {
+                    ProjectError::NotFound(format!(
+                        "Branch '{}' not found in public repo {}/{}. Available branches: {}",
+                        branch_to_use,
+                        project.repo_owner,
+                        project.repo_name,
+                        branches
+                            .iter()
+                            .take(10)
+                            .map(|b| b.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                })?;
+
+            info!(
+                "Fetched latest commit from public repo {}/{} branch {}: {}",
+                project.repo_owner, project.repo_name, branch_to_use, branch_info.commit_sha
+            );
+            branch_info.commit_sha.clone()
         } else {
             warn!("No git provider connection found for project, using placeholder commit");
             format!("manual-trigger-{}", chrono::Utc::now().timestamp())

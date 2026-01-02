@@ -20,6 +20,7 @@ import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { SecuritySettings } from '@/components/settings/SecuritySettings'
 import { DockerRegistrySettings } from '@/components/settings/DockerRegistrySettings'
+import { MonitoringSettings } from '@/components/settings/MonitoringSettings'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
@@ -30,6 +31,7 @@ import {
 import {
   AlertCircle,
   Globe,
+  HardDrive,
   Image,
   Link,
   Loader2,
@@ -50,6 +52,7 @@ type SettingsFormData = Pick<
   | 'security_headers'
   | 'rate_limiting'
   | 'docker_registry'
+  | 'disk_space_alert'
 >
 
 export function Settings() {
@@ -99,6 +102,12 @@ export function Settings() {
         tls_verify: true,
         ca_certificate: null,
       },
+      disk_space_alert: {
+        enabled: true,
+        threshold_percent: 80,
+        check_interval_seconds: 300,
+        monitor_path: null,
+      },
     },
   })
 
@@ -106,6 +115,7 @@ export function Settings() {
   const securityHeaders = useWatch({ control, name: 'security_headers' })
   const rateLimiting = useWatch({ control, name: 'rate_limiting' })
   const dockerRegistry = useWatch({ control, name: 'docker_registry' })
+  const diskSpaceAlert = useWatch({ control, name: 'disk_space_alert' })
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Settings' }])
@@ -148,6 +158,12 @@ export function Settings() {
           password: null,
           tls_verify: true,
           ca_certificate: null,
+        },
+        disk_space_alert: settings.disk_space_alert || {
+          enabled: true,
+          threshold_percent: 80,
+          check_interval_seconds: 300,
+          monitor_path: null,
         },
       })
     }
@@ -207,7 +223,7 @@ export function Settings() {
 
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
           <Tabs defaultValue="general" className="space-y-6">
-            <TabsList className="grid w-full grid-cols-3 lg:w-auto lg:inline-grid">
+            <TabsList className="grid w-full grid-cols-4 lg:w-auto lg:inline-grid">
               <TabsTrigger value="general" className="gap-2">
                 <Settings2 className="h-4 w-4" />
                 General
@@ -219,6 +235,10 @@ export function Settings() {
               <TabsTrigger value="security" className="gap-2">
                 <Shield className="h-4 w-4" />
                 Security
+              </TabsTrigger>
+              <TabsTrigger value="monitoring" className="gap-2">
+                <HardDrive className="h-4 w-4" />
+                Monitoring
               </TabsTrigger>
             </TabsList>
 
@@ -384,6 +404,15 @@ export function Settings() {
                 setValue={setValue}
                 securityHeaders={securityHeaders}
                 rateLimiting={rateLimiting}
+              />
+            </TabsContent>
+
+            <TabsContent value="monitoring" className="space-y-6">
+              <MonitoringSettings
+                control={control}
+                register={register}
+                setValue={setValue}
+                diskSpaceAlert={diskSpaceAlert}
               />
             </TabsContent>
 

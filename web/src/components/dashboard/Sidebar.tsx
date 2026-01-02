@@ -361,7 +361,7 @@ export default function AppSidebar() {
                     )}
                   >
                     <span className="truncate font-semibold">Temps</span>
-                    <span className="truncate text-xs">v1.0.0</span>
+                    <span className="truncate text-xs">{import.meta.env.TEMPS_VERSION}</span>
                   </div>
                 )}
               </div>

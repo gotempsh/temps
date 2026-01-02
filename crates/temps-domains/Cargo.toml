@@ -23,7 +23,7 @@ serde_json = { workspace = true }
 log = { workspace = true }
 chrono = { workspace = true }
 sea-orm = { workspace = true }
-hickory-resolver = "0.24.4"
+hickory-resolver = "0.25.2"
 instant-acme = "0.7.2"
 rcgen = { version = "0.13.2", features = ["x509-parser"] }
 thiserror = { workspace = true }

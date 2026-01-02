@@ -50,6 +50,7 @@ fn main() {
     );
     println!("cargo:rerun-if-env-changed=SKIP_WEB_BUILD");
     println!("cargo:rerun-if-env-changed=FORCE_WEB_BUILD");
+    println!("cargo:rerun-if-env-changed=TEMPS_VERSION");
 
     build_web(&web_dir, &dist_dir);
 }
@@ -145,16 +146,38 @@ fn build_web(web_dir: &std::path::Path, dist_dir: &std::path::Path) {
     println!("cargo:warning=Running bun run build...");
     println!("cargo:warning=Output directory: {}", dist_dir.display());
 
-    // Set RSBUILD_OUTPUT_PATH environment variable for rsbuild
+    // Get version info for web build
+    // Prefer TEMPS_VERSION env var (set by CI), then git tag, then fallback to Cargo version
+    let git_tag = env::var("TEMPS_VERSION").ok().unwrap_or_else(|| {
+        Command::new("git")
+            .args(["describe", "--tags", "--abbrev=0"])
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    String::from_utf8(output.stdout).ok()
+                } else {
+                    None
+                }
+            })
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| {
+                env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.1.0".to_string())
+            })
+    });
+
+    // Set RSBUILD_OUTPUT_PATH and TEMPS_VERSION environment variables for rsbuild
     let status = Command::new("bun")
         .args(["run", "build"])
         .current_dir(web_dir)
         .env("RSBUILD_OUTPUT_PATH", dist_dir)
+        .env("TEMPS_VERSION", &git_tag)
         .status()
         .unwrap_or_else(|e| {
             eprintln!("Failed to execute bun run build: {}", e);
             std::process::exit(1);
         });
+    println!("cargo:warning=Building web UI with version: {}", git_tag);
 
     if !status.success() {
         eprintln!("bun run build failed with status: {}", status);

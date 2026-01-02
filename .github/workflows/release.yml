@@ -68,6 +68,7 @@ jobs:
         env:
           FORCE_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
+          TEMPS_VERSION: ${{ github.ref_name }}
 
       - name: Strip binary
         run: strip target/release/temps
@@ -146,6 +147,7 @@ jobs:
         env:
           FORCE_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
+          TEMPS_VERSION: ${{ github.ref_name }}
 
       - name: Strip binary
         run: strip target/x86_64-apple-darwin/release/temps
@@ -224,6 +226,7 @@ jobs:
         env:
           FORCE_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
+          TEMPS_VERSION: ${{ github.ref_name }}
 
       - name: Strip binary
         run: strip target/aarch64-apple-darwin/release/temps

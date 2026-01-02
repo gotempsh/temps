@@ -335,14 +335,36 @@ impl WorkflowExecutionService {
                         WorkflowExecutionError::InvalidJobConfig("repo_name missing".to_string())
                     })?;
 
+                // Check if this is a public repo
+                let is_public_repo = config
+                    .get("is_public_repo")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                // Get git_url for public repos
+                let git_url = config
+                    .get("git_url")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                // Get connection_id for private repos (optional for public repos)
                 let connection_id = config
                     .get("git_provider_connection_id")
                     .and_then(|v| v.as_i64())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "git_provider_connection_id missing".to_string(),
-                        )
-                    })? as i32;
+                    .map(|v| v as i32);
+
+                // Validate: public repos need git_url, private repos need connection_id
+                if is_public_repo && git_url.is_none() {
+                    return Err(WorkflowExecutionError::InvalidJobConfig(
+                        "git_url is required for public repositories".to_string(),
+                    ));
+                }
+                if !is_public_repo && connection_id.is_none() {
+                    return Err(WorkflowExecutionError::InvalidJobConfig(
+                        "git_provider_connection_id is required for private repositories"
+                            .to_string(),
+                    ));
+                }
 
                 // Get branch_ref from job config (set by workflow planner based on deployment)
                 // Fallback to project.main_branch if not specified
@@ -368,10 +390,20 @@ impl WorkflowExecutionService {
                     .job_id(db_job.job_id.clone())
                     .repo_owner(repo_owner.to_string())
                     .repo_name(repo_name.to_string())
-                    .git_provider_connection_id(connection_id)
+                    .is_public_repo(is_public_repo)
                     .branch_ref(branch_ref)
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone());
+
+                // Add git_url for public repos
+                if let Some(url) = git_url {
+                    builder = builder.git_url(url);
+                }
+
+                // Add connection_id for private repos
+                if let Some(id) = connection_id {
+                    builder = builder.git_provider_connection_id(id);
+                }
 
                 // Add tag_ref if present (highest priority in checkout)
                 if let Some(tag) = tag_ref {

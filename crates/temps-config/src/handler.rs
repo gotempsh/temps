@@ -11,8 +11,8 @@ use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
-    problemdetails::Problem, AppSettings, LetsEncryptSettings, RateLimitSettings,
-    ScreenshotSettings, SecurityHeadersSettings,
+    problemdetails::Problem, AppSettings, DiskSpaceAlertSettings, LetsEncryptSettings,
+    RateLimitSettings, ScreenshotSettings, SecurityHeadersSettings,
 };
 use utoipa::{OpenApi, ToSchema};
 
@@ -48,6 +48,9 @@ pub struct AppSettingsResponse {
 
     // Docker registry settings with masked password
     pub docker_registry: DockerRegistrySettingsMasked,
+
+    // Monitoring settings
+    pub disk_space_alert: DiskSpaceAlertSettings,
 }
 
 /// DNS provider settings with masked sensitive fields
@@ -97,6 +100,7 @@ impl From<AppSettings> for AppSettingsResponse {
                 tls_verify: settings.docker_registry.tls_verify,
                 ca_certificate: settings.docker_registry.ca_certificate,
             },
+            disk_space_alert: settings.disk_space_alert,
         }
     }
 }

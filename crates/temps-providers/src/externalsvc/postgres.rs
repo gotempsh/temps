@@ -1124,9 +1124,10 @@ impl ExternalService for PostgresService {
         std::io::copy(&mut std::fs::File::open(temp_file.path())?, &mut encoder)?;
         encoder.finish()?;
 
-        // Get file size before compression
-        let size_bytes = temp_file.as_file().metadata()?.len() as i32;
-        match s3_client
+        // Get file size after compression
+        let size_bytes = compressed_file.as_file().metadata()?.len() as i32;
+
+        s3_client
             .put_object()
             .bucket(&s3_source.bucket_name)
             .key(&backup_key)
@@ -1134,23 +1135,16 @@ impl ExternalService for PostgresService {
             .content_type("application/x-gzip")
             .send()
             .await
-        {
-            Ok(_) => {
-                info!("Successfully uploaded backup to S3");
-                return Ok(backup_key.clone());
-            }
-            Err(e) => {
+            .map_err(|e| {
                 error!(
                     "Failed to upload backup to S3: {:?} - Message: {}",
                     e,
                     e.to_string()
                 );
-                return Err(anyhow::anyhow!(
-                    "Failed to upload backup to S3: {}",
-                    e.to_string()
-                ));
-            }
-        }
+                anyhow::anyhow!("Failed to upload backup to S3: {}", e.to_string())
+            })?;
+
+        info!("Successfully uploaded backup to S3");
 
         // Update backup record with success
         let mut backup_update: external_service_backups::ActiveModel = backup_record.clone().into();

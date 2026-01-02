@@ -222,11 +222,12 @@ export function GitImportClone({
     }
   }
 
-  // If in inline mode and repository is selected, show ProjectConfigurator
+  // Show ProjectConfigurator when:
+  // 1. In inline mode with authenticated repo selected, OR
+  // 2. Using Git URL with public repo selected (works in both modes)
   if (
-    mode === 'inline' &&
     selectedRepository &&
-    (selectedConnection || useGitUrl)
+    ((mode === 'inline' && selectedConnection) || useGitUrl)
   ) {
     return (
       <div className="space-y-6">

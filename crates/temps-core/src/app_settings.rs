@@ -28,6 +28,9 @@ pub struct AppSettings {
 
     // Docker registry settings
     pub docker_registry: DockerRegistrySettings,
+
+    // System monitoring settings
+    pub disk_space_alert: DiskSpaceAlertSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -87,6 +90,22 @@ pub struct RateLimitSettings {
     pub blacklist_ips: Vec<String>,
 }
 
+/// Disk space alert settings for monitoring disk usage
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct DiskSpaceAlertSettings {
+    /// Whether disk space alerts are enabled
+    pub enabled: bool,
+    /// Threshold percentage (0-100) at which to trigger alerts
+    #[schema(minimum = 0, maximum = 100, example = 80)]
+    pub threshold_percent: u32,
+    /// Interval in seconds between disk space checks
+    #[schema(minimum = 60, example = 300)]
+    pub check_interval_seconds: u64,
+    /// Path to monitor (defaults to data directory)
+    pub monitor_path: Option<String>,
+}
+
 const DEFAULT_LOCAL_DOMAIN: &str = "localho.st";
 impl Default for AppSettings {
     fn default() -> Self {
@@ -100,6 +119,7 @@ impl Default for AppSettings {
             security_headers: SecurityHeadersSettings::default(),
             rate_limiting: RateLimitSettings::default(),
             docker_registry: DockerRegistrySettings::default(),
+            disk_space_alert: DiskSpaceAlertSettings::default(),
         }
     }
 }
@@ -171,6 +191,17 @@ impl Default for RateLimitSettings {
             max_requests_per_hour: 1000,
             whitelist_ips: vec![],
             blacklist_ips: vec![],
+        }
+    }
+}
+
+impl Default for DiskSpaceAlertSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,               // Enabled by default
+            threshold_percent: 80,       // Alert at 80% usage
+            check_interval_seconds: 300, // Check every 5 minutes
+            monitor_path: None,          // Use data directory by default
         }
     }
 }

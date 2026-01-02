@@ -2,8 +2,14 @@ import { defineConfig } from '@rsbuild/core'
 import { pluginReact } from '@rsbuild/plugin-react'
 const rsbuildOutputPath = process.env.RSBUILD_OUTPUT_PATH as string | undefined
 const nodeEnv = process.env.NODE_ENV as string | undefined
+const tempsVersion = process.env.TEMPS_VERSION || 'dev'
 export default defineConfig({
   plugins: [pluginReact()],
+  source: {
+    define: {
+      'import.meta.env.TEMPS_VERSION': JSON.stringify(tempsVersion),
+    },
+  },
   html: {
     title: 'Temps',
     favicon: './src/favicon.png',

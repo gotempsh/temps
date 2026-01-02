@@ -370,15 +370,15 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         // Generic provider routes: /git/public/{provider}/{owner}/{repo}
         .route(
-            "/public/{provider}/{owner}/{repo}",
+            "/git/public/{provider}/{owner}/{repo}",
             axum::routing::get(get_public_repository),
         )
         .route(
-            "/public/{provider}/{owner}/{repo}/branches",
+            "/git/public/{provider}/{owner}/{repo}/branches",
             axum::routing::get(get_public_branches),
         )
         .route(
-            "/public/{provider}/{owner}/{repo}/presets",
+            "/git/public/{provider}/{owner}/{repo}/presets",
             axum::routing::get(detect_public_presets),
         )
 }

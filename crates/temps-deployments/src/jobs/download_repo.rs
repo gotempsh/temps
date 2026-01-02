@@ -570,6 +570,8 @@ pub struct DownloadRepoBuilder {
     repo_owner: Option<String>,
     repo_name: Option<String>,
     git_provider_connection_id: Option<i32>,
+    git_url: Option<String>,
+    is_public_repo: bool,
     branch_ref: Option<String>,
     tag_ref: Option<String>,
     commit_sha: Option<String>,
@@ -585,6 +587,8 @@ impl DownloadRepoBuilder {
             repo_owner: None,
             repo_name: None,
             git_provider_connection_id: None,
+            git_url: None,
+            is_public_repo: false,
             branch_ref: None,
             tag_ref: None,
             commit_sha: None,
@@ -611,6 +615,16 @@ impl DownloadRepoBuilder {
 
     pub fn git_provider_connection_id(mut self, connection_id: i32) -> Self {
         self.git_provider_connection_id = Some(connection_id);
+        self
+    }
+
+    pub fn git_url(mut self, git_url: String) -> Self {
+        self.git_url = Some(git_url);
+        self
+    }
+
+    pub fn is_public_repo(mut self, is_public: bool) -> Self {
+        self.is_public_repo = is_public;
         self
     }
 
@@ -655,17 +669,37 @@ impl DownloadRepoBuilder {
         let repo_name = self.repo_name.ok_or_else(|| {
             WorkflowError::JobValidationFailed("repo_name is required".to_string())
         })?;
-        let git_provider_connection_id = self.git_provider_connection_id.ok_or_else(|| {
-            WorkflowError::JobValidationFailed("git_provider_connection_id is required".to_string())
-        })?;
 
-        let mut job = DownloadRepoJob::new(
-            job_id,
-            repo_owner,
-            repo_name,
-            git_provider_connection_id,
-            git_provider_manager,
-        );
+        // Create job based on whether it's a public or private repo
+        let mut job = if self.is_public_repo {
+            // Public repo: requires git_url
+            let git_url = self.git_url.ok_or_else(|| {
+                WorkflowError::JobValidationFailed(
+                    "git_url is required for public repositories".to_string(),
+                )
+            })?;
+            DownloadRepoJob::new_public(
+                job_id,
+                repo_owner,
+                repo_name,
+                git_url,
+                git_provider_manager,
+            )
+        } else {
+            // Private repo: requires git_provider_connection_id
+            let git_provider_connection_id = self.git_provider_connection_id.ok_or_else(|| {
+                WorkflowError::JobValidationFailed(
+                    "git_provider_connection_id is required for private repositories".to_string(),
+                )
+            })?;
+            DownloadRepoJob::new(
+                job_id,
+                repo_owner,
+                repo_name,
+                git_provider_connection_id,
+                git_provider_manager,
+            )
+        };
 
         if let Some(branch_ref) = self.branch_ref {
             job = job.with_branch_ref(branch_ref);

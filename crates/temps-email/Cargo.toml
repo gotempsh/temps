@@ -53,6 +53,9 @@ urlencoding = { workspace = true }
 # DNS resolution
 hickory-resolver = "0.24"
 
+# Email validation
+check-if-email-exists = "0.9"
+
 [dev-dependencies]
 tokio-test = "0.4"
 testcontainers = { workspace = true }

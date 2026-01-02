@@ -1853,6 +1853,148 @@ export type EmailStatusResponse = {
     password_reset_available: boolean;
 };
 
+export type ValidateEmailRequest = {
+    /**
+     * Email address to validate
+     */
+    email: string;
+    /**
+     * Optional SOCKS5 proxy configuration
+     */
+    proxy?: EmailValidationProxyConfig;
+};
+
+export type EmailValidationProxyConfig = {
+    /**
+     * Proxy host
+     */
+    host: string;
+    /**
+     * Proxy port
+     */
+    port: number;
+    /**
+     * Optional proxy username
+     */
+    username?: string | null;
+    /**
+     * Optional proxy password
+     */
+    password?: string | null;
+};
+
+export type ValidateEmailResponse = {
+    /**
+     * The email address that was validated
+     */
+    email: string;
+    /**
+     * Overall reachability status: safe, risky, invalid, or unknown
+     */
+    is_reachable: ReachabilityStatus;
+    /**
+     * Syntax validation result
+     */
+    syntax: EmailSyntaxResult;
+    /**
+     * MX record validation result
+     */
+    mx: EmailMxResult;
+    /**
+     * Miscellaneous validation result
+     */
+    misc: EmailMiscResult;
+    /**
+     * SMTP validation result
+     */
+    smtp: EmailSmtpResult;
+};
+
+/**
+ * Email reachability status
+ */
+export type ReachabilityStatus = 'safe' | 'risky' | 'invalid' | 'unknown';
+
+export type EmailSyntaxResult = {
+    /**
+     * Whether the email syntax is valid
+     */
+    is_valid_syntax: boolean;
+    /**
+     * The domain part of the email
+     */
+    domain?: string | null;
+    /**
+     * The username part of the email
+     */
+    username?: string | null;
+    /**
+     * Suggested email correction if available
+     */
+    suggestion?: string | null;
+};
+
+export type EmailMxResult = {
+    /**
+     * Whether the domain accepts mail
+     */
+    accepts_mail: boolean;
+    /**
+     * List of MX records for the domain
+     */
+    records: Array<string>;
+    /**
+     * Error message if MX lookup failed
+     */
+    error?: string | null;
+};
+
+export type EmailMiscResult = {
+    /**
+     * Whether the email is from a disposable email provider
+     */
+    is_disposable: boolean;
+    /**
+     * Whether the email is a role-based account (e.g., admin@, info@)
+     */
+    is_role_account: boolean;
+    /**
+     * Whether the email provider is a B2C (consumer) email provider
+     */
+    is_b2c: boolean;
+    /**
+     * Gravatar URL if available
+     */
+    gravatar_url?: string | null;
+};
+
+export type EmailSmtpResult = {
+    /**
+     * Whether we could connect to the SMTP server
+     */
+    can_connect_smtp: boolean;
+    /**
+     * Whether the mailbox appears to have a full inbox
+     */
+    has_full_inbox: boolean;
+    /**
+     * Whether this is a catch-all domain
+     */
+    is_catch_all: boolean;
+    /**
+     * Whether the email is deliverable
+     */
+    is_deliverable: boolean;
+    /**
+     * Whether the mailbox is disabled
+     */
+    is_disabled: boolean;
+    /**
+     * Error message if SMTP check failed
+     */
+    error?: string | null;
+};
+
 export type EnrichVisitorRequest = {
     custom_data: {
         [key: string]: unknown;
@@ -9277,6 +9419,41 @@ export type GetEmailStatsResponses = {
 };
 
 export type GetEmailStatsResponse = GetEmailStatsResponses[keyof GetEmailStatsResponses];
+
+export type ValidateEmailData = {
+    body: ValidateEmailRequest;
+    path?: never;
+    query?: never;
+    url: '/emails/validate';
+};
+
+export type ValidateEmailErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ValidateEmailResponses = {
+    /**
+     * Email validation result
+     */
+    200: ValidateEmailResponse;
+};
+
+export type ValidateEmailResponse2 = ValidateEmailResponses[keyof ValidateEmailResponses];
 
 export type GetEmailData = {
     body?: never;

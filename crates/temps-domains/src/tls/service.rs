@@ -1,7 +1,8 @@
 use anyhow::Result;
 use chrono::Utc;
-use hickory_resolver::config::{LookupIpStrategy, ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{LookupIpStrategy, ResolveHosts, ResolverConfig, ResolverOpts};
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::Resolver;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
 use temps_core::notifications::{
@@ -14,10 +15,13 @@ use super::models::*;
 use super::providers::CertificateProvider;
 use super::repository::CertificateRepository;
 
+/// Type alias for the Tokio-based DNS resolver
+type TokioResolver = Resolver<TokioConnectionProvider>;
+
 pub struct TlsService {
     repository: Arc<dyn CertificateRepository>,
     cert_provider: Arc<dyn CertificateProvider>,
-    resolver: Arc<TokioAsyncResolver>,
+    resolver: Arc<TokioResolver>,
     notification_service: Option<Arc<dyn NotificationService>>,
     config_service: Option<Arc<temps_config::ConfigService>>,
     db: Option<Arc<temps_database::DbConnection>>,
@@ -31,15 +35,19 @@ impl TlsService {
         // Create a cached DNS resolver
         let mut options = ResolverOpts::default();
         options.cache_size = 256;
-        options.use_hosts_file = false;
+        options.use_hosts_file = ResolveHosts::Never;
         options.edns0 = true;
         options.ip_strategy = LookupIpStrategy::Ipv4Only;
         options.try_tcp_on_error = true;
 
-        let resolver = Arc::new(TokioAsyncResolver::tokio(
-            ResolverConfig::cloudflare(),
-            options,
-        ));
+        let resolver = Arc::new(
+            Resolver::builder_with_config(
+                ResolverConfig::cloudflare(),
+                TokioConnectionProvider::default(),
+            )
+            .with_options(options)
+            .build(),
+        );
 
         Self {
             repository,

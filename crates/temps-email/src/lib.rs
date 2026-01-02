@@ -20,4 +20,7 @@ pub mod services;
 pub use errors::EmailError;
 pub use plugin::EmailPlugin;
 pub use providers::{EmailProvider, EmailProviderType};
-pub use services::{DomainService, EmailService, ProviderService};
+pub use services::{
+    DomainService, EmailService, ProviderService, ValidateEmailRequest, ValidateEmailResponse,
+    ValidationService,
+};
