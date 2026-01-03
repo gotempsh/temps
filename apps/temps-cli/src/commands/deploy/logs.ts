@@ -11,6 +11,7 @@ import { startSpinner, succeedSpinner, failSpinner } from '../../ui/spinner.js'
 import { newline, colors, info, warning } from '../../ui/output.js'
 
 interface LogsOptions {
+  project?: string
   environment: string
   follow?: boolean
   lines: string
@@ -24,14 +25,14 @@ interface LogEntry {
   line?: number
 }
 
-export async function logs(project: string, options: LogsOptions): Promise<void> {
+export async function logs(options: LogsOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const projectName = project ?? config.get('defaultProject')
+  const projectName = options.project ?? config.get('defaultProject')
 
   if (!projectName) {
-    warning('No project specified')
+    warning('No project specified. Use: temps logs --project <project>')
     return
   }
 

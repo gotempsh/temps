@@ -7,6 +7,7 @@ use axum::response::Response;
 use axum::Router;
 use chrono;
 use colored::Colorize;
+use futures::FutureExt;
 use include_dir::{include_dir, Dir};
 use rand::Rng;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
@@ -787,6 +788,46 @@ pub async fn start_console_api(
         debug!("Backup scheduler started in background");
         // Note: Currently no graceful shutdown mechanism for cancellation_token
         // In the future, this could be wired to a shutdown signal handler
+    }
+
+    // Start certificate renewal scheduler (optional - fails gracefully if TlsService unavailable)
+    if let Some(tls_service) = service_context.get_service::<temps_domains::TlsService>() {
+        let cancellation_token = tokio_util::sync::CancellationToken::new();
+        let scheduler_token = cancellation_token.clone();
+        let scheduler_service = tls_service.clone();
+
+        tokio::spawn(async move {
+            debug!("Starting certificate renewal scheduler");
+            // Catch any panics to prevent scheduler issues from crashing the main task
+            let result = std::panic::AssertUnwindSafe(async {
+                scheduler_service
+                    .start_certificate_renewal_scheduler(scheduler_token)
+                    .await
+            })
+            .catch_unwind()
+            .await;
+
+            match result {
+                Ok(Ok(())) => {
+                    debug!("Certificate renewal scheduler completed normally");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Certificate renewal scheduler error (non-fatal): {}", e);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Certificate renewal scheduler panicked (non-fatal) - scheduler stopped"
+                    );
+                }
+            }
+        });
+
+        debug!("Certificate renewal scheduler started in background");
+    } else {
+        tracing::warn!(
+            "TlsService not available - certificate renewal scheduler disabled. \
+             This is non-fatal but automatic certificate renewal will not work."
+        );
     }
 
     // Build the application with all plugin routes and OpenAPI schemas

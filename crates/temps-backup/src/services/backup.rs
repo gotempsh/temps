@@ -230,6 +230,13 @@ impl BackupService {
             .map_err(BackupError::Io)?
             .len() as i32;
 
+        // Validate backup size - a zero-size backup indicates failure
+        if size_bytes == 0 {
+            return Err(BackupError::Validation(
+                "Backup failed: backup file has zero size".to_string(),
+            ));
+        }
+
         // Generate S3 location
         let s3_location = format!(
             "{}/backups/{}/{}/backup.postgresql.gz",

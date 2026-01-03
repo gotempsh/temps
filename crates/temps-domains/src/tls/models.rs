@@ -39,6 +39,7 @@ pub struct HttpChallengeData {
     pub token: String,
     pub key_authorization: String,
     pub validation_url: Option<String>,
+    pub order_url: Option<String>,
     pub created_at: UtcDateTime,
 }
 

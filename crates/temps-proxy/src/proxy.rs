@@ -1822,6 +1822,43 @@ impl ProxyHttp for LoadBalancer {
             return Ok(true); // Request handled
         }
 
+        // Handle ACME HTTP-01 challenges BEFORE redirects
+        // This ensures domains configured as redirects can still complete certificate provisioning
+        if let Some(key_authorization) = self
+            .handle_acme_http_challenge(&ctx.host, &ctx.path)
+            .await?
+        {
+            debug!(
+                "Serving ACME HTTP-01 challenge response for {}{} (request_id={}) - before redirect check",
+                ctx.host, ctx.path, ctx.request_id
+            );
+
+            let key_auth_bytes = Bytes::from(key_authorization.clone());
+            let content_length = key_auth_bytes.len();
+
+            let mut resp = ResponseHeader::build(200, None)?;
+            resp.insert_header("Content-Type", "text/plain")?;
+            resp.insert_header("Cache-Control", "no-cache")?;
+            resp.insert_header("X-Request-ID", &ctx.request_id)?;
+            resp.insert_header("Content-Length", content_length.to_string())?;
+            resp.insert_header("Connection", "close")?;
+
+            session.write_response_header(Box::new(resp), false).await?;
+            session
+                .write_response_body(Some(key_auth_bytes), true)
+                .await?;
+
+            info!(
+                "ACME challenge completed (redirect domain): {} {} - 200 OK - {}ms",
+                ctx.method,
+                ctx.path,
+                ctx.start_time.elapsed().as_millis()
+            );
+
+            ctx.routing_status = "acme_challenge".to_string();
+            return Ok(true);
+        }
+
         // Check if this host should redirect
         if let Some((redirect_url, status_code)) = self
             .project_context_resolver

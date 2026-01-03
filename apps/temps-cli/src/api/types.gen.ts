@@ -117,6 +117,14 @@ export type AddEventsResponse = {
     message: string;
 };
 
+/**
+ * Request to add a managed domain
+ */
+export type AddManagedDomainApiRequest = {
+    auto_manage?: boolean;
+    domain: string;
+};
+
 export type AggregatedBucketItem = {
     count: number;
     timestamp: string;
@@ -200,6 +208,7 @@ export type ApiKeyResponse = {
  */
 export type AppSettings = {
     allow_readonly_external_access?: boolean;
+    disk_space_alert?: DiskSpaceAlertSettings;
     dns_provider?: DnsProviderSettings;
     docker_registry?: DockerRegistrySettings;
     external_url?: string | null;
@@ -557,6 +566,14 @@ export type ConnectionResponse = {
 };
 
 /**
+ * Connection test result
+ */
+export type ConnectionTestResult = {
+    message: string;
+    success: boolean;
+};
+
+/**
  * Response indicating success of container state change
  */
 export type ContainerActionResponse = {
@@ -729,6 +746,28 @@ export type CreateDsnRequest = {
     name?: string | null;
 };
 
+/**
+ * Request to create a new DNS provider
+ */
+export type CreateDnsProviderRequest = {
+    /**
+     * Provider credentials
+     */
+    credentials: DnsProviderCredentials;
+    /**
+     * Optional description
+     */
+    description?: string | null;
+    /**
+     * User-friendly name
+     */
+    name: string;
+    /**
+     * Provider type
+     */
+    provider_type: DnsProviderType;
+};
+
 export type CreateDomainRequest = {
     /**
      * Challenge type for Let's Encrypt validation. Options: "http-01" (default) or "dns-01"
@@ -737,10 +776,32 @@ export type CreateDomainRequest = {
     domain: string;
 };
 
+export type CreateEmailDomainRequest = {
+    /**
+     * Domain name (e.g., "updates.example.com")
+     */
+    domain: string;
+    /**
+     * Provider ID to use for this domain
+     */
+    provider_id: number;
+};
+
 export type CreateEmailProviderRequest = {
-    config: EmailConfig;
-    enabled?: boolean | null;
+    /**
+     * User-friendly name for the provider
+     */
     name: string;
+    /**
+     * Provider type
+     */
+    provider_type: EmailProviderTypeRoute;
+    /**
+     * Cloud region
+     */
+    region: string;
+    scaleway_credentials?: null | ScalewayCredentialsRequest;
+    ses_credentials?: null | SesCredentialsRequest;
 };
 
 export type CreateEnvironmentRequest = {
@@ -931,6 +992,11 @@ export type CreateRouteRequest = {
     domain: string;
     host: string;
     port: number;
+    /**
+     * Route type: "http" (default) matches on HTTP Host header,
+     * "tls" matches on TLS SNI hostname for TCP passthrough
+     */
+    route_type?: string | null;
 };
 
 export type CreateS3SourceRequest = {
@@ -961,6 +1027,25 @@ export type CreateUserRequest = {
     password?: string | null;
     roles: Array<string>;
     username: string;
+};
+
+export type CreateWebhookRequestBody = {
+    /**
+     * Whether the webhook is enabled
+     */
+    enabled?: boolean | null;
+    /**
+     * Event types to subscribe to
+     */
+    events: Array<string>;
+    /**
+     * Secret for HMAC signature verification (optional)
+     */
+    secret?: string | null;
+    /**
+     * Target URL for webhook delivery
+     */
+    url: string;
 };
 
 export type CronExecutionInfo = {
@@ -1292,13 +1377,15 @@ export type DeviceCount = {
 
 /**
  * Sections that can be included in the weekly digest
+ * Note: `#[serde(default)]` allows backward compatibility when deserializing
+ * old data that may have `security` and `resources` fields instead of `projects`
  */
 export type DigestSections = {
-    deployments: boolean;
-    errors: boolean;
-    funnels: boolean;
-    performance: boolean;
-    projects: boolean;
+    deployments?: boolean;
+    errors?: boolean;
+    funnels?: boolean;
+    performance?: boolean;
+    projects?: boolean;
 };
 
 export type DisableMfaRequest = {
@@ -1327,6 +1414,50 @@ export type DiscoverResponse = {
      * Discovered workloads
      */
     workloads: Array<WorkloadDescriptor>;
+};
+
+/**
+ * Disk space alert settings for monitoring disk usage
+ */
+export type DiskSpaceAlertSettings = {
+    /**
+     * Interval in seconds between disk space checks
+     */
+    check_interval_seconds?: number;
+    /**
+     * Whether disk space alerts are enabled
+     */
+    enabled?: boolean;
+    /**
+     * Path to monitor (defaults to data directory)
+     */
+    monitor_path?: string | null;
+    /**
+     * Threshold percentage (0-100) at which to trigger alerts
+     */
+    threshold_percent?: number;
+};
+
+/**
+ * Result of a single DNS TXT record creation for ACME challenge
+ */
+export type DnsChallengeRecordResult = {
+    /**
+     * Human-readable message about the operation
+     */
+    message: string;
+    /**
+     * TXT record name (e.g., "_acme-challenge.example.com")
+     */
+    name: string;
+    /**
+     * Whether the record was created successfully
+     */
+    success: boolean;
+    /**
+     * TXT record value (the ACME challenge token)
+     */
+    value: string;
 };
 
 export type DnsCompletionResponse = {
@@ -1380,6 +1511,61 @@ export type DnsLookupResponse = {
     records: Array<string>;
 };
 
+/**
+ * DNS provider credentials (API-facing)
+ */
+export type DnsProviderCredentials = {
+    account_id?: string | null;
+    api_token: string;
+    type: 'cloudflare';
+} | {
+    api_key: string;
+    api_user: string;
+    client_ip?: string | null;
+    sandbox?: boolean;
+    type: 'namecheap';
+} | {
+    access_key_id: string;
+    region?: string | null;
+    secret_access_key: string;
+    session_token?: string | null;
+    type: 'route53';
+} | {
+    api_token: string;
+    type: 'digitalocean';
+} | {
+    private_key: string;
+    project_id: string;
+    service_account_email: string;
+    type: 'gcp';
+} | {
+    client_id: string;
+    client_secret: string;
+    resource_group: string;
+    subscription_id: string;
+    tenant_id: string;
+    type: 'azure';
+};
+
+/**
+ * DNS provider response
+ */
+export type DnsProviderResponse = {
+    created_at: string;
+    /**
+     * Masked credentials for display
+     */
+    credentials: unknown;
+    description?: string | null;
+    id: number;
+    is_active: boolean;
+    last_error?: string | null;
+    last_used_at?: string | null;
+    name: string;
+    provider_type: string;
+    updated_at: string;
+};
+
 export type DnsProviderSettings = {
     cloudflare_api_key?: string | null;
     provider?: string;
@@ -1391,6 +1577,216 @@ export type DnsProviderSettings = {
 export type DnsProviderSettingsMasked = {
     cloudflare_api_key?: string | null;
     provider: string;
+};
+
+/**
+ * Supported DNS provider types
+ */
+export type DnsProviderType = 'cloudflare' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure' | 'manual';
+
+/**
+ * A DNS record
+ */
+export type DnsRecord = {
+    /**
+     * Record content
+     */
+    content: DnsRecordContent;
+    /**
+     * Fully qualified domain name
+     */
+    fqdn: string;
+    /**
+     * Provider-specific record ID (if exists)
+     */
+    id?: string | null;
+    /**
+     * Provider-specific metadata
+     */
+    metadata?: {
+        [key: string]: string;
+    };
+    /**
+     * Record name (without zone, e.g., "www" or "@" for root)
+     */
+    name: string;
+    /**
+     * Whether this record is proxied (Cloudflare-specific)
+     */
+    proxied?: boolean;
+    /**
+     * Time to live in seconds
+     */
+    ttl: number;
+    /**
+     * Zone/domain this record belongs to
+     */
+    zone: string;
+};
+
+/**
+ * DNS record content - varies by record type
+ */
+export type DnsRecordContent = {
+    type: 'A';
+    /**
+     * A record - IPv4 address (as string, e.g., "192.0.2.1")
+     */
+    value: {
+        address: string;
+    };
+} | {
+    type: 'AAAA';
+    /**
+     * AAAA record - IPv6 address (as string, e.g., "2001:db8::1")
+     */
+    value: {
+        address: string;
+    };
+} | {
+    type: 'CNAME';
+    /**
+     * CNAME record - canonical name
+     */
+    value: {
+        target: string;
+    };
+} | {
+    type: 'TXT';
+    /**
+     * TXT record - text content
+     */
+    value: {
+        content: string;
+    };
+} | {
+    type: 'MX';
+    /**
+     * MX record - mail exchange
+     */
+    value: {
+        priority: number;
+        target: string;
+    };
+} | {
+    type: 'NS';
+    /**
+     * NS record - nameserver
+     */
+    value: {
+        nameserver: string;
+    };
+} | {
+    type: 'SRV';
+    /**
+     * SRV record - service
+     */
+    value: {
+        port: number;
+        priority: number;
+        target: string;
+        weight: number;
+    };
+} | {
+    type: 'CAA';
+    /**
+     * CAA record - certification authority authorization
+     */
+    value: {
+        flags: number;
+        tag: string;
+        value: string;
+    };
+} | {
+    type: 'PTR';
+    /**
+     * PTR record - pointer
+     */
+    value: {
+        target: string;
+    };
+};
+
+export type DnsRecordResponse = {
+    /**
+     * DNS record name (host)
+     */
+    name: string;
+    /**
+     * Priority (for MX records)
+     */
+    priority?: number | null;
+    /**
+     * Record type: TXT, CNAME, MX
+     */
+    record_type: string;
+    /**
+     * Verification status: unknown, verified, pending, failed
+     */
+    status: DnsRecordStatusResponse;
+    /**
+     * DNS record value
+     */
+    value: string;
+};
+
+/**
+ * Result of a single DNS record creation
+ */
+export type DnsRecordSetupResult = {
+    /**
+     * Whether the operation was automatic or manual
+     */
+    automatic: boolean;
+    /**
+     * Human-readable message
+     */
+    message: string;
+    /**
+     * Record name
+     */
+    name: string;
+    /**
+     * Record type (TXT, CNAME, MX)
+     */
+    record_type: string;
+    /**
+     * Whether the record was created successfully
+     */
+    success: boolean;
+};
+
+/**
+ * DNS record verification status
+ */
+export type DnsRecordStatusResponse = 'unknown' | 'verified' | 'pending' | 'failed';
+
+/**
+ * A DNS zone (domain managed by the provider)
+ */
+export type DnsZone = {
+    /**
+     * Provider-specific zone ID
+     */
+    id: string;
+    /**
+     * Provider-specific metadata
+     */
+    metadata?: {
+        [key: string]: string;
+    };
+    /**
+     * Zone name (domain)
+     */
+    name: string;
+    /**
+     * Nameservers for this zone
+     */
+    nameservers: Array<string>;
+    /**
+     * Zone status
+     */
+    status: string;
 };
 
 export type DockerRegistrySettings = {
@@ -1483,6 +1879,73 @@ export type EmailConfig = {
     tls_mode?: TlsMode;
     to_addresses: Array<string>;
     username: string;
+};
+
+export type EmailDomainResponse = {
+    created_at: string;
+    domain: string;
+    id: number;
+    last_verified_at?: string | null;
+    provider_id: number;
+    status: string;
+    updated_at: string;
+    verification_error?: string | null;
+};
+
+export type EmailDomainWithDnsResponse = {
+    dns_records: Array<DnsRecordResponse>;
+    domain: EmailDomainResponse;
+};
+
+export type EmailProviderResponse = {
+    created_at: string;
+    /**
+     * Masked credentials for display
+     */
+    credentials: unknown;
+    id: number;
+    is_active: boolean;
+    name: string;
+    provider_type: EmailProviderTypeRoute;
+    region: string;
+    updated_at: string;
+};
+
+export type EmailProviderTypeRoute = 'ses' | 'scaleway';
+
+export type EmailResponse = {
+    bcc_addresses?: Array<string> | null;
+    cc_addresses?: Array<string> | null;
+    created_at: string;
+    domain_id?: number | null;
+    error_message?: string | null;
+    from_address: string;
+    from_name?: string | null;
+    headers?: {
+        [key: string]: string;
+    } | null;
+    html_body?: string | null;
+    id: string;
+    project_id?: number | null;
+    provider_message_id?: string | null;
+    reply_to?: string | null;
+    sent_at?: string | null;
+    status: string;
+    subject: string;
+    tags?: Array<string> | null;
+    text_body?: string | null;
+    to_addresses: Array<string>;
+};
+
+export type EmailStatsResponse = {
+    /**
+     * Emails captured without sending (Mailhog mode - no provider configured)
+     */
+    captured: number;
+    failed: number;
+    queued: number;
+    sent: number;
+    total: number;
 };
 
 export type EmailStatusResponse = {
@@ -1835,6 +2298,12 @@ export type EventTypeBreakdownQuery = {
     start_date: string;
 };
 
+export type EventTypeResponse = {
+    category: string;
+    description: string;
+    event_type: string;
+};
+
 export type EventTypesResponse = {
     events: Array<EventType>;
 };
@@ -1950,6 +2419,27 @@ export type ExternalImageResponse = {
     image_ref: string;
     pushed_at: string;
     size?: number | null;
+};
+
+/**
+ * Response type for external service backup
+ */
+export type ExternalServiceBackupResponse = {
+    backup_id: number;
+    backup_type: string;
+    checksum?: string | null;
+    compression_type: string;
+    created_by: number;
+    error_message?: string | null;
+    expires_at?: string | null;
+    finished_at?: string | null;
+    id: number;
+    metadata: unknown;
+    s3_location: string;
+    service_id: number;
+    size_bytes?: number | null;
+    started_at: string;
+    state: string;
 };
 
 export type ExternalServiceDetails = {
@@ -2635,6 +3125,17 @@ export type ListPresetsResponse = {
     total: number;
 };
 
+export type ListScansQuery = {
+    page?: number | null;
+    page_size?: number | null;
+};
+
+export type ListVulnerabilitiesQuery = {
+    page?: number | null;
+    page_size?: number | null;
+    severity?: string | null;
+};
+
 export type LiveVisitorInfo = {
     city?: string | null;
     country?: string | null;
@@ -2685,6 +3186,22 @@ export type LoginRequest = {
 
 export type MagicLinkRequest = {
     email: string;
+};
+
+/**
+ * Managed domain response
+ */
+export type ManagedDomainResponse = {
+    auto_manage: boolean;
+    created_at: string;
+    domain: string;
+    id: number;
+    provider_id: number;
+    updated_at: string;
+    verification_error?: string | null;
+    verified: boolean;
+    verified_at?: string | null;
+    zone_id?: string | null;
 };
 
 export type MetricsOverTimeResponse = {
@@ -2744,6 +3261,28 @@ export type MfaVerificationRequest = {
     code: string;
 };
 
+/**
+ * Miscellaneous validation result
+ */
+export type MiscResult = {
+    /**
+     * Gravatar URL if available
+     */
+    gravatar_url?: string | null;
+    /**
+     * Whether the email provider is a B2C (consumer) email provider
+     */
+    is_b2c: boolean;
+    /**
+     * Whether the email is from a disposable email provider
+     */
+    is_disposable: boolean;
+    /**
+     * Whether the email is a role-based account (e.g., admin@, info@)
+     */
+    is_role_account: boolean;
+};
+
 export type MonitorResponse = {
     check_interval_seconds: number;
     created_at: string;
@@ -2762,6 +3301,24 @@ export type MonitorStatus = {
     current_status: string;
     monitor: MonitorResponse;
     uptime_percentage: number;
+};
+
+/**
+ * MX (Mail Exchange) validation result
+ */
+export type MxResult = {
+    /**
+     * Whether the domain accepts mail
+     */
+    accepts_mail: boolean;
+    /**
+     * Error message if MX lookup failed
+     */
+    error?: string | null;
+    /**
+     * List of MX records for the domain
+     */
+    records: Array<string>;
 };
 
 /**
@@ -2928,6 +3485,13 @@ export type PageVisit = {
 export type PagesComparisonResponse = {
     comparisons: Array<PageSessionComparison>;
     page_paths: Array<string>;
+};
+
+export type PaginatedEmailsResponse = {
+    data: Array<EmailResponse>;
+    page: number;
+    page_size: number;
+    total: number;
 };
 
 export type PaginatedEntitiesResponse = {
@@ -3136,6 +3700,36 @@ export type PortMapping = {
  * Use the appropriate configuration type based on your preset
  */
 export type PresetConfigSchema = DockerfilePresetConfig | NixpacksPresetConfig | StaticPresetConfig;
+
+/**
+ * Detected preset information
+ */
+export type PresetInfo = {
+    /**
+     * Default exposed port for this preset
+     */
+    exposed_port?: number | null;
+    /**
+     * Icon URL for this preset
+     */
+    icon_url?: string | null;
+    /**
+     * Path where preset was detected (empty for root)
+     */
+    path: string;
+    /**
+     * Preset slug (e.g., "nextjs", "fastapi")
+     */
+    preset: string;
+    /**
+     * Human-readable preset label
+     */
+    preset_label: string;
+    /**
+     * Project type (e.g., "frontend", "backend", "fullstack")
+     */
+    project_type: string;
+};
 
 export type PresetResponse = {
     /**
@@ -3509,6 +4103,80 @@ export type ProxyLogsPaginatedResponse = {
 };
 
 /**
+ * Proxy configuration for email validation
+ */
+export type ProxyRequest = {
+    /**
+     * Proxy host
+     */
+    host: string;
+    /**
+     * Optional proxy password
+     */
+    password?: string | null;
+    /**
+     * Proxy port
+     */
+    port: number;
+    /**
+     * Optional proxy username
+     */
+    username?: string | null;
+};
+
+/**
+ * Response for preset detection
+ */
+export type PublicPresetResponse = {
+    /**
+     * Branch name where presets were detected
+     */
+    branch: string;
+    /**
+     * List of detected presets
+     */
+    presets: Array<PresetInfo>;
+};
+
+/**
+ * Public repository information
+ */
+export type PublicRepositoryInfo = {
+    /**
+     * Default branch name
+     */
+    default_branch: string;
+    /**
+     * Repository description
+     */
+    description?: string | null;
+    /**
+     * Fork count
+     */
+    forks: number;
+    /**
+     * Full repository name (owner/repo)
+     */
+    full_name: string;
+    /**
+     * Primary programming language
+     */
+    language?: string | null;
+    /**
+     * Repository name
+     */
+    name: string;
+    /**
+     * Repository owner
+     */
+    owner: string;
+    /**
+     * Star count
+     */
+    stars: number;
+};
+
+/**
  * Request to push an external image
  */
 export type PushImageRequest = {
@@ -3590,6 +4258,18 @@ export type RateLimitSettings = {
     max_requests_per_hour?: number;
     max_requests_per_minute?: number;
     whitelist_ips?: Array<string>;
+};
+
+/**
+ * Email reachability status
+ */
+export type ReachabilityStatus = 'safe' | 'risky' | 'invalid' | 'unknown';
+
+/**
+ * Record list response
+ */
+export type RecordListResponse = {
+    records: Array<DnsRecord>;
 };
 
 export type ReferrerCount = {
@@ -3730,6 +4410,10 @@ export type RouteResponse = {
     host: string;
     id: number;
     port: number;
+    /**
+     * Route type: "http" or "tls"
+     */
+    route_type: string;
     updated_at: number;
 };
 
@@ -3762,6 +4446,17 @@ export type RunBackupRequest = {
     backup_type: string;
 };
 
+export type RunExternalServiceBackupRequest = {
+    /**
+     * Type of backup to perform (e.g., "full", "incremental")
+     */
+    backup_type?: string | null;
+    /**
+     * ID of the S3 source to store the backup
+     */
+    s3_source_id: number;
+};
+
 /**
  * Response type for S3 source
  */
@@ -3776,6 +4471,34 @@ export type S3SourceResponse = {
     name: string;
     region: string;
     updated_at: number;
+};
+
+export type ScalewayCredentialsRequest = {
+    api_key: string;
+    project_id: string;
+};
+
+export type ScanResponse = {
+    branch?: string | null;
+    commit_hash?: string | null;
+    completed_at?: string | null;
+    created_at: string;
+    critical_count: number;
+    deployment_id?: number | null;
+    environment_id?: number | null;
+    error_message?: string | null;
+    high_count: number;
+    id: number;
+    low_count: number;
+    medium_count: number;
+    project_id: number;
+    scanner_type: string;
+    scanner_version?: string | null;
+    started_at: string;
+    status: string;
+    total_count: number;
+    unknown_count: number;
+    updated_at: string;
 };
 
 export type ScreenshotSettings = {
@@ -3849,6 +4572,70 @@ export type SecurityHeadersSettings = {
     x_xss_protection?: string;
 };
 
+export type SendEmailRequestBody = {
+    /**
+     * BCC recipients
+     */
+    bcc?: Array<string> | null;
+    /**
+     * CC recipients
+     */
+    cc?: Array<string> | null;
+    /**
+     * Sender email address (domain will be auto-extracted for lookup)
+     */
+    from: string;
+    /**
+     * Sender display name
+     */
+    from_name?: string | null;
+    /**
+     * Custom headers
+     */
+    headers?: {
+        [key: string]: string;
+    } | null;
+    /**
+     * HTML body content
+     */
+    html?: string | null;
+    /**
+     * Reply-to address
+     */
+    reply_to?: string | null;
+    /**
+     * Email subject
+     */
+    subject: string;
+    /**
+     * Tags for categorization
+     */
+    tags?: Array<string> | null;
+    /**
+     * Plain text body content
+     */
+    text?: string | null;
+    /**
+     * Recipient email addresses
+     */
+    to: Array<string>;
+};
+
+export type SendEmailResponseBody = {
+    /**
+     * Email ID
+     */
+    id: string;
+    /**
+     * Provider message ID
+     */
+    provider_message_id?: string | null;
+    /**
+     * Email status
+     */
+    status: string;
+};
+
 export type SentryEventRequest = {
     event_id?: string | null;
     message?: string | null;
@@ -3902,6 +4689,11 @@ export type ServiceTypeInfo = {
 };
 
 export type ServiceTypeRoute = 'mongodb' | 'postgres' | 'redis' | 's3';
+
+export type SesCredentialsRequest = {
+    access_key_id: string;
+    secret_access_key: string;
+};
 
 export type SessionDetails = {
     duration_seconds: number;
@@ -4080,6 +4872,78 @@ export type SettingsUpdateResponse = {
     message: string;
 };
 
+/**
+ * Request to setup DNS challenge records using a configured DNS provider
+ */
+export type SetupDnsChallengeRequest = {
+    /**
+     * The ID of the DNS provider to use for creating the TXT records
+     */
+    dns_provider_id: number;
+};
+
+/**
+ * Response from DNS challenge setup operation
+ */
+export type SetupDnsChallengeResponse = {
+    /**
+     * Human-readable summary message
+     */
+    message: string;
+    /**
+     * Number of TXT records that were successfully created
+     */
+    records_created: number;
+    /**
+     * Results for each individual TXT record
+     */
+    results: Array<DnsChallengeRecordResult>;
+    /**
+     * Overall success status (true if all records were created)
+     */
+    success: boolean;
+    /**
+     * Total number of TXT records required for the challenge
+     */
+    total_records: number;
+};
+
+/**
+ * Request to setup DNS records using a configured DNS provider
+ */
+export type SetupDnsRequest = {
+    /**
+     * The ID of the DNS provider to use for creating records
+     */
+    dns_provider_id: number;
+};
+
+/**
+ * Response from DNS setup operation
+ */
+export type SetupDnsResponse = {
+    /**
+     * Human-readable summary message
+     */
+    message: string;
+    /**
+     * Number of records that were successfully created
+     */
+    records_created: number;
+    /**
+     * Results for each individual record
+     */
+    results: Array<DnsRecordSetupResult>;
+    /**
+     * Overall success status
+     */
+    success: boolean;
+    /**
+     * Total number of records attempted
+     */
+    total_records: number;
+};
+
 export type SlackConfig = {
     channel?: string | null;
     webhook_url: string;
@@ -4165,6 +5029,36 @@ export type SmartFilter = {
         path: string;
         value: string;
     };
+};
+
+/**
+ * SMTP validation result
+ */
+export type SmtpResult = {
+    /**
+     * Whether we could connect to the SMTP server
+     */
+    can_connect_smtp: boolean;
+    /**
+     * Error message if SMTP check failed
+     */
+    error?: string | null;
+    /**
+     * Whether the mailbox appears to have a full inbox
+     */
+    has_full_inbox: boolean;
+    /**
+     * Whether this is a catch-all domain
+     */
+    is_catch_all: boolean;
+    /**
+     * Whether the email is deliverable
+     */
+    is_deliverable: boolean;
+    /**
+     * Whether the mailbox is disabled
+     */
+    is_disabled: boolean;
 };
 
 /**
@@ -4384,6 +5278,28 @@ export type SyncedRepositoryListQuery = {
     sort?: string | null;
 };
 
+/**
+ * Syntax validation result
+ */
+export type SyntaxResult = {
+    /**
+     * The domain part of the email
+     */
+    domain?: string | null;
+    /**
+     * Whether the email syntax is valid
+     */
+    is_valid_syntax: boolean;
+    /**
+     * Suggested email correction if available
+     */
+    suggestion?: string | null;
+    /**
+     * The username part of the email
+     */
+    username?: string | null;
+};
+
 export type TagInfo = {
     commit_sha: string;
     name: string;
@@ -4391,6 +5307,42 @@ export type TagInfo = {
 
 export type TagListResponse = {
     tags: Array<TagInfo>;
+};
+
+/**
+ * Request body for testing an email provider
+ */
+export type TestEmailRequest = {
+    /**
+     * Sender email address (must be verified with the provider)
+     */
+    from: string;
+    /**
+     * Sender display name
+     */
+    from_name?: string | null;
+};
+
+/**
+ * Response for test email endpoint
+ */
+export type TestEmailResponse = {
+    /**
+     * Error message if the test failed
+     */
+    error?: string | null;
+    /**
+     * Provider message ID if successful
+     */
+    provider_message_id?: string | null;
+    /**
+     * The email address the test was sent to
+     */
+    sent_to: string;
+    /**
+     * Whether the test email was sent successfully
+     */
+    success: boolean;
 };
 
 export type TestProviderResponse = {
@@ -4482,6 +5434,19 @@ export type TriggerPipelineResponse = {
     tag?: string | null;
 };
 
+export type TriggerScanRequest = {
+    /**
+     * Environment ID to scan (uses the current deployment for this environment)
+     */
+    environment_id: number;
+};
+
+export type TriggerScanResponse = {
+    message: string;
+    scan_id: number;
+    status: string;
+};
+
 export type TxtRecord = {
     name: string;
     value: string;
@@ -4547,6 +5512,25 @@ export type UpdateDeploymentConfigRequest = {
     replicas?: number | null;
     security?: null | SecurityConfig;
     sessionRecordingEnabled?: boolean | null;
+};
+
+/**
+ * Request to update a DNS provider
+ */
+export type UpdateDnsProviderRequest = {
+    credentials?: null | DnsProviderCredentials;
+    /**
+     * New description
+     */
+    description?: string | null;
+    /**
+     * Active status
+     */
+    is_active?: boolean | null;
+    /**
+     * New name
+     */
+    name?: string | null;
 };
 
 export type UpdateEmailProviderRequest = {
@@ -4667,6 +5651,11 @@ export type UpdateRouteRequest = {
     enabled: boolean;
     host: string;
     port: number;
+    /**
+     * Route type: "http" (default) matches on HTTP Host header,
+     * "tls" matches on TLS SNI hostname for TCP passthrough
+     */
+    route_type?: string | null;
 };
 
 export type UpdateS3SourceRequest = {
@@ -4753,6 +5742,25 @@ export type UpdateUserRequest = {
     name?: string | null;
 };
 
+export type UpdateWebhookRequestBody = {
+    /**
+     * Whether the webhook is enabled
+     */
+    enabled?: boolean | null;
+    /**
+     * Event types to subscribe to
+     */
+    events?: Array<string> | null;
+    /**
+     * Secret for HMAC signature verification
+     */
+    secret?: string | null;
+    /**
+     * Target URL for webhook delivery
+     */
+    url?: string | null;
+};
+
 export type UpgradeExternalServiceRequest = {
     /**
      * Docker image to upgrade to (e.g., "postgres:17-alpine")
@@ -4780,6 +5788,47 @@ export type UserResponse = {
     mfa_enabled: boolean;
     name: string;
     username: string;
+};
+
+/**
+ * Request body for validating an email address
+ */
+export type ValidateEmailRequest = {
+    /**
+     * Email address to validate
+     */
+    email: string;
+    proxy?: null | ProxyRequest;
+};
+
+/**
+ * Complete email validation response
+ */
+export type ValidateEmailResponse = {
+    /**
+     * The email address that was validated
+     */
+    email: string;
+    /**
+     * Overall reachability status: safe, risky, invalid, or unknown
+     */
+    is_reachable: ReachabilityStatus;
+    /**
+     * Miscellaneous validation result
+     */
+    misc: MiscResult;
+    /**
+     * MX record validation result
+     */
+    mx: MxResult;
+    /**
+     * SMTP validation result
+     */
+    smtp: SmtpResult;
+    /**
+     * Syntax validation result
+     */
+    syntax: SyntaxResult;
 };
 
 /**
@@ -5066,6 +6115,55 @@ export type VolumeMount = {
  */
 export type VolumeType = 'bind' | 'volume' | 'tmpfs';
 
+export type VulnerabilityResponse = {
+    class?: string | null;
+    created_at: string;
+    cvss_score?: number | null;
+    description?: string | null;
+    fixed_version?: string | null;
+    id: number;
+    installed_version: string;
+    last_modified_date?: string | null;
+    package_name: string;
+    primary_url?: string | null;
+    published_date?: string | null;
+    references?: unknown;
+    scan_id: number;
+    severity: string;
+    target?: string | null;
+    title: string;
+    type?: string | null;
+    vulnerability_id: string;
+};
+
+export type WebhookDeliveryResponse = {
+    attempt_number: number;
+    created_at: string;
+    delivered_at?: string | null;
+    error_message?: string | null;
+    event_id: string;
+    event_type: string;
+    id: number;
+    /**
+     * JSON payload that was sent to the webhook endpoint
+     */
+    payload: string;
+    status_code?: number | null;
+    success: boolean;
+    webhook_id: number;
+};
+
+export type WebhookResponse = {
+    created_at: string;
+    enabled: boolean;
+    events: Array<string>;
+    has_secret: boolean;
+    id: number;
+    project_id: number;
+    updated_at: string;
+    url: string;
+};
+
 /**
  * Brief descriptor for discovered workloads (used in listing)
  */
@@ -5116,6 +6214,13 @@ export type WorkloadStatus = 'running' | 'paused' | 'stopped' | 'exited' | 'fail
  * Workload type
  */
 export type WorkloadType = 'container' | 'function' | 'static-site' | 'server-side-app' | 'worker' | 'database' | 'message-queue' | 'cache' | 'other';
+
+/**
+ * Zone list response
+ */
+export type ZoneListResponse = {
+    zones: Array<DnsZone>;
+};
 
 /**
  * Response type for S3 source
@@ -5949,9 +7054,9 @@ export type EnrichVisitorData = {
     body: EnrichVisitorRequest;
     path: {
         /**
-         * Visitor numeric ID
+         * Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx)
          */
-        visitor_id: number;
+        visitor_id: string;
     };
     query: {
         /**
@@ -6758,6 +7863,41 @@ export type VerifyMfaChallengeResponses = {
 
 export type VerifyMfaChallengeResponse = VerifyMfaChallengeResponses[keyof VerifyMfaChallengeResponses];
 
+export type RunExternalServiceBackupData = {
+    body: RunExternalServiceBackupRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/backups/external-services/{id}/run';
+};
+
+export type RunExternalServiceBackupErrors = {
+    /**
+     * Invalid request
+     */
+    400: ProblemDetails;
+    /**
+     * External service or S3 source not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RunExternalServiceBackupError = RunExternalServiceBackupErrors[keyof RunExternalServiceBackupErrors];
+
+export type RunExternalServiceBackupResponses = {
+    /**
+     * Backup started successfully
+     */
+    200: ExternalServiceBackupResponse;
+};
+
+export type RunExternalServiceBackupResponse = RunExternalServiceBackupResponses[keyof RunExternalServiceBackupResponses];
+
 export type ListS3SourcesData = {
     body?: never;
     path?: never;
@@ -7263,6 +8403,413 @@ export type GetActivityGraphResponses = {
 
 export type GetActivityGraphResponse = GetActivityGraphResponses[keyof GetActivityGraphResponses];
 
+export type GetScanByDeploymentData = {
+    body?: never;
+    path: {
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+    };
+    query?: never;
+    url: '/deployments/{deployment_id}/vulnerability-scan';
+};
+
+export type GetScanByDeploymentErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No scan found for deployment
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetScanByDeploymentError = GetScanByDeploymentErrors[keyof GetScanByDeploymentErrors];
+
+export type GetScanByDeploymentResponses = {
+    /**
+     * Scan for the specified deployment
+     */
+    200: ScanResponse;
+};
+
+export type GetScanByDeploymentResponse = GetScanByDeploymentResponses[keyof GetScanByDeploymentResponses];
+
+export type ListProvidersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/dns-providers';
+};
+
+export type ListProvidersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type ListProvidersResponses = {
+    /**
+     * List of DNS providers
+     */
+    200: Array<DnsProviderResponse>;
+};
+
+export type ListProvidersResponse = ListProvidersResponses[keyof ListProvidersResponses];
+
+export type CreateProviderData = {
+    body: CreateDnsProviderRequest;
+    path?: never;
+    query?: never;
+    url: '/dns-providers';
+};
+
+export type CreateProviderErrors = {
+    /**
+     * Invalid request or connection test failed
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type CreateProviderResponses = {
+    /**
+     * DNS provider created
+     */
+    201: DnsProviderResponse;
+};
+
+export type CreateProviderResponse = CreateProviderResponses[keyof CreateProviderResponses];
+
+export type DeleteProviderData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}';
+};
+
+export type DeleteProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type DeleteProviderResponses = {
+    /**
+     * DNS provider deleted
+     */
+    204: void;
+};
+
+export type DeleteProviderResponse = DeleteProviderResponses[keyof DeleteProviderResponses];
+
+export type GetProviderData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}';
+};
+
+export type GetProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type GetProviderResponses = {
+    /**
+     * DNS provider details
+     */
+    200: DnsProviderResponse;
+};
+
+export type GetProviderResponse = GetProviderResponses[keyof GetProviderResponses];
+
+export type UpdateProviderData = {
+    body: UpdateDnsProviderRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}';
+};
+
+export type UpdateProviderErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type UpdateProviderResponses = {
+    /**
+     * DNS provider updated
+     */
+    200: DnsProviderResponse;
+};
+
+export type UpdateProviderResponse = UpdateProviderResponses[keyof UpdateProviderResponses];
+
+export type ListManagedDomainsData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}/domains';
+};
+
+export type ListManagedDomainsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type ListManagedDomainsResponses = {
+    /**
+     * List of managed domains
+     */
+    200: Array<ManagedDomainResponse>;
+};
+
+export type ListManagedDomainsResponse = ListManagedDomainsResponses[keyof ListManagedDomainsResponses];
+
+export type AddManagedDomainData = {
+    body: AddManagedDomainApiRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}/domains';
+};
+
+export type AddManagedDomainErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type AddManagedDomainResponses = {
+    /**
+     * Managed domain added
+     */
+    201: ManagedDomainResponse;
+};
+
+export type AddManagedDomainResponse = AddManagedDomainResponses[keyof AddManagedDomainResponses];
+
+export type TestProviderConnectionData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}/test';
+};
+
+export type TestProviderConnectionErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type TestProviderConnectionResponses = {
+    /**
+     * Connection test result
+     */
+    200: ConnectionTestResult;
+};
+
+export type TestProviderConnectionResponse = TestProviderConnectionResponses[keyof TestProviderConnectionResponses];
+
+export type ListProviderZonesData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}/zones';
+};
+
+export type ListProviderZonesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type ListProviderZonesResponses = {
+    /**
+     * List of zones
+     */
+    200: ZoneListResponse;
+};
+
+export type ListProviderZonesResponse = ListProviderZonesResponses[keyof ListProviderZonesResponses];
+
+export type RemoveManagedDomainData = {
+    body?: never;
+    path: {
+        provider_id: number;
+        domain: string;
+    };
+    query?: never;
+    url: '/dns-providers/{provider_id}/domains/{domain}';
+};
+
+export type RemoveManagedDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type RemoveManagedDomainResponses = {
+    /**
+     * Managed domain removed
+     */
+    204: void;
+};
+
+export type RemoveManagedDomainResponse = RemoveManagedDomainResponses[keyof RemoveManagedDomainResponses];
+
+export type VerifyManagedDomainData = {
+    body?: never;
+    path: {
+        provider_id: number;
+        domain: string;
+    };
+    query?: never;
+    url: '/dns-providers/{provider_id}/domains/{domain}/verify';
+};
+
+export type VerifyManagedDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type VerifyManagedDomainResponses = {
+    /**
+     * Domain verification result
+     */
+    200: ManagedDomainResponse;
+};
+
+export type VerifyManagedDomainResponse = VerifyManagedDomainResponses[keyof VerifyManagedDomainResponses];
+
 export type LookupDnsARecordsData = {
     body?: never;
     path?: never;
@@ -7531,6 +9078,50 @@ export type FinalizeOrderResponses = {
 
 export type FinalizeOrderResponse = FinalizeOrderResponses[keyof FinalizeOrderResponses];
 
+export type SetupDnsChallengeData = {
+    body: SetupDnsChallengeRequest;
+    path: {
+        /**
+         * Domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/domains/{domain_id}/setup-dns';
+};
+
+export type SetupDnsChallengeErrors = {
+    /**
+     * Bad request - DNS provider not configured or no challenge pending
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain or DNS provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetupDnsChallengeResponses = {
+    /**
+     * DNS records created successfully
+     */
+    200: SetupDnsChallengeResponse;
+};
+
+export type SetupDnsChallengeResponse2 = SetupDnsChallengeResponses[keyof SetupDnsChallengeResponses];
+
 export type DeleteDomainData = {
     body?: never;
     path: {
@@ -7778,6 +9369,690 @@ export type CheckDomainStatusResponses = {
 };
 
 export type CheckDomainStatusResponse = CheckDomainStatusResponses[keyof CheckDomainStatusResponses];
+
+export type ListDomains2Data = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/email-domains';
+};
+
+export type ListDomains2Errors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDomains2Responses = {
+    /**
+     * List of email domains
+     */
+    200: Array<EmailDomainResponse>;
+};
+
+export type ListDomains2Response = ListDomains2Responses[keyof ListDomains2Responses];
+
+export type CreateDomain2Data = {
+    body: CreateEmailDomainRequest;
+    path?: never;
+    query?: never;
+    url: '/email-domains';
+};
+
+export type CreateDomain2Errors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateDomain2Responses = {
+    /**
+     * Domain created successfully
+     */
+    201: EmailDomainWithDnsResponse;
+};
+
+export type CreateDomain2Response = CreateDomain2Responses[keyof CreateDomain2Responses];
+
+export type GetDomainByNameData = {
+    body?: never;
+    path: {
+        /**
+         * Domain name (e.g., 'mail.example.com')
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/email-domains/by-domain/{domain}';
+};
+
+export type GetDomainByNameErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDomainByNameResponses = {
+    /**
+     * Email domain details with DNS records
+     */
+    200: EmailDomainWithDnsResponse;
+};
+
+export type GetDomainByNameResponse = GetDomainByNameResponses[keyof GetDomainByNameResponses];
+
+export type DeleteDomain2Data = {
+    body?: never;
+    path: {
+        /**
+         * Domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}';
+};
+
+export type DeleteDomain2Errors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteDomain2Responses = {
+    /**
+     * Domain deleted
+     */
+    204: void;
+};
+
+export type DeleteDomain2Response = DeleteDomain2Responses[keyof DeleteDomain2Responses];
+
+export type GetDomainData = {
+    body?: never;
+    path: {
+        /**
+         * Domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}';
+};
+
+export type GetDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDomainResponses = {
+    /**
+     * Email domain details with DNS records
+     */
+    200: EmailDomainWithDnsResponse;
+};
+
+export type GetDomainResponse = GetDomainResponses[keyof GetDomainResponses];
+
+export type GetDomainDnsRecordsData = {
+    body?: never;
+    path: {
+        /**
+         * Domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/dns-records';
+};
+
+export type GetDomainDnsRecordsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDomainDnsRecordsResponses = {
+    /**
+     * DNS records for the domain
+     */
+    200: Array<DnsRecordResponse>;
+};
+
+export type GetDomainDnsRecordsResponse = GetDomainDnsRecordsResponses[keyof GetDomainDnsRecordsResponses];
+
+export type SetupDnsData = {
+    body: SetupDnsRequest;
+    path: {
+        /**
+         * Email Domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/setup-dns';
+};
+
+export type SetupDnsErrors = {
+    /**
+     * Invalid request or DNS provider not configured
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetupDnsResponses = {
+    /**
+     * DNS records setup result
+     */
+    200: SetupDnsResponse;
+};
+
+export type SetupDnsResponse2 = SetupDnsResponses[keyof SetupDnsResponses];
+
+export type VerifyDomainData = {
+    body?: never;
+    path: {
+        /**
+         * Domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/verify';
+};
+
+export type VerifyDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type VerifyDomainResponses = {
+    /**
+     * Domain verification result with DNS records
+     */
+    200: EmailDomainWithDnsResponse;
+};
+
+export type VerifyDomainResponse = VerifyDomainResponses[keyof VerifyDomainResponses];
+
+export type ListProviders2Data = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/email-providers';
+};
+
+export type ListProviders2Errors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListProviders2Responses = {
+    /**
+     * List of email providers
+     */
+    200: Array<EmailProviderResponse>;
+};
+
+export type ListProviders2Response = ListProviders2Responses[keyof ListProviders2Responses];
+
+export type CreateProvider2Data = {
+    body: CreateEmailProviderRequest;
+    path?: never;
+    query?: never;
+    url: '/email-providers';
+};
+
+export type CreateProvider2Errors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateProvider2Responses = {
+    /**
+     * Provider created successfully
+     */
+    201: EmailProviderResponse;
+};
+
+export type CreateProvider2Response = CreateProvider2Responses[keyof CreateProvider2Responses];
+
+export type DeleteProvider2Data = {
+    body?: never;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-providers/{id}';
+};
+
+export type DeleteProvider2Errors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteProvider2Responses = {
+    /**
+     * Provider deleted
+     */
+    204: void;
+};
+
+export type DeleteProvider2Response = DeleteProvider2Responses[keyof DeleteProvider2Responses];
+
+export type GetProvider2Data = {
+    body?: never;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-providers/{id}';
+};
+
+export type GetProvider2Errors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetProvider2Responses = {
+    /**
+     * Email provider details
+     */
+    200: EmailProviderResponse;
+};
+
+export type GetProvider2Response = GetProvider2Responses[keyof GetProvider2Responses];
+
+export type TestProviderData = {
+    body: TestEmailRequest;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-providers/{id}/test';
+};
+
+export type TestProviderErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type TestProviderResponses = {
+    /**
+     * Test email result
+     */
+    200: TestEmailResponse;
+};
+
+export type TestProviderResponse2 = TestProviderResponses[keyof TestProviderResponses];
+
+export type ListEmailsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        domain_id?: number | null;
+        project_id?: number | null;
+        status?: string | null;
+        from_address?: string | null;
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/emails';
+};
+
+export type ListEmailsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListEmailsResponses = {
+    /**
+     * List of emails
+     */
+    200: PaginatedEmailsResponse;
+};
+
+export type ListEmailsResponse = ListEmailsResponses[keyof ListEmailsResponses];
+
+export type SendEmailData = {
+    body: SendEmailRequestBody;
+    path?: never;
+    query?: never;
+    url: '/emails';
+};
+
+export type SendEmailErrors = {
+    /**
+     * Invalid request or domain not verified
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SendEmailResponses = {
+    /**
+     * Email sent successfully
+     */
+    201: SendEmailResponseBody;
+};
+
+export type SendEmailResponse = SendEmailResponses[keyof SendEmailResponses];
+
+export type GetEmailStatsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Optional domain ID to filter stats
+         */
+        domain_id?: number;
+    };
+    url: '/emails/stats';
+};
+
+export type GetEmailStatsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetEmailStatsResponses = {
+    /**
+     * Email statistics
+     */
+    200: EmailStatsResponse;
+};
+
+export type GetEmailStatsResponse = GetEmailStatsResponses[keyof GetEmailStatsResponses];
+
+export type ValidateEmailData = {
+    body: ValidateEmailRequest;
+    path?: never;
+    query?: never;
+    url: '/emails/validate';
+};
+
+export type ValidateEmailErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ValidateEmailResponses = {
+    /**
+     * Email validation result
+     */
+    200: ValidateEmailResponse;
+};
+
+export type ValidateEmailResponse2 = ValidateEmailResponses[keyof ValidateEmailResponses];
+
+export type GetEmailData = {
+    body?: never;
+    path: {
+        /**
+         * Email ID (UUID)
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/emails/{id}';
+};
+
+export type GetEmailErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Email not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetEmailResponses = {
+    /**
+     * Email details
+     */
+    200: EmailResponse;
+};
+
+export type GetEmailResponse = GetEmailResponses[keyof GetEmailResponses];
 
 export type ListServicesData = {
     body?: never;
@@ -9433,7 +11708,7 @@ export type CreateGitlabPatProviderResponses = {
 
 export type CreateGitlabPatProviderResponse = CreateGitlabPatProviderResponses[keyof CreateGitlabPatProviderResponses];
 
-export type DeleteProviderData = {
+export type DeleteProvider3Data = {
     body?: never;
     path: {
         /**
@@ -9445,7 +11720,7 @@ export type DeleteProviderData = {
     url: '/git-providers/{provider_id}';
 };
 
-export type DeleteProviderErrors = {
+export type DeleteProvider3Errors = {
     /**
      * Provider has connections and cannot be deleted
      */
@@ -9464,14 +11739,14 @@ export type DeleteProviderErrors = {
     500: unknown;
 };
 
-export type DeleteProviderResponses = {
+export type DeleteProvider3Responses = {
     /**
      * Provider deleted successfully
      */
     204: void;
 };
 
-export type DeleteProviderResponse = DeleteProviderResponses[keyof DeleteProviderResponses];
+export type DeleteProvider3Response = DeleteProvider3Responses[keyof DeleteProvider3Responses];
 
 export type GetGitProviderData = {
     body?: never;
@@ -9739,6 +12014,164 @@ export type DeleteProviderSafelyResponses = {
 };
 
 export type DeleteProviderSafelyResponse = DeleteProviderSafelyResponses[keyof DeleteProviderSafelyResponses];
+
+export type GetPublicRepositoryData = {
+    body?: never;
+    path: {
+        /**
+         * Git provider (github or gitlab)
+         */
+        provider: string;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query?: never;
+    url: '/git/public/{provider}/{owner}/{repo}';
+};
+
+export type GetPublicRepositoryErrors = {
+    /**
+     * Provider not supported
+     */
+    400: unknown;
+    /**
+     * Repository not found
+     */
+    404: unknown;
+    /**
+     * API rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPublicRepositoryResponses = {
+    /**
+     * Repository information
+     */
+    200: PublicRepositoryInfo;
+};
+
+export type GetPublicRepositoryResponse = GetPublicRepositoryResponses[keyof GetPublicRepositoryResponses];
+
+export type GetPublicBranchesData = {
+    body?: never;
+    path: {
+        /**
+         * Git provider (github or gitlab)
+         */
+        provider: string;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query?: {
+        /**
+         * Force fetch fresh data, bypassing cache (default: false)
+         */
+        fresh?: boolean;
+    };
+    url: '/git/public/{provider}/{owner}/{repo}/branches';
+};
+
+export type GetPublicBranchesErrors = {
+    /**
+     * Provider not supported
+     */
+    400: unknown;
+    /**
+     * Repository not found
+     */
+    404: unknown;
+    /**
+     * API rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPublicBranchesResponses = {
+    /**
+     * List of branches
+     */
+    200: BranchListResponse;
+};
+
+export type GetPublicBranchesResponse = GetPublicBranchesResponses[keyof GetPublicBranchesResponses];
+
+export type DetectPublicPresetsData = {
+    body?: never;
+    path: {
+        /**
+         * Git provider (github or gitlab)
+         */
+        provider: string;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query?: {
+        /**
+         * Branch name to detect presets for (default: repository's default branch)
+         */
+        branch?: string | null;
+        /**
+         * Force fetch fresh data, bypassing cache (default: false)
+         */
+        fresh?: boolean;
+    };
+    url: '/git/public/{provider}/{owner}/{repo}/presets';
+};
+
+export type DetectPublicPresetsErrors = {
+    /**
+     * Provider not supported
+     */
+    400: unknown;
+    /**
+     * Repository or branch not found
+     */
+    404: unknown;
+    /**
+     * API rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DetectPublicPresetsResponses = {
+    /**
+     * Detected presets
+     */
+    200: PublicPresetResponse;
+};
+
+export type DetectPublicPresetsResponse = DetectPublicPresetsResponses[keyof DetectPublicPresetsResponses];
 
 export type DiscoverWorkloadsData = {
     body: DiscoverRequest;
@@ -10783,7 +13216,7 @@ export type UpdateSlackProviderResponses = {
 
 export type UpdateSlackProviderResponse = UpdateSlackProviderResponses[keyof UpdateSlackProviderResponses];
 
-export type DeleteProvider2Data = {
+export type DeleteProvider4Data = {
     body?: never;
     path: {
         /**
@@ -10795,7 +13228,7 @@ export type DeleteProvider2Data = {
     url: '/notification-providers/{id}';
 };
 
-export type DeleteProvider2Errors = {
+export type DeleteProvider4Errors = {
     /**
      * Provider not found
      */
@@ -10806,14 +13239,14 @@ export type DeleteProvider2Errors = {
     500: unknown;
 };
 
-export type DeleteProvider2Responses = {
+export type DeleteProvider4Responses = {
     /**
      * Successfully deleted provider
      */
     204: void;
 };
 
-export type DeleteProvider2Response = DeleteProvider2Responses[keyof DeleteProvider2Responses];
+export type DeleteProvider4Response = DeleteProvider4Responses[keyof DeleteProvider4Responses];
 
 export type GetNotificationProviderData = {
     body?: never;
@@ -10847,7 +13280,7 @@ export type GetNotificationProviderResponses = {
 
 export type GetNotificationProviderResponse = GetNotificationProviderResponses[keyof GetNotificationProviderResponses];
 
-export type UpdateProviderData = {
+export type UpdateProvider2Data = {
     body: UpdateProviderRequest;
     path: {
         /**
@@ -10859,7 +13292,7 @@ export type UpdateProviderData = {
     url: '/notification-providers/{id}';
 };
 
-export type UpdateProviderErrors = {
+export type UpdateProvider2Errors = {
     /**
      * Provider not found
      */
@@ -10870,16 +13303,16 @@ export type UpdateProviderErrors = {
     500: unknown;
 };
 
-export type UpdateProviderResponses = {
+export type UpdateProvider2Responses = {
     /**
      * Successfully updated provider
      */
     200: NotificationProviderResponse;
 };
 
-export type UpdateProviderResponse = UpdateProviderResponses[keyof UpdateProviderResponses];
+export type UpdateProvider2Response = UpdateProvider2Responses[keyof UpdateProvider2Responses];
 
-export type TestProviderData = {
+export type TestProvider2Data = {
     body?: never;
     path: {
         /**
@@ -10891,7 +13324,7 @@ export type TestProviderData = {
     url: '/notification-providers/{id}/test';
 };
 
-export type TestProviderErrors = {
+export type TestProvider2Errors = {
     /**
      * Provider not found
      */
@@ -10902,14 +13335,14 @@ export type TestProviderErrors = {
     500: unknown;
 };
 
-export type TestProviderResponses = {
+export type TestProvider2Responses = {
     /**
      * Test result
      */
     200: TestProviderResponse;
 };
 
-export type TestProviderResponse2 = TestProviderResponses[keyof TestProviderResponses];
+export type TestProvider2Response = TestProvider2Responses[keyof TestProvider2Responses];
 
 export type ListOrdersData = {
     body?: never;
@@ -15006,6 +17439,533 @@ export type GetUniqueCountsResponses = {
 
 export type GetUniqueCountsResponse = GetUniqueCountsResponses[keyof GetUniqueCountsResponses];
 
+export type ListProjectScansData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Page number (default: 1)
+         */
+        page?: number;
+        /**
+         * Page size (default: 20, max: 100)
+         */
+        page_size?: number;
+    };
+    url: '/projects/{project_id}/vulnerability-scans';
+};
+
+export type ListProjectScansErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListProjectScansError = ListProjectScansErrors[keyof ListProjectScansErrors];
+
+export type ListProjectScansResponses = {
+    /**
+     * List of vulnerability scans
+     */
+    200: Array<ScanResponse>;
+};
+
+export type ListProjectScansResponse = ListProjectScansResponses[keyof ListProjectScansResponses];
+
+export type TriggerScanData = {
+    body: TriggerScanRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/vulnerability-scans';
+};
+
+export type TriggerScanErrors = {
+    /**
+     * Invalid request
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type TriggerScanError = TriggerScanErrors[keyof TriggerScanErrors];
+
+export type TriggerScanResponses = {
+    /**
+     * Scan triggered successfully
+     */
+    202: TriggerScanResponse;
+};
+
+export type TriggerScanResponse2 = TriggerScanResponses[keyof TriggerScanResponses];
+
+export type GetLatestScansPerEnvironmentData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/vulnerability-scans/environments';
+};
+
+export type GetLatestScansPerEnvironmentErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetLatestScansPerEnvironmentError = GetLatestScansPerEnvironmentErrors[keyof GetLatestScansPerEnvironmentErrors];
+
+export type GetLatestScansPerEnvironmentResponses = {
+    /**
+     * Latest scans per environment for current deployments
+     */
+    200: Array<ScanResponse>;
+};
+
+export type GetLatestScansPerEnvironmentResponse = GetLatestScansPerEnvironmentResponses[keyof GetLatestScansPerEnvironmentResponses];
+
+export type GetLatestScanData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Filter by environment ID
+         */
+        environment_id?: number;
+    };
+    url: '/projects/{project_id}/vulnerability-scans/latest';
+};
+
+export type GetLatestScanErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No scans found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetLatestScanError = GetLatestScanErrors[keyof GetLatestScanErrors];
+
+export type GetLatestScanResponses = {
+    /**
+     * Latest scan for project
+     */
+    200: ScanResponse;
+};
+
+export type GetLatestScanResponse = GetLatestScanResponses[keyof GetLatestScanResponses];
+
+export type ListWebhooksData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks';
+};
+
+export type ListWebhooksErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListWebhooksResponses = {
+    /**
+     * List of webhooks
+     */
+    200: Array<WebhookResponse>;
+};
+
+export type ListWebhooksResponse = ListWebhooksResponses[keyof ListWebhooksResponses];
+
+export type CreateWebhookData = {
+    body: CreateWebhookRequestBody;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks';
+};
+
+export type CreateWebhookErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateWebhookResponses = {
+    /**
+     * Webhook created
+     */
+    201: WebhookResponse;
+};
+
+export type CreateWebhookResponse = CreateWebhookResponses[keyof CreateWebhookResponses];
+
+export type DeleteWebhookData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks/{webhook_id}';
+};
+
+export type DeleteWebhookErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Webhook not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteWebhookResponses = {
+    /**
+     * Webhook deleted
+     */
+    204: void;
+};
+
+export type DeleteWebhookResponse = DeleteWebhookResponses[keyof DeleteWebhookResponses];
+
+export type GetWebhookData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks/{webhook_id}';
+};
+
+export type GetWebhookErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Webhook not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetWebhookResponses = {
+    /**
+     * Webhook details
+     */
+    200: WebhookResponse;
+};
+
+export type GetWebhookResponse = GetWebhookResponses[keyof GetWebhookResponses];
+
+export type UpdateWebhookData = {
+    body: UpdateWebhookRequestBody;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks/{webhook_id}';
+};
+
+export type UpdateWebhookErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Webhook not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateWebhookResponses = {
+    /**
+     * Webhook updated
+     */
+    200: WebhookResponse;
+};
+
+export type UpdateWebhookResponse = UpdateWebhookResponses[keyof UpdateWebhookResponses];
+
+export type ListDeliveriesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+    };
+    query?: {
+        /**
+         * Number of deliveries to return (default: 50)
+         */
+        limit?: number;
+    };
+    url: '/projects/{project_id}/webhooks/{webhook_id}/deliveries';
+};
+
+export type ListDeliveriesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDeliveriesResponses = {
+    /**
+     * List of deliveries
+     */
+    200: Array<WebhookDeliveryResponse>;
+};
+
+export type ListDeliveriesResponse = ListDeliveriesResponses[keyof ListDeliveriesResponses];
+
+export type GetDeliveryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+        /**
+         * Delivery ID
+         */
+        delivery_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}';
+};
+
+export type GetDeliveryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Delivery not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDeliveryResponses = {
+    /**
+     * Delivery details including full payload
+     */
+    200: WebhookDeliveryResponse;
+};
+
+export type GetDeliveryResponse = GetDeliveryResponses[keyof GetDeliveryResponses];
+
+export type RetryDeliveryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+        /**
+         * Delivery ID
+         */
+        delivery_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry';
+};
+
+export type RetryDeliveryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Delivery not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RetryDeliveryResponses = {
+    /**
+     * Delivery retried
+     */
+    200: WebhookDeliveryResponse;
+};
+
+export type RetryDeliveryResponse = RetryDeliveryResponses[keyof RetryDeliveryResponses];
+
 export type GetProxyLogsData = {
     body?: never;
     path?: never;
@@ -16612,6 +19572,161 @@ export type AddEventsResponses = {
 };
 
 export type AddEventsResponse2 = AddEventsResponses[keyof AddEventsResponses];
+
+export type DeleteScanData = {
+    body?: never;
+    path: {
+        /**
+         * Scan ID
+         */
+        scan_id: number;
+    };
+    query?: never;
+    url: '/vulnerability-scans/{scan_id}';
+};
+
+export type DeleteScanErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Scan not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteScanError = DeleteScanErrors[keyof DeleteScanErrors];
+
+export type DeleteScanResponses = {
+    /**
+     * Scan deleted
+     */
+    204: void;
+};
+
+export type DeleteScanResponse = DeleteScanResponses[keyof DeleteScanResponses];
+
+export type GetScanData = {
+    body?: never;
+    path: {
+        /**
+         * Scan ID
+         */
+        scan_id: number;
+    };
+    query?: never;
+    url: '/vulnerability-scans/{scan_id}';
+};
+
+export type GetScanErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Scan not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetScanError = GetScanErrors[keyof GetScanErrors];
+
+export type GetScanResponses = {
+    /**
+     * Scan details
+     */
+    200: ScanResponse;
+};
+
+export type GetScanResponse = GetScanResponses[keyof GetScanResponses];
+
+export type GetScanVulnerabilitiesData = {
+    body?: never;
+    path: {
+        /**
+         * Scan ID
+         */
+        scan_id: number;
+    };
+    query?: {
+        /**
+         * Page number (default: 1)
+         */
+        page?: number;
+        /**
+         * Page size (default: 20, max: 100)
+         */
+        page_size?: number;
+        /**
+         * Filter by severity (CRITICAL, HIGH, MEDIUM, LOW)
+         */
+        severity?: string;
+    };
+    url: '/vulnerability-scans/{scan_id}/vulnerabilities';
+};
+
+export type GetScanVulnerabilitiesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Scan not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetScanVulnerabilitiesError = GetScanVulnerabilitiesErrors[keyof GetScanVulnerabilitiesErrors];
+
+export type GetScanVulnerabilitiesResponses = {
+    /**
+     * List of vulnerabilities
+     */
+    200: Array<VulnerabilityResponse>;
+};
+
+export type GetScanVulnerabilitiesResponse = GetScanVulnerabilitiesResponses[keyof GetScanVulnerabilitiesResponses];
+
+export type ListEventTypesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/webhook-event-types';
+};
+
+export type ListEventTypesResponses = {
+    /**
+     * List of available event types
+     */
+    200: Array<EventTypeResponse>;
+};
+
+export type ListEventTypesResponse = ListEventTypesResponses[keyof ListEventTypesResponses];
 
 export type TriggerWeeklyDigestData = {
     body?: never;

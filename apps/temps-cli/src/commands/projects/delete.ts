@@ -6,16 +6,21 @@ import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { deleteProject, getProjectBySlug } from '../../api/sdk.gen.js'
 
 interface DeleteOptions {
+  project: string
   force?: boolean
+  yes?: boolean
 }
 
-export async function remove(projectIdOrName: string, options: DeleteOptions): Promise<void> {
+export async function remove(options: DeleteOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
+  const projectIdOrName = options.project
+
   newline()
 
-  if (!options.force) {
+  // Support both --force and --yes for skipping confirmation
+  if (!options.force && !options.yes) {
     warning(`You are about to delete project "${colors.bold(projectIdOrName)}"`)
     warning('This action cannot be undone!')
     newline()

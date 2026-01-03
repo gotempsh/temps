@@ -2,6 +2,7 @@ import { Command } from 'commander'
 import chalk from 'chalk'
 import { colors, icons } from './ui/output.js'
 import { handleError } from './utils/errors.js'
+import { createRequire } from 'module'
 
 // Import command modules
 import { registerAuthCommands } from './commands/auth/index.js'
@@ -13,8 +14,21 @@ import { registerEnvironmentsCommands } from './commands/environments/index.js'
 import { registerProvidersCommands } from './commands/providers/index.js'
 import { registerBackupsCommands } from './commands/backups/index.js'
 import { registerRuntimeLogsCommand } from './commands/runtime-logs.js'
+import { registerNotificationsCommands } from './commands/notifications/index.js'
+import { registerDnsCommands } from './commands/dns/index.js'
+import { registerServicesCommands } from './commands/services/index.js'
+import { registerSettingsCommands } from './commands/settings/index.js'
+import { registerUsersCommands } from './commands/users/index.js'
+import { registerApiKeysCommands } from './commands/apikeys/index.js'
+import { registerMonitorsCommands } from './commands/monitors/index.js'
+import { registerWebhooksCommands } from './commands/webhooks/index.js'
+import { registerContainersCommands } from './commands/containers/index.js'
+import { registerDocsCommand } from './commands/docs.js'
 
-const VERSION = '0.1.0'
+// Read version from package.json
+const require = createRequire(import.meta.url)
+const pkg = require('../package.json')
+const VERSION = pkg.version
 
 const LOGO = `
 ${chalk.cyan('╔════════════════════════════════════════╗')}
@@ -52,6 +66,16 @@ export function createProgram(): Command {
   registerProvidersCommands(program)
   registerBackupsCommands(program)
   registerRuntimeLogsCommand(program)
+  registerNotificationsCommands(program)
+  registerDnsCommands(program)
+  registerServicesCommands(program)
+  registerSettingsCommands(program)
+  registerUsersCommands(program)
+  registerApiKeysCommands(program)
+  registerMonitorsCommands(program)
+  registerWebhooksCommands(program)
+  registerContainersCommands(program)
+  registerDocsCommand(program)
 
   // Custom help
   program.addHelpText('beforeAll', LOGO)

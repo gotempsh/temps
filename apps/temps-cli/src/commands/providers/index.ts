@@ -5,16 +5,48 @@ import {
   listGitProviders,
   createGithubPatProvider,
   createGitlabPatProvider,
-  deleteProvider,
+  deleteProvider3 as deleteGitProvider,
   getGitProvider,
   listSyncedRepositories,
   listRepositoriesByConnection,
 } from '../../api/sdk.gen.js'
-import type { ProviderResponse, RepositoryResponse } from '../../api/types.gen.js'
+import type { ProviderResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptSelect, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning } from '../../ui/output.js'
+
+interface AddOptions {
+  provider?: string
+  name?: string
+  token?: string
+  baseUrl?: string
+  yes?: boolean
+}
+
+interface ShowOptions {
+  id: string
+  json?: boolean
+}
+
+interface RemoveOptions {
+  id: string
+  force?: boolean
+  yes?: boolean
+}
+
+interface ConnectOptions {
+  provider: string
+  name?: string
+  token?: string
+  baseUrl?: string
+  yes?: boolean
+}
+
+interface ReposOptions {
+  id?: string
+  json?: boolean
+}
 
 export function registerProvidersCommands(program: Command): void {
   const providers = program
@@ -31,19 +63,27 @@ export function registerProvidersCommands(program: Command): void {
 
   providers
     .command('add')
-    .description('Add a new Git provider (interactive)')
+    .description('Add a new Git provider')
+    .option('-p, --provider <provider>', 'Provider type (github, gitlab)')
+    .option('-n, --name <name>', 'Provider name')
+    .option('-t, --token <token>', 'Personal access token')
+    .option('--base-url <url>', 'GitLab base URL (for self-hosted GitLab)')
+    .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(addProvider)
 
   providers
-    .command('remove <provider>')
+    .command('remove')
     .alias('rm')
     .description('Remove a Git provider')
+    .requiredOption('--id <id>', 'Provider ID')
     .option('-f, --force', 'Skip confirmation')
+    .option('-y, --yes', 'Skip confirmation prompts (alias for --force)')
     .action(removeProvider)
 
   providers
-    .command('show <provider>')
+    .command('show')
     .description('Show Git provider details')
+    .requiredOption('--id <id>', 'Provider ID')
     .option('--json', 'Output in JSON format')
     .action(showProvider)
 
@@ -51,13 +91,19 @@ export function registerProvidersCommands(program: Command): void {
   const git = providers.command('git').description('Manage Git providers')
 
   git
-    .command('connect <provider>')
+    .command('connect')
     .description('Connect a Git provider (github, gitlab)')
+    .requiredOption('-p, --provider <provider>', 'Provider type (github, gitlab)')
+    .option('-n, --name <name>', 'Provider name')
+    .option('-t, --token <token>', 'Personal access token')
+    .option('--base-url <url>', 'GitLab base URL (for self-hosted GitLab)')
+    .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(connectGitProvider)
 
   git
-    .command('repos [provider]')
+    .command('repos')
     .description('List available repositories')
+    .option('--id <id>', 'Provider ID (optional, lists all if not provided)')
     .option('--json', 'Output in JSON format')
     .action(listRepos)
 }
@@ -84,7 +130,7 @@ async function listProviders(options: { json?: boolean }): Promise<void> {
 
   if (providers.length === 0) {
     info('No Git providers configured')
-    info('Run: temps providers add')
+    info('Run: temps providers add --provider github --name my-github --token <token> -y')
     newline()
     return
   }
@@ -101,36 +147,69 @@ async function listProviders(options: { json?: boolean }): Promise<void> {
   newline()
 }
 
-async function addProvider(): Promise<void> {
+async function addProvider(options: AddOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const provider = await promptSelect({
-    message: 'Git provider',
-    choices: [
-      { name: 'GitHub', value: 'github' },
-      { name: 'GitLab', value: 'gitlab' },
-    ],
-  })
+  let provider: string
+  let name: string
+  let token: string
+  let baseUrl: string | null = null
 
-  info(`\nTo connect ${provider}, you'll need to create a personal access token.`)
+  // Check if automation mode (all required params provided)
+  const isAutomation = options.yes && options.provider && options.name && options.token
 
-  const tokenUrl: Record<string, string> = {
-    github: 'https://github.com/settings/tokens/new',
-    gitlab: 'https://gitlab.com/-/profile/personal_access_tokens',
+  if (isAutomation) {
+    provider = options.provider!
+    name = options.name!
+    token = options.token!
+    baseUrl = options.baseUrl || null
+
+    if (provider !== 'github' && provider !== 'gitlab') {
+      warning(`Invalid provider: ${provider}. Supported: github, gitlab`)
+      return
+    }
+  } else {
+    // Interactive mode
+    provider = options.provider || await promptSelect({
+      message: 'Git provider',
+      choices: [
+        { name: 'GitHub', value: 'github' },
+        { name: 'GitLab', value: 'gitlab' },
+      ],
+    })
+
+    if (provider !== 'github' && provider !== 'gitlab') {
+      warning(`Invalid provider: ${provider}. Supported: github, gitlab`)
+      return
+    }
+
+    info(`\nTo connect ${provider}, you'll need to create a personal access token.`)
+
+    const tokenUrl: Record<string, string> = {
+      github: 'https://github.com/settings/tokens/new',
+      gitlab: 'https://gitlab.com/-/profile/personal_access_tokens',
+    }
+
+    info(`Visit: ${colors.primary(tokenUrl[provider])}\n`)
+
+    name = options.name || await promptText({
+      message: 'Provider name',
+      default: `${provider}-connection`,
+      required: true,
+    })
+
+    token = options.token || await promptPassword({
+      message: 'Personal access token',
+    })
+
+    if (provider === 'gitlab') {
+      baseUrl = options.baseUrl || await promptText({
+        message: 'GitLab base URL (leave empty for gitlab.com)',
+        default: '',
+      }) || null
+    }
   }
-
-  info(`Visit: ${colors.primary(tokenUrl[provider])}\n`)
-
-  const name = await promptText({
-    message: 'Provider name',
-    default: `${provider}-connection`,
-    required: true,
-  })
-
-  const token = await promptPassword({
-    message: 'Personal access token',
-  })
 
   await withSpinner(`Connecting to ${provider}...`, async () => {
     if (provider === 'github') {
@@ -142,17 +221,12 @@ async function addProvider(): Promise<void> {
         throw new Error(getErrorMessage(error))
       }
     } else if (provider === 'gitlab') {
-      const baseUrl = await promptText({
-        message: 'GitLab base URL (leave empty for gitlab.com)',
-        default: '',
-      })
-
       const { error } = await createGitlabPatProvider({
         client,
         body: {
           name,
           token,
-          base_url: baseUrl || null,
+          base_url: baseUrl,
         },
       })
       if (error) {
@@ -164,11 +238,11 @@ async function addProvider(): Promise<void> {
   success(`${provider} connected successfully`)
 }
 
-async function removeProvider(providerId: string, options: { force?: boolean }): Promise<void> {
+async function removeProvider(options: RemoveOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const id = parseInt(providerId, 10)
+  const id = parseInt(options.id, 10)
   if (isNaN(id)) {
     warning('Invalid provider ID')
     return
@@ -181,11 +255,13 @@ async function removeProvider(providerId: string, options: { force?: boolean }):
   })
 
   if (getError || !provider) {
-    warning(`Provider ${providerId} not found`)
+    warning(`Provider ${options.id} not found`)
     return
   }
 
-  if (!options.force) {
+  const skipConfirmation = options.force || options.yes
+
+  if (!skipConfirmation) {
     const confirmed = await promptConfirm({
       message: `Remove provider "${provider.name}" (${provider.provider_type})?`,
       default: false,
@@ -197,7 +273,7 @@ async function removeProvider(providerId: string, options: { force?: boolean }):
   }
 
   await withSpinner('Removing provider...', async () => {
-    const { error } = await deleteProvider({
+    const { error } = await deleteGitProvider({
       client,
       path: { provider_id: id },
     })
@@ -209,11 +285,11 @@ async function removeProvider(providerId: string, options: { force?: boolean }):
   success('Provider removed')
 }
 
-async function showProvider(providerId: string, options: { json?: boolean }): Promise<void> {
+async function showProvider(options: ShowOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const id = parseInt(providerId, 10)
+  const id = parseInt(options.id, 10)
   if (isNaN(id)) {
     warning('Invalid provider ID')
     return
@@ -225,7 +301,7 @@ async function showProvider(providerId: string, options: { json?: boolean }): Pr
       path: { provider_id: id },
     })
     if (error || !data) {
-      throw new Error(getErrorMessage(error) ?? `Provider ${providerId} not found`)
+      throw new Error(getErrorMessage(error) ?? `Provider ${options.id} not found`)
     }
     return data
   })
@@ -248,21 +324,28 @@ async function showProvider(providerId: string, options: { json?: boolean }): Pr
   newline()
 }
 
-async function connectGitProvider(provider: string): Promise<void> {
-  if (provider !== 'github' && provider !== 'gitlab') {
-    warning(`Unsupported provider: ${provider}. Supported: github, gitlab`)
+async function connectGitProvider(options: ConnectOptions): Promise<void> {
+  if (options.provider !== 'github' && options.provider !== 'gitlab') {
+    warning(`Unsupported provider: ${options.provider}. Supported: github, gitlab`)
     return
   }
-  await addProvider()
+
+  await addProvider({
+    provider: options.provider,
+    name: options.name,
+    token: options.token,
+    baseUrl: options.baseUrl,
+    yes: options.yes,
+  })
 }
 
-async function listRepos(providerId?: string, options?: { json?: boolean }): Promise<void> {
+async function listRepos(options: ReposOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
   const repos = await withSpinner('Fetching repositories...', async () => {
-    if (providerId) {
-      const id = parseInt(providerId, 10)
+    if (options.id) {
+      const id = parseInt(options.id, 10)
       if (isNaN(id)) {
         throw new Error('Invalid provider ID')
       }
@@ -283,7 +366,7 @@ async function listRepos(providerId?: string, options?: { json?: boolean }): Pro
     }
   })
 
-  if (options?.json) {
+  if (options.json) {
     json(repos)
     return
   }
@@ -299,7 +382,7 @@ async function listRepos(providerId?: string, options?: { json?: boolean }): Pro
   }
 
   for (const repo of repos) {
-    const visibility = repo.is_private ? colors.muted('(private)') : colors.success('(public)')
+    const visibility = repo.private ? colors.muted('(private)') : colors.success('(public)')
     console.log(`  ${colors.bold(repo.full_name)} ${visibility}`)
     console.log(`    ${colors.muted(`Branch: ${repo.default_branch}`)}`)
   }

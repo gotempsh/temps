@@ -999,6 +999,23 @@ impl ExternalService for RedisService {
             timestamp
         );
 
+        // Get file size before upload
+        let size_bytes = std::fs::metadata(&tar_path)?.len() as i32;
+
+        // Validate backup size - a zero-size backup indicates failure
+        if size_bytes == 0 {
+            let mut backup_update: temps_entities::external_service_backups::ActiveModel =
+                backup_record.clone().into();
+            backup_update.state = Set("failed".to_string());
+            backup_update.finished_at = Set(Some(Utc::now()));
+            backup_update.error_message =
+                Set(Some("Backup failed: backup file has zero size".to_string()));
+            backup_update.update(pool).await?;
+            return Err(anyhow::anyhow!(
+                "Redis backup failed: backup file has zero size"
+            ));
+        }
+
         // Upload to S3
         s3_client
             .put_object()
@@ -1008,9 +1025,6 @@ impl ExternalService for RedisService {
             .content_type("application/x-tar")
             .send()
             .await?;
-
-        // Get file size
-        let size_bytes = std::fs::metadata(&tar_path)?.len() as i32;
 
         // Update backup record with success
         let mut backup_update: temps_entities::external_service_backups::ActiveModel =

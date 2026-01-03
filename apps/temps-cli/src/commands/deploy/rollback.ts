@@ -10,26 +10,31 @@ import { withSpinner } from '../../ui/spinner.js'
 import { success, warning, newline, colors, info, icons, header, keyValue } from '../../ui/output.js'
 
 interface RollbackOptions {
+  project?: string
   environment: string
   to?: string
 }
 
-export async function rollback(project: string, options: RollbackOptions): Promise<void> {
+export async function rollback(options: RollbackOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
+  if (!options.project) {
+    throw new Error('Project is required. Use: temps deployments rollback --project <project>')
+  }
+
   newline()
-  warning(`Rolling back ${colors.bold(project)} in ${colors.bold(options.environment)}`)
+  warning(`Rolling back ${colors.bold(options.project)} in ${colors.bold(options.environment)}`)
   newline()
 
   // Get project ID
   const { data: projectData, error: projectError } = await getProjectBySlug({
     client,
-    path: { slug: project },
+    path: { slug: options.project },
   })
 
   if (projectError || !projectData) {
-    throw new Error(`Project "${project}" not found`)
+    throw new Error(`Project "${options.project}" not found`)
   }
 
   let targetDeploymentId = options.to ? parseInt(options.to, 10) : undefined
@@ -107,5 +112,5 @@ export async function rollback(project: string, options: RollbackOptions): Promi
   keyValue('Status', newDeployment.status)
   newline()
 
-  info(`Track progress with: temps deployments status ${project}:${newDeployment.id}`)
+  info(`Track progress with: temps deployments status --project ${options.project} --deployment-id ${newDeployment.id}`)
 }

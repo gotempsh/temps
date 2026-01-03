@@ -12,23 +12,26 @@ import { startSpinner, succeedSpinner, failSpinner, updateSpinner } from '../../
 import { success, info, warning, newline, icons, colors, header, keyValue, box } from '../../ui/output.js'
 
 interface DeployOptions {
-  environment: string
+  project?: string
+  environment?: string
+  environmentId?: string
   branch?: string
   wait?: boolean
+  yes?: boolean
 }
 
-export async function deploy(project: string | undefined, options: DeployOptions): Promise<void> {
+export async function deploy(options: DeployOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
   newline()
 
   // Get project name
-  const projectName = project ?? config.get('defaultProject')
+  const projectName = options.project ?? config.get('defaultProject')
 
   if (!projectName) {
     warning('No project specified')
-    info('Use: temps deploy <project> or set a default with temps configure')
+    info('Use: temps deploy --project <project> or set a default with temps configure')
     return
   }
 
@@ -65,10 +68,25 @@ export async function deploy(project: string | undefined, options: DeployOptions
 
   // Get environment
   let environmentId: number | undefined
-  let environmentName = options.environment
+  let environmentName = options.environment || 'production'
 
   if (environments.length > 0) {
-    if (!options.environment || options.environment === 'production') {
+    // If environment ID is specified directly, use it
+    if (options.environmentId) {
+      environmentId = parseInt(options.environmentId, 10)
+      const env = environments.find(e => e.id === environmentId)
+      if (env) {
+        environmentName = env.name
+      }
+    } else if (options.environment) {
+      // Find by name
+      const env = environments.find(e => e.name === options.environment)
+      if (env) {
+        environmentId = env.id
+        environmentName = env.name
+      }
+    } else if (!options.yes) {
+      // Interactive: prompt for environment selection
       const selectedEnv = await promptSelect({
         message: 'Select environment',
         choices: environments.map((env) => ({
@@ -76,27 +94,37 @@ export async function deploy(project: string | undefined, options: DeployOptions
           value: String(env.id),
           description: env.is_preview ? 'Preview environment' : undefined,
         })),
-        default: String(environments.find(e => e.name === 'production')?.id ?? environments[0].id),
+        default: String(environments.find(e => e.name === 'production')?.id ?? environments[0]?.id ?? ''),
       })
       environmentId = parseInt(selectedEnv, 10)
-      environmentName = environments.find(e => e.id === environmentId)?.name ?? options.environment
+      environmentName = environments.find(e => e.id === environmentId)?.name ?? 'production'
     } else {
-      const env = environments.find(e => e.name === options.environment)
-      if (env) {
-        environmentId = env.id
+      // Non-interactive: use production or first environment
+      const prodEnv = environments.find(e => e.name === 'production')
+      if (prodEnv) {
+        environmentId = prodEnv.id
+        environmentName = prodEnv.name
+      } else if (environments[0]) {
+        environmentId = environments[0].id
+        environmentName = environments[0].name
       }
     }
   }
 
-  // Get branch if not specified
-  const branch =
-    options.branch ??
-    (await promptText({
-      message: 'Branch to deploy',
-      default: 'main',
-    }))
+  // Get branch - use flag value, or prompt if interactive mode
+  let branch = options.branch
+  if (!branch) {
+    if (options.yes) {
+      branch = 'main' // Default for automation
+    } else {
+      branch = await promptText({
+        message: 'Branch to deploy',
+        default: 'main',
+      })
+    }
+  }
 
-  // Confirm deployment
+  // Confirm deployment (skip if --yes flag)
   newline()
   box(
     `Project: ${colors.bold(projectName)}\n` +
@@ -106,14 +134,16 @@ export async function deploy(project: string | undefined, options: DeployOptions
   )
   newline()
 
-  const confirmed = await promptConfirm({
-    message: 'Start deployment?',
-    default: true,
-  })
+  if (!options.yes) {
+    const confirmed = await promptConfirm({
+      message: 'Start deployment?',
+      default: true,
+    })
 
-  if (!confirmed) {
-    info('Deployment cancelled')
-    return
+    if (!confirmed) {
+      info('Deployment cancelled')
+      return
+    }
   }
 
   // Start deployment
@@ -142,7 +172,7 @@ export async function deploy(project: string | undefined, options: DeployOptions
     } else {
       newline()
       info('Deployment running in background')
-      info(`Check status with: temps deployments list ${projectName}`)
+      info(`Check status with: temps deployments list --project ${projectName}`)
     }
   } catch (err) {
     failSpinner('Deployment failed')

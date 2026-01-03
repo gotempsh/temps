@@ -17,6 +17,41 @@ import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptConfirm, promptText, promptSelect } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, formatRelativeTime } from '../../ui/output.js'
 
+interface CreateScheduleOptions {
+  name?: string
+  type?: string
+  schedule?: string
+  retention?: string
+  description?: string
+  s3SourceId?: string
+  yes?: boolean
+}
+
+interface ShowScheduleOptions {
+  id: string
+  json?: boolean
+}
+
+interface EnableDisableOptions {
+  id: string
+}
+
+interface DeleteScheduleOptions {
+  id: string
+  force?: boolean
+  yes?: boolean
+}
+
+interface ListBackupsOptions {
+  scheduleId: string
+  json?: boolean
+}
+
+interface ShowBackupOptions {
+  id: string
+  json?: boolean
+}
+
 export function registerBackupsCommands(program: Command): void {
   const backups = program
     .command('backups')
@@ -39,42 +74,56 @@ export function registerBackupsCommands(program: Command): void {
   schedules
     .command('create')
     .description('Create a backup schedule')
+    .option('-n, --name <name>', 'Schedule name')
+    .option('-t, --type <type>', 'Backup type (full, incremental)')
+    .option('-s, --schedule <cron>', 'Schedule expression (cron format)')
+    .option('-r, --retention <days>', 'Retention period in days')
+    .option('-d, --description <desc>', 'Description')
+    .option('--s3-source-id <id>', 'S3 Source ID')
+    .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createSchedule)
 
   schedules
-    .command('show <schedule-id>')
+    .command('show')
     .description('Show backup schedule details')
+    .requiredOption('--id <id>', 'Schedule ID')
     .option('--json', 'Output in JSON format')
     .action(showSchedule)
 
   schedules
-    .command('enable <schedule-id>')
+    .command('enable')
     .description('Enable a backup schedule')
+    .requiredOption('--id <id>', 'Schedule ID')
     .action(enableSchedule)
 
   schedules
-    .command('disable <schedule-id>')
+    .command('disable')
     .description('Disable a backup schedule')
+    .requiredOption('--id <id>', 'Schedule ID')
     .action(disableSchedule)
 
   schedules
-    .command('delete <schedule-id>')
+    .command('delete')
     .alias('rm')
     .description('Delete a backup schedule')
+    .requiredOption('--id <id>', 'Schedule ID')
     .option('-f, --force', 'Skip confirmation')
+    .option('-y, --yes', 'Skip confirmation prompts (alias for --force)')
     .action(deleteSchedule)
 
   // Backup commands
   backups
-    .command('list <schedule-id>')
+    .command('list')
     .alias('ls')
     .description('List backups for a schedule')
+    .requiredOption('--schedule-id <id>', 'Schedule ID')
     .option('--json', 'Output in JSON format')
     .action(listBackups)
 
   backups
-    .command('show <backup-id>')
+    .command('show')
     .description('Show backup details')
+    .requiredOption('--id <id>', 'Backup ID')
     .option('--json', 'Output in JSON format')
     .action(showBackup)
 }
@@ -101,7 +150,7 @@ async function listSchedules(options: { json?: boolean }): Promise<void> {
 
   if (schedules.length === 0) {
     info('No backup schedules configured')
-    info('Run: temps backups schedules create')
+    info('Run: temps backups schedules create --name daily-backup --type full --schedule "0 2 * * *" --retention 30 --s3-source-id 1 -y')
     newline()
     return
   }
@@ -119,43 +168,80 @@ async function listSchedules(options: { json?: boolean }): Promise<void> {
   newline()
 }
 
-async function createSchedule(): Promise<void> {
+async function createSchedule(options: CreateScheduleOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const name = await promptText({
-    message: 'Schedule name',
-    required: true,
-  })
+  let name: string
+  let backupType: string
+  let scheduleExpression: string
+  let retentionDays: number
+  let description: string | null = null
+  let s3SourceId: number
 
-  const backupType = await promptSelect({
-    message: 'Backup type',
-    choices: [
-      { name: 'Full', value: 'full' },
-      { name: 'Incremental', value: 'incremental' },
-    ],
-  })
+  // Check if automation mode (all required params provided)
+  const isAutomation = options.yes && options.name && options.type && options.schedule && options.retention && options.s3SourceId
 
-  const scheduleExpression = await promptText({
-    message: 'Schedule expression (cron format, e.g., 0 2 * * * for daily at 2 AM)',
-    default: '0 2 * * *',
-    required: true,
-  })
+  if (isAutomation) {
+    name = options.name!
+    backupType = options.type!
+    scheduleExpression = options.schedule!
+    retentionDays = parseInt(options.retention!, 10)
+    description = options.description || null
+    s3SourceId = parseInt(options.s3SourceId!, 10)
 
-  const retentionDays = await promptText({
-    message: 'Retention period (days)',
-    default: '30',
-  })
+    if (backupType !== 'full' && backupType !== 'incremental') {
+      warning(`Invalid backup type: ${backupType}. Supported: full, incremental`)
+      return
+    }
 
-  const description = await promptText({
-    message: 'Description (optional)',
-    default: '',
-  })
+    if (isNaN(retentionDays) || retentionDays <= 0) {
+      warning('Invalid retention period')
+      return
+    }
 
-  const s3SourceId = await promptText({
-    message: 'S3 Source ID',
-    required: true,
-  })
+    if (isNaN(s3SourceId)) {
+      warning('Invalid S3 Source ID')
+      return
+    }
+  } else {
+    // Interactive mode
+    name = options.name || await promptText({
+      message: 'Schedule name',
+      required: true,
+    })
+
+    backupType = options.type || await promptSelect({
+      message: 'Backup type',
+      choices: [
+        { name: 'Full', value: 'full' },
+        { name: 'Incremental', value: 'incremental' },
+      ],
+    })
+
+    scheduleExpression = options.schedule || await promptText({
+      message: 'Schedule expression (cron format, e.g., 0 2 * * * for daily at 2 AM)',
+      default: '0 2 * * *',
+      required: true,
+    })
+
+    const retentionInput = options.retention || await promptText({
+      message: 'Retention period (days)',
+      default: '30',
+    })
+    retentionDays = parseInt(retentionInput, 10)
+
+    description = options.description || await promptText({
+      message: 'Description (optional)',
+      default: '',
+    }) || null
+
+    const s3Input = options.s3SourceId || await promptText({
+      message: 'S3 Source ID',
+      required: true,
+    })
+    s3SourceId = parseInt(s3Input, 10)
+  }
 
   const schedule = await withSpinner('Creating backup schedule...', async () => {
     const { data, error } = await createBackupSchedule({
@@ -164,9 +250,9 @@ async function createSchedule(): Promise<void> {
         name,
         backup_type: backupType,
         schedule_expression: scheduleExpression,
-        retention_period: parseInt(retentionDays, 10),
-        description: description || null,
-        s3_source_id: parseInt(s3SourceId, 10),
+        retention_period: retentionDays,
+        description,
+        s3_source_id: s3SourceId,
         enabled: true,
         tags: [],
       },
@@ -178,14 +264,14 @@ async function createSchedule(): Promise<void> {
   })
 
   success(`Backup schedule #${schedule.id} created`)
-  info(`Enable/disable with: temps backups schedules enable/disable ${schedule.id}`)
+  info(`Enable/disable with: temps backups schedules enable/disable --id ${schedule.id}`)
 }
 
-async function showSchedule(scheduleId: string, options: { json?: boolean }): Promise<void> {
+async function showSchedule(options: ShowScheduleOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const id = parseInt(scheduleId, 10)
+  const id = parseInt(options.id, 10)
   if (isNaN(id)) {
     warning('Invalid schedule ID')
     return
@@ -197,7 +283,7 @@ async function showSchedule(scheduleId: string, options: { json?: boolean }): Pr
       path: { id },
     })
     if (error || !data) {
-      throw new Error(getErrorMessage(error) ?? `Schedule ${scheduleId} not found`)
+      throw new Error(getErrorMessage(error) ?? `Schedule ${options.id} not found`)
     }
     return data
   })
@@ -227,11 +313,11 @@ async function showSchedule(scheduleId: string, options: { json?: boolean }): Pr
   newline()
 }
 
-async function enableSchedule(scheduleId: string): Promise<void> {
+async function enableSchedule(options: EnableDisableOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const id = parseInt(scheduleId, 10)
+  const id = parseInt(options.id, 10)
   if (isNaN(id)) {
     warning('Invalid schedule ID')
     return
@@ -247,14 +333,14 @@ async function enableSchedule(scheduleId: string): Promise<void> {
     }
   })
 
-  success(`Schedule #${scheduleId} enabled`)
+  success(`Schedule #${options.id} enabled`)
 }
 
-async function disableSchedule(scheduleId: string): Promise<void> {
+async function disableSchedule(options: EnableDisableOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const id = parseInt(scheduleId, 10)
+  const id = parseInt(options.id, 10)
   if (isNaN(id)) {
     warning('Invalid schedule ID')
     return
@@ -270,22 +356,24 @@ async function disableSchedule(scheduleId: string): Promise<void> {
     }
   })
 
-  success(`Schedule #${scheduleId} disabled`)
+  success(`Schedule #${options.id} disabled`)
 }
 
-async function deleteSchedule(scheduleId: string, options: { force?: boolean }): Promise<void> {
+async function deleteSchedule(options: DeleteScheduleOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const id = parseInt(scheduleId, 10)
+  const id = parseInt(options.id, 10)
   if (isNaN(id)) {
     warning('Invalid schedule ID')
     return
   }
 
-  if (!options.force) {
+  const skipConfirmation = options.force || options.yes
+
+  if (!skipConfirmation) {
     const confirmed = await promptConfirm({
-      message: `Delete backup schedule #${scheduleId}?`,
+      message: `Delete backup schedule #${options.id}?`,
       default: false,
     })
     if (!confirmed) {
@@ -304,14 +392,14 @@ async function deleteSchedule(scheduleId: string, options: { force?: boolean }):
     }
   })
 
-  success(`Schedule #${scheduleId} deleted`)
+  success(`Schedule #${options.id} deleted`)
 }
 
-async function listBackups(scheduleId: string, options: { json?: boolean }): Promise<void> {
+async function listBackups(options: ListBackupsOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const id = parseInt(scheduleId, 10)
+  const id = parseInt(options.scheduleId, 10)
   if (isNaN(id)) {
     warning('Invalid schedule ID')
     return
@@ -334,7 +422,7 @@ async function listBackups(scheduleId: string, options: { json?: boolean }): Pro
   }
 
   newline()
-  header(`${icons.package} Backups for Schedule #${scheduleId} (${backups.length})`)
+  header(`${icons.package} Backups for Schedule #${options.scheduleId} (${backups.length})`)
 
   if (backups.length === 0) {
     info('No backups found for this schedule')
@@ -354,17 +442,17 @@ async function listBackups(scheduleId: string, options: { json?: boolean }): Pro
   newline()
 }
 
-async function showBackup(backupId: string, options: { json?: boolean }): Promise<void> {
+async function showBackup(options: ShowBackupOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
   const backup = await withSpinner('Fetching backup...', async () => {
     const { data, error } = await getBackup({
       client,
-      path: { id: backupId },
+      path: { id: options.id },
     })
     if (error || !data) {
-      throw new Error(getErrorMessage(error) ?? `Backup ${backupId} not found`)
+      throw new Error(getErrorMessage(error) ?? `Backup ${options.id} not found`)
     }
     return data
   })

@@ -43,6 +43,12 @@ export function registerConfigureCommand(program: Command): void {
     .action(listConfig)
 
   configure
+    .command('show')
+    .description('Show current configuration and authentication status')
+    .option('--json', 'Output in JSON format')
+    .action(showConfig)
+
+  configure
     .command('reset')
     .description('Reset configuration to defaults')
     .action(resetConfig)
@@ -261,6 +267,88 @@ function listConfig(): void {
 
   newline()
   info(`Configuration file: ${colors.muted(config.path)}`)
+}
+
+async function showConfig(options: { json?: boolean }): Promise<void> {
+  const allConfig = config.getAll()
+  const apiKey = await credentials.getApiKey()
+  const email = await credentials.get('email')
+
+  // Check if API URL is from environment variable
+  const envApiUrl = process.env.TEMPS_API_URL
+  const apiUrlSource = envApiUrl ? 'env' : 'config'
+  const apiUrl = envApiUrl || allConfig.apiUrl
+
+  // Check if API key is from environment variable
+  const envApiKey = process.env.TEMPS_API_TOKEN || process.env.TEMPS_API_KEY
+  const apiKeySource = envApiKey ? 'env' : 'config'
+
+  // Mask API key - show first 8 characters
+  let maskedApiKey = 'Not configured'
+  if (apiKey) {
+    if (apiKey.length > 8) {
+      maskedApiKey = `${apiKey.substring(0, 8)}...`
+    } else {
+      maskedApiKey = apiKey
+    }
+  }
+
+  if (options.json) {
+    console.log(JSON.stringify({
+      apiUrl,
+      apiUrlSource,
+      apiKey: maskedApiKey,
+      apiKeySource,
+      email: email || null,
+      authenticated: !!apiKey,
+      outputFormat: allConfig.outputFormat,
+      colorEnabled: allConfig.colorEnabled,
+      configPath: config.path,
+      credentialsPath: credentials.path,
+    }, null, 2))
+    return
+  }
+
+  newline()
+  header(`${icons.sparkles} Temps CLI Configuration`)
+  newline()
+
+  // API URL
+  if (apiUrlSource === 'env') {
+    keyValue('API URL', `${apiUrl} ${colors.muted('(from TEMPS_API_URL)')}`)
+  } else {
+    keyValue('API URL', apiUrl)
+  }
+
+  // API Key
+  if (apiKey) {
+    const sourceNote = apiKeySource === 'env'
+      ? colors.muted('(from TEMPS_API_TOKEN)')
+      : colors.muted('(from config)')
+    keyValue('API Key', `${maskedApiKey} ${sourceNote}`)
+  } else {
+    keyValue('API Key', colors.warning('Not configured'))
+  }
+
+  // Email
+  if (email) {
+    keyValue('User', email)
+  }
+
+  // Auth status
+  if (apiKey) {
+    keyValue('Status', colors.success('Authenticated'))
+  } else {
+    keyValue('Status', colors.warning('Not authenticated'))
+  }
+
+  newline()
+  keyValue('Output Format', allConfig.outputFormat)
+  keyValue('Colors', allConfig.colorEnabled ? 'enabled' : 'disabled')
+
+  newline()
+  info(`Config file: ${colors.muted(config.path)}`)
+  info(`Credentials file: ${colors.muted(credentials.path)}`)
 }
 
 async function resetConfig(): Promise<void> {

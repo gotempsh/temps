@@ -6,6 +6,7 @@ import { colors, info, warning, newline } from '../ui/output.js'
 import { startSpinner, succeedSpinner, failSpinner } from '../ui/spinner.js'
 
 interface RuntimeLogsOptions {
+  project?: string
   environment: string
   container?: string
   tail: string
@@ -14,9 +15,10 @@ interface RuntimeLogsOptions {
 
 export function registerRuntimeLogsCommand(program: Command): void {
   program
-    .command('runtime-logs <project>')
+    .command('runtime-logs')
     .alias('rlogs')
     .description('Stream runtime container logs (not build logs)')
+    .option('-p, --project <project>', 'Project slug or ID')
     .option('-e, --environment <env>', 'Environment name', 'production')
     .option('-c, --container <id>', 'Container ID (partial match supported)')
     .option('-n, --tail <lines>', 'Number of lines to tail', '1000')
@@ -24,11 +26,11 @@ export function registerRuntimeLogsCommand(program: Command): void {
     .action(runtimeLogs)
 }
 
-async function runtimeLogs(project: string, options: RuntimeLogsOptions): Promise<void> {
+async function runtimeLogs(options: RuntimeLogsOptions): Promise<void> {
   const apiKey = await requireAuth()
   await setupClient()
 
-  const projectName = project ?? config.get('defaultProject')
+  const projectName = options.project ?? config.get('defaultProject')
 
   if (!projectName) {
     warning('No project specified')
@@ -88,6 +90,11 @@ async function runtimeLogs(project: string, options: RuntimeLogsOptions): Promis
 
   // Select container
   let selectedContainer = containers[0]
+  if (!selectedContainer) {
+    warning('No container available')
+    return
+  }
+
   if (options.container) {
     const match = containers.find(c =>
       c.container_id.startsWith(options.container!) ||

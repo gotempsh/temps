@@ -1127,6 +1127,20 @@ impl ExternalService for PostgresService {
         // Get file size after compression
         let size_bytes = compressed_file.as_file().metadata()?.len() as i32;
 
+        // Validate backup size - a zero-size backup indicates failure
+        if size_bytes == 0 {
+            let mut backup_update: external_service_backups::ActiveModel =
+                backup_record.clone().into();
+            backup_update.state = Set("failed".to_string());
+            backup_update.finished_at = Set(Some(Utc::now()));
+            backup_update.error_message =
+                Set(Some("Backup failed: backup file has zero size".to_string()));
+            backup_update.update(pool).await?;
+            return Err(anyhow::anyhow!(
+                "PostgreSQL backup failed: backup file has zero size"
+            ));
+        }
+
         s3_client
             .put_object()
             .bucket(&s3_source.bucket_name)

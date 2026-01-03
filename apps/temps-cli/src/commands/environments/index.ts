@@ -18,7 +18,7 @@ import {
 import type { EnvironmentResponse, EnvironmentVariableResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
-import { promptText, promptConfirm, promptSelect } from '../../ui/prompts.js'
+import { promptText, promptConfirm, promptSelect, promptCheckbox } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, warning, keyValue, info, error as errorOutput } from '../../ui/output.js'
 
 export function registerEnvironmentsCommands(program: Command): void {
@@ -503,11 +503,10 @@ async function setEnvVar(
     if (existingVar && options.update) {
       environmentIds = existingVar.environments.map(e => e.id)
     } else {
-      const selected = await promptSelect({
+      const selected = await promptCheckbox({
         message: 'Select environments',
         choices,
-        multiple: true,
-      }) as number[]
+      })
       environmentIds = selected
     }
   }
@@ -521,6 +520,7 @@ async function setEnvVar(
         client,
         path: { project_id: projectId, var_id: existingVar.id },
         body: {
+          key,
           value: actualValue,
           environment_ids: environmentIds,
           include_in_preview: options.preview !== false,
@@ -731,11 +731,10 @@ async function importEnvVars(
       value: e.id,
     }))
 
-    const selected = await promptSelect({
+    const selected = await promptCheckbox({
       message: 'Select environments to import into',
       choices,
-      multiple: true,
-    }) as number[]
+    })
     environmentIds = selected
   }
 
@@ -754,6 +753,7 @@ async function importEnvVars(
             client,
             path: { project_id: projectId, var_id: existing.id },
             body: {
+              key,
               value,
               environment_ids: environmentIds,
               include_in_preview: true,
@@ -1147,6 +1147,8 @@ function parseEnvFile(content: string): Record<string, string> {
     if (!match) continue
 
     const [, key, rawValue] = match
+    if (!key || rawValue === undefined) continue
+
     let value = rawValue.trim()
 
     // Handle quoted values

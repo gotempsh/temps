@@ -3,7 +3,7 @@
 import {
   deleteProviderMutation,
   listNotificationProvidersOptions,
-  testProviderMutation,
+  testProvider2Mutation,
   updateEmailProviderMutation,
   updateProviderMutation,
   updateSlackProviderMutation,
@@ -119,7 +119,7 @@ export function ProvidersManagement() {
   })
 
   const testMutation = useMutation({
-    ...testProviderMutation(),
+    ...testProvider2Mutation(),
     meta: {
       errorTitle: 'Failed to test provider',
     },
@@ -178,20 +178,28 @@ export function ProvidersManagement() {
 
   const handleDelete = async (provider: ExtendedNotificationProvider) => {
     await deleteMutation.mutateAsync({
-      path: { provider_id: provider.id },
+      path: { id: provider.id },
     })
   }
 
   const handleTest = async (provider: ExtendedNotificationProvider) => {
-    toast.promise(testMutation.mutateAsync({ path: { id: provider.id } }), {
-      loading: 'Sending test notification...',
-      success: (data) => data.message || 'Test notification sent successfully!',
-      error: (error) => {
-        const message =
-          error?.response?.data?.detail || 'Failed to send test notification'
-        return message
-      },
-    })
+    toast.promise(
+      testMutation.mutateAsync({
+        path: { id: provider.id },
+      }),
+      {
+        loading: 'Sending test notification...',
+        success: (data) =>
+          data.success
+            ? 'Test notification sent successfully!'
+            : data.message || 'Failed to send test notification',
+        error: (error) => {
+          const message =
+            error?.response?.data?.detail || 'Failed to send test notification'
+          return message
+        },
+      }
+    )
   }
 
   const handleEdit = (provider: ExtendedNotificationProvider) => {
@@ -205,8 +213,7 @@ export function ProvidersManagement() {
       path: { id: provider.id },
       body: {
         name: provider.name,
-        enabled: !provider.enabled,
-        config: provider.config,
+        is_active: !provider.enabled,
       },
     })
   }

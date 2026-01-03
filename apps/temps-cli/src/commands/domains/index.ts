@@ -12,11 +12,44 @@ import {
 import type { DomainResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
-import { promptText, promptConfirm } from '../../ui/prompts.js'
+import { promptConfirm } from '../../ui/prompts.js'
 import {
   newline, header, icons, json, colors, success, warning, info,
   keyValue, formatDate, box
 } from '../../ui/output.js'
+
+// Helper function to find domain ID by domain name
+async function findDomainIdByName(domainName: string): Promise<number | null> {
+  const { data, error } = await listDomainsApi({ client })
+  if (error || !data?.domains) return null
+
+  const domain = data.domains.find((d: DomainResponse) => d.domain === domainName)
+  return domain?.id ?? null
+}
+
+interface AddOptions {
+  domain: string
+  challenge?: string
+}
+
+interface VerifyOptions {
+  domain: string
+}
+
+interface RemoveOptions {
+  domain: string
+  force?: boolean
+  yes?: boolean
+}
+
+interface SslOptions {
+  domain: string
+  renew?: boolean
+}
+
+interface StatusOptions {
+  domain: string
+}
 
 export function registerDomainsCommands(program: Command): void {
   const domains = program
@@ -32,32 +65,38 @@ export function registerDomainsCommands(program: Command): void {
     .action(listDomains)
 
   domains
-    .command('add <domain>')
+    .command('add')
     .description('Add a custom domain')
+    .requiredOption('-d, --domain <domain>', 'Domain name')
     .option('-c, --challenge <type>', 'Challenge type (http-01 or dns-01)', 'http-01')
     .action(addDomain)
 
   domains
-    .command('verify <domain>')
+    .command('verify')
     .description('Verify domain and provision SSL certificate')
+    .requiredOption('-d, --domain <domain>', 'Domain name')
     .action(verifyDomain)
 
   domains
-    .command('remove <domain>')
+    .command('remove')
     .alias('rm')
     .description('Remove a domain')
+    .requiredOption('-d, --domain <domain>', 'Domain name')
     .option('-f, --force', 'Skip confirmation')
+    .option('-y, --yes', 'Skip confirmation prompts (alias for --force)')
     .action(removeDomain)
 
   domains
-    .command('ssl <domain>')
+    .command('ssl')
     .description('Manage SSL certificate')
+    .requiredOption('-d, --domain <domain>', 'Domain name')
     .option('--renew', 'Force certificate renewal')
     .action(manageSsl)
 
   domains
-    .command('status <domain>')
+    .command('status')
     .description('Check domain status')
+    .requiredOption('-d, --domain <domain>', 'Domain name')
     .action(domainStatus)
 }
 
@@ -95,12 +134,11 @@ async function listDomains(options: { json?: boolean }): Promise<void> {
   newline()
 }
 
-async function addDomain(
-  domain: string,
-  options: { challenge: string }
-): Promise<void> {
+async function addDomain(options: AddOptions): Promise<void> {
   await requireAuth()
   await setupClient()
+
+  const domain = options.domain
 
   newline()
   info(`Adding domain ${colors.bold(domain)}`)
@@ -110,7 +148,7 @@ async function addDomain(
       client,
       body: {
         domain,
-        challenge_type: options.challenge,
+        challenge_type: options.challenge || 'http-01',
       },
     })
     if (error) throw new Error(getErrorMessage(error))
@@ -129,17 +167,19 @@ async function addDomain(
       'Add this DNS record to verify ownership'
     )
     newline()
-    info('Run "temps domains verify ' + domain + '" after adding the record')
+    info(`Run "temps domains verify --domain ${domain}" after adding the record`)
   } else if (options.challenge === 'http-01') {
     newline()
     info('HTTP-01 challenge will be validated automatically when provisioning')
-    info('Run "temps domains verify ' + domain + '" to provision SSL certificate')
+    info(`Run "temps domains verify --domain ${domain}" to provision SSL certificate`)
   }
 }
 
-async function verifyDomain(domain: string): Promise<void> {
+async function verifyDomain(options: VerifyOptions): Promise<void> {
   await requireAuth()
   await setupClient()
+
+  const domain = options.domain
 
   const result = await withSpinner(`Provisioning SSL for ${domain}...`, async () => {
     const { data, error } = await provisionDomain({
@@ -151,23 +191,41 @@ async function verifyDomain(domain: string): Promise<void> {
   })
 
   newline()
-  if (result?.status === 'active' || result?.status === 'provisioned') {
-    success(`Domain ${domain} verified and SSL certificate provisioned`)
-  } else if (result?.status === 'pending') {
+  if (!result) {
+    warning('No response received')
+    return
+  }
+
+  // Handle union type based on 'type' discriminator
+  if (result.type === 'complete') {
+    const domainData = result
+    if (domainData.status === 'active' || domainData.status === 'provisioned') {
+      success(`Domain ${domain} verified and SSL certificate provisioned`)
+    } else {
+      warning(`Domain status: ${domainData.status}`)
+      if (domainData.last_error) {
+        warning(`Error: ${domainData.last_error}`)
+      }
+    }
+  } else if (result.type === 'pending') {
     info(`Domain ${domain} is pending verification`)
     info('Please ensure DNS records are properly configured')
-  } else {
-    warning(`Domain status: ${result?.status ?? 'unknown'}`)
-    if (result?.last_error) {
-      warning(`Error: ${result.last_error}`)
+  } else if (result.type === 'error') {
+    const errorData = result
+    warning(`Domain provisioning error: ${errorData.message}`)
+    if (errorData.details) {
+      warning(`Details: ${errorData.details}`)
     }
   }
 }
 
-async function removeDomain(domain: string, options: { force?: boolean }): Promise<void> {
+async function removeDomain(options: RemoveOptions): Promise<void> {
   await requireAuth()
 
-  if (!options.force) {
+  const domain = options.domain
+  const skipConfirmation = options.force || options.yes
+
+  if (!skipConfirmation) {
     const confirmed = await promptConfirm({
       message: `Remove domain ${domain}?`,
       default: false,
@@ -191,15 +249,17 @@ async function removeDomain(domain: string, options: { force?: boolean }): Promi
   success(`Domain ${domain} removed`)
 }
 
-async function manageSsl(domain: string, options: { renew?: boolean }): Promise<void> {
+async function manageSsl(options: SslOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
+  const domainName = options.domain
+
   if (options.renew) {
-    await withSpinner(`Renewing SSL certificate for ${domain}...`, async () => {
+    await withSpinner(`Renewing SSL certificate for ${domainName}...`, async () => {
       const { error } = await renewDomain({
         client,
-        path: { domain },
+        path: { domain: domainName },
       })
       if (error) throw new Error(getErrorMessage(error))
     })
@@ -207,17 +267,24 @@ async function manageSsl(domain: string, options: { renew?: boolean }): Promise<
     return
   }
 
+  // Look up domain ID by name
+  const domainId = await findDomainIdByName(domainName)
+  if (!domainId) {
+    warning(`Domain ${domainName} not found`)
+    return
+  }
+
   const sslInfo = await withSpinner('Fetching SSL info...', async () => {
     const { data, error } = await checkDomainStatus({
       client,
-      path: { domain },
+      path: { domain: domainId },
     })
     if (error) throw new Error(getErrorMessage(error))
     return data
   })
 
   newline()
-  header(`${icons.lock} SSL Certificate for ${domain}`)
+  header(`${icons.lock} SSL Certificate for ${domainName}`)
   keyValue('Status', statusBadge(sslInfo?.status ?? 'unknown'))
   keyValue('Wildcard', sslInfo?.is_wildcard ? 'Yes' : 'No')
   keyValue('Method', sslInfo?.verification_method ?? '-')
@@ -231,21 +298,30 @@ async function manageSsl(domain: string, options: { renew?: boolean }): Promise<
   newline()
 }
 
-async function domainStatus(domain: string): Promise<void> {
+async function domainStatus(options: StatusOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const status = await withSpinner(`Checking status for ${domain}...`, async () => {
+  const domainName = options.domain
+
+  // Look up domain ID by name
+  const domainId = await findDomainIdByName(domainName)
+  if (!domainId) {
+    warning(`Domain ${domainName} not found`)
+    return
+  }
+
+  const status = await withSpinner(`Checking status for ${domainName}...`, async () => {
     const { data, error } = await checkDomainStatus({
       client,
-      path: { domain },
+      path: { domain: domainId },
     })
     if (error) throw new Error(getErrorMessage(error))
     return data
   })
 
   newline()
-  header(`${icons.globe} Domain Status: ${domain}`)
+  header(`${icons.globe} Domain Status: ${domainName}`)
   keyValue('Status', statusBadge(status?.status ?? 'unknown'))
   keyValue('Wildcard', status?.is_wildcard ? 'Yes' : 'No')
   keyValue('Verification Method', status?.verification_method ?? '-')

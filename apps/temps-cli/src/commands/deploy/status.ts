@@ -6,32 +6,38 @@ import { newline, header, icons, json, colors, formatDate } from '../../ui/outpu
 import { detailsTable, statusBadge } from '../../ui/table.js'
 
 interface StatusOptions {
+  project?: string
+  deploymentId?: string
   json?: boolean
 }
 
-export async function status(deploymentId: string, options: StatusOptions): Promise<void> {
+export async function status(options: StatusOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  // Parse project and deployment from input
-  // Format: project:deployment_id or just deployment_id (requires project context)
-  let projectId: number
-  let depId: number
+  if (!options.project) {
+    throw new Error('Project is required. Use: temps deployments status --project <project> --deployment-id <id>')
+  }
 
-  if (deploymentId.includes(':')) {
-    const [projectSlug, depIdStr] = deploymentId.split(':')
-    const { data, error } = await getProjectBySlug({
-      client,
-      path: { slug: projectSlug },
-    })
-    if (error || !data) {
-      throw new Error(`Project "${projectSlug}" not found`)
-    }
-    projectId = data.id
-    depId = parseInt(depIdStr, 10)
-  } else {
-    // Assume deploymentId is in format "projectId:deploymentId" as number:number
-    throw new Error('Please specify deployment as project:deployment_id (e.g., my-project:123)')
+  if (!options.deploymentId) {
+    throw new Error('Deployment ID is required. Use: temps deployments status --project <project> --deployment-id <id>')
+  }
+
+  // Get project ID from slug
+  const { data: projectData, error: projectError } = await getProjectBySlug({
+    client,
+    path: { slug: options.project },
+  })
+
+  if (projectError || !projectData) {
+    throw new Error(`Project "${options.project}" not found`)
+  }
+
+  const projectId = projectData.id
+  const depId = parseInt(options.deploymentId, 10)
+
+  if (isNaN(depId)) {
+    throw new Error('Invalid deployment ID')
   }
 
   const deployment = await withSpinner('Fetching deployment status...', async () => {

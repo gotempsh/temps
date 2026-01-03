@@ -455,6 +455,7 @@ impl CertificateRepository for DefaultCertificateRepository {
                 http_challenge_token: Set(Some(data.token.clone())),
                 http_challenge_key_authorization: Set(Some(data.key_authorization.clone())),
                 last_error: Set(data.validation_url.clone()), // Store validation URL in last_error temporarily
+                last_error_type: Set(data.order_url.clone()), // Store order URL in last_error_type temporarily
                 updated_at: Set(Utc::now()),
                 ..Default::default()
             })
@@ -469,6 +470,7 @@ impl CertificateRepository for DefaultCertificateRepository {
                 http_challenge_token: Set(Some(data.token)),
                 http_challenge_key_authorization: Set(Some(data.key_authorization)),
                 last_error: Set(data.validation_url),
+                last_error_type: Set(data.order_url), // Store order URL in last_error_type temporarily
                 created_at: Set(data.created_at),
                 updated_at: Set(Utc::now()),
                 verification_method: Set("http-01".to_string()),
@@ -502,6 +504,7 @@ impl CertificateRepository for DefaultCertificateRepository {
                     token,
                     key_authorization: key_auth,
                     validation_url: r.last_error, // Validation URL stored in last_error
+                    order_url: r.last_error_type, // Order URL stored in last_error_type
                     created_at: r.created_at,
                 }),
                 _ => None,

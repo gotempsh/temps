@@ -6,12 +6,15 @@ import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { getProject, getProjectBySlug } from '../../api/sdk.gen.js'
 
 interface ShowOptions {
+  project: string
   json?: boolean
 }
 
-export async function show(projectIdOrName: string, options: ShowOptions): Promise<void> {
+export async function show(options: ShowOptions): Promise<void> {
   await requireAuth()
   await setupClient()
+
+  const projectIdOrName = options.project
 
   const project = await withSpinner('Fetching project...', async () => {
     // Try to parse as ID first
@@ -32,6 +35,10 @@ export async function show(projectIdOrName: string, options: ShowOptions): Promi
     }
     return data
   })
+
+  if (!project) {
+    throw new Error(`Project "${projectIdOrName}" not found`)
+  }
 
   if (options.json) {
     json(project)

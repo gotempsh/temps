@@ -66,6 +66,7 @@ dirs = { version = "5.0" }
 rand = { workspace = true }
 hex = { workspace = true }
 bollard = { workspace = true }
+futures = { workspace = true }
 axum = { workspace = true }
 utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }

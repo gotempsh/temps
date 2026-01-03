@@ -86,30 +86,8 @@ impl TempsPlugin for DomainsPlugin {
             let tls_service = Arc::new(tls_service);
             context.register_service(tls_service.clone());
 
-            // Run certificate renewal check on startup (spawn as background task)
-            let tls_service_clone = tls_service.clone();
-            tokio::spawn(async move {
-                tracing::debug!("Running certificate renewal check on startup");
-                match tls_service_clone.check_and_renew_certificates(30).await {
-                    Ok(report) => {
-                        // Only log if there's something interesting
-                        if report.total_checked > 0 {
-                            tracing::info!(
-                                "Certificate renewal check: {} checked, {} renewed, {} failed, {} manual",
-                                report.total_checked,
-                                report.auto_renewed.len(),
-                                report.renewal_failed.len(),
-                                report.manual_action_needed.len()
-                            );
-                        } else {
-                            tracing::debug!("Certificate renewal check completed: no certificates expiring within 30 days");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Certificate renewal check failed: {}", e);
-                    }
-                }
-            });
+            // Note: Certificate renewal scheduler is started in console.rs
+            // The scheduler handles both initial check and daily scheduled checks
 
             // Get encryption service
             let encryption_service = context.require_service::<temps_core::EncryptionService>();

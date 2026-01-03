@@ -16,6 +16,9 @@
     "build": "bun build src/index.ts --outdir dist --target node && sed -i '' '1s|#!/usr/bin/env bun|#!/usr/bin/env node|' dist/index.js && chmod +x dist/index.js",
     "build:bin": "bun build src/index.ts --compile --outfile bin/temps",
     "generate:api": "bun openapi-ts",
+    "generate:docs": "bun run scripts/generate-docs.ts",
+    "generate:docs:mdx": "bun run scripts/generate-docs.ts --format mdx",
+    "generate:docs:json": "bun run scripts/generate-docs.ts --format json",
     "typecheck": "tsc --noEmit",
     "link": "bun link"
   },

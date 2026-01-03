@@ -7,19 +7,20 @@ import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { newline, header, icons, json, colors, formatRelativeTime, truncate } from '../../ui/output.js'
 
 interface ListOptions {
+  project?: string
   environment?: string
   limit: string
   json?: boolean
 }
 
-export async function list(project: string | undefined, options: ListOptions): Promise<void> {
+export async function list(options: ListOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const projectName = project ?? config.get('defaultProject')
+  const projectName = options.project ?? config.get('defaultProject')
 
   if (!projectName) {
-    throw new Error('No project specified. Use: temps deployments list <project>')
+    throw new Error('No project specified. Use: temps deployments list --project <project>')
   }
 
   const deployments = await withSpinner('Fetching deployments...', async () => {

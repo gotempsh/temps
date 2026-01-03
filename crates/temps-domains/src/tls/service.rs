@@ -112,6 +112,7 @@ impl TlsService {
                     token: challenge_data.token.clone(),
                     key_authorization: challenge_data.key_authorization.clone(),
                     validation_url: challenge_data.validation_url.clone(),
+                    order_url: challenge_data.order_url.clone(),
                     created_at: Utc::now(),
                 };
 
@@ -159,7 +160,7 @@ impl TlsService {
             key_authorization: challenge_data.key_authorization,
             validation_url: challenge_data.validation_url,
             dns_txt_records: vec![],
-            order_url: None, // Order URL not stored for HTTP challenges
+            order_url: challenge_data.order_url,
         };
 
         let cert = self
@@ -345,21 +346,58 @@ impl TlsService {
 
         let email = self.get_acme_email().await;
 
+        // Step 1: Initiate the ACME order and HTTP-01 challenge
+        // provision_certificate returns ManualActionRequired error when challenge is initiated,
+        // which is expected behavior for the provisioning step
         match self.provision_certificate(&cert.domain, &email).await {
-            Ok(_) => {
+            Ok(_new_cert) => {
+                // Certificate was immediately available (shouldn't happen for renewals, but handle it)
                 info!("✅ Successfully renewed certificate for {}", cert.domain);
                 report.auto_renewed.push(cert.domain.clone());
+                return;
+            }
+            Err(TlsError::ManualActionRequired(_)) => {
+                // This is expected - challenge has been initiated and saved
+                info!(
+                    "HTTP-01 challenge initiated for {}, waiting for validation...",
+                    cert.domain
+                );
             }
             Err(e) => {
-                error!("❌ Failed to renew certificate for {}: {}", cert.domain, e);
-
+                error!("❌ Failed to initiate renewal for {}: {}", cert.domain, e);
                 report.renewal_failed.push(RenewalFailure {
                     domain: cert.domain.clone(),
                     error: e.to_string(),
                     verification_method: cert.verification_method.clone(),
                 });
+                self.send_renewal_failure_notification(&cert.domain, &e.to_string())
+                    .await;
+                return;
+            }
+        }
 
-                // Send immediate notification for failed renewal
+        // Step 2: Wait for the ACME server to validate the challenge
+        // The proxy automatically serves the challenge token at /.well-known/acme-challenge/{token}
+        // Let's Encrypt typically validates within a few seconds
+        info!(
+            "Waiting for Let's Encrypt to validate HTTP-01 challenge for {}...",
+            cert.domain
+        );
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+        // Step 3: Complete the challenge and obtain the certificate
+        match self.complete_http_challenge(&cert.domain, &email).await {
+            Ok(_new_cert) => {
+                info!("✅ Successfully renewed certificate for {}", cert.domain);
+                report.auto_renewed.push(cert.domain.clone());
+            }
+            Err(e) => {
+                error!("❌ Failed to complete renewal for {}: {}", cert.domain, e);
+                report.renewal_failed.push(RenewalFailure {
+                    domain: cert.domain.clone(),
+                    error: e.to_string(),
+                    verification_method: cert.verification_method.clone(),
+                });
                 self.send_renewal_failure_notification(&cert.domain, &e.to_string())
                     .await;
             }
@@ -668,6 +706,103 @@ impl TlsService {
         } else {
             // If it's not a LetsEncryptProvider, we can't fetch challenge status
             Ok(None)
+        }
+    }
+
+    /// Start the certificate renewal scheduler
+    ///
+    /// This runs continuously, checking for expiring certificates once per day at 3:00 AM.
+    /// - HTTP-01 certificates: Auto-renewed
+    /// - DNS-01 certificates: Notification sent for manual renewal
+    ///
+    /// The scheduler will continue running until the cancellation token is triggered.
+    pub async fn start_certificate_renewal_scheduler(
+        &self,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Result<(), TlsError> {
+        use chrono::Timelike;
+        use tokio::time;
+
+        info!("Starting certificate renewal scheduler");
+
+        // Run initial check on startup
+        match self.check_and_renew_certificates(30).await {
+            Ok(report) => {
+                if report.total_checked > 0 {
+                    info!(
+                        "Initial certificate check: {} checked, {} renewed, {} failed, {} manual",
+                        report.total_checked,
+                        report.auto_renewed.len(),
+                        report.renewal_failed.len(),
+                        report.manual_action_needed.len()
+                    );
+                }
+            }
+            Err(e) => {
+                error!("Initial certificate renewal check failed: {}", e);
+            }
+        }
+
+        loop {
+            let now = chrono::Utc::now();
+
+            // Calculate time until next 3:00 AM UTC
+            let next_run = if now.hour() >= 3 {
+                // Next 3 AM is tomorrow
+                (now + chrono::Duration::days(1))
+                    .with_hour(3)
+                    .unwrap()
+                    .with_minute(0)
+                    .unwrap()
+                    .with_second(0)
+                    .unwrap()
+                    .with_nanosecond(0)
+                    .unwrap()
+            } else {
+                // Next 3 AM is today
+                now.with_hour(3)
+                    .unwrap()
+                    .with_minute(0)
+                    .unwrap()
+                    .with_second(0)
+                    .unwrap()
+                    .with_nanosecond(0)
+                    .unwrap()
+            };
+
+            let sleep_duration = next_run - now;
+            let sleep_secs = sleep_duration.num_seconds().max(0) as u64;
+
+            info!(
+                "Next certificate renewal check scheduled for {} (in {} hours)",
+                next_run.format("%Y-%m-%d %H:%M:%S UTC"),
+                sleep_duration.num_hours()
+            );
+
+            tokio::select! {
+                _ = time::sleep(time::Duration::from_secs(sleep_secs)) => {
+                    info!("Running scheduled certificate renewal check");
+
+                    match self.check_and_renew_certificates(30).await {
+                        Ok(report) => {
+                            info!(
+                                "Certificate renewal check: {} checked, {} renewed, {} failed, {} manual",
+                                report.total_checked,
+                                report.auto_renewed.len(),
+                                report.renewal_failed.len(),
+                                report.manual_action_needed.len()
+                            );
+                        }
+                        Err(e) => {
+                            error!("Certificate renewal check failed: {}", e);
+                        }
+                    }
+                }
+                _ = cancellation_token.cancelled() => {
+                    info!("Certificate renewal scheduler shutting down");
+                    return Ok(());
+                }
+            }
         }
     }
 }

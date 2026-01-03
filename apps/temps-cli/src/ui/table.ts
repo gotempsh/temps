@@ -123,7 +123,7 @@ export function createTable<T>(
   const table = new Table({
     head: columns.map((col) => colors.bold(col.header)),
     colAligns: columns.map((col) => col.align ?? 'left'),
-    colWidths: columns.map((col) => col.width),
+    colWidths: columns.map((col) => col.width ?? null),
     ...preset,
   })
 
@@ -173,7 +173,7 @@ export function detailsTable(
 ): void {
   const table = new Table({
     ...stylePresets.borderless,
-    colWidths: [20, undefined],
+    colWidths: [20, null],
   })
 
   for (const [key, value] of Object.entries(details)) {
