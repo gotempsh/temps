@@ -120,6 +120,9 @@ pub struct VisitorsListQuery {
     pub include_crawlers: Option<bool>,
     pub limit: Option<i32>,
     pub offset: Option<i32>,
+    /// Filter to only include visitors with recorded activity (events/sessions).
+    /// When true, excludes "ghost" visitors that have no events.
+    pub has_activity_only: Option<bool>,
 }
 
 #[derive(Deserialize, Clone, ToSchema)]
@@ -261,4 +264,17 @@ pub struct PagePathsQuery {
 pub struct GeneralStatsQuery {
     pub start_date: DateTime,
     pub end_date: DateTime,
+}
+
+/// Query parameters for page path detail analytics
+#[derive(Deserialize, Clone, ToSchema)]
+pub struct PagePathDetailQuery {
+    /// The specific page path to get details for (URL-encoded)
+    pub page_path: String,
+    pub project_id: i32,
+    pub environment_id: Option<i32>,
+    pub start_date: DateTime,
+    pub end_date: DateTime,
+    /// Bucket interval for time series: 'hour', 'day', 'week', 'month' (default: auto)
+    pub bucket_interval: Option<String>,
 }

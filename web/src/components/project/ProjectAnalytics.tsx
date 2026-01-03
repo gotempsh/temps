@@ -10,6 +10,7 @@ import {
   BrowsersChart,
   LocationsChart,
   PagesChart,
+  ReferrersChart,
 } from '@/components/analytics/overview'
 import { Pages } from '@/components/analytics/Pages'
 import { SessionReplays } from '@/components/analytics/SessionReplays'
@@ -878,6 +879,12 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
               environment={selectedEnvironment}
             />
             <LocationsChart
+              project={project}
+              startDate={startDate}
+              endDate={endDate}
+              environment={selectedEnvironment}
+            />
+            <ReferrersChart
               project={project}
               startDate={startDate}
               endDate={endDate}

@@ -16,6 +16,16 @@ pub struct Model {
     pub referrer: Option<String>,
     pub data: String,
     pub visitor_id: Option<i32>,
+    // UTM tracking fields
+    pub utm_source: Option<String>,
+    pub utm_medium: Option<String>,
+    pub utm_campaign: Option<String>,
+    pub utm_content: Option<String>,
+    pub utm_term: Option<String>,
+    // Computed channel attribution
+    pub channel: Option<String>,
+    // Extracted referrer hostname for easier querying
+    pub referrer_hostname: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

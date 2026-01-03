@@ -1,4 +1,5 @@
-use crate::types::{requests::*, responses::*};
+use crate::types::requests::{self, *};
+use crate::types::responses::*;
 use crate::{Analytics, AnalyticsError};
 use axum::{
     extract::{Query, State},
@@ -35,6 +36,7 @@ pub struct AppState {
         get_session_logs,
         has_analytics_events,
         get_page_paths,
+        get_page_path_detail,
         get_active_visitors,
         get_live_visitors_list,
         get_page_hourly_sessions,
@@ -108,6 +110,12 @@ pub struct AppState {
         GeneralStatsQuery,
         GeneralStatsResponse,
         ProjectStatsBreakdown,
+        // Page path detail types
+        PagePathDetailQuery,
+        PagePathDetailResponse,
+        PageActivityBucket,
+        PageCountryStats,
+        PageReferrerStats,
     )),
     info(
         title = "Analytics API",
@@ -151,6 +159,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
         .route("/analytics/has-events", get(has_analytics_events))
         .route("/analytics/page-paths", get(get_page_paths))
+        .route("/analytics/page-path-detail", get(get_page_path_detail))
         .route("/analytics/active-visitors", get(get_active_visitors))
         .route("/analytics/live-visitors", get(get_live_visitors_list))
         .route(
@@ -225,6 +234,7 @@ pub async fn get_events_count(
         ("include_crawlers" = Option<bool>, Query, description = "Include crawlers (default: false)"),
         ("limit" = Option<i32>, Query, description = "Maximum number of visitors to return (default: 50)"),
         ("offset" = Option<i32>, Query, description = "Number of visitors to skip (default: 0)"),
+        ("has_activity_only" = Option<bool>, Query, description = "Filter to only include visitors with recorded activity (events/sessions). When true, excludes ghost visitors (default: true)"),
     ),
     responses(
         (status = 200, description = "Successfully retrieved visitors", body = VisitorsResponse),
@@ -252,7 +262,8 @@ pub async fn get_visitors(
             query.environment_id,
             query.include_crawlers,
             query.limit,
-            Some(0), // Default offset
+            query.offset,
+            Some(query.has_activity_only.unwrap_or(true)),
         )
         .await
     {
@@ -726,6 +737,56 @@ pub async fn get_page_paths(
             };
             Ok(Json(response))
         }
+        Err(e) => Err(handle_analytics_error(e)),
+    }
+}
+
+/// Get detailed analytics for a specific page path
+/// Returns visitors, page views, activity over time, geographic distribution, and referrers
+#[utoipa::path(
+    tag = "Analytics",
+    get,
+    path = "/analytics/page-path-detail",
+    params(
+        ("page_path" = String, Query, description = "The page path to get details for (URL-encoded)"),
+        ("project_id" = i32, Query, description = "Project ID"),
+        ("environment_id" = Option<i32>, Query, description = "Environment ID (optional)"),
+        ("start_date" = String, Query, description = "Start date in ISO 8601 format"),
+        ("end_date" = String, Query, description = "End date in ISO 8601 format"),
+        ("bucket_interval" = Option<String>, Query, description = "Bucket interval for time series: 'hour', 'day', 'week', 'month' (default: auto based on date range)")
+    ),
+    responses(
+        (status = 200, description = "Successfully retrieved page path detail analytics", body = PagePathDetailResponse),
+        (status = 400, description = "Invalid parameters or project not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_page_path_detail(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Query(query): Query<requests::PagePathDetailQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+
+    let start_date: UtcDateTime = query.start_date.into();
+    let end_date: UtcDateTime = query.end_date.into();
+
+    match app_state
+        .analytics_service
+        .get_page_path_detail(
+            query.project_id,
+            &query.page_path,
+            start_date,
+            end_date,
+            query.environment_id,
+            query.bucket_interval.as_deref(),
+        )
+        .await
+    {
+        Ok(detail) => Ok(Json(detail)),
         Err(e) => Err(handle_analytics_error(e)),
     }
 }

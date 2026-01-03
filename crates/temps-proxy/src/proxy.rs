@@ -358,6 +358,7 @@ impl LoadBalancer {
         };
 
         // Create session using the trait - pass encrypted cookie, not decrypted value
+        // Include query string for UTM parameter extraction and host for self-referral detection
         let session = match self
             .session_manager
             .get_or_create_session(
@@ -365,6 +366,8 @@ impl LoadBalancer {
                 &visitor,
                 project_context.as_ref(),
                 ctx.referrer.as_deref(),
+                ctx.query_string.as_deref(),
+                Some(&ctx.host),
             )
             .await
         {

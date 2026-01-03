@@ -8,6 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-analytics = { path = "../temps-analytics" }
 temps-audit = { path = "../temps-audit" }
 temps-auth = { path = "../temps-auth" }
 temps-config = { path = "../temps-config" }

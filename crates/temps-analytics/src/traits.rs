@@ -31,6 +31,7 @@ pub trait Analytics: Send + Sync {
         include_crawlers: Option<bool>,
         limit: Option<i32>,
         offset: Option<i32>,
+        has_activity_only: Option<bool>,
     ) -> Result<VisitorsResponse, AnalyticsError>;
 
     /// Get event counts
@@ -189,4 +190,16 @@ pub trait Analytics: Send + Sync {
         start_date: UtcDateTime,
         end_date: UtcDateTime,
     ) -> Result<crate::types::responses::GeneralStatsResponse, AnalyticsError>;
+
+    /// Get detailed analytics for a specific page path
+    /// Returns visitors, page views, activity over time, geographic distribution, and referrers
+    async fn get_page_path_detail(
+        &self,
+        project_id: i32,
+        page_path: &str,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        environment_id: Option<i32>,
+        bucket_interval: Option<&str>,
+    ) -> Result<crate::types::responses::PagePathDetailResponse, AnalyticsError>;
 }

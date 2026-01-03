@@ -486,3 +486,70 @@ pub struct LiveVisitorsListResponse {
     pub visitors: Vec<LiveVisitorInfo>,
     pub window_minutes: i32,
 }
+
+/// Time bucket data point for page activity graph
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+pub struct PageActivityBucket {
+    /// Timestamp for this bucket (ISO 8601)
+    #[schema(value_type = String)]
+    pub timestamp: UtcDateTime,
+    /// Number of unique visitors in this bucket
+    pub visitors: i64,
+    /// Number of page views in this bucket
+    pub page_views: i64,
+    /// Average time on page in seconds
+    pub avg_time_seconds: f64,
+}
+
+/// Geographic distribution of visitors for a page
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+pub struct PageCountryStats {
+    /// Country name
+    pub country: String,
+    /// ISO country code (2-letter)
+    pub country_code: Option<String>,
+    /// Number of unique visitors from this country
+    pub visitors: i64,
+    /// Number of page views from this country
+    pub page_views: i64,
+    /// Percentage of total visitors
+    pub percentage: f64,
+}
+
+/// Referrer source for the page
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+pub struct PageReferrerStats {
+    /// Referrer URL or domain
+    pub referrer: String,
+    /// Number of visits from this referrer
+    pub visits: i64,
+    /// Percentage of total visits
+    pub percentage: f64,
+}
+
+/// Detailed analytics response for a specific page path
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PagePathDetailResponse {
+    /// The page path being analyzed
+    pub page_path: String,
+    /// Total unique visitors to this page in the date range
+    pub unique_visitors: i64,
+    /// Total page views in the date range
+    pub total_page_views: i64,
+    /// Average time on page in seconds
+    pub avg_time_on_page: f64,
+    /// Bounce rate percentage (0-100)
+    pub bounce_rate: f64,
+    /// Entry rate - percentage of sessions that started on this page
+    pub entry_rate: f64,
+    /// Exit rate - percentage of sessions that ended on this page
+    pub exit_rate: f64,
+    /// Time series data for activity graph
+    pub activity_over_time: Vec<PageActivityBucket>,
+    /// Geographic distribution of visitors
+    pub countries: Vec<PageCountryStats>,
+    /// Top referrers to this page
+    pub referrers: Vec<PageReferrerStats>,
+    /// Bucket interval used for time series ('hour', 'day', etc.)
+    pub bucket_interval: String,
+}

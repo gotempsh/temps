@@ -1130,6 +1130,15 @@
 							"type": "integer",
 							"format": "int32"
 						}
+					},
+					{
+						"name": "has_activity_only",
+						"in": "query",
+						"description": "Filter to only include visitors with recorded activity (events/sessions). When true, excludes ghost visitors (default: false)",
+						"required": false,
+						"schema": {
+							"type": "boolean"
+						}
 					}
 				],
 				"responses": {
@@ -37475,6 +37484,13 @@
 							"null"
 						],
 						"format": "int32"
+					},
+					"has_activity_only": {
+						"description": "Filter to only include visitors with recorded activity (events/sessions). When true, excludes ghost visitors.",
+						"type": [
+							"boolean",
+							"null"
+						]
 					},
 					"project_id": {
 						"type": "integer",

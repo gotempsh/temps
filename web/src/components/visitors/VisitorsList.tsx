@@ -15,6 +15,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
+import { Label } from '@/components/ui/label'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
@@ -39,6 +41,7 @@ export function VisitorsList({ project }: VisitorsListProps) {
   const [crawlerFilter, setCrawlerFilter] = React.useState<
     'all' | 'humans' | 'crawlers'
   >('all')
+  const [hideGhostVisitors, setHideGhostVisitors] = React.useState(true)
 
   // Default date range: last 30 days
   const endDate = React.useMemo(() => {
@@ -68,6 +71,7 @@ export function VisitorsList({ project }: VisitorsListProps) {
             : crawlerFilter === 'crawlers'
               ? true
               : false,
+        has_activity_only: hideGhostVisitors ? undefined : false,
       },
     }),
   })
@@ -90,7 +94,20 @@ export function VisitorsList({ project }: VisitorsListProps) {
                   : 'Browse and analyze visitor sessions'}
               </CardDescription>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-2">
+                <Switch
+                  id="hide-ghost"
+                  checked={hideGhostVisitors}
+                  onCheckedChange={setHideGhostVisitors}
+                />
+                <Label
+                  htmlFor="hide-ghost"
+                  className="text-sm cursor-pointer whitespace-nowrap"
+                >
+                  Hide ghost visitors
+                </Label>
+              </div>
               <Select
                 value={crawlerFilter}
                 onValueChange={(value: any) => setCrawlerFilter(value)}

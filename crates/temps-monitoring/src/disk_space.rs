@@ -73,29 +73,24 @@ pub enum DiskSpaceError {
 /// Disk space monitoring service
 pub struct DiskSpaceMonitor {
     config_service: Arc<ConfigService>,
-    notification_service: Option<Arc<dyn NotificationService>>,
+    notification_service: Arc<dyn NotificationService>,
     data_dir: PathBuf,
     last_alert_time: RwLock<Option<DateTime<Utc>>>,
 }
 
 impl DiskSpaceMonitor {
     /// Create a new disk space monitor
-    pub fn new(config_service: Arc<ConfigService>, data_dir: PathBuf) -> Self {
+    pub fn new(
+        config_service: Arc<ConfigService>,
+        notification_service: Arc<dyn NotificationService>,
+        data_dir: PathBuf,
+    ) -> Self {
         Self {
             config_service,
-            notification_service: None,
+            notification_service,
             data_dir,
             last_alert_time: RwLock::new(None),
         }
-    }
-
-    /// Set the notification service for sending alerts
-    pub fn with_notification_service(
-        mut self,
-        notification_service: Arc<dyn NotificationService>,
-    ) -> Self {
-        self.notification_service = Some(notification_service);
-        self
     }
 
     /// Get the current disk space settings
@@ -208,16 +203,8 @@ impl DiskSpaceMonitor {
 
     /// Send alert notifications for disks exceeding threshold
     async fn send_alerts(&self, alerts: &[DiskSpaceAlert], settings: &DiskSpaceAlertSettings) {
-        let notification_service = match &self.notification_service {
-            Some(ns) => ns,
-            None => {
-                warn!("Disk space alert triggered but no notification service configured");
-                return;
-            }
-        };
-
         // Check if notification service is configured
-        match notification_service.is_configured().await {
+        match self.notification_service.is_configured().await {
             Ok(false) => {
                 debug!("Notification service not configured, skipping disk space alert");
                 return;
@@ -278,7 +265,11 @@ impl DiskSpaceMonitor {
                 bypass_throttling: false,
             };
 
-            if let Err(e) = notification_service.send_notification(notification).await {
+            if let Err(e) = self
+                .notification_service
+                .send_notification(notification)
+                .await
+            {
                 error!(
                     "Failed to send disk space alert for {}: {}",
                     alert.mount_point, e

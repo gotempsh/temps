@@ -17,6 +17,8 @@ pub struct Model {
     pub crawler_name: Option<String>,
     #[sea_orm(column_type = "JsonBinary")]
     pub custom_data: Option<serde_json::Value>,
+    /// Flag indicating visitor has recorded events/sessions (not a "ghost" visitor)
+    pub has_activity: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

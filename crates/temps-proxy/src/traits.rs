@@ -176,12 +176,22 @@ pub trait VisitorManager: Send + Sync {
 #[async_trait]
 pub trait SessionManager: Send + Sync {
     /// Get or create a session from encrypted cookie
+    ///
+    /// # Arguments
+    /// * `session_cookie` - Encrypted session cookie value
+    /// * `visitor` - The visitor associated with this session
+    /// * `context` - Project context for the request
+    /// * `referrer` - The HTTP Referer header value
+    /// * `query_string` - The URL query string (for UTM parameter extraction)
+    /// * `current_hostname` - The current site's hostname (for self-referral detection)
     async fn get_or_create_session(
         &self,
         session_cookie: Option<&str>,
         visitor: &Visitor,
         context: Option<&ProjectContext>,
         referrer: Option<&str>,
+        query_string: Option<&str>,
+        current_hostname: Option<&str>,
     ) -> Result<Session, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Generate encrypted session cookie

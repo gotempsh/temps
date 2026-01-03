@@ -1068,46 +1068,50 @@ WHERE project_id = $1
             .unwrap_or(&format!("http://{}{}", hostname, request_path))
             .to_string();
 
-        // Extract UTM parameters from event_data
-        let utm_source = event_data
-            .get("utm_source")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let utm_medium = event_data
-            .get("utm_medium")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let utm_campaign = event_data
-            .get("utm_campaign")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let utm_term = event_data
-            .get("utm_term")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let utm_content = event_data
-            .get("utm_content")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        // Parse UTM parameters from query string (request_query)
+        let utm_params = temps_analytics::parse_utm_params(request_query);
 
         // Extract referrer hostname if referrer is present
-        let referrer_hostname = referrer.as_ref().and_then(|r| {
-            url::Url::parse(r)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h.to_string()))
-        });
+        let referrer_hostname = referrer
+            .as_ref()
+            .and_then(|r| temps_analytics::extract_referrer_hostname(r));
+
+        // Compute channel attribution
+        let current_hostname = event_data.get("hostname").and_then(|v| v.as_str());
+        let channel = temps_analytics::get_channel(
+            &utm_params,
+            referrer_hostname.as_deref(),
+            current_hostname,
+        );
+
+        // Get UTM values from parsed params
+        let utm_source = utm_params.utm_source;
+        let utm_medium = utm_params.utm_medium;
+        let utm_campaign = utm_params.utm_campaign;
+        let utm_term = utm_params.utm_term;
+        let utm_content = utm_params.utm_content;
         // Get visitor from visitor_id from visitors table
         // Convert visitor_id (String) to Option<i32> by looking up the visitor in the database
         let visitor_id_i32 = if let Some(ref visitor_id) = visitor_id {
-            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+            use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter};
             use temps_entities::visitor;
 
-            visitor::Entity::find()
+            let visitor_record = visitor::Entity::find()
                 .filter(visitor::Column::VisitorId.eq(visitor_id.clone()))
                 .one(self.db.as_ref())
                 .await
-                .map_err(EventsError::Database)?
-                .map(|v| v.id)
+                .map_err(EventsError::Database)?;
+
+            // If visitor exists and doesn't have activity flag set, update it
+            if let Some(ref v) = visitor_record {
+                if !v.has_activity {
+                    let mut active_visitor: visitor::ActiveModel = v.clone().into();
+                    active_visitor.has_activity = sea_orm::ActiveValue::Set(true);
+                    let _ = active_visitor.update(self.db.as_ref()).await;
+                }
+            }
+
+            visitor_record.map(|v| v.id)
         } else {
             None
         };
@@ -1150,6 +1154,7 @@ WHERE project_id = $1
             operating_system: Set(operating_system),
             operating_system_version: Set(operating_system_version),
             device_type: Set(device_type),
+            channel: Set(Some(channel.to_string())),
             utm_source: Set(utm_source),
             utm_medium: Set(utm_medium),
             utm_campaign: Set(utm_campaign),

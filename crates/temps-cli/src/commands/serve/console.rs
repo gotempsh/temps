@@ -41,6 +41,7 @@ use temps_git::GitPlugin;
 use temps_import::ImportPlugin;
 use temps_infra::InfraPlugin;
 use temps_logs::LogsPlugin;
+use temps_monitoring::DiskSpaceMonitor;
 use temps_notifications::NotificationsPlugin;
 use temps_projects::ProjectsPlugin;
 use temps_providers::ProvidersPlugin;
@@ -827,6 +828,29 @@ pub async fn start_console_api(
         tracing::warn!(
             "TlsService not available - certificate renewal scheduler disabled. \
              This is non-fatal but automatic certificate renewal will not work."
+        );
+    }
+
+    // Start disk space monitoring if ConfigService and NotificationService are available
+    if let (Some(config_service), Some(notification_service)) = (
+        service_context.get_service::<temps_config::ConfigService>(),
+        service_context.get_service::<dyn temps_core::notifications::NotificationService>(),
+    ) {
+        let data_dir = config.data_dir.clone();
+        let monitor = Arc::new(DiskSpaceMonitor::new(
+            config_service.clone(),
+            notification_service,
+            data_dir,
+        ));
+
+        tokio::spawn(async move {
+            monitor.start_monitoring().await;
+        });
+
+        debug!("Disk space monitoring started in background");
+    } else {
+        tracing::warn!(
+            "ConfigService or NotificationService not available - disk space monitoring disabled."
         );
     }
 

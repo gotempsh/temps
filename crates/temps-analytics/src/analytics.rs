@@ -224,6 +224,7 @@ impl Analytics for AnalyticsService {
         include_crawlers: Option<bool>,
         limit: Option<i32>,
         offset: Option<i32>,
+        has_activity_only: Option<bool>,
     ) -> Result<VisitorsResponse, AnalyticsError> {
         // Build WHERE conditions with parameterized queries
         let mut where_conditions = vec!["v.project_id = $1".to_string()];
@@ -240,6 +241,11 @@ impl Analytics for AnalyticsService {
         // Add crawler filter if requested
         if include_crawlers == Some(false) {
             where_conditions.push("v.is_crawler = false".to_string());
+        }
+
+        // Add has_activity filter to exclude ghost visitors
+        if has_activity_only == Some(true) {
+            where_conditions.push("v.has_activity = true".to_string());
         }
 
         // Add date range filter - check last_seen is within range
@@ -1934,6 +1940,343 @@ WHERE project_id = $1
             avg_bounce_rate: total_stats.avg_bounce_rate,
             avg_engagement_rate: total_stats.avg_engagement_rate,
             project_breakdown: Vec::new(),
+        })
+    }
+
+    /// Get detailed analytics for a specific page path
+    async fn get_page_path_detail(
+        &self,
+        project_id: i32,
+        page_path: &str,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        environment_id: Option<i32>,
+        bucket_interval: Option<&str>,
+    ) -> Result<crate::types::responses::PagePathDetailResponse, AnalyticsError> {
+        // Determine bucket interval based on date range if not specified
+        let duration = end_date - start_date;
+        let interval = bucket_interval.unwrap_or_else(|| {
+            if duration.num_days() <= 1 {
+                "hour"
+            } else if duration.num_days() <= 31 {
+                "day"
+            } else if duration.num_days() <= 180 {
+                "week"
+            } else {
+                "month"
+            }
+        });
+
+        let (pg_interval, date_trunc_unit) = match interval {
+            "hour" => ("1 hour", "hour"),
+            "day" => ("1 day", "day"),
+            "week" => ("1 week", "week"),
+            "month" => ("1 month", "month"),
+            _ => ("1 day", "day"),
+        };
+
+        // Build environment filter
+        let env_filter = environment_id
+            .map(|id| format!("AND e.environment_id = {}", id))
+            .unwrap_or_default();
+
+        // 1. Get overall page stats
+        let stats_sql = format!(
+            r#"
+            WITH page_events AS (
+                SELECT
+                    e.visitor_id,
+                    e.session_id,
+                    e.timestamp,
+                    e.is_bounce,
+                    e.time_on_page,
+                    e.referrer,
+                    ROW_NUMBER() OVER (PARTITION BY e.session_id ORDER BY e.timestamp ASC) as event_order_asc,
+                    ROW_NUMBER() OVER (PARTITION BY e.session_id ORDER BY e.timestamp DESC) as event_order_desc
+                FROM events e
+                WHERE e.project_id = $1
+                  AND e.page_path = $2
+                  AND e.event_type = 'page_view'
+                  AND e.timestamp >= $3
+                  AND e.timestamp < $4
+                  {}
+            ),
+            session_stats AS (
+                SELECT
+                    COUNT(DISTINCT session_id) as total_sessions,
+                    COUNT(*) FILTER (WHERE event_order_asc = 1) as entry_count,
+                    COUNT(*) FILTER (WHERE event_order_desc = 1) as exit_count
+                FROM page_events
+            )
+            SELECT
+                COUNT(DISTINCT pe.visitor_id) as unique_visitors,
+                COUNT(*) as total_page_views,
+                COALESCE(AVG(NULLIF(pe.time_on_page, 0)), 0)::float8 as avg_time_on_page,
+                CASE WHEN COUNT(*) > 0
+                     THEN (COUNT(*) FILTER (WHERE pe.is_bounce = true))::float / COUNT(*)::float * 100
+                     ELSE 0 END as bounce_rate,
+                CASE WHEN ss.total_sessions > 0
+                     THEN ss.entry_count::float / ss.total_sessions::float * 100
+                     ELSE 0 END as entry_rate,
+                CASE WHEN ss.total_sessions > 0
+                     THEN ss.exit_count::float / ss.total_sessions::float * 100
+                     ELSE 0 END as exit_rate
+            FROM page_events pe
+            CROSS JOIN session_stats ss
+            GROUP BY ss.total_sessions, ss.entry_count, ss.exit_count
+            "#,
+            env_filter
+        );
+
+        #[derive(FromQueryResult)]
+        struct PageStats {
+            unique_visitors: i64,
+            total_page_views: i64,
+            avg_time_on_page: f64,
+            bounce_rate: f64,
+            entry_rate: f64,
+            exit_rate: f64,
+        }
+
+        let stats = PageStats::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &stats_sql,
+            vec![
+                project_id.into(),
+                page_path.into(),
+                start_date.into(),
+                end_date.into(),
+            ],
+        ))
+        .one(self.db.as_ref())
+        .await?
+        .unwrap_or(PageStats {
+            unique_visitors: 0,
+            total_page_views: 0,
+            avg_time_on_page: 0.0,
+            bounce_rate: 0.0,
+            entry_rate: 0.0,
+            exit_rate: 0.0,
+        });
+
+        // 2. Get time series data for activity graph
+        let activity_sql = format!(
+            r#"
+            WITH time_buckets AS (
+                SELECT generate_series(
+                    date_trunc('{}', $3::timestamptz),
+                    date_trunc('{}', $4::timestamptz),
+                    '{}'::interval
+                ) AS bucket
+            ),
+            page_activity AS (
+                SELECT
+                    date_trunc('{}', e.timestamp) as bucket,
+                    COUNT(DISTINCT e.visitor_id) as visitors,
+                    COUNT(*) as page_views,
+                    COALESCE(AVG(NULLIF(e.time_on_page, 0)), 0)::float8 as avg_time_seconds
+                FROM events e
+                WHERE e.project_id = $1
+                  AND e.page_path = $2
+                  AND e.event_type = 'page_view'
+                  AND e.timestamp >= $3
+                  AND e.timestamp < $4
+                  {}
+                GROUP BY date_trunc('{}', e.timestamp)
+            )
+            SELECT
+                tb.bucket::timestamptz as timestamp,
+                COALESCE(pa.visitors, 0) as visitors,
+                COALESCE(pa.page_views, 0) as page_views,
+                COALESCE(pa.avg_time_seconds, 0)::float8 as avg_time_seconds
+            FROM time_buckets tb
+            LEFT JOIN page_activity pa ON tb.bucket = pa.bucket
+            ORDER BY tb.bucket
+            "#,
+            date_trunc_unit,
+            date_trunc_unit,
+            pg_interval,
+            date_trunc_unit,
+            env_filter,
+            date_trunc_unit
+        );
+
+        #[derive(FromQueryResult)]
+        struct ActivityBucket {
+            timestamp: UtcDateTime,
+            visitors: i64,
+            page_views: i64,
+            avg_time_seconds: f64,
+        }
+
+        let activity_results = ActivityBucket::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &activity_sql,
+            vec![
+                project_id.into(),
+                page_path.into(),
+                start_date.into(),
+                end_date.into(),
+            ],
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        let activity_over_time: Vec<crate::types::responses::PageActivityBucket> = activity_results
+            .into_iter()
+            .map(|b| crate::types::responses::PageActivityBucket {
+                timestamp: b.timestamp,
+                visitors: b.visitors,
+                page_views: b.page_views,
+                avg_time_seconds: b.avg_time_seconds,
+            })
+            .collect();
+
+        // 3. Get geographic distribution by country
+        let countries_sql = format!(
+            r#"
+            WITH country_stats AS (
+                SELECT
+                    COALESCE(ig.country, 'Unknown') as country,
+                    ig.country_code,
+                    COUNT(DISTINCT e.visitor_id) as visitors,
+                    COUNT(*) as page_views
+                FROM events e
+                LEFT JOIN ip_geolocations ig ON e.ip_geolocation_id = ig.id
+                WHERE e.project_id = $1
+                  AND e.page_path = $2
+                  AND e.event_type = 'page_view'
+                  AND e.timestamp >= $3
+                  AND e.timestamp < $4
+                  {}
+                GROUP BY COALESCE(ig.country, 'Unknown'), ig.country_code
+            ),
+            total AS (
+                SELECT SUM(visitors) as total_visitors FROM country_stats
+            )
+            SELECT
+                cs.country,
+                cs.country_code,
+                cs.visitors,
+                cs.page_views,
+                CASE WHEN t.total_visitors > 0
+                     THEN cs.visitors::float / t.total_visitors::float * 100
+                     ELSE 0 END as percentage
+            FROM country_stats cs
+            CROSS JOIN total t
+            ORDER BY cs.visitors DESC
+            LIMIT 50
+            "#,
+            env_filter
+        );
+
+        #[derive(FromQueryResult)]
+        struct CountryStats {
+            country: String,
+            country_code: Option<String>,
+            visitors: i64,
+            page_views: i64,
+            percentage: f64,
+        }
+
+        let country_results = CountryStats::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &countries_sql,
+            vec![
+                project_id.into(),
+                page_path.into(),
+                start_date.into(),
+                end_date.into(),
+            ],
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        let countries: Vec<crate::types::responses::PageCountryStats> = country_results
+            .into_iter()
+            .map(|c| crate::types::responses::PageCountryStats {
+                country: c.country,
+                country_code: c.country_code,
+                visitors: c.visitors,
+                page_views: c.page_views,
+                percentage: c.percentage,
+            })
+            .collect();
+
+        // 4. Get top referrers
+        let referrers_sql = format!(
+            r#"
+            WITH referrer_stats AS (
+                SELECT
+                    COALESCE(NULLIF(e.referrer, ''), 'Direct') as referrer,
+                    COUNT(*) as visits
+                FROM events e
+                WHERE e.project_id = $1
+                  AND e.page_path = $2
+                  AND e.event_type = 'page_view'
+                  AND e.timestamp >= $3
+                  AND e.timestamp < $4
+                  {}
+                GROUP BY COALESCE(NULLIF(e.referrer, ''), 'Direct')
+            ),
+            total AS (
+                SELECT SUM(visits) as total_visits FROM referrer_stats
+            )
+            SELECT
+                rs.referrer,
+                rs.visits,
+                CASE WHEN t.total_visits > 0
+                     THEN rs.visits::float / t.total_visits::float * 100
+                     ELSE 0 END as percentage
+            FROM referrer_stats rs
+            CROSS JOIN total t
+            ORDER BY rs.visits DESC
+            LIMIT 20
+            "#,
+            env_filter
+        );
+
+        #[derive(FromQueryResult)]
+        struct ReferrerStats {
+            referrer: String,
+            visits: i64,
+            percentage: f64,
+        }
+
+        let referrer_results = ReferrerStats::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &referrers_sql,
+            vec![
+                project_id.into(),
+                page_path.into(),
+                start_date.into(),
+                end_date.into(),
+            ],
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        let referrers: Vec<crate::types::responses::PageReferrerStats> = referrer_results
+            .into_iter()
+            .map(|r| crate::types::responses::PageReferrerStats {
+                referrer: r.referrer,
+                visits: r.visits,
+                percentage: r.percentage,
+            })
+            .collect();
+
+        Ok(crate::types::responses::PagePathDetailResponse {
+            page_path: page_path.to_string(),
+            unique_visitors: stats.unique_visitors,
+            total_page_views: stats.total_page_views,
+            avg_time_on_page: stats.avg_time_on_page,
+            bounce_rate: stats.bounce_rate,
+            entry_rate: stats.entry_rate,
+            exit_rate: stats.exit_rate,
+            activity_over_time,
+            countries,
+            referrers,
+            bucket_interval: interval.to_string(),
         })
     }
 }

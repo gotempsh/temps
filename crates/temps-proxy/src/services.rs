@@ -609,6 +609,8 @@ impl SessionManager for SessionManagerImpl {
         visitor: &Visitor,
         _context: Option<&ProjectContext>,
         referrer: Option<&str>,
+        query_string: Option<&str>,
+        current_hostname: Option<&str>,
     ) -> Result<Session, Box<dyn std::error::Error + Send + Sync>> {
         let now = chrono::Utc::now();
 
@@ -672,6 +674,23 @@ impl SessionManager for SessionManagerImpl {
             debug!("No session cookie provided in request");
         }
 
+        // Parse UTM parameters from query string
+        let utm = query_string
+            .map(temps_analytics::parse_utm_params)
+            .unwrap_or_default();
+
+        // Extract referrer hostname
+        let referrer_hostname = referrer.and_then(temps_analytics::extract_referrer_hostname);
+
+        // Compute marketing channel
+        let channel =
+            temps_analytics::get_channel(&utm, referrer_hostname.as_deref(), current_hostname);
+
+        debug!(
+            "UTM params: source={:?}, medium={:?}, campaign={:?}, channel={}",
+            utm.utm_source, utm.utm_medium, utm.utm_campaign, channel
+        );
+
         // Create new session
         let new_session_id = Uuid::new_v4().to_string();
 
@@ -684,14 +703,23 @@ impl SessionManager for SessionManagerImpl {
             referrer: Set(referrer.map(|r| r.to_string())),
             data: Set("{}".to_string()), // Empty JSON object
             visitor_id: Set(Some(visitor.visitor_id_i32)),
+            // UTM tracking fields
+            utm_source: Set(utm.utm_source),
+            utm_medium: Set(utm.utm_medium),
+            utm_campaign: Set(utm.utm_campaign),
+            utm_content: Set(utm.utm_content),
+            utm_term: Set(utm.utm_term),
+            // Channel attribution
+            channel: Set(Some(channel.to_string())),
+            referrer_hostname: Set(referrer_hostname),
             ..Default::default()
         };
 
         let session = session.insert(self.db.as_ref()).await?;
 
         debug!(
-            "Created new session {} for visitor {}",
-            session.session_id, visitor.visitor_id
+            "Created new session {} for visitor {} (channel: {})",
+            session.session_id, visitor.visitor_id, channel
         );
 
         Ok(Session {
@@ -1177,7 +1205,7 @@ mod tests {
 
         // First request - should create new session
         let session1 = session_manager
-            .get_or_create_session(None, &visitor, Some(&context), None)
+            .get_or_create_session(None, &visitor, Some(&context), None, None, None)
             .await
             .unwrap();
 
@@ -1202,7 +1230,14 @@ mod tests {
 
         // Second request with same cookie - should reuse session
         let session2 = session_manager
-            .get_or_create_session(Some(&encrypted_session_id), &visitor, Some(&context), None)
+            .get_or_create_session(
+                Some(&encrypted_session_id),
+                &visitor,
+                Some(&context),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1214,7 +1249,14 @@ mod tests {
 
         // Third request - should still reuse
         let session3 = session_manager
-            .get_or_create_session(Some(&encrypted_session_id), &visitor, Some(&context), None)
+            .get_or_create_session(
+                Some(&encrypted_session_id),
+                &visitor,
+                Some(&context),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1257,7 +1299,7 @@ mod tests {
 
         // Create initial session
         let session1 = session_manager
-            .get_or_create_session(None, &visitor, Some(&context), None)
+            .get_or_create_session(None, &visitor, Some(&context), None, None, None)
             .await
             .unwrap();
 
@@ -1295,7 +1337,14 @@ mod tests {
 
         // Try to reuse with expired session - should create new one
         let session2 = session_manager
-            .get_or_create_session(Some(&encrypted_session_id), &visitor, Some(&context), None)
+            .get_or_create_session(
+                Some(&encrypted_session_id),
+                &visitor,
+                Some(&context),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1346,6 +1395,8 @@ mod tests {
                 &visitor,
                 Some(&context),
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1388,7 +1439,7 @@ mod tests {
 
         // Create session
         let session = session_manager
-            .get_or_create_session(None, &visitor, Some(&context), None)
+            .get_or_create_session(None, &visitor, Some(&context), None, None, None)
             .await
             .unwrap();
 
@@ -1455,7 +1506,7 @@ mod tests {
 
         // Create initial session
         let session1 = session_manager
-            .get_or_create_session(None, &visitor, Some(&context), None)
+            .get_or_create_session(None, &visitor, Some(&context), None, None, None)
             .await
             .unwrap();
 
@@ -1490,7 +1541,14 @@ mod tests {
 
         // Reuse session
         session_manager
-            .get_or_create_session(Some(&encrypted_session_id), &visitor, Some(&context), None)
+            .get_or_create_session(
+                Some(&encrypted_session_id),
+                &visitor,
+                Some(&context),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 

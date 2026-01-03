@@ -219,6 +219,7 @@ export type AppSettings = {
  * Safe response for application settings that masks sensitive fields
  */
 export type AppSettingsResponse = {
+    disk_space_alert: DiskSpaceAlertSettings;
     dns_provider: DnsProviderSettingsMasked;
     docker_registry: DockerRegistrySettingsMasked;
     external_url?: string | null;
@@ -6071,6 +6072,11 @@ export type VisitorWithGeolocation = {
 export type VisitorsListQuery = {
     end_date: string;
     environment_id?: number | null;
+    /**
+     * Filter to only include visitors with recorded activity (events/sessions).
+     * When true, excludes "ghost" visitors that have no events.
+     */
+    has_activity_only?: boolean | null;
     include_crawlers?: boolean | null;
     limit?: number | null;
     offset?: number | null;
@@ -6887,6 +6893,10 @@ export type GetVisitorsData = {
          * Number of visitors to skip (default: 0)
          */
         offset?: number;
+        /**
+         * Filter to only include visitors with recorded activity (events/sessions). When true, excludes ghost visitors (default: true)
+         */
+        has_activity_only?: boolean;
     };
     url: '/analytics/visitors';
 };
