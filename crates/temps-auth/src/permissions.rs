@@ -188,6 +188,16 @@ pub enum Permission {
     VulnerabilityScansWrite,
     VulnerabilityScansCreate,
     VulnerabilityScansDelete,
+
+    // Blob Storage permissions
+    BlobRead,
+    BlobWrite,
+    BlobDelete,
+
+    // KV Store permissions
+    KvRead,
+    KvWrite,
+    KvDelete,
 }
 
 impl fmt::Display for Permission {
@@ -308,6 +318,12 @@ impl fmt::Display for Permission {
             Permission::VulnerabilityScansWrite => "vulnerability_scans:write",
             Permission::VulnerabilityScansCreate => "vulnerability_scans:create",
             Permission::VulnerabilityScansDelete => "vulnerability_scans:delete",
+            Permission::BlobRead => "blob:read",
+            Permission::BlobWrite => "blob:write",
+            Permission::BlobDelete => "blob:delete",
+            Permission::KvRead => "kv:read",
+            Permission::KvWrite => "kv:write",
+            Permission::KvDelete => "kv:delete",
         };
         write!(f, "{}", name)
     }
@@ -432,6 +448,12 @@ impl Permission {
             "vulnerability_scans:write" => Some(Permission::VulnerabilityScansWrite),
             "vulnerability_scans:create" => Some(Permission::VulnerabilityScansCreate),
             "vulnerability_scans:delete" => Some(Permission::VulnerabilityScansDelete),
+            "blob:read" => Some(Permission::BlobRead),
+            "blob:write" => Some(Permission::BlobWrite),
+            "blob:delete" => Some(Permission::BlobDelete),
+            "kv:read" => Some(Permission::KvRead),
+            "kv:write" => Some(Permission::KvWrite),
+            "kv:delete" => Some(Permission::KvDelete),
             _ => None,
         }
     }
@@ -553,6 +575,12 @@ impl Permission {
             Permission::VulnerabilityScansWrite,
             Permission::VulnerabilityScansCreate,
             Permission::VulnerabilityScansDelete,
+            Permission::BlobRead,
+            Permission::BlobWrite,
+            Permission::BlobDelete,
+            Permission::KvRead,
+            Permission::KvWrite,
+            Permission::KvDelete,
         ]
     }
 }
@@ -725,6 +753,12 @@ impl Role {
                 Permission::VulnerabilityScansWrite,
                 Permission::VulnerabilityScansCreate,
                 Permission::VulnerabilityScansDelete,
+                Permission::BlobRead,
+                Permission::BlobWrite,
+                Permission::BlobDelete,
+                Permission::KvRead,
+                Permission::KvWrite,
+                Permission::KvDelete,
             ],
             Role::User => &[
                 Permission::ProjectsRead,
@@ -811,6 +845,10 @@ impl Role {
                 Permission::VulnerabilityScansRead,
                 Permission::VulnerabilityScansWrite,
                 Permission::VulnerabilityScansCreate,
+                Permission::BlobRead,
+                Permission::BlobWrite,
+                Permission::KvRead,
+                Permission::KvWrite,
             ],
             Role::Reader => &[
                 Permission::ProjectsRead,
@@ -845,6 +883,8 @@ impl Role {
                 Permission::EmailsRead,
                 Permission::DeploymentTokensRead,
                 Permission::VulnerabilityScansRead,
+                Permission::BlobRead,
+                Permission::KvRead,
             ],
             Role::Mcp => &[
                 Permission::ProjectsRead,

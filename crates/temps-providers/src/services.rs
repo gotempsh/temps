@@ -1,6 +1,6 @@
 use crate::externalsvc::{
-    mongodb::MongodbService, postgres::PostgresService, redis::RedisService, s3::S3Service,
-    AvailableContainer, ExternalService, ServiceConfig, ServiceType,
+    mongodb::MongodbService, postgres::PostgresService, redis::RedisService, rustfs::RustfsService,
+    s3::S3Service, AvailableContainer, ExternalService, ServiceConfig, ServiceType,
 };
 use crate::parameter_strategies;
 use crate::types::EnvironmentVariableInfo;
@@ -274,6 +274,17 @@ impl ExternalServiceManager {
             ServiceType::Redis => Box::new(RedisService::new(name, self.docker.clone())),
             ServiceType::S3 => Box::new(S3Service::new(
                 name,
+                self.docker.clone(),
+                self.encryption_service.clone(),
+            )),
+            // Temps KV uses Redis backend - create a RedisService with "kv-" prefix
+            ServiceType::Kv => Box::new(RedisService::new(
+                format!("kv-{}", name),
+                self.docker.clone(),
+            )),
+            // Temps Blob uses RustfsService (high-performance S3-compatible storage)
+            ServiceType::Blob => Box::new(RustfsService::new(
+                format!("blob-{}", name),
                 self.docker.clone(),
                 self.encryption_service.clone(),
             )),
@@ -1915,6 +1926,35 @@ impl ExternalServiceManager {
                     additional_config,
                 )
                 .await?
+            }
+            // Temps KV uses Redis backend
+            ServiceType::Kv => {
+                let redis =
+                    RedisService::new(format!("kv-{}", request.name), Arc::clone(&self.docker));
+                redis
+                    .import_from_container(
+                        request.container_id.clone(),
+                        request.name.clone(),
+                        credentials,
+                        additional_config,
+                    )
+                    .await?
+            }
+            // Temps Blob uses RustfsService (high-performance S3-compatible storage)
+            ServiceType::Blob => {
+                let rustfs = RustfsService::new(
+                    format!("blob-{}", request.name),
+                    Arc::clone(&self.docker),
+                    Arc::clone(&self.encryption_service),
+                );
+                rustfs
+                    .import_from_container(
+                        request.container_id.clone(),
+                        request.name.clone(),
+                        credentials,
+                        additional_config,
+                    )
+                    .await?
             }
         };
 

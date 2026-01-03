@@ -23,6 +23,7 @@ use temps_analytics_session_replay::SessionReplayPlugin;
 use temps_audit::AuditPlugin;
 use temps_auth::{ApiKeyPlugin, AuthPlugin};
 use temps_backup::BackupPlugin;
+use temps_blob::BlobPlugin;
 use temps_config::ConfigPlugin;
 use temps_config::ServerConfig;
 use temps_core::plugin::PluginManager;
@@ -40,6 +41,7 @@ use temps_geo::GeoPlugin;
 use temps_git::GitPlugin;
 use temps_import::ImportPlugin;
 use temps_infra::InfraPlugin;
+use temps_kv::KvPlugin;
 use temps_logs::LogsPlugin;
 use temps_monitoring::DiskSpaceMonitor;
 use temps_notifications::NotificationsPlugin;
@@ -614,6 +616,16 @@ pub async fn start_console_api(
     debug!("Registering ProvidersPlugin");
     let providers_plugin = Box::new(ProvidersPlugin::new());
     plugin_manager.register_plugin(providers_plugin);
+
+    // 5.1. KvPlugin - provides key-value storage (depends on database, docker)
+    debug!("Registering KvPlugin");
+    let kv_plugin = Box::new(KvPlugin::new());
+    plugin_manager.register_plugin(kv_plugin);
+
+    // 5.2. BlobPlugin - provides blob storage (depends on database, docker)
+    debug!("Registering BlobPlugin");
+    let blob_plugin = Box::new(BlobPlugin::new());
+    plugin_manager.register_plugin(blob_plugin);
 
     // 5.5. EnvironmentsPlugin - provides environment management (depends on config)
     debug!("Registering EnvironmentsPlugin");

@@ -1,0 +1,57 @@
+[package]
+name = "temps-kv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Internal crates
+temps-core = { path = "../temps-core" }
+temps-auth = { path = "../temps-auth" }
+temps-database = { path = "../temps-database" }
+temps-providers = { path = "../temps-providers" }
+temps-entities = { path = "../temps-entities" }
+
+# Async runtime
+tokio.workspace = true
+async-trait.workspace = true
+
+# Web framework
+axum.workspace = true
+tower.workspace = true
+http.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling & logging
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Date/Time & UUID
+chrono.workspace = true
+uuid.workspace = true
+
+# API Documentation
+utoipa.workspace = true
+
+# Redis client
+redis.workspace = true
+
+# Docker container management
+bollard.workspace = true
+futures-util.workspace = true
+
+# Utilities
+once_cell.workspace = true
+rand.workspace = true
+futures.workspace = true
+sea-orm.workspace = true
+schemars.workspace = true
+urlencoding.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

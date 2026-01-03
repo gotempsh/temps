@@ -10831,6 +10831,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-blob"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "axum 0.8.6",
+ "bollard",
+ "bytes",
+ "chrono",
+ "futures",
+ "futures-util",
+ "http 1.3.1",
+ "once_cell",
+ "rand 0.8.5",
+ "reqwest 0.12.24",
+ "schemars 0.8.22",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "temps-auth",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-providers",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-util",
+ "tower 0.5.2",
+ "tracing",
+ "urlencoding",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
 name = "temps-captcha-wasm"
 version = "0.1.0"
 dependencies = [
@@ -10877,6 +10914,7 @@ dependencies = [
  "temps-audit",
  "temps-auth",
  "temps-backup",
+ "temps-blob",
  "temps-config",
  "temps-core",
  "temps-database",
@@ -10892,6 +10930,7 @@ dependencies = [
  "temps-git",
  "temps-import",
  "temps-infra",
+ "temps-kv",
  "temps-logs",
  "temps-migrations",
  "temps-monitoring",
@@ -11439,6 +11478,39 @@ dependencies = [
  "tower 0.5.2",
  "tracing",
  "utoipa",
+]
+
+[[package]]
+name = "temps-kv"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.6",
+ "bollard",
+ "chrono",
+ "futures",
+ "futures-util",
+ "http 1.3.1",
+ "once_cell",
+ "rand 0.8.5",
+ "redis 0.28.2",
+ "schemars 0.8.22",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "temps-auth",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-providers",
+ "thiserror 2.0.17",
+ "tokio",
+ "tower 0.5.2",
+ "tracing",
+ "urlencoding",
+ "utoipa",
+ "uuid",
 ]
 
 [[package]]

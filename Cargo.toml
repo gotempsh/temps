@@ -49,6 +49,8 @@ members = [
     "crates/temps-email",
     "crates/temps-dns",
     "crates/temps-vulnerability-scanner",
+    "crates/temps-kv",
+    "crates/temps-blob",
 ]
 
 [workspace.package]

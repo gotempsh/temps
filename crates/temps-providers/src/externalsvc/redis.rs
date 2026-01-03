@@ -152,7 +152,8 @@ impl RedisService {
 
     /// Create a fresh Redis connection
     /// Connection will be automatically closed when ConnectionManager is dropped
-    async fn get_connection(&self) -> Result<ConnectionManager> {
+    /// This method is public to allow other services (like temps-kv) to get connections
+    pub async fn get_connection(&self) -> Result<ConnectionManager> {
         let config = self
             .config
             .read()

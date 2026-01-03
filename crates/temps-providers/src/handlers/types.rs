@@ -60,6 +60,10 @@ pub enum ServiceTypeRoute {
     Postgres,
     Redis,
     S3,
+    /// Temps KV service (Redis-backed key-value store)
+    Kv,
+    /// Temps Blob service (S3-compatible object storage)
+    Blob,
 }
 
 impl ServiceTypeRoute {
@@ -70,6 +74,8 @@ impl ServiceTypeRoute {
             "postgres" => Ok(ServiceTypeRoute::Postgres),
             "redis" => Ok(ServiceTypeRoute::Redis),
             "s3" => Ok(ServiceTypeRoute::S3),
+            "kv" => Ok(ServiceTypeRoute::Kv),
+            "blob" => Ok(ServiceTypeRoute::Blob),
             _ => Err(anyhow::anyhow!("Invalid service type: {}", s)),
         }
     }
@@ -81,6 +87,8 @@ impl ServiceTypeRoute {
             ServiceTypeRoute::Postgres,
             ServiceTypeRoute::Redis,
             ServiceTypeRoute::S3,
+            ServiceTypeRoute::Kv,
+            ServiceTypeRoute::Blob,
         ]
     }
 
@@ -99,6 +107,8 @@ impl std::fmt::Display for ServiceTypeRoute {
             ServiceTypeRoute::Postgres => write!(f, "postgres"),
             ServiceTypeRoute::Redis => write!(f, "redis"),
             ServiceTypeRoute::S3 => write!(f, "s3"),
+            ServiceTypeRoute::Kv => write!(f, "kv"),
+            ServiceTypeRoute::Blob => write!(f, "blob"),
         }
     }
 }
@@ -110,6 +120,8 @@ impl From<ServiceTypeRoute> for crate::externalsvc::ServiceType {
             ServiceTypeRoute::Postgres => crate::externalsvc::ServiceType::Postgres,
             ServiceTypeRoute::Redis => crate::externalsvc::ServiceType::Redis,
             ServiceTypeRoute::S3 => crate::externalsvc::ServiceType::S3,
+            ServiceTypeRoute::Kv => crate::externalsvc::ServiceType::Kv,
+            ServiceTypeRoute::Blob => crate::externalsvc::ServiceType::Blob,
         }
     }
 }
@@ -121,6 +133,8 @@ impl From<crate::externalsvc::ServiceType> for ServiceTypeRoute {
             crate::externalsvc::ServiceType::Postgres => ServiceTypeRoute::Postgres,
             crate::externalsvc::ServiceType::Redis => ServiceTypeRoute::Redis,
             crate::externalsvc::ServiceType::S3 => ServiceTypeRoute::S3,
+            crate::externalsvc::ServiceType::Kv => ServiceTypeRoute::Kv,
+            crate::externalsvc::ServiceType::Blob => ServiceTypeRoute::Blob,
         }
     }
 }

@@ -207,6 +207,66 @@ impl QueryService {
 
                 Arc::new(redis_source)
             }
+            // Temps KV uses Redis backend - treat the same as Redis for query purposes
+            crate::externalsvc::ServiceType::Kv => {
+                let config: RedisInputConfig = serde_json::from_value(service.parameters.clone())
+                    .map_err(|e| {
+                    DataError::InvalidConfiguration(format!(
+                        "Failed to parse KV (Redis) configuration: {}",
+                        e
+                    ))
+                })?;
+
+                let port = config.port.unwrap_or_else(|| "6379".to_string());
+                let password = config.password.unwrap_or_else(|| "".to_string());
+
+                let connection_string = if password.is_empty() {
+                    format!("redis://{}:{}", config.host, port)
+                } else {
+                    let encoded_password = urlencoding::encode(&password);
+                    format!("redis://:{}@{}:{}", encoded_password, config.host, port)
+                };
+
+                let redis_source = RedisSource::new(&connection_string).await.map_err(|e| {
+                    error!("Failed to connect to KV service {}: {}", service_id, e);
+                    e
+                })?;
+
+                Arc::new(redis_source)
+            }
+            // Temps Blob uses S3-compatible storage - treat the same as S3 for query purposes
+            crate::externalsvc::ServiceType::Blob => {
+                let config: S3InputConfig = serde_json::from_value(service.parameters.clone())
+                    .map_err(|e| {
+                        DataError::InvalidConfiguration(format!(
+                            "Failed to parse Blob (S3) configuration: {}",
+                            e
+                        ))
+                    })?;
+
+                let endpoint = format!(
+                    "http://{}:{}",
+                    config.host,
+                    config.port.unwrap_or_else(|| "9000".to_string())
+                );
+
+                let access_key = config.access_key.ok_or_else(|| {
+                    DataError::InvalidConfiguration("Blob access_key is required".to_string())
+                })?;
+                let secret_key = config.secret_key.ok_or_else(|| {
+                    DataError::InvalidConfiguration("Blob secret_key is required".to_string())
+                })?;
+
+                let s3_source =
+                    S3Source::new(&config.region, Some(&endpoint), &access_key, &secret_key)
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to connect to Blob service {}: {}", service_id, e);
+                            e
+                        })?;
+
+                Arc::new(s3_source)
+            }
         };
 
         // Cache the connection (remove old one if force_new)
@@ -350,6 +410,10 @@ impl QueryService {
                 // The actual database listing happens in RedisSource::list_containers
                 "_redis_root".to_string()
             }
+            // Temps KV uses Redis backend
+            crate::externalsvc::ServiceType::Kv => "_kv_root".to_string(),
+            // Temps Blob uses S3-compatible storage
+            crate::externalsvc::ServiceType::Blob => "_blob_root".to_string(),
         };
 
         // Use retry mechanism for connection errors

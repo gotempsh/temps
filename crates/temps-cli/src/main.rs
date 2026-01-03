@@ -6,7 +6,9 @@
 mod commands;
 
 use clap::{Parser, Subcommand};
-use commands::{BackupCommand, ProxyCommand, ResetPasswordCommand, ServeCommand, SetupCommand};
+use commands::{
+    BackupCommand, ProxyCommand, ResetPasswordCommand, ServeCommand, ServicesCommand, SetupCommand,
+};
 use tracing_subscriber::{layer::SubscriberExt, Layer};
 
 #[derive(Parser)]
@@ -46,6 +48,8 @@ enum Commands {
     ResetAdminPassword(ResetPasswordCommand),
     /// Backup management commands
     Backup(BackupCommand),
+    /// Manage platform services (KV, Blob)
+    Services(ServicesCommand),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -138,5 +142,6 @@ fn main() -> anyhow::Result<()> {
         Commands::Setup(setup_cmd) => setup_cmd.execute(),
         Commands::ResetAdminPassword(reset_cmd) => reset_cmd.execute(),
         Commands::Backup(backup_cmd) => backup_cmd.execute(),
+        Commands::Services(services_cmd) => services_cmd.execute(),
     }
 }

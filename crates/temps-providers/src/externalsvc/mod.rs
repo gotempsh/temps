@@ -7,6 +7,7 @@ use utoipa::ToSchema;
 pub mod mongodb;
 pub mod postgres;
 pub mod redis;
+pub mod rustfs;
 pub mod s3;
 
 // Test utilities for backup and restore testing
@@ -17,6 +18,7 @@ pub mod test_utils;
 pub use mongodb::MongodbService;
 pub use postgres::PostgresService;
 pub use redis::RedisService;
+pub use rustfs::RustfsService;
 pub use s3::S3Service;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +35,10 @@ pub enum ServiceType {
     Postgres,
     Redis,
     S3,
+    /// Temps KV service (Redis-backed key-value store)
+    Kv,
+    /// Temps Blob service (MinIO-backed object storage)
+    Blob,
 }
 
 impl std::fmt::Display for ServiceType {
@@ -42,6 +48,8 @@ impl std::fmt::Display for ServiceType {
             ServiceType::Postgres => write!(f, "postgres"),
             ServiceType::Redis => write!(f, "redis"),
             ServiceType::S3 => write!(f, "s3"),
+            ServiceType::Kv => write!(f, "kv"),
+            ServiceType::Blob => write!(f, "blob"),
         }
     }
 }
@@ -54,6 +62,8 @@ impl ServiceType {
             "postgres" => Ok(ServiceType::Postgres),
             "redis" => Ok(ServiceType::Redis),
             "s3" => Ok(ServiceType::S3),
+            "kv" => Ok(ServiceType::Kv),
+            "blob" => Ok(ServiceType::Blob),
             _ => Err(anyhow::anyhow!("Invalid service type: {}", s)),
         }
     }
@@ -65,6 +75,8 @@ impl ServiceType {
             ServiceType::Postgres,
             ServiceType::Redis,
             ServiceType::S3,
+            ServiceType::Kv,
+            ServiceType::Blob,
         ]
     }
 

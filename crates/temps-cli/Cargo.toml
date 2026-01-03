@@ -15,6 +15,8 @@ path = "src/main.rs"
 # All library crates
 temps-analytics = { path = "../temps-analytics" }
 temps-analytics-events = { path = "../temps-analytics-events" }
+temps-blob = { path = "../temps-blob" }
+temps-kv = { path = "../temps-kv" }
 temps-analytics-funnels = { path = "../temps-analytics-funnels" }
 temps-analytics-performance = { path = "../temps-analytics-performance" }
 temps-analytics-session-replay = { path = "../temps-analytics-session-replay" }

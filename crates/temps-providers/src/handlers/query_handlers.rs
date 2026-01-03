@@ -392,6 +392,45 @@ pub async fn check_explorer_support(
 
             (true, vec!["key-value".to_string()], None, hierarchy, None)
         }
+        // Temps KV: Same as Redis (flat key-value store)
+        crate::externalsvc::ServiceType::Kv => {
+            let hierarchy = vec![HierarchyLevel {
+                level: 0,
+                name: "root".to_string(),
+                container_type: "key".to_string(),
+                can_list_containers: false,
+                can_list_entities: true,
+            }];
+
+            (true, vec!["key-value".to_string()], None, hierarchy, None)
+        }
+        // Temps Blob: Same as S3 (object store)
+        crate::externalsvc::ServiceType::Blob => {
+            let hierarchy = vec![
+                HierarchyLevel {
+                    level: 0,
+                    name: "root".to_string(),
+                    container_type: "bucket".to_string(),
+                    can_list_containers: true,
+                    can_list_entities: false,
+                },
+                HierarchyLevel {
+                    level: 1,
+                    name: "bucket".to_string(),
+                    container_type: "object".to_string(),
+                    can_list_containers: false,
+                    can_list_entities: true,
+                },
+            ];
+
+            (
+                true,
+                vec!["object-store".to_string()],
+                None,
+                hierarchy,
+                None,
+            )
+        }
     };
 
     let response = ExplorerSupportResponse {
