@@ -18,6 +18,7 @@ import {
   BarChart3,
   Bell,
   BellPlus,
+  Boxes,
   Database,
   DatabaseBackup,
   Folder,
@@ -25,6 +26,7 @@ import {
   GitBranch,
   Globe,
   GlobeLock,
+  HardDrive,
   Home,
   Key,
   Mail,
@@ -342,6 +344,24 @@ const projectNavItems: NavigationItem[] = [
     url: 'settings/cron-jobs',
     icon: Activity,
     keywords: ['cron', 'jobs', 'scheduled', 'tasks'],
+  },
+  {
+    title: 'Services',
+    url: 'services',
+    icon: Boxes,
+    keywords: ['services', 'kv', 'blob', 'storage', 'redis', 's3'],
+  },
+  {
+    title: 'Services - KV Store',
+    url: 'services/kv',
+    icon: Database,
+    keywords: ['kv', 'key-value', 'redis', 'cache', 'storage'],
+  },
+  {
+    title: 'Services - Blob Storage',
+    url: 'services/blob',
+    icon: HardDrive,
+    keywords: ['blob', 's3', 'files', 'storage', 'uploads', 'objects'],
   },
 ]
 

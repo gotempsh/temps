@@ -16,6 +16,7 @@ import {
   ShieldAlert,
   Key,
   Globe,
+  Boxes,
 } from 'lucide-react'
 import {
   useCallback,
@@ -157,6 +158,16 @@ const baseNavItems: NavItem[] = [
     url: 'storage',
     icon: Database,
     kbd: 'S',
+  },
+  {
+    title: 'Services',
+    url: 'services',
+    icon: Boxes,
+    subItems: [
+      { title: 'Overview', url: 'services' },
+      { title: 'KV Store', url: 'services/kv' },
+      { title: 'Blob Storage', url: 'services/blob' },
+    ],
   },
 
   // Configuration (Lower Frequency)

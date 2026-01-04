@@ -9,10 +9,12 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use std::collections::HashMap;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
-use temps_providers::externalsvc::ExternalService;
+use temps_providers::externalsvc::{ExternalService, ServiceType};
+use temps_providers::CreateExternalServiceRequest;
 use tracing::{error, info};
 use utoipa::OpenApi;
 
@@ -100,7 +102,7 @@ pub async fn kv_get(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<GetRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth)?;
+    let project_id = extract_project_id(&auth, request.project_id)?;
 
     let value = state.kv_service.get(project_id, &request.key).await?;
 
@@ -125,7 +127,7 @@ pub async fn kv_set(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<SetRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth)?;
+    let project_id = extract_project_id(&auth, request.project_id)?;
 
     let options = SetOptions {
         ex: request.ex,
@@ -162,7 +164,7 @@ pub async fn kv_del(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<DelRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth)?;
+    let project_id = extract_project_id(&auth, request.project_id)?;
 
     let deleted = state.kv_service.del(project_id, request.keys).await?;
 
@@ -187,7 +189,7 @@ pub async fn kv_incr(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<IncrRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth)?;
+    let project_id = extract_project_id(&auth, request.project_id)?;
 
     let value = match request.amount {
         Some(amount) if amount != 1 => {
@@ -220,7 +222,7 @@ pub async fn kv_expire(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<ExpireRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth)?;
+    let project_id = extract_project_id(&auth, request.project_id)?;
 
     let success = state
         .kv_service
@@ -248,7 +250,7 @@ pub async fn kv_ttl(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<TtlRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth)?;
+    let project_id = extract_project_id(&auth, request.project_id)?;
 
     let ttl = state.kv_service.ttl(project_id, &request.key).await?;
 
@@ -273,19 +275,34 @@ pub async fn kv_keys(
     State(state): State<Arc<KvAppState>>,
     Json(request): Json<KeysRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_id = extract_project_id(&auth)?;
+    let project_id = extract_project_id(&auth, request.project_id)?;
 
     let keys = state.kv_service.keys(project_id, &request.pattern).await?;
 
     Ok(Json(KeysResponse { keys }))
 }
 
-/// Extract project_id from authentication context
-fn extract_project_id(auth: &temps_auth::AuthContext) -> Result<i32, Problem> {
-    auth.project_id().ok_or_else(|| {
-        temps_core::problemdetails::new(axum::http::StatusCode::FORBIDDEN)
-            .with_title("Project Required")
-            .with_detail("This operation requires a project-scoped token")
+/// Extract project_id from request body or authentication context
+///
+/// Priority:
+/// 1. Deployment tokens: Use project_id from token (request body ignored for security)
+/// 2. API keys/sessions: Use project_id from request body (required)
+fn extract_project_id(
+    auth: &temps_auth::AuthContext,
+    request_project_id: Option<i32>,
+) -> Result<i32, Problem> {
+    // For deployment tokens, always use the token's project_id (security: prevent access to other projects)
+    if let Some(token_project_id) = auth.project_id() {
+        return Ok(token_project_id);
+    }
+
+    // For API keys and sessions, require project_id in the request body
+    request_project_id.ok_or_else(|| {
+        temps_core::problemdetails::new(axum::http::StatusCode::BAD_REQUEST)
+            .with_title("Project ID Required")
+            .with_detail(
+                "The 'project_id' field is required in the request body for API key or session authentication",
+            )
     })
 }
 
@@ -312,27 +329,45 @@ pub async fn kv_status(
     // Status check requires SystemRead permission
     permission_guard!(auth, SystemRead);
 
-    let healthy = state.redis_service.health_check().await.unwrap_or(false);
+    // Check if the service exists in the database via ExternalServiceManager
+    let service_result = state
+        .external_service_manager
+        .get_service_by_name("temps-kv")
+        .await;
 
-    let (version, docker_image) = if healthy {
-        let version = state.redis_service.get_current_version().await.ok();
-        let image = state
-            .redis_service
-            .get_current_docker_image()
-            .await
-            .ok()
-            .map(|(name, tag)| format!("{}:{}", name, tag));
-        (version, image)
-    } else {
-        (None, None)
-    };
+    match service_result {
+        Ok(service) => {
+            // Service exists in database, get full details
+            let details = state
+                .external_service_manager
+                .get_service_details(service.id)
+                .await
+                .ok();
 
-    Ok(Json(KvStatusResponse {
-        enabled: healthy,
-        healthy,
-        version,
-        docker_image,
-    }))
+            let healthy = service.status == "running";
+            let version = details.as_ref().and_then(|d| d.service.version.clone());
+            let docker_image = details
+                .and_then(|d| d.current_parameters)
+                .and_then(|p| p.get("docker_image").cloned())
+                .and_then(|v| v.as_str().map(String::from));
+
+            Ok(Json(KvStatusResponse {
+                enabled: true,
+                healthy,
+                version,
+                docker_image,
+            }))
+        }
+        Err(_) => {
+            // Service not found in database - not enabled
+            Ok(Json(KvStatusResponse {
+                enabled: false,
+                healthy: false,
+                version: None,
+                docker_image: None,
+            }))
+        }
+    }
 }
 
 /// Enable KV service
@@ -359,25 +394,61 @@ pub async fn kv_enable(
 
     info!("Enabling KV service with config: {:?}", request);
 
-    // Start the Redis service
-    if let Err(e) = state.redis_service.start().await {
-        error!("Failed to start KV service: {}", e);
-        return Err(
+    // Build parameters for Redis service creation
+    let mut parameters: HashMap<String, serde_json::Value> = HashMap::new();
+    if let Some(docker_image) = &request.docker_image {
+        parameters.insert("docker_image".to_string(), serde_json::json!(docker_image));
+    }
+    if let Some(max_memory) = &request.max_memory {
+        parameters.insert("max_memory".to_string(), serde_json::json!(max_memory));
+    }
+    parameters.insert(
+        "persistence".to_string(),
+        serde_json::json!(request.persistence),
+    );
+
+    // Extract version from docker_image (e.g., "redis:7-alpine" -> "7-alpine")
+    let version = parameters
+        .get("docker_image")
+        .and_then(|v| v.as_str())
+        .and_then(|img| img.split(':').nth(1))
+        .map(String::from)
+        .or_else(|| Some("7-alpine".to_string())); // Default Redis version
+
+    // Create service request for ExternalServiceManager
+    let create_request = CreateExternalServiceRequest {
+        name: "temps-kv".to_string(),
+        service_type: ServiceType::Redis,
+        version,
+        parameters,
+    };
+
+    // Create the service through ExternalServiceManager
+    // This creates the database record AND initializes/starts the container
+    let service_info = state
+        .external_service_manager
+        .create_service(create_request)
+        .await
+        .map_err(|e| {
+            error!("Failed to create KV service: {}", e);
             temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Failed to Enable KV Service")
-                .with_detail(format!("Could not start Redis container: {}", e)),
-        );
-    }
+                .with_detail(format!("Could not create Redis service: {}", e))
+        })?;
 
-    // Get status after starting
-    let healthy = state.redis_service.health_check().await.unwrap_or(false);
-    let version = state.redis_service.get_current_version().await.ok();
+    // Get status from the created service
+    let healthy = service_info.status == "running";
+    let version = service_info.version.clone();
+
+    // Get docker image from service details
     let docker_image = state
-        .redis_service
-        .get_current_docker_image()
+        .external_service_manager
+        .get_service_details(service_info.id)
         .await
         .ok()
-        .map(|(name, tag)| format!("{}:{}", name, tag));
+        .and_then(|details| details.current_parameters)
+        .and_then(|p| p.get("docker_image").cloned())
+        .and_then(|v| v.as_str().map(String::from));
 
     // Create audit log
     let audit = KvServiceEnabledAudit {

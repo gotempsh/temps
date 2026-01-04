@@ -13,6 +13,14 @@ export interface KVClientConfig {
    * @default process.env.TEMPS_TOKEN
    */
   token?: string;
+
+  /**
+   * Project ID for KV operations.
+   * Required when using API keys or session authentication.
+   * Optional when using deployment tokens (project is inferred from token).
+   * @default process.env.TEMPS_PROJECT_ID
+   */
+  projectId?: number;
 }
 
 /**

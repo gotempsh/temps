@@ -3,11 +3,13 @@
 use std::sync::Arc;
 
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::Client;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::Stream;
 use temps_providers::externalsvc::RustfsService;
-use tracing::debug;
+use tokio::sync::OnceCell;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::error::BlobError;
@@ -64,12 +66,51 @@ pub struct ListResult {
 /// Blob Service for file storage operations with project isolation
 pub struct BlobService {
     rustfs_service: Arc<RustfsService>,
+    /// Track whether we've ensured the bucket exists
+    bucket_initialized: OnceCell<()>,
 }
 
 impl BlobService {
     /// Create a new Blob service
     pub fn new(rustfs_service: Arc<RustfsService>) -> Self {
-        Self { rustfs_service }
+        Self {
+            rustfs_service,
+            bucket_initialized: OnceCell::new(),
+        }
+    }
+
+    /// Ensure the default bucket exists, creating it if necessary
+    async fn ensure_bucket_exists(&self, client: &Client) -> Result<(), BlobError> {
+        // Only run once per service instance
+        self.bucket_initialized
+            .get_or_try_init(|| async {
+                // Check if bucket exists
+                match client.head_bucket().bucket(DEFAULT_BUCKET).send().await {
+                    Ok(_) => {
+                        debug!("Bucket '{}' already exists", DEFAULT_BUCKET);
+                        Ok(())
+                    }
+                    Err(_) => {
+                        // Bucket doesn't exist, create it
+                        info!("Creating bucket '{}'", DEFAULT_BUCKET);
+                        client
+                            .create_bucket()
+                            .bucket(DEFAULT_BUCKET)
+                            .send()
+                            .await
+                            .map_err(|e| {
+                                BlobError::Internal(format!(
+                                    "Failed to create bucket '{}': {}",
+                                    DEFAULT_BUCKET, e
+                                ))
+                            })?;
+                        info!("Bucket '{}' created successfully", DEFAULT_BUCKET);
+                        Ok(())
+                    }
+                }
+            })
+            .await
+            .map(|_| ())
     }
 
     /// Build the object key with project namespace
@@ -94,6 +135,25 @@ impl BlobService {
         key.strip_prefix(&prefix).unwrap_or(key).to_string()
     }
 
+    /// Map S3 SDK errors to BlobError with proper not-found detection
+    fn map_s3_error<E: std::fmt::Display + std::fmt::Debug>(error: E, pathname: &str) -> BlobError {
+        let error_str = format!("{:?}", error);
+        let error_msg = error.to_string();
+
+        // Check for various not-found error patterns from AWS SDK
+        if error_str.contains("NotFound")
+            || error_str.contains("NoSuchKey")
+            || error_str.contains("404")
+            || error_msg.contains("NotFound")
+            || error_msg.contains("NoSuchKey")
+            || error_msg.contains("not found")
+        {
+            BlobError::NotFound(pathname.to_string())
+        } else {
+            BlobError::S3(error_msg)
+        }
+    }
+
     /// Upload a blob
     pub async fn put(
         &self,
@@ -107,6 +167,9 @@ impl BlobService {
             .get_connection()
             .await
             .map_err(|e| BlobError::ConnectionFailed(e.to_string()))?;
+
+        // Ensure bucket exists on first operation
+        self.ensure_bucket_exists(&client).await?;
 
         // Generate final pathname with optional random suffix
         let final_pathname = if options.add_random_suffix {
@@ -195,13 +258,7 @@ impl BlobService {
             .key(&key)
             .send()
             .await
-            .map_err(|e| {
-                if e.to_string().contains("NotFound") || e.to_string().contains("404") {
-                    BlobError::NotFound(pathname.to_string())
-                } else {
-                    BlobError::S3(e.to_string())
-                }
-            })?;
+            .map_err(|e| Self::map_s3_error(e, pathname))?;
 
         let content_type = response
             .content_type()
@@ -327,13 +384,7 @@ impl BlobService {
             .key(&key)
             .send()
             .await
-            .map_err(|e| {
-                if e.to_string().contains("NoSuchKey") || e.to_string().contains("404") {
-                    BlobError::NotFound(pathname.to_string())
-                } else {
-                    BlobError::S3(e.to_string())
-                }
-            })?;
+            .map_err(|e| Self::map_s3_error(e, pathname))?;
 
         let content_type = response
             .content_type()
@@ -347,6 +398,59 @@ impl BlobService {
         let reader_stream = tokio_util::io::ReaderStream::new(stream);
 
         Ok((reader_stream, content_type, size))
+    }
+
+    /// Copy a blob to a new location within the same project
+    pub async fn copy(
+        &self,
+        project_id: i32,
+        from_pathname: &str,
+        to_pathname: &str,
+    ) -> Result<BlobInfo, BlobError> {
+        let client = self
+            .rustfs_service
+            .get_connection()
+            .await
+            .map_err(|e| BlobError::ConnectionFailed(e.to_string()))?;
+
+        let source_key = self.object_key(project_id, from_pathname);
+        let dest_key = self.object_key(project_id, to_pathname);
+
+        debug!("COPY {} -> {}", source_key, dest_key);
+
+        // Get source object metadata first to verify it exists and get content type
+        let head_response = client
+            .head_object()
+            .bucket(DEFAULT_BUCKET)
+            .key(&source_key)
+            .send()
+            .await
+            .map_err(|e| Self::map_s3_error(e, from_pathname))?;
+
+        let content_type = head_response
+            .content_type()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let size = head_response.content_length().unwrap_or(0);
+
+        // Copy the object
+        let copy_source = format!("{}/{}", DEFAULT_BUCKET, source_key);
+        client
+            .copy_object()
+            .bucket(DEFAULT_BUCKET)
+            .key(&dest_key)
+            .copy_source(&copy_source)
+            .send()
+            .await
+            .map_err(|e| BlobError::S3(format!("Failed to copy object: {}", e)))?;
+
+        Ok(BlobInfo {
+            url: self.blob_url(project_id, to_pathname),
+            pathname: to_pathname.to_string(),
+            content_type,
+            size,
+            uploaded_at: Utc::now(),
+        })
     }
 }
 

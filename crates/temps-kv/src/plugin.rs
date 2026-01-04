@@ -12,12 +12,14 @@ use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
 use temps_core::AuditLogger;
-use temps_providers::externalsvc::RedisService;
+use temps_providers::externalsvc::{ExternalService, RedisService};
+use tracing::{debug, info, warn};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{configure_routes, KvApiDoc, KvAppState};
 use crate::services::KvService;
+use temps_providers::ExternalServiceManager;
 
 /// Default name for the KV Redis service
 const KV_REDIS_SERVICE_NAME: &str = "temps-kv";
@@ -69,21 +71,98 @@ impl TempsPlugin for KvPlugin {
             context.register_service(kv_service);
             context.register_service(redis_service);
 
-            tracing::debug!("KV plugin services registered successfully");
+            debug!("KV plugin services registered successfully");
+            Ok(())
+        })
+    }
+
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            debug!("Initializing KV plugin services...");
+
+            // Get the RedisService and ExternalServiceManager from context
+            let redis_service = context.require_service::<RedisService>();
+            let external_service_manager = context.require_service::<ExternalServiceManager>();
+
+            // Try to load the temps-kv service configuration from the database
+            match external_service_manager
+                .get_service_by_name(KV_REDIS_SERVICE_NAME)
+                .await
+            {
+                Ok(service_model) => {
+                    info!(
+                        "Found KV service '{}' in database (id: {}), loading configuration...",
+                        KV_REDIS_SERVICE_NAME, service_model.id
+                    );
+
+                    // Get the full service config (with decrypted parameters)
+                    match external_service_manager
+                        .get_service_config(service_model.id)
+                        .await
+                    {
+                        Ok(service_config) => {
+                            // Initialize the RedisService with the config from database
+                            match redis_service.init(service_config).await {
+                                Ok(_) => {
+                                    info!(
+                                        "KV Redis service '{}' initialized successfully from database config",
+                                        KV_REDIS_SERVICE_NAME
+                                    );
+
+                                    // Start the Redis container if not already running
+                                    if let Err(e) = redis_service.start().await {
+                                        warn!(
+                                            "Failed to start KV Redis container (may already be running): {}",
+                                            e
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to initialize KV Redis service from database config: {}. \
+                                         The service will need to be created via the API.",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to get KV service config from database: {}. \
+                                 The service may need to be recreated.",
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(_) => {
+                    debug!(
+                        "KV service '{}' not found in database. \
+                         It will be created when first accessed via the API.",
+                        KV_REDIS_SERVICE_NAME
+                    );
+                }
+            }
+
             Ok(())
         })
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        // Get the KV service, Redis service, and Audit service from the plugin context
+        // Get the KV service, Redis service, ExternalServiceManager, and Audit service from the plugin context
         let kv_service = context.require_service::<KvService>();
         let redis_service = context.require_service::<RedisService>();
+        let external_service_manager = context.require_service::<ExternalServiceManager>();
         let audit_service = context.require_service::<dyn AuditLogger>();
 
         // Create app state for handlers
         let app_state = Arc::new(KvAppState {
             kv_service,
             redis_service,
+            external_service_manager,
             audit_service,
         });
 

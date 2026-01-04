@@ -24,6 +24,7 @@ import { registerMonitorsCommands } from './commands/monitors/index.js'
 import { registerWebhooksCommands } from './commands/webhooks/index.js'
 import { registerContainersCommands } from './commands/containers/index.js'
 import { registerDocsCommand } from './commands/docs.js'
+import { registerTokensCommands } from './commands/tokens/index.js'
 
 // Read version from package.json
 const require = createRequire(import.meta.url)
@@ -75,6 +76,7 @@ export function createProgram(): Command {
   registerMonitorsCommands(program)
   registerWebhooksCommands(program)
   registerContainersCommands(program)
+  registerTokensCommands(program)
   registerDocsCommand(program)
 
   // Custom help

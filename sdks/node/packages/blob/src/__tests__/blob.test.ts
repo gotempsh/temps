@@ -735,13 +735,13 @@ describe('BlobError', () => {
   });
 
   it('should create error with code', () => {
-    const error = new BlobError('Not found', 'NOT_FOUND');
+    const error = new BlobError('Not found', { code: 'NOT_FOUND' });
     expect(error.message).toBe('Not found');
     expect(error.code).toBe('NOT_FOUND');
   });
 
   it('should create error with status', () => {
-    const error = new BlobError('Unauthorized', 'UNAUTHORIZED', 401);
+    const error = new BlobError('Unauthorized', { code: 'UNAUTHORIZED', status: 401 });
     expect(error.message).toBe('Unauthorized');
     expect(error.code).toBe('UNAUTHORIZED');
     expect(error.status).toBe(401);

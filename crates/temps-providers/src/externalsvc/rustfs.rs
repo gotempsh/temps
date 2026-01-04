@@ -451,6 +451,7 @@ impl RustfsService {
         );
 
         let sdk_config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(Region::new(config.region.clone()))
             .endpoint_url(&endpoint)
             .force_path_style(true)

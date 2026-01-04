@@ -17,10 +17,12 @@ import { KVError } from './errors.js';
 export class KV {
   private readonly apiUrl: string;
   private readonly token: string;
+  private readonly projectId?: number;
 
   constructor(config: KVClientConfig = {}) {
     const apiUrl = config.apiUrl || process.env.TEMPS_API_URL;
     const token = config.token || process.env.TEMPS_TOKEN;
+    const projectId = config.projectId ?? (process.env.TEMPS_PROJECT_ID ? parseInt(process.env.TEMPS_PROJECT_ID, 10) : undefined);
 
     if (!apiUrl) {
       throw KVError.missingConfig('apiUrl');
@@ -32,6 +34,7 @@ export class KV {
     // Remove trailing slash from API URL
     this.apiUrl = apiUrl.replace(/\/$/, '');
     this.token = token;
+    this.projectId = projectId;
   }
 
   /**
@@ -40,6 +43,11 @@ export class KV {
   private async request<T>(endpoint: string, body: Record<string, unknown>): Promise<T> {
     const url = `${this.apiUrl}/api/kv/${endpoint}`;
 
+    // Include project_id in all requests when set
+    const requestBody = this.projectId !== undefined
+      ? { ...body, project_id: this.projectId }
+      : body;
+
     try {
       const response = await fetch(url, {
         method: 'POST',
@@ -47,7 +55,7 @@ export class KV {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${this.token}`,
         },
-        body: JSON.stringify(body),
+        body: JSON.stringify(requestBody),
       });
 
       const data = await response.json() as T & { error?: { message: string; code?: string } };

@@ -371,6 +371,21 @@ pub trait TempsPlugin: Send + Sync {
         context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>;
 
+    /// Initialize plugin-managed services after all plugins are registered
+    ///
+    /// This is called after all plugins have registered their services, allowing
+    /// plugins to access services from other plugins (like ExternalServiceManager)
+    /// to initialize their own services with configuration from the database.
+    ///
+    /// Use this hook when you need to load service configuration from the database
+    /// or perform other async initialization that requires access to other plugins' services.
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        _context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move { Ok(()) })
+    }
+
     /// Configure HTTP routes for this plugin
     ///
     /// Return None if this plugin doesn't provide HTTP endpoints.
@@ -631,8 +646,9 @@ impl PluginManager {
     pub async fn initialize_plugins(&mut self) -> Result<(), PluginError> {
         debug!("Initializing {} plugins", self.plugins.len());
 
+        // Phase 1: Register all services
         for plugin in &self.plugins {
-            debug!("Initializing plugin: {}", plugin.name());
+            debug!("Registering services for plugin: {}", plugin.name());
 
             plugin.register_services(&self.context).await.map_err(|e| {
                 PluginError::PluginRegistrationFailed {
@@ -641,7 +657,30 @@ impl PluginManager {
                 }
             })?;
 
-            debug!("Successfully initialized plugin: {}", plugin.name());
+            debug!(
+                "Successfully registered services for plugin: {}",
+                plugin.name()
+            );
+        }
+
+        // Phase 2: Initialize plugin services (after all services are registered)
+        // This allows plugins to access services from other plugins
+        let plugin_context = self.context.create_plugin_context();
+        for plugin in &self.plugins {
+            debug!("Initializing plugin services for: {}", plugin.name());
+
+            plugin
+                .initialize_plugin_services(&plugin_context)
+                .await
+                .map_err(|e| PluginError::PluginRegistrationFailed {
+                    plugin_name: plugin.name().to_string(),
+                    error: format!("Failed to initialize plugin services: {}", e),
+                })?;
+
+            debug!(
+                "Successfully initialized plugin services for: {}",
+                plugin.name()
+            );
         }
 
         Ok(())

@@ -8,7 +8,9 @@ use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
 use temps_core::AuditLogger;
-use temps_providers::externalsvc::RustfsService;
+use temps_providers::externalsvc::{ExternalService, RustfsService};
+use temps_providers::ExternalServiceManager;
+use tracing::{debug, info, warn};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
@@ -63,7 +65,82 @@ impl TempsPlugin for BlobPlugin {
             context.register_service(rustfs_service);
             context.register_service(blob_service);
 
-            tracing::debug!("Blob plugin services registered successfully");
+            debug!("Blob plugin services registered successfully");
+            Ok(())
+        })
+    }
+
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            debug!("Initializing Blob plugin services...");
+
+            // Get the RustfsService and ExternalServiceManager from context
+            let rustfs_service = context.require_service::<RustfsService>();
+            let external_service_manager = context.require_service::<ExternalServiceManager>();
+
+            // Try to load the temps-blob service configuration from the database
+            match external_service_manager
+                .get_service_by_name(BLOB_RUSTFS_SERVICE_NAME)
+                .await
+            {
+                Ok(service_model) => {
+                    info!(
+                        "Found Blob service '{}' in database (id: {}), loading configuration...",
+                        BLOB_RUSTFS_SERVICE_NAME, service_model.id
+                    );
+
+                    // Get the full service config (with decrypted parameters)
+                    match external_service_manager
+                        .get_service_config(service_model.id)
+                        .await
+                    {
+                        Ok(service_config) => {
+                            // Initialize the RustfsService with the config from database
+                            match rustfs_service.init(service_config).await {
+                                Ok(_) => {
+                                    info!(
+                                        "Blob RustFS service '{}' initialized successfully from database config",
+                                        BLOB_RUSTFS_SERVICE_NAME
+                                    );
+
+                                    // Start the RustFS container if not already running
+                                    if let Err(e) = rustfs_service.start().await {
+                                        warn!(
+                                            "Failed to start Blob RustFS container (may already be running): {}",
+                                            e
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to initialize Blob RustFS service from database config: {}. \
+                                         The service will need to be created via the API.",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to get Blob service config from database: {}. \
+                                 The service may need to be recreated.",
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(_) => {
+                    debug!(
+                        "Blob service '{}' not found in database. \
+                         It will be created when first accessed via the API.",
+                        BLOB_RUSTFS_SERVICE_NAME
+                    );
+                }
+            }
+
             Ok(())
         })
     }
@@ -72,12 +149,14 @@ impl TempsPlugin for BlobPlugin {
         // Get services from context
         let blob_service = context.require_service::<BlobService>();
         let rustfs_service = context.require_service::<RustfsService>();
+        let external_service_manager = context.require_service::<ExternalServiceManager>();
         let audit_service = context.require_service::<dyn AuditLogger>();
 
         // Create app state
         let app_state = Arc::new(BlobAppState {
             blob_service,
             rustfs_service,
+            external_service_manager,
             audit_service,
         });
 

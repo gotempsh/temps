@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use temps_core::AuditLogger;
 use temps_providers::externalsvc::RedisService;
+use temps_providers::ExternalServiceManager;
 use utoipa::ToSchema;
 
 use crate::KvService;
@@ -14,6 +15,7 @@ use crate::KvService;
 pub struct KvAppState {
     pub kv_service: Arc<KvService>,
     pub redis_service: Arc<RedisService>,
+    pub external_service_manager: Arc<ExternalServiceManager>,
     pub audit_service: Arc<dyn AuditLogger>,
 }
 
@@ -27,6 +29,10 @@ pub struct GetRequest {
     /// The key to retrieve
     #[schema(example = "user:123")]
     pub key: String,
+
+    /// Project ID (required for API key/session auth, optional for deployment tokens)
+    #[schema(example = 1)]
+    pub project_id: Option<i32>,
 }
 
 /// Request to set a value
@@ -54,6 +60,10 @@ pub struct SetRequest {
     /// Only set if key exists
     #[serde(default)]
     pub xx: bool,
+
+    /// Project ID (required for API key/session auth, optional for deployment tokens)
+    #[schema(example = 1)]
+    pub project_id: Option<i32>,
 }
 
 /// Request to delete keys
@@ -62,6 +72,10 @@ pub struct DelRequest {
     /// The key(s) to delete
     #[schema(example = json!(["user:123", "user:456"]))]
     pub keys: Vec<String>,
+
+    /// Project ID (required for API key/session auth, optional for deployment tokens)
+    #[schema(example = 1)]
+    pub project_id: Option<i32>,
 }
 
 /// Request to increment a value
@@ -74,6 +88,10 @@ pub struct IncrRequest {
     /// Amount to increment by (default: 1)
     #[serde(default = "default_incr_amount")]
     pub amount: Option<i64>,
+
+    /// Project ID (required for API key/session auth, optional for deployment tokens)
+    #[schema(example = 1)]
+    pub project_id: Option<i32>,
 }
 
 fn default_incr_amount() -> Option<i64> {
@@ -90,6 +108,10 @@ pub struct ExpireRequest {
     /// Expiration time in seconds
     #[schema(example = 3600)]
     pub seconds: i64,
+
+    /// Project ID (required for API key/session auth, optional for deployment tokens)
+    #[schema(example = 1)]
+    pub project_id: Option<i32>,
 }
 
 /// Request to get TTL for a key
@@ -98,6 +120,10 @@ pub struct TtlRequest {
     /// The key to check TTL for
     #[schema(example = "session:abc")]
     pub key: String,
+
+    /// Project ID (required for API key/session auth, optional for deployment tokens)
+    #[schema(example = 1)]
+    pub project_id: Option<i32>,
 }
 
 /// Request to get keys matching a pattern
@@ -106,6 +132,10 @@ pub struct KeysRequest {
     /// Pattern to match (supports * and ? wildcards)
     #[schema(example = "user:*")]
     pub pattern: String,
+
+    /// Project ID (required for API key/session auth, optional for deployment tokens)
+    #[schema(example = 1)]
+    pub project_id: Option<i32>,
 }
 
 // =============================================================================

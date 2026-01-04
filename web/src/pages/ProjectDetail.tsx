@@ -15,6 +15,7 @@ import {
 import { ProjectDetailHeader } from '@/components/project/ProjectDetailHeader'
 import { ProjectOverview } from '@/components/project/ProjectOverview'
 import { ProjectRuntime } from '@/components/project/ProjectRuntime'
+import { ProjectServices } from '@/components/project/ProjectServices'
 import { ProjectSettings } from '@/components/project/ProjectSettings'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
@@ -327,6 +328,10 @@ export function ProjectDetail() {
               <Route
                 path="storage"
                 element={<ProjectStorage project={project} />}
+              />
+              <Route
+                path="services/*"
+                element={<ProjectServices project={project} />}
               />
               <Route
                 path="runtime"

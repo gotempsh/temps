@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use temps_core::AuditLogger;
 use temps_providers::externalsvc::RustfsService;
+use temps_providers::ExternalServiceManager;
 use utoipa::ToSchema;
 
 use crate::services::{BlobInfo, BlobService, ListResult};
@@ -14,6 +15,7 @@ use crate::services::{BlobInfo, BlobService, ListResult};
 pub struct BlobAppState {
     pub blob_service: Arc<BlobService>,
     pub rustfs_service: Arc<RustfsService>,
+    pub external_service_manager: Arc<ExternalServiceManager>,
     pub audit_service: Arc<dyn AuditLogger>,
 }
 
@@ -32,8 +34,27 @@ pub struct PutBlobRequest {
     pub add_random_suffix: bool,
 }
 
+/// Query parameters for blob upload
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct PutBlobQuery {
+    /// Path where the blob will be stored
+    #[schema(example = "images/avatar.png")]
+    pub pathname: Option<String>,
+    /// Content type of the blob (optional, will be guessed from extension)
+    #[schema(example = "image/png")]
+    pub content_type: Option<String>,
+    /// Add random suffix to pathname to prevent collisions
+    #[schema(example = true)]
+    #[serde(default)]
+    pub add_random_suffix: bool,
+    /// Project ID (required for API key/session auth, optional for deployment tokens)
+    #[schema(example = 1)]
+    pub project_id: Option<i32>,
+}
+
 /// Response after uploading a blob
 #[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct BlobResponse {
     /// URL path to access the blob
     #[schema(example = "/api/blob/123/images/avatar-abc123.png")]
@@ -66,18 +87,39 @@ impl From<BlobInfo> for BlobResponse {
 
 /// Request to delete blobs
 #[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct DeleteBlobRequest {
     /// Pathnames to delete (relative to project)
     #[schema(example = json!(["images/avatar.png", "documents/file.pdf"]))]
     pub pathnames: Vec<String>,
+
+    /// Project ID (required for API key/session auth, optional for deployment tokens)
+    #[schema(example = 1)]
+    pub project_id: Option<i32>,
 }
 
 /// Response after deleting blobs
 #[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct DeleteBlobResponse {
     /// Number of blobs deleted
     #[schema(example = 2)]
     pub deleted: i64,
+}
+
+/// Request to copy a blob
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CopyBlobRequest {
+    /// Source blob URL or pathname
+    #[schema(example = "/api/blob/10/images/avatar.png")]
+    pub from_url: String,
+    /// Destination pathname
+    #[schema(example = "images/avatar-copy.png")]
+    pub to_pathname: String,
+    /// Project ID (required for API key/session auth, optional for deployment tokens)
+    #[schema(example = 1)]
+    pub project_id: Option<i32>,
 }
 
 /// Query parameters for listing blobs
@@ -91,10 +133,14 @@ pub struct ListBlobsQuery {
     pub prefix: Option<String>,
     /// Continuation token for pagination
     pub cursor: Option<String>,
+    /// Project ID (required for API key/session auth, optional for deployment tokens)
+    #[schema(example = 1)]
+    pub project_id: Option<i32>,
 }
 
 /// Response for listing blobs
 #[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ListBlobsResponse {
     /// List of blobs
     pub blobs: Vec<BlobResponse>,

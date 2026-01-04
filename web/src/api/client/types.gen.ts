@@ -417,6 +417,54 @@ export type BackupScheduleResponse = {
     updated_at: number;
 };
 
+/**
+ * Response after uploading a blob
+ */
+export type BlobResponse = {
+    /**
+     * Content type of the blob
+     */
+    content_type: string;
+    /**
+     * Original pathname
+     */
+    pathname: string;
+    /**
+     * Size in bytes
+     */
+    size: number;
+    /**
+     * Upload timestamp
+     */
+    uploaded_at: string;
+    /**
+     * URL path to access the blob
+     */
+    url: string;
+};
+
+/**
+ * Response for Blob service status
+ */
+export type BlobStatusResponse = {
+    /**
+     * Docker image being used
+     */
+    docker_image?: string | null;
+    /**
+     * Whether the Blob service is enabled
+     */
+    enabled: boolean;
+    /**
+     * Whether the service is healthy
+     */
+    healthy: boolean;
+    /**
+     * Current version (if running)
+     */
+    version?: string | null;
+};
+
 export type BranchInfo = {
     commit_sha: string;
     name: string;
@@ -1102,6 +1150,46 @@ export type CustomDomainResponse = {
 };
 
 /**
+ * Request to delete keys
+ */
+export type DelRequest = {
+    /**
+     * The key(s) to delete
+     */
+    keys: Array<string>;
+};
+
+/**
+ * Response for delete operation
+ */
+export type DelResponse = {
+    /**
+     * Number of keys deleted
+     */
+    deleted: number;
+};
+
+/**
+ * Request to delete blobs
+ */
+export type DeleteBlobRequest = {
+    /**
+     * Pathnames to delete (relative to project)
+     */
+    pathnames: Array<string>;
+};
+
+/**
+ * Response after deleting blobs
+ */
+export type DeleteBlobResponse = {
+    /**
+     * Number of blobs deleted
+     */
+    deleted: number;
+};
+
+/**
  * Deployment configuration shared between projects and environments
  *
  * This configuration can be set at the project level (as defaults) and
@@ -1383,6 +1471,34 @@ export type DigestSections = {
     funnels?: boolean;
     performance?: boolean;
     projects?: boolean;
+};
+
+/**
+ * Response after disabling Blob service
+ */
+export type DisableBlobResponse = {
+    /**
+     * Human-readable message
+     */
+    message: string;
+    /**
+     * Whether the operation succeeded
+     */
+    success: boolean;
+};
+
+/**
+ * Response after disabling KV service
+ */
+export type DisableKvResponse = {
+    /**
+     * Status message
+     */
+    message: string;
+    /**
+     * Whether the service was successfully disabled
+     */
+    success: boolean;
 };
 
 export type DisableMfaRequest = {
@@ -1951,6 +2067,78 @@ export type EmailStatusResponse = {
     password_reset_available: boolean;
 };
 
+/**
+ * Request to enable Blob service
+ */
+export type EnableBlobRequest = {
+    /**
+     * Docker image to use (optional, defaults to RustFS)
+     */
+    docker_image?: string | null;
+    /**
+     * Root password for S3 access
+     */
+    root_password?: string | null;
+    /**
+     * Root user for S3 access
+     */
+    root_user?: string | null;
+};
+
+/**
+ * Response after enabling Blob service
+ */
+export type EnableBlobResponse = {
+    /**
+     * Human-readable message
+     */
+    message: string;
+    /**
+     * Current status
+     */
+    status: BlobStatusResponse;
+    /**
+     * Whether the operation succeeded
+     */
+    success: boolean;
+};
+
+/**
+ * Request to enable the KV service
+ */
+export type EnableKvRequest = {
+    /**
+     * Docker image to use (optional, uses default if not provided)
+     */
+    docker_image?: string | null;
+    /**
+     * Maximum memory allocation (e.g., "256mb", "1gb")
+     */
+    max_memory?: string | null;
+    /**
+     * Enable data persistence
+     */
+    persistence?: boolean;
+};
+
+/**
+ * Response after enabling KV service
+ */
+export type EnableKvResponse = {
+    /**
+     * Status message
+     */
+    message: string;
+    /**
+     * Current service status
+     */
+    status: KvStatusResponse;
+    /**
+     * Whether the service was successfully enabled
+     */
+    success: boolean;
+};
+
 export type EnrichVisitorRequest = {
     custom_data: {
         [key: string]: unknown;
@@ -2380,6 +2568,30 @@ export type ExecuteOperationRequest = {
     operation: string;
 };
 
+/**
+ * Request to set expiration on a key
+ */
+export type ExpireRequest = {
+    /**
+     * The key to set expiration on
+     */
+    key: string;
+    /**
+     * Expiration time in seconds
+     */
+    seconds: number;
+};
+
+/**
+ * Response for expire operation
+ */
+export type ExpireResponse = {
+    /**
+     * True if expiration was set, false if key doesn't exist
+     */
+    success: boolean;
+};
+
 export type ExplorerSupportResponse = {
     /**
      * Capabilities supported by this service
@@ -2598,6 +2810,26 @@ export type GetProjectSessionReplaysResponse = {
     per_page: number;
     sessions: Array<SessionReplayWithVisitorDto>;
     total_count: number;
+};
+
+/**
+ * Request to get a value by key
+ */
+export type GetRequest = {
+    /**
+     * The key to retrieve
+     */
+    key: string;
+};
+
+/**
+ * Response for get operation
+ */
+export type GetResponse = {
+    /**
+     * The value, or null if not found
+     */
+    value?: unknown;
 };
 
 export type GetSessionReplayResponse = {
@@ -3005,6 +3237,30 @@ export type IncidentUpdateResponse = {
     status: string;
 };
 
+/**
+ * Request to increment a value
+ */
+export type IncrRequest = {
+    /**
+     * Amount to increment by (default: 1)
+     */
+    amount?: number | null;
+    /**
+     * The key to increment
+     */
+    key: string;
+};
+
+/**
+ * Response for increment operation
+ */
+export type IncrResponse = {
+    /**
+     * New value after increment
+     */
+    value: number;
+};
+
 export type InitAuthResponse = {
     auth_url: string;
     session_token: string;
@@ -3031,6 +3287,48 @@ export type IpAccessControlResponse = {
     ip_address: string;
     reason?: string | null;
     updated_at: string;
+};
+
+/**
+ * Request to get keys matching a pattern
+ */
+export type KeysRequest = {
+    /**
+     * Pattern to match (supports * and ? wildcards)
+     */
+    pattern: string;
+};
+
+/**
+ * Response for keys operation
+ */
+export type KeysResponse = {
+    /**
+     * List of matching keys
+     */
+    keys: Array<string>;
+};
+
+/**
+ * Response for KV service status
+ */
+export type KvStatusResponse = {
+    /**
+     * Docker image being used
+     */
+    docker_image?: string | null;
+    /**
+     * Whether the KV service is enabled
+     */
+    enabled: boolean;
+    /**
+     * Whether the underlying Redis service is healthy
+     */
+    healthy: boolean;
+    /**
+     * Service version
+     */
+    version?: string | null;
 };
 
 export type LetsEncryptSettings = {
@@ -3075,6 +3373,42 @@ export type ListAuditLogsQuery = {
      * Filter logs by user ID
      */
     user_id?: number | null;
+};
+
+/**
+ * Query parameters for listing blobs
+ */
+export type ListBlobsQuery = {
+    /**
+     * Continuation token for pagination
+     */
+    cursor?: string | null;
+    /**
+     * Maximum number of items to return
+     */
+    limit?: number | null;
+    /**
+     * Prefix to filter by
+     */
+    prefix?: string | null;
+};
+
+/**
+ * Response for listing blobs
+ */
+export type ListBlobsResponse = {
+    /**
+     * List of blobs
+     */
+    blobs: Array<BlobResponse>;
+    /**
+     * Continuation token for next page
+     */
+    cursor?: string | null;
+    /**
+     * Whether there are more results
+     */
+    has_more: boolean;
 };
 
 export type ListCustomDomainsResponse = {
@@ -3408,6 +3742,54 @@ export type OperationResultsResponse = {
 };
 
 /**
+ * Time bucket data point for page activity graph
+ */
+export type PageActivityBucket = {
+    /**
+     * Average time on page in seconds
+     */
+    avg_time_seconds: number;
+    /**
+     * Number of page views in this bucket
+     */
+    page_views: number;
+    /**
+     * Timestamp for this bucket (ISO 8601)
+     */
+    timestamp: string;
+    /**
+     * Number of unique visitors in this bucket
+     */
+    visitors: number;
+};
+
+/**
+ * Geographic distribution of visitors for a page
+ */
+export type PageCountryStats = {
+    /**
+     * Country name
+     */
+    country: string;
+    /**
+     * ISO country code (2-letter)
+     */
+    country_code?: string | null;
+    /**
+     * Number of page views from this country
+     */
+    page_views: number;
+    /**
+     * Percentage of total visitors
+     */
+    percentage: number;
+    /**
+     * Number of unique visitors from this country
+     */
+    visitors: number;
+};
+
+/**
  * Query parameters for page hourly sessions endpoint
  */
 export type PageHourlySessionsQuery = {
@@ -3424,6 +3806,74 @@ export type PageHourlySessionsResponse = {
     hours: number;
     page_path: string;
     total_sessions: number;
+};
+
+/**
+ * Query parameters for page path detail analytics
+ */
+export type PagePathDetailQuery = {
+    /**
+     * Bucket interval for time series: 'hour', 'day', 'week', 'month' (default: auto)
+     */
+    bucket_interval?: string | null;
+    end_date: string;
+    environment_id?: number | null;
+    /**
+     * The specific page path to get details for (URL-encoded)
+     */
+    page_path: string;
+    project_id: number;
+    start_date: string;
+};
+
+/**
+ * Detailed analytics response for a specific page path
+ */
+export type PagePathDetailResponse = {
+    /**
+     * Time series data for activity graph
+     */
+    activity_over_time: Array<PageActivityBucket>;
+    /**
+     * Average time on page in seconds
+     */
+    avg_time_on_page: number;
+    /**
+     * Bounce rate percentage (0-100)
+     */
+    bounce_rate: number;
+    /**
+     * Bucket interval used for time series ('hour', 'day', etc.)
+     */
+    bucket_interval: string;
+    /**
+     * Geographic distribution of visitors
+     */
+    countries: Array<PageCountryStats>;
+    /**
+     * Entry rate - percentage of sessions that started on this page
+     */
+    entry_rate: number;
+    /**
+     * Exit rate - percentage of sessions that ended on this page
+     */
+    exit_rate: number;
+    /**
+     * The page path being analyzed
+     */
+    page_path: string;
+    /**
+     * Top referrers to this page
+     */
+    referrers: Array<PageReferrerStats>;
+    /**
+     * Total page views in the date range
+     */
+    total_page_views: number;
+    /**
+     * Total unique visitors to this page in the date range
+     */
+    unique_visitors: number;
 };
 
 export type PagePathInfo = {
@@ -3446,6 +3896,24 @@ export type PagePathsQuery = {
 export type PagePathsResponse = {
     page_paths: Array<PagePathInfo>;
     total_count: number;
+};
+
+/**
+ * Referrer source for the page
+ */
+export type PageReferrerStats = {
+    /**
+     * Percentage of total visits
+     */
+    percentage: number;
+    /**
+     * Referrer URL or domain
+     */
+    referrer: string;
+    /**
+     * Number of visits from this referrer
+     */
+    visits: number;
 };
 
 export type PageSessionComparison = {
@@ -4685,7 +5153,7 @@ export type ServiceTypeInfo = {
     service_type: ServiceTypeRoute;
 };
 
-export type ServiceTypeRoute = 'mongodb' | 'postgres' | 'redis' | 's3';
+export type ServiceTypeRoute = 'mongodb' | 'postgres' | 'redis' | 's3' | 'kv' | 'blob';
 
 export type SesCredentialsRequest = {
     access_key_id: string;
@@ -4860,6 +5328,46 @@ export type SessionSummary = {
     requests_count: number;
     session_id: number;
     started_at: string;
+};
+
+/**
+ * Request to set a value
+ */
+export type SetRequest = {
+    /**
+     * Expire in seconds
+     */
+    ex?: number | null;
+    /**
+     * The key to set
+     */
+    key: string;
+    /**
+     * Only set if key does not exist
+     */
+    nx?: boolean;
+    /**
+     * Expire in milliseconds
+     */
+    px?: number | null;
+    /**
+     * The value to store (can be any JSON value)
+     */
+    value: unknown;
+    /**
+     * Only set if key exists
+     */
+    xx?: boolean;
+};
+
+/**
+ * Response for set operation
+ */
+export type SetResponse = {
+    /**
+     * Always "OK" on success
+     */
+    result: string;
 };
 
 /**
@@ -5442,6 +5950,26 @@ export type TriggerScanResponse = {
     message: string;
     scan_id: number;
     status: string;
+};
+
+/**
+ * Request to get TTL for a key
+ */
+export type TtlRequest = {
+    /**
+     * The key to check TTL for
+     */
+    key: string;
+};
+
+/**
+ * Response for TTL operation
+ */
+export type TtlResponse = {
+    /**
+     * TTL in seconds, -1 if no expiration, -2 if key doesn't exist
+     */
+    ttl: number;
 };
 
 export type TxtRecord = {
@@ -6645,6 +7173,58 @@ export type GetPageHourlySessionsResponses = {
 };
 
 export type GetPageHourlySessionsResponse = GetPageHourlySessionsResponses[keyof GetPageHourlySessionsResponses];
+
+export type GetPagePathDetailData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * The page path to get details for (URL-encoded)
+         */
+        page_path: string;
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID (optional)
+         */
+        environment_id?: number;
+        /**
+         * Start date in ISO 8601 format
+         */
+        start_date: string;
+        /**
+         * End date in ISO 8601 format
+         */
+        end_date: string;
+        /**
+         * Bucket interval for time series: 'hour', 'day', 'week', 'month' (default: auto based on date range)
+         */
+        bucket_interval?: string;
+    };
+    url: '/analytics/page-path-detail';
+};
+
+export type GetPagePathDetailErrors = {
+    /**
+     * Invalid parameters or project not found
+     */
+    400: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPagePathDetailResponses = {
+    /**
+     * Successfully retrieved page path detail analytics
+     */
+    200: PagePathDetailResponse;
+};
+
+export type GetPagePathDetailResponse = GetPagePathDetailResponses[keyof GetPagePathDetailResponses];
 
 export type GetPagePathsData = {
     body?: never;
@@ -8368,6 +8948,266 @@ export type GetBackupResponses = {
 };
 
 export type GetBackupResponse = GetBackupResponses[keyof GetBackupResponses];
+
+export type BlobDeleteData = {
+    body: DeleteBlobRequest;
+    path?: never;
+    query?: never;
+    url: '/blob';
+};
+
+export type BlobDeleteErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type BlobDeleteError = BlobDeleteErrors[keyof BlobDeleteErrors];
+
+export type BlobDeleteResponses = {
+    /**
+     * Blobs deleted successfully
+     */
+    200: DeleteBlobResponse;
+};
+
+export type BlobDeleteResponse = BlobDeleteResponses[keyof BlobDeleteResponses];
+
+export type BlobListData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Maximum number of items to return
+         */
+        limit?: number;
+        /**
+         * Prefix to filter by
+         */
+        prefix?: string;
+        /**
+         * Continuation token for pagination
+         */
+        cursor?: string;
+    };
+    url: '/blob';
+};
+
+export type BlobListErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type BlobListError = BlobListErrors[keyof BlobListErrors];
+
+export type BlobListResponses = {
+    /**
+     * List of blobs
+     */
+    200: ListBlobsResponse;
+};
+
+export type BlobListResponse = BlobListResponses[keyof BlobListResponses];
+
+export type BlobPutData = {
+    /**
+     * Binary blob data
+     */
+    body: string;
+    path?: never;
+    query?: never;
+    url: '/blob';
+};
+
+export type BlobPutErrors = {
+    /**
+     * Invalid request
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type BlobPutError = BlobPutErrors[keyof BlobPutErrors];
+
+export type BlobPutResponses = {
+    /**
+     * Blob uploaded successfully
+     */
+    201: BlobResponse;
+};
+
+export type BlobPutResponse = BlobPutResponses[keyof BlobPutResponses];
+
+export type BlobDisableData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/blob/disable';
+};
+
+export type BlobDisableErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type BlobDisableResponses = {
+    /**
+     * Blob service disabled
+     */
+    200: DisableBlobResponse;
+};
+
+export type BlobDisableResponse = BlobDisableResponses[keyof BlobDisableResponses];
+
+export type BlobEnableData = {
+    body: EnableBlobRequest;
+    path?: never;
+    query?: never;
+    url: '/blob/enable';
+};
+
+export type BlobEnableErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type BlobEnableResponses = {
+    /**
+     * Blob service enabled
+     */
+    200: EnableBlobResponse;
+};
+
+export type BlobEnableResponse = BlobEnableResponses[keyof BlobEnableResponses];
+
+export type BlobStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/blob/status';
+};
+
+export type BlobStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type BlobStatusResponses = {
+    /**
+     * Blob service status
+     */
+    200: BlobStatusResponse;
+};
+
+export type BlobStatusResponse2 = BlobStatusResponses[keyof BlobStatusResponses];
+
+export type BlobDownloadData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Blob path
+         */
+        path: string;
+    };
+    query?: never;
+    url: '/blob/{project_id}/{path}';
+};
+
+export type BlobDownloadErrors = {
+    /**
+     * Blob not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type BlobDownloadError = BlobDownloadErrors[keyof BlobDownloadErrors];
+
+export type BlobDownloadResponses = {
+    /**
+     * Blob content
+     */
+    200: unknown;
+};
+
+export type BlobHeadData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Blob path
+         */
+        path: string;
+    };
+    query?: never;
+    url: '/blob/{project_id}/{path}';
+};
+
+export type BlobHeadErrors = {
+    /**
+     * Blob not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type BlobHeadError = BlobHeadErrors[keyof BlobHeadErrors];
+
+export type BlobHeadResponses = {
+    /**
+     * Blob metadata in headers
+     */
+    200: unknown;
+};
 
 export type GetActivityGraphData = {
     body?: never;
@@ -12619,6 +13459,276 @@ export type UpdateIpAccessControlResponses = {
 };
 
 export type UpdateIpAccessControlResponse = UpdateIpAccessControlResponses[keyof UpdateIpAccessControlResponses];
+
+export type KvDelData = {
+    body: DelRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/del';
+};
+
+export type KvDelErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvDelResponses = {
+    /**
+     * Keys deleted
+     */
+    200: DelResponse;
+};
+
+export type KvDelResponse = KvDelResponses[keyof KvDelResponses];
+
+export type KvDisableData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/kv/disable';
+};
+
+export type KvDisableErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvDisableResponses = {
+    /**
+     * KV service disabled
+     */
+    200: DisableKvResponse;
+};
+
+export type KvDisableResponse = KvDisableResponses[keyof KvDisableResponses];
+
+export type KvEnableData = {
+    body: EnableKvRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/enable';
+};
+
+export type KvEnableErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvEnableResponses = {
+    /**
+     * KV service enabled
+     */
+    200: EnableKvResponse;
+};
+
+export type KvEnableResponse = KvEnableResponses[keyof KvEnableResponses];
+
+export type KvExpireData = {
+    body: ExpireRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/expire';
+};
+
+export type KvExpireErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvExpireResponses = {
+    /**
+     * Expiration set
+     */
+    200: ExpireResponse;
+};
+
+export type KvExpireResponse = KvExpireResponses[keyof KvExpireResponses];
+
+export type KvGetData = {
+    body: GetRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/get';
+};
+
+export type KvGetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvGetResponses = {
+    /**
+     * Value retrieved
+     */
+    200: GetResponse;
+};
+
+export type KvGetResponse = KvGetResponses[keyof KvGetResponses];
+
+export type KvIncrData = {
+    body: IncrRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/incr';
+};
+
+export type KvIncrErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvIncrResponses = {
+    /**
+     * Value incremented
+     */
+    200: IncrResponse;
+};
+
+export type KvIncrResponse = KvIncrResponses[keyof KvIncrResponses];
+
+export type KvKeysData = {
+    body: KeysRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/keys';
+};
+
+export type KvKeysErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvKeysResponses = {
+    /**
+     * Keys retrieved
+     */
+    200: KeysResponse;
+};
+
+export type KvKeysResponse = KvKeysResponses[keyof KvKeysResponses];
+
+export type KvSetData = {
+    body: SetRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/set';
+};
+
+export type KvSetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvSetResponses = {
+    /**
+     * Value set
+     */
+    200: SetResponse;
+};
+
+export type KvSetResponse = KvSetResponses[keyof KvSetResponses];
+
+export type KvStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/kv/status';
+};
+
+export type KvStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvStatusResponses = {
+    /**
+     * KV service status
+     */
+    200: KvStatusResponse;
+};
+
+export type KvStatusResponse2 = KvStatusResponses[keyof KvStatusResponses];
+
+export type KvTtlData = {
+    body: TtlRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/ttl';
+};
+
+export type KvTtlErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvTtlResponses = {
+    /**
+     * TTL retrieved
+     */
+    200: TtlResponse;
+};
+
+export type KvTtlResponse = KvTtlResponses[keyof KvTtlResponses];
 
 export type ListRoutesData = {
     body?: never;

@@ -3,7 +3,8 @@
   "type": "module",
   "version": "0.0.1-alpha.1",
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "examples/**/*"
   ],
   "scripts": {
     "build": "bun run --filter @temps-sdk/* build",
