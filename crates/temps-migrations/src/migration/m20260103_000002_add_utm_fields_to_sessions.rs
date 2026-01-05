@@ -8,27 +8,57 @@ use sea_orm_migration::prelude::*;
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
+#[derive(DeriveIden)]
+enum RequestSessions {
+    Table,
+    UtmSource,
+    UtmMedium,
+    UtmCampaign,
+    UtmContent,
+    UtmTerm,
+    Channel,
+    ReferrerHostname,
+}
+
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let db = manager.get_connection();
-
-        // Add UTM fields to request_sessions
-        db.execute_unprepared(
-            r#"
-            ALTER TABLE request_sessions
-            ADD COLUMN IF NOT EXISTS utm_source VARCHAR(255),
-            ADD COLUMN IF NOT EXISTS utm_medium VARCHAR(255),
-            ADD COLUMN IF NOT EXISTS utm_campaign VARCHAR(255),
-            ADD COLUMN IF NOT EXISTS utm_content VARCHAR(255),
-            ADD COLUMN IF NOT EXISTS utm_term VARCHAR(255),
-            ADD COLUMN IF NOT EXISTS channel VARCHAR(50),
-            ADD COLUMN IF NOT EXISTS referrer_hostname VARCHAR(255)
-            "#,
-        )
-        .await?;
+        // Add UTM fields to request_sessions using SeaORM API
+        // Using TEXT type for unlimited length
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(RequestSessions::Table)
+                    .add_column_if_not_exists(
+                        ColumnDef::new(RequestSessions::UtmSource).text().null(),
+                    )
+                    .add_column_if_not_exists(
+                        ColumnDef::new(RequestSessions::UtmMedium).text().null(),
+                    )
+                    .add_column_if_not_exists(
+                        ColumnDef::new(RequestSessions::UtmCampaign).text().null(),
+                    )
+                    .add_column_if_not_exists(
+                        ColumnDef::new(RequestSessions::UtmContent).text().null(),
+                    )
+                    .add_column_if_not_exists(
+                        ColumnDef::new(RequestSessions::UtmTerm).text().null(),
+                    )
+                    .add_column_if_not_exists(
+                        ColumnDef::new(RequestSessions::Channel).text().null(),
+                    )
+                    .add_column_if_not_exists(
+                        ColumnDef::new(RequestSessions::ReferrerHostname)
+                            .text()
+                            .null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
 
         // Backfill referrer_hostname from existing referrer URLs
+        // This needs raw SQL due to complex CASE expression
+        let db = manager.get_connection();
         db.execute_unprepared(
             r#"
             UPDATE request_sessions
@@ -46,67 +76,127 @@ impl MigrationTrait for Migration {
         )
         .await?;
 
-        // Create indexes for efficient querying (one statement per execute_unprepared)
-        db.execute_unprepared(
-            r#"CREATE INDEX IF NOT EXISTS idx_request_sessions_utm_source
-            ON request_sessions (utm_source) WHERE utm_source IS NOT NULL"#,
-        )
-        .await?;
+        // Create indexes for efficient querying
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_request_sessions_utm_source")
+                    .table(RequestSessions::Table)
+                    .col(RequestSessions::UtmSource)
+                    .to_owned(),
+            )
+            .await?;
 
-        db.execute_unprepared(
-            r#"CREATE INDEX IF NOT EXISTS idx_request_sessions_utm_medium
-            ON request_sessions (utm_medium) WHERE utm_medium IS NOT NULL"#,
-        )
-        .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_request_sessions_utm_medium")
+                    .table(RequestSessions::Table)
+                    .col(RequestSessions::UtmMedium)
+                    .to_owned(),
+            )
+            .await?;
 
-        db.execute_unprepared(
-            r#"CREATE INDEX IF NOT EXISTS idx_request_sessions_utm_campaign
-            ON request_sessions (utm_campaign) WHERE utm_campaign IS NOT NULL"#,
-        )
-        .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_request_sessions_utm_campaign")
+                    .table(RequestSessions::Table)
+                    .col(RequestSessions::UtmCampaign)
+                    .to_owned(),
+            )
+            .await?;
 
-        db.execute_unprepared(
-            r#"CREATE INDEX IF NOT EXISTS idx_request_sessions_channel
-            ON request_sessions (channel) WHERE channel IS NOT NULL"#,
-        )
-        .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_request_sessions_channel")
+                    .table(RequestSessions::Table)
+                    .col(RequestSessions::Channel)
+                    .to_owned(),
+            )
+            .await?;
 
-        db.execute_unprepared(
-            r#"CREATE INDEX IF NOT EXISTS idx_request_sessions_referrer_hostname
-            ON request_sessions (referrer_hostname) WHERE referrer_hostname IS NOT NULL"#,
-        )
-        .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_request_sessions_referrer_hostname")
+                    .table(RequestSessions::Table)
+                    .col(RequestSessions::ReferrerHostname)
+                    .to_owned(),
+            )
+            .await?;
 
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let db = manager.get_connection();
-
-        // Drop indexes (one statement per execute_unprepared)
-        db.execute_unprepared("DROP INDEX IF EXISTS idx_request_sessions_utm_source")
-            .await?;
-        db.execute_unprepared("DROP INDEX IF EXISTS idx_request_sessions_utm_medium")
-            .await?;
-        db.execute_unprepared("DROP INDEX IF EXISTS idx_request_sessions_utm_campaign")
-            .await?;
-        db.execute_unprepared("DROP INDEX IF EXISTS idx_request_sessions_channel")
-            .await?;
-        db.execute_unprepared("DROP INDEX IF EXISTS idx_request_sessions_referrer_hostname")
+        // Drop indexes
+        manager
+            .drop_index(
+                Index::drop()
+                    .if_exists()
+                    .name("idx_request_sessions_utm_source")
+                    .to_owned(),
+            )
             .await?;
 
-        // Drop columns (this can be done in a single ALTER TABLE)
-        db.execute_unprepared(
-            r#"ALTER TABLE request_sessions
-            DROP COLUMN IF EXISTS utm_source,
-            DROP COLUMN IF EXISTS utm_medium,
-            DROP COLUMN IF EXISTS utm_campaign,
-            DROP COLUMN IF EXISTS utm_content,
-            DROP COLUMN IF EXISTS utm_term,
-            DROP COLUMN IF EXISTS channel,
-            DROP COLUMN IF EXISTS referrer_hostname"#,
-        )
-        .await?;
+        manager
+            .drop_index(
+                Index::drop()
+                    .if_exists()
+                    .name("idx_request_sessions_utm_medium")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .drop_index(
+                Index::drop()
+                    .if_exists()
+                    .name("idx_request_sessions_utm_campaign")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .drop_index(
+                Index::drop()
+                    .if_exists()
+                    .name("idx_request_sessions_channel")
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .drop_index(
+                Index::drop()
+                    .if_exists()
+                    .name("idx_request_sessions_referrer_hostname")
+                    .to_owned(),
+            )
+            .await?;
+
+        // Drop columns
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(RequestSessions::Table)
+                    .drop_column(RequestSessions::UtmSource)
+                    .drop_column(RequestSessions::UtmMedium)
+                    .drop_column(RequestSessions::UtmCampaign)
+                    .drop_column(RequestSessions::UtmContent)
+                    .drop_column(RequestSessions::UtmTerm)
+                    .drop_column(RequestSessions::Channel)
+                    .drop_column(RequestSessions::ReferrerHostname)
+                    .to_owned(),
+            )
+            .await?;
 
         Ok(())
     }
