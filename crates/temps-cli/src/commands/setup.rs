@@ -53,6 +53,16 @@ impl std::fmt::Display for DnsProviderType {
     }
 }
 
+/// Output format for the setup command
+#[derive(Debug, Clone, Default, clap::ValueEnum)]
+pub enum OutputFormat {
+    /// Human-readable output with colors and formatting
+    #[default]
+    Text,
+    /// JSON output for automation and scripting
+    Json,
+}
+
 #[derive(Args)]
 pub struct SetupCommand {
     /// Database connection URL
@@ -66,6 +76,15 @@ pub struct SetupCommand {
     /// Admin user email address (required)
     #[arg(long)]
     pub admin_email: String,
+
+    /// Admin user display name (default: "Admin")
+    #[arg(long, default_value = "Admin")]
+    pub admin_name: String,
+
+    /// Admin user password (auto-generated if not provided)
+    /// For automation, provide a secure password to avoid interactive prompts
+    #[arg(long, env = "TEMPS_ADMIN_PASSWORD")]
+    pub admin_password: Option<String>,
 
     /// Wildcard domain pattern for SSL certificate (e.g., "*.app.example.com")
     #[arg(long)]
@@ -138,6 +157,34 @@ pub struct SetupCommand {
     /// Server public IP address for DNS A records (auto-detected if not provided)
     #[arg(long, env = "SERVER_IP")]
     pub server_ip: Option<String>,
+
+    /// Skip SSL certificate provisioning (useful for testing or when using external certificates)
+    #[arg(long, default_value = "false")]
+    pub skip_ssl: bool,
+
+    /// Skip DNS A record creation (useful when managing DNS externally)
+    #[arg(long, default_value = "false")]
+    pub skip_dns_records: bool,
+
+    /// Use Let's Encrypt staging environment (for testing, avoids rate limits)
+    #[arg(long, default_value = "false", env = "LETSENCRYPT_STAGING")]
+    pub letsencrypt_staging: bool,
+
+    /// DNS propagation wait time in seconds (default: 60)
+    #[arg(long, default_value = "60")]
+    pub dns_propagation_wait: u32,
+
+    /// Maximum retry attempts for SSL certificate provisioning (default: 3)
+    #[arg(long, default_value = "3")]
+    pub ssl_max_retries: u32,
+
+    /// Wait time between SSL retry attempts in seconds (default: 30)
+    #[arg(long, default_value = "30")]
+    pub ssl_retry_wait: u32,
+
+    /// Output format: text (human-readable) or json (machine-readable)
+    #[arg(long, value_enum, default_value = "text")]
+    pub output_format: OutputFormat,
 }
 
 fn generate_secure_password() -> String {
@@ -191,11 +238,15 @@ pub enum AdminUserResult {
 async fn create_admin_user(
     conn: &sea_orm::DatabaseConnection,
     email: &str,
+    name: &str,
+    provided_password: Option<&str>,
 ) -> anyhow::Result<AdminUserResult> {
     let email_lower = email.to_lowercase();
 
-    // Generate secure password
-    let password = generate_secure_password();
+    // Use provided password or generate a secure one
+    let password = provided_password
+        .map(|p| p.to_string())
+        .unwrap_or_else(generate_secure_password);
 
     // Hash password with Argon2
     let argon2 = Argon2::default();
@@ -253,7 +304,7 @@ async fn create_admin_user(
     // Create new user
     let new_user = users::ActiveModel {
         email: Set(email_lower.clone()),
-        name: Set("Admin".to_string()),
+        name: Set(name.to_string()),
         password_hash: Set(Some(password_hash)),
         email_verified: Set(true),
         mfa_enabled: Set(false),
@@ -729,17 +780,21 @@ impl SetupCommand {
 
         // Create admin user (or reset password if user exists)
         print_section("Admin User Setup");
-        let (user, password) =
-            match rt.block_on(create_admin_user(db.as_ref(), &self.admin_email))? {
-                AdminUserResult::Created(user, password) => {
-                    print_success("Admin user created");
-                    (user, password)
-                }
-                AdminUserResult::PasswordReset(user, password) => {
-                    print_success("Admin user password reset");
-                    (user, password)
-                }
-            };
+        let (user, password) = match rt.block_on(create_admin_user(
+            db.as_ref(),
+            &self.admin_email,
+            &self.admin_name,
+            self.admin_password.as_deref(),
+        ))? {
+            AdminUserResult::Created(user, password) => {
+                print_success("Admin user created");
+                (user, password)
+            }
+            AdminUserResult::PasswordReset(user, password) => {
+                print_success("Admin user password reset");
+                (user, password)
+            }
+        };
 
         // DNS Provider setup (required)
         print_section("DNS Provider Setup");
@@ -865,6 +920,112 @@ impl SetupCommand {
             ));
         }
 
+        // Check if SSL provisioning is skipped
+        if self.skip_ssl {
+            print_success("SSL certificate provisioning skipped (--skip-ssl)");
+            println!();
+
+            // Still need to handle DNS records if not skipped
+            if !self.skip_dns_records {
+                // We need server IP for DNS records
+                let server_ip = if let Some(ip) = &self.server_ip {
+                    ip.clone()
+                } else if self.non_interactive {
+                    return Err(anyhow::anyhow!(
+                        "Server IP is required for DNS A records. Use --server-ip or --skip-dns-records"
+                    ));
+                } else {
+                    match rt.block_on(detect_public_ip()) {
+                        Ok(ip) => ip,
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "Failed to detect IP: {}. Use --server-ip or --skip-dns-records",
+                                e
+                            ));
+                        }
+                    }
+                };
+
+                // Extract base domain from wildcard
+                let base_domain = self
+                    .wildcard_domain
+                    .trim_start_matches("*.")
+                    .split('.')
+                    .rev()
+                    .take(2)
+                    .collect::<Vec<&str>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<&str>>()
+                    .join(".");
+
+                let subdomain_prefix = {
+                    let without_wildcard = self.wildcard_domain.trim_start_matches("*.");
+                    let parts: Vec<&str> = without_wildcard.split('.').collect();
+                    if parts.len() > 2 {
+                        parts[..parts.len() - 2].join(".")
+                    } else {
+                        String::new()
+                    }
+                };
+
+                let cf_provider = CloudflareDnsProvider::new(self.cloudflare_token.clone());
+
+                print_section("DNS A Record Setup");
+                let wildcard_record_name = if subdomain_prefix.is_empty() {
+                    "*".to_string()
+                } else {
+                    format!("*.{}", subdomain_prefix)
+                };
+                print_substep(&format!(
+                    "Creating A record: {} → {}",
+                    format!("{}.{}", wildcard_record_name, base_domain).bright_cyan(),
+                    server_ip.bright_yellow()
+                ));
+                if let Err(e) = rt.block_on(cf_provider.set_a_record(
+                    &base_domain,
+                    &wildcard_record_name,
+                    &server_ip,
+                )) {
+                    warn!("Failed to create wildcard A record: {}", e);
+                } else {
+                    print_substep(&format!("{} Wildcard A record created", "✓".bright_green()));
+                }
+
+                if !subdomain_prefix.is_empty() {
+                    print_substep(&format!(
+                        "Creating A record: {} → {}",
+                        format!("{}.{}", subdomain_prefix, base_domain).bright_cyan(),
+                        server_ip.bright_yellow()
+                    ));
+                    if let Err(e) = rt.block_on(cf_provider.set_a_record(
+                        &base_domain,
+                        &subdomain_prefix,
+                        &server_ip,
+                    )) {
+                        warn!("Failed to create subdomain A record: {}", e);
+                    } else {
+                        print_substep(&format!(
+                            "{} Subdomain A record created",
+                            "✓".bright_green()
+                        ));
+                    }
+                }
+                println!();
+            } else {
+                print_success("DNS A record creation skipped (--skip-dns-records)");
+                println!();
+            }
+
+            return finish_setup(
+                &user,
+                &password,
+                &self.wildcard_domain,
+                self.non_interactive,
+                &self.output_format,
+            );
+        }
+
         // SSL Certificate Provisioning
         print_section("SSL Certificate Provisioning");
         println!(
@@ -972,6 +1133,16 @@ impl SetupCommand {
 
         // Step 2: Initialize certificate services
         print_step(2, 8, "Initializing certificate services");
+
+        // Set Let's Encrypt environment based on --letsencrypt-staging flag
+        if self.letsencrypt_staging {
+            std::env::set_var("LETSENCRYPT_MODE", "staging");
+            print_substep(&format!(
+                "{} Using Let's Encrypt staging environment",
+                "ℹ".bright_blue()
+            ));
+        }
+
         let encryption_service_arc = std::sync::Arc::new(encryption_service);
         let repository: std::sync::Arc<dyn temps_domains::tls::CertificateRepository> =
             std::sync::Arc::new(DefaultCertificateRepository::new(
@@ -1036,6 +1207,7 @@ impl SetupCommand {
                 &password,
                 &self.wildcard_domain,
                 self.non_interactive,
+                &self.output_format,
             );
         }
 
@@ -1057,6 +1229,7 @@ impl SetupCommand {
                 &password,
                 &self.wildcard_domain,
                 self.non_interactive,
+                &self.output_format,
             );
         }
 
@@ -1094,7 +1267,7 @@ impl SetupCommand {
 
         // Step 6: Wait for DNS propagation with progress bar
         print_step(6, 8, "Waiting for DNS propagation");
-        let propagation_seconds = 60u32; // Increased to 60 seconds for better reliability
+        let propagation_seconds = self.dns_propagation_wait;
         for i in 0..=propagation_seconds {
             print_progress_bar("DNS propagation", i, propagation_seconds);
             if i < propagation_seconds {
@@ -1109,8 +1282,8 @@ impl SetupCommand {
         print_step(7, 8, "Completing DNS challenge with Let's Encrypt");
 
         let mut certificate_success = false;
-        let max_retries = 3;
-        let retry_wait_seconds = 30;
+        let max_retries = self.ssl_max_retries;
+        let retry_wait_seconds = self.ssl_retry_wait;
 
         for attempt in 1..=max_retries {
             if attempt > 1 {
@@ -1189,58 +1362,68 @@ impl SetupCommand {
             }
         }
 
-        // Step 8: Create DNS A records for routing traffic (ALWAYS do this)
-        print_step(8, 8, "Creating DNS A records for routing traffic");
-
-        // Create wildcard A record (e.g., "*.app" for *.app.example.com)
-        let wildcard_record_name = if subdomain_prefix.is_empty() {
-            "*".to_string()
+        // Step 8: Create DNS A records for routing traffic
+        if self.skip_dns_records {
+            print_step(8, 8, "DNS A record creation skipped (--skip-dns-records)");
+            print_success("Skipping DNS A record creation as requested");
+            println!();
         } else {
-            format!("*.{}", subdomain_prefix)
-        };
-        print_substep(&format!(
-            "Creating A record: {} → {}",
-            format!("{}.{}", wildcard_record_name, base_domain).bright_cyan(),
-            server_ip.bright_yellow()
-        ));
-        if let Err(e) =
-            rt.block_on(cf_provider.set_a_record(&base_domain, &wildcard_record_name, &server_ip))
-        {
-            warn!("Failed to create wildcard A record: {}", e);
-            print_substep(&format!(
-                "{} Failed to create wildcard A record: {}",
-                "⚠".bright_yellow(),
-                e
-            ));
-        } else {
-            print_substep(&format!("{} Wildcard A record created", "✓".bright_green()));
-        }
+            print_step(8, 8, "Creating DNS A records for routing traffic");
 
-        // Create base subdomain A record (e.g., "app" for app.example.com)
-        // This allows direct access to the subdomain without wildcard
-        if !subdomain_prefix.is_empty() {
+            // Create wildcard A record (e.g., "*.app" for *.app.example.com)
+            let wildcard_record_name = if subdomain_prefix.is_empty() {
+                "*".to_string()
+            } else {
+                format!("*.{}", subdomain_prefix)
+            };
             print_substep(&format!(
                 "Creating A record: {} → {}",
-                format!("{}.{}", subdomain_prefix, base_domain).bright_cyan(),
+                format!("{}.{}", wildcard_record_name, base_domain).bright_cyan(),
                 server_ip.bright_yellow()
             ));
-            if let Err(e) =
-                rt.block_on(cf_provider.set_a_record(&base_domain, &subdomain_prefix, &server_ip))
-            {
-                warn!("Failed to create subdomain A record: {}", e);
+            if let Err(e) = rt.block_on(cf_provider.set_a_record(
+                &base_domain,
+                &wildcard_record_name,
+                &server_ip,
+            )) {
+                warn!("Failed to create wildcard A record: {}", e);
                 print_substep(&format!(
-                    "{} Failed to create subdomain A record: {}",
+                    "{} Failed to create wildcard A record: {}",
                     "⚠".bright_yellow(),
                     e
                 ));
             } else {
-                print_substep(&format!(
-                    "{} Subdomain A record created",
-                    "✓".bright_green()
-                ));
+                print_substep(&format!("{} Wildcard A record created", "✓".bright_green()));
             }
+
+            // Create base subdomain A record (e.g., "app" for app.example.com)
+            // This allows direct access to the subdomain without wildcard
+            if !subdomain_prefix.is_empty() {
+                print_substep(&format!(
+                    "Creating A record: {} → {}",
+                    format!("{}.{}", subdomain_prefix, base_domain).bright_cyan(),
+                    server_ip.bright_yellow()
+                ));
+                if let Err(e) = rt.block_on(cf_provider.set_a_record(
+                    &base_domain,
+                    &subdomain_prefix,
+                    &server_ip,
+                )) {
+                    warn!("Failed to create subdomain A record: {}", e);
+                    print_substep(&format!(
+                        "{} Failed to create subdomain A record: {}",
+                        "⚠".bright_yellow(),
+                        e
+                    ));
+                } else {
+                    print_substep(&format!(
+                        "{} Subdomain A record created",
+                        "✓".bright_green()
+                    ));
+                }
+            }
+            println!();
         }
-        println!();
 
         // Show warning if certificate wasn't provisioned but continue with setup
         if !certificate_success {
@@ -1273,8 +1456,19 @@ impl SetupCommand {
             &password,
             &self.wildcard_domain,
             self.non_interactive,
+            &self.output_format,
         )
     }
+}
+
+/// JSON output structure for automation
+#[derive(serde::Serialize)]
+struct SetupResult {
+    success: bool,
+    admin_email: String,
+    admin_password: Option<String>,
+    wildcard_domain: String,
+    message: String,
 }
 
 fn finish_setup(
@@ -1282,8 +1476,30 @@ fn finish_setup(
     password: &str,
     wildcard_domain: &str,
     non_interactive: bool,
+    output_format: &OutputFormat,
 ) -> anyhow::Result<()> {
-    // Print summary
+    // JSON output for automation
+    if matches!(output_format, OutputFormat::Json) {
+        let result = SetupResult {
+            success: true,
+            admin_email: user.email.clone(),
+            admin_password: if password.is_empty() {
+                None
+            } else {
+                Some(password.to_string())
+            },
+            wildcard_domain: wildcard_domain.to_string(),
+            message: "Setup completed successfully".to_string(),
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result)
+                .unwrap_or_else(|_| r#"{"success":true}"#.to_string())
+        );
+        return Ok(());
+    }
+
+    // Text output (default)
     print_section("Setup Complete!");
 
     println!();

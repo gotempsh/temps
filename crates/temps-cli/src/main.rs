@@ -43,6 +43,7 @@ enum Commands {
     /// Start only the proxy server
     Proxy(ProxyCommand),
     /// Initial setup: create admin user, configure DNS/Git providers, and domain
+    #[command(alias = "init")]
     Setup(SetupCommand),
     /// Reset admin user password
     ResetAdminPassword(ResetPasswordCommand),
