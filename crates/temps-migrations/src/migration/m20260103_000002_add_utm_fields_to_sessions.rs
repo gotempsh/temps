@@ -46,24 +46,34 @@ impl MigrationTrait for Migration {
         )
         .await?;
 
-        // Create indexes for efficient querying
+        // Create indexes for efficient querying (one statement per execute_unprepared)
         db.execute_unprepared(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_request_sessions_utm_source
-            ON request_sessions (utm_source) WHERE utm_source IS NOT NULL;
+            r#"CREATE INDEX IF NOT EXISTS idx_request_sessions_utm_source
+            ON request_sessions (utm_source) WHERE utm_source IS NOT NULL"#,
+        )
+        .await?;
 
-            CREATE INDEX IF NOT EXISTS idx_request_sessions_utm_medium
-            ON request_sessions (utm_medium) WHERE utm_medium IS NOT NULL;
+        db.execute_unprepared(
+            r#"CREATE INDEX IF NOT EXISTS idx_request_sessions_utm_medium
+            ON request_sessions (utm_medium) WHERE utm_medium IS NOT NULL"#,
+        )
+        .await?;
 
-            CREATE INDEX IF NOT EXISTS idx_request_sessions_utm_campaign
-            ON request_sessions (utm_campaign) WHERE utm_campaign IS NOT NULL;
+        db.execute_unprepared(
+            r#"CREATE INDEX IF NOT EXISTS idx_request_sessions_utm_campaign
+            ON request_sessions (utm_campaign) WHERE utm_campaign IS NOT NULL"#,
+        )
+        .await?;
 
-            CREATE INDEX IF NOT EXISTS idx_request_sessions_channel
-            ON request_sessions (channel) WHERE channel IS NOT NULL;
+        db.execute_unprepared(
+            r#"CREATE INDEX IF NOT EXISTS idx_request_sessions_channel
+            ON request_sessions (channel) WHERE channel IS NOT NULL"#,
+        )
+        .await?;
 
-            CREATE INDEX IF NOT EXISTS idx_request_sessions_referrer_hostname
-            ON request_sessions (referrer_hostname) WHERE referrer_hostname IS NOT NULL
-            "#,
+        db.execute_unprepared(
+            r#"CREATE INDEX IF NOT EXISTS idx_request_sessions_referrer_hostname
+            ON request_sessions (referrer_hostname) WHERE referrer_hostname IS NOT NULL"#,
         )
         .await?;
 
@@ -73,23 +83,28 @@ impl MigrationTrait for Migration {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
 
-        db.execute_unprepared(
-            r#"
-            DROP INDEX IF EXISTS idx_request_sessions_utm_source;
-            DROP INDEX IF EXISTS idx_request_sessions_utm_medium;
-            DROP INDEX IF EXISTS idx_request_sessions_utm_campaign;
-            DROP INDEX IF EXISTS idx_request_sessions_channel;
-            DROP INDEX IF EXISTS idx_request_sessions_referrer_hostname;
+        // Drop indexes (one statement per execute_unprepared)
+        db.execute_unprepared("DROP INDEX IF EXISTS idx_request_sessions_utm_source")
+            .await?;
+        db.execute_unprepared("DROP INDEX IF EXISTS idx_request_sessions_utm_medium")
+            .await?;
+        db.execute_unprepared("DROP INDEX IF EXISTS idx_request_sessions_utm_campaign")
+            .await?;
+        db.execute_unprepared("DROP INDEX IF EXISTS idx_request_sessions_channel")
+            .await?;
+        db.execute_unprepared("DROP INDEX IF EXISTS idx_request_sessions_referrer_hostname")
+            .await?;
 
-            ALTER TABLE request_sessions
+        // Drop columns (this can be done in a single ALTER TABLE)
+        db.execute_unprepared(
+            r#"ALTER TABLE request_sessions
             DROP COLUMN IF EXISTS utm_source,
             DROP COLUMN IF EXISTS utm_medium,
             DROP COLUMN IF EXISTS utm_campaign,
             DROP COLUMN IF EXISTS utm_content,
             DROP COLUMN IF EXISTS utm_term,
             DROP COLUMN IF EXISTS channel,
-            DROP COLUMN IF EXISTS referrer_hostname
-            "#,
+            DROP COLUMN IF EXISTS referrer_hostname"#,
         )
         .await?;
 
