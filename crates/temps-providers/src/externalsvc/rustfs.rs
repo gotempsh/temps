@@ -30,8 +30,8 @@ use crate::utils::ensure_network_exists;
 
 use super::{ExternalService, ServiceConfig, ServiceType};
 
-/// Default RustFS Docker image
-pub const DEFAULT_RUSTFS_IMAGE: &str = "rustfs/rustfs:latest";
+/// Default RustFS Docker image (pinned to specific version for reproducibility)
+pub const DEFAULT_RUSTFS_IMAGE: &str = "ghcr.io/rustfs/rustfs:0.5.0";
 /// Default RustFS API port
 pub const DEFAULT_RUSTFS_API_PORT: u16 = 9000;
 /// Default RustFS console port
@@ -285,8 +285,40 @@ impl RustfsService {
             .await?;
 
         if !containers.is_empty() {
-            info!("Container {} already exists", container_name);
-            return Ok(());
+            // Check if we need to recreate with a new image
+            let existing_image = containers
+                .first()
+                .and_then(|c| c.image.as_deref())
+                .unwrap_or("");
+
+            if existing_image == config.docker_image {
+                info!(
+                    "Container {} already exists with same image",
+                    container_name
+                );
+                return Ok(());
+            }
+
+            info!(
+                "Container {} already exists with different image (current: {}, requested: {}), removing it to recreate",
+                container_name, existing_image, config.docker_image
+            );
+
+            // Stop the container first
+            let _ = docker
+                .stop_container(&container_name, None::<StopContainerOptions>)
+                .await;
+
+            // Remove the container
+            docker
+                .remove_container(
+                    &container_name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await?;
         }
 
         let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);

@@ -246,8 +246,40 @@ impl S3Service {
             .await?;
 
         if !containers.is_empty() {
-            info!("Container {} already exists", container_name);
-            return Ok(());
+            // Check if we need to recreate with a new image
+            let existing_image = containers
+                .first()
+                .and_then(|c| c.image.as_deref())
+                .unwrap_or("");
+
+            if existing_image == config.docker_image {
+                info!(
+                    "Container {} already exists with same image",
+                    container_name
+                );
+                return Ok(());
+            }
+
+            info!(
+                "Container {} already exists with different image (current: {}, requested: {}), removing it to recreate",
+                container_name, existing_image, config.docker_image
+            );
+
+            // Stop the container first
+            let _ = docker
+                .stop_container(&container_name, None::<StopContainerOptions>)
+                .await;
+
+            // Remove the container
+            docker
+                .remove_container(
+                    &container_name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await?;
         }
 
         let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);

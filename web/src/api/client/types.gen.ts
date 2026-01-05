@@ -424,7 +424,7 @@ export type BlobResponse = {
     /**
      * Content type of the blob
      */
-    content_type: string;
+    contentType: string;
     /**
      * Original pathname
      */
@@ -436,7 +436,7 @@ export type BlobResponse = {
     /**
      * Upload timestamp
      */
-    uploaded_at: string;
+    uploadedAt: string;
     /**
      * URL path to access the blob
      */
@@ -753,6 +753,24 @@ export type ContainerResponse = {
      * Container name
      */
     name: string;
+};
+
+/**
+ * Request to copy a blob
+ */
+export type CopyBlobRequest = {
+    /**
+     * Source blob URL or pathname
+     */
+    fromUrl: string;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    projectId?: number | null;
+    /**
+     * Destination pathname
+     */
+    toPathname: string;
 };
 
 export type CreateApiKeyRequest = {
@@ -1157,6 +1175,10 @@ export type DelRequest = {
      * The key(s) to delete
      */
     keys: Array<string>;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
 };
 
 /**
@@ -1177,6 +1199,10 @@ export type DeleteBlobRequest = {
      * Pathnames to delete (relative to project)
      */
     pathnames: Array<string>;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    projectId?: number | null;
 };
 
 /**
@@ -2577,6 +2603,10 @@ export type ExpireRequest = {
      */
     key: string;
     /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
+    /**
      * Expiration time in seconds
      */
     seconds: number;
@@ -2820,6 +2850,10 @@ export type GetRequest = {
      * The key to retrieve
      */
     key: string;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
 };
 
 /**
@@ -3249,6 +3283,10 @@ export type IncrRequest = {
      * The key to increment
      */
     key: string;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
 };
 
 /**
@@ -3297,6 +3335,10 @@ export type KeysRequest = {
      * Pattern to match (supports * and ? wildcards)
      */
     pattern: string;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
 };
 
 /**
@@ -3391,6 +3433,10 @@ export type ListBlobsQuery = {
      * Prefix to filter by
      */
     prefix?: string | null;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
 };
 
 /**
@@ -3408,7 +3454,7 @@ export type ListBlobsResponse = {
     /**
      * Whether there are more results
      */
-    has_more: boolean;
+    hasMore: boolean;
 };
 
 export type ListCustomDomainsResponse = {
@@ -5347,6 +5393,10 @@ export type SetRequest = {
      */
     nx?: boolean;
     /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
+    /**
      * Expire in milliseconds
      */
     px?: number | null;
@@ -5960,6 +6010,10 @@ export type TtlRequest = {
      * The key to check TTL for
      */
     key: string;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
 };
 
 /**
@@ -6016,6 +6070,34 @@ export type UpdateApiKeyRequest = {
 
 export type UpdateAutomaticDeployRequest = {
     automatic_deploy: boolean;
+};
+
+/**
+ * Request to update Blob service configuration
+ */
+export type UpdateBlobRequest = {
+    /**
+     * Docker image to use (e.g., "minio/minio:RELEASE.2025-09-07T16-13-09Z")
+     */
+    docker_image?: string | null;
+};
+
+/**
+ * Response after updating Blob service
+ */
+export type UpdateBlobResponse = {
+    /**
+     * Human-readable message
+     */
+    message: string;
+    /**
+     * Current status
+     */
+    status: BlobStatusResponse;
+    /**
+     * Whether the operation succeeded
+     */
+    success: boolean;
 };
 
 export type UpdateCustomDomainRequest = {
@@ -6142,6 +6224,34 @@ export type UpdateIpAccessControlRequest = {
      * Optional new reason
      */
     reason?: string | null;
+};
+
+/**
+ * Request to update KV service configuration
+ */
+export type UpdateKvRequest = {
+    /**
+     * Docker image to use (e.g., "redis:7-alpine", "redis:8-alpine")
+     */
+    docker_image?: string | null;
+};
+
+/**
+ * Response after updating KV service
+ */
+export type UpdateKvResponse = {
+    /**
+     * Status message
+     */
+    message: string;
+    /**
+     * Current service status
+     */
+    status: KvStatusResponse;
+    /**
+     * Whether the operation succeeded
+     */
+    success: boolean;
 };
 
 export type UpdatePreferencesRequest = {
@@ -9056,6 +9166,43 @@ export type BlobPutResponses = {
 
 export type BlobPutResponse = BlobPutResponses[keyof BlobPutResponses];
 
+export type BlobCopyData = {
+    body: CopyBlobRequest;
+    path?: never;
+    query?: never;
+    url: '/blob/copy';
+};
+
+export type BlobCopyErrors = {
+    /**
+     * Invalid request
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Source blob not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type BlobCopyError = BlobCopyErrors[keyof BlobCopyErrors];
+
+export type BlobCopyResponses = {
+    /**
+     * Blob copied successfully
+     */
+    200: BlobResponse;
+};
+
+export type BlobCopyResponse = BlobCopyResponses[keyof BlobCopyResponses];
+
 export type BlobDisableData = {
     body?: never;
     path?: never;
@@ -9136,6 +9283,37 @@ export type BlobStatusResponses = {
 };
 
 export type BlobStatusResponse2 = BlobStatusResponses[keyof BlobStatusResponses];
+
+export type BlobUpdateData = {
+    body: UpdateBlobRequest;
+    path?: never;
+    query?: never;
+    url: '/blob/update';
+};
+
+export type BlobUpdateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Blob service not enabled
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type BlobUpdateResponses = {
+    /**
+     * Blob service updated
+     */
+    200: UpdateBlobResponse;
+};
+
+export type BlobUpdateResponse = BlobUpdateResponses[keyof BlobUpdateResponses];
 
 export type BlobDownloadData = {
     body?: never;
@@ -13729,6 +13907,37 @@ export type KvTtlResponses = {
 };
 
 export type KvTtlResponse = KvTtlResponses[keyof KvTtlResponses];
+
+export type KvUpdateData = {
+    body: UpdateKvRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/update';
+};
+
+export type KvUpdateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * KV service not enabled
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvUpdateResponses = {
+    /**
+     * KV service updated
+     */
+    200: UpdateKvResponse;
+};
+
+export type KvUpdateResponse = KvUpdateResponses[keyof KvUpdateResponses];
 
 export type ListRoutesData = {
     body?: never;

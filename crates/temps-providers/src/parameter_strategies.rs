@@ -270,11 +270,11 @@ impl ParameterStrategy for S3ParameterStrategy {
             }
         }
 
-        // Default docker_image if not provided
+        // Default docker_image if not provided (pinned to specific version for reproducibility)
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("minio/minio:latest".to_string()),
+                JsonValue::String("minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()),
             );
         }
 
@@ -354,8 +354,8 @@ impl ParameterStrategy for S3ParameterStrategy {
                 },
                 "docker_image": {
                     "type": "string",
-                    "description": "Docker image (updateable, e.g., minio/minio:latest)",
-                    "default": "minio/minio:latest"
+                    "description": "Docker image (updateable, e.g., minio/minio:RELEASE.2025-09-07T16-13-09Z)",
+                    "default": "minio/minio:RELEASE.2025-09-07T16-13-09Z"
                 }
             },
             "readonly": ["access_key", "secret_key"]

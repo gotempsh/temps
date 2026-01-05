@@ -1,10 +1,13 @@
+import { useState, useEffect } from 'react'
 import {
   kvStatusOptions,
   kvEnableMutation,
   kvDisableMutation,
+  kvUpdateMutation,
   blobStatusOptions,
   blobEnableMutation,
   blobDisableMutation,
+  blobUpdateMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -18,6 +21,16 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import {
   Database,
   HardDrive,
   CheckCircle2,
@@ -26,12 +39,95 @@ import {
   Info,
   Power,
   PowerOff,
+  Settings,
 } from 'lucide-react'
 import { Skeleton } from '@/components/ui/skeleton'
 import { toast } from 'sonner'
 
+type ServiceType = 'kv' | 'blob'
+
+interface EditDockerImageDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  serviceName: string
+  currentImage: string
+  onSave: (newImage: string) => void
+  isPending: boolean
+}
+
+function EditDockerImageDialog({
+  open,
+  onOpenChange,
+  serviceName,
+  currentImage,
+  onSave,
+  isPending,
+}: EditDockerImageDialogProps) {
+  const [dockerImage, setDockerImage] = useState(currentImage)
+
+  // Sync state when dialog opens with new currentImage
+  useEffect(() => {
+    if (open) {
+      setDockerImage(currentImage)
+    }
+  }, [open, currentImage])
+
+  const handleSave = () => {
+    if (dockerImage.trim()) {
+      onSave(dockerImage.trim())
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Update {serviceName} Configuration</DialogTitle>
+          <DialogDescription>
+            Change the Docker image for the {serviceName} service. This will
+            restart the service with the new image.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4 py-4">
+          <div className="space-y-2">
+            <Label htmlFor="docker-image">Docker Image</Label>
+            <Input
+              id="docker-image"
+              value={dockerImage}
+              onChange={(e) => setDockerImage(e.target.value)}
+              placeholder={serviceName === 'KV Store' ? 'redis:7-alpine' : 'minio/minio:latest'}
+            />
+            <p className="text-xs text-muted-foreground">
+              {serviceName === 'KV Store'
+                ? 'Examples: redis:7-alpine, redis:8-alpine, valkey/valkey:8-alpine'
+                : 'Examples: minio/minio:latest, minio/minio:RELEASE.2025-09-07T16-13-09Z'}
+            </p>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={isPending}>
+            Cancel
+          </Button>
+          <Button onClick={handleSave} disabled={isPending || !dockerImage.trim()}>
+            {isPending ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                Updating...
+              </>
+            ) : (
+              'Update'
+            )}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 export function PlatformServices() {
   const queryClient = useQueryClient()
+  const [editDialogOpen, setEditDialogOpen] = useState(false)
+  const [editingService, setEditingService] = useState<ServiceType | null>(null)
 
   // Fetch KV status
   const { data: kvStatus, isLoading: kvLoading } = useQuery({
@@ -68,6 +164,19 @@ export function PlatformServices() {
     },
   })
 
+  const kvUpdateMut = useMutation({
+    ...kvUpdateMutation(),
+    onSuccess: () => {
+      toast.success('KV Store updated successfully')
+      queryClient.invalidateQueries({ queryKey: kvStatusOptions().queryKey })
+      setEditDialogOpen(false)
+      setEditingService(null)
+    },
+    onError: (error: Error) => {
+      toast.error(error.message || 'Failed to update KV Store')
+    },
+  })
+
   // Blob mutations
   const blobEnableMut = useMutation({
     ...blobEnableMutation(),
@@ -91,7 +200,38 @@ export function PlatformServices() {
     },
   })
 
+  const blobUpdateMut = useMutation({
+    ...blobUpdateMutation(),
+    onSuccess: () => {
+      toast.success('Blob Storage updated successfully')
+      queryClient.invalidateQueries({ queryKey: blobStatusOptions().queryKey })
+      setEditDialogOpen(false)
+      setEditingService(null)
+    },
+    onError: (error: Error) => {
+      toast.error(error.message || 'Failed to update Blob Storage')
+    },
+  })
+
   const isLoading = kvLoading || blobLoading
+
+  const handleEditKv = () => {
+    setEditingService('kv')
+    setEditDialogOpen(true)
+  }
+
+  const handleEditBlob = () => {
+    setEditingService('blob')
+    setEditDialogOpen(true)
+  }
+
+  const handleSaveDockerImage = (newImage: string) => {
+    if (editingService === 'kv') {
+      kvUpdateMut.mutate({ body: { docker_image: newImage } })
+    } else if (editingService === 'blob') {
+      blobUpdateMut.mutate({ body: { docker_image: newImage } })
+    }
+  }
 
   if (isLoading) {
     return (
@@ -103,6 +243,12 @@ export function PlatformServices() {
       </div>
     )
   }
+
+  const currentServiceName = editingService === 'kv' ? 'KV Store' : 'Blob Storage'
+  const currentImage =
+    editingService === 'kv'
+      ? kvStatus?.docker_image || 'redis:7-alpine'
+      : blobStatus?.docker_image || 'minio/minio:latest'
 
   return (
     <div className="space-y-6">
@@ -134,6 +280,7 @@ export function PlatformServices() {
           ]}
           onEnable={() => kvEnableMut.mutate({ body: {} })}
           onDisable={() => kvDisableMut.mutate({})}
+          onEdit={handleEditKv}
           isEnabling={kvEnableMut.isPending}
           isDisabling={kvDisableMut.isPending}
         />
@@ -155,10 +302,24 @@ export function PlatformServices() {
           ]}
           onEnable={() => blobEnableMut.mutate({ body: {} })}
           onDisable={() => blobDisableMut.mutate({})}
+          onEdit={handleEditBlob}
           isEnabling={blobEnableMut.isPending}
           isDisabling={blobDisableMut.isPending}
         />
       </div>
+
+      {/* Edit Docker Image Dialog */}
+      <EditDockerImageDialog
+        open={editDialogOpen}
+        onOpenChange={(open) => {
+          setEditDialogOpen(open)
+          if (!open) setEditingService(null)
+        }}
+        serviceName={currentServiceName}
+        currentImage={currentImage}
+        onSave={handleSaveDockerImage}
+        isPending={kvUpdateMut.isPending || blobUpdateMut.isPending}
+      />
     </div>
   )
 }
@@ -174,6 +335,7 @@ interface ServiceCardProps {
   features: string[]
   onEnable: () => void
   onDisable: () => void
+  onEdit: () => void
   isEnabling: boolean
   isDisabling: boolean
 }
@@ -189,6 +351,7 @@ function ServiceCard({
   features,
   onEnable,
   onDisable,
+  onEdit,
   isEnabling,
   isDisabling,
 }: ServiceCardProps) {
@@ -229,6 +392,16 @@ function ServiceCard({
               </Badge>
             </div>
           </div>
+          {enabled && (
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={onEdit}
+              title="Edit configuration"
+            >
+              <Settings className="h-4 w-4" />
+            </Button>
+          )}
         </div>
         <CardDescription className="mt-3">{description}</CardDescription>
       </CardHeader>

@@ -7,7 +7,7 @@ use axum::{
     extract::{Extension, Path, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
-    routing::{delete, get, head, post},
+    routing::{delete, get, head, patch, post},
     Json, Router,
 };
 use bytes::Bytes;
@@ -17,11 +17,13 @@ use temps_auth::{permission_guard, RequireAuth};
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::RequestMetadata;
 use temps_providers::externalsvc::{ExternalService, ServiceType};
-use temps_providers::CreateExternalServiceRequest;
+use temps_providers::{CreateExternalServiceRequest, UpdateExternalServiceRequest};
 use tracing::{error, info};
 use utoipa::OpenApi;
 
-use super::audit::{AuditContext, BlobServiceDisabledAudit, BlobServiceEnabledAudit};
+use super::audit::{
+    AuditContext, BlobServiceDisabledAudit, BlobServiceEnabledAudit, BlobServiceUpdatedAudit,
+};
 
 use super::types::*;
 use crate::services::{ListOptions, PutOptions};
@@ -60,6 +62,7 @@ fn extract_project_id(
         blob_copy,
         blob_status,
         blob_enable,
+        blob_update,
         blob_disable,
     ),
     components(
@@ -73,6 +76,8 @@ fn extract_project_id(
             BlobStatusResponse,
             EnableBlobRequest,
             EnableBlobResponse,
+            UpdateBlobRequest,
+            UpdateBlobResponse,
             DisableBlobResponse,
         )
     ),
@@ -96,6 +101,7 @@ pub fn configure_routes() -> Router<Arc<BlobAppState>> {
         // Management operations
         .route("/blob/status", get(blob_status))
         .route("/blob/enable", post(blob_enable))
+        .route("/blob/update", patch(blob_update))
         .route("/blob/disable", delete(blob_disable))
 }
 
@@ -424,11 +430,25 @@ pub async fn blob_status(
                 .ok();
 
             let healthy = service.status == "running";
-            let version = details.as_ref().and_then(|d| d.service.version.clone());
+
+            // Get docker_image from parameters
             let docker_image = details
-                .and_then(|d| d.current_parameters)
+                .as_ref()
+                .and_then(|d| d.current_parameters.as_ref())
                 .and_then(|p| p.get("docker_image").cloned())
                 .and_then(|v| v.as_str().map(String::from));
+
+            // Get version from service record, or extract from docker_image tag as fallback
+            let version = details
+                .as_ref()
+                .and_then(|d| d.service.version.clone())
+                .or_else(|| {
+                    docker_image
+                        .as_ref()
+                        .and_then(|img| img.split(':').nth(1))
+                        .map(String::from)
+                })
+                .or_else(|| Some("latest".to_string()));
 
             Ok(Json(BlobStatusResponse {
                 enabled: true,
@@ -553,6 +573,135 @@ pub async fn blob_enable(
             healthy,
             version,
             docker_image,
+        },
+    }))
+}
+
+/// Update Blob service configuration
+#[utoipa::path(
+    tag = "Blob Management",
+    patch,
+    path = "/blob/update",
+    request_body = UpdateBlobRequest,
+    responses(
+        (status = 200, description = "Blob service updated", body = UpdateBlobResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Blob service not enabled"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn blob_update(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<BlobAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<UpdateBlobRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    // Update requires SystemAdmin permission
+    permission_guard!(auth, SystemAdmin);
+
+    info!("Updating Blob service with config: {:?}", request);
+
+    // Get existing service
+    let service = state
+        .external_service_manager
+        .get_service_by_name("temps-blob")
+        .await
+        .map_err(|_| {
+            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Blob Service Not Found")
+                .with_detail("Blob service is not enabled. Enable it first before updating.")
+        })?;
+
+    // Get current details for audit log
+    let current_details = state
+        .external_service_manager
+        .get_service_details(service.id)
+        .await
+        .ok();
+
+    let old_docker_image = current_details
+        .as_ref()
+        .and_then(|d| d.current_parameters.as_ref())
+        .and_then(|p| p.get("docker_image").cloned())
+        .and_then(|v| v.as_str().map(String::from));
+
+    let old_version = current_details
+        .as_ref()
+        .and_then(|d| d.service.version.clone());
+
+    // Build parameters for update
+    let mut parameters: HashMap<String, serde_json::Value> = HashMap::new();
+    if let Some(docker_image) = &request.docker_image {
+        parameters.insert("docker_image".to_string(), serde_json::json!(docker_image));
+    }
+
+    // Extract version from docker_image
+    let new_version = request
+        .docker_image
+        .as_ref()
+        .and_then(|img| img.split(':').nth(1))
+        .map(String::from);
+
+    // Build update request
+    let update_request = UpdateExternalServiceRequest {
+        name: None,
+        parameters,
+        docker_image: request.docker_image.clone(),
+    };
+
+    // Update the service
+    let updated_service = state
+        .external_service_manager
+        .update_service(service.id, update_request)
+        .await
+        .map_err(|e| {
+            error!("Failed to update Blob service: {}", e);
+            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Failed to Update Blob Service")
+                .with_detail(format!("Could not update S3/Blob service: {}", e))
+        })?;
+
+    // Get updated docker image from service details
+    let new_docker_image = state
+        .external_service_manager
+        .get_service_details(updated_service.id)
+        .await
+        .ok()
+        .and_then(|details| details.current_parameters)
+        .and_then(|p| p.get("docker_image").cloned())
+        .and_then(|v| v.as_str().map(String::from));
+
+    // Create audit log
+    let audit = BlobServiceUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        service_name: "temps-blob".to_string(),
+        old_docker_image,
+        new_docker_image: new_docker_image.clone(),
+        old_version,
+        new_version: new_version.clone(),
+    };
+
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    let healthy = updated_service.status == "running";
+
+    Ok(Json(UpdateBlobResponse {
+        success: true,
+        message:
+            "Blob service updated successfully. Restart may be required for changes to take effect."
+                .to_string(),
+        status: BlobStatusResponse {
+            enabled: true,
+            healthy,
+            version: new_version,
+            docker_image: new_docker_image,
         },
     }))
 }

@@ -6,7 +6,7 @@ use axum::{
     extract::{Extension, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use std::collections::HashMap;
@@ -14,11 +14,13 @@ use temps_auth::{permission_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
 use temps_providers::externalsvc::{ExternalService, ServiceType};
-use temps_providers::CreateExternalServiceRequest;
+use temps_providers::{CreateExternalServiceRequest, UpdateExternalServiceRequest};
 use tracing::{error, info};
 use utoipa::OpenApi;
 
-use super::audit::{AuditContext, KvServiceDisabledAudit, KvServiceEnabledAudit};
+use super::audit::{
+    AuditContext, KvServiceDisabledAudit, KvServiceEnabledAudit, KvServiceUpdatedAudit,
+};
 
 use super::types::*;
 use crate::services::SetOptions;
@@ -36,6 +38,7 @@ use crate::services::SetOptions;
         kv_keys,
         kv_status,
         kv_enable,
+        kv_update,
         kv_disable,
     ),
     components(
@@ -57,6 +60,8 @@ use crate::services::SetOptions;
             KvStatusResponse,
             EnableKvRequest,
             EnableKvResponse,
+            UpdateKvRequest,
+            UpdateKvResponse,
             DisableKvResponse,
         )
     ),
@@ -81,6 +86,7 @@ pub fn configure_routes() -> Router<Arc<KvAppState>> {
         // Management operations
         .route("/kv/status", get(kv_status))
         .route("/kv/enable", post(kv_enable))
+        .route("/kv/update", patch(kv_update))
         .route("/kv/disable", delete(kv_disable))
 }
 
@@ -345,11 +351,25 @@ pub async fn kv_status(
                 .ok();
 
             let healthy = service.status == "running";
-            let version = details.as_ref().and_then(|d| d.service.version.clone());
+
+            // Get docker_image from parameters
             let docker_image = details
-                .and_then(|d| d.current_parameters)
+                .as_ref()
+                .and_then(|d| d.current_parameters.as_ref())
                 .and_then(|p| p.get("docker_image").cloned())
                 .and_then(|v| v.as_str().map(String::from));
+
+            // Get version from service record, or extract from docker_image tag as fallback
+            let version = details
+                .as_ref()
+                .and_then(|d| d.service.version.clone())
+                .or_else(|| {
+                    docker_image
+                        .as_ref()
+                        .and_then(|img| img.split(':').nth(1))
+                        .map(String::from)
+                })
+                .or_else(|| Some("7-alpine".to_string()));
 
             Ok(Json(KvStatusResponse {
                 enabled: true,
@@ -474,6 +494,135 @@ pub async fn kv_enable(
             healthy,
             version,
             docker_image,
+        },
+    }))
+}
+
+/// Update KV service configuration
+#[utoipa::path(
+    tag = "KV Management",
+    patch,
+    path = "/kv/update",
+    request_body = UpdateKvRequest,
+    responses(
+        (status = 200, description = "KV service updated", body = UpdateKvResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "KV service not enabled"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn kv_update(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<KvAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<UpdateKvRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    // Update requires SystemAdmin permission
+    permission_guard!(auth, SystemAdmin);
+
+    info!("Updating KV service with config: {:?}", request);
+
+    // Get existing service
+    let service = state
+        .external_service_manager
+        .get_service_by_name("temps-kv")
+        .await
+        .map_err(|_| {
+            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("KV Service Not Found")
+                .with_detail("KV service is not enabled. Enable it first before updating.")
+        })?;
+
+    // Get current details for audit log
+    let current_details = state
+        .external_service_manager
+        .get_service_details(service.id)
+        .await
+        .ok();
+
+    let old_docker_image = current_details
+        .as_ref()
+        .and_then(|d| d.current_parameters.as_ref())
+        .and_then(|p| p.get("docker_image").cloned())
+        .and_then(|v| v.as_str().map(String::from));
+
+    let old_version = current_details
+        .as_ref()
+        .and_then(|d| d.service.version.clone());
+
+    // Build parameters for update
+    let mut parameters: HashMap<String, serde_json::Value> = HashMap::new();
+    if let Some(docker_image) = &request.docker_image {
+        parameters.insert("docker_image".to_string(), serde_json::json!(docker_image));
+    }
+
+    // Extract version from docker_image
+    let new_version = request
+        .docker_image
+        .as_ref()
+        .and_then(|img| img.split(':').nth(1))
+        .map(String::from);
+
+    // Build update request
+    let update_request = UpdateExternalServiceRequest {
+        name: None,
+        parameters,
+        docker_image: request.docker_image.clone(),
+    };
+
+    // Update the service
+    let updated_service = state
+        .external_service_manager
+        .update_service(service.id, update_request)
+        .await
+        .map_err(|e| {
+            error!("Failed to update KV service: {}", e);
+            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Failed to Update KV Service")
+                .with_detail(format!("Could not update Redis service: {}", e))
+        })?;
+
+    // Get updated docker image from service details
+    let new_docker_image = state
+        .external_service_manager
+        .get_service_details(updated_service.id)
+        .await
+        .ok()
+        .and_then(|details| details.current_parameters)
+        .and_then(|p| p.get("docker_image").cloned())
+        .and_then(|v| v.as_str().map(String::from));
+
+    // Create audit log
+    let audit = KvServiceUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        service_name: "temps-kv".to_string(),
+        old_docker_image,
+        new_docker_image: new_docker_image.clone(),
+        old_version,
+        new_version: new_version.clone(),
+    };
+
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    let healthy = updated_service.status == "running";
+
+    Ok(Json(UpdateKvResponse {
+        success: true,
+        message:
+            "KV service updated successfully. Restart may be required for changes to take effect."
+                .to_string(),
+        status: KvStatusResponse {
+            enabled: true,
+            healthy,
+            version: new_version,
+            docker_image: new_docker_image,
         },
     }))
 }

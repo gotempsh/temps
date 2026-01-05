@@ -217,3 +217,24 @@ pub struct DisableBlobResponse {
     #[schema(example = "Blob service disabled successfully")]
     pub message: String,
 }
+
+/// Request to update Blob service configuration
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct UpdateBlobRequest {
+    /// Docker image to use (e.g., "minio/minio:RELEASE.2025-09-07T16-13-09Z")
+    #[schema(example = "minio/minio:RELEASE.2025-09-07T16-13-09Z")]
+    pub docker_image: Option<String>,
+}
+
+/// Response after updating Blob service
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UpdateBlobResponse {
+    /// Whether the operation succeeded
+    #[schema(example = true)]
+    pub success: bool,
+    /// Human-readable message
+    #[schema(example = "Blob service updated successfully")]
+    pub message: String,
+    /// Current status
+    pub status: BlobStatusResponse,
+}

@@ -4,7 +4,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 /// Default MinIO Docker image (use dated release for reproducibility)
-pub const DEFAULT_MINIO_IMAGE: &str = "minio/minio:RELEASE.2024-11-07T00-52-20Z";
+pub const DEFAULT_MINIO_IMAGE: &str = "minio/minio:RELEASE.2025-09-07T16-13-09Z";
 /// Default container name
 pub const DEFAULT_CONTAINER_NAME: &str = "temps-blob-minio";
 /// Default volume name
@@ -15,7 +15,7 @@ pub const DEFAULT_BUCKET_NAME: &str = "temps-blobs";
 /// User-provided configuration for Blob service (with defaults)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BlobInputConfig {
-    /// Docker image to use (e.g., "minio/minio:RELEASE.2024-11-07T00-52-20Z")
+    /// Docker image to use (e.g., "minio/minio:RELEASE.2025-09-07T16-13-09Z")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_image: Option<String>,
 
@@ -208,8 +208,8 @@ mod tests {
     #[test]
     fn test_version_extraction() {
         let tests = vec![
+            ("minio/minio:RELEASE.2025-09-07T16-13-09Z", "2025-09-07"),
             ("minio/minio:RELEASE.2024-11-07T00-52-20Z", "2024-11-07"),
-            ("minio/minio:RELEASE.2024-01-01T12-30-45Z", "2024-01-01"),
             ("minio/minio:latest", "latest"),
         ];
 

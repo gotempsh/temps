@@ -229,9 +229,23 @@ impl RedisService {
             .await?;
 
         if !containers.is_empty() {
+            // Check if we need to recreate with a new image
+            let existing_image = containers
+                .first()
+                .and_then(|c| c.image.as_deref())
+                .unwrap_or("");
+
+            if existing_image == config.docker_image {
+                info!(
+                    "Container {} already exists with same image",
+                    container_name
+                );
+                return Ok(());
+            }
+
             info!(
-                "Container {} already exists, removing it to recreate with new configuration",
-                container_name
+                "Container {} already exists with different image (current: {}, requested: {}), removing it to recreate",
+                container_name, existing_image, config.docker_image
             );
 
             // Stop the container first

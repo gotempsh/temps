@@ -262,3 +262,25 @@ pub struct DisableKvResponse {
     #[schema(example = "KV service disabled successfully")]
     pub message: String,
 }
+
+/// Request to update KV service configuration
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct UpdateKvRequest {
+    /// Docker image to use (e.g., "redis:7-alpine", "redis:8-alpine")
+    #[schema(example = "redis:7-alpine")]
+    pub docker_image: Option<String>,
+}
+
+/// Response after updating KV service
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UpdateKvResponse {
+    /// Whether the operation succeeded
+    pub success: bool,
+
+    /// Status message
+    #[schema(example = "KV service updated successfully")]
+    pub message: String,
+
+    /// Current service status
+    pub status: KvStatusResponse,
+}
