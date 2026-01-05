@@ -63,6 +63,21 @@ pub struct RedisConfig {
 
 impl From<RedisInputConfig> for RedisConfig {
     fn from(input: RedisInputConfig) -> Self {
+        let password = if let Some(ref pwd) = input.password {
+            tracing::info!(
+                "RedisInputConfig->RedisConfig: using provided password (len={})",
+                pwd.len()
+            );
+            pwd.clone()
+        } else {
+            let generated = generate_password();
+            tracing::warn!(
+                "RedisInputConfig->RedisConfig: password was None, generated new password (len={})",
+                generated.len()
+            );
+            generated
+        };
+
         Self {
             host: input.host,
             port: input.port.unwrap_or_else(|| {
@@ -70,7 +85,7 @@ impl From<RedisInputConfig> for RedisConfig {
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "6379".to_string())
             }),
-            password: input.password.unwrap_or_else(generate_password),
+            password,
             docker_image: input.docker_image,
         }
     }
@@ -120,7 +135,7 @@ fn example_password() -> &'static str {
 }
 
 fn default_docker_image() -> String {
-    "redis:7-alpine".to_string()
+    "redis:8-alpine".to_string()
 }
 
 fn example_docker_image() -> &'static str {
@@ -154,13 +169,21 @@ impl RedisService {
     /// Connection will be automatically closed when ConnectionManager is dropped
     /// This method is public to allow other services (like temps-kv) to get connections
     pub async fn get_connection(&self) -> Result<ConnectionManager> {
+        info!("RedisService::get_connection - acquiring config read lock...");
         let config = self
             .config
             .read()
             .await
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Redis configuration not found"))?
+            .ok_or_else(|| {
+                error!("RedisService::get_connection - config is None!");
+                anyhow::anyhow!("Redis configuration not found")
+            })?
             .clone();
+        info!(
+            "RedisService::get_connection - got config, port={}",
+            config.port
+        );
 
         let connection_url = if config.password.is_empty() {
             format!("redis://localhost:{}", config.port)
@@ -172,12 +195,28 @@ impl RedisService {
             )
         };
 
+        info!(
+            "RedisService::get_connection - creating client for URL (password masked): redis://...@localhost:{}",
+            config.port
+        );
+
         let client = Client::open(connection_url.as_str())
             .map_err(|e| anyhow::anyhow!("Failed to create Redis client: {}", e))?;
 
-        ConnectionManager::new(client)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create Redis connection manager: {}", e))
+        info!("RedisService::get_connection - client created, establishing connection...");
+
+        // Add a timeout to prevent hanging indefinitely
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ConnectionManager::new(client),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Redis connection timed out after 5 seconds"))?
+        .map_err(|e| anyhow::anyhow!("Failed to create Redis connection manager: {}", e))?;
+
+        info!("RedisService::get_connection - connection established successfully");
+
+        Ok(conn)
     }
 
     fn get_container_name(&self) -> String {
@@ -434,11 +473,30 @@ impl RedisService {
     }
 
     fn get_redis_config(&self, service_config: ServiceConfig) -> Result<RedisConfig> {
+        info!(
+            "get_redis_config - parsing parameters: {:?}",
+            service_config.parameters
+        );
+
         // Parse input config and transform to runtime config
         let input_config: RedisInputConfig = serde_json::from_value(service_config.parameters)
             .map_err(|e| anyhow::anyhow!("Failed to parse Redis configuration: {}", e))?;
 
-        Ok(RedisConfig::from(input_config))
+        info!(
+            "get_redis_config - parsed input config: port={:?}, password_provided={}",
+            input_config.port,
+            input_config.password.is_some()
+        );
+
+        let redis_config = RedisConfig::from(input_config);
+
+        info!(
+            "get_redis_config - resulting config: port={}, password_len={}",
+            redis_config.port,
+            redis_config.password.len()
+        );
+
+        Ok(redis_config)
     }
 
     /// Verify that a Docker image can be pulled without actually downloading the full image
@@ -508,8 +566,16 @@ impl ExternalService for RedisService {
         // Parse input config and transform to runtime config
         let redis_config = self.get_redis_config(config)?;
 
+        info!(
+            "Redis init - storing config: port={}, password_len={}",
+            redis_config.port,
+            redis_config.password.len()
+        );
+
         // Store runtime config
         *self.config.write().await = Some(redis_config.clone());
+
+        info!("Redis init - config stored successfully");
 
         // Create Docker container (but don't start it yet)
         // Note: Connection will be established in start() method

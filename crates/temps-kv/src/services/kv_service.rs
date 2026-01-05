@@ -83,7 +83,10 @@ impl KvService {
         value: Value,
         options: SetOptions,
     ) -> Result<(), KvError> {
+        debug!("KvService::set - getting connection...");
         let mut conn = self.get_connection().await?;
+        debug!("KvService::set - got connection");
+
         let namespaced = self.namespaced_key(project_id, key);
 
         // Serialize value to JSON string

@@ -93,9 +93,19 @@ impl TempsPlugin for KvPlugin {
                 .await
             {
                 Ok(service_model) => {
+                    // Check if service is stopped - don't initialize in that case
+                    if service_model.status == "stopped" {
+                        info!(
+                            "KV service '{}' is stopped, skipping initialization. \
+                             Enable the service via the API to use it.",
+                            KV_REDIS_SERVICE_NAME
+                        );
+                        return Ok(());
+                    }
+
                     info!(
-                        "Found KV service '{}' in database (id: {}), loading configuration...",
-                        KV_REDIS_SERVICE_NAME, service_model.id
+                        "Found KV service '{}' in database (id: {}, status: {}), loading configuration...",
+                        KV_REDIS_SERVICE_NAME, service_model.id, service_model.status
                     );
 
                     // Get the full service config (with decrypted parameters)

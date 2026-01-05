@@ -429,7 +429,8 @@ pub async fn blob_status(
                 .await
                 .ok();
 
-            let healthy = service.status == "running";
+            let is_running = service.status == "running";
+            let is_stopped = service.status == "stopped";
 
             // Get docker_image from parameters
             let docker_image = details
@@ -438,21 +439,20 @@ pub async fn blob_status(
                 .and_then(|p| p.get("docker_image").cloned())
                 .and_then(|v| v.as_str().map(String::from));
 
-            // Get version from service record, or extract from docker_image tag as fallback
-            let version = details
+            // Extract version from docker_image tag (e.g., "minio/minio:RELEASE.2025-01-01" -> "RELEASE.2025-01-01")
+            // This ensures the version always matches the actual docker image being used
+            let version = docker_image
                 .as_ref()
-                .and_then(|d| d.service.version.clone())
-                .or_else(|| {
-                    docker_image
-                        .as_ref()
-                        .and_then(|img| img.split(':').nth(1))
-                        .map(String::from)
-                })
+                .and_then(|img| img.split(':').nth(1))
+                .map(String::from)
                 .or_else(|| Some("latest".to_string()));
 
+            // Service is enabled if it exists and is not stopped
+            let enabled = !is_stopped;
+
             Ok(Json(BlobStatusResponse {
-                enabled: true,
-                healthy,
+                enabled,
+                healthy: is_running,
                 version,
                 docker_image,
             }))
@@ -493,49 +493,117 @@ pub async fn blob_enable(
 
     info!("Enabling Blob service with config: {:?}", request);
 
-    // Build parameters for S3/Blob service creation
-    let mut parameters: HashMap<String, serde_json::Value> = HashMap::new();
-    if let Some(docker_image) = &request.docker_image {
-        parameters.insert("docker_image".to_string(), serde_json::json!(docker_image));
-    }
-    if let Some(root_user) = &request.root_user {
-        parameters.insert("access_key".to_string(), serde_json::json!(root_user));
-    }
-    if let Some(root_password) = &request.root_password {
-        parameters.insert("secret_key".to_string(), serde_json::json!(root_password));
-    }
+    // Check if the service already exists (might be stopped)
+    let existing_service = state
+        .external_service_manager
+        .get_service_by_name("temps-blob")
+        .await
+        .ok();
 
-    // Extract version from docker_image (e.g., "minio/minio:RELEASE.2025-01-01" -> "RELEASE.2025-01-01")
-    let version = parameters
-        .get("docker_image")
-        .and_then(|v| v.as_str())
-        .and_then(|img| img.split(':').nth(1))
-        .map(String::from)
-        .or_else(|| Some("latest".to_string())); // Default version
+    let service_info = if let Some(existing) = existing_service {
+        // Service exists - need to initialize the plugin's RustfsService and start the container
+        info!(
+            "Blob service exists with status '{}', ensuring it's running...",
+            existing.status
+        );
 
-    // Create service request for ExternalServiceManager
-    // Using S3 service type since Blob is S3-compatible storage
-    let create_request = CreateExternalServiceRequest {
-        name: "temps-blob".to_string(),
-        service_type: ServiceType::S3,
-        version,
-        parameters,
+        // Get the service config from the database and initialize the plugin's RustfsService
+        let service_config = state
+            .external_service_manager
+            .get_service_config(existing.id)
+            .await
+            .map_err(|e| {
+                error!("Failed to get Blob service config: {}", e);
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Failed to Enable Blob Service")
+                    .with_detail(format!("Could not get Blob service config: {}", e))
+            })?;
+
+        info!(
+            "Retrieved Blob service config (service_id: {}), initializing RustfsService...",
+            existing.id
+        );
+
+        // Initialize the plugin's RustfsService with the config from database
+        if let Err(e) = state.rustfs_service.init(service_config).await {
+            error!("Failed to initialize RustfsService: {}", e);
+            return Err(
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Failed to Enable Blob Service")
+                    .with_detail(format!("Could not initialize RustFS service: {}", e)),
+            );
+        }
+
+        info!("RustfsService initialized, starting container...");
+
+        // Start the container through the plugin's RustfsService
+        if let Err(e) = state.rustfs_service.start().await {
+            // Not a fatal error - container may already be running
+            info!(
+                "RustFS container start returned: {} (may already be running)",
+                e
+            );
+        }
+
+        // Also start via ExternalServiceManager to update DB status
+        state
+            .external_service_manager
+            .start_service(existing.id)
+            .await
+            .map_err(|e| {
+                error!("Failed to update Blob service status in database: {}", e);
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Failed to Enable Blob Service")
+                    .with_detail(format!("Could not start Blob service: {}", e))
+            })?
+    } else {
+        // Service doesn't exist, create it
+        info!("Blob service doesn't exist, creating new service...");
+
+        // Build parameters for S3/Blob service creation
+        let mut parameters: HashMap<String, serde_json::Value> = HashMap::new();
+        if let Some(docker_image) = &request.docker_image {
+            parameters.insert("docker_image".to_string(), serde_json::json!(docker_image));
+        }
+        if let Some(root_user) = &request.root_user {
+            parameters.insert("access_key".to_string(), serde_json::json!(root_user));
+        }
+        if let Some(root_password) = &request.root_password {
+            parameters.insert("secret_key".to_string(), serde_json::json!(root_password));
+        }
+
+        // Extract version from docker_image (e.g., "minio/minio:RELEASE.2025-01-01" -> "RELEASE.2025-01-01")
+        let version = parameters
+            .get("docker_image")
+            .and_then(|v| v.as_str())
+            .and_then(|img| img.split(':').nth(1))
+            .map(String::from)
+            .or_else(|| Some("latest".to_string())); // Default version
+
+        // Create service request for ExternalServiceManager
+        // Using S3 service type since Blob is S3-compatible storage
+        let create_request = CreateExternalServiceRequest {
+            name: "temps-blob".to_string(),
+            service_type: ServiceType::S3,
+            version,
+            parameters,
+        };
+
+        // Create the service through ExternalServiceManager
+        // This creates the database record AND initializes/starts the container
+        state
+            .external_service_manager
+            .create_service(create_request)
+            .await
+            .map_err(|e| {
+                error!("Failed to create Blob service: {}", e);
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Failed to Enable Blob Service")
+                    .with_detail(format!("Could not create S3/Blob service: {}", e))
+            })?
     };
 
-    // Create the service through ExternalServiceManager
-    // This creates the database record AND initializes/starts the container
-    let service_info = state
-        .external_service_manager
-        .create_service(create_request)
-        .await
-        .map_err(|e| {
-            error!("Failed to create Blob service: {}", e);
-            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Failed to Enable Blob Service")
-                .with_detail(format!("Could not create S3/Blob service: {}", e))
-        })?;
-
-    // Get status from the created service
+    // Get status from the service
     let healthy = service_info.status == "running";
     let version = service_info.version.clone();
 
@@ -714,6 +782,7 @@ pub async fn blob_update(
     responses(
         (status = 200, description = "Blob service disabled", body = DisableBlobResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Blob service not enabled"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -728,15 +797,28 @@ pub async fn blob_disable(
 
     info!("Disabling Blob service");
 
-    // Stop the RustFS service
-    if let Err(e) = state.rustfs_service.stop().await {
-        error!("Failed to stop Blob service: {}", e);
-        return Err(
+    // Get the service record
+    let service = state
+        .external_service_manager
+        .get_service_by_name("temps-blob")
+        .await
+        .map_err(|_| {
+            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Blob Service Not Found")
+                .with_detail("Blob service is not enabled")
+        })?;
+
+    // Stop the service through external_service_manager (stops container + updates DB status)
+    state
+        .external_service_manager
+        .stop_service(service.id)
+        .await
+        .map_err(|e| {
+            error!("Failed to stop Blob service: {}", e);
             temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Failed to Disable Blob Service")
-                .with_detail(format!("Could not stop RustFS container: {}", e)),
-        );
-    }
+                .with_detail(format!("Could not stop Blob service: {}", e))
+        })?;
 
     // Create audit log
     let audit = BlobServiceDisabledAudit {

@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Default Redis Docker image
-pub const DEFAULT_REDIS_IMAGE: &str = "redis:7-alpine";
+pub const DEFAULT_REDIS_IMAGE: &str = "redis:8-alpine";
 /// Default container name
 pub const DEFAULT_CONTAINER_NAME: &str = "temps-kv-redis";
 /// Default volume name
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn test_kv_config_default() {
         let config = KvConfig::default();
-        assert_eq!(config.docker_image, "redis:7-alpine");
+        assert_eq!(config.docker_image, "redis:8-alpine");
         assert_eq!(config.port, 0);
         assert_eq!(config.max_memory, "256mb");
         assert!(config.persistence);
@@ -167,14 +167,14 @@ mod tests {
     #[test]
     fn test_kv_input_config_to_config() {
         let input = KvInputConfig {
-            docker_image: "redis:7.2-alpine".to_string(),
+            docker_image: "redis:8.0-alpine".to_string(),
             port: Some("6380".to_string()),
             max_memory: "512mb".to_string(),
             persistence: false,
         };
 
         let config: KvConfig = input.into();
-        assert_eq!(config.docker_image, "redis:7.2-alpine");
+        assert_eq!(config.docker_image, "redis:8.0-alpine");
         assert_eq!(config.port, 6380);
         assert_eq!(config.max_memory, "512mb");
         assert!(!config.persistence);
@@ -185,7 +185,7 @@ mod tests {
         let input = KvInputConfig::default();
         let config: KvConfig = input.into();
 
-        assert_eq!(config.docker_image, "redis:7-alpine");
+        assert_eq!(config.docker_image, "redis:8-alpine");
         assert_eq!(config.port, 0);
         assert!(config.persistence);
     }

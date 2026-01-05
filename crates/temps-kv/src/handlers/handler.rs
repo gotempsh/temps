@@ -135,6 +135,11 @@ pub async fn kv_set(
 ) -> Result<impl IntoResponse, Problem> {
     let project_id = extract_project_id(&auth, request.project_id)?;
 
+    info!(
+        "KV SET request: key={}, project_id={}",
+        request.key, project_id
+    );
+
     let options = SetOptions {
         ex: request.ex,
         px: request.px,
@@ -142,14 +147,22 @@ pub async fn kv_set(
         xx: request.xx,
     };
 
-    state
+    match state
         .kv_service
         .set(project_id, &request.key, request.value, options)
-        .await?;
-
-    Ok(Json(SetResponse {
-        result: "OK".to_string(),
-    }))
+        .await
+    {
+        Ok(_) => {
+            info!("KV SET success: key={}", request.key);
+            Ok(Json(SetResponse {
+                result: "OK".to_string(),
+            }))
+        }
+        Err(e) => {
+            error!("KV SET failed: key={}, error={}", request.key, e);
+            Err(e.into())
+        }
+    }
 }
 
 /// Delete one or more keys
@@ -350,7 +363,13 @@ pub async fn kv_status(
                 .await
                 .ok();
 
-            let healthy = service.status == "running";
+            // Check service status
+            let is_running = service.status == "running";
+            let is_stopped = service.status == "stopped";
+
+            // Service is enabled if it exists and is not stopped
+            let enabled = !is_stopped;
+            let healthy = is_running;
 
             // Get docker_image from parameters
             let docker_image = details
@@ -359,20 +378,16 @@ pub async fn kv_status(
                 .and_then(|p| p.get("docker_image").cloned())
                 .and_then(|v| v.as_str().map(String::from));
 
-            // Get version from service record, or extract from docker_image tag as fallback
-            let version = details
+            // Extract version from docker_image tag (e.g., "redis:8-alpine" -> "8-alpine")
+            // This ensures the version always matches the actual docker image being used
+            let version = docker_image
                 .as_ref()
-                .and_then(|d| d.service.version.clone())
-                .or_else(|| {
-                    docker_image
-                        .as_ref()
-                        .and_then(|img| img.split(':').nth(1))
-                        .map(String::from)
-                })
-                .or_else(|| Some("7-alpine".to_string()));
+                .and_then(|img| img.split(':').nth(1))
+                .map(String::from)
+                .or_else(|| Some("8-alpine".to_string()));
 
             Ok(Json(KvStatusResponse {
-                enabled: true,
+                enabled,
                 healthy,
                 version,
                 docker_image,
@@ -414,49 +429,118 @@ pub async fn kv_enable(
 
     info!("Enabling KV service with config: {:?}", request);
 
-    // Build parameters for Redis service creation
-    let mut parameters: HashMap<String, serde_json::Value> = HashMap::new();
-    if let Some(docker_image) = &request.docker_image {
-        parameters.insert("docker_image".to_string(), serde_json::json!(docker_image));
-    }
-    if let Some(max_memory) = &request.max_memory {
-        parameters.insert("max_memory".to_string(), serde_json::json!(max_memory));
-    }
-    parameters.insert(
-        "persistence".to_string(),
-        serde_json::json!(request.persistence),
-    );
+    // Check if the service already exists (might be stopped)
+    let existing_service = state
+        .external_service_manager
+        .get_service_by_name("temps-kv")
+        .await
+        .ok();
 
-    // Extract version from docker_image (e.g., "redis:7-alpine" -> "7-alpine")
-    let version = parameters
-        .get("docker_image")
-        .and_then(|v| v.as_str())
-        .and_then(|img| img.split(':').nth(1))
-        .map(String::from)
-        .or_else(|| Some("7-alpine".to_string())); // Default Redis version
+    let service_info = if let Some(existing) = existing_service {
+        // Service exists - start it (will be a no-op if already running)
+        info!(
+            "KV service exists with status '{}', ensuring it's running...",
+            existing.status
+        );
 
-    // Create service request for ExternalServiceManager
-    let create_request = CreateExternalServiceRequest {
-        name: "temps-kv".to_string(),
-        service_type: ServiceType::Redis,
-        version,
-        parameters,
+        // Get the service config from the database and initialize the plugin's RedisService
+        // This is necessary because the plugin may have skipped initialization if the service was stopped
+        let service_config = state
+            .external_service_manager
+            .get_service_config(existing.id)
+            .await
+            .map_err(|e| {
+                error!("Failed to get KV service config: {}", e);
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Failed to Enable KV Service")
+                    .with_detail(format!("Could not get KV service config: {}", e))
+            })?;
+
+        info!(
+            "Retrieved KV service config (service_id: {}), initializing RedisService...",
+            existing.id
+        );
+
+        // Initialize the plugin's RedisService with the config from database
+        if let Err(e) = state.redis_service.init(service_config).await {
+            error!("Failed to initialize RedisService: {}", e);
+            return Err(
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Failed to Enable KV Service")
+                    .with_detail(format!("Could not initialize Redis service: {}", e)),
+            );
+        }
+
+        info!("RedisService initialized, starting container...");
+
+        // Start the container through the plugin's RedisService
+        if let Err(e) = state.redis_service.start().await {
+            // Log but continue - container might already be running
+            info!(
+                "Redis container start returned: {} (may already be running)",
+                e
+            );
+        }
+
+        // Start via ExternalServiceManager to update DB status
+        state
+            .external_service_manager
+            .start_service(existing.id)
+            .await
+            .map_err(|e| {
+                error!("Failed to update KV service status in database: {}", e);
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Failed to Enable KV Service")
+                    .with_detail(format!("Could not start KV service: {}", e))
+            })?
+    } else {
+        // Service doesn't exist, create it
+        info!("KV service doesn't exist, creating new service...");
+
+        // Build parameters for Redis service creation
+        let mut parameters: HashMap<String, serde_json::Value> = HashMap::new();
+        if let Some(docker_image) = &request.docker_image {
+            parameters.insert("docker_image".to_string(), serde_json::json!(docker_image));
+        }
+        if let Some(max_memory) = &request.max_memory {
+            parameters.insert("max_memory".to_string(), serde_json::json!(max_memory));
+        }
+        parameters.insert(
+            "persistence".to_string(),
+            serde_json::json!(request.persistence),
+        );
+
+        // Extract version from docker_image (e.g., "redis:7-alpine" -> "7-alpine")
+        let version = parameters
+            .get("docker_image")
+            .and_then(|v| v.as_str())
+            .and_then(|img| img.split(':').nth(1))
+            .map(String::from)
+            .or_else(|| Some("8-alpine".to_string())); // Default Redis version
+
+        // Create service request for ExternalServiceManager
+        let create_request = CreateExternalServiceRequest {
+            name: "temps-kv".to_string(),
+            service_type: ServiceType::Redis,
+            version,
+            parameters,
+        };
+
+        // Create the service through ExternalServiceManager
+        // This creates the database record AND initializes/starts the container
+        state
+            .external_service_manager
+            .create_service(create_request)
+            .await
+            .map_err(|e| {
+                error!("Failed to create KV service: {}", e);
+                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Failed to Enable KV Service")
+                    .with_detail(format!("Could not create Redis service: {}", e))
+            })?
     };
 
-    // Create the service through ExternalServiceManager
-    // This creates the database record AND initializes/starts the container
-    let service_info = state
-        .external_service_manager
-        .create_service(create_request)
-        .await
-        .map_err(|e| {
-            error!("Failed to create KV service: {}", e);
-            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Failed to Enable KV Service")
-                .with_detail(format!("Could not create Redis service: {}", e))
-        })?;
-
-    // Get status from the created service
+    // Get status from the service
     let healthy = service_info.status == "running";
     let version = service_info.version.clone();
 
@@ -635,6 +719,7 @@ pub async fn kv_update(
     responses(
         (status = 200, description = "KV service disabled", body = DisableKvResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "KV service not enabled"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -649,15 +734,28 @@ pub async fn kv_disable(
 
     info!("Disabling KV service");
 
-    // Stop the Redis service
-    if let Err(e) = state.redis_service.stop().await {
-        error!("Failed to stop KV service: {}", e);
-        return Err(
+    // Get the service record
+    let service = state
+        .external_service_manager
+        .get_service_by_name("temps-kv")
+        .await
+        .map_err(|_| {
+            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("KV Service Not Found")
+                .with_detail("KV service is not enabled")
+        })?;
+
+    // Stop the service through external_service_manager (stops container + updates DB status)
+    state
+        .external_service_manager
+        .stop_service(service.id)
+        .await
+        .map_err(|e| {
+            error!("Failed to stop KV service: {}", e);
             temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Failed to Disable KV Service")
-                .with_detail(format!("Could not stop Redis container: {}", e)),
-        );
-    }
+                .with_detail(format!("Could not stop KV service: {}", e))
+        })?;
 
     // Create audit log
     let audit = KvServiceDisabledAudit {

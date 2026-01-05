@@ -87,9 +87,19 @@ impl TempsPlugin for BlobPlugin {
                 .await
             {
                 Ok(service_model) => {
+                    // Check if service is stopped - don't initialize in that case
+                    if service_model.status == "stopped" {
+                        info!(
+                            "Blob service '{}' is stopped, skipping initialization. \
+                             Enable the service via the API to use it.",
+                            BLOB_RUSTFS_SERVICE_NAME
+                        );
+                        return Ok(());
+                    }
+
                     info!(
-                        "Found Blob service '{}' in database (id: {}), loading configuration...",
-                        BLOB_RUSTFS_SERVICE_NAME, service_model.id
+                        "Found Blob service '{}' in database (id: {}, status: {}), loading configuration...",
+                        BLOB_RUSTFS_SERVICE_NAME, service_model.id, service_model.status
                     );
 
                     // Get the full service config (with decrypted parameters)
