@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     # Application crates
     "crates/temps-cli",
+    # LocalTemps desktop app
+    "apps/localtemps/src-tauri",
     # Library crates
     "crates/temps-core",
     "crates/temps-entities",

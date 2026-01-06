@@ -1,0 +1,76 @@
+[package]
+name = "localtemps"
+version = "0.1.0"
+description = "Local development environment for Temps SDK (KV, Blob services)"
+authors = ["Temps Contributors"]
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+name = "localtemps_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# ============================================================================
+# Tauri Framework
+# ============================================================================
+tauri = { version = "2", features = ["tray-icon", "devtools"] }
+tauri-plugin-opener = "2"
+tauri-plugin-shell = "2"
+
+# ============================================================================
+# Internal Temps Crates (reuse existing services)
+# ============================================================================
+temps-core = { path = "../../../crates/temps-core" }
+temps-providers = { path = "../../../crates/temps-providers" }
+temps-kv = { path = "../../../crates/temps-kv" }
+temps-blob = { path = "../../../crates/temps-blob" }
+
+# ============================================================================
+# HTTP Server (for local API)
+# ============================================================================
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+http = { workspace = true }
+
+# ============================================================================
+# Async Runtime
+# ============================================================================
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# ============================================================================
+# Serialization
+# ============================================================================
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# ============================================================================
+# Error Handling & Logging
+# ============================================================================
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# ============================================================================
+# Docker Container Management
+# ============================================================================
+bollard = { workspace = true }
+
+# ============================================================================
+# Date/Time & UUID
+# ============================================================================
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# ============================================================================
+# System Utilities
+# ============================================================================
+dirs = "6"
+bytes = { workspace = true }
