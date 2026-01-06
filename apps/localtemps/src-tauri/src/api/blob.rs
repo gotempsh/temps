@@ -1,6 +1,6 @@
 //! Blob API endpoints
 //!
-//! Implements SDK-compatible Blob API endpoints using the existing BlobService.
+//! Implements SDK-compatible Blob API endpoints using local services.
 
 use std::sync::Arc;
 
@@ -18,6 +18,24 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::context::{LocalTempsContext, LOCAL_PROJECT_ID};
+use crate::services::blob::{ListOptions, PutOptions};
+
+/// Parse blob path in format "project_id/rest/of/path" into (project_id, path)
+fn parse_blob_path(full_path: &str) -> Result<(i32, String), String> {
+    // Remove leading slash if present
+    let path = full_path.strip_prefix('/').unwrap_or(full_path);
+
+    // Split on first slash to get project_id and rest of path
+    let (project_id_str, rest) = path
+        .split_once('/')
+        .ok_or_else(|| "Path must be in format: {project_id}/{path}".to_string())?;
+
+    let project_id = project_id_str
+        .parse::<i32>()
+        .map_err(|_| format!("Invalid project_id: {}", project_id_str))?;
+
+    Ok((project_id, rest.to_string()))
+}
 
 /// Upload query parameters
 #[derive(Deserialize)]
@@ -83,6 +101,12 @@ pub struct DeleteRequest {
     pub project_id: Option<i32>,
 }
 
+/// Delete response
+#[derive(Serialize)]
+pub struct DeleteResponse {
+    pub deleted: i64,
+}
+
 /// Copy request
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,7 +155,7 @@ pub async fn upload_handler(
         project_id
     );
 
-    let options = temps_blob::services::PutOptions {
+    let options = PutOptions {
         content_type: query.content_type,
         add_random_suffix: query.add_random_suffix.unwrap_or(false),
     };
@@ -172,7 +196,7 @@ pub async fn list_handler(
         query.prefix, query.limit, project_id
     );
 
-    let options = temps_blob::services::ListOptions {
+    let options = ListOptions {
         limit: query.limit,
         prefix: query.prefix,
         cursor: query.cursor,
@@ -219,7 +243,7 @@ pub async fn delete_handler(
     );
 
     match ctx.blob_service().del(project_id, request.pathnames).await {
-        Ok(_) => StatusCode::OK.into_response(),
+        Ok(deleted) => (StatusCode::OK, Json(DeleteResponse { deleted })).into_response(),
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &e.to_string(),
@@ -232,8 +256,15 @@ pub async fn delete_handler(
 /// Head blob endpoint (HEAD /api/blob/{project_id}/{path})
 pub async fn head_handler(
     State(ctx): State<Arc<LocalTempsContext>>,
-    Path((project_id, path)): Path<(i32, String)>,
+    Path(full_path): Path<String>,
 ) -> impl IntoResponse {
+    // Parse project_id and path from full_path (e.g., "1/folder/file.txt")
+    let (project_id, path) = match parse_blob_path(&full_path) {
+        Ok((id, p)) => (id, p),
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, &e, "INVALID_PATH").into_response()
+        }
+    };
     debug!("BLOB HEAD path={} project_id={}", path, project_id);
 
     match ctx.blob_service().head(project_id, &path).await {
@@ -277,8 +308,15 @@ pub async fn head_handler(
 /// Download blob endpoint (GET /api/blob/{project_id}/{path})
 pub async fn download_handler(
     State(ctx): State<Arc<LocalTempsContext>>,
-    Path((project_id, path)): Path<(i32, String)>,
+    Path(full_path): Path<String>,
 ) -> impl IntoResponse {
+    // Parse project_id and path from full_path (e.g., "1/folder/file.txt")
+    let (project_id, path) = match parse_blob_path(&full_path) {
+        Ok((id, p)) => (id, p),
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, &e, "INVALID_PATH").into_response()
+        }
+    };
     debug!("BLOB GET path={} project_id={}", path, project_id);
 
     match ctx.blob_service().download(project_id, &path).await {

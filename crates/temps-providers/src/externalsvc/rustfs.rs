@@ -30,8 +30,8 @@ use crate::utils::ensure_network_exists;
 
 use super::{ExternalService, ServiceConfig, ServiceType};
 
-/// Default RustFS Docker image (pinned to specific version for reproducibility)
-pub const DEFAULT_RUSTFS_IMAGE: &str = "ghcr.io/rustfs/rustfs:0.5.0";
+/// Default RustFS Docker image (from Docker Hub)
+pub const DEFAULT_RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0-alpha.78";
 /// Default RustFS API port
 pub const DEFAULT_RUSTFS_API_PORT: u16 = 9000;
 /// Default RustFS console port

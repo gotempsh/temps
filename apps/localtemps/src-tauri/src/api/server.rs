@@ -58,13 +58,14 @@ pub fn create_api_router(ctx: Arc<LocalTempsContext>) -> Router {
         .route("/keys", post(kv::keys_handler));
 
     // Blob routes (auth required)
+    // Note: Axum requires catch-all parameters to be at the end of the route
     let blob_routes = Router::new()
         .route("/", post(blob::upload_handler))
         .route("/", get(blob::list_handler))
         .route("/", delete(blob::delete_handler))
         .route("/copy", post(blob::copy_handler))
-        .route("/{project_id}/{*path}", head(blob::head_handler))
-        .route("/{project_id}/{*path}", get(blob::download_handler));
+        .route("/{*path}", head(blob::head_handler))
+        .route("/{*path}", get(blob::download_handler));
 
     // Services status route (no auth required - for UI)
     let services_routes = Router::new().route("/services", get(services_handler));

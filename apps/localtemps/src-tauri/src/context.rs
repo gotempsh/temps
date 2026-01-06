@@ -1,21 +1,16 @@
-//! LocalTemps Context - wraps Temps services for local development
+//! LocalTemps Context - standalone local development environment
 //!
-//! This module provides a simplified context that wraps KvService and BlobService
-//! without requiring database dependencies. Perfect for local development workflows.
+//! This module provides a simplified context that manages Redis and RustFS
+//! containers for local development without requiring any temps-* crate dependencies.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use bollard::Docker;
-use serde_json::json;
-use temps_blob::services::BlobService;
-use temps_core::EncryptionService;
-use temps_kv::services::KvService;
-use temps_providers::externalsvc::{
-    ExternalService, RedisService, RustfsService, ServiceConfig, ServiceType,
-};
 use tokio::sync::RwLock;
 use tracing::{error, info};
+
+use crate::services::{BlobService, KvService, RedisService, RustfsService};
 
 /// Fixed local development token
 pub const LOCAL_TOKEN: &str = "localtemps-dev-token";
@@ -40,14 +35,12 @@ pub struct ServiceStatus {
 pub struct LocalTempsContext {
     #[allow(dead_code)]
     docker: Arc<Docker>,
-    #[allow(dead_code)]
-    encryption_service: Arc<EncryptionService>,
 
-    // External services (Docker containers)
+    // Infrastructure services
     redis_service: Arc<RedisService>,
     rustfs_service: Arc<RustfsService>,
 
-    // Business logic services
+    // Application services
     kv_service: Arc<KvService>,
     blob_service: Arc<BlobService>,
 
@@ -68,35 +61,16 @@ impl LocalTempsContext {
 
         info!("Connected to Docker");
 
-        // Create encryption service with a fixed local key
-        // This key is only used locally, so security is not a concern
-        let local_encryption_key =
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let encryption_service = Arc::new(
-            EncryptionService::new(local_encryption_key)
-                .map_err(|e| anyhow::anyhow!("Failed to create encryption service: {}", e))?,
-        );
+        // Create infrastructure services
+        let redis_service = Arc::new(RedisService::new(docker.clone()));
+        let rustfs_service = Arc::new(RustfsService::new(docker.clone()));
 
-        // Create Redis service for KV
-        let redis_service = Arc::new(RedisService::new(
-            "localtemps-kv".to_string(),
-            docker.clone(),
-        ));
-
-        // Create RustFS service for Blob
-        let rustfs_service = Arc::new(RustfsService::new(
-            "localtemps-blob".to_string(),
-            docker.clone(),
-            encryption_service.clone(),
-        ));
-
-        // Create business logic services
+        // Create application services
         let kv_service = Arc::new(KvService::new(redis_service.clone()));
         let blob_service = Arc::new(BlobService::new(rustfs_service.clone()));
 
         Ok(Self {
             docker,
-            encryption_service,
             redis_service,
             rustfs_service,
             kv_service,
@@ -117,40 +91,18 @@ impl LocalTempsContext {
 
         // Initialize Redis service
         info!("Starting Redis container...");
-        let redis_config = ServiceConfig {
-            name: "localtemps-kv".to_string(),
-            service_type: ServiceType::Kv,
-            version: None,
-            parameters: json!({
-                "port": "6379"
-            }),
-        };
-
         self.redis_service
-            .init(redis_config)
+            .init()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to initialize Redis: {}", e))?;
-
         info!("Redis container started");
 
         // Initialize RustFS service
         info!("Starting RustFS container...");
-        let rustfs_config = ServiceConfig {
-            name: "localtemps-blob".to_string(),
-            service_type: ServiceType::Blob,
-            version: None,
-            parameters: json!({
-                "port": "9000",
-                "console_port": "9001",
-                "host": "localhost"
-            }),
-        };
-
         self.rustfs_service
-            .init(rustfs_config)
+            .init()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to initialize RustFS: {}", e))?;
-
         info!("RustFS container started");
 
         *initialized = true;
@@ -186,32 +138,42 @@ impl LocalTempsContext {
 
         // Redis status
         let redis_running = self.redis_service.health_check().await.unwrap_or(false);
-        let redis_port = if redis_running { Some(6379) } else { None };
+        let redis_connection_info = if redis_running {
+            self.redis_service.get_connection_info().ok()
+        } else {
+            None
+        };
+        // Extract port from connection info (e.g., "redis://localhost:6379" -> 6379)
+        let redis_port = redis_connection_info
+            .as_ref()
+            .and_then(|info| info.rsplit(':').next())
+            .and_then(|port_str| port_str.parse::<u16>().ok());
         statuses.push(ServiceStatus {
             name: "Redis (KV)".to_string(),
             service_type: "kv".to_string(),
             running: redis_running,
             port: redis_port,
-            connection_info: if redis_running {
-                self.redis_service.get_connection_info().ok()
-            } else {
-                None
-            },
+            connection_info: redis_connection_info,
         });
 
         // RustFS status
         let rustfs_running = self.rustfs_service.health_check().await.unwrap_or(false);
-        let rustfs_port = if rustfs_running { Some(9000) } else { None };
+        let rustfs_connection_info = if rustfs_running {
+            self.rustfs_service.get_connection_info().ok()
+        } else {
+            None
+        };
+        // Extract port from connection info (e.g., "http://localhost:9000" -> 9000)
+        let rustfs_port = rustfs_connection_info
+            .as_ref()
+            .and_then(|info| info.rsplit(':').next())
+            .and_then(|port_str| port_str.parse::<u16>().ok());
         statuses.push(ServiceStatus {
             name: "RustFS (Blob)".to_string(),
             service_type: "blob".to_string(),
             running: rustfs_running,
             port: rustfs_port,
-            connection_info: if rustfs_running {
-                self.rustfs_service.get_connection_info().ok()
-            } else {
-                None
-            },
+            connection_info: rustfs_connection_info,
         });
 
         statuses
@@ -223,11 +185,7 @@ impl LocalTempsContext {
     }
 
     /// Ensure services are initialized (auto-start if needed)
-    ///
-    /// This is called automatically by API handlers to provide a zero-config
-    /// developer experience. Services start on first API call.
     pub async fn ensure_initialized(&self) -> Result<()> {
-        // Quick check without write lock
         if self.is_initialized().await {
             // Double-check health
             let redis_healthy = self.redis_service.health_check().await.unwrap_or(false);
@@ -243,8 +201,17 @@ impl LocalTempsContext {
             *initialized = false;
         }
 
-        // Initialize services
         self.init_services().await
+    }
+
+    /// Get Redis service reference
+    pub fn redis_service(&self) -> Arc<RedisService> {
+        self.redis_service.clone()
+    }
+
+    /// Get RustFS service reference
+    pub fn rustfs_service(&self) -> Arc<RustfsService> {
+        self.rustfs_service.clone()
     }
 
     /// Get KV service reference

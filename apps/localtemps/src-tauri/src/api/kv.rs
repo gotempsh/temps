@@ -1,6 +1,6 @@
 //! KV API endpoints
 //!
-//! Implements SDK-compatible KV API endpoints using the existing KvService.
+//! Implements SDK-compatible KV API endpoints using local services.
 
 use std::sync::Arc;
 
@@ -10,6 +10,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::context::{LocalTempsContext, LOCAL_PROJECT_ID};
+use crate::services::kv::SetOptions;
 
 /// GET request
 #[derive(Deserialize)]
@@ -173,7 +174,7 @@ pub async fn set_handler(
         request.key, project_id, request.ex
     );
 
-    let options = temps_kv::services::SetOptions {
+    let options = SetOptions {
         ex: request.ex,
         px: request.px,
         nx: request.nx.unwrap_or(false),

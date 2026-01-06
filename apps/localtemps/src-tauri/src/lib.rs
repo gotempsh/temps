@@ -27,6 +27,7 @@
 pub mod api;
 pub mod commands;
 pub mod context;
+pub mod services;
 
 use std::sync::Arc;
 
