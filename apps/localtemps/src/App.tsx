@@ -1,13 +1,14 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Loader2, Play, Square, ChevronDown, ChevronUp, Trash2, Database, HardDrive, CheckCircle2, XCircle, AlertCircle, Info, Activity } from "lucide-react";
+import { Loader2, Play, Square, ChevronDown, ChevronUp, Trash2, Database, HardDrive, CheckCircle2, XCircle, AlertCircle, Info } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { CopyButton } from "@/components/ui/copy-button";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { SidebarProvider, SidebarInset, SidebarTrigger } from "@/components/ui/sidebar";
+import { AppSidebar, type NavPage } from "@/components/app-sidebar";
 import { AnalyticsInspector } from "@/components/analytics/AnalyticsInspector";
 import { cn } from "@/lib/utils";
 
@@ -246,6 +247,129 @@ const list = await blob.list({ prefix: 'images/' })`;
   );
 }
 
+function ServicesPage({
+  services,
+  envConfig,
+  activityLogs,
+  isStarting,
+  isStopping,
+  allRunning,
+  anyRunning,
+  error,
+  onStartServices,
+  onStopServices,
+  onClearLogs,
+  onDismissError,
+}: {
+  services: ServiceStatus[];
+  envConfig: EnvConfig | null;
+  activityLogs: ActivityLogEntry[];
+  isStarting: boolean;
+  isStopping: boolean;
+  allRunning: boolean;
+  anyRunning: boolean;
+  error: string | null;
+  onStartServices: () => void;
+  onStopServices: () => void;
+  onClearLogs: () => void;
+  onDismissError: () => void;
+}) {
+  return (
+    <div className="space-y-6">
+      {/* Error Banner */}
+      {error && (
+        <Card className="border-destructive bg-destructive/10">
+          <CardContent className="flex items-center justify-between p-4">
+            <div className="flex items-center gap-2 text-destructive">
+              <XCircle className="h-5 w-5" />
+              <p className="text-sm">{error}</p>
+            </div>
+            <Button variant="ghost" size="sm" onClick={onDismissError}>
+              Dismiss
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Controls */}
+      <div className="flex gap-3">
+        <Button
+          onClick={onStartServices}
+          disabled={isStarting || allRunning}
+          className="flex-1"
+          variant={allRunning ? "secondary" : "default"}
+        >
+          {isStarting ? (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Starting...
+            </>
+          ) : (
+            <>
+              <Play className="h-4 w-4" />
+              Start All Services
+            </>
+          )}
+        </Button>
+        <Button
+          onClick={onStopServices}
+          disabled={isStopping || !anyRunning}
+          variant="outline"
+          className="flex-1"
+        >
+          {isStopping ? (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Stopping...
+            </>
+          ) : (
+            <>
+              <Square className="h-4 w-4" />
+              Stop All Services
+            </>
+          )}
+        </Button>
+      </div>
+
+      {/* Services Grid */}
+      <div className="grid gap-4 md:grid-cols-2">
+        {services.map((service) => (
+          <ServiceCard key={service.service_type} service={service} />
+        ))}
+      </div>
+
+      {/* Environment Variables */}
+      {envConfig && <EnvVarsSection config={envConfig} />}
+
+      {/* Activity Log */}
+      <ActivityLog logs={activityLogs} onClear={onClearLogs} />
+
+      {/* Usage Examples */}
+      <UsageExample />
+    </div>
+  );
+}
+
+function SettingsPage() {
+  return (
+    <div className="space-y-6">
+      <Card>
+        <CardHeader>
+          <CardTitle>Settings</CardTitle>
+          <CardDescription>
+            Configure LocalTemps settings
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm text-muted-foreground">
+            Settings configuration coming soon.
+          </p>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
 function App() {
   const [services, setServices] = useState<ServiceStatus[]>([]);
   const [envConfig, setEnvConfig] = useState<EnvConfig | null>(null);
@@ -255,6 +379,7 @@ function App() {
   const [apiRunning, setApiRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activityLogs, setActivityLogs] = useState<ActivityLogEntry[]>([]);
+  const [activePage, setActivePage] = useState<NavPage>('services');
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -349,117 +474,71 @@ function App() {
     );
   }
 
+  const renderPage = () => {
+    switch (activePage) {
+      case 'services':
+        return (
+          <ServicesPage
+            services={services}
+            envConfig={envConfig}
+            activityLogs={activityLogs}
+            isStarting={isStarting}
+            isStopping={isStopping}
+            allRunning={allRunning}
+            anyRunning={anyRunning}
+            error={error}
+            onStartServices={startServices}
+            onStopServices={stopServices}
+            onClearLogs={clearLogs}
+            onDismissError={() => setError(null)}
+          />
+        );
+      case 'analytics':
+        return <AnalyticsInspector />;
+      case 'settings':
+        return <SettingsPage />;
+      default:
+        return null;
+    }
+  };
+
+  const getPageTitle = () => {
+    switch (activePage) {
+      case 'services':
+        return 'Services';
+      case 'analytics':
+        return 'Analytics Inspector';
+      case 'settings':
+        return 'Settings';
+      default:
+        return 'LocalTemps';
+    }
+  };
+
   return (
-    <main className="min-h-screen bg-background">
-      <div className="container mx-auto max-w-4xl py-6 px-4 space-y-6">
-        {/* Header */}
-        <header className="flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-bold tracking-tight">LocalTemps</h1>
-            <p className="text-sm text-muted-foreground">Local Development Environment</p>
+    <SidebarProvider>
+      <AppSidebar
+        activePage={activePage}
+        onNavigate={setActivePage}
+        apiRunning={apiRunning}
+      />
+      <SidebarInset>
+        <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
+          <SidebarTrigger className="-ml-1" />
+          <div className="flex-1">
+            <h1 className="text-lg font-semibold">{getPageTitle()}</h1>
           </div>
-          <Badge variant={apiRunning ? "success" : "secondary"} className="text-sm">
-            API: {apiRunning ? "Running" : "Stopped"}
-          </Badge>
         </header>
-
-        {/* Error Banner */}
-        {error && (
-          <Card className="border-destructive bg-destructive/10">
-            <CardContent className="flex items-center justify-between p-4">
-              <div className="flex items-center gap-2 text-destructive">
-                <XCircle className="h-5 w-5" />
-                <p className="text-sm">{error}</p>
-              </div>
-              <Button variant="ghost" size="sm" onClick={() => setError(null)}>
-                Dismiss
-              </Button>
-            </CardContent>
-          </Card>
-        )}
-
-        {/* Main Content Tabs */}
-        <Tabs defaultValue="services" className="w-full">
-          <TabsList className="grid w-full grid-cols-2">
-            <TabsTrigger value="services" className="flex items-center gap-2">
-              <Database className="h-4 w-4" />
-              Services
-            </TabsTrigger>
-            <TabsTrigger value="analytics" className="flex items-center gap-2">
-              <Activity className="h-4 w-4" />
-              Analytics
-            </TabsTrigger>
-          </TabsList>
-
-          <TabsContent value="services" className="space-y-6 mt-6">
-            {/* Controls */}
-            <div className="flex gap-3">
-              <Button
-                onClick={startServices}
-                disabled={isStarting || allRunning}
-                className="flex-1"
-                variant={allRunning ? "secondary" : "default"}
-              >
-                {isStarting ? (
-                  <>
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    Starting...
-                  </>
-                ) : (
-                  <>
-                    <Play className="h-4 w-4" />
-                    Start All Services
-                  </>
-                )}
-              </Button>
-              <Button
-                onClick={stopServices}
-                disabled={isStopping || !anyRunning}
-                variant="outline"
-                className="flex-1"
-              >
-                {isStopping ? (
-                  <>
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    Stopping...
-                  </>
-                ) : (
-                  <>
-                    <Square className="h-4 w-4" />
-                    Stop All Services
-                  </>
-                )}
-              </Button>
-            </div>
-
-            {/* Services Grid */}
-            <div className="grid gap-4 md:grid-cols-2">
-              {services.map((service) => (
-                <ServiceCard key={service.service_type} service={service} />
-              ))}
-            </div>
-
-            {/* Environment Variables */}
-            {envConfig && <EnvVarsSection config={envConfig} />}
-
-            {/* Activity Log */}
-            <ActivityLog logs={activityLogs} onClear={clearLogs} />
-
-            {/* Usage Examples */}
-            <UsageExample />
-          </TabsContent>
-
-          <TabsContent value="analytics" className="mt-6">
-            <AnalyticsInspector />
-          </TabsContent>
-        </Tabs>
-
-        {/* Footer */}
-        <footer className="text-center text-sm text-muted-foreground pt-4 border-t">
+        <main className="flex-1 overflow-auto">
+          <div className="container mx-auto max-w-4xl py-6 px-4">
+            {renderPage()}
+          </div>
+        </main>
+        <footer className="border-t px-4 py-3 text-center text-sm text-muted-foreground">
           LocalTemps provides local development services compatible with the Temps SDK.
         </footer>
-      </div>
-    </main>
+      </SidebarInset>
+    </SidebarProvider>
   );
 }
 

@@ -3,6 +3,8 @@
 
 @import 'tailwindcss';
 
+@import "tw-animate-css";
+
 @custom-variant dark (&:is(.dark *));
 
 :root {
@@ -32,6 +34,16 @@
   --font-sans: 'Noto Sans Mono', ui-monospace, 'SF Mono', monospace, system-ui;
   --font-mono: 'Noto Sans Mono', 'SF Mono', 'Consolas', monospace;
   --radius: 0.5rem;
+
+  /* Sidebar variables */
+  --sidebar: oklch(0.9846 0.0017 247.8389);
+  --sidebar-foreground: oklch(0 0 0);
+  --sidebar-primary: oklch(0 0 0);
+  --sidebar-primary-foreground: oklch(1 0 0);
+  --sidebar-accent: oklch(0.9276 0.0058 264.5313);
+  --sidebar-accent-foreground: oklch(0 0 0);
+  --sidebar-border: oklch(0.9276 0.0058 264.5313);
+  --sidebar-ring: oklch(0 0 0);
 }
 
 .dark {
@@ -58,6 +70,16 @@
   --success-foreground: oklch(1 0 0);
   --warning: oklch(0.75 0.12 85);
   --warning-foreground: oklch(0 0 0);
+
+  /* Sidebar variables */
+  --sidebar: oklch(0.1776 0 0);
+  --sidebar-foreground: oklch(1 0 0);
+  --sidebar-primary: oklch(1 0 0);
+  --sidebar-primary-foreground: oklch(0 0 0);
+  --sidebar-accent: oklch(0.3211 0 0);
+  --sidebar-accent-foreground: oklch(1 0 0);
+  --sidebar-border: oklch(0.3211 0 0);
+  --sidebar-ring: oklch(1 0 0);
 }
 
 @theme inline {
@@ -84,6 +106,14 @@
   --color-success-foreground: var(--success-foreground);
   --color-warning: var(--warning);
   --color-warning-foreground: var(--warning-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
 
   --font-sans: 'Noto Sans Mono', ui-monospace, 'SF Mono', monospace, system-ui;
   --font-mono: 'Noto Sans Mono', 'SF Mono', 'Consolas', monospace;
@@ -117,5 +147,14 @@
 
   .animate-spin-slow {
     animation: spin 3s linear infinite;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
   }
 }

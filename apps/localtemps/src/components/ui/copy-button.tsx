@@ -1,10 +1,13 @@
 import * as React from 'react'
 import { CheckIcon, CopyIcon } from 'lucide-react'
+import { type VariantProps } from 'class-variance-authority'
 
 import { cn } from '@/lib/utils'
-import { Button, type ButtonProps } from '@/components/ui/button'
+import { Button, buttonVariants } from '@/components/ui/button'
 
-interface CopyButtonProps extends ButtonProps {
+interface CopyButtonProps
+  extends React.ComponentProps<'button'>,
+    VariantProps<typeof buttonVariants> {
   value: string
 }
 
