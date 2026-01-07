@@ -319,7 +319,7 @@ pub async fn start_api_server(state: State<'_, AppState>) -> Result<CommandResul
     // Start API server in background
     let api_running = state.api_running.clone();
     tokio::spawn(async move {
-        if let Err(e) = crate::api::create_api_server(ctx, DEFAULT_API_PORT).await {
+        if let Err(e) = crate::api::create_api_server(ctx, None, DEFAULT_API_PORT).await {
             error!("API server error: {}", e);
         }
         // Mark as not running when server stops

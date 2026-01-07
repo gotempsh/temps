@@ -6426,6 +6426,8 @@ dependencies = [
  "rand 0.8.5",
  "redis 0.28.2",
  "reqwest 0.12.24",
+ "sea-orm",
+ "sea-orm-migration",
  "serde",
  "serde_json",
  "tauri",

@@ -27,6 +27,8 @@
 pub mod api;
 pub mod commands;
 pub mod context;
+pub mod db;
+pub mod entities;
 pub mod services;
 
 use std::sync::Arc;
@@ -140,8 +142,33 @@ pub fn run() {
             // Auto-start API server on app launch
             // Services will auto-initialize on first API request (zero-config)
             let app_handle = app.handle().clone();
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .expect("Failed to get app data dir");
+
             tauri::async_runtime::spawn(async move {
                 tracing::info!("Auto-starting API server...");
+
+                // Initialize SQLite database for analytics
+                let db = match db::init_database(app_data_dir).await {
+                    Ok(db) => {
+                        tracing::info!("SQLite database initialized");
+                        Some(db)
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to initialize database: {}", e);
+                        let state = app_handle.state::<AppState>();
+                        state
+                            .add_log(
+                                "warning",
+                                &format!("Analytics database unavailable: {}", e),
+                                None,
+                            )
+                            .await;
+                        None
+                    }
+                };
 
                 // Create context for the API server
                 match LocalTempsContext::new().await {
@@ -175,8 +202,8 @@ pub fn run() {
                             .add_log("info", "Services will auto-start on first API call", None)
                             .await;
 
-                        // Start the API server
-                        if let Err(e) = api::create_api_server(ctx, DEFAULT_API_PORT).await {
+                        // Start the API server with optional analytics
+                        if let Err(e) = api::create_api_server(ctx, db, DEFAULT_API_PORT).await {
                             tracing::error!("API server error: {}", e);
                             state
                                 .add_log("error", &format!("API server error: {}", e), None)

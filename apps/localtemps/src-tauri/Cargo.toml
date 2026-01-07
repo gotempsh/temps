@@ -83,3 +83,19 @@ uuid = { version = "1", features = ["v4", "serde"] }
 bytes = "1"
 rand = "0.8"
 urlencoding = "2"
+
+# ============================================================================
+# Database (SQLite with SeaORM)
+# ============================================================================
+sea-orm = { version = "1.1", features = [
+    "sqlx-sqlite",
+    "runtime-tokio-rustls",
+    "macros",
+    "with-chrono",
+    "with-json",
+    "with-uuid"
+]}
+sea-orm-migration = { version = "1.1", features = [
+    "sqlx-sqlite",
+    "runtime-tokio-rustls"
+]}

@@ -114,4 +114,8 @@
   .animate-spin {
     animation: spin 1s linear infinite;
   }
+
+  .animate-spin-slow {
+    animation: spin 3s linear infinite;
+  }
 }

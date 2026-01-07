@@ -1,12 +1,14 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Loader2, Play, Square, ChevronDown, ChevronUp, Trash2, Database, HardDrive, CheckCircle2, XCircle, AlertCircle, Info } from "lucide-react";
+import { Loader2, Play, Square, ChevronDown, ChevronUp, Trash2, Database, HardDrive, CheckCircle2, XCircle, AlertCircle, Info, Activity } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { CopyButton } from "@/components/ui/copy-button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { AnalyticsInspector } from "@/components/analytics/AnalyticsInspector";
 import { cn } from "@/lib/utils";
 
 interface ServiceStatus {
@@ -376,61 +378,81 @@ function App() {
           </Card>
         )}
 
-        {/* Controls */}
-        <div className="flex gap-3">
-          <Button
-            onClick={startServices}
-            disabled={isStarting || allRunning}
-            className="flex-1"
-            variant={allRunning ? "secondary" : "default"}
-          >
-            {isStarting ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Starting...
-              </>
-            ) : (
-              <>
-                <Play className="h-4 w-4" />
-                Start All Services
-              </>
-            )}
-          </Button>
-          <Button
-            onClick={stopServices}
-            disabled={isStopping || !anyRunning}
-            variant="outline"
-            className="flex-1"
-          >
-            {isStopping ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Stopping...
-              </>
-            ) : (
-              <>
-                <Square className="h-4 w-4" />
-                Stop All Services
-              </>
-            )}
-          </Button>
-        </div>
+        {/* Main Content Tabs */}
+        <Tabs defaultValue="services" className="w-full">
+          <TabsList className="grid w-full grid-cols-2">
+            <TabsTrigger value="services" className="flex items-center gap-2">
+              <Database className="h-4 w-4" />
+              Services
+            </TabsTrigger>
+            <TabsTrigger value="analytics" className="flex items-center gap-2">
+              <Activity className="h-4 w-4" />
+              Analytics
+            </TabsTrigger>
+          </TabsList>
 
-        {/* Services Grid */}
-        <div className="grid gap-4 md:grid-cols-2">
-          {services.map((service) => (
-            <ServiceCard key={service.service_type} service={service} />
-          ))}
-        </div>
+          <TabsContent value="services" className="space-y-6 mt-6">
+            {/* Controls */}
+            <div className="flex gap-3">
+              <Button
+                onClick={startServices}
+                disabled={isStarting || allRunning}
+                className="flex-1"
+                variant={allRunning ? "secondary" : "default"}
+              >
+                {isStarting ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Starting...
+                  </>
+                ) : (
+                  <>
+                    <Play className="h-4 w-4" />
+                    Start All Services
+                  </>
+                )}
+              </Button>
+              <Button
+                onClick={stopServices}
+                disabled={isStopping || !anyRunning}
+                variant="outline"
+                className="flex-1"
+              >
+                {isStopping ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Stopping...
+                  </>
+                ) : (
+                  <>
+                    <Square className="h-4 w-4" />
+                    Stop All Services
+                  </>
+                )}
+              </Button>
+            </div>
 
-        {/* Environment Variables */}
-        {envConfig && <EnvVarsSection config={envConfig} />}
+            {/* Services Grid */}
+            <div className="grid gap-4 md:grid-cols-2">
+              {services.map((service) => (
+                <ServiceCard key={service.service_type} service={service} />
+              ))}
+            </div>
 
-        {/* Activity Log */}
-        <ActivityLog logs={activityLogs} onClear={clearLogs} />
+            {/* Environment Variables */}
+            {envConfig && <EnvVarsSection config={envConfig} />}
 
-        {/* Usage Examples */}
-        <UsageExample />
+            {/* Activity Log */}
+            <ActivityLog logs={activityLogs} onClear={clearLogs} />
+
+            {/* Usage Examples */}
+            <UsageExample />
+          </TabsContent>
+
+          <TabsContent value="analytics" className="mt-6">
+            <AnalyticsInspector />
+          </TabsContent>
+        </Tabs>
 
         {/* Footer */}
         <footer className="text-center text-sm text-muted-foreground pt-4 border-t">
