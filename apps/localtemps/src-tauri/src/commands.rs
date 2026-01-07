@@ -5,6 +5,9 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use bollard::models::ContainerSummaryStateEnum;
+use bollard::query_parameters::ListContainersOptions;
+use bollard::Docker;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tauri::State;
@@ -217,6 +220,132 @@ pub async fn stop_services(state: State<'_, AppState>) -> Result<CommandResult<(
     Ok(CommandResult::ok(()))
 }
 
+/// Check Docker directly for running localtemps containers
+/// This is used when no context exists yet (e.g., at startup)
+async fn check_docker_containers() -> Vec<ServiceStatus> {
+    // Try to connect to Docker
+    let docker = match Docker::connect_with_local_defaults() {
+        Ok(d) => d,
+        Err(e) => {
+            error!("Failed to connect to Docker: {}", e);
+            // Return default stopped status if we can't connect to Docker
+            return vec![
+                ServiceStatus {
+                    name: "Redis (KV)".to_string(),
+                    service_type: "kv".to_string(),
+                    running: false,
+                    port: None,
+                    connection_info: None,
+                },
+                ServiceStatus {
+                    name: "RustFS (Blob)".to_string(),
+                    service_type: "blob".to_string(),
+                    running: false,
+                    port: None,
+                    connection_info: None,
+                },
+            ];
+        }
+    };
+
+    // List all containers (including stopped ones)
+    let containers = match docker
+        .list_containers(Some(ListContainersOptions {
+            all: true,
+            ..Default::default()
+        }))
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to list Docker containers: {}", e);
+            return vec![
+                ServiceStatus {
+                    name: "Redis (KV)".to_string(),
+                    service_type: "kv".to_string(),
+                    running: false,
+                    port: None,
+                    connection_info: None,
+                },
+                ServiceStatus {
+                    name: "RustFS (Blob)".to_string(),
+                    service_type: "blob".to_string(),
+                    running: false,
+                    port: None,
+                    connection_info: None,
+                },
+            ];
+        }
+    };
+
+    // Check for Redis container
+    let mut redis_running = false;
+    let mut redis_port: Option<u16> = None;
+    let mut redis_connection_info: Option<String> = None;
+
+    // Check for RustFS container
+    let mut rustfs_running = false;
+    let mut rustfs_port: Option<u16> = None;
+    let mut rustfs_connection_info: Option<String> = None;
+
+    for container in containers {
+        if let Some(names) = &container.names {
+            // Check Redis container
+            if names.iter().any(|n| n.contains("localtemps-redis")) {
+                redis_running = container.state == Some(ContainerSummaryStateEnum::RUNNING);
+                if redis_running {
+                    if let Some(ports) = &container.ports {
+                        for port in ports {
+                            if port.private_port == 6379 {
+                                if let Some(public_port) = port.public_port {
+                                    redis_port = Some(public_port);
+                                    redis_connection_info =
+                                        Some(format!("redis://localhost:{}", public_port));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check RustFS container
+            if names.iter().any(|n| n.contains("localtemps-rustfs")) {
+                rustfs_running = container.state == Some(ContainerSummaryStateEnum::RUNNING);
+                if rustfs_running {
+                    if let Some(ports) = &container.ports {
+                        for port in ports {
+                            if port.private_port == 9000 {
+                                if let Some(public_port) = port.public_port {
+                                    rustfs_port = Some(public_port);
+                                    rustfs_connection_info =
+                                        Some(format!("http://localhost:{}", public_port));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    vec![
+        ServiceStatus {
+            name: "Redis (KV)".to_string(),
+            service_type: "kv".to_string(),
+            running: redis_running,
+            port: redis_port,
+            connection_info: redis_connection_info,
+        },
+        ServiceStatus {
+            name: "RustFS (Blob)".to_string(),
+            service_type: "blob".to_string(),
+            running: rustfs_running,
+            port: rustfs_port,
+            connection_info: rustfs_connection_info,
+        },
+    ]
+}
+
 /// Get status of all services
 #[tauri::command]
 pub async fn get_services_status(
@@ -227,22 +356,9 @@ pub async fn get_services_status(
         let statuses = ctx.get_service_status().await;
         Ok(CommandResult::ok(statuses))
     } else {
-        Ok(CommandResult::ok(vec![
-            ServiceStatus {
-                name: "Redis (KV)".to_string(),
-                service_type: "kv".to_string(),
-                running: false,
-                port: None,
-                connection_info: None,
-            },
-            ServiceStatus {
-                name: "RustFS (Blob)".to_string(),
-                service_type: "blob".to_string(),
-                running: false,
-                port: None,
-                connection_info: None,
-            },
-        ]))
+        // No context yet - check Docker directly for running containers
+        let statuses = check_docker_containers().await;
+        Ok(CommandResult::ok(statuses))
     }
 }
 

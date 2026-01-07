@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useState, useMemo } from "react"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import { format, formatDistanceToNow } from "date-fns"
 import {
@@ -14,6 +14,8 @@ import {
   Zap,
   ChevronDown,
   ChevronUp,
+  Video,
+  BarChart3,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -22,6 +24,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { JsonViewer } from "@/components/ui/json-viewer"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { CopyButton } from "@/components/ui/copy-button"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { cn } from "@/lib/utils"
 
 const API_BASE = "http://localhost:4000"
@@ -97,6 +100,10 @@ function getEventBadgeVariant(eventType: string, eventName: string | null) {
     default:
       return "default"
   }
+}
+
+function isSessionReplayEvent(event: AnalyticsEvent): boolean {
+  return event.event_type === "session_init" || event.event_type === "session_events"
 }
 
 function EventCard({ event }: { event: AnalyticsEvent }) {
@@ -215,7 +222,23 @@ function EventCard({ event }: { event: AnalyticsEvent }) {
   )
 }
 
-function UsageInstructions() {
+function EventsList({ events }: { events: AnalyticsEvent[] }) {
+  if (events.length === 0) {
+    return null
+  }
+
+  return (
+    <ScrollArea className="h-[calc(100vh-340px)]">
+      <div className="space-y-2 pr-4">
+        {events.map((event) => (
+          <EventCard key={event.id} event={event} />
+        ))}
+      </div>
+    </ScrollArea>
+  )
+}
+
+function AnalyticsEmptyState() {
   const setupCode = `import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics'
 
 function App() {
@@ -242,43 +265,107 @@ function MyComponent() {
 }`
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base flex items-center gap-2">
-          <Activity className="h-4 w-4" />
-          How to Use
-        </CardTitle>
-        <CardDescription>
-          Configure @temps-sdk/react-analytics to send events to LocalTemps
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="space-y-2">
-          <div className="flex items-center justify-between">
-            <h4 className="text-sm font-medium">1. Setup Provider</h4>
-            <CopyButton value={setupCode} size="sm" variant="ghost" className="h-7" />
+    <div className="space-y-4">
+      <Card className="border-dashed">
+        <CardContent className="flex flex-col items-center justify-center py-12 text-center">
+          <BarChart3 className="h-12 w-12 text-muted-foreground mb-4" />
+          <h3 className="text-lg font-medium mb-1">No analytics events yet</h3>
+          <p className="text-sm text-muted-foreground max-w-sm">
+            Configure your app with @temps-sdk/react-analytics to start capturing page views, custom events, and more.
+          </p>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base flex items-center gap-2">
+            <Activity className="h-4 w-4" />
+            How to Use
+          </CardTitle>
+          <CardDescription>
+            Configure @temps-sdk/react-analytics to send events to LocalTemps
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <h4 className="text-sm font-medium">1. Setup Provider</h4>
+              <CopyButton value={setupCode} size="sm" variant="ghost" className="h-7" />
+            </div>
+            <pre className="p-3 rounded-lg bg-muted font-mono text-xs overflow-x-auto">
+              {setupCode}
+            </pre>
           </div>
-          <pre className="p-3 rounded-lg bg-muted font-mono text-xs overflow-x-auto">
-            {setupCode}
-          </pre>
-        </div>
-        <div className="space-y-2">
-          <div className="flex items-center justify-between">
-            <h4 className="text-sm font-medium">2. Track Custom Events</h4>
-            <CopyButton value={trackEventCode} size="sm" variant="ghost" className="h-7" />
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <h4 className="text-sm font-medium">2. Track Custom Events</h4>
+              <CopyButton value={trackEventCode} size="sm" variant="ghost" className="h-7" />
+            </div>
+            <pre className="p-3 rounded-lg bg-muted font-mono text-xs overflow-x-auto">
+              {trackEventCode}
+            </pre>
           </div>
-          <pre className="p-3 rounded-lg bg-muted font-mono text-xs overflow-x-auto">
-            {trackEventCode}
-          </pre>
-        </div>
-      </CardContent>
-    </Card>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+function SessionReplayEmptyState() {
+  const setupCode = `import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics'
+
+function App() {
+  return (
+    <TempsAnalyticsProvider
+      basePath="http://localhost:4000/api/_temps"
+      ignoreLocalhost={false}
+      sessionReplay={true}  // Enable session replay
+    >
+      <YourApp />
+    </TempsAnalyticsProvider>
+  )
+}`
+
+  return (
+    <div className="space-y-4">
+      <Card className="border-dashed">
+        <CardContent className="flex flex-col items-center justify-center py-12 text-center">
+          <Video className="h-12 w-12 text-muted-foreground mb-4" />
+          <h3 className="text-lg font-medium mb-1">No session replay events yet</h3>
+          <p className="text-sm text-muted-foreground max-w-sm">
+            Enable session replay in your analytics provider to capture user interactions, mouse movements, and DOM changes.
+          </p>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base flex items-center gap-2">
+            <Video className="h-4 w-4" />
+            Enable Session Replay
+          </CardTitle>
+          <CardDescription>
+            Add sessionReplay option to your TempsAnalyticsProvider
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <h4 className="text-sm font-medium">Setup with Session Replay</h4>
+              <CopyButton value={setupCode} size="sm" variant="ghost" className="h-7" />
+            </div>
+            <pre className="p-3 rounded-lg bg-muted font-mono text-xs overflow-x-auto">
+              {setupCode}
+            </pre>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
   )
 }
 
 export function AnalyticsInspector() {
   const queryClient = useQueryClient()
   const [autoRefresh, setAutoRefresh] = useState(true)
+  const [activeTab, setActiveTab] = useState<"analytics" | "session-replay">("analytics")
 
   const {
     data: events = [],
@@ -295,6 +382,22 @@ export function AnalyticsInspector() {
     queryFn: fetchEventCount,
     refetchInterval: autoRefresh ? 3000 : false,
   })
+
+  // Separate events into analytics and session replay
+  const { analyticsEvents, sessionReplayEvents } = useMemo(() => {
+    const analytics: AnalyticsEvent[] = []
+    const sessionReplay: AnalyticsEvent[] = []
+
+    for (const event of events) {
+      if (isSessionReplayEvent(event)) {
+        sessionReplay.push(event)
+      } else {
+        analytics.push(event)
+      }
+    }
+
+    return { analyticsEvents: analytics, sessionReplayEvents: sessionReplay }
+  }, [events])
 
   const clearMutation = useMutation({
     mutationFn: clearAllEvents,
@@ -315,7 +418,7 @@ export function AnalyticsInspector() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <h2 className="text-lg font-semibold">Analytics Inspector</h2>
-          <Badge variant="secondary">{eventCount} events</Badge>
+          <Badge variant="secondary">{eventCount} total</Badge>
         </div>
         <div className="flex items-center gap-2">
           <Button
@@ -346,33 +449,50 @@ export function AnalyticsInspector() {
         </div>
       </div>
 
-      {/* Events List */}
-      {isLoading ? (
-        <div className="flex items-center justify-center py-12">
-          <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-        </div>
-      ) : events.length === 0 ? (
-        <div className="space-y-4">
-          <Card className="border-dashed">
-            <CardContent className="flex flex-col items-center justify-center py-12 text-center">
-              <Activity className="h-12 w-12 text-muted-foreground mb-4" />
-              <h3 className="text-lg font-medium mb-1">No events captured yet</h3>
-              <p className="text-sm text-muted-foreground max-w-sm">
-                Configure your app with @temps-sdk/react-analytics to start capturing events.
-              </p>
-            </CardContent>
-          </Card>
-          <UsageInstructions />
-        </div>
-      ) : (
-        <ScrollArea className="h-[calc(100vh-280px)]">
-          <div className="space-y-2 pr-4">
-            {events.map((event) => (
-              <EventCard key={event.id} event={event} />
-            ))}
+      {/* Tabs */}
+      <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as "analytics" | "session-replay")}>
+        <TabsList className="grid w-full grid-cols-2">
+          <TabsTrigger value="analytics" className="flex items-center gap-2">
+            <BarChart3 className="h-4 w-4" />
+            Analytics
+            <Badge variant="secondary" className="ml-1 h-5 px-1.5 text-xs">
+              {analyticsEvents.length}
+            </Badge>
+          </TabsTrigger>
+          <TabsTrigger value="session-replay" className="flex items-center gap-2">
+            <Video className="h-4 w-4" />
+            Session Replay
+            <Badge variant="secondary" className="ml-1 h-5 px-1.5 text-xs">
+              {sessionReplayEvents.length}
+            </Badge>
+          </TabsTrigger>
+        </TabsList>
+
+        {/* Loading State */}
+        {isLoading ? (
+          <div className="flex items-center justify-center py-12">
+            <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
           </div>
-        </ScrollArea>
-      )}
+        ) : (
+          <>
+            <TabsContent value="analytics" className="mt-4">
+              {analyticsEvents.length === 0 ? (
+                <AnalyticsEmptyState />
+              ) : (
+                <EventsList events={analyticsEvents} />
+              )}
+            </TabsContent>
+
+            <TabsContent value="session-replay" className="mt-4">
+              {sessionReplayEvents.length === 0 ? (
+                <SessionReplayEmptyState />
+              ) : (
+                <EventsList events={sessionReplayEvents} />
+              )}
+            </TabsContent>
+          </>
+        )}
+      </Tabs>
     </div>
   )
 }
