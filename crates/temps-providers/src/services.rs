@@ -288,6 +288,12 @@ impl ExternalServiceManager {
                 self.docker.clone(),
                 self.encryption_service.clone(),
             )),
+            // RustFS standalone S3-compatible storage
+            ServiceType::Rustfs => Box::new(RustfsService::new(
+                name,
+                self.docker.clone(),
+                self.encryption_service.clone(),
+            )),
         }
     }
 
@@ -1787,6 +1793,8 @@ impl ExternalServiceManager {
                 ServiceType::Redis
             } else if image.contains("mongo") {
                 ServiceType::Mongodb
+            } else if image.contains("rustfs") {
+                ServiceType::Rustfs
             } else if image.contains("minio") || image.contains("s3") {
                 ServiceType::S3
             } else {
@@ -1944,6 +1952,22 @@ impl ExternalServiceManager {
             ServiceType::Blob => {
                 let rustfs = RustfsService::new(
                     format!("blob-{}", request.name),
+                    Arc::clone(&self.docker),
+                    Arc::clone(&self.encryption_service),
+                );
+                rustfs
+                    .import_from_container(
+                        request.container_id.clone(),
+                        request.name.clone(),
+                        credentials,
+                        additional_config,
+                    )
+                    .await?
+            }
+            // RustFS standalone S3-compatible storage
+            ServiceType::Rustfs => {
+                let rustfs = RustfsService::new(
+                    request.name.clone(),
                     Arc::clone(&self.docker),
                     Arc::clone(&self.encryption_service),
                 );
@@ -3362,6 +3386,24 @@ mod tests {
                 ServiceType::Postgres
             };
             assert_eq!(detected, ServiceType::S3, "Failed for image: {}", image);
+        }
+    }
+
+    #[test]
+    fn test_service_type_detection_rustfs() {
+        let images = vec![
+            "rustfs/rustfs:latest",
+            "rustfs/rustfs:1.0.0-alpha.78",
+            "rustfs/rustfs:1.0.0",
+        ];
+
+        for image in images {
+            let detected = if image.contains("rustfs") {
+                ServiceType::Rustfs
+            } else {
+                ServiceType::Postgres
+            };
+            assert_eq!(detected, ServiceType::Rustfs, "Failed for image: {}", image);
         }
     }
 

@@ -7,7 +7,8 @@ import { ServiceTypeRoute } from '@/api/client/types.gen'
  * - "mongo:latest" → "mongodb"
  * - "redis:7" → "redis"
  * - "mysql:8" → "mysql"
- * - "minio/minio:latest" → "s3"
+ * - "rustfs/rustfs:1.0.0" → "rustfs"
+ * - "minio/minio:latest" → "s3" (legacy)
  */
 export function extractServiceTypeFromImage(image: string): ServiceTypeRoute | null {
   if (!image) return null
@@ -23,8 +24,8 @@ export function extractServiceTypeFromImage(image: string): ServiceTypeRoute | n
     mongo: 'mongodb',
     mongodb: 'mongodb',
     redis: 'redis',
-    minio: 's3',
-    mongodb: 'mongodb',
+    rustfs: 'rustfs',
+    minio: 's3', // Legacy support
   }
 
   return serviceTypeMap[imageName] || null

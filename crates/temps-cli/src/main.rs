@@ -107,6 +107,7 @@ fn main() -> anyhow::Result<()> {
              pingora=warn,\
              sqlx=warn,\
              sea_orm=warn,\
+             sea_orm_migration=warn,\
              h2=warn,\
              tower=warn,\
              hyper=warn,\

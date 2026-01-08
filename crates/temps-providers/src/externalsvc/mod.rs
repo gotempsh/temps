@@ -35,9 +35,11 @@ pub enum ServiceType {
     Postgres,
     Redis,
     S3,
+    /// RustFS S3-compatible object storage (standalone)
+    Rustfs,
     /// Temps KV service (Redis-backed key-value store)
     Kv,
-    /// Temps Blob service (MinIO-backed object storage)
+    /// Temps Blob service (RustFS-backed object storage)
     Blob,
 }
 
@@ -48,6 +50,7 @@ impl std::fmt::Display for ServiceType {
             ServiceType::Postgres => write!(f, "postgres"),
             ServiceType::Redis => write!(f, "redis"),
             ServiceType::S3 => write!(f, "s3"),
+            ServiceType::Rustfs => write!(f, "rustfs"),
             ServiceType::Kv => write!(f, "kv"),
             ServiceType::Blob => write!(f, "blob"),
         }
@@ -62,6 +65,7 @@ impl ServiceType {
             "postgres" => Ok(ServiceType::Postgres),
             "redis" => Ok(ServiceType::Redis),
             "s3" => Ok(ServiceType::S3),
+            "rustfs" => Ok(ServiceType::Rustfs),
             "kv" => Ok(ServiceType::Kv),
             "blob" => Ok(ServiceType::Blob),
             _ => Err(anyhow::anyhow!("Invalid service type: {}", s)),
@@ -75,6 +79,7 @@ impl ServiceType {
             ServiceType::Postgres,
             ServiceType::Redis,
             ServiceType::S3,
+            ServiceType::Rustfs,
             ServiceType::Kv,
             ServiceType::Blob,
         ]

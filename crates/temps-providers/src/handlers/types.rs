@@ -62,8 +62,10 @@ pub enum ServiceTypeRoute {
     S3,
     /// Temps KV service (Redis-backed key-value store)
     Kv,
-    /// Temps Blob service (S3-compatible object storage)
+    /// Temps Blob service (RustFS-backed object storage)
     Blob,
+    /// RustFS S3-compatible object storage (standalone)
+    Rustfs,
 }
 
 impl ServiceTypeRoute {
@@ -76,6 +78,7 @@ impl ServiceTypeRoute {
             "s3" => Ok(ServiceTypeRoute::S3),
             "kv" => Ok(ServiceTypeRoute::Kv),
             "blob" => Ok(ServiceTypeRoute::Blob),
+            "rustfs" => Ok(ServiceTypeRoute::Rustfs),
             _ => Err(anyhow::anyhow!("Invalid service type: {}", s)),
         }
     }
@@ -89,6 +92,7 @@ impl ServiceTypeRoute {
             ServiceTypeRoute::S3,
             ServiceTypeRoute::Kv,
             ServiceTypeRoute::Blob,
+            ServiceTypeRoute::Rustfs,
         ]
     }
 
@@ -109,6 +113,7 @@ impl std::fmt::Display for ServiceTypeRoute {
             ServiceTypeRoute::S3 => write!(f, "s3"),
             ServiceTypeRoute::Kv => write!(f, "kv"),
             ServiceTypeRoute::Blob => write!(f, "blob"),
+            ServiceTypeRoute::Rustfs => write!(f, "rustfs"),
         }
     }
 }
@@ -122,6 +127,7 @@ impl From<ServiceTypeRoute> for crate::externalsvc::ServiceType {
             ServiceTypeRoute::S3 => crate::externalsvc::ServiceType::S3,
             ServiceTypeRoute::Kv => crate::externalsvc::ServiceType::Kv,
             ServiceTypeRoute::Blob => crate::externalsvc::ServiceType::Blob,
+            ServiceTypeRoute::Rustfs => crate::externalsvc::ServiceType::Rustfs,
         }
     }
 }
@@ -135,6 +141,7 @@ impl From<crate::externalsvc::ServiceType> for ServiceTypeRoute {
             crate::externalsvc::ServiceType::S3 => ServiceTypeRoute::S3,
             crate::externalsvc::ServiceType::Kv => ServiceTypeRoute::Kv,
             crate::externalsvc::ServiceType::Blob => ServiceTypeRoute::Blob,
+            crate::externalsvc::ServiceType::Rustfs => ServiceTypeRoute::Rustfs,
         }
     }
 }

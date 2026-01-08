@@ -14,6 +14,7 @@ use tracing::{debug, error};
 use crate::externalsvc::mongodb::MongodbInputConfig;
 use crate::externalsvc::postgres::PostgresInputConfig;
 use crate::externalsvc::redis::RedisInputConfig;
+use crate::externalsvc::rustfs::RustfsConfig;
 use crate::externalsvc::s3::S3InputConfig;
 use crate::ExternalServiceManager;
 
@@ -267,6 +268,32 @@ impl QueryService {
 
                 Arc::new(s3_source)
             }
+            // RustFS standalone: S3-compatible storage with same connection pattern as Blob
+            crate::externalsvc::ServiceType::Rustfs => {
+                let config: RustfsConfig = serde_json::from_value(service.parameters.clone())
+                    .map_err(|e| {
+                        DataError::InvalidConfiguration(format!(
+                            "Failed to parse RustFS (S3) configuration: {}",
+                            e
+                        ))
+                    })?;
+
+                let endpoint = format!("http://{}:{}", config.host, config.port);
+
+                let s3_source = S3Source::new(
+                    &config.region,
+                    Some(&endpoint),
+                    &config.access_key,
+                    &config.secret_key,
+                )
+                .await
+                .map_err(|e| {
+                    error!("Failed to connect to RustFS service {}: {}", service_id, e);
+                    e
+                })?;
+
+                Arc::new(s3_source)
+            }
         };
 
         // Cache the connection (remove old one if force_new)
@@ -414,6 +441,8 @@ impl QueryService {
             crate::externalsvc::ServiceType::Kv => "_kv_root".to_string(),
             // Temps Blob uses S3-compatible storage
             crate::externalsvc::ServiceType::Blob => "_blob_root".to_string(),
+            // RustFS standalone S3-compatible storage
+            crate::externalsvc::ServiceType::Rustfs => "_rustfs_root".to_string(),
         };
 
         // Use retry mechanism for connection errors

@@ -1,7 +1,7 @@
 //! temps-blob: Blob storage service for Temps platform
 //!
 //! Provides S3-compatible blob storage with project isolation.
-//! Uses Bollard to manage MinIO containers on-demand.
+//! Uses RustFS (S3-compatible storage) for high-performance object storage.
 
 pub mod error;
 pub mod handlers;

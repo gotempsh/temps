@@ -95,12 +95,12 @@ function EditDockerImageDialog({
               id="docker-image"
               value={dockerImage}
               onChange={(e) => setDockerImage(e.target.value)}
-              placeholder={serviceName === 'KV Store' ? 'redis:8-alpine' : 'minio/minio:latest'}
+              placeholder={serviceName === 'KV Store' ? 'redis:8-alpine' : 'rustfs/rustfs:1.0.0-alpha.78'}
             />
             <p className="text-xs text-muted-foreground">
               {serviceName === 'KV Store'
                 ? 'Examples: redis:8-alpine, redis:8-alpine, valkey/valkey:8-alpine'
-                : 'Examples: minio/minio:latest, minio/minio:RELEASE.2025-09-07T16-13-09Z'}
+                : 'Examples: rustfs/rustfs:1.0.0-alpha.78, rustfs/rustfs:latest'}
             </p>
           </div>
         </div>
@@ -248,7 +248,7 @@ export function PlatformServices() {
   const currentImage =
     editingService === 'kv'
       ? kvStatus?.docker_image || 'redis:8-alpine'
-      : blobStatus?.docker_image || 'minio/minio:latest'
+      : blobStatus?.docker_image || 'rustfs/rustfs:1.0.0-alpha.78'
 
   return (
     <div className="space-y-6">

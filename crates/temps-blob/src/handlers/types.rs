@@ -221,8 +221,8 @@ pub struct DisableBlobResponse {
 /// Request to update Blob service configuration
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateBlobRequest {
-    /// Docker image to use (e.g., "minio/minio:RELEASE.2025-09-07T16-13-09Z")
-    #[schema(example = "minio/minio:RELEASE.2025-09-07T16-13-09Z")]
+    /// Docker image to use (e.g., "rustfs/rustfs:1.0.0-alpha.78")
+    #[schema(example = "rustfs/rustfs:1.0.0-alpha.78")]
     pub docker_image: Option<String>,
 }
 

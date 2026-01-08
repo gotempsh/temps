@@ -96,6 +96,75 @@ pub struct RustfsConfig {
     pub docker_image: String,
 }
 
+impl RustfsConfig {
+    /// Create a RustfsConfig from input, using async Docker-aware port finding
+    /// Even if ports are provided, validates they are available and finds new ones if not
+    async fn from_input_async(input: RustfsInputConfig, docker: &Docker) -> Self {
+        // For API port: use provided if available, otherwise find a new one
+        let port = match &input.port {
+            Some(p) => {
+                let port_num: u16 = p.parse().unwrap_or(DEFAULT_RUSTFS_API_PORT);
+                // Check if the provided port is actually available
+                if is_port_available_async(docker, port_num).await {
+                    p.clone()
+                } else {
+                    // Port is in use, find a new one
+                    tracing::warn!(
+                        "Provided port {} is not available, finding a new one",
+                        port_num
+                    );
+                    find_available_port_async(docker, DEFAULT_RUSTFS_API_PORT)
+                        .await
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| DEFAULT_RUSTFS_API_PORT.to_string())
+                }
+            }
+            None => find_available_port_async(docker, DEFAULT_RUSTFS_API_PORT)
+                .await
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| DEFAULT_RUSTFS_API_PORT.to_string()),
+        };
+
+        // For console port, start searching after the API port to avoid conflicts
+        let api_port: u16 = port.parse().unwrap_or(DEFAULT_RUSTFS_API_PORT);
+        let console_start = std::cmp::max(api_port + 1, DEFAULT_RUSTFS_CONSOLE_PORT);
+
+        let console_port = match &input.console_port {
+            Some(p) => {
+                let port_num: u16 = p.parse().unwrap_or(DEFAULT_RUSTFS_CONSOLE_PORT);
+                // Check if the provided port is actually available
+                if is_port_available_async(docker, port_num).await {
+                    p.clone()
+                } else {
+                    // Port is in use, find a new one
+                    tracing::warn!(
+                        "Provided console port {} is not available, finding a new one",
+                        port_num
+                    );
+                    find_available_port_async(docker, console_start)
+                        .await
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| DEFAULT_RUSTFS_CONSOLE_PORT.to_string())
+                }
+            }
+            None => find_available_port_async(docker, console_start)
+                .await
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| DEFAULT_RUSTFS_CONSOLE_PORT.to_string()),
+        };
+
+        Self {
+            port,
+            console_port,
+            access_key: input.access_key.unwrap_or_else(default_access_key),
+            secret_key: input.secret_key.unwrap_or_else(default_secret_key),
+            host: input.host,
+            region: input.region,
+            docker_image: input.docker_image,
+        }
+    }
+}
+
 impl From<RustfsInputConfig> for RustfsConfig {
     fn from(input: RustfsInputConfig) -> Self {
         Self {
@@ -198,7 +267,74 @@ fn is_port_available(port: u16) -> bool {
 }
 
 fn find_available_port(start_port: u16) -> Option<u16> {
-    (start_port..start_port + 100).find(|&port| is_port_available(port))
+    (start_port..start_port + 1000).find(|&port| is_port_available(port))
+}
+
+/// Check if a specific port is available (both OS and Docker)
+async fn is_port_available_async(docker: &Docker, port: u16) -> bool {
+    // Check OS-level availability first
+    if !is_port_available(port) {
+        return false;
+    }
+
+    // Check Docker containers
+    let containers = match docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            all: true,
+            ..Default::default()
+        }))
+        .await
+    {
+        Ok(c) => c,
+        Err(_) => return true, // If we can't check Docker, assume available
+    };
+
+    for container in containers {
+        if let Some(port_mappings) = container.ports {
+            for port_mapping in port_mappings {
+                if let Some(public_port) = port_mapping.public_port {
+                    if public_port == port {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    true
+}
+
+/// Async version that checks both OS and Docker port availability
+async fn find_available_port_async(docker: &Docker, start_port: u16) -> Option<u16> {
+    // Get all ports currently used by Docker containers
+    let docker_ports: std::collections::HashSet<u16> = {
+        let containers = match docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: true,
+                ..Default::default()
+            }))
+            .await
+        {
+            Ok(c) => c,
+            Err(_) => return find_available_port(start_port), // Fallback to OS-only check
+        };
+
+        let mut ports = std::collections::HashSet::new();
+        for container in containers {
+            if let Some(port_mappings) = container.ports {
+                for port_mapping in port_mappings {
+                    if let Some(public_port) = port_mapping.public_port {
+                        ports.insert(public_port);
+                    }
+                }
+            }
+        }
+        ports
+    };
+
+    // Find a port that's available both at OS level and not used by Docker
+    (start_port..start_port + 1000)
+        .find(|&port| !docker_ports.contains(&port) && is_port_available(port))
 }
 
 pub struct RustfsService {
@@ -206,6 +342,8 @@ pub struct RustfsService {
     config: Arc<RwLock<Option<RustfsConfig>>>,
     client: Arc<RwLock<Option<Client>>>,
     docker: Arc<Docker>,
+    /// Reserved for encrypting/decrypting credentials when storing to database
+    #[allow(dead_code)]
     encryption_service: Arc<EncryptionService>,
 }
 
@@ -285,26 +423,27 @@ impl RustfsService {
             .await?;
 
         if !containers.is_empty() {
-            // Check if we need to recreate with a new image
-            let existing_image = containers
-                .first()
-                .and_then(|c| c.image.as_deref())
-                .unwrap_or("");
+            let container = containers.first().unwrap();
+            let existing_image = container.image.as_deref().unwrap_or("");
+            let is_running =
+                container.state == Some(bollard::models::ContainerSummaryStateEnum::RUNNING);
 
-            if existing_image == config.docker_image {
+            // Check if container is running with same image - if so, we're good
+            if existing_image == config.docker_image && is_running {
                 info!(
-                    "Container {} already exists with same image",
+                    "Container {} already exists and is running with same image",
                     container_name
                 );
                 return Ok(());
             }
 
+            // Container exists but is not running or has different image - remove and recreate
             info!(
-                "Container {} already exists with different image (current: {}, requested: {}), removing it to recreate",
-                container_name, existing_image, config.docker_image
+                "Container {} exists (running: {}, image: {}) but needs to be recreated (requested image: {})",
+                container_name, is_running, existing_image, config.docker_image
             );
 
-            // Stop the container first
+            // Stop the container first (ignore errors if already stopped)
             let _ = docker
                 .stop_container(&container_name, None::<StopContainerOptions>)
                 .await;
@@ -329,10 +468,10 @@ impl RustfsService {
             (name_label_key.as_str(), self.name.as_str()),
         ]);
 
-        // RustFS uses RUSTFS_ROOT_USER and RUSTFS_ROOT_PASSWORD environment variables
+        // RustFS uses RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY environment variables
         let env_vars = [
-            format!("RUSTFS_ROOT_USER={}", config.access_key),
-            format!("RUSTFS_ROOT_PASSWORD={}", config.secret_key),
+            format!("RUSTFS_ACCESS_KEY={}", config.access_key),
+            format!("RUSTFS_SECRET_KEY={}", config.secret_key),
         ];
 
         ensure_network_exists(docker)
@@ -404,17 +543,17 @@ impl RustfsService {
                 }),
                 ..host_config
             }),
-            // RustFS healthcheck - use curl to check if the service is ready
+            // RustFS healthcheck - check if the health endpoint is responding
             healthcheck: Some(bollard::models::HealthConfig {
                 test: Some(vec![
                     "CMD-SHELL".to_string(),
-                    "curl -f http://localhost:9000/minio/health/live || exit 1".to_string(),
+                    "curl -sf http://localhost:9000/health > /dev/null || exit 1".to_string(),
                 ]),
-                interval: Some(1000000000), // 1 second
-                timeout: Some(3000000000),  // 3 seconds
+                interval: Some(2000000000), // 2 seconds
+                timeout: Some(5000000000),  // 5 seconds
                 retries: Some(3),
-                start_period: Some(5000000000),   // 5 seconds
-                start_interval: Some(1000000000), // 1 second
+                start_period: Some(10000000000),  // 10 seconds
+                start_interval: Some(2000000000), // 2 seconds
             }),
             ..Default::default()
         };
@@ -514,8 +653,8 @@ impl ExternalService for RustfsService {
         let input_config: RustfsInputConfig = serde_json::from_value(config.parameters.clone())
             .context("Failed to parse RustFS configuration")?;
 
-        // Convert to runtime config
-        let runtime_config = RustfsConfig::from(input_config);
+        // Convert to runtime config using async Docker-aware port finding
+        let runtime_config = RustfsConfig::from_input_async(input_config, &self.docker).await;
 
         // Create container
         self.create_container(&self.docker, &runtime_config).await?;

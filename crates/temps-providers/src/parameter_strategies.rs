@@ -367,6 +367,169 @@ impl ParameterStrategy for S3ParameterStrategy {
     }
 }
 
+/// RustFS/Blob parameter strategy (high-performance S3-compatible storage)
+pub struct RustfsParameterStrategy;
+
+impl ParameterStrategy for RustfsParameterStrategy {
+    fn validate_for_creation(&self, _params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        // RustFS doesn't require parameters for creation
+        Ok(())
+    }
+
+    fn auto_generate_missing(&self, params: &mut HashMap<String, JsonValue>) -> Result<(), String> {
+        // Auto-assign port if not provided
+        if is_empty_value(params.get("port")) {
+            if let Some(port) = find_available_port(9000) {
+                params.insert("port".to_string(), JsonValue::String(port.to_string()));
+            }
+        }
+
+        // Auto-assign console_port if not provided
+        // IMPORTANT: Start search AFTER the API port to avoid assigning the same port
+        if is_empty_value(params.get("console_port")) {
+            let api_port: u16 = params
+                .get("port")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(9000);
+            // Start searching from max(api_port + 1, 9001) to ensure different port
+            let console_start = std::cmp::max(api_port + 1, 9001);
+            if let Some(port) = find_available_port(console_start) {
+                params.insert(
+                    "console_port".to_string(),
+                    JsonValue::String(port.to_string()),
+                );
+            }
+        }
+
+        // Default docker_image if not provided
+        if is_empty_value(params.get("docker_image")) {
+            params.insert(
+                "docker_image".to_string(),
+                JsonValue::String("rustfs/rustfs:1.0.0-alpha.78".to_string()),
+            );
+        }
+
+        // Default host if not provided
+        if is_empty_value(params.get("host")) {
+            params.insert(
+                "host".to_string(),
+                JsonValue::String("localhost".to_string()),
+            );
+        }
+
+        // Default region if not provided
+        if is_empty_value(params.get("region")) {
+            params.insert(
+                "region".to_string(),
+                JsonValue::String("us-east-1".to_string()),
+            );
+        }
+
+        // Auto-generate access_key if not provided
+        if is_empty_value(params.get("access_key")) {
+            params.insert(
+                "access_key".to_string(),
+                JsonValue::String(generate_access_key()),
+            );
+        }
+
+        // Auto-generate secret_key if not provided
+        if is_empty_value(params.get("secret_key")) {
+            params.insert(
+                "secret_key".to_string(),
+                JsonValue::String(generate_secret_key()),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn validate_for_update(&self, updates: &HashMap<String, JsonValue>) -> Result<(), String> {
+        for key in updates.keys() {
+            if !self.updateable_keys().contains(&key.as_str()) {
+                return Err(format!(
+                    "Cannot update parameter '{}' for RustFS/Blob. Read-only parameters: {}. Updateable parameters: {}",
+                    key,
+                    self.readonly_keys().join(", "),
+                    self.updateable_keys().join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn updateable_keys(&self) -> Vec<&'static str> {
+        vec!["port", "console_port", "docker_image"]
+    }
+
+    fn readonly_keys(&self) -> Vec<&'static str> {
+        vec!["access_key", "secret_key", "host", "region"]
+    }
+
+    fn merge_updates(
+        &self,
+        existing: &mut HashMap<String, JsonValue>,
+        updates: HashMap<String, JsonValue>,
+    ) -> Result<(), String> {
+        self.validate_for_update(&updates)?;
+
+        for (key, value) in updates {
+            existing.insert(key, value);
+        }
+        Ok(())
+    }
+
+    fn get_schema(&self) -> Option<JsonValue> {
+        Some(json!({
+            "type": "object",
+            "title": "RustFS/Blob Parameters",
+            "properties": {
+                "access_key": {
+                    "type": "string",
+                    "description": "Access key (read-only after creation, auto-generated)",
+                    "example": "AKIAIOSFODNN7EXAMPLE"
+                },
+                "secret_key": {
+                    "type": "string",
+                    "description": "Secret key (read-only after creation, auto-generated)",
+                    "example": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+                },
+                "host": {
+                    "type": "string",
+                    "description": "Host address (read-only after creation)",
+                    "default": "localhost"
+                },
+                "region": {
+                    "type": "string",
+                    "description": "S3 region (read-only after creation)",
+                    "default": "us-east-1"
+                },
+                "port": {
+                    "type": "integer",
+                    "description": "API port (updateable)",
+                    "default": 9000
+                },
+                "console_port": {
+                    "type": "integer",
+                    "description": "Console port (updateable)",
+                    "default": 9001
+                },
+                "docker_image": {
+                    "type": "string",
+                    "description": "Docker image (updateable)",
+                    "default": "rustfs/rustfs:1.0.0-alpha.78"
+                }
+            },
+            "readonly": ["access_key", "secret_key", "host", "region"]
+        }))
+    }
+
+    fn service_name(&self) -> &'static str {
+        "RustFS/Blob"
+    }
+}
+
 /// MongoDB parameter strategy
 pub struct MongodbParameterStrategy;
 
@@ -492,6 +655,10 @@ pub fn get_strategy(service_type: &str) -> Option<Box<dyn ParameterStrategy>> {
         "redis" => Some(Box::new(RedisParameterStrategy)),
         "s3" => Some(Box::new(S3ParameterStrategy)),
         "mongodb" => Some(Box::new(MongodbParameterStrategy)),
+        // RustFS is used for both standalone rustfs and temps blob service
+        "rustfs" | "blob" => Some(Box::new(RustfsParameterStrategy)),
+        // KV service uses Redis backend
+        "kv" => Some(Box::new(RedisParameterStrategy)),
         _ => None,
     }
 }
@@ -509,7 +676,9 @@ fn is_empty_value(value: Option<&JsonValue>) -> bool {
 
 fn find_available_port(start_port: u16) -> Option<u16> {
     use std::net::TcpListener;
-    (start_port..start_port + 100).find(|&port| TcpListener::bind(("0.0.0.0", port)).is_ok())
+    // Simple OS-level port check - Docker port conflicts will be handled at container creation time
+    // with proper error handling and retry logic
+    (start_port..start_port + 1000).find(|&port| TcpListener::bind(("0.0.0.0", port)).is_ok())
 }
 
 fn generate_secure_password() -> String {
@@ -518,6 +687,26 @@ fn generate_secure_password() -> String {
     let charset: &[u8] =
         b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*_-+=";
     (0..32)
+        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .collect()
+}
+
+/// Generate an S3-style access key (20 uppercase alphanumeric characters)
+fn generate_access_key() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let charset: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    (0..20)
+        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .collect()
+}
+
+/// Generate an S3-style secret key (40 alphanumeric characters with special chars)
+fn generate_secret_key() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let charset: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
+    (0..40)
         .map(|_| charset[rng.gen_range(0..charset.len())] as char)
         .collect()
 }

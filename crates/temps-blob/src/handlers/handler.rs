@@ -439,7 +439,7 @@ pub async fn blob_status(
                 .and_then(|p| p.get("docker_image").cloned())
                 .and_then(|v| v.as_str().map(String::from));
 
-            // Extract version from docker_image tag (e.g., "minio/minio:RELEASE.2025-01-01" -> "RELEASE.2025-01-01")
+            // Extract version from docker_image tag (e.g., "rustfs/rustfs:1.0.0" -> "1.0.0")
             // This ensures the version always matches the actual docker image being used
             let version = docker_image
                 .as_ref()
@@ -572,7 +572,7 @@ pub async fn blob_enable(
             parameters.insert("secret_key".to_string(), serde_json::json!(root_password));
         }
 
-        // Extract version from docker_image (e.g., "minio/minio:RELEASE.2025-01-01" -> "RELEASE.2025-01-01")
+        // Extract version from docker_image (e.g., "rustfs/rustfs:1.0.0" -> "1.0.0")
         let version = parameters
             .get("docker_image")
             .and_then(|v| v.as_str())
@@ -581,10 +581,10 @@ pub async fn blob_enable(
             .or_else(|| Some("latest".to_string())); // Default version
 
         // Create service request for ExternalServiceManager
-        // Using S3 service type since Blob is S3-compatible storage
+        // Using Blob service type which uses RustfsService (high-performance S3-compatible storage)
         let create_request = CreateExternalServiceRequest {
             name: "temps-blob".to_string(),
-            service_type: ServiceType::S3,
+            service_type: ServiceType::Blob,
             version,
             parameters,
         };

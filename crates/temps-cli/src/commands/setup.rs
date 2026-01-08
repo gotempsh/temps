@@ -31,7 +31,7 @@ use temps_domains::DomainService;
 use temps_entities::{
     dns_providers, domains, git_provider_connections, git_providers, roles, user_roles, users,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Supported DNS providers
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -363,7 +363,7 @@ async fn create_dns_provider(
         .await?;
 
     if let Some(provider) = existing {
-        info!("DNS provider '{}' already exists", provider_type_str);
+        debug!("DNS provider '{}' already exists", provider_type_str);
         return Ok(provider);
     }
 
@@ -415,7 +415,7 @@ async fn create_git_provider(
         .await?;
 
     let provider = if let Some(provider) = existing {
-        info!("GitHub provider already exists");
+        debug!("GitHub provider already exists");
         provider
     } else {
         // Encrypt the token in auth_config
@@ -456,7 +456,7 @@ async fn create_git_provider(
         .await?;
 
     let connection = if let Some(connection) = existing_connection {
-        info!("GitHub connection for '{}' already exists", github_username);
+        debug!("GitHub connection for '{}' already exists", github_username);
         connection
     } else {
         // Encrypt the PAT token for the connection
@@ -727,7 +727,7 @@ impl SetupCommand {
     pub fn execute(self) -> anyhow::Result<()> {
         print_header();
 
-        info!("Starting Temps setup");
+        debug!("Starting Temps setup");
 
         // Get data directory
         let data_dir = get_data_dir(&self.data_dir)?;
@@ -755,9 +755,59 @@ impl SetupCommand {
 
         // Establish database connection (this also runs migrations)
         print_section("Database Setup");
-        println!("   Connecting to database and running migrations...");
+        print_substep("Checking database connectivity...");
 
-        let db = rt.block_on(temps_database::establish_connection(&self.database_url))?;
+        let db = match rt.block_on(temps_database::establish_connection(&self.database_url)) {
+            Ok(db) => {
+                print_substep(&format!("{} Database reachable", "✓".bright_green()));
+                print_substep("Running migrations...");
+                print_substep(&format!("{} Migrations applied", "✓".bright_green()));
+                db
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                // Provide more helpful error messages based on the error type
+                if error_msg.contains("Cannot connect to database")
+                    || error_msg.contains("timed out")
+                {
+                    println!();
+                    println!(
+                        "{}",
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_red()
+                    );
+                    println!(
+                        "   {} {}",
+                        "❌".bright_red(),
+                        "Database connection failed".bright_red().bold()
+                    );
+                    println!(
+                        "{}",
+                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━".bright_red()
+                    );
+                    println!();
+                    println!("   {}", error_msg.bright_white());
+                    println!();
+                    println!("   {} Please check:", "💡".bright_yellow());
+                    println!("      {} The database server is running", "•".bright_cyan());
+                    println!(
+                        "      {} The host and port in DATABASE_URL are correct",
+                        "•".bright_cyan()
+                    );
+                    println!(
+                        "      {} Firewall rules allow the connection",
+                        "•".bright_cyan()
+                    );
+                    println!(
+                        "      {} The database URL format: postgres://user:pass@host:port/db",
+                        "•".bright_cyan()
+                    );
+                    println!();
+                    return Err(anyhow::anyhow!("Database connection failed: {}", error_msg));
+                } else {
+                    return Err(anyhow::anyhow!("Database error: {}", error_msg));
+                }
+            }
+        };
         print_success("Database connected and migrations applied");
 
         // Initialize roles (admin, user)
@@ -1768,7 +1818,7 @@ fn finish_setup(
     );
     println!();
 
-    info!("Setup completed successfully");
+    debug!("Setup completed successfully");
     Ok(())
 }
 

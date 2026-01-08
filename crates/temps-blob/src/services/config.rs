@@ -3,27 +3,27 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-/// Default MinIO Docker image (use dated release for reproducibility)
-pub const DEFAULT_MINIO_IMAGE: &str = "minio/minio:RELEASE.2025-09-07T16-13-09Z";
+/// Default RustFS Docker image
+pub const DEFAULT_RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0-alpha.78";
 /// Default container name
-pub const DEFAULT_CONTAINER_NAME: &str = "temps-blob-minio";
+pub const DEFAULT_CONTAINER_NAME: &str = "temps-blob-rustfs";
 /// Default volume name
-pub const DEFAULT_VOLUME_NAME: &str = "temps-blob-minio_data";
+pub const DEFAULT_VOLUME_NAME: &str = "temps-blob-rustfs_data";
 /// Default bucket name
 pub const DEFAULT_BUCKET_NAME: &str = "temps-blobs";
 
 /// User-provided configuration for Blob service (with defaults)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BlobInputConfig {
-    /// Docker image to use (e.g., "minio/minio:RELEASE.2025-09-07T16-13-09Z")
+    /// Docker image to use (e.g., "rustfs/rustfs:1.0.0-alpha.78")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_image: Option<String>,
 
-    /// Host port for MinIO API (0 = auto-assign)
+    /// Host port for RustFS API (0 = auto-assign)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_port: Option<u16>,
 
-    /// Host port for MinIO Console (0 = auto-assign)
+    /// Host port for RustFS Console (0 = auto-assign)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub console_port: Option<u16>,
 
@@ -42,10 +42,10 @@ pub struct BlobConfig {
     /// Docker image name with tag
     pub docker_image: String,
 
-    /// Host port for MinIO API (0 = auto-assign on creation)
+    /// Host port for RustFS API (0 = auto-assign on creation)
     pub api_port: u16,
 
-    /// Host port for MinIO Console (0 = auto-assign on creation)
+    /// Host port for RustFS Console (0 = auto-assign on creation)
     pub console_port: u16,
 
     /// Root user (access key)
@@ -67,7 +67,7 @@ pub struct BlobConfig {
 impl Default for BlobConfig {
     fn default() -> Self {
         Self {
-            docker_image: DEFAULT_MINIO_IMAGE.to_string(),
+            docker_image: DEFAULT_RUSTFS_IMAGE.to_string(),
             api_port: 0,     // Auto-assign
             console_port: 0, // Auto-assign
             root_user: generate_access_key(),
@@ -84,7 +84,7 @@ impl From<BlobInputConfig> for BlobConfig {
         Self {
             docker_image: input
                 .docker_image
-                .unwrap_or_else(|| DEFAULT_MINIO_IMAGE.to_string()),
+                .unwrap_or_else(|| DEFAULT_RUSTFS_IMAGE.to_string()),
             api_port: input.api_port.unwrap_or(0),
             console_port: input.console_port.unwrap_or(0),
             root_user: input.root_user.unwrap_or_else(generate_access_key),
@@ -111,11 +111,13 @@ impl BlobConfig {
     }
 
     /// Get the version from the image tag
-    /// MinIO uses release dates: "RELEASE.2024-11-07T00-52-20Z" -> "2024-11-07"
+    /// Examples:
+    /// - RustFS: "1.0.0-alpha.78" -> "1.0.0-alpha.78"
+    /// - Legacy MinIO: "RELEASE.2024-11-07T00-52-20Z" -> "2024-11-07"
     pub fn version(&self) -> String {
         let tag = self.image_tag();
         if tag.starts_with("RELEASE.") {
-            // Extract date: RELEASE.2024-11-07T00-52-20Z -> 2024-11-07
+            // Extract date from legacy MinIO format: RELEASE.2024-11-07T00-52-20Z -> 2024-11-07
             tag.strip_prefix("RELEASE.")
                 .and_then(|s| s.split('T').next())
                 .unwrap_or(tag)
@@ -151,10 +153,10 @@ mod tests {
     #[test]
     fn test_blob_config_default() {
         let config = BlobConfig::default();
-        assert_eq!(config.docker_image, DEFAULT_MINIO_IMAGE);
+        assert_eq!(config.docker_image, DEFAULT_RUSTFS_IMAGE);
         assert_eq!(config.api_port, 0);
         assert_eq!(config.console_port, 0);
-        assert_eq!(config.container_name, "temps-blob-minio");
+        assert_eq!(config.container_name, "temps-blob-rustfs");
         assert_eq!(config.bucket_name, "temps-blobs");
         // Root user and password should be generated
         assert!(!config.root_user.is_empty());
@@ -164,7 +166,7 @@ mod tests {
     #[test]
     fn test_blob_input_config_to_config() {
         let input = BlobInputConfig {
-            docker_image: Some("minio/minio:RELEASE.2024-12-01T00-00-00Z".to_string()),
+            docker_image: Some("rustfs/rustfs:1.0.0".to_string()),
             api_port: Some(9002),
             console_port: Some(9003),
             root_user: Some("myuser".to_string()),
@@ -172,10 +174,7 @@ mod tests {
         };
 
         let config: BlobConfig = input.into();
-        assert_eq!(
-            config.docker_image,
-            "minio/minio:RELEASE.2024-12-01T00-00-00Z"
-        );
+        assert_eq!(config.docker_image, "rustfs/rustfs:1.0.0");
         assert_eq!(config.api_port, 9002);
         assert_eq!(config.console_port, 9003);
         assert_eq!(config.root_user, "myuser");
@@ -187,7 +186,7 @@ mod tests {
         let input = BlobInputConfig::default();
         let config: BlobConfig = input.into();
 
-        assert_eq!(config.docker_image, DEFAULT_MINIO_IMAGE);
+        assert_eq!(config.docker_image, DEFAULT_RUSTFS_IMAGE);
         assert_eq!(config.api_port, 0);
         // Generated credentials should not be empty
         assert!(!config.root_user.is_empty());
@@ -197,20 +196,24 @@ mod tests {
     #[test]
     fn test_image_name_and_tag() {
         let config = BlobConfig {
-            docker_image: "minio/minio:RELEASE.2024-11-07T00-52-20Z".to_string(),
+            docker_image: "rustfs/rustfs:1.0.0-alpha.78".to_string(),
             ..Default::default()
         };
 
-        assert_eq!(config.image_name(), "minio/minio");
-        assert_eq!(config.image_tag(), "RELEASE.2024-11-07T00-52-20Z");
+        assert_eq!(config.image_name(), "rustfs/rustfs");
+        assert_eq!(config.image_tag(), "1.0.0-alpha.78");
     }
 
     #[test]
     fn test_version_extraction() {
         let tests = vec![
+            // RustFS versions
+            ("rustfs/rustfs:1.0.0-alpha.78", "1.0.0-alpha.78"),
+            ("rustfs/rustfs:1.0.0", "1.0.0"),
+            ("rustfs/rustfs:latest", "latest"),
+            // Legacy MinIO versions (backward compatibility)
             ("minio/minio:RELEASE.2025-09-07T16-13-09Z", "2025-09-07"),
             ("minio/minio:RELEASE.2024-11-07T00-52-20Z", "2024-11-07"),
-            ("minio/minio:latest", "latest"),
         ];
 
         for (image, expected_version) in tests {

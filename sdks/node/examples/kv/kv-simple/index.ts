@@ -99,11 +99,11 @@ async function main() {
     const matchingKeys = await client.keys('example:*');
     console.log(`✅ KEYS result:`, matchingKeys, '\n');
 
-    // Cleanup
-    if (matchingKeys.length > 0) {
-      const cleaned = await client.del(...matchingKeys);
-      console.log(`🧹 Cleaned up ${cleaned} key(s)`);
-    }
+    // // Cleanup
+    // if (matchingKeys.length > 0) {
+    //   const cleaned = await client.del(...matchingKeys);
+    //   console.log(`🧹 Cleaned up ${cleaned} key(s)`);
+    // }
 
   } catch (err) {
     if (err instanceof KVError) {
