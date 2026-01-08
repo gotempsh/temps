@@ -119,7 +119,7 @@ const baseNavItems: NavItem[] = [
   {
     title: 'Error Tracking',
     url: 'errors',
-    icon: Shield,
+    icon: ShieldAlert,
     kbd: 'E',
   },
   {

@@ -31,10 +31,22 @@ pub struct ServeCommand {
     /// Console/Admin address (defaults to random port on localhost)
     #[arg(long, env = "TEMPS_CONSOLE_ADDRESS")]
     pub console_address: Option<String>,
+
+    /// Screenshot provider to use: "local" (headless Chrome), "remote", or "noop" (disabled)
+    /// Use "noop" on servers without Chrome installed to skip screenshot functionality
+    #[arg(long, env = "TEMPS_SCREENSHOT_PROVIDER", value_parser = ["local", "remote", "noop", "disabled", "none"])]
+    pub screenshot_provider: Option<String>,
 }
 
 impl ServeCommand {
     pub fn execute(self) -> anyhow::Result<()> {
+        // Set screenshot provider from CLI flag (takes precedence over env var)
+        // This allows: temps serve --screenshot-provider=noop
+        if let Some(ref provider) = self.screenshot_provider {
+            std::env::set_var("TEMPS_SCREENSHOT_PROVIDER", provider);
+            debug!("Screenshot provider set to '{}' from CLI flag", provider);
+        }
+
         let serve_config = Arc::new(temps_config::ServerConfig::new(
             self.address.clone(),
             self.database_url.clone(),
