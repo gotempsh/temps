@@ -22,7 +22,9 @@ use temps_dns::providers::credentials::{
     AzureCredentials, CloudflareCredentials, DigitalOceanCredentials, GcpCredentials,
     ProviderCredentials, Route53Credentials,
 };
-use temps_domains::dns_provider::{CloudflareDnsProvider, DnsProviderService};
+use temps_domains::dns_provider::{
+    CloudflareDnsProvider, DnsPropagationChecker, DnsProviderService,
+};
 use temps_domains::tls::providers::LetsEncryptProvider;
 use temps_domains::tls::repository::DefaultCertificateRepository;
 use temps_domains::DomainService;
@@ -634,19 +636,6 @@ fn print_substep(description: &str) {
     println!("       {} {}", "→".bright_cyan(), description);
 }
 
-fn print_progress_bar(label: &str, progress: u32, total: u32) {
-    let percentage = (progress as f32 / total as f32 * 100.0) as u32;
-    let filled = (progress as f32 / total as f32 * 20.0) as usize;
-    let empty = 20 - filled;
-    let bar = format!(
-        "[{}{}]",
-        "█".repeat(filled).bright_green(),
-        "░".repeat(empty).bright_black()
-    );
-    print!("\r       {} {} {}%  ", label, bar, percentage);
-    std::io::stdout().flush().ok();
-}
-
 fn print_spinner_step(description: &str) {
     print!("       {} {}... ", "⏳".bright_yellow(), description);
     std::io::stdout().flush().ok();
@@ -1242,6 +1231,27 @@ impl SetupCommand {
 
         // Step 5: Auto-provision DNS TXT records via Cloudflare
         print_step(5, 8, "Creating DNS TXT records via Cloudflare");
+
+        // First, clean up any existing TXT records from previous challenge attempts
+        // This ensures we don't have stale records that could interfere with validation
+        let unique_txt_names: std::collections::HashSet<_> = challenge_data
+            .txt_records
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+
+        for txt_name in &unique_txt_names {
+            print_substep(&format!(
+                "Cleaning up old TXT records for: {}",
+                txt_name.bright_cyan()
+            ));
+            if let Err(e) = rt.block_on(cf_provider.remove_txt_record(&base_domain, txt_name)) {
+                warn!("Failed to clean up old TXT records for {}: {}", txt_name, e);
+                // Continue anyway - old records might not exist
+            }
+        }
+
+        // Now create all the new TXT records for the current challenge
         for (idx, txt_record) in challenge_data.txt_records.iter().enumerate() {
             print_substep(&format!(
                 "Adding TXT record {}/{}: {}",
@@ -1265,17 +1275,95 @@ impl SetupCommand {
         print_substep(&format!("{} All TXT records created", "✓".bright_green()));
         println!();
 
-        // Step 6: Wait for DNS propagation with progress bar
-        print_step(6, 8, "Waiting for DNS propagation");
-        let propagation_seconds = self.dns_propagation_wait;
-        for i in 0..=propagation_seconds {
-            print_progress_bar("DNS propagation", i, propagation_seconds);
-            if i < propagation_seconds {
-                std::thread::sleep(std::time::Duration::from_secs(1));
+        // Step 6: Wait for DNS propagation with active verification using multiple DNS servers
+        print_step(6, 8, "Verifying DNS propagation across multiple servers");
+        let propagation_checker = DnsPropagationChecker::new();
+
+        // Build the full record name for checking (e.g., _acme-challenge.app.example.com)
+        let expected_values: Vec<String> = challenge_data
+            .txt_records
+            .iter()
+            .map(|r| r.value.clone())
+            .collect();
+
+        // Get the TXT record name (should be the same for all records in a wildcard challenge)
+        let txt_record_name = if let Some(first_txt) = challenge_data.txt_records.first() {
+            first_txt.name.clone()
+        } else {
+            format!("_acme-challenge.{}", self.wildcard_domain)
+        };
+
+        print_substep(&format!(
+            "Checking TXT record: {}",
+            txt_record_name.bright_cyan()
+        ));
+        print_substep(&format!(
+            "Expected {} value(s), requiring 50% server agreement",
+            expected_values.len()
+        ));
+
+        // Use active propagation verification with polling
+        // Wait up to dns_propagation_wait seconds, polling every 10 seconds
+        // Require at least 50% of DNS servers to see all records
+        let propagation_result = rt.block_on(propagation_checker.wait_for_propagation(
+            &txt_record_name,
+            &expected_values,
+            50, // min_propagation_percent
+            self.dns_propagation_wait,
+            10, // poll_interval_seconds
+        ));
+
+        match propagation_result {
+            Some(result) => {
+                // Display per-server results
+                println!();
+                print_substep("DNS Server Propagation Status:");
+                for server_result in &result.server_results {
+                    let status_icon = if server_result.found {
+                        "✓".bright_green()
+                    } else {
+                        "✗".bright_red()
+                    };
+                    let error_info = server_result
+                        .error
+                        .as_ref()
+                        .map(|e| format!(" ({})", e))
+                        .unwrap_or_default();
+                    print_substep(&format!(
+                        "   {} {} ({}): {}{}",
+                        status_icon,
+                        server_result.server_name,
+                        server_result.server_ip.bright_black(),
+                        if server_result.found {
+                            "Found".bright_green()
+                        } else {
+                            "Not found".bright_yellow()
+                        },
+                        error_info.bright_black()
+                    ));
+                }
+
+                if result.is_propagated {
+                    print_substep(&format!(
+                        "{} DNS propagation verified: {}% of servers see the records",
+                        "✓".bright_green(),
+                        result.propagation_percentage
+                    ));
+                } else {
+                    print_substep(&format!(
+                        "{} Partial propagation: {}% of servers see the records (proceeding anyway)",
+                        "⚠".bright_yellow(),
+                        result.propagation_percentage
+                    ));
+                }
+            }
+            None => {
+                print_substep(&format!(
+                    "{} DNS propagation verification timed out (proceeding anyway)",
+                    "⚠".bright_yellow()
+                ));
             }
         }
-        println!(); // New line after progress bar
-        print_substep(&format!("{} DNS propagation complete", "✓".bright_green()));
         println!();
 
         // Step 7: Complete challenge and get certificate (with retries)
@@ -1285,19 +1373,119 @@ impl SetupCommand {
         let max_retries = self.ssl_max_retries;
         let retry_wait_seconds = self.ssl_retry_wait;
 
+        // Store the current challenge data - will be updated on retry if we need a new order
+        let mut current_challenge_data = challenge_data.clone();
+
         for attempt in 1..=max_retries {
             if attempt > 1 {
                 print_substep(&format!(
-                    "Retry {}/{} - waiting {} seconds for DNS propagation...",
+                    "Retry {}/{} - creating new ACME order and waiting {} seconds for DNS propagation...",
                     attempt, max_retries, retry_wait_seconds
                 ));
-                for i in 0..=retry_wait_seconds {
-                    print_progress_bar("Waiting", i, retry_wait_seconds);
-                    if i < retry_wait_seconds {
-                        std::thread::sleep(std::time::Duration::from_secs(1));
+
+                // CRITICAL: On retry, we need to cancel the old order and create a new one
+                // ACME orders move to 'invalid' state after validation failure and cannot be reused
+                print_substep("Canceling previous order and requesting fresh challenge...");
+                if let Err(e) = rt.block_on(domain_service.cancel_order(&self.wildcard_domain)) {
+                    warn!("Failed to cancel previous order (may not exist): {}", e);
+                }
+
+                // Request a new challenge (this creates a new ACME order)
+                match rt.block_on(
+                    domain_service.request_challenge(&self.wildcard_domain, &self.admin_email),
+                ) {
+                    Ok(new_challenge) => {
+                        if new_challenge.status == "completed" {
+                            // Certificate was issued immediately (unlikely but possible)
+                            print_substep(&format!(
+                                "{} Certificate provisioned!",
+                                "✓".bright_green()
+                            ));
+                            certificate_success = true;
+                            break;
+                        }
+
+                        // Update DNS TXT records for the new challenge
+                        print_substep("Updating DNS TXT records for new challenge...");
+
+                        // First, clean up old TXT records
+                        for txt_record in &current_challenge_data.txt_records {
+                            if let Err(e) = rt.block_on(
+                                cf_provider.remove_txt_record(&base_domain, &txt_record.name),
+                            ) {
+                                warn!("Failed to remove old TXT record {}: {}", txt_record.name, e);
+                            }
+                        }
+
+                        // Add new TXT records
+                        for txt_record in &new_challenge.txt_records {
+                            if let Err(e) = rt.block_on(cf_provider.set_txt_record(
+                                &base_domain,
+                                &txt_record.name,
+                                &txt_record.value,
+                            )) {
+                                warn!("Failed to create TXT record {}: {}", txt_record.name, e);
+                            }
+                        }
+
+                        current_challenge_data = new_challenge;
+                        print_substep(&format!("{} New TXT records created", "✓".bright_green()));
+                    }
+                    Err(e) => {
+                        print_substep(&format!(
+                            "{} Failed to create new challenge: {}",
+                            "⚠".bright_yellow(),
+                            e
+                        ));
+                        // Continue with wait and retry anyway
                     }
                 }
-                println!();
+
+                // Wait for DNS propagation with active verification
+                print_substep("Verifying DNS propagation for retry...");
+                let retry_expected_values: Vec<String> = current_challenge_data
+                    .txt_records
+                    .iter()
+                    .map(|r| r.value.clone())
+                    .collect();
+                let retry_txt_name = current_challenge_data
+                    .txt_records
+                    .first()
+                    .map(|r| r.name.clone())
+                    .unwrap_or_else(|| format!("_acme-challenge.{}", self.wildcard_domain));
+
+                let retry_result = rt.block_on(propagation_checker.wait_for_propagation(
+                    &retry_txt_name,
+                    &retry_expected_values,
+                    50, // min_propagation_percent
+                    retry_wait_seconds,
+                    10, // poll_interval_seconds
+                ));
+
+                if let Some(result) = retry_result {
+                    // Show brief status for retry
+                    for server_result in &result.server_results {
+                        let status_icon = if server_result.found {
+                            "✓".bright_green()
+                        } else {
+                            "✗".bright_red()
+                        };
+                        print_substep(&format!(
+                            "   {} {}: {}",
+                            status_icon,
+                            server_result.server_name,
+                            if server_result.found {
+                                "Found"
+                            } else {
+                                "Not found"
+                            }
+                        ));
+                    }
+                    print_substep(&format!(
+                        "Propagation: {}% of servers",
+                        result.propagation_percentage
+                    ));
+                }
             }
 
             print_spinner_step(&format!(
@@ -1320,7 +1508,7 @@ impl SetupCommand {
 
                         // Clean up DNS TXT records
                         print_substep("Cleaning up DNS TXT records...");
-                        for txt_record in &challenge_data.txt_records {
+                        for txt_record in &current_challenge_data.txt_records {
                             if let Err(e) = rt.block_on(
                                 cf_provider.remove_txt_record(&base_domain, &txt_record.name),
                             ) {
