@@ -11,6 +11,7 @@ use temps_config::ConfigService;
 
 use crate::error::{ScreenshotError, ScreenshotResult};
 use crate::local_provider::LocalScreenshotProvider;
+use crate::noop_provider::NoopScreenshotProvider;
 use crate::provider::ScreenshotProvider;
 use crate::remote_provider::RemoteScreenshotProvider;
 
@@ -22,17 +23,39 @@ pub struct ScreenshotService {
 
 impl ScreenshotService {
     /// Create a new screenshot service
+    ///
+    /// Provider selection priority:
+    /// 1. Environment variable `TEMPS_SCREENSHOT_PROVIDER` (values: "noop", "local", "remote")
+    /// 2. Settings in database (screenshots.provider)
+    /// 3. Default to "local" (headless Chrome)
     pub async fn new(config_service: Arc<ConfigService>) -> ScreenshotResult<Self> {
         let settings = config_service
             .get_settings()
             .await
             .map_err(|e| ScreenshotError::ConfigError(format!("Failed to get settings: {}", e)))?;
 
-        // Determine which provider to use based on configuration
-        let provider: Arc<dyn ScreenshotProvider> =
-            if !settings.screenshots.url.is_empty() && settings.screenshots.provider == "remote" {
+        // Check environment variable first (highest priority)
+        let env_provider = std::env::var("TEMPS_SCREENSHOT_PROVIDER").ok();
+
+        // Determine which provider to use
+        let provider: Arc<dyn ScreenshotProvider> = match env_provider.as_deref() {
+            Some("noop") | Some("disabled") | Some("none") => {
                 info!(
-                    "Using remote screenshot provider at {}",
+                    "Using noop screenshot provider (TEMPS_SCREENSHOT_PROVIDER={}). \
+                    Screenshots are disabled.",
+                    env_provider.as_deref().unwrap_or("noop")
+                );
+                Arc::new(NoopScreenshotProvider::new())
+            }
+            Some("remote") => {
+                if settings.screenshots.url.is_empty() {
+                    return Err(ScreenshotError::ConfigError(
+                        "TEMPS_SCREENSHOT_PROVIDER=remote but screenshots.url is not configured"
+                            .to_string(),
+                    ));
+                }
+                info!(
+                    "Using remote screenshot provider at {} (from TEMPS_SCREENSHOT_PROVIDER)",
                     settings.screenshots.url
                 );
                 Arc::new(
@@ -43,10 +66,23 @@ impl ScreenshotService {
                         },
                     )?,
                 )
-            } else {
-                info!("Using local headless Chrome screenshot provider");
+            }
+            Some("local") => {
+                info!("Using local headless Chrome screenshot provider (from TEMPS_SCREENSHOT_PROVIDER)");
                 Arc::new(LocalScreenshotProvider::new())
-            };
+            }
+            Some(unknown) => {
+                warn!(
+                    "Unknown TEMPS_SCREENSHOT_PROVIDER value '{}', falling back to settings or default",
+                    unknown
+                );
+                Self::create_provider_from_settings(&settings).await?
+            }
+            None => {
+                // No env var, use settings or default
+                Self::create_provider_from_settings(&settings).await?
+            }
+        };
 
         // Check if provider is available
         if !provider.is_available().await {
@@ -60,6 +96,29 @@ impl ScreenshotService {
             config_service,
             provider,
         })
+    }
+
+    /// Create provider based on database settings (fallback when no env var)
+    async fn create_provider_from_settings(
+        settings: &temps_core::AppSettings,
+    ) -> ScreenshotResult<Arc<dyn ScreenshotProvider>> {
+        if !settings.screenshots.url.is_empty() && settings.screenshots.provider == "remote" {
+            info!(
+                "Using remote screenshot provider at {}",
+                settings.screenshots.url
+            );
+            Ok(Arc::new(
+                RemoteScreenshotProvider::new(settings.screenshots.url.clone(), None).map_err(
+                    |e| {
+                        error!("Failed to create remote screenshot provider: {}", e);
+                        e
+                    },
+                )?,
+            ))
+        } else {
+            info!("Using local headless Chrome screenshot provider");
+            Ok(Arc::new(LocalScreenshotProvider::new()))
+        }
     }
 
     /// Create a new screenshot service with a custom provider (useful for testing)

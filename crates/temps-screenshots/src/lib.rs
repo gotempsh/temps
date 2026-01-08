@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 pub mod error;
 pub mod local_provider;
+pub mod noop_provider;
 pub mod plugin;
 pub mod provider;
 pub mod remote_provider;
@@ -14,6 +15,7 @@ pub mod service;
 
 pub use error::{ScreenshotError, ScreenshotResult};
 pub use local_provider::LocalScreenshotProvider;
+pub use noop_provider::NoopScreenshotProvider;
 pub use plugin::ScreenshotsPlugin;
 pub use provider::ScreenshotProvider;
 pub use remote_provider::RemoteScreenshotProvider;
