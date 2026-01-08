@@ -46,7 +46,7 @@ fn example_max_memory() -> &'static str {
     description = "Configuration for Temps KV service (Redis-backed)"
 )]
 pub struct KvInputConfig {
-    /// Docker image to use (e.g., "redis:7-alpine", "redis:7.2-alpine")
+    /// Docker image to use (e.g., "redis:8-alpine", "redis:7.2-alpine")
     #[serde(default = "default_docker_image")]
     #[schemars(example = "example_docker_image", default = "default_docker_image")]
     pub docker_image: String,
@@ -142,7 +142,7 @@ impl KvConfig {
         self.docker_image.split(':').nth(1).unwrap_or("latest")
     }
 
-    /// Get the version from the image tag (e.g., "7" from "redis:7-alpine")
+    /// Get the version from the image tag (e.g., "7" from "redis:8-alpine")
     pub fn version(&self) -> String {
         let tag = self.image_tag();
         // Extract numeric version: "7-alpine" -> "7", "7.2.4-alpine" -> "7.2.4"
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn test_version_extraction() {
         let tests = vec![
-            ("redis:7-alpine", "7"),
+            ("redis:8-alpine", "7"),
             ("redis:7.2-alpine", "7.2"),
             ("redis:7.2.4", "7.2.4"),
             ("redis:latest", "latest"),

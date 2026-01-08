@@ -214,7 +214,7 @@ pub struct KvStatusResponse {
     pub version: Option<String>,
 
     /// Docker image being used
-    #[schema(example = "redis:7-alpine")]
+    #[schema(example = "redis:8-alpine")]
     pub docker_image: Option<String>,
 }
 
@@ -222,7 +222,7 @@ pub struct KvStatusResponse {
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct EnableKvRequest {
     /// Docker image to use (optional, uses default if not provided)
-    #[schema(example = "redis:7-alpine")]
+    #[schema(example = "redis:8-alpine")]
     pub docker_image: Option<String>,
 
     /// Maximum memory allocation (e.g., "256mb", "1gb")
@@ -266,8 +266,8 @@ pub struct DisableKvResponse {
 /// Request to update KV service configuration
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateKvRequest {
-    /// Docker image to use (e.g., "redis:7-alpine", "redis:8-alpine")
-    #[schema(example = "redis:7-alpine")]
+    /// Docker image to use (e.g., "redis:8-alpine", "redis:8-alpine")
+    #[schema(example = "redis:8-alpine")]
     pub docker_image: Option<String>,
 }
 

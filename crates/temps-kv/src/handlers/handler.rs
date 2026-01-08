@@ -510,7 +510,7 @@ pub async fn kv_enable(
             serde_json::json!(request.persistence),
         );
 
-        // Extract version from docker_image (e.g., "redis:7-alpine" -> "7-alpine")
+        // Extract version from docker_image (e.g., "redis:8-alpine" -> "7-alpine")
         let version = parameters
             .get("docker_image")
             .and_then(|v| v.as_str())

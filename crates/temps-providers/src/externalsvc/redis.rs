@@ -45,7 +45,7 @@ pub struct RedisInputConfig {
     )]
     pub password: Option<String>,
 
-    /// Full Docker image reference (e.g., "redis:7-alpine")
+    /// Full Docker image reference (e.g., "redis:8-alpine")
     #[serde(default = "default_docker_image")]
     #[schemars(example = "example_docker_image", default = "default_docker_image")]
     pub docker_image: String,
@@ -139,7 +139,7 @@ fn default_docker_image() -> String {
 }
 
 fn example_docker_image() -> &'static str {
-    "redis:7-alpine"
+    "redis:8-alpine"
 }
 
 fn is_port_available(port: u16) -> bool {
@@ -1291,7 +1291,7 @@ impl ExternalService for RedisService {
             anyhow::anyhow!("Could not determine image for container '{}'", container_id)
         })?;
 
-        // Extract version from image name (e.g., "redis:7-alpine" -> "7")
+        // Extract version from image name (e.g., "redis:8-alpine" -> "7")
         let version = if let Some(tag_pos) = image.rfind(':') {
             image[tag_pos + 1..].to_string()
         } else {
@@ -1471,14 +1471,14 @@ mod tests {
             host: "localhost".to_string(),
             port: Some("6379".to_string()),
             password: Some("mypassword".to_string()),
-            docker_image: "redis:7-alpine".to_string(),
+            docker_image: "redis:8-alpine".to_string(),
         };
 
         // Convert to runtime config
         let runtime_config: RedisConfig = input_config.into();
 
         // Verify docker_image is used directly
-        assert_eq!(runtime_config.docker_image, "redis:7-alpine");
+        assert_eq!(runtime_config.docker_image, "redis:8-alpine");
     }
 
     #[test]
@@ -1574,7 +1574,7 @@ mod tests {
                 "port": 6379,
                 "password": "",
                 "db": 0,
-                "docker_image": "redis:7-alpine",
+                "docker_image": "redis:8-alpine",
                 "container_id": "xyz789abc123",
             }),
         };
@@ -1588,7 +1588,7 @@ mod tests {
     #[test]
     fn test_import_redis_version_extraction() {
         let test_cases = vec![
-            ("redis:7-alpine", "7-alpine"),
+            ("redis:8-alpine", "7-alpine"),
             ("redis:latest", "latest"),
             ("redis:6.2", "6.2"),
             ("redis:7.0-alpine", "7.0-alpine"),
@@ -1693,7 +1693,7 @@ mod tests {
             "host": "localhost",
             "port": redis_port.to_string(),
             "password": redis_password,
-            "docker_image": "redis:7-alpine",
+            "docker_image": "redis:8-alpine",
         });
 
         let redis_config = ServiceConfig {

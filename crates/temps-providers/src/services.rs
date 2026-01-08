@@ -3317,7 +3317,7 @@ mod tests {
 
     #[test]
     fn test_service_type_detection_redis() {
-        let images = vec!["redis:7-alpine", "redis:latest", "redis:6.2-bullseye"];
+        let images = vec!["redis:8-alpine", "redis:latest", "redis:6.2-bullseye"];
 
         for image in images {
             let detected = if image.contains("redis") {

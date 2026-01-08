@@ -181,7 +181,7 @@ impl ParameterStrategy for RedisParameterStrategy {
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("redis:7-alpine".to_string()),
+                JsonValue::String("redis:8-alpine".to_string()),
             );
         }
 
@@ -240,8 +240,8 @@ impl ParameterStrategy for RedisParameterStrategy {
                 },
                 "docker_image": {
                     "type": "string",
-                    "description": "Docker image (updateable, e.g., redis:7-alpine)",
-                    "default": "redis:7-alpine"
+                    "description": "Docker image (updateable, e.g., redis:8-alpine)",
+                    "default": "redis:8-alpine"
                 }
             },
             "readonly": ["password"]

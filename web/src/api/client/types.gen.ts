@@ -6231,7 +6231,7 @@ export type UpdateIpAccessControlRequest = {
  */
 export type UpdateKvRequest = {
     /**
-     * Docker image to use (e.g., "redis:7-alpine", "redis:8-alpine")
+     * Docker image to use (e.g., "redis:8-alpine", "redis:8-alpine")
      */
     docker_image?: string | null;
 };
