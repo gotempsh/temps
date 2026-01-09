@@ -235,36 +235,30 @@ impl QueryService {
 
                 Arc::new(redis_source)
             }
-            // Temps Blob uses S3-compatible storage - treat the same as S3 for query purposes
+            // Temps Blob uses RustfsService (RustFS) for S3-compatible storage
             crate::externalsvc::ServiceType::Blob => {
-                let config: S3InputConfig = serde_json::from_value(service.parameters.clone())
+                // Blob services are backed by RustFS, so use RustfsConfig
+                let config: RustfsConfig = serde_json::from_value(service.parameters.clone())
                     .map_err(|e| {
                         DataError::InvalidConfiguration(format!(
-                            "Failed to parse Blob (S3) configuration: {}",
+                            "Failed to parse Blob (RustFS) configuration: {}",
                             e
                         ))
                     })?;
 
-                let endpoint = format!(
-                    "http://{}:{}",
-                    config.host,
-                    config.port.unwrap_or_else(|| "9000".to_string())
-                );
+                let endpoint = format!("http://{}:{}", config.host, config.port);
 
-                let access_key = config.access_key.ok_or_else(|| {
-                    DataError::InvalidConfiguration("Blob access_key is required".to_string())
+                let s3_source = S3Source::new(
+                    &config.region,
+                    Some(&endpoint),
+                    &config.access_key,
+                    &config.secret_key,
+                )
+                .await
+                .map_err(|e| {
+                    error!("Failed to connect to Blob service {}: {}", service_id, e);
+                    e
                 })?;
-                let secret_key = config.secret_key.ok_or_else(|| {
-                    DataError::InvalidConfiguration("Blob secret_key is required".to_string())
-                })?;
-
-                let s3_source =
-                    S3Source::new(&config.region, Some(&endpoint), &access_key, &secret_key)
-                        .await
-                        .map_err(|e| {
-                            error!("Failed to connect to Blob service {}: {}", service_id, e);
-                            e
-                        })?;
 
                 Arc::new(s3_source)
             }
@@ -528,8 +522,13 @@ impl QueryService {
             let path_clone = path_clone.clone();
             let continuation_token = continuation_token.clone();
             async move {
-                // Check if this is S3 and use pagination
-                if service_type == crate::externalsvc::ServiceType::S3 {
+                // Check if this is S3-compatible (S3, Blob, or RustFS) and use pagination
+                if matches!(
+                    service_type,
+                    crate::externalsvc::ServiceType::S3
+                        | crate::externalsvc::ServiceType::Blob
+                        | crate::externalsvc::ServiceType::Rustfs
+                ) {
                     if let Some(s3_source) = conn.downcast_ref::<S3Source>() {
                         return s3_source
                             .list_entities_paginated(&path_clone, limit, continuation_token)
@@ -537,7 +536,18 @@ impl QueryService {
                     }
                 }
 
-                // For other backends (PostgreSQL, MongoDB, Redis), just return all entities with no pagination
+                // Check if this is Redis and use pagination (Redis can have millions of keys)
+                if service_type == crate::externalsvc::ServiceType::Redis
+                    || service_type == crate::externalsvc::ServiceType::Kv
+                {
+                    if let Some(redis_source) = conn.downcast_ref::<RedisSource>() {
+                        return redis_source
+                            .list_entities_paginated(&path_clone, limit, continuation_token)
+                            .await;
+                    }
+                }
+
+                // For other backends (PostgreSQL, MongoDB), just return all entities with no pagination
                 // These typically don't have thousands of entities
                 let entities = conn.list_entities(&path_clone).await?;
                 Ok((entities, None))
@@ -605,6 +615,12 @@ impl QueryService {
                 }
 
                 if let Some(queryable) = conn.downcast_ref::<MongoDBSource>() {
+                    return queryable
+                        .query(&path_clone, &entity_name, filters, options)
+                        .await;
+                }
+
+                if let Some(queryable) = conn.downcast_ref::<RedisSource>() {
                     return queryable
                         .query(&path_clone, &entity_name, filters, options)
                         .await;

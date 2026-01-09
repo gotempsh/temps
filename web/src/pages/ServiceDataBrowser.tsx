@@ -1726,6 +1726,10 @@ function ContainerEntitiesView({
   const [selectedEntityForInfo, setSelectedEntityForInfo] = useState<
     string | null
   >(null)
+  // State for viewing key values (Redis/KV)
+  const [selectedKeyForValue, setSelectedKeyForValue] = useState<string | null>(
+    null
+  )
   const pageSize = 20
 
   // Fetch entities at this container path
@@ -1769,6 +1773,27 @@ function ContainerEntitiesView({
     },
     enabled: !!serviceId && !!containerPath && !!selectedEntityForInfo,
   })
+
+  // Query to fetch key value for Redis/KV
+  const queryKeyValue = useMutation({
+    ...queryDataMutation(),
+  })
+
+  // Handler to view key value
+  const handleViewKeyValue = (entityName: string) => {
+    setSelectedKeyForValue(entityName)
+    queryKeyValue.mutate({
+      path: {
+        service_id: parseInt(serviceId),
+        path: containerPath,
+        entity: entityName,
+      },
+      body: {
+        limit: 1,
+        offset: 0,
+      },
+    })
+  }
 
   if (isLoading) {
     return (
@@ -1904,7 +1929,7 @@ function ContainerEntitiesView({
                     <th className="text-left p-3 font-medium whitespace-nowrap">
                       Name
                     </th>
-                    {isObjectStore() && (
+                    {isObjectStore() ? (
                       <>
                         <th className="text-left p-3 font-medium whitespace-nowrap">
                           Content Type
@@ -1919,6 +1944,10 @@ function ContainerEntitiesView({
                           Actions
                         </th>
                       </>
+                    ) : (
+                      <th className="text-right p-3 font-medium whitespace-nowrap">
+                        Actions
+                      </th>
                     )}
                   </tr>
                 </thead>
@@ -1934,7 +1963,7 @@ function ContainerEntitiesView({
                         </div>
                       </td>
                       <td className="p-3 font-mono text-xs">{entity.name}</td>
-                      {isObjectStore() && (
+                      {isObjectStore() ? (
                         <>
                           <td className="p-3 text-xs">
                             {(entity as any).metadata?.content_type ||
@@ -2022,6 +2051,18 @@ function ContainerEntitiesView({
                             </div>
                           </td>
                         </>
+                      ) : (
+                        <td className="p-3 text-right">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 px-2"
+                            onClick={() => handleViewKeyValue(entity.name)}
+                            title="View Value"
+                          >
+                            <Eye className="h-4 w-4" />
+                          </Button>
+                        </td>
                       )}
                     </tr>
                   ))}
@@ -2195,6 +2236,88 @@ function ContainerEntitiesView({
                           )}
                       </div>
                     ) : null}
+                  </div>
+                )}
+              </DialogContent>
+            </Dialog>
+
+            {/* Key Value Modal (for Redis/KV) */}
+            <Dialog
+              open={!!selectedKeyForValue}
+              onOpenChange={(open) => {
+                if (!open) {
+                  setSelectedKeyForValue(null)
+                  queryKeyValue.reset()
+                }
+              }}
+            >
+              <DialogContent className="max-w-4xl max-h-[80vh] overflow-y-auto">
+                <DialogHeader>
+                  <DialogTitle className="flex items-center gap-2">
+                    <Hash className="h-5 w-5" />
+                    Key Value: {selectedKeyForValue}
+                  </DialogTitle>
+                </DialogHeader>
+
+                {queryKeyValue.isPending && (
+                  <div className="flex items-center justify-center py-8">
+                    <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+                  </div>
+                )}
+
+                {queryKeyValue.isError && (
+                  <Alert variant="destructive">
+                    <AlertCircle className="h-4 w-4" />
+                    <AlertDescription>
+                      Failed to load key value:{' '}
+                      {(queryKeyValue.error as any)?.detail ||
+                        'Unknown error'}
+                    </AlertDescription>
+                  </Alert>
+                )}
+
+                {queryKeyValue.isSuccess && queryKeyValue.data && (
+                  <div className="space-y-4">
+                    {/* Key Info from query result */}
+                    {queryKeyValue.data.rows &&
+                      queryKeyValue.data.rows.length > 0 && (
+                        <div className="rounded-md border">
+                          <table className="w-full text-sm">
+                            <tbody>
+                              {Object.entries(
+                                queryKeyValue.data.rows[0] as Record<
+                                  string,
+                                  unknown
+                                >
+                              ).map(([key, value]) => (
+                                <tr
+                                  key={key}
+                                  className="border-b last:border-0"
+                                >
+                                  <td className="p-3 font-medium bg-muted/50 w-1/4 align-top">
+                                    {key}
+                                  </td>
+                                  <td className="p-3 font-mono text-xs break-all whitespace-pre-wrap">
+                                    {value === null
+                                      ? 'null'
+                                      : typeof value === 'object'
+                                        ? JSON.stringify(value, null, 2)
+                                        : String(value)}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+
+                    {/* Empty state */}
+                    {(!queryKeyValue.data.rows ||
+                      queryKeyValue.data.rows.length === 0) && (
+                      <div className="text-center py-4 text-muted-foreground">
+                        No data found for this key
+                      </div>
+                    )}
                   </div>
                 )}
               </DialogContent>

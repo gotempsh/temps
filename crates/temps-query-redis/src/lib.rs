@@ -32,7 +32,8 @@ use redis::{AsyncCommands, RedisError};
 use std::collections::HashMap;
 use temps_query::{
     Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType, DataError,
-    DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType, Result,
+    DataRow, DataSource, DatasetSchema, EntityCountHint, EntityInfo, FieldDef, FieldType,
+    QueryOptions, QueryResult, Queryable, Result,
 };
 use tracing::{debug, error};
 
@@ -82,39 +83,224 @@ impl RedisSource {
         Ok(conn)
     }
 
-    /// List keys in a specific database with optional pattern
+    /// List keys in a specific database with optional pattern (limited to first 1000 keys)
     async fn list_keys_in_db(&self, db: i32, pattern: Option<&str>) -> Result<Vec<EntityInfo>> {
+        // Use paginated version with limit for safety
+        let (entities, _) = self
+            .list_keys_in_db_paginated(db, pattern, 1000, None)
+            .await?;
+        Ok(entities)
+    }
+
+    /// List keys in a specific database with pagination using SCAN
+    pub async fn list_keys_in_db_paginated(
+        &self,
+        db: i32,
+        pattern: Option<&str>,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<(Vec<EntityInfo>, Option<String>)> {
         let mut conn = self.get_db_connection(db).await?;
         let pattern = pattern.unwrap_or("*");
+        let start_cursor: u64 = cursor.as_ref().and_then(|c| c.parse().ok()).unwrap_or(0);
 
-        debug!("Listing keys in database {} with pattern: {}", db, pattern);
+        debug!(
+            "Listing keys in database {} with pattern: {}, cursor: {}, limit: {}",
+            db, pattern, start_cursor, limit
+        );
 
-        // Use SCAN for better performance with large datasets
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg(pattern)
-            .query_async(&mut conn)
-            .await
-            .map_err(|e: RedisError| {
-                error!("Failed to list keys in database {}: {}", db, e);
-                DataError::QueryFailed(format!("Failed to list keys: {}", e))
-            })?;
+        let mut entities = Vec::with_capacity(limit);
+        let mut current_cursor = start_cursor;
 
-        let entities: Vec<EntityInfo> = keys
-            .into_iter()
-            .map(|key| EntityInfo {
-                namespace: db.to_string(),
-                name: key,
-                entity_type: "key".to_string(),
-                row_count: Some(1),
-                size_bytes: None,
-                schema: None,
-                metadata: None,
-            })
-            .collect();
+        // Use SCAN for efficient iteration
+        loop {
+            let result: (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(current_cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(limit.min(100)) // Batch size
+                .query_async(&mut conn)
+                .await
+                .map_err(|e: RedisError| {
+                    error!("Failed to scan keys in database {}: {}", db, e);
+                    DataError::QueryFailed(format!("Failed to scan keys: {}", e))
+                })?;
+
+            let (next_cursor, keys) = result;
+
+            for key in keys {
+                if entities.len() >= limit {
+                    break;
+                }
+                entities.push(EntityInfo {
+                    namespace: db.to_string(),
+                    name: key,
+                    entity_type: "key".to_string(),
+                    row_count: Some(1),
+                    size_bytes: None,
+                    schema: None,
+                    metadata: None,
+                });
+            }
+
+            current_cursor = next_cursor;
+
+            // Stop if we've collected enough keys or completed a full scan
+            if entities.len() >= limit || current_cursor == 0 {
+                break;
+            }
+        }
 
         debug!("Found {} keys in database {}", entities.len(), db);
 
-        Ok(entities)
+        // Return next cursor if there are more keys
+        let next_token = if current_cursor != 0 {
+            Some(current_cursor.to_string())
+        } else {
+            None
+        };
+
+        Ok((entities, next_token))
+    }
+
+    /// List entities with pagination support - public method for query service
+    pub async fn list_entities_paginated(
+        &self,
+        container_path: &ContainerPath,
+        limit: usize,
+        continuation_token: Option<String>,
+    ) -> Result<(Vec<EntityInfo>, Option<String>)> {
+        if container_path.depth() == 0 {
+            return Err(DataError::InvalidQuery(
+                "Cannot list entities at root level - specify a database path (0-15)".to_string(),
+            ));
+        }
+
+        let db_str = &container_path.segments[0];
+        let db_num: i32 = db_str.parse().map_err(|_| {
+            DataError::InvalidQuery(format!(
+                "Invalid database number '{}'. Must be 0-15",
+                db_str
+            ))
+        })?;
+
+        if !(0..=15).contains(&db_num) {
+            return Err(DataError::InvalidQuery(format!(
+                "Database number {} out of range. Must be 0-15",
+                db_num
+            )));
+        }
+
+        // If depth > 1, use remaining segments as key pattern
+        let pattern = if container_path.depth() > 1 {
+            Some(format!("{}*", container_path.segments[1..].join(":")))
+        } else {
+            None
+        };
+
+        self.list_keys_in_db_paginated(db_num, pattern.as_deref(), limit, continuation_token)
+            .await
+    }
+
+    /// Get the value of a specific key
+    async fn get_key_value(&self, db: i32, key: &str) -> Result<DataRow> {
+        let mut conn = self.get_db_connection(db).await?;
+
+        debug!("Getting value for key '{}' in database {}", key, db);
+
+        // Check if key exists
+        let exists: bool = conn.exists(key).await.map_err(|e: RedisError| {
+            error!("Failed to check if key exists: {}", e);
+            DataError::QueryFailed(format!("Failed to check key existence: {}", e))
+        })?;
+
+        if !exists {
+            return Err(DataError::NotFound(format!(
+                "Key '{}' not found in database {}",
+                key, db
+            )));
+        }
+
+        // Get key type
+        let key_type: String = redis::cmd("TYPE")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e: RedisError| {
+                error!("Failed to get key type: {}", e);
+                DataError::QueryFailed(format!("Failed to get key type: {}", e))
+            })?;
+
+        // Get TTL
+        let ttl: i64 = conn.ttl(key).await.map_err(|e: RedisError| {
+            error!("Failed to get key TTL: {}", e);
+            DataError::QueryFailed(format!("Failed to get key TTL: {}", e))
+        })?;
+
+        // Get value based on type
+        let value = match key_type.as_str() {
+            "string" => {
+                let v: String = conn.get(key).await.map_err(|e: RedisError| {
+                    error!("Failed to get string value: {}", e);
+                    DataError::QueryFailed(format!("Failed to get string value: {}", e))
+                })?;
+                serde_json::Value::String(v)
+            }
+            "list" => {
+                let v: Vec<String> = conn.lrange(key, 0, -1).await.map_err(|e: RedisError| {
+                    error!("Failed to get list value: {}", e);
+                    DataError::QueryFailed(format!("Failed to get list value: {}", e))
+                })?;
+                serde_json::json!(v)
+            }
+            "set" => {
+                let v: Vec<String> = conn.smembers(key).await.map_err(|e: RedisError| {
+                    error!("Failed to get set value: {}", e);
+                    DataError::QueryFailed(format!("Failed to get set value: {}", e))
+                })?;
+                serde_json::json!(v)
+            }
+            "zset" => {
+                let v: Vec<(String, f64)> =
+                    conn.zrange_withscores(key, 0, -1)
+                        .await
+                        .map_err(|e: RedisError| {
+                            error!("Failed to get sorted set value: {}", e);
+                            DataError::QueryFailed(format!("Failed to get sorted set value: {}", e))
+                        })?;
+                serde_json::json!(v
+                    .into_iter()
+                    .map(|(member, score)| {
+                        serde_json::json!({"member": member, "score": score})
+                    })
+                    .collect::<Vec<_>>())
+            }
+            "hash" => {
+                let v: HashMap<String, String> =
+                    conn.hgetall(key).await.map_err(|e: RedisError| {
+                        error!("Failed to get hash value: {}", e);
+                        DataError::QueryFailed(format!("Failed to get hash value: {}", e))
+                    })?;
+                serde_json::json!(v)
+            }
+            "stream" => {
+                // For streams, just indicate it's a stream - full stream reading is complex
+                serde_json::Value::String("[Stream data - use XREAD/XRANGE commands]".to_string())
+            }
+            _ => serde_json::Value::String(format!("[Unknown type: {}]", key_type)),
+        };
+
+        let mut row = DataRow::new();
+        row.insert(
+            "key".to_string(),
+            serde_json::Value::String(key.to_string()),
+        );
+        row.insert("type".to_string(), serde_json::Value::String(key_type));
+        row.insert("ttl".to_string(), serde_json::Value::Number(ttl.into()));
+        row.insert("value".to_string(), value);
+
+        Ok(row)
     }
 
     /// Get information about a specific key
@@ -231,7 +417,7 @@ impl DataSource for RedisSource {
                                 can_contain_entities: true,
                                 child_container_type: None,
                                 entity_type_label: Some("key".to_string()),
-                                entity_count_hint: Some(EntityCountHint::Small),
+                                entity_count_hint: Some(EntityCountHint::Large),
                             },
                             metadata,
                         }
@@ -298,7 +484,7 @@ impl DataSource for RedisSource {
                 can_contain_entities: true,
                 child_container_type: None,
                 entity_type_label: Some("key".to_string()),
-                entity_count_hint: Some(EntityCountHint::Small),
+                entity_count_hint: Some(EntityCountHint::Large),
             },
             metadata,
         })
@@ -381,6 +567,152 @@ impl DataSource for RedisSource {
         debug!("Closing Redis source");
         // Connection manager handles cleanup automatically
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Queryable for RedisSource {
+    async fn query(
+        &self,
+        container_path: &ContainerPath,
+        entity_name: &str,
+        _filters: Option<serde_json::Value>,
+        _options: QueryOptions,
+    ) -> Result<QueryResult> {
+        let start = std::time::Instant::now();
+
+        if container_path.depth() == 0 {
+            return Err(DataError::InvalidQuery(
+                "Cannot query at root level - specify a database path (0-15)".to_string(),
+            ));
+        }
+
+        let db_str = &container_path.segments[0];
+        let db_num: i32 = db_str.parse().map_err(|_| {
+            DataError::InvalidQuery(format!(
+                "Invalid database number '{}'. Must be 0-15",
+                db_str
+            ))
+        })?;
+
+        if !(0..=15).contains(&db_num) {
+            return Err(DataError::InvalidQuery(format!(
+                "Database number {} out of range. Must be 0-15",
+                db_num
+            )));
+        }
+
+        // Get the key value
+        let row = self.get_key_value(db_num, entity_name).await?;
+        let execution_ms = start.elapsed().as_millis() as u64;
+
+        // Define schema for the result
+        let schema = DatasetSchema {
+            fields: vec![
+                FieldDef {
+                    name: "key".to_string(),
+                    field_type: FieldType::String,
+                    nullable: false,
+                    description: Some("Redis key name".to_string()),
+                },
+                FieldDef {
+                    name: "type".to_string(),
+                    field_type: FieldType::String,
+                    nullable: false,
+                    description: Some("Redis data type".to_string()),
+                },
+                FieldDef {
+                    name: "ttl".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: true,
+                    description: Some("Time to live in seconds (-1 = no expiry)".to_string()),
+                },
+                FieldDef {
+                    name: "value".to_string(),
+                    field_type: FieldType::Json,
+                    nullable: true,
+                    description: Some("Key value".to_string()),
+                },
+            ],
+            partitions: None,
+            primary_key: Some(vec!["key".to_string()]),
+        };
+
+        Ok(QueryResult::new(schema, vec![row], execution_ms))
+    }
+
+    async fn count(
+        &self,
+        container_path: &ContainerPath,
+        entity_name: &str,
+        _filters: Option<serde_json::Value>,
+    ) -> Result<u64> {
+        if container_path.depth() == 0 {
+            return Err(DataError::InvalidQuery(
+                "Cannot count at root level - specify a database path (0-15)".to_string(),
+            ));
+        }
+
+        let db_str = &container_path.segments[0];
+        let db_num: i32 = db_str.parse().map_err(|_| {
+            DataError::InvalidQuery(format!(
+                "Invalid database number '{}'. Must be 0-15",
+                db_str
+            ))
+        })?;
+
+        if !(0..=15).contains(&db_num) {
+            return Err(DataError::InvalidQuery(format!(
+                "Database number {} out of range. Must be 0-15",
+                db_num
+            )));
+        }
+
+        let mut conn = self.get_db_connection(db_num).await?;
+
+        // Check if key exists
+        let exists: bool = conn.exists(entity_name).await.map_err(|e: RedisError| {
+            error!("Failed to check if key exists: {}", e);
+            DataError::QueryFailed(format!("Failed to check key existence: {}", e))
+        })?;
+
+        Ok(if exists { 1 } else { 0 })
+    }
+
+    async fn entity_exists(
+        &self,
+        container_path: &ContainerPath,
+        entity_name: &str,
+    ) -> Result<bool> {
+        if container_path.depth() == 0 {
+            return Err(DataError::InvalidQuery(
+                "Cannot check entity at root level - specify a database path (0-15)".to_string(),
+            ));
+        }
+
+        let db_str = &container_path.segments[0];
+        let db_num: i32 = db_str.parse().map_err(|_| {
+            DataError::InvalidQuery(format!(
+                "Invalid database number '{}'. Must be 0-15",
+                db_str
+            ))
+        })?;
+
+        if !(0..=15).contains(&db_num) {
+            return Err(DataError::InvalidQuery(format!(
+                "Database number {} out of range. Must be 0-15",
+                db_num
+            )));
+        }
+
+        let mut conn = self.get_db_connection(db_num).await?;
+
+        let exists: bool = conn.exists(entity_name).await.map_err(|e: RedisError| {
+            error!("Failed to check if key exists: {}", e);
+            DataError::QueryFailed(format!("Failed to check key existence: {}", e))
+        })?;
+
+        Ok(exists)
     }
 }
 
