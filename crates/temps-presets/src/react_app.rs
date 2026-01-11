@@ -1,9 +1,11 @@
-use std::path::PathBuf;
+use std::path::Path;
 
-use super::{PackageManager, Preset, ProjectType};
+use super::{DockerfileWithArgs, PackageManager, Preset, ProjectType};
+use async_trait::async_trait;
 
 pub struct CreateReactApp;
 
+#[async_trait]
 impl Preset for CreateReactApp {
     fn slug(&self) -> String {
         "react-app".to_string()
@@ -18,20 +20,11 @@ impl Preset for CreateReactApp {
     }
 
     fn icon_url(&self) -> String {
-        "https://example.com/react-icon.png".to_string()
+        "/presets/react.svg".to_string()
     }
 
-    fn dockerfile(
-        &self,
-        _root_local_path: &PathBuf,
-        local_path: &PathBuf,
-        install_command: Option<&str>,
-        build_command: Option<&str>,
-        _output_dir: Option<&str>,
-        build_vars: Option<&Vec<String>>,
-        project_slug: &str,
-    ) -> String {
-        let pkg_manager = self.package_manager(local_path);
+    async fn dockerfile(&self, config: super::DockerfileConfig<'_>) -> DockerfileWithArgs {
+        let pkg_manager = self.package_manager(config.local_path);
 
         let lockfile = match pkg_manager {
             PackageManager::Bun => "COPY package.json bun.lock* ./",
@@ -51,16 +44,15 @@ WORKDIR /app
 {}
 
 # Install dependencies
-RUN --mount=type=cache,target=/app/node_modules,id=node_modules_{} {}
+RUN {}
 "#,
             pkg_manager.base_image(),
             lockfile,
-            project_slug,
-            install_command.unwrap_or(&self.install_command(local_path))
+            config.install_command.unwrap_or(&self.install_command(config.local_path))
         );
 
         // Add build variables if present
-        if let Some(vars) = build_vars {
+        if let Some(vars) = config.build_vars {
             for var in vars {
                 dockerfile.push_str(&format!("ARG {}\n", var));
             }
@@ -90,7 +82,7 @@ EXPOSE 3000
 
 CMD ["serve", "-s", "build", "-l", "3000"]
 "#,
-            build_command.unwrap_or(&self.build_command(local_path)),
+            config.build_command.unwrap_or(&self.build_command(config.local_path)),
             pkg_manager.base_image(),
             match pkg_manager {
                 PackageManager::Bun => "bun install -g serve",
@@ -101,13 +93,13 @@ CMD ["serve", "-s", "build", "-l", "3000"]
             }
         ));
 
-        dockerfile
+        DockerfileWithArgs::new(dockerfile)
     }
 
-    fn dockerfile_with_build_dir(&self, local_path: &PathBuf) -> String {
+    async fn dockerfile_with_build_dir(&self, local_path: &Path) -> DockerfileWithArgs {
         let pkg_manager = self.package_manager(local_path);
 
-        format!(
+        let content = format!(
             r#"
 FROM {}
 
@@ -131,10 +123,11 @@ CMD ["serve", "-s", "build", "-l", "3000"]
                 PackageManager::Npm => "npm install -g serve",
                 PackageManager::Pnpm => "npm install -g serve",
             }
-        )
+        );
+        DockerfileWithArgs::new(content)
     }
 
-    fn install_command(&self, local_path: &PathBuf) -> String {
+    fn install_command(&self, local_path: &Path) -> String {
         match self.package_manager(local_path) {
             PackageManager::Bun => "bun install --frozen-lockfile".to_string(),
             PackageManager::Yarn => "yarn install".to_string(),
@@ -143,7 +136,7 @@ CMD ["serve", "-s", "build", "-l", "3000"]
         }
     }
 
-    fn build_command(&self, local_path: &PathBuf) -> String {
+    fn build_command(&self, local_path: &Path) -> String {
         match self.package_manager(local_path) {
             PackageManager::Bun => "bun run build".to_string(),
             PackageManager::Yarn => "yarn run build".to_string(),
@@ -153,12 +146,16 @@ CMD ["serve", "-s", "build", "-l", "3000"]
     }
 
     fn dirs_to_upload(&self) -> Vec<String> {
-        vec!["build".to_string()]
+        vec!["/app/build".to_string()]
+    }
+
+    fn static_output_dir(&self) -> Option<String> {
+        Some("/app/build".to_string())
     }
 }
 
 impl CreateReactApp {
-    fn package_manager(&self, local_path: &PathBuf) -> PackageManager {
+    fn package_manager(&self, local_path: &Path) -> PackageManager {
         if local_path.join("package-lock.json").exists() {
             PackageManager::Npm
         } else if local_path.join("bun.lockb").exists() ||  local_path.join("bun.lock").exists() {

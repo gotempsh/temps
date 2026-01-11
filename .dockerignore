@@ -1,0 +1,83 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# CI/CD
+.github
+.gitlab-ci.yml
+.circleci
+azure-pipelines.yml
+
+# IDEs
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# Build artifacts
+target/
+*.o
+*.a
+*.so
+dist/
+
+# Dependencies
+node_modules/
+yarn.lock
+package-lock.json
+bun.lockb
+
+# Docs and examples
+docs/
+examples/
+README.md
+CHANGELOG.md
+LICENSE
+*.md
+
+# Development files
+.env
+.env.local
+.env.*.local
+docker-compose.dev.yml
+.pre-commit-config.yaml
+
+# Test files and coverage
+tests/
+coverage/
+*.profraw
+*.profdata
+
+# Temporary files
+.cache
+tmp/
+temp/
+*.tmp
+*.log
+
+# OS specific
+Thumbs.db
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Development scripts
+scripts/
+Makefile
+
+# Docker
+Dockerfile.dev
+docker-compose.yml
+docker-compose.*.yml
+
+# Miscellaneous
+.editorconfig
+.prettierrc
+.eslintrc*
+.stylelintrc*
+thoughts/

@@ -1,8 +1,4 @@
-import {
-  ExternalServiceInfo,
-  ProjectResponse,
-  ServiceTypeRoute,
-} from '@/api/client'
+import { ExternalServiceInfo, ProjectResponse } from '@/api/client'
 import {
   getServicePreviewEnvironmentVariablesMaskedOptions,
   linkServiceToProjectMutation,
@@ -11,7 +7,6 @@ import {
   unlinkServiceFromProjectMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { CreateServiceButton } from '@/components/storage/CreateServiceButton'
-import { CreateServiceDialog } from '@/components/storage/CreateServiceDialog'
 import EmptyStateStorage from '@/components/storage/EmptyStateStorage'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -43,6 +38,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
 import { CopyButton } from '../ui/copy-button'
+import { TimeAgo } from '@/components/utils/TimeAgo'
 
 function ServiceCard({
   service,
@@ -106,8 +102,16 @@ function ServiceCard({
                   </CollapsibleTrigger>
                 )}
               </CardTitle>
-              <CardDescription className="flex items-center gap-2">
+              <CardDescription className="flex items-center gap-2 flex-wrap">
                 <span>{service.service_type}</span>
+                {service.created_at && (
+                  <>
+                    <span>•</span>
+                    <span className="text-xs">
+                      Created <TimeAgo date={service.created_at} />
+                    </span>
+                  </>
+                )}
                 <span>•</span>
                 <Badge variant={isLinked ? 'default' : 'secondary'}>
                   {isLinked ? 'Linked' : 'Available'}
@@ -254,9 +258,6 @@ function ServiceCard({
 
 export function ProjectStorage({ project }: { project: ProjectResponse }) {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
-  const [selectedServiceType, setSelectedServiceType] =
-    useState<ServiceTypeRoute | null>(null)
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Storage', href: '/storage' }])
@@ -370,32 +371,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
               }}
             />
           </div>
-          <EmptyStateStorage
-            onCreateClick={(serviceType) => {
-              setSelectedServiceType(serviceType as ServiceTypeRoute)
-              setIsCreateDialogOpen(true)
-            }}
-          />
-
-          {/* Service creation dialog for empty state */}
-          {selectedServiceType && (
-            <CreateServiceDialog
-              open={isCreateDialogOpen}
-              onOpenChange={(open) => {
-                setIsCreateDialogOpen(open)
-                if (!open) {
-                  setSelectedServiceType(null)
-                }
-              }}
-              onSuccess={() => {
-                setIsCreateDialogOpen(false)
-                setSelectedServiceType(null)
-                refetchServices()
-                refetchServicesLinked()
-              }}
-              serviceType={selectedServiceType}
-            />
-          )}
+          <EmptyStateStorage />
         </div>
       </div>
     )

@@ -1,5 +1,5 @@
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait
+    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 use std::sync::Arc;
 use temps_entities::{env_var_environments, env_vars, environments};
@@ -65,7 +65,7 @@ impl EnvVarService {
         // Get all env vars for the project
         let vars = env_vars::Entity::find()
             .filter(env_vars::Column::ProjectId.eq(project_id))
-            .order_by_asc(env_vars::Column::Key)
+            .order_by_desc(env_vars::Column::UpdatedAt)
             .all(self.db.as_ref())
             .await?;
 
@@ -97,7 +97,7 @@ impl EnvVarService {
             if let Some(env) = env_option {
                 env_map
                     .entry(env_var_env.env_var_id)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(EnvVarEnvironment {
                         id: env.id,
                         name: env.name,
@@ -126,6 +126,7 @@ impl EnvVarService {
                     created_at: var.created_at,
                     updated_at: var.updated_at,
                     environments,
+                    include_in_preview: var.include_in_preview,
                 })
             })
             .collect();
@@ -139,6 +140,7 @@ impl EnvVarService {
         environment_ids: Vec<i32>,
         key: String,
         value: String,
+        include_in_preview: bool,
     ) -> Result<EnvVarWithEnvironments, EnvVarError> {
         // Check for conflicts before creating the new env var
         let existing_env_vars = env_vars::Entity::find()
@@ -176,6 +178,7 @@ impl EnvVarService {
                         project_id: Set(project_id),
                         key: Set(key.clone()),
                         value: Set(value.clone()),
+                        include_in_preview: Set(include_in_preview),
                         created_at: Set(chrono::Utc::now()),
                         updated_at: Set(chrono::Utc::now()),
                         environment_id: Set(None),
@@ -218,6 +221,7 @@ impl EnvVarService {
                         created_at: var.created_at,
                         updated_at: var.updated_at,
                         environments,
+                        include_in_preview: var.include_in_preview,
                     })
                 })
             })
@@ -233,6 +237,7 @@ impl EnvVarService {
         key: String,
         value: String,
         environment_ids: Vec<i32>,
+        include_in_preview: bool,
     ) -> Result<EnvVarWithEnvironments, EnvVarError> {
         let result = self
             .db
@@ -250,6 +255,7 @@ impl EnvVarService {
                     let mut active_var: env_vars::ActiveModel = env_var.into();
                     active_var.key = Set(key.clone());
                     active_var.value = Set(value.clone());
+                    active_var.include_in_preview = Set(include_in_preview);
                     active_var.updated_at = Set(chrono::Utc::now());
                     let var = active_var.update(txn).await?;
 
@@ -293,6 +299,7 @@ impl EnvVarService {
                         created_at: var.created_at,
                         updated_at: var.updated_at,
                         environments,
+                        include_in_preview: var.include_in_preview,
                     })
                 })
             })
@@ -306,8 +313,7 @@ impl EnvVarService {
         project_id: i32,
         var_id: i32,
     ) -> Result<(), EnvVarError> {
-        let _result = self
-            .db
+        self.db
             .transaction::<_, (), EnvVarError>(|txn| {
                 Box::pin(async move {
                     // First delete the environment relationships

@@ -32,9 +32,7 @@ fn generate_secure_password() -> String {
         .collect()
 }
 
-async fn reset_admin_password(
-    conn: &sea_orm::DatabaseConnection,
-) -> anyhow::Result<()> {
+async fn reset_admin_password(conn: &sea_orm::DatabaseConnection) -> anyhow::Result<()> {
     use sea_orm::ColumnTrait;
 
     // Find the admin user (first user with admin role)

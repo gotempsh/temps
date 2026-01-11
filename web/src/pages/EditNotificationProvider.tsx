@@ -8,7 +8,7 @@ import {
   getNotificationProviderOptions,
   updateEmailProviderMutation,
   updateSlackProviderMutation,
-  testProviderMutation,
+  testProvider2Mutation,
   deleteProvider2Mutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ProviderForm } from '@/components/monitoring/ProviderForm'
@@ -62,7 +62,7 @@ export function EditNotificationProvider() {
     if (provider) {
       setBreadcrumbs([
         { label: 'Monitoring & Alerts', href: '/monitoring' },
-        { label: 'Providers', href: '/monitoring/providers' },
+        { label: 'Providers', href: '/notifications' },
         { label: provider.name || 'Edit Provider' },
       ])
     }
@@ -132,7 +132,7 @@ export function EditNotificationProvider() {
     onSuccess: () => {
       toast.success('Email provider updated successfully')
       queryClient.invalidateQueries({ queryKey: ['getNotificationProviders'] })
-      navigate('/monitoring/providers')
+      navigate('/notifications')
     },
   })
 
@@ -144,13 +144,13 @@ export function EditNotificationProvider() {
     onSuccess: () => {
       toast.success('Slack provider updated successfully')
       queryClient.invalidateQueries({ queryKey: ['getNotificationProviders'] })
-      navigate('/monitoring/providers')
+      navigate('/notifications')
     },
   })
 
   // Test mutation with toast.promise
   const testMutation = useMutation({
-    ...testProviderMutation(),
+    ...testProvider2Mutation(),
     meta: {
       errorTitle: 'Failed to test provider',
     },
@@ -165,7 +165,7 @@ export function EditNotificationProvider() {
     onSuccess: () => {
       toast.success('Provider deleted successfully')
       queryClient.invalidateQueries({ queryKey: ['getNotificationProviders'] })
-      navigate('/monitoring/providers')
+      navigate('/notifications')
     },
   })
 
@@ -214,15 +214,23 @@ export function EditNotificationProvider() {
   const handleTest = async () => {
     if (!provider) return
 
-    toast.promise(testMutation.mutateAsync({ path: { id: provider.id } }), {
-      loading: 'Sending test notification...',
-      success: 'Test notification sent successfully!',
-      error: (error) => {
-        const message =
-          error?.response?.data?.detail || 'Failed to send test notification'
-        return message
-      },
-    })
+    toast.promise(
+      testMutation.mutateAsync({
+        path: { id: provider.id },
+      }),
+      {
+        loading: 'Sending test notification...',
+        success: (data) =>
+          data.success
+            ? 'Test notification sent successfully!'
+            : data.message || 'Failed to send test notification',
+        error: (error) => {
+          const message =
+            error?.response?.data?.detail || 'Failed to send test notification'
+          return message
+        },
+      }
+    )
   }
 
   const handleDelete = async () => {
@@ -246,10 +254,7 @@ export function EditNotificationProvider() {
             Failed to load provider. Please check the ID and try again.
           </AlertDescription>
         </Alert>
-        <Button
-          onClick={() => navigate('/monitoring/providers')}
-          variant="outline"
-        >
+        <Button onClick={() => navigate('/notifications')} variant="outline">
           <ArrowLeft className="h-4 w-4 mr-2" />
           Back to Providers
         </Button>
@@ -265,7 +270,7 @@ export function EditNotificationProvider() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <Button
-            onClick={() => navigate('/monitoring/providers')}
+            onClick={() => navigate('/notifications')}
             variant="ghost"
             size="sm"
           >

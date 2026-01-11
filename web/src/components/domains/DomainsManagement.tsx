@@ -21,6 +21,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { KbdBadge } from '@/components/ui/kbd-badge'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -39,7 +40,6 @@ import {
   MoreHorizontal,
   Plus,
   RefreshCw,
-  Shield,
   Trash2,
   AlertTriangle,
   Info,
@@ -220,19 +220,9 @@ export function DomainsManagement({
       {pendingProvisioningCount > 0 && (
         <Alert className="border-yellow-200 bg-yellow-50/50 dark:bg-yellow-950/10">
           <AlertTriangle className="h-4 w-4 text-yellow-600" />
-          <AlertTitle className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <span>SSL Certificates Pending</span>
-              <Badge variant="secondary">{pendingProvisioningCount}</Badge>
-            </div>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => navigate('/domains/provisioning')}
-            >
-              <Shield className="mr-2 h-4 w-4" />
-              Manage Provisioning
-            </Button>
+          <AlertTitle className="flex items-center gap-2">
+            <span>SSL Certificates Pending</span>
+            <Badge variant="secondary">{pendingProvisioningCount}</Badge>
           </AlertTitle>
           <AlertDescription>
             {pendingProvisioningCount} domain
@@ -250,27 +240,14 @@ export function DomainsManagement({
             Manage your custom domains and SSL certificates
           </p>
         </div>
-        <div className="flex gap-2">
-          {pendingProvisioningCount > 0 && (
-            <Button
-              variant="outline"
-              onClick={() => navigate('/domains/provisioning')}
-            >
-              <Shield className="mr-2 h-4 w-4" />
-              SSL Provisioning
-              <Badge variant="secondary" className="ml-2">
-                {pendingProvisioningCount}
-              </Badge>
-            </Button>
-          )}
-          <Button
-            disabled={!canCreateDomains}
-            onClick={() => navigate('/domains/add')}
-          >
-            <Globe className="mr-2 h-4 w-4" />
-            {canCreateDomains ? 'Add Domain' : 'Managed by Cloudflare'}
-          </Button>
-        </div>
+        <Button
+          disabled={!canCreateDomains}
+          onClick={() => navigate('/domains/add')}
+        >
+          <Globe className="mr-2 h-4 w-4" />
+          {canCreateDomains ? 'Add Domain' : 'Managed by Cloudflare'}
+          {canCreateDomains && <KbdBadge keys="N" className="ml-2" />}
+        </Button>
       </div>
 
       <AlertDialog

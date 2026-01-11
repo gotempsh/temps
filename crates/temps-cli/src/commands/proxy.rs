@@ -2,6 +2,7 @@ use clap::Args;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use temps_config::ServerConfig;
 use temps_core::CookieCrypto;
 use temps_database::DbConnection;
 use temps_proxy::ProxyShutdownSignal;
@@ -167,10 +168,11 @@ impl ProxyCommand {
             self.console_address.clone(),
             cookie_crypto,
             encryption_service,
-            serve_config.data_dir.clone(),
+            serve_config.clone(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_proxy_server(
         &self,
         db: Arc<DbConnection>,
@@ -179,8 +181,9 @@ impl ProxyCommand {
         console_address: Option<String>,
         cookie_crypto: Arc<CookieCrypto>,
         encryption_service: Arc<temps_core::EncryptionService>,
-        data_dir: PathBuf,
+        config: Arc<ServerConfig>,
     ) -> anyhow::Result<()> {
+        let data_dir = config.data_dir.clone();
         let console_address = console_address
             .ok_or_else(|| anyhow::anyhow!("Console address is required for proxy server"))?;
 
@@ -231,6 +234,18 @@ impl ProxyCommand {
         info!("Starting route table listener...");
         rt.block_on(async { listener.start_listening().await })?;
 
+        // Start project change listener
+        info!("Starting project change listener...");
+        let project_listener = temps_routes::ProjectChangeListener::new(
+            self.database_url.clone(),
+            route_table.clone(),
+        );
+        rt.spawn(async move {
+            if let Err(e) = project_listener.start_listening().await {
+                tracing::error!("Project change listener failed: {}", e);
+            }
+        });
+
         let shutdown_signal = Box::new(CtrlCShutdownSignal::new(
             Duration::from_secs(30),
             db.clone(),
@@ -244,6 +259,7 @@ impl ProxyCommand {
             encryption_service,
             route_table,
             shutdown_signal,
+            config.clone(),
         ) {
             Ok(_) => {
                 info!("Proxy server exited");

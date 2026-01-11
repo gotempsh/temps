@@ -1,7 +1,7 @@
+use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashMap;
 use temps_core::{AuditContext, AuditOperation};
-use anyhow::Result;
 
 // Add these after the other audit structs
 #[derive(Debug, Clone, Serialize)]

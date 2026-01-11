@@ -1,11 +1,11 @@
 use sea_orm::*;
-use sea_orm_migration::MigratorTrait;
 #[cfg(test)]
 use std::sync::Arc;
 use temps_database::DbConnection;
-use temps_entities::{custom_routes, deployments, environments, projects, project_custom_domains, request_logs, visitor};
-use temps_migrations::Migrator;
-use testcontainers::{runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
+use temps_entities::{
+    custom_routes, deployments, environments, project_custom_domains, projects, proxy_logs,
+    upstream_config::UpstreamList, visitor,
+};
 
 /// Test database setup with TimescaleDB container
 pub struct TestDBMockOperations {
@@ -15,9 +15,7 @@ pub struct TestDBMockOperations {
 impl TestDBMockOperations {
     /// Create a new test database with TimescaleDB
     pub async fn new(db: Arc<DbConnection>) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(TestDBMockOperations {
-            db,
-        })
+        Ok(TestDBMockOperations { db })
     }
 
     /// Create test project with environment and deployment
@@ -39,18 +37,18 @@ impl TestDBMockOperations {
         (projects::Model, environments::Model, deployments::Model),
         Box<dyn std::error::Error>,
     > {
-        use temps_entities::types::ProjectType;
+        use temps_entities::preset::Preset;
 
         // Create project with unique name based on domain
         let project_name = format!("test-project-{}", domain.replace(".", "-"));
         let project = projects::ActiveModel {
             name: Set(project_name.clone()),
-            custom_domain: Set(Some(domain.to_string())),
-            is_web_app: Set(true),
-            project_type: Set(ProjectType::Server),
+            preset: Set(Preset::Nixpacks), // Default to Nixpacks for tests
             slug: Set(project_name.clone()),
             directory: Set(".".to_string()),
             main_branch: Set("main".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             ..Default::default()
         };
         let project = project.insert(self.db.as_ref()).await?;
@@ -61,9 +59,8 @@ impl TestDBMockOperations {
             slug: Set("production".to_string()),
             subdomain: Set("http://localhost:8080".to_string()),
             host: Set(domain.to_string()),
-            upstreams: Set(sea_orm::JsonValue::Null),
+            upstreams: Set(UpstreamList::default()),
             project_id: Set(project.id),
-            use_default_wildcard: Set(true),
             ..Default::default()
         };
         let environment = environment.insert(self.db.as_ref()).await?;
@@ -74,9 +71,9 @@ impl TestDBMockOperations {
             environment_id: Set(environment.id),
             slug: Set("http://localhost:8080".to_string()),
             state: Set("running".to_string()),
-            metadata: Set(sea_orm::JsonValue::Object(serde_json::Map::from_iter(vec![
-                ("container_port".to_string(), serde_json::Value::Number(8080.into())),
-            ]))),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             ..Default::default()
         };
         let deployment = deployment.insert(self.db.as_ref()).await?;
@@ -139,7 +136,7 @@ impl TestDBMockOperations {
     /// Clean up all test data
     pub async fn cleanup(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Delete in reverse dependency order
-        let _ = request_logs::Entity::delete_many()
+        let _ = proxy_logs::Entity::delete_many()
             .exec(self.db.as_ref())
             .await;
         let _ = visitor::Entity::delete_many().exec(self.db.as_ref()).await;
@@ -206,6 +203,12 @@ pub struct MockProjectContextResolver {
 }
 
 #[cfg(test)]
+impl Default for MockProjectContextResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockProjectContextResolver {
     pub fn new() -> Self {
         Self {

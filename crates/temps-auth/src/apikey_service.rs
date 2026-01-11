@@ -1,16 +1,15 @@
 use crate::permissions::{Permission, Role};
 use chrono::Utc;
 use rand::Rng;
-use temps_core::UtcDateTime;
-use temps_database::DbConnection;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
+use temps_core::UtcDateTime;
+use temps_database::DbConnection;
 use temps_entities::api_keys::{ActiveModel as ApiKeyActiveModel, Entity as ApiKeyEntity};
 use temps_entities::users;
 use thiserror::Error;
@@ -48,10 +47,8 @@ impl From<temps_entities::api_keys::Model> for ApiKeyResponse {
                 .permissions
                 .and_then(|p| serde_json::from_str(&p).ok()),
             is_active: model.is_active,
-            expires_at: model
-                .expires_at,
-            last_used_at: model
-                .last_used_at,
+            expires_at: model.expires_at,
+            last_used_at: model.last_used_at,
             created_at: model.created_at,
         }
     }
@@ -263,8 +260,7 @@ impl ApiKeyService {
                 .permissions
                 .and_then(|p| serde_json::from_str(&p).ok()),
             api_key, // Only returned on creation
-            expires_at: api_key_model
-                .expires_at,
+            expires_at: api_key_model.expires_at,
             created_at: api_key_model.created_at,
         })
     }
@@ -405,11 +401,12 @@ impl ApiKeyService {
             }
         }
 
-        // Get user
+        // Get user, excluding soft-deleted users
         let user = users::Entity::find_by_id(api_key_model.user_id)
+            .filter(users::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ApiKeyServiceError::NotFound("User not found".to_string()))?;
+            .ok_or_else(|| ApiKeyServiceError::NotFound("User not found or deleted".to_string()))?;
 
         // Parse role or permissions based on role_type
         let (role, permissions) = if api_key_model.role_type == "custom" {
@@ -510,9 +507,9 @@ impl ApiKeyService {
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
+    use sea_orm::{ActiveModelTrait, Set};
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{api_keys, users};
-    use sea_orm::{ActiveModelTrait, Set};
 
     async fn setup_test_env() -> (TestDatabase, ApiKeyService, users::Model) {
         let db = TestDatabase::with_migrations().await.unwrap();
@@ -553,7 +550,7 @@ mod tests {
             role_type: Set(role_type.to_string()),
             permissions: Set(None),
             is_active: Set(true),
-            expires_at: Set(Some((Utc::now() + Duration::days(365)))),
+            expires_at: Set(Some(Utc::now() + Duration::days(365))),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -593,7 +590,10 @@ mod tests {
         let request = CreateApiKeyRequest {
             name: "Custom API Key".to_string(),
             role_type: "custom".to_string(),
-            permissions: Some(vec!["projects:read".to_string(), "deployments:read".to_string()]),
+            permissions: Some(vec![
+                "projects:read".to_string(),
+                "deployments:read".to_string(),
+            ]),
             expires_at: None,
         };
 
@@ -1191,7 +1191,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_error_to_problem_conversion() {
-        let db_error = ApiKeyServiceError::DatabaseError(sea_orm::DbErr::RecordNotFound("test".to_string()));
+        let db_error =
+            ApiKeyServiceError::DatabaseError(sea_orm::DbErr::RecordNotFound("test".to_string()));
         let problem = db_error.to_problem();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
 

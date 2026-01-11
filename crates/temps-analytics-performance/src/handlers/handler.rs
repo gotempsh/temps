@@ -1,7 +1,7 @@
 use super::types::AppState;
 use crate::services::service::{
     GroupBy, GroupedPageMetric, GroupedPageMetricsResponse, MetricsOverTimeResponse,
-    PerformanceMetricsResponse,
+    PerformanceMetricsResponse, RecordPerformanceMetricsConfig, UpdatePerformanceMetricsConfig,
 };
 use axum::http::header::HeaderMap;
 use axum::Extension;
@@ -13,8 +13,8 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_core::DateTime;
 use std::sync::Arc;
+use temps_core::DateTime;
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
 
@@ -35,6 +35,16 @@ pub struct GroupedPageMetricsQuery {
     environment_id: Option<i32>,
     deployment_id: Option<i32>,
     group_by: String, // "path", "country", "device_type", "browser", "operating_system"
+}
+
+#[derive(Deserialize, Clone, ToSchema)]
+pub struct HasMetricsQuery {
+    project_id: i32,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HasMetricsResponse {
+    pub has_metrics: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -91,6 +101,7 @@ pub struct UpdateSpeedMetricsPayload {
         get_performance_metrics,
         get_metrics_over_time,
         get_grouped_page_metrics,
+        has_performance_metrics,
         record_speed_metrics,
         update_speed_metrics
     ),
@@ -102,6 +113,8 @@ pub struct UpdateSpeedMetricsPayload {
             GroupedPageMetric,
             PerformanceMetricsQuery,
             GroupedPageMetricsQuery,
+            HasMetricsQuery,
+            HasMetricsResponse,
             SpeedMetricsPayload,
             UpdateSpeedMetricsPayload,
             ErrorResponse
@@ -116,14 +129,9 @@ pub struct PerformanceApiDoc;
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/performance/metrics", get(get_performance_metrics))
-        .route(
-            "/performance/metrics-over-time",
-            get(get_metrics_over_time),
-        )
-        .route(
-            "/performance/page-metrics",
-            get(get_grouped_page_metrics),
-        )
+        .route("/performance/metrics-over-time", get(get_metrics_over_time))
+        .route("/performance/page-metrics", get(get_grouped_page_metrics))
+        .route("/performance/has-metrics", get(has_performance_metrics))
         .route("/_temps/speed", post(record_speed_metrics))
         .route("/_temps/speed/update", post(update_speed_metrics))
 }
@@ -150,8 +158,6 @@ async fn get_performance_metrics(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PerformanceMetricsQuery>,
 ) -> Result<Json<PerformanceMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
-
-
     match state
         .performance_service
         .get_metrics(
@@ -199,7 +205,6 @@ async fn get_metrics_over_time(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PerformanceMetricsQuery>,
 ) -> Result<Json<MetricsOverTimeResponse>, (StatusCode, Json<ErrorResponse>)> {
-   
     match state
         .performance_service
         .get_metrics_over_time(
@@ -248,8 +253,6 @@ async fn get_grouped_page_metrics(
     State(state): State<Arc<AppState>>,
     Query(query): Query<GroupedPageMetricsQuery>,
 ) -> Result<Json<GroupedPageMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
-
-
     let group_by = match query.group_by.as_str() {
         "path" => GroupBy::Path,
         "country" => GroupBy::Country,
@@ -290,6 +293,42 @@ async fn get_grouped_page_metrics(
                 Json(ErrorResponse {
                     error: "Failed to fetch grouped page metrics".to_string(),
                     details: Some(format!("Error retrieving metrics: {:?}", e)),
+                }),
+            ))
+        }
+    }
+}
+
+/// Check if performance metrics exist for a project
+#[utoipa::path(
+    tag = "Performance",
+    get,
+    path = "/performance/has-metrics",
+    params(
+        ("project_id" = i32, Query, description = "Project ID")
+    ),
+    responses(
+        (status = 200, description = "Successfully checked performance metrics availability", body = HasMetricsResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
+async fn has_performance_metrics(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HasMetricsQuery>,
+) -> Result<Json<HasMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    match state
+        .performance_service
+        .has_metrics(query.project_id)
+        .await
+    {
+        Ok(has_metrics) => Ok(Json(HasMetricsResponse { has_metrics })),
+        Err(e) => {
+            error!("Error checking performance metrics: {:?}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Failed to check performance metrics".to_string(),
+                    details: Some(format!("Error checking metrics: {:?}", e)),
                 }),
             ))
         }
@@ -372,10 +411,17 @@ pub async fn record_speed_metrics(
 
     // Lookup IP geolocation
     let ip_address_id = if !metadata.ip_address.is_empty() {
-        match state.ip_address_service.get_or_create_ip(&metadata.ip_address).await {
+        match state
+            .ip_address_service
+            .get_or_create_ip(&metadata.ip_address)
+            .await
+        {
             Ok(ip_info) => Some(ip_info.id),
             Err(e) => {
-                error!("Failed to lookup IP geolocation for {}: {}", metadata.ip_address, e);
+                error!(
+                    "Failed to lookup IP geolocation for {}: {}",
+                    metadata.ip_address, e
+                );
                 None
             }
         }
@@ -391,29 +437,29 @@ pub async fn record_speed_metrics(
 
     match state
         .performance_service
-        .record_performance_metrics(
+        .record_performance_metrics(RecordPerformanceMetricsConfig {
             project_id,
             environment_id,
             deployment_id,
-            metadata.session_id_cookie,
-            metadata.visitor_id_cookie,
+            session_id: metadata.session_id_cookie,
+            visitor_id: metadata.visitor_id_cookie,
             ip_address_id,
-            payload.ttfb,
-            payload.lcp,
-            payload.fid,
-            payload.fcp,
-            payload.cls,
-            payload.inp,
-            payload.pathname,
-            payload.query,
-            Some(host),
+            ttfb: payload.ttfb,
+            lcp: payload.lcp,
+            fid: payload.fid,
+            fcp: payload.fcp,
+            cls: payload.cls,
+            inp: payload.inp,
+            pathname: payload.pathname,
+            query: payload.query,
+            host: Some(host),
             user_agent,
-            payload.screen_width,
-            payload.screen_height,
-            payload.viewport_width,
-            payload.viewport_height,
-            payload.language,
-        )
+            screen_width: payload.screen_width,
+            screen_height: payload.screen_height,
+            viewport_width: payload.viewport_width,
+            viewport_height: payload.viewport_height,
+            language: payload.language,
+        })
         .await
     {
         Ok(_) => StatusCode::OK.into_response(),
@@ -507,15 +553,15 @@ pub async fn update_speed_metrics(
 
     match state
         .performance_service
-        .update_performance_metrics(
+        .update_performance_metrics(UpdatePerformanceMetricsConfig {
             project_id,
             environment_id,
             deployment_id,
-            metadata.session_id_cookie,
-            metadata.visitor_id_cookie,
-            payload.cls,
-            payload.inp,
-        )
+            session_id: metadata.session_id_cookie,
+            visitor_id: metadata.visitor_id_cookie,
+            cls: payload.cls,
+            inp: payload.inp,
+        })
         .await
     {
         Ok(_) => StatusCode::OK.into_response(),

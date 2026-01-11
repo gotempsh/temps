@@ -60,10 +60,14 @@ impl TempsPlugin for ProvidersPlugin {
         let external_service_manager = context.require_service::<ExternalServiceManager>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
+        // Create QueryService
+        let query_service = Arc::new(crate::QueryService::new(external_service_manager.clone()));
+
         // Create AppState for handlers
         let app_state = Arc::new(AppState {
             external_service_manager,
             audit_service,
+            query_service,
         });
 
         // Configure routes with the app state
@@ -91,7 +95,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_providers_plugin_default() {
-        let providers_plugin = ProvidersPlugin::default();
+        let providers_plugin = ProvidersPlugin;
         assert_eq!(providers_plugin.name(), "providers");
     }
 }

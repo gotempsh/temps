@@ -13,17 +13,17 @@ mod mod_rs {
 
 // Re-export main types for easy access
 pub use {
-    ProjectType, PackageManager, Preset,
-    all_presets, get_preset_by_slug, create_custom_preset,
-    detect_preset_from_files, register_docker_custom_preset
+    all_presets, detect_node_framework, detect_preset_from_files, get_preset_by_slug,
+    DockerfileWithArgs, JavaPreset, NixpacksPreset, NixpacksProvider, NodeFramework,
+    PackageManager, Preset, PresetConfig, ProjectType,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    use tempfile::TempDir;
+
     use std::fs;
+    use tempfile::TempDir;
 
     /// Helper function to create a temporary directory with test files
     fn create_test_dir_with_files(files: &[&str]) -> TempDir {
@@ -73,7 +73,10 @@ mod tests {
 
     #[test]
     fn test_detect_docusaurus_preset() {
-        let files = vec!["docusaurus.config.js".to_string(), "package.json".to_string()];
+        let files = vec![
+            "docusaurus.config.js".to_string(),
+            "package.json".to_string(),
+        ];
         let preset = detect_preset_from_files(&files);
 
         assert!(preset.is_some());
@@ -99,47 +102,220 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_custom_preset_fallback() {
-        let files = vec!["some-random-file.txt".to_string()];
+    fn test_no_preset_for_random_files() {
+        // Random files should NOT auto-detect any preset
+        let files = vec![
+            "some-random-file.txt".to_string(),
+            "src/main.rs".to_string(),
+        ];
+        let preset = detect_preset_from_files(&files);
+
+        assert!(
+            preset.is_none(),
+            "Random files should not auto-detect a preset"
+        );
+    }
+
+    #[test]
+    fn test_detect_nixpacks_with_config() {
+        // Nixpacks should only be detected if nixpacks.toml is present
+        let files = vec!["nixpacks.toml".to_string(), "main.py".to_string()];
         let preset = detect_preset_from_files(&files);
 
         assert!(preset.is_some());
-        assert_eq!(preset.unwrap().slug(), "custom");
+        assert_eq!(preset.unwrap().slug(), "nixpacks");
+    }
+
+    #[test]
+    fn test_detect_java_maven_preset() {
+        let files = vec!["pom.xml".to_string(), "src/main/java/Main.java".to_string()];
+        let preset = detect_preset_from_files(&files);
+
+        assert!(preset.is_some());
+        assert_eq!(preset.unwrap().slug(), "java");
+    }
+
+    #[test]
+    fn test_detect_java_gradle_preset() {
+        let files = vec![
+            "build.gradle".to_string(),
+            "src/main/java/Main.java".to_string(),
+        ];
+        let preset = detect_preset_from_files(&files);
+
+        assert!(preset.is_some());
+        assert_eq!(preset.unwrap().slug(), "java");
+    }
+
+    #[test]
+    fn test_detect_java_gradle_kts_preset() {
+        let files = vec![
+            "build.gradle.kts".to_string(),
+            "src/main/kotlin/Main.kt".to_string(),
+        ];
+        let preset = detect_preset_from_files(&files);
+
+        assert!(preset.is_some());
+        assert_eq!(preset.unwrap().slug(), "java");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_empty() {
+        let files: Vec<String> = vec![];
+        let presets = detect_presets_from_file_tree(&files);
+        assert!(presets.is_empty());
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_root_only() {
+        let files = vec![
+            "package.json".to_string(),
+            "next.config.js".to_string(),
+            "src/app/page.tsx".to_string(),
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].path, "./");
+        assert_eq!(presets[0].slug, "nextjs");
+        assert_eq!(presets[0].label, "Next.js");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_monorepo() {
+        let files = vec![
+            "package.json".to_string(),
+            "apps/web/next.config.js".to_string(),
+            "apps/web/package.json".to_string(),
+            "apps/api/Dockerfile".to_string(),
+            "apps/api/main.go".to_string(),
+            "packages/ui/vite.config.ts".to_string(),
+            "packages/ui/package.json".to_string(),
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 3);
+
+        // Root should come first
+        assert_eq!(presets[0].path, "apps/api");
+        assert_eq!(presets[0].slug, "dockerfile");
+
+        assert_eq!(presets[1].path, "apps/web");
+        assert_eq!(presets[1].slug, "nextjs");
+
+        assert_eq!(presets[2].path, "packages/ui");
+        assert_eq!(presets[2].slug, "vite");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_skips_node_modules() {
+        let files = vec![
+            "next.config.js".to_string(),
+            "node_modules/some-package/vite.config.js".to_string(), // Should be ignored
+            "src/index.ts".to_string(),
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].slug, "nextjs"); // Only Next.js detected, not Vite
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_skips_build_dirs() {
+        let files = vec![
+            "vite.config.ts".to_string(),
+            "dist/next.config.js".to_string(), // Should be ignored
+            "build/rsbuild.config.ts".to_string(), // Should be ignored
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].slug, "vite");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_depth_limit() {
+        let files = vec![
+            "next.config.js".to_string(),
+            "a/b/c/d/e/vite.config.ts".to_string(), // Too deep (5 levels), should be ignored
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].slug, "nextjs");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_dockerfile_priority() {
+        let files = vec!["Dockerfile".to_string(), "next.config.js".to_string()];
+        let presets = detect_presets_from_file_tree(&files);
+
+        // Dockerfile has higher priority
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].slug, "dockerfile");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_nixpacks_with_config() {
+        let files = vec!["nixpacks.toml".to_string(), "main.py".to_string()];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].slug, "nixpacks");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_no_preset_for_random_files() {
+        let files = vec![
+            "README.md".to_string(),
+            "src/utils.js".to_string(), // Generic JS file (no framework config)
+            "data.json".to_string(),    // Random JSON file
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        // No framework-specific config files, so no presets should be detected
+        assert!(presets.is_empty());
     }
 
     #[test]
     fn test_package_manager_detection() {
         // Test pnpm detection
         let temp_dir = create_test_dir_with_files(&["pnpm-lock.yaml"]);
-        let package_manager = PackageManager::detect(&temp_dir.path().to_path_buf());
+        let package_manager = PackageManager::detect(temp_dir.path());
         assert!(matches!(package_manager, PackageManager::Pnpm));
 
         // Test npm detection
         let temp_dir = create_test_dir_with_files(&["package-lock.json"]);
-        let package_manager = PackageManager::detect(&temp_dir.path().to_path_buf());
+        let package_manager = PackageManager::detect(temp_dir.path());
         assert!(matches!(package_manager, PackageManager::Npm));
 
         // Test yarn detection
         let temp_dir = create_test_dir_with_files(&["yarn.lock"]);
-        let package_manager = PackageManager::detect(&temp_dir.path().to_path_buf());
+        let package_manager = PackageManager::detect(temp_dir.path());
         assert!(matches!(package_manager, PackageManager::Yarn));
 
         // Test bun detection
         let temp_dir = create_test_dir_with_files(&["bun.lockb"]);
-        let package_manager = PackageManager::detect(&temp_dir.path().to_path_buf());
+        let package_manager = PackageManager::detect(temp_dir.path());
         assert!(matches!(package_manager, PackageManager::Bun));
 
         // Test default (npm) when no lock files
         let temp_dir = create_test_dir_with_files(&["package.json"]);
-        let package_manager = PackageManager::detect(&temp_dir.path().to_path_buf());
+        let package_manager = PackageManager::detect(temp_dir.path());
         assert!(matches!(package_manager, PackageManager::Npm));
     }
 
     #[test]
     fn test_package_manager_commands() {
         assert_eq!(PackageManager::Npm.install_command(), "npm install");
-        assert_eq!(PackageManager::Yarn.install_command(), "yarn install --frozen-lockfile");
-        assert_eq!(PackageManager::Pnpm.install_command(), "pnpm install --frozen-lockfile");
+        assert_eq!(
+            PackageManager::Yarn.install_command(),
+            "yarn install --frozen-lockfile"
+        );
+        assert_eq!(
+            PackageManager::Pnpm.install_command(),
+            "pnpm install --frozen-lockfile"
+        );
         assert_eq!(PackageManager::Bun.install_command(), "bun install");
 
         assert_eq!(PackageManager::Npm.build_command(), "npm run build");
@@ -175,6 +351,10 @@ mod tests {
         assert!(slugs.contains(&"vite".to_string()));
         assert!(slugs.contains(&"dockerfile".to_string()));
         assert!(slugs.contains(&"docusaurus".to_string()));
+        assert!(slugs.contains(&"java".to_string()));
+        assert!(slugs.contains(&"go".to_string()));
+        assert!(slugs.contains(&"python".to_string()));
+        assert!(slugs.contains(&"rust".to_string()));
     }
 
     #[test]
@@ -183,47 +363,32 @@ mod tests {
         assert_eq!(ProjectType::Static.to_string(), "static");
     }
 
-    #[test]
-    fn test_dockerfile_generation() {
+    #[tokio::test]
+    async fn test_dockerfile_generation() {
         let temp_dir = create_test_dir_with_files(&["package.json"]);
-        let path = temp_dir.path().to_path_buf();
+        let path = temp_dir.path();
 
         if let Some(preset) = get_preset_by_slug("nextjs") {
-            let dockerfile = preset.dockerfile(
-                &path,
-                &path,
-                Some("npm install"),
-                Some("npm run build"),
-                Some("dist"),
-                None,
-                "test-project"
-            );
+            let result = preset
+                .dockerfile(DockerfileConfig {
+                    use_buildkit: true,
+                    root_local_path: path,
+                    local_path: path,
+                    install_command: Some("npm install"),
+                    build_command: Some("npm run build"),
+                    output_dir: Some("dist"),
+                    build_vars: None,
+                    project_slug: "test-project",
+                })
+                .await;
 
             // Basic checks that dockerfile contains expected content
-            assert!(dockerfile.contains("FROM"));
-            assert!(dockerfile.contains("npm install"));
-            assert!(dockerfile.contains("npm run build"));
+            assert!(result.content.contains("FROM"));
+            assert!(result.content.contains("npm install"));
+            assert!(result.content.contains("npm run build"));
         } else {
             panic!("NextJS preset should be available");
         }
-    }
-
-    #[test]
-    fn test_create_custom_preset() {
-        let custom_preset = create_custom_preset(
-            "My Custom".to_string(),
-            "https://example.com/icon.png".to_string(),
-            ProjectType::Server,
-            "FROM alpine\nRUN echo 'hello'".to_string(),
-            "custom-test".to_string(),
-            "make install".to_string(),
-            "make build".to_string(),
-            "FROM alpine\nWORKDIR /app".to_string(),
-        );
-
-        assert_eq!(custom_preset.slug(), "custom-test");
-        assert_eq!(custom_preset.label(), "My Custom");
-        assert!(matches!(custom_preset.project_type(), ProjectType::Server));
     }
 
     #[test]
@@ -232,7 +397,7 @@ mod tests {
         let files = vec![
             "Dockerfile".to_string(),
             "next.config.js".to_string(),
-            "vite.config.js".to_string()
+            "vite.config.js".to_string(),
         ];
         let preset = detect_preset_from_files(&files);
 
@@ -245,11 +410,28 @@ mod tests {
         // Docusaurus should be detected before Next.js if both configs exist
         let files = vec![
             "docusaurus.config.js".to_string(),
-            "next.config.js".to_string()
+            "next.config.js".to_string(),
         ];
         let preset = detect_preset_from_files(&files);
 
         assert!(preset.is_some());
         assert_eq!(preset.unwrap().slug(), "docusaurus");
+    }
+
+    #[test]
+    fn test_preset_default_ports() {
+        // Test that presets return expected default ports
+        assert_eq!(get_preset_by_slug("java").unwrap().default_port(), 8080);
+        assert_eq!(get_preset_by_slug("go").unwrap().default_port(), 8080);
+        assert_eq!(get_preset_by_slug("rust").unwrap().default_port(), 8080);
+        assert_eq!(get_preset_by_slug("python").unwrap().default_port(), 8000);
+        assert_eq!(get_preset_by_slug("vite").unwrap().default_port(), 5173);
+        assert_eq!(get_preset_by_slug("nextjs").unwrap().default_port(), 3000); // Default
+        assert_eq!(
+            get_preset_by_slug("docusaurus").unwrap().default_port(),
+            3000
+        ); // Default
+        assert_eq!(get_preset_by_slug("rsbuild").unwrap().default_port(), 3000);
+        // Default
     }
 }

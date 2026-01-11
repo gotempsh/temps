@@ -7,19 +7,20 @@ mod audit;
 mod auth_service;
 pub mod context;
 mod decorators;
+mod deployment_token_service;
 mod email_templates;
+pub mod handlers;
 mod macros;
 mod middleware;
 mod permission_attribute;
 mod permission_decorator;
 mod permission_guard;
-mod plugin;
-mod temps_middleware;
-mod user_service;
-mod types;
 pub mod permissions;
+mod plugin;
 pub mod state;
-pub mod handlers;
+mod temps_middleware;
+mod types;
+mod user_service;
 
 pub use decorators::*;
 pub use macros::*;
@@ -31,13 +32,16 @@ pub use permissions::*;
 pub use state::*;
 
 // Export plugins
-pub use plugin::AuthPlugin;
 pub use apikey_plugin::ApiKeyPlugin;
+pub use plugin::AuthPlugin;
 
 // Export services
-pub use auth_service::AuthService;
-pub use user_service::UserService;
 pub use apikey_service::ApiKeyService;
+pub use auth_service::AuthService;
+pub use deployment_token_service::{
+    DeploymentTokenValidationError, DeploymentTokenValidationService, ValidatedDeploymentToken,
+};
+pub use user_service::UserService;
 
 // Export TempsMiddleware implementation
 pub use temps_middleware::AuthMiddleware;

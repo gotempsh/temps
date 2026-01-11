@@ -1,0 +1,39 @@
+class Temps < Formula
+  desc "Temps - Modern deployment platform for web applications"
+  homepage "https://github.com/davidviejo/temps"
+  version "{{VERSION}}"
+  license "MIT OR Apache-2.0"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/davidviejo/temps/releases/download/v{{VERSION}}/temps-darwin-arm64.tar.gz"
+      sha256 "{{SHA256_DARWIN_ARM64}}"
+
+      def install
+        bin.install "temps"
+      end
+    else
+      url "https://github.com/davidviejo/temps/releases/download/v{{VERSION}}/temps-darwin-amd64.tar.gz"
+      sha256 "{{SHA256_DARWIN_AMD64}}"
+
+      def install
+        bin.install "temps"
+      end
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.intel?
+      url "https://github.com/davidviejo/temps/releases/download/v{{VERSION}}/temps-linux-amd64.tar.gz"
+      sha256 "{{SHA256_LINUX_AMD64}}"
+
+      def install
+        bin.install "temps"
+      end
+    end
+  end
+
+  test do
+    system "#{bin}/temps", "--version"
+  end
+end

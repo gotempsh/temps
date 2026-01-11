@@ -7,8 +7,17 @@ use temps_migrations::Migrator;
 /// Test that migrations can be applied successfully
 #[tokio::test]
 async fn test_migration_up() -> anyhow::Result<()> {
+    // Skip this test if TEMPS_TEST_DATABASE_URL is set
+    // (external databases may already have migrations applied)
+    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+        println!(
+            "⏭️  Skipping test_migration_up: using external database via TEMPS_TEST_DATABASE_URL"
+        );
+        return Ok(());
+    }
+
     // Start TimescaleDB container
-    let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg17")
+    let postgres_container = GenericImage::new("timescale/timescaledb", "latest-pg17")
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -34,7 +43,10 @@ async fn test_migration_up() -> anyhow::Result<()> {
             Ok(db) => break db,
             Err(e) if retries > 0 => {
                 retries -= 1;
-                println!("Database connection failed, retrying in 2s... ({} retries left)", retries);
+                println!(
+                    "Database connection failed, retrying in 2s... ({} retries left)",
+                    retries
+                );
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                 if retries == 0 {
                     panic!("Failed to connect to database after retries: {}", e);
@@ -66,8 +78,17 @@ async fn test_migration_up() -> anyhow::Result<()> {
 /// Test that migrations can be rolled back successfully
 #[tokio::test]
 async fn test_migration_down() -> anyhow::Result<()> {
+    // Skip this test if TEMPS_TEST_DATABASE_URL is set
+    // (running down migrations would destroy data in external database)
+    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+        println!(
+            "⏭️  Skipping test_migration_down: using external database via TEMPS_TEST_DATABASE_URL"
+        );
+        return Ok(());
+    }
+
     // Start TimescaleDB container
-    let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg17")
+    let postgres_container = GenericImage::new("timescale/timescaledb", "latest-pg17")
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -93,7 +114,10 @@ async fn test_migration_down() -> anyhow::Result<()> {
             Ok(db) => break db,
             Err(e) if retries > 0 => {
                 retries -= 1;
-                println!("Database connection failed, retrying in 2s... ({} retries left)", retries);
+                println!(
+                    "Database connection failed, retrying in 2s... ({} retries left)",
+                    retries
+                );
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                 if retries == 0 {
                     panic!("Failed to connect to database after retries: {}", e);
@@ -130,8 +154,15 @@ async fn test_migration_down() -> anyhow::Result<()> {
 /// Test migration status
 #[tokio::test]
 async fn test_migration_status() -> anyhow::Result<()> {
+    // Skip this test if TEMPS_TEST_DATABASE_URL is set
+    // (external databases may already have migrations applied)
+    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+        println!("⏭️  Skipping test_migration_status: using external database via TEMPS_TEST_DATABASE_URL");
+        return Ok(());
+    }
+
     // Start TimescaleDB container
-    let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg17")
+    let postgres_container = GenericImage::new("timescale/timescaledb", "latest-pg17")
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -157,7 +188,10 @@ async fn test_migration_status() -> anyhow::Result<()> {
             Ok(db) => break db,
             Err(e) if retries > 0 => {
                 retries -= 1;
-                println!("Database connection failed, retrying in 2s... ({} retries left)", retries);
+                println!(
+                    "Database connection failed, retrying in 2s... ({} retries left)",
+                    retries
+                );
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                 if retries == 0 {
                     panic!("Failed to connect to database after retries: {}", e);
@@ -176,7 +210,10 @@ async fn test_migration_status() -> anyhow::Result<()> {
 
     // Check status after migrations
     let status_after = Migrator::get_pending_migrations(&db).await?;
-    assert!(status_after.is_empty(), "Should have no pending migrations after up");
+    assert!(
+        status_after.is_empty(),
+        "Should have no pending migrations after up"
+    );
 
     // Note: Migrator::fresh doesn't work well with TimescaleDB extensions
     // So we skip the fresh test for now
@@ -189,7 +226,7 @@ async fn test_migration_status() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_pgvector_extension() -> anyhow::Result<()> {
     // Start TimescaleDB container
-    let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg17")
+    let postgres_container = GenericImage::new("timescale/timescaledb", "latest-pg17")
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -215,7 +252,10 @@ async fn test_pgvector_extension() -> anyhow::Result<()> {
             Ok(db) => break db,
             Err(e) if retries > 0 => {
                 retries -= 1;
-                println!("Database connection failed, retrying in 2s... ({} retries left)", retries);
+                println!(
+                    "Database connection failed, retrying in 2s... ({} retries left)",
+                    retries
+                );
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                 if retries == 0 {
                     panic!("Failed to connect to database after retries: {}", e);
@@ -253,8 +293,11 @@ async fn test_pgvector_extension() -> anyhow::Result<()> {
 
         if let Ok(Some(row)) = result {
             let data_type: String = row.try_get("", "data_type").unwrap_or_default();
-            assert!(data_type.contains("USER-DEFINED") || data_type.contains("vector"),
-                    "Expected vector type for embedding column, got: {}", data_type);
+            assert!(
+                data_type.contains("USER-DEFINED") || data_type.contains("vector"),
+                "Expected vector type for embedding column, got: {}",
+                data_type
+            );
             println!("✅ Vector embedding column properly created");
         }
     } else {
@@ -270,8 +313,11 @@ async fn test_pgvector_extension() -> anyhow::Result<()> {
 
         if let Ok(Some(row)) = result {
             let data_type: String = row.try_get("", "data_type").unwrap_or_default();
-            assert_eq!(data_type, "text",
-                    "Expected text type for embedding column fallback, got: {}", data_type);
+            assert_eq!(
+                data_type, "text",
+                "Expected text type for embedding column fallback, got: {}",
+                data_type
+            );
             println!("✅ Text embedding column fallback properly created");
         }
     }
@@ -282,8 +328,15 @@ async fn test_pgvector_extension() -> anyhow::Result<()> {
 /// Test specific table creation and constraints
 #[tokio::test]
 async fn test_table_constraints() -> anyhow::Result<()> {
+    // Skip this test if TEMPS_TEST_DATABASE_URL is set
+    // (external databases may already have migrations applied)
+    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+        println!("⏭️  Skipping test_table_constraints: using external database via TEMPS_TEST_DATABASE_URL");
+        return Ok(());
+    }
+
     // Start TimescaleDB container
-    let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg17")
+    let postgres_container = GenericImage::new("timescale/timescaledb", "latest-pg17")
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -309,7 +362,10 @@ async fn test_table_constraints() -> anyhow::Result<()> {
             Ok(db) => break db,
             Err(e) if retries > 0 => {
                 retries -= 1;
-                println!("Database connection failed, retrying in 2s... ({} retries left)", retries);
+                println!(
+                    "Database connection failed, retrying in 2s... ({} retries left)",
+                    retries
+                );
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                 if retries == 0 {
                     panic!("Failed to connect to database after retries: {}", e);
@@ -337,17 +393,29 @@ async fn test_table_constraints() -> anyhow::Result<()> {
 
 async fn verify_tables_exist(db: &DatabaseConnection) -> anyhow::Result<()> {
     let tables = vec![
-        "users", "projects", "environments", "deployments", "visitor",
-        "ip_geolocations", "session_replay_sessions", "error_groups",
-        "error_events", "project_dsns", "error_sessions",
-        "error_attachments", "error_user_feedback"
+        "users",
+        "projects",
+        "environments",
+        "deployments",
+        "visitor",
+        "ip_geolocations",
+        "session_replay_sessions",
+        "error_groups",
+        "error_events",
+        "project_dsns",
+        "error_sessions",
+        "error_attachments",
+        "error_user_feedback",
     ];
 
     for table in tables {
         let result = db
             .query_one(sea_orm::Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
-                format!("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{}')", table),
+                format!(
+                    "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{}')",
+                    table
+                ),
             ))
             .await?;
 
@@ -363,23 +431,39 @@ async fn verify_tables_exist(db: &DatabaseConnection) -> anyhow::Result<()> {
 
 async fn verify_tables_dropped(db: &DatabaseConnection) -> anyhow::Result<()> {
     let tables = vec![
-        "error_user_feedback", "error_attachments", "error_sessions",
-        "project_dsns", "error_events", "error_groups",
-        "session_replay_sessions", "ip_geolocations", "visitor",
-        "deployments", "environments", "projects", "users"
+        "error_user_feedback",
+        "error_attachments",
+        "error_sessions",
+        "project_dsns",
+        "error_events",
+        "error_groups",
+        "session_replay_sessions",
+        "ip_geolocations",
+        "visitor",
+        "deployments",
+        "environments",
+        "projects",
+        "users",
     ];
 
     for table in tables {
         let result = db
             .query_one(sea_orm::Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
-                format!("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{}')", table),
+                format!(
+                    "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{}')",
+                    table
+                ),
             ))
             .await?;
 
         if let Some(row) = result {
             let exists: bool = row.try_get("", "exists")?;
-            assert!(!exists, "Table {} should not exist after migration down", table);
+            assert!(
+                !exists,
+                "Table {} should not exist after migration down",
+                table
+            );
         }
     }
 
@@ -407,7 +491,11 @@ async fn verify_foreign_keys(db: &DatabaseConnection) -> anyhow::Result<()> {
 
         if let Some(row) = result {
             let exists: bool = row.try_get("", "exists")?;
-            assert!(exists, "Foreign key constraint {} should exist on table {}", constraint, table);
+            assert!(
+                exists,
+                "Foreign key constraint {} should exist on table {}",
+                constraint, table
+            );
         }
     }
 
@@ -429,7 +517,10 @@ async fn verify_indexes(db: &DatabaseConnection) -> anyhow::Result<()> {
         let result = db
             .query_one(sea_orm::Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
-                format!("SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = '{}')", index),
+                format!(
+                    "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = '{}')",
+                    index
+                ),
             ))
             .await?;
 
@@ -454,7 +545,10 @@ async fn verify_unique_constraints(db: &DatabaseConnection) -> anyhow::Result<()
 
     if let Some(row) = result {
         let exists: bool = row.try_get("", "exists")?;
-        assert!(exists, "Unique constraint on project_dsns.public_key should exist");
+        assert!(
+            exists,
+            "Unique constraint on project_dsns.public_key should exist"
+        );
     }
 
     println!("✅ Unique constraints verified");

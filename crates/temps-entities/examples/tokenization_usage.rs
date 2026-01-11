@@ -43,7 +43,6 @@ fn main() {
 
 fn create_sample_error() -> ErrorGroup {
     use chrono::Utc;
-    use temps_entities::error_groups::PgVector;
 
     ErrorGroup {
         id: 1,
@@ -116,8 +115,14 @@ fn demonstrate_embedding_creation(tokenizer: &HashTokenizer) {
     let embedding2 = create_embedding(tokenizer, error2, 384);
     let embedding3 = create_embedding(tokenizer, error3, 384);
 
-    println!("   Similarity (error1 vs error2): {:.4}", cosine_similarity(&embedding1, &embedding2));
-    println!("   Similarity (error1 vs error3): {:.4}", cosine_similarity(&embedding1, &embedding3));
+    println!(
+        "   Similarity (error1 vs error2): {:.4}",
+        cosine_similarity(&embedding1, &embedding2)
+    );
+    println!(
+        "   Similarity (error1 vs error3): {:.4}",
+        cosine_similarity(&embedding1, &embedding3)
+    );
     println!("   Note: Higher similarity means errors are more similar");
 }
 

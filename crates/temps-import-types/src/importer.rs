@@ -4,7 +4,9 @@
 //! This is generic for all workload types: containers, serverless functions, static sites, etc.
 
 use crate::{
-    error::ImportResult, plan::ImportPlan, snapshot::{WorkloadDescriptor, WorkloadId, WorkloadSnapshot},
+    error::ImportResult,
+    plan::ImportPlan,
+    snapshot::{WorkloadDescriptor, WorkloadId, WorkloadSnapshot},
     validation::{ImportValidationRule, ValidationReport},
 };
 use async_trait::async_trait;
@@ -51,9 +53,18 @@ impl ImportSource {
             ImportSource::Custom => "custom",
         }
     }
+}
 
-    /// Parse ImportSource from string
-    pub fn from_str(s: &str) -> Result<Self, crate::ImportError> {
+impl std::fmt::Display for ImportSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::str::FromStr for ImportSource {
+    type Err = crate::ImportError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "docker" => Ok(ImportSource::Docker),
             "coolify" => Ok(ImportSource::Coolify),
@@ -64,14 +75,11 @@ impl ImportSource {
             "render" => Ok(ImportSource::Render),
             "fly" => Ok(ImportSource::Fly),
             "custom" => Ok(ImportSource::Custom),
-            _ => Err(crate::ImportError::SourceNotAccessible(format!("Unknown import source: {}", s))),
+            _ => Err(crate::ImportError::SourceNotAccessible(format!(
+                "Unknown import source: {}",
+                s
+            ))),
         }
-    }
-}
-
-impl std::fmt::Display for ImportSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
     }
 }
 

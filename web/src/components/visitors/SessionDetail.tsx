@@ -155,8 +155,8 @@ export function SessionDetail({
   }, [sessionLogs, logsLimit])
 
   const eventsTotalPages = React.useMemo(() => {
-    if (!sessionEvents?.total_events) return 0
-    return Math.ceil(sessionEvents.total_events / eventsLimit)
+    if (!sessionEvents?.total_count) return 0
+    return Math.ceil(sessionEvents.total_count / eventsLimit)
   }, [sessionEvents, eventsLimit])
 
   const formatDuration = (seconds: number) => {
@@ -203,6 +203,24 @@ export function SessionDetail({
   const handleEventsLimitChange = (value: string) => {
     setEventsLimit(parseInt(value))
     setEventsPage(1)
+  }
+
+  // Helper function to generate pagination button numbers
+  const getPaginationPages = (currentPage: number, totalPages: number) => {
+    const pageNumbers = []
+    const maxButtons = 5
+    let startPage = Math.max(1, currentPage - Math.floor(maxButtons / 2))
+    const endPage = Math.min(totalPages, startPage + maxButtons - 1)
+
+    if (endPage - startPage < maxButtons - 1) {
+      startPage = Math.max(1, endPage - maxButtons + 1)
+    }
+
+    for (let i = startPage; i <= endPage; i++) {
+      pageNumbers.push(i)
+    }
+
+    return pageNumbers
   }
 
   return (
@@ -431,7 +449,7 @@ export function SessionDetail({
                 Request Logs ({sessionLogs?.total_count || 0})
               </TabsTrigger>
               <TabsTrigger value="events">
-                Events ({sessionEvents?.total_events || 0})
+                Events ({sessionEvents?.total_count || 0})
               </TabsTrigger>
             </TabsList>
 
@@ -564,30 +582,8 @@ export function SessionDetail({
                               Previous
                             </Button>
                             <div className="flex items-center gap-1">
-                              {(() => {
-                                const pageNumbers = []
-                                const maxButtons = 5
-                                let startPage = Math.max(
-                                  1,
-                                  logsPage - Math.floor(maxButtons / 2)
-                                )
-                                const endPage = Math.min(
-                                  logsTotalPages,
-                                  startPage + maxButtons - 1
-                                )
-
-                                if (endPage - startPage < maxButtons - 1) {
-                                  startPage = Math.max(
-                                    1,
-                                    endPage - maxButtons + 1
-                                  )
-                                }
-
-                                for (let i = startPage; i <= endPage; i++) {
-                                  pageNumbers.push(i)
-                                }
-
-                                return pageNumbers.map((pageNum) => (
+                              {getPaginationPages(logsPage, logsTotalPages).map(
+                                (pageNum) => (
                                   <Button
                                     key={pageNum}
                                     variant={
@@ -601,8 +597,8 @@ export function SessionDetail({
                                   >
                                     {pageNum}
                                   </Button>
-                                ))
-                              })()}
+                                )
+                              )}
                             </div>
                             <Button
                               variant="outline"
@@ -715,9 +711,9 @@ export function SessionDetail({
                             Showing {(eventsPage - 1) * eventsLimit + 1} to{' '}
                             {Math.min(
                               eventsPage * eventsLimit,
-                              sessionEvents.total_events
+                              sessionEvents.total_count
                             )}{' '}
-                            of {sessionEvents.total_events} events
+                            of {sessionEvents.total_count} events
                           </div>
                           <div className="flex items-center gap-2">
                             <Button
@@ -732,45 +728,24 @@ export function SessionDetail({
                               Previous
                             </Button>
                             <div className="flex items-center gap-1">
-                              {(() => {
-                                const pageNumbers = []
-                                const maxButtons = 5
-                                let startPage = Math.max(
-                                  1,
-                                  eventsPage - Math.floor(maxButtons / 2)
-                                )
-                                const endPage = Math.min(
-                                  eventsTotalPages,
-                                  startPage + maxButtons - 1
-                                )
-
-                                if (endPage - startPage < maxButtons - 1) {
-                                  startPage = Math.max(
-                                    1,
-                                    endPage - maxButtons + 1
-                                  )
-                                }
-
-                                for (let i = startPage; i <= endPage; i++) {
-                                  pageNumbers.push(i)
-                                }
-
-                                return pageNumbers.map((pageNum) => (
-                                  <Button
-                                    key={pageNum}
-                                    variant={
-                                      pageNum === eventsPage
-                                        ? 'default'
-                                        : 'outline'
-                                    }
-                                    size="sm"
-                                    onClick={() => setEventsPage(pageNum)}
-                                    className="w-10"
-                                  >
-                                    {pageNum}
-                                  </Button>
-                                ))
-                              })()}
+                              {getPaginationPages(
+                                eventsPage,
+                                eventsTotalPages
+                              ).map((pageNum) => (
+                                <Button
+                                  key={pageNum}
+                                  variant={
+                                    pageNum === eventsPage
+                                      ? 'default'
+                                      : 'outline'
+                                  }
+                                  size="sm"
+                                  onClick={() => setEventsPage(pageNum)}
+                                  className="w-10"
+                                >
+                                  {pageNum}
+                                </Button>
+                              ))}
                             </div>
                             <Button
                               variant="outline"

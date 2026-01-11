@@ -12,19 +12,22 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, Key, RefreshCw } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useMemo, useState, useEffect } from 'react'
 import { isExpiredTokenError } from '@/utils/errorHandling'
 import { Link } from 'react-router-dom'
 
 interface BranchSelectorProps {
   repoOwner: string
   repoName: string
-  connectionId: number
+  connectionId?: number  // Optional for public repos
   defaultBranch?: string
   value?: string
   onChange: (branch: string) => void
   onError?: (error: string | null) => void
+  onBranchesLoaded?: (branches: string[]) => void
   disabled?: boolean
+  /** Pre-loaded branches (for public repos or when already fetched) */
+  branches?: Array<{ name: string; is_default?: boolean }>
 }
 
 export function BranchSelector({
@@ -35,12 +38,14 @@ export function BranchSelector({
   value = '',
   onChange,
   onError,
+  onBranchesLoaded,
   disabled = false,
+  branches: providedBranches,
 }: BranchSelectorProps) {
   const [isCustomBranch, setIsCustomBranch] = useState(false)
   const queryClient = useQueryClient()
 
-  // Fetch branches from repository (always with fresh=false for caching)
+  // Fetch branches from repository (only if not provided and connectionId exists)
   const branchesQuery = useQuery({
     ...getRepositoryBranchesOptions({
       path: {
@@ -48,15 +53,18 @@ export function BranchSelector({
         repo: repoName,
       },
       query: {
-        connection_id: connectionId,
+        connection_id: connectionId!,
         fresh: false,
       },
     }),
-    enabled: !!repoOwner && !!repoName && !!connectionId,
+    enabled: !providedBranches && !!repoOwner && !!repoName && !!connectionId,
     retry: false,
   })
 
   const handleRefresh = async () => {
+    // Only refresh when connectionId is available
+    if (!connectionId) return
+
     // Fetch fresh data and update the cache
     const freshData = await queryClient.fetchQuery({
       ...getRepositoryBranchesOptions({
@@ -95,9 +103,10 @@ export function BranchSelector({
 
   // Sort branches: default branch first, then alphabetically
   const sortedBranches = useMemo(() => {
-    if (!branchesQuery.data?.branches) return []
+    const branchList = providedBranches || branchesQuery.data?.branches
+    if (!branchList) return []
 
-    return [...branchesQuery.data.branches].sort((a, b) => {
+    return [...branchList].sort((a, b) => {
       // Default branch always comes first
       if (a.name === defaultBranch) return -1
       if (b.name === defaultBranch) return 1
@@ -113,9 +122,17 @@ export function BranchSelector({
       // Then alphabetically
       return a.name.localeCompare(b.name)
     })
-  }, [branchesQuery.data, defaultBranch])
+  }, [providedBranches, branchesQuery.data, defaultBranch])
 
   const effectiveBranch = value || defaultBranch || ''
+
+  // Notify parent when branches are loaded
+  useEffect(() => {
+    if (sortedBranches.length > 0 && onBranchesLoaded) {
+      onBranchesLoaded(sortedBranches.map((b) => b.name))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sortedBranches])
 
   if (hasExpiredToken) {
     return (
@@ -126,7 +143,7 @@ export function BranchSelector({
           <p className="mb-2">
             Your Git provider token has expired. Please reconnect to continue.
           </p>
-          <Link to="/settings/git-providers">
+          <Link to="/git-sources">
             <Button variant="outline" size="sm">
               <Key className="mr-2 h-4 w-4" />
               Manage Git Providers

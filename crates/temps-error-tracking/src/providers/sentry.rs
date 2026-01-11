@@ -49,15 +49,15 @@ impl ErrorProvider for SentryProvider {
         auth: &AuthContext,
     ) -> Result<Vec<ParsedErrorEvent>, ProviderError> {
         // Parse Sentry envelope
-        let envelope = Envelope::from_slice(payload)
-            .map_err(|e| ProviderError::Parsing(e.to_string()))?;
+        let envelope =
+            Envelope::from_slice(payload).map_err(|e| ProviderError::Parsing(e.to_string()))?;
 
         let mut parsed_events = Vec::new();
 
         // Process each item in the envelope
         for item in envelope.items() {
             match item {
-                EnvelopeItem::Event(event) | EnvelopeItem::Transaction(event) => {
+                EnvelopeItem::Event(event) => {
                     // Extract event ID first
                     let event_id = event
                         .value()
@@ -69,8 +69,9 @@ impl ErrorProvider for SentryProvider {
                     let raw_event = if let Some(ev) = event.value() {
                         // Convert Event to relay Value
                         let relay_val: relay_protocol::Value = ev.clone().into_value();
-                        mapper::relay_value_to_json(&relay_val)
-                            .unwrap_or_else(|| serde_json::json!({"error": "Failed to serialize event"}))
+                        mapper::relay_value_to_json(&relay_val).unwrap_or_else(
+                            || serde_json::json!({"error": "Failed to serialize event"}),
+                        )
                     } else {
                         serde_json::json!({"error": "Event has no value"})
                     };
@@ -102,6 +103,9 @@ impl ErrorProvider for SentryProvider {
                 }
                 EnvelopeItem::Span(_) => {
                     tracing::debug!("Sentry span item (not yet implemented)");
+                }
+                EnvelopeItem::Transaction(_) => {
+                    tracing::debug!("Sentry transaction item (not yet implemented)");
                 }
             }
         }

@@ -64,7 +64,10 @@ impl RemoteScreenshotProvider {
 #[async_trait]
 impl ScreenshotProvider for RemoteScreenshotProvider {
     async fn capture_screenshot(&self, url: &str) -> ScreenshotResult<Vec<u8>> {
-        debug!("Capturing screenshot of {} using remote service at {}", url, self.service_url);
+        debug!(
+            "Capturing screenshot of {} using remote service at {}",
+            url, self.service_url
+        );
 
         // Validate URL
         if url::Url::parse(url).is_err() {
@@ -95,7 +98,10 @@ impl ScreenshotProvider for RemoteScreenshotProvider {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            error!("Screenshot service returned error {}: {}", status, error_text);
+            error!(
+                "Screenshot service returned error {}: {}",
+                status, error_text
+            );
             return Err(ScreenshotError::HttpRequest(format!(
                 "Service returned error {}: {}",
                 status, error_text
@@ -108,23 +114,31 @@ impl ScreenshotProvider for RemoteScreenshotProvider {
         })?;
 
         if !screenshot_response.success {
-            let error_msg = screenshot_response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = screenshot_response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             error!("Screenshot service reported failure: {}", error_msg);
             return Err(ScreenshotError::ProviderError(error_msg));
         }
 
-        let image_data = screenshot_response
-            .image
-            .ok_or_else(|| ScreenshotError::ProviderError("No image data in response".to_string()))?;
+        let image_data = screenshot_response.image.ok_or_else(|| {
+            ScreenshotError::ProviderError("No image data in response".to_string())
+        })?;
 
         // Decode base64 image
         use base64::Engine;
-        let image_bytes = base64::engine::general_purpose::STANDARD.decode(&image_data).map_err(|e| {
-            error!("Failed to decode base64 image: {}", e);
-            ScreenshotError::ProviderError(format!("Failed to decode image: {}", e))
-        })?;
+        let image_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&image_data)
+            .map_err(|e| {
+                error!("Failed to decode base64 image: {}", e);
+                ScreenshotError::ProviderError(format!("Failed to decode image: {}", e))
+            })?;
 
-        info!("Successfully captured screenshot of {} using remote service ({} bytes)", url, image_bytes.len());
+        info!(
+            "Successfully captured screenshot of {} using remote service ({} bytes)",
+            url,
+            image_bytes.len()
+        );
 
         Ok(image_bytes)
     }
@@ -162,11 +176,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_url() {
-        let provider = RemoteScreenshotProvider::new(
-            "https://screenshot.example.com/api".to_string(),
-            None,
-        )
-        .unwrap();
+        let provider =
+            RemoteScreenshotProvider::new("https://screenshot.example.com/api".to_string(), None)
+                .unwrap();
         let result = provider.capture_screenshot("not-a-valid-url").await;
         assert!(result.is_err());
         match result {

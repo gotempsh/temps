@@ -12,17 +12,19 @@ temps-auth = { path = "../temps-auth" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
+temps-dns = { path = "../temps-dns" }
 temps-entities = { path = "../temps-entities" }
 axum = { workspace = true }
 tracing = { workspace = true }
 utoipa = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 chrono = { workspace = true }
 sea-orm = { workspace = true }
-hickory-resolver = "0.24.4"
+hickory-resolver = "0.25.2"
 instant-acme = "0.7.2"
 rcgen = { version = "0.13.2", features = ["x509-parser"] }
 thiserror = { workspace = true }
@@ -37,9 +39,13 @@ async-trait = { workspace = true }
 cloudflare = {  git="https://github.com/cloudflare/cloudflare-rs", rev = "85fc25c" }
 x509-parser = "0.18.0"
 rustls-pki-types = "1.12.0"
-public-ip = { version = "0.2.2", features = ["dns-resolver"] }
 time = "0.3"
 sha2 = { workspace = true }
 base64 = { workspace = true }
 uuid = { workspace = true }
 
+[dev-dependencies]
+testcontainers = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+axum-test = "16.3"
+webpki-roots = "0.26"

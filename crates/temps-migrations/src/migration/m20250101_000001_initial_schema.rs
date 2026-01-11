@@ -109,15 +109,22 @@ impl MigrationTrait for Migration {
                             .primary_key(),
                     )
                     .col(ColumnDef::new(Alias::new("name")).string().not_null())
-                    .col(ColumnDef::new(Alias::new("repo_name")).string().null())
-                    .col(ColumnDef::new(Alias::new("repo_owner")).string().null())
+                    .col(ColumnDef::new(Alias::new("repo_name")).string().not_null())
+                    .col(ColumnDef::new(Alias::new("repo_owner")).string().not_null())
                     .col(ColumnDef::new(Alias::new("directory")).string().not_null())
                     .col(
                         ColumnDef::new(Alias::new("main_branch"))
                             .string()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(Alias::new("preset")).string().null())
+                    .col(ColumnDef::new(Alias::new("preset")).string().not_null())
+                    .col(ColumnDef::new(Alias::new("preset_config")).json_binary().null())
+                    .col(
+                        ColumnDef::new(Alias::new("deployment_config"))
+                            .json_binary()
+                            .null()
+                            .comment("Deployment configuration including CPU, memory, ports, and feature flags"),
+                    )
                     .col(
                         ColumnDef::new(Alias::new("created_at"))
                             .timestamp_with_time_zone()
@@ -145,61 +152,11 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .default(false),
                     )
-                    .col(ColumnDef::new(Alias::new("cpu_request")).integer().null())
-                    .col(ColumnDef::new(Alias::new("cpu_limit")).integer().null())
-                    .col(
-                        ColumnDef::new(Alias::new("memory_request"))
-                            .integer()
-                            .null(),
-                    )
-                    .col(ColumnDef::new(Alias::new("memory_limit")).integer().null())
-                    .col(ColumnDef::new(Alias::new("build_command")).string().null())
-                    .col(
-                        ColumnDef::new(Alias::new("install_command"))
-                            .string()
-                            .null(),
-                    )
-                    .col(ColumnDef::new(Alias::new("output_dir")).string().null())
-                    .col(
-                        ColumnDef::new(Alias::new("automatic_deploy"))
-                            .boolean()
-                            .not_null()
-                            .default(true),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("project_type"))
-                            .string()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("is_web_app"))
-                            .boolean()
-                            .not_null()
-                            .default(false),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("performance_metrics_enabled"))
-                            .boolean()
-                            .not_null()
-                            .default(false),
-                    )
                     .col(
                         ColumnDef::new(Alias::new("last_deployment"))
                             .timestamp_with_time_zone()
                             .null(),
                     )
-                    .col(
-                        ColumnDef::new(Alias::new("payment_provider_id"))
-                            .integer()
-                            .null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("use_default_wildcard"))
-                            .boolean()
-                            .not_null()
-                            .default(true),
-                    )
-                    .col(ColumnDef::new(Alias::new("custom_domain")).string().null())
                     .col(
                         ColumnDef::new(Alias::new("is_public_repo"))
                             .boolean()
@@ -212,12 +169,6 @@ impl MigrationTrait for Migration {
                             .integer()
                             .null(),
                     ) // Optional - null for public repos
-                    .col(
-                        ColumnDef::new(Alias::new("is_on_demand"))
-                            .boolean()
-                            .not_null()
-                            .default(false),
-                    ) // For on-demand/serverless deployments
                     .to_owned(),
             )
             .await?;
@@ -265,16 +216,13 @@ impl MigrationTrait for Migration {
                             .integer()
                             .null(),
                     )
-                    .col(ColumnDef::new(Alias::new("cpu_request")).integer().null())
-                    .col(ColumnDef::new(Alias::new("cpu_limit")).integer().null())
-                    .col(
-                        ColumnDef::new(Alias::new("memory_request"))
-                            .integer()
-                            .null(),
-                    )
-                    .col(ColumnDef::new(Alias::new("memory_limit")).integer().null())
                     .col(ColumnDef::new(Alias::new("branch")).string().null())
-                    .col(ColumnDef::new(Alias::new("replicas")).integer().null())
+                    .col(
+                        ColumnDef::new(Alias::new("deployment_config"))
+                            .json_binary()
+                            .null()
+                            .comment("Environment-specific deployment configuration (overrides project defaults)"),
+                    )
                     .col(
                         ColumnDef::new(Alias::new("payment_provider_live_mode"))
                             .boolean()
@@ -401,6 +349,11 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(Alias::new("cancelled_reason")).text().null())
                     .col(ColumnDef::new(Alias::new("pipeline_id")).integer().null())
                     .col(ColumnDef::new(Alias::new("log_id")).string().null())
+                    .col(
+                        ColumnDef::new(Alias::new("deployment_config"))
+                            .json()
+                            .null(),
+                    )
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_deployments_project_id")
@@ -1479,7 +1432,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Create external_services table (needed for external_service_backups, project_services, and external_service_params)
+        // Create external_services table (needed for external_service_backups and project_services)
         manager
             .create_table(
                 Table::create()
@@ -1511,6 +1464,7 @@ impl MigrationTrait for Migration {
                             .not_null(),
                     )
                     .col(ColumnDef::new(Alias::new("slug")).string().null())
+                    .col(ColumnDef::new(Alias::new("config")).text().null())
                     .to_owned(),
             )
             .await?;
@@ -1982,146 +1936,6 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Create traces table
-        manager
-            .create_table(
-                Table::create()
-                    .table(Alias::new("traces"))
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(Alias::new("id"))
-                            .integer()
-                            .not_null()
-                            .auto_increment()
-                            .primary_key(),
-                    )
-                    .col(ColumnDef::new(Alias::new("trace_id")).string().not_null())
-                    .col(ColumnDef::new(Alias::new("span_id")).string().not_null())
-                    .col(ColumnDef::new(Alias::new("parent_span_id")).string().null())
-                    .col(ColumnDef::new(Alias::new("name")).string().not_null())
-                    .col(ColumnDef::new(Alias::new("kind")).integer().not_null())
-                    .col(
-                        ColumnDef::new(Alias::new("start_time_unix_nano"))
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("end_time_unix_nano"))
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(Alias::new("status_code")).integer().null())
-                    .col(ColumnDef::new(Alias::new("status_message")).string().null())
-                    .col(ColumnDef::new(Alias::new("flags")).integer().not_null())
-                    .col(
-                        ColumnDef::new(Alias::new("created_at"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("partition_date"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("project_id"))
-                            .integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("environment_id"))
-                            .integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("deployment_id"))
-                            .integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("attributes_json"))
-                            .string()
-                            .not_null(),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_traces_project_id")
-                            .from(Alias::new("traces"), Alias::new("project_id"))
-                            .to(Alias::new("projects"), Alias::new("id"))
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_traces_environment_id")
-                            .from(Alias::new("traces"), Alias::new("environment_id"))
-                            .to(Alias::new("environments"), Alias::new("id"))
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_traces_deployment_id")
-                            .from(Alias::new("traces"), Alias::new("deployment_id"))
-                            .to(Alias::new("deployments"), Alias::new("id"))
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-
-        // Create attribute_keys table (needed for attribute_values)
-        manager
-            .create_table(
-                Table::create()
-                    .table(Alias::new("attribute_keys"))
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(Alias::new("id"))
-                            .integer()
-                            .not_null()
-                            .auto_increment()
-                            .primary_key(),
-                    )
-                    .col(ColumnDef::new(Alias::new("key")).string().not_null())
-                    .col(
-                        ColumnDef::new(Alias::new("created_at"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-
-        // Create attribute_values table (needed for trace_attributes and log_attributes)
-        manager
-            .create_table(
-                Table::create()
-                    .table(Alias::new("attribute_values"))
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(Alias::new("id"))
-                            .integer()
-                            .not_null()
-                            .auto_increment()
-                            .primary_key(),
-                    )
-                    .col(ColumnDef::new(Alias::new("key_id")).integer().not_null())
-                    .col(ColumnDef::new(Alias::new("value")).string().not_null())
-                    .col(
-                        ColumnDef::new(Alias::new("created_at"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_attribute_values_key_id")
-                            .from(Alias::new("attribute_values"), Alias::new("key_id"))
-                            .to(Alias::new("attribute_keys"), Alias::new("id"))
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-
         // Create tls_acme_certificates table
         manager
             .create_table(
@@ -2311,8 +2125,8 @@ impl MigrationTrait for Migration {
                     .col(
                         ColumnDef::new(Alias::new("git_provider_connection_id"))
                             .integer()
-                            .null(),
-                    ) // Foreign key to git_provider_connections
+                            .not_null(),
+                    ) // Foreign key to git_provider_connections - repositories are always linked to a connection
                     .col(ColumnDef::new(Alias::new("owner")).string().not_null())
                     .col(ColumnDef::new(Alias::new("name")).string().not_null())
                     .col(ColumnDef::new(Alias::new("full_name")).string().not_null())
@@ -2362,30 +2176,14 @@ impl MigrationTrait for Migration {
                             .string()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(Alias::new("framework")).string().null())
-                    .col(
-                        ColumnDef::new(Alias::new("framework_version"))
-                            .string()
-                            .null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("framework_last_updated_at"))
-                            .timestamp_with_time_zone()
-                            .null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("package_manager"))
-                            .string()
-                            .null(),
-                    )
                     .col(
                         ColumnDef::new(Alias::new("installation_id"))
                             .integer()
                             .null(),
                     )
-                    .col(ColumnDef::new(Alias::new("clone_url")).string().null()) // Added for non-API based cloning
-                    .col(ColumnDef::new(Alias::new("ssh_url")).string().null()) // Added for SSH cloning
-                    .col(ColumnDef::new(Alias::new("preset")).string().null()) // Project preset/template
+                    .col(ColumnDef::new(Alias::new("clone_url")).string().null()) // HTTPS clone URL
+                    .col(ColumnDef::new(Alias::new("ssh_url")).string().null()) // SSH clone URL
+                    .col(ColumnDef::new(Alias::new("preset")).json_binary().null()) // Preset cache (JSON array for monorepo support)
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_repositories_git_provider_connection_id")
@@ -2394,201 +2192,6 @@ impl MigrationTrait for Migration {
                                 Alias::new("git_provider_connection_id"),
                             )
                             .to(Alias::new("git_provider_connections"), Alias::new("id"))
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-
-        // Create repo_tree_entries table
-        manager
-            .create_table(
-                Table::create()
-                    .table(Alias::new("repo_tree_entries"))
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(Alias::new("id"))
-                            .integer()
-                            .not_null()
-                            .auto_increment()
-                            .primary_key(),
-                    )
-                    .col(ColumnDef::new(Alias::new("repo_id")).integer().not_null())
-                    .col(ColumnDef::new(Alias::new("path")).string().not_null())
-                    .col(ColumnDef::new(Alias::new("full_path")).string().not_null())
-                    .col(ColumnDef::new(Alias::new("name")).string().not_null())
-                    .col(ColumnDef::new(Alias::new("level")).integer().not_null())
-                    .col(ColumnDef::new(Alias::new("entry_type")).string().not_null())
-                    .col(
-                        ColumnDef::new(Alias::new("created_at"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("updated_at"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_repo_tree_entries_repo_id")
-                            .from(Alias::new("repo_tree_entries"), Alias::new("repo_id"))
-                            .to(Alias::new("repositories"), Alias::new("id"))
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-
-        // Create project_webhooks table
-        manager
-            .create_table(
-                Table::create()
-                    .table(Alias::new("project_webhooks"))
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(Alias::new("id"))
-                            .integer()
-                            .not_null()
-                            .auto_increment()
-                            .primary_key(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("project_id"))
-                            .integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("provider_id"))
-                            .string()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("callback_url"))
-                            .string()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("signing_secret"))
-                            .string()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(Alias::new("is_live")).boolean().not_null())
-                    .col(ColumnDef::new(Alias::new("metadata")).string().not_null())
-                    .col(
-                        ColumnDef::new(Alias::new("created_at"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("updated_at"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("last_delivery"))
-                            .timestamp_with_time_zone()
-                            .null(),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_project_webhooks_project_id")
-                            .from(Alias::new("project_webhooks"), Alias::new("project_id"))
-                            .to(Alias::new("projects"), Alias::new("id"))
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-
-        // Create project_webhook_invocations table
-        manager
-            .create_table(
-                Table::create()
-                    .table(Alias::new("project_webhook_invocations"))
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(Alias::new("id"))
-                            .integer()
-                            .not_null()
-                            .auto_increment()
-                            .primary_key(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("project_webhook_id"))
-                            .integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("project_id"))
-                            .integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("environment_id"))
-                            .integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("deployment_id"))
-                            .integer()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(Alias::new("event_name")).string().not_null())
-                    .col(
-                        ColumnDef::new(Alias::new("status_code"))
-                            .integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("request_start"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("request_end"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(Alias::new("metadata")).string().not_null())
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_project_webhook_invocations_project_webhook_id")
-                            .from(
-                                Alias::new("project_webhook_invocations"),
-                                Alias::new("project_webhook_id"),
-                            )
-                            .to(Alias::new("project_webhooks"), Alias::new("id"))
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_project_webhook_invocations_project_id")
-                            .from(
-                                Alias::new("project_webhook_invocations"),
-                                Alias::new("project_id"),
-                            )
-                            .to(Alias::new("projects"), Alias::new("id"))
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_project_webhook_invocations_environment_id")
-                            .from(
-                                Alias::new("project_webhook_invocations"),
-                                Alias::new("environment_id"),
-                            )
-                            .to(Alias::new("environments"), Alias::new("id"))
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_project_webhook_invocations_deployment_id")
-                            .from(
-                                Alias::new("project_webhook_invocations"),
-                                Alias::new("deployment_id"),
-                            )
-                            .to(Alias::new("deployments"), Alias::new("id"))
                             .on_delete(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
@@ -2640,144 +2243,6 @@ impl MigrationTrait for Migration {
                             .name("fk_project_services_service_id")
                             .from(Alias::new("project_services"), Alias::new("service_id"))
                             .to(Alias::new("external_services"), Alias::new("id"))
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-
-        // Create project_plans table
-        manager
-            .create_table(
-                Table::create()
-                    .table(Alias::new("project_plans"))
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(Alias::new("id"))
-                            .integer()
-                            .not_null()
-                            .auto_increment()
-                            .primary_key(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("project_id"))
-                            .integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("provider_id"))
-                            .string()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(Alias::new("slug")).string().not_null())
-                    .col(ColumnDef::new(Alias::new("is_live")).boolean().not_null())
-                    .col(
-                        ColumnDef::new(Alias::new("created_at"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("updated_at"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_project_plans_project_id")
-                            .from(Alias::new("project_plans"), Alias::new("project_id"))
-                            .to(Alias::new("projects"), Alias::new("id"))
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-
-        // Create logs table
-        manager
-            .create_table(
-                Table::create()
-                    .table(Alias::new("logs"))
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(Alias::new("id"))
-                            .integer()
-                            .not_null()
-                            .auto_increment()
-                            .primary_key(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("time_unix_nano"))
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("observed_time_unix_nano"))
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("severity_number"))
-                            .integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("severity_text"))
-                            .string()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(Alias::new("body")).string().not_null())
-                    .col(ColumnDef::new(Alias::new("trace_id")).string().not_null())
-                    .col(ColumnDef::new(Alias::new("span_id")).string().not_null())
-                    .col(ColumnDef::new(Alias::new("flags")).integer().not_null())
-                    .col(
-                        ColumnDef::new(Alias::new("created_at"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("partition_date"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("project_id"))
-                            .integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("environment_id"))
-                            .integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("deployment_id"))
-                            .integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("attributes_json"))
-                            .string()
-                            .not_null(),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_logs_project_id")
-                            .from(Alias::new("logs"), Alias::new("project_id"))
-                            .to(Alias::new("projects"), Alias::new("id"))
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_logs_environment_id")
-                            .from(Alias::new("logs"), Alias::new("environment_id"))
-                            .to(Alias::new("environments"), Alias::new("id"))
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_logs_deployment_id")
-                            .from(Alias::new("logs"), Alias::new("deployment_id"))
-                            .to(Alias::new("deployments"), Alias::new("id"))
                             .on_delete(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
@@ -3202,56 +2667,6 @@ impl MigrationTrait for Migration {
                                 Alias::new("environment_id"),
                             )
                             .to(Alias::new("environments"), Alias::new("id"))
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-
-        // Create external_service_params table
-        manager
-            .create_table(
-                Table::create()
-                    .table(Alias::new("external_service_params"))
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(Alias::new("id"))
-                            .integer()
-                            .not_null()
-                            .auto_increment()
-                            .primary_key(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("service_id"))
-                            .integer()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(Alias::new("key")).string().not_null())
-                    .col(ColumnDef::new(Alias::new("value")).text().not_null())
-                    .col(
-                        ColumnDef::new(Alias::new("is_encrypted"))
-                            .boolean()
-                            .not_null()
-                            .default(false),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("created_at"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("updated_at"))
-                            .timestamp_with_time_zone()
-                            .not_null(),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_external_service_params_service_id")
-                            .from(
-                                Alias::new("external_service_params"),
-                                Alias::new("service_id"),
-                            )
-                            .to(Alias::new("external_services"), Alias::new("id"))
                             .on_delete(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
@@ -3786,28 +3201,30 @@ impl MigrationTrait for Migration {
         if manager.get_database_backend() == DatabaseBackend::Postgres {
             // Configure TimescaleDB for deployment_metrics and events
             let sql = r#"
-                -- Configure TimescaleDB for events table
-                SELECT create_hypertable('events', 'timestamp', 
+                -- Configure TimescaleDB for events table with id segmenting (space partitioning)
+                SELECT create_hypertable('events', 'timestamp',
+                    partitioning_column => 'id',
+                    number_partitions => 4,
                     chunk_time_interval => INTERVAL '1 day',
                     if_not_exists => TRUE);
-                
+
                 -- Create indexes for events
-                CREATE INDEX IF NOT EXISTS idx_events_project_timestamp 
+                CREATE INDEX IF NOT EXISTS idx_events_project_timestamp
                     ON events (project_id, timestamp DESC);
-                CREATE INDEX IF NOT EXISTS idx_events_session_timestamp 
+                CREATE INDEX IF NOT EXISTS idx_events_session_timestamp
                     ON events (session_id, timestamp DESC);
-                CREATE INDEX IF NOT EXISTS idx_events_page_timestamp 
+                CREATE INDEX IF NOT EXISTS idx_events_page_timestamp
                     ON events (page_path, timestamp DESC);
-                
+
                 -- Enable compression for events after 7 days
                 ALTER TABLE events SET (
                     timescaledb.compress,
                     timescaledb.compress_segmentby = 'project_id,event_type',
                     timescaledb.compress_orderby = 'timestamp DESC'
                 );
-                
+
                 SELECT add_compression_policy('events', INTERVAL '7 days', if_not_exists => TRUE);
-                
+
                 -- Data retention for events (keep for 90 days)
                 SELECT add_retention_policy('events', INTERVAL '90 days', if_not_exists => TRUE);
             "#;
@@ -3945,15 +3362,11 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(Alias::new("deployment_id")).integer())
                     .col(ColumnDef::new(Alias::new("visitor_id")).integer())
                     .col(ColumnDef::new(Alias::new("ip_geolocation_id")).integer())
-                    .col(
-                        ColumnDef::new(Alias::new("source"))
-                            .string_len(50)
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(Alias::new("source")).text().not_null())
                     // Indexed fields (ACID - fast queries)
                     .col(
                         ColumnDef::new(Alias::new("fingerprint_hash"))
-                            .string()
+                            .text()
                             .not_null(),
                     )
                     .col(
@@ -3971,10 +3384,10 @@ impl MigrationTrait for Migration {
                     // Core error data (frequently displayed)
                     .col(
                         ColumnDef::new(Alias::new("exception_type"))
-                            .string()
+                            .text()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(Alias::new("exception_value")).string())
+                    .col(ColumnDef::new(Alias::new("exception_value")).text())
                     // ALL STRUCTURED DATA IN ONE JSONB COLUMN
                     // Contains: user, device, request, stack_trace, environment, trace contexts
                     .col(ColumnDef::new(Alias::new("data")).json_binary())
@@ -4120,11 +3533,13 @@ impl MigrationTrait for Migration {
         // Convert error_events to TimescaleDB hypertable for time-series optimization
         // This enables efficient time-range queries, compression, and continuous aggregates
         if manager.get_database_backend() == sea_orm::DatabaseBackend::Postgres {
-            // 1. Convert to hypertable with 1-day chunks
+            // 1. Convert to hypertable with 1-day chunks and id segmenting (space partitioning)
             let create_hypertable_sql = r#"
                 SELECT create_hypertable(
                     'error_events',
                     'timestamp',
+                    partitioning_column => 'id',
+                    number_partitions => 4,
                     chunk_time_interval => INTERVAL '1 day',
                     if_not_exists => TRUE,
                     migrate_data => TRUE
@@ -4728,11 +4143,7 @@ impl MigrationTrait for Migration {
                             .integer()
                             .not_null(),
                     )
-                    .col(
-                        ColumnDef::new(Alias::new("status"))
-                            .string_len(50)
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(Alias::new("status")).text().not_null())
                     .col(
                         ColumnDef::new(Alias::new("response_time_ms"))
                             .integer()
@@ -4964,10 +4375,12 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Convert status_checks to TimescaleDB hypertable
+        // Convert status_checks to TimescaleDB hypertable with id segmenting (space partitioning)
         db.execute_unprepared(
             r#"
                 SELECT create_hypertable('status_checks', 'checked_at',
+                    partitioning_column => 'id',
+                    number_partitions => 4,
                     chunk_time_interval => INTERVAL '1 day',
                     if_not_exists => TRUE);
                 "#,
@@ -5208,15 +4621,6 @@ impl MigrationTrait for Migration {
         )
         .await?;
 
-        // Remove is_encrypted from external_service_params table
-        db.execute_unprepared(
-            r#"
-            ALTER TABLE external_service_params
-            DROP COLUMN IF EXISTS is_encrypted;
-            "#,
-        )
-        .await?;
-
         manager
             .alter_table(
                 Table::alter()
@@ -5324,10 +4728,10 @@ impl MigrationTrait for Migration {
                             .timestamp_with_time_zone()
                             .not_null(),
                     )
-                    .col(ColumnDef::new(Alias::new("method")).string().not_null())
+                    .col(ColumnDef::new(Alias::new("method")).text().not_null())
                     .col(ColumnDef::new(Alias::new("path")).text().not_null())
                     .col(ColumnDef::new(Alias::new("query_string")).text().null())
-                    .col(ColumnDef::new(Alias::new("host")).string().not_null())
+                    .col(ColumnDef::new(Alias::new("host")).text().not_null())
                     .col(
                         ColumnDef::new(Alias::new("status_code"))
                             .small_integer()
@@ -5340,7 +4744,7 @@ impl MigrationTrait for Migration {
                     )
                     .col(
                         ColumnDef::new(Alias::new("request_source"))
-                            .string()
+                            .text()
                             .not_null(),
                     )
                     .col(
@@ -5351,7 +4755,7 @@ impl MigrationTrait for Migration {
                     )
                     .col(
                         ColumnDef::new(Alias::new("routing_status"))
-                            .string()
+                            .text()
                             .not_null(),
                     )
                     // Context (nullable for unrouted requests)
@@ -5362,35 +4766,27 @@ impl MigrationTrait for Migration {
                             .null(),
                     )
                     .col(ColumnDef::new(Alias::new("deployment_id")).integer().null())
-                    .col(ColumnDef::new(Alias::new("container_id")).string().null())
-                    .col(ColumnDef::new(Alias::new("upstream_host")).string().null())
+                    .col(ColumnDef::new(Alias::new("container_id")).text().null())
+                    .col(ColumnDef::new(Alias::new("upstream_host")).text().null())
                     // Error tracking
                     .col(ColumnDef::new(Alias::new("error_message")).text().null())
                     // Client information
-                    .col(ColumnDef::new(Alias::new("client_ip")).string().null())
+                    .col(ColumnDef::new(Alias::new("client_ip")).text().null())
                     .col(ColumnDef::new(Alias::new("user_agent")).text().null())
                     .col(ColumnDef::new(Alias::new("referrer")).text().null())
-                    .col(ColumnDef::new(Alias::new("request_id")).string().not_null())
+                    .col(ColumnDef::new(Alias::new("request_id")).text().not_null())
                     .col(
                         ColumnDef::new(Alias::new("ip_geolocation_id"))
                             .integer()
                             .null(),
                     )
                     // User agent parsing
-                    .col(ColumnDef::new(Alias::new("browser")).string().null())
-                    .col(
-                        ColumnDef::new(Alias::new("browser_version"))
-                            .string()
-                            .null(),
-                    )
-                    .col(
-                        ColumnDef::new(Alias::new("operating_system"))
-                            .string()
-                            .null(),
-                    )
-                    .col(ColumnDef::new(Alias::new("device_type")).string().null())
+                    .col(ColumnDef::new(Alias::new("browser")).text().null())
+                    .col(ColumnDef::new(Alias::new("browser_version")).text().null())
+                    .col(ColumnDef::new(Alias::new("operating_system")).text().null())
+                    .col(ColumnDef::new(Alias::new("device_type")).text().null())
                     .col(ColumnDef::new(Alias::new("is_bot")).boolean().null())
-                    .col(ColumnDef::new(Alias::new("bot_name")).string().null())
+                    .col(ColumnDef::new(Alias::new("bot_name")).text().null())
                     // Additional metadata
                     .col(
                         ColumnDef::new(Alias::new("request_size_bytes"))
@@ -5468,35 +4864,17 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Convert to TimescaleDB hypertable
+        // Convert to TimescaleDB hypertable with id segmenting (space partitioning)
         manager
             .get_connection()
             .execute_unprepared(
                 "SELECT create_hypertable('proxy_logs', 'timestamp',
+         partitioning_column => 'id',
+         number_partitions => 4,
          chunk_time_interval => INTERVAL '1 day',
          if_not_exists => TRUE);",
             )
             .await?;
-
-        // Convert status_checks to hypertable partitioned by checked_at
-        // This will partition the table into chunks based on time
-        db.execute_unprepared(
-            "SELECT create_hypertable(
-                'status_checks',
-                'checked_at',
-                chunk_time_interval => INTERVAL '1 day',
-                if_not_exists => TRUE,
-                migrate_data => TRUE
-            )",
-        )
-        .await?;
-
-        // Create an index on monitor_id and checked_at for efficient queries
-        db.execute_unprepared(
-            "CREATE INDEX IF NOT EXISTS idx_status_checks_monitor_checked
-             ON status_checks(monitor_id, checked_at DESC)",
-        )
-        .await?;
 
         // Create a continuous aggregate for hourly stats (optional but useful)
         db.execute_unprepared(
@@ -5636,14 +5014,6 @@ impl MigrationTrait for Migration {
         manager
             .drop_table(
                 Table::drop()
-                    .table(Alias::new("project_webhook_invocations"))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_table(
-                Table::drop()
                     .table(Alias::new("project_services"))
                     .to_owned(),
             )
@@ -5698,14 +5068,6 @@ impl MigrationTrait for Migration {
             .await?;
 
         manager
-            .drop_table(
-                Table::drop()
-                    .table(Alias::new("repo_tree_entries"))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
             .drop_table(Table::drop().table(Alias::new("repositories")).to_owned())
             .await?;
 
@@ -5719,14 +5081,6 @@ impl MigrationTrait for Migration {
 
         manager
             .drop_table(Table::drop().table(Alias::new("request_logs")).to_owned())
-            .await?;
-
-        manager
-            .drop_table(Table::drop().table(Alias::new("logs")).to_owned())
-            .await?;
-
-        manager
-            .drop_table(Table::drop().table(Alias::new("traces")).to_owned())
             .await?;
 
         manager
@@ -5770,43 +5124,11 @@ impl MigrationTrait for Migration {
             .await?;
 
         manager
-            .drop_table(
-                Table::drop()
-                    .table(Alias::new("external_service_params"))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
             .drop_table(Table::drop().table(Alias::new("custom_routes")).to_owned())
             .await?;
 
         manager
-            .drop_table(
-                Table::drop()
-                    .table(Alias::new("project_webhooks"))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_table(Table::drop().table(Alias::new("project_plans")).to_owned())
-            .await?;
-
-        manager
             .drop_table(Table::drop().table(Alias::new("domains")).to_owned())
-            .await?;
-
-        manager
-            .drop_table(
-                Table::drop()
-                    .table(Alias::new("attribute_values"))
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_table(Table::drop().table(Alias::new("attribute_keys")).to_owned())
             .await?;
 
         manager

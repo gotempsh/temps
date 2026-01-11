@@ -1,8 +1,8 @@
 use chrono::Utc;
 use futures::future::BoxFuture;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult,
-    QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
+    QueryOrder, Set,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,7 +62,10 @@ impl MonitorService {
                         debug!("Emitted MonitorCreated event for monitor {}", monitor.id);
                     }
                     Err(e) => {
-                        warn!("Failed to emit MonitorCreated event for monitor {}: {:?}", monitor.id, e);
+                        warn!(
+                            "Failed to emit MonitorCreated event for monitor {}: {:?}",
+                            monitor.id, e
+                        );
                     }
                 }
             }
@@ -78,7 +81,11 @@ impl MonitorService {
                 .await
             {
                 // Get deployment URL from config service
-                if let Ok(base_url) = self.config_service.get_deployment_url_by_slug(&env.subdomain).await {
+                if let Ok(base_url) = self
+                    .config_service
+                    .get_deployment_url_by_slug(&env.subdomain)
+                    .await
+                {
                     // Append /health if monitor type is "health"
                     let url = if response.monitor_type == "health" {
                         format!("{}/health", base_url.trim_end_matches('/'))
@@ -119,7 +126,11 @@ impl MonitorService {
             match operation().await {
                 Ok(result) => {
                     if attempt > 0 {
-                        debug!("{} succeeded after {} attempts", operation_name, attempt + 1);
+                        debug!(
+                            "{} succeeded after {} attempts",
+                            operation_name,
+                            attempt + 1
+                        );
                     }
                     return Ok(result);
                 }
@@ -128,21 +139,22 @@ impl MonitorService {
 
                     // Check if it's a transient error that we should retry
                     let should_retry = match &db_err {
-                        sea_orm::DbErr::ConnectionAcquire(_) |
-                        sea_orm::DbErr::Conn(_) => true,
+                        sea_orm::DbErr::ConnectionAcquire(_) | sea_orm::DbErr::Conn(_) => true,
                         sea_orm::DbErr::Query(runtime_err) => {
                             let err_str = runtime_err.to_string();
                             err_str.contains("deadlock")
                                 || err_str.contains("timeout")
                                 || err_str.contains("connection")
-                        },
+                        }
                         _ => false,
                     };
 
                     if should_retry && attempt < MAX_RETRIES {
                         warn!(
                             "{} failed (attempt {}), will retry: {:?}",
-                            operation_name, attempt + 1, db_err
+                            operation_name,
+                            attempt + 1,
+                            db_err
                         );
                         last_error = Some(db_err);
                         continue;
@@ -151,7 +163,9 @@ impl MonitorService {
                     // Non-retryable error or final attempt
                     error!(
                         "{} failed after {} attempts: {:?}",
-                        operation_name, attempt + 1, db_err
+                        operation_name,
+                        attempt + 1,
+                        db_err
                     );
                     return Err(StatusPageError::Database(db_err));
                 }
@@ -159,9 +173,12 @@ impl MonitorService {
         }
 
         // Should not reach here
-        Err(StatusPageError::Database(last_error.unwrap_or_else(||
-            sea_orm::DbErr::Custom(format!("{} failed after all retry attempts", operation_name))
-        )))
+        Err(StatusPageError::Database(last_error.unwrap_or_else(|| {
+            sea_orm::DbErr::Custom(format!(
+                "{} failed after all retry attempts",
+                operation_name
+            ))
+        })))
     }
 
     /// Create a default monitor for an environment if it doesn't exist
@@ -231,12 +248,14 @@ impl MonitorService {
 
         // Create an initial status check to bootstrap uptime calculations
         // This ensures that uptime queries have data to work with from the start
-        let _initial_check = self.record_check(
-            result.id,
-            "unknown".to_string(),
-            None,
-            Some("Monitor created - awaiting first health check".to_string()),
-        ).await?;
+        let _initial_check = self
+            .record_check(
+                result.id,
+                "unknown".to_string(),
+                None,
+                Some("Monitor created - awaiting first health check".to_string()),
+            )
+            .await?;
 
         // Emit MonitorCreated event for realtime health check
         self.emit_monitor_created(&result).await;
@@ -327,16 +346,12 @@ impl MonitorService {
 
         let db = self.db.clone();
 
-        let result = Self::with_retry(
-            &format!("record_check for monitor {}", monitor_id),
-            || {
-                let check = check.clone();
-                let db = db.clone();
-                Box::pin(async move {
-                    check.insert(db.as_ref()).await
-                })
-            },
-        ).await?;
+        let result = Self::with_retry(&format!("record_check for monitor {}", monitor_id), || {
+            let check = check.clone();
+            let db = db.clone();
+            Box::pin(async move { check.insert(db.as_ref()).await })
+        })
+        .await?;
 
         Ok(result.into())
     }
@@ -535,11 +550,11 @@ impl MonitorService {
             degraded_count: i64,
             down_count: i64,
             avg_response_time_ms: Option<Decimal>, // AVG returns NUMERIC
-            min_response_time_ms: Option<i32>,      // MIN returns INT4 (same as column type)
-            max_response_time_ms: Option<i32>,      // MAX returns INT4 (same as column type)
-            p50_response_time_ms: Option<f64>,      // PERCENTILE_CONT returns DOUBLE PRECISION
-            p95_response_time_ms: Option<f64>,      // PERCENTILE_CONT returns DOUBLE PRECISION
-            p99_response_time_ms: Option<f64>,      // PERCENTILE_CONT returns DOUBLE PRECISION
+            min_response_time_ms: Option<i32>,     // MIN returns INT4 (same as column type)
+            max_response_time_ms: Option<i32>,     // MAX returns INT4 (same as column type)
+            p50_response_time_ms: Option<f64>,     // PERCENTILE_CONT returns DOUBLE PRECISION
+            p95_response_time_ms: Option<f64>,     // PERCENTILE_CONT returns DOUBLE PRECISION
+            p99_response_time_ms: Option<f64>,     // PERCENTILE_CONT returns DOUBLE PRECISION
         }
 
         let bucket_interval = match interval {
@@ -547,9 +562,11 @@ impl MonitorService {
             "5min" => "5 minutes",
             "hourly" => "1 hour",
             "daily" => "1 day",
-            _ => return Err(StatusPageError::Validation(
-                "Invalid interval. Must be '5min', 'hourly', or 'daily'".to_string()
-            )),
+            _ => {
+                return Err(StatusPageError::Validation(
+                    "Invalid interval. Must be '5min', 'hourly', or 'daily'".to_string(),
+                ))
+            }
         };
 
         let query = format!(
@@ -603,9 +620,8 @@ impl MonitorService {
         let buckets = results
             .into_iter()
             .map(|r| {
-                let decimal_to_f64 = |d: Decimal| -> Option<f64> {
-                    d.to_string().parse::<f64>().ok()
-                };
+                let decimal_to_f64 =
+                    |d: Decimal| -> Option<f64> { d.to_string().parse::<f64>().ok() };
 
                 // Determine overall status for this bucket
                 // Priority: down > degraded > operational
@@ -654,7 +670,8 @@ impl MonitorService {
         monitor_id: i32,
     ) -> Result<super::types::CurrentStatusResponse, StatusPageError> {
         // Default to 24 hours
-        self.get_current_status_for_timeframe(monitor_id, "24h").await
+        self.get_current_status_for_timeframe(monitor_id, "24h")
+            .await
     }
 
     /// Get current status for a specific timeframe
@@ -734,12 +751,11 @@ impl MonitorService {
             last_check_at: None,
         });
 
-        let current_status = stats.last_check_status
+        let current_status = stats
+            .last_check_status
             .unwrap_or_else(|| "unknown".to_string());
 
-        let decimal_to_f64 = |d: Decimal| -> Option<f64> {
-            d.to_string().parse::<f64>().ok()
-        };
+        let decimal_to_f64 = |d: Decimal| -> Option<f64> { d.to_string().parse::<f64>().ok() };
 
         Ok(super::types::CurrentStatusResponse {
             monitor_id,
@@ -754,7 +770,7 @@ impl MonitorService {
     pub async fn get_current_status_with_timeframes(
         &self,
         monitor_id: i32,
-        start_time: UtcDateTime,    
+        start_time: UtcDateTime,
         end_time: UtcDateTime,
     ) -> Result<super::types::CurrentStatusResponse, StatusPageError> {
         use sea_orm::prelude::Decimal;
@@ -768,7 +784,7 @@ impl MonitorService {
         }
 
         // If custom time range provided, use it
-    
+
         let query = r#"
             WITH recent_checks AS (
                 SELECT
@@ -811,7 +827,6 @@ impl MonitorService {
             .into_model::<UptimeStats>()
             .one(self.db.as_ref())
             .await?;
-    
 
         let stats = result.unwrap_or(UptimeStats {
             uptime: Some(0.0),
@@ -820,12 +835,11 @@ impl MonitorService {
             last_check_at: None,
         });
 
-        let current_status = stats.last_check_status
+        let current_status = stats
+            .last_check_status
             .unwrap_or_else(|| "unknown".to_string());
 
-        let decimal_to_f64 = |d: Decimal| -> Option<f64> {
-            d.to_string().parse::<f64>().ok()
-        };
+        let decimal_to_f64 = |d: Decimal| -> Option<f64> { d.to_string().parse::<f64>().ok() };
 
         Ok(super::types::CurrentStatusResponse {
             monitor_id,
@@ -840,18 +854,22 @@ impl MonitorService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_database::test_utils::TestDatabase;
-    use temps_entities::{environments, projects};
     use sea_orm::{ActiveModelTrait, Set};
+    use temps_database::test_utils::TestDatabase;
+    use temps_entities::{environments, projects, upstream_config::UpstreamList};
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> projects::Model {
-        let slug = format!("test-project-{}", chrono::Utc::now().timestamp());
+        // Use nanoseconds for better uniqueness in parallel tests
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let slug = format!("test-project-{}", nanos);
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set(slug.clone()),
             directory: Set(slug),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
+            preset: Set(temps_entities::preset::Preset::Nixpacks),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             ..Default::default()
         };
         project.insert(db.as_ref()).await.unwrap()
@@ -861,14 +879,17 @@ mod tests {
         db: &Arc<DatabaseConnection>,
         project_id: i32,
     ) -> environments::Model {
-        let subdomain = format!("test-env-{}", chrono::Utc::now().timestamp());
+        // Use nanoseconds for better uniqueness in parallel tests
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let subdomain = format!("test-env-{}", nanos);
+        let slug = format!("test-env-{}", nanos);
         let env = environments::ActiveModel {
             project_id: Set(project_id),
-            name: Set("test-env".to_string()),
-            slug: Set("test-env".to_string()),
+            name: Set(slug.clone()),
+            slug: Set(slug),
             subdomain: Set(subdomain.clone()),
             host: Set(format!("{}.local", subdomain)),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         };
         env.insert(db.as_ref()).await.unwrap()
@@ -882,7 +903,8 @@ mod tests {
             "postgres://test:test@localhost/test".to_string(),
             None,
             None,
-        ).expect("Failed to create test config");
+        )
+        .expect("Failed to create test config");
         Arc::new(ConfigService::new(Arc::new(config), db.clone()))
     }
 
@@ -986,7 +1008,10 @@ mod tests {
         assert_eq!(all_monitors.len(), 2);
 
         // List monitors for specific environment
-        let env1_monitors = service.list_monitors(project.id, Some(env1.id)).await.unwrap();
+        let env1_monitors = service
+            .list_monitors(project.id, Some(env1.id))
+            .await
+            .unwrap();
         assert_eq!(env1_monitors.len(), 1);
         assert_eq!(env1_monitors[0].name, "Monitor 1");
     }
@@ -1012,11 +1037,17 @@ mod tests {
         assert!(monitor.is_active);
 
         // Deactivate monitor
-        let updated = service.update_monitor_status(monitor.id, false).await.unwrap();
+        let updated = service
+            .update_monitor_status(monitor.id, false)
+            .await
+            .unwrap();
         assert!(!updated.is_active);
 
         // Reactivate monitor
-        let reactivated = service.update_monitor_status(monitor.id, true).await.unwrap();
+        let reactivated = service
+            .update_monitor_status(monitor.id, true)
+            .await
+            .unwrap();
         assert!(reactivated.is_active);
     }
 

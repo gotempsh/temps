@@ -1,7 +1,7 @@
 use super::types::AppState;
 use crate::services::service::{
-    Screen, SessionMetadata, SessionReplayError, SessionReplayInfo,
-    SessionReplayWithEvents, SessionReplayWithVisitor, Viewport,
+    Screen, SessionMetadata, SessionReplayError, SessionReplayInfo, SessionReplayWithEvents,
+    SessionReplayWithVisitor, Viewport,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
-use tracing::info;
+use tracing::debug;
 use utoipa::{OpenApi, ToSchema};
 
 /// OpenAPI documentation for session replay endpoints
@@ -379,7 +379,7 @@ pub async fn get_project_session_replays(
     State(state): State<Arc<AppState>>,
     Query(query): Query<GetProjectSessionReplaysQuery>,
 ) -> Result<Json<GetProjectSessionReplaysResponse>, Problem> {
-    info!("Getting session replays for project: {}", query.project_id);
+    debug!("Getting session replays for project: {}", query.project_id);
 
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(50).min(100); // Cap at 100 items per page
@@ -424,7 +424,7 @@ pub async fn get_visitor_sessions(
     Path(visitor_id): Path<i32>,
     Query(query): Query<GetVisitorSessionsQuery>,
 ) -> Result<Json<GetVisitorSessionsResponse>, Problem> {
-    info!("Getting session replays for visitor: {}", visitor_id);
+    debug!("Getting session replays for visitor: {}", visitor_id);
 
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(50).min(100); // Cap at 100 items per page
@@ -469,7 +469,7 @@ pub async fn get_session_replay(
     State(state): State<Arc<AppState>>,
     Path((visitor_id, session_id)): Path<(i32, i32)>,
 ) -> Result<Json<GetSessionReplayResponse>, Problem> {
-    info!(
+    debug!(
         "Getting session replay: {} for visitor: {}",
         session_id, visitor_id
     );
@@ -505,7 +505,7 @@ pub async fn get_session_replay_events(
     State(state): State<Arc<AppState>>,
     Path((visitor_id, session_id)): Path<(i32, i32)>,
 ) -> Result<Json<SessionReplayWithEventsDto>, Problem> {
-    info!(
+    debug!(
         "Getting session replay events: {} for visitor: {}",
         session_id, visitor_id
     );
@@ -515,9 +515,7 @@ pub async fn get_session_replay_events(
         .get_session_replay(session_id)
         .await
     {
-        Ok(session_replay_with_events) => {
-            Ok(Json(session_replay_with_events.into()))
-        }
+        Ok(session_replay_with_events) => Ok(Json(session_replay_with_events.into())),
         Err(e) => Err(e.into()),
     }
 }
@@ -543,7 +541,7 @@ pub async fn update_session_duration(
     Path((visitor_id, session_id)): Path<(i32, String)>,
     Json(request): Json<UpdateSessionDurationRequest>,
 ) -> Result<Json<UpdateSessionDurationResponse>, Problem> {
-    info!(
+    debug!(
         "Updating duration for session: {} for visitor: {}",
         session_id, visitor_id
     );
@@ -579,7 +577,7 @@ pub async fn delete_session_replay(
     State(state): State<Arc<AppState>>,
     Path((visitor_id, session_id)): Path<(i32, String)>,
 ) -> Result<StatusCode, Problem> {
-    info!(
+    debug!(
         "Deleting session replay: {} for visitor: {}",
         session_id, visitor_id
     );
@@ -616,7 +614,7 @@ pub async fn add_events(
     Path((visitor_id, session_id)): Path<(i32, String)>,
     Json(request): Json<AddEventsRequest>,
 ) -> Result<Json<AddEventsResponse>, Problem> {
-    info!(
+    debug!(
         "Adding events to session: {} for visitor: {}",
         session_id, visitor_id
     );
@@ -651,36 +649,39 @@ pub async fn init_session_replay(
     Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<SessionReplayInitRequest>,
 ) -> Result<(StatusCode, Json<SessionReplayInitResponse>), Problem> {
-    info!(
+    debug!(
         "Initializing session replay for session: {}",
         request.session_id
     );
 
-    let visitor_id = metadata
-        .visitor_id_cookie
-        .ok_or_else(|| ErrorBuilder::new(StatusCode::BAD_REQUEST).title("Visitor ID is required").build())?;
+    let visitor_id = metadata.visitor_id_cookie.ok_or_else(|| {
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Visitor ID is required")
+            .build()
+    })?;
 
     // Resolve project, environment, and deployment from route table
-    let (project_id, environment_id, deployment_id) = match state.route_table.get_route(&metadata.host) {
-        Some(route_info) => {
-            let project_id = route_info.project.as_ref().map(|p| p.id).unwrap_or(1);
-            let environment_id = route_info.environment.as_ref().map(|e| e.id);
-            let deployment_id = route_info.deployment.as_ref().map(|d| d.id);
+    let (project_id, environment_id, deployment_id) =
+        match state.route_table.get_route(&metadata.host) {
+            Some(route_info) => {
+                let project_id = route_info.project.as_ref().map(|p| p.id).unwrap_or(1);
+                let environment_id = route_info.environment.as_ref().map(|e| e.id);
+                let deployment_id = route_info.deployment.as_ref().map(|d| d.id);
 
-            info!(
-                "Resolved host {} to project={}, env={:?}, deploy={:?}",
-                metadata.host, project_id, environment_id, deployment_id
-            );
+                debug!(
+                    "Resolved host {} to project={}, env={:?}, deploy={:?}",
+                    metadata.host, project_id, environment_id, deployment_id
+                );
 
-            (project_id, environment_id, deployment_id)
-        }
-        None => {
-            return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-                .title("Host not found in route table")
-                .detail(format!("Host {} not found", metadata.host))
-                .build());
-        }
-    };
+                (project_id, environment_id, deployment_id)
+            }
+            None => {
+                return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+                    .title("Host not found in route table")
+                    .detail(format!("Host {} not found", metadata.host))
+                    .build());
+            }
+        };
 
     let session_metadata = SessionMetadata {
         visitor_id,
@@ -714,7 +715,7 @@ pub async fn init_session_replay(
         .await
     {
         Ok(session_id) => {
-            info!("Successfully initialized session replay: {}", session_id);
+            debug!("Successfully initialized session replay: {}", session_id);
             Ok((
                 StatusCode::CREATED,
                 Json(SessionReplayInitResponse {
@@ -744,7 +745,7 @@ pub async fn add_session_replay_events(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SessionReplayEventsRequest>,
 ) -> Result<Json<AddEventsResponse>, Problem> {
-    info!(
+    debug!(
         "Adding events to session replay for session: {}",
         request.session_id
     );
@@ -755,7 +756,7 @@ pub async fn add_session_replay_events(
         .await
     {
         Ok(event_count) => {
-            info!(
+            debug!(
                 "Successfully added {} events to session: {}",
                 event_count, request.session_id
             );
@@ -801,8 +802,6 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 mod tests {
     use super::*;
     use crate::services::service::VisitorInfo;
-    use axum_test::TestServer;
-    use serde_json::json;
 
     #[tokio::test]
     async fn test_session_replay_dto_conversion() {

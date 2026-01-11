@@ -16,7 +16,7 @@ export default function RequestLogsList({
   }
 
   return (
-    <div className="container mx-auto py-6">
+    <div className="w-full py-4 sm:py-6">
       <ProxyLogsList project={projectResponse} onRowClick={handleRowClick} />
     </div>
   )

@@ -36,6 +36,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   Clock,
+  Code2,
   Eye,
   Info,
   Monitor,
@@ -45,6 +46,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
 import {
   CartesianGrid,
   Legend,
@@ -181,6 +183,24 @@ const CustomTooltip = ({
   )
 }
 
+// Helper component to display score status
+interface ScoreStatusProps {
+  status: {
+    label: string
+    icon: React.ComponentType<{ className?: string }>
+    color: string
+  }
+}
+
+function ScoreStatus({ status }: ScoreStatusProps) {
+  return (
+    <div className="flex items-center gap-2">
+      <status.icon className={cn('h-4 w-4', status.color)} />
+      <span className={cn('font-medium', status.color)}>{status.label}</span>
+    </div>
+  )
+}
+
 interface ProjectSpeedInsightsProps {
   project: ProjectResponse
 }
@@ -298,6 +318,29 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
     return avgValidPercent < 50
   }, [metrics])
 
+  // Check if we have no performance data at all
+  const hasNoData = useMemo(() => {
+    if (!metrics || isLoading) return false
+
+    // Check if all metric arrays are empty or all values are null
+    const countValid = (arr: any[]) =>
+      arr?.filter((v) => v !== null && v !== undefined).length || 0
+
+    const validFcp = countValid(metrics.fcp)
+    const validLcp = countValid(metrics.lcp)
+    const validTtfb = countValid(metrics.ttfb)
+    const validFid = countValid(metrics.fid)
+    const validCls = countValid(metrics.cls)
+
+    return (
+      validFcp === 0 &&
+      validLcp === 0 &&
+      validTtfb === 0 &&
+      validFid === 0 &&
+      validCls === 0
+    )
+  }, [metrics, isLoading])
+
   const getScoreColor = (score: number) => {
     if (score >= 90) return 'text-green-600'
     if (score >= 50) return 'text-orange-500'
@@ -324,6 +367,173 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
           Failed to load performance metrics. Please try again later.
         </AlertDescription>
       </Alert>
+    )
+  }
+
+  // Show setup instructions if no data
+  if (hasNoData && !isLoading) {
+    return (
+      <div className="space-y-6">
+        {/* Header */}
+        <Card>
+          <CardHeader>
+            <div className="flex items-start gap-3">
+              <div className="rounded-lg bg-primary/10 p-2">
+                <Info className="h-5 w-5 text-primary" />
+              </div>
+              <div className="space-y-1">
+                <CardTitle>Performance Metrics Setup Required</CardTitle>
+                <CardDescription>
+                  Performance metrics are automatically collected when you set
+                  up analytics
+                </CardDescription>
+              </div>
+            </div>
+          </CardHeader>
+        </Card>
+
+        {/* No Data Alert */}
+        <Card className="border-yellow-200 bg-yellow-50 dark:border-yellow-800 dark:bg-yellow-950/50">
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <Info className="h-4 w-4 text-yellow-600 dark:text-yellow-400" />
+              <CardTitle className="text-base text-yellow-900 dark:text-yellow-100">
+                No performance data detected
+              </CardTitle>
+            </div>
+            <CardDescription className="text-yellow-700 dark:text-yellow-300">
+              Performance metrics (Core Web Vitals) are collected automatically
+              when you integrate the analytics SDK. Set up analytics to start
+              tracking performance data.
+            </CardDescription>
+          </CardHeader>
+        </Card>
+
+        {/* Setup Instructions - Redirect to Analytics */}
+        <Card>
+          <CardHeader>
+            <CardTitle>Setup Analytics to Track Performance</CardTitle>
+            <CardDescription>
+              The Temps analytics SDK automatically tracks Core Web Vitals
+              alongside page views and events
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <div className="rounded-lg border border-muted bg-muted/30 p-6">
+              <div className="space-y-4">
+                <div className="flex items-start gap-3">
+                  <CheckCircle2 className="h-5 w-5 text-green-600 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <h4 className="font-medium mb-1">
+                      Automatic Web Vitals Tracking
+                    </h4>
+                    <p className="text-sm text-muted-foreground">
+                      When you install the Temps analytics SDK, it automatically
+                      captures:
+                    </p>
+                    <ul className="mt-2 space-y-1 text-sm text-muted-foreground ml-4">
+                      <li>• First Contentful Paint (FCP)</li>
+                      <li>• Largest Contentful Paint (LCP)</li>
+                      <li>• First Input Delay (FID)</li>
+                      <li>• Interaction to Next Paint (INP)</li>
+                      <li>• Cumulative Layout Shift (CLS)</li>
+                      <li>• Time to First Byte (TTFB)</li>
+                    </ul>
+                  </div>
+                </div>
+
+                <div className="flex items-start gap-3">
+                  <Zap className="h-5 w-5 text-blue-600 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <h4 className="font-medium mb-1">Real User Monitoring</h4>
+                    <p className="text-sm text-muted-foreground">
+                      Performance data is collected from real users, giving you
+                      accurate insights into how your application performs in
+                      production.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-3">
+              <Link to={`/projects/${project.slug}/analytics/setup`}>
+                <Button
+                  onClick={() =>
+                    (window.location.href = `/projects/${project.slug}/analytics/setup`)
+                  }
+                  className="w-full sm:w-auto"
+                >
+                  <Code2 className="mr-2 h-4 w-4" />
+                  Go to Analytics Setup
+                </Button>
+              </Link>
+              <p className="text-sm text-muted-foreground">
+                Once analytics is configured, performance metrics will appear
+                here automatically.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Additional Information */}
+        <Card>
+          <CardHeader>
+            <CardTitle>What are Core Web Vitals?</CardTitle>
+            <CardDescription>
+              Key metrics that measure real-world user experience
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-4">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="rounded-lg border p-4">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Eye className="h-4 w-4 text-muted-foreground" />
+                    <h4 className="font-medium text-sm">LCP - Loading</h4>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Measures how quickly the main content loads. Target: &lt;
+                    2.5s
+                  </p>
+                </div>
+                <div className="rounded-lg border p-4">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Zap className="h-4 w-4 text-muted-foreground" />
+                    <h4 className="font-medium text-sm">INP - Interactivity</h4>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Measures responsiveness to user interactions. Target: &lt;
+                    200ms
+                  </p>
+                </div>
+                <div className="rounded-lg border p-4">
+                  <div className="flex items-center gap-2 mb-2">
+                    <TrendingUp className="h-4 w-4 text-muted-foreground" />
+                    <h4 className="font-medium text-sm">
+                      CLS - Visual Stability
+                    </h4>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Measures unexpected layout shifts. Target: &lt; 0.1
+                  </p>
+                </div>
+                <div className="rounded-lg border p-4">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Clock className="h-4 w-4 text-muted-foreground" />
+                    <h4 className="font-medium text-sm">
+                      TTFB - Server Response
+                    </h4>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Measures server response time. Target: &lt; 800ms
+                  </p>
+                </div>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
     )
   }
 
@@ -505,19 +715,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
                     />
                   </div>
                   <div className="space-y-2">
-                    {(() => {
-                      const status = getScoreStatus(score)
-                      return (
-                        <div className="flex items-center gap-2">
-                          <status.icon
-                            className={cn('h-4 w-4', status.color)}
-                          />
-                          <span className={cn('font-medium', status.color)}>
-                            {status.label}
-                          </span>
-                        </div>
-                      )
-                    })()}
+                    <ScoreStatus status={getScoreStatus(score)} />
                     <p className="text-sm text-muted-foreground">
                       {score >= 90
                         ? 'Excellent performance'

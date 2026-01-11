@@ -1,4 +1,5 @@
-use crate::types::{requests::*, responses::*};
+use crate::types::requests::{self, *};
+use crate::types::responses::*;
 use crate::{Analytics, AnalyticsError};
 use axum::{
     extract::{Query, State},
@@ -35,7 +36,9 @@ pub struct AppState {
         get_session_logs,
         has_analytics_events,
         get_page_paths,
+        get_page_path_detail,
         get_active_visitors,
+        get_live_visitors_list,
         get_page_hourly_sessions,
         get_visitor_by_id,
         get_visitor_by_guid,
@@ -82,6 +85,8 @@ pub struct AppState {
         PageHourlySessionsResponse,
         PageSessionComparison,
         PagesComparisonResponse,
+        LiveVisitorInfo,
+        LiveVisitorsListResponse,
         // Query schemas
         MetricsQuery,
         ViewsOverTimeQuery,
@@ -99,13 +104,18 @@ pub struct AppState {
         ProjectQuery,
         PageSessionStatsQuery,
         PagePathsQuery,
-        ActiveVisitorsQuery,
         PageHourlySessionsQuery,
         VisitorWithGeolocation,
         EventBreakdown,
         GeneralStatsQuery,
         GeneralStatsResponse,
         ProjectStatsBreakdown,
+        // Page path detail types
+        PagePathDetailQuery,
+        PagePathDetailResponse,
+        PageActivityBucket,
+        PageCountryStats,
+        PageReferrerStats,
     )),
     info(
         title = "Analytics API",
@@ -149,7 +159,9 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
         .route("/analytics/has-events", get(has_analytics_events))
         .route("/analytics/page-paths", get(get_page_paths))
+        .route("/analytics/page-path-detail", get(get_page_path_detail))
         .route("/analytics/active-visitors", get(get_active_visitors))
+        .route("/analytics/live-visitors", get(get_live_visitors_list))
         .route(
             "/analytics/page-hourly-sessions",
             get(get_page_hourly_sessions),
@@ -222,6 +234,7 @@ pub async fn get_events_count(
         ("include_crawlers" = Option<bool>, Query, description = "Include crawlers (default: false)"),
         ("limit" = Option<i32>, Query, description = "Maximum number of visitors to return (default: 50)"),
         ("offset" = Option<i32>, Query, description = "Number of visitors to skip (default: 0)"),
+        ("has_activity_only" = Option<bool>, Query, description = "Filter to only include visitors with recorded activity (events/sessions). When true, excludes ghost visitors (default: true)"),
     ),
     responses(
         (status = 200, description = "Successfully retrieved visitors", body = VisitorsResponse),
@@ -249,7 +262,8 @@ pub async fn get_visitors(
             query.environment_id,
             query.include_crawlers,
             query.limit,
-            Some(0), // Default offset
+            query.offset,
+            Some(query.has_activity_only.unwrap_or(true)),
         )
         .await
     {
@@ -333,7 +347,7 @@ pub async fn get_visitor_info(
     }
 }
 
-/// Get comprehensive visitor statistics
+/// Get visitor statistics
 #[utoipa::path(
     tag = "Analytics",
     get,
@@ -544,6 +558,7 @@ pub async fn get_session_logs(
             session_id,
             project_id,
             query.environment_id,
+            query.visitor_id,
             query.start_date.map(|d| d.into()),
             query.end_date.map(|d| d.into()),
             query.limit,
@@ -565,7 +580,7 @@ pub async fn get_session_logs(
     put,
     path = "/analytics/visitors/{visitor_id}/enrich",
     params(
-        ("visitor_id" = i32, Path, description = "Visitor numeric ID"),
+        ("visitor_id" = String, Path, description = "Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx)"),
         ("project_id" = i32, Query, description = "Project ID or slug"),
     ),
     request_body = EnrichVisitorRequest,
@@ -582,19 +597,32 @@ pub async fn get_session_logs(
 pub async fn enrich_visitor(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
-    axum::extract::Path(visitor_id): axum::extract::Path<i32>,
-
+    axum::extract::Path(visitor_id): axum::extract::Path<String>,
     Json(request): Json<EnrichVisitorRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsWrite);
 
-    match app_state
-        .analytics_service
-        .enrich_visitor_by_id(visitor_id, request.custom_data)
-        .await
-    {
-        Ok(response) => Ok(Json(response)),
-        Err(e) => Err(handle_analytics_error(e)),
+    // Check if visitor_id is a numeric ID or a GUID/encrypted GUID
+    if let Ok(numeric_id) = visitor_id.parse::<i32>() {
+        // Numeric ID - use enrich_visitor_by_id
+        match app_state
+            .analytics_service
+            .enrich_visitor_by_id(numeric_id, request.custom_data)
+            .await
+        {
+            Ok(response) => Ok(Json(response)),
+            Err(e) => Err(handle_analytics_error(e)),
+        }
+    } else {
+        // GUID or encrypted GUID (enc_xxx) - use enrich_visitor_by_guid
+        match app_state
+            .analytics_service
+            .enrich_visitor_by_guid(&visitor_id, request.custom_data)
+            .await
+        {
+            Ok(response) => Ok(Json(response)),
+            Err(e) => Err(handle_analytics_error(e)),
+        }
     }
 }
 
@@ -713,6 +741,56 @@ pub async fn get_page_paths(
     }
 }
 
+/// Get detailed analytics for a specific page path
+/// Returns visitors, page views, activity over time, geographic distribution, and referrers
+#[utoipa::path(
+    tag = "Analytics",
+    get,
+    path = "/analytics/page-path-detail",
+    params(
+        ("page_path" = String, Query, description = "The page path to get details for (URL-encoded)"),
+        ("project_id" = i32, Query, description = "Project ID"),
+        ("environment_id" = Option<i32>, Query, description = "Environment ID (optional)"),
+        ("start_date" = String, Query, description = "Start date in ISO 8601 format"),
+        ("end_date" = String, Query, description = "End date in ISO 8601 format"),
+        ("bucket_interval" = Option<String>, Query, description = "Bucket interval for time series: 'hour', 'day', 'week', 'month' (default: auto based on date range)")
+    ),
+    responses(
+        (status = 200, description = "Successfully retrieved page path detail analytics", body = PagePathDetailResponse),
+        (status = 400, description = "Invalid parameters or project not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_page_path_detail(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Query(query): Query<requests::PagePathDetailQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+
+    let start_date: UtcDateTime = query.start_date.into();
+    let end_date: UtcDateTime = query.end_date.into();
+
+    match app_state
+        .analytics_service
+        .get_page_path_detail(
+            query.project_id,
+            &query.page_path,
+            start_date,
+            end_date,
+            query.environment_id,
+            query.bucket_interval.as_deref(),
+        )
+        .await
+    {
+        Ok(detail) => Ok(Json(detail)),
+        Err(e) => Err(handle_analytics_error(e)),
+    }
+}
+
 /// Query parameters for active visitors endpoint
 #[derive(Debug, Deserialize, ToSchema, Clone)]
 pub struct ActiveVisitorsQuery {
@@ -791,12 +869,7 @@ pub async fn get_active_visitors(
 
     match app_state
         .analytics_service
-        .get_active_visitors_details(
-            project_id,
-            query.environment_id,
-            query.deployment_id,
-            Some(window),
-        )
+        .get_active_visitors_details(project_id, query.environment_id, Some(window), None)
         .await
     {
         Ok(visitors) => {
@@ -804,6 +877,56 @@ pub async fn get_active_visitors(
             let response = ActiveVisitorsResponse {
                 count,
                 visitors: visitors.visitors,
+                window_minutes: window,
+            };
+            Ok(Json(response))
+        }
+        Err(e) => {
+            error!("Analytics error: {:?}", e);
+            Err(handle_analytics_error(e))
+        }
+    }
+}
+
+/// Get list of currently live visitors from visitor table
+#[utoipa::path(
+    tag = "Analytics",
+    get,
+    path = "/analytics/live-visitors",
+    params(
+        ("project_id" = i32, Query, description = "Project ID"),
+        ("environment_id" = Option<i32>, Query, description = "Environment ID (optional)"),
+        ("window_minutes" = Option<i32>, Query, description = "Time window in minutes for live visitors (default: 5)")
+    ),
+    responses(
+        (status = 200, description = "Successfully retrieved live visitors list", body = LiveVisitorsListResponse),
+        (status = 400, description = "Invalid parameters or project not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_live_visitors_list(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Query(query): Query<ActiveVisitorsQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+
+    let project_id = query.project_id;
+    let window = query.window_minutes.unwrap_or(5);
+
+    match app_state
+        .analytics_service
+        .get_live_visitors(project_id, query.environment_id, window)
+        .await
+    {
+        Ok(live_visitors) => {
+            let total_count = live_visitors.len() as i64;
+            let response = LiveVisitorsListResponse {
+                total_count,
+                visitors: live_visitors,
                 window_minutes: window,
             };
             Ok(Json(response))

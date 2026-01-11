@@ -1,6 +1,7 @@
-
 use serde::{Deserialize, Serialize};
 use temps_core::UtcDateTime;
+use temps_entities::{deployment_config::DeploymentConfigSnapshot, prelude::DeploymentMetadata};
+
 // Deployment-related types
 #[derive(Debug, Serialize)]
 pub struct Deployment {
@@ -22,6 +23,10 @@ pub struct Deployment {
     pub commit_date: Option<UtcDateTime>,
     pub is_current: bool,
     pub cancelled_reason: Option<String>,
+    /// Deployment configuration snapshot (resources, replicas, environment variables, etc.)
+    pub deployment_config: Option<DeploymentConfigSnapshot>,
+    /// Deployment metadata (build info, git event, etc.)
+    pub metadata: Option<DeploymentMetadata>,
 }
 
 #[derive(Debug, Serialize)]
@@ -75,7 +80,6 @@ pub struct DeploymentStage {
     pub finished_at: Option<UtcDateTime>,
 }
 
-
 #[derive(Deserialize)]
 pub struct UpdateDeploymentSettingsRequest {
     pub cpu_request: Option<i32>,
@@ -83,7 +87,6 @@ pub struct UpdateDeploymentSettingsRequest {
     pub memory_request: Option<i32>,
     pub memory_limit: Option<i32>,
 }
-
 
 #[derive(Debug, Serialize)]
 pub struct Pipeline {

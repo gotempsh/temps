@@ -71,7 +71,10 @@ impl SimpleTokenizer {
 
     fn tokenize_word(&self, word: &str) -> u32 {
         // Return existing ID or create new one
-        *self.word_to_id.get(word).unwrap_or(&(self.vocab.len() as u32))
+        *self
+            .word_to_id
+            .get(word)
+            .unwrap_or(&(self.vocab.len() as u32))
     }
 }
 
@@ -197,10 +200,7 @@ impl Tokenizer for CharTokenizer {
     fn decode(&self, token_ids: &[u32]) -> TokenizerResult<String> {
         let chars: Result<Vec<char>, _> = token_ids
             .iter()
-            .map(|&id| {
-                char::from_u32(id)
-                    .ok_or_else(|| TokenizerError::InvalidTokenId(id))
-            })
+            .map(|&id| char::from_u32(id).ok_or(TokenizerError::InvalidTokenId(id)))
             .collect();
 
         chars.map(|c| c.into_iter().collect())
@@ -217,10 +217,7 @@ mod tests {
 
     #[test]
     fn test_simple_tokenizer() {
-        let tokenizer = SimpleTokenizer::with_vocab(vec![
-            "hello".to_string(),
-            "world".to_string(),
-        ]);
+        let tokenizer = SimpleTokenizer::with_vocab(vec!["hello".to_string(), "world".to_string()]);
 
         let tokens = tokenizer.encode("hello world").unwrap();
         assert_eq!(tokens, vec![0, 1]);

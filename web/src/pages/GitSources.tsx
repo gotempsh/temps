@@ -20,6 +20,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { KbdBadge } from '@/components/ui/kbd-badge'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -31,6 +32,7 @@ import { FeedbackAlert } from '@/components/ui/feedback-alert'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useFeedback } from '@/hooks/useFeedback'
+import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -165,6 +167,9 @@ export function GitSources() {
     setBreadcrumbs([{ label: 'Git Providers' }])
   }, [setBreadcrumbs])
 
+  // Keyboard shortcut: N to add new git provider
+  useKeyboardShortcut({ key: 'n', path: '/git-sources/add' })
+
   usePageTitle('Git Providers')
 
   return (
@@ -185,6 +190,7 @@ export function GitSources() {
             <Button onClick={() => navigate('/git-sources/add')}>
               <Plus className="mr-2 h-4 w-4" />
               Add Git Provider
+              <KbdBadge keys="N" className="ml-2" />
             </Button>
           </div>
         </div>

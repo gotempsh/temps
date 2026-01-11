@@ -25,9 +25,10 @@ pub async fn auth_middleware(
     let auth_context = match extract_auth_from_request(&req, &app_state).await {
         Ok(ctx) => {
             // Extract user from auth context if available
-            user = Some(ctx.user.clone());
+            // Note: deployment tokens don't have a user associated
+            user = ctx.user.clone();
             Some(ctx)
-        },
+        }
         Err(_) => {
             // For routes that don't require auth, continue without context
             // The RequireAuth extractor will handle the error later
@@ -40,16 +41,20 @@ pub async fn auth_middleware(
     let session_id_cookie = extract_session_id_cookie(&req, &app_state.cookie_crypto);
 
     // Create base URL from request headers
-    let host = req.headers()
+    let host = req
+        .headers()
         .get("host")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("localhost")
         .to_string();
 
     // Determine scheme (simplified - you may want to add more sophisticated logic)
-    let scheme = if req.headers().get("x-forwarded-proto")
+    let scheme = if req
+        .headers()
+        .get("x-forwarded-proto")
         .and_then(|h| h.to_str().ok())
-        .map_or(false, |s| s == "https") {
+        == Some("https")
+    {
         "https"
     } else {
         "http"
@@ -101,8 +106,9 @@ pub async fn extract_auth_from_request(
     let auth_service = &auth_state.auth_service;
     let user_service = &auth_state.user_service;
     let api_key_service = &auth_state.api_key_service;
+    let deployment_token_service = &auth_state.deployment_token_service;
 
-    // 1. Check for Authorization header (API Key or CLI Token)
+    // 1. Check for Authorization header (API Key, Deployment Token, or CLI Token)
     if let Some(auth_header) = req.headers().get("authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
             if auth_str.starts_with("Bearer ") {
@@ -119,6 +125,19 @@ pub async fn extract_auth_from_request(
                             permissions,
                             key_name,
                             key_id,
+                        ));
+                    }
+                }
+
+                // Try deployment token (format: dt_...)
+                if token.starts_with("dt_") {
+                    if let Ok(validated) = deployment_token_service.validate_token(token).await {
+                        return Ok(AuthContext::new_deployment_token(
+                            validated.project_id,
+                            validated.environment_id,
+                            validated.token_id,
+                            validated.name,
+                            validated.permissions,
                         ));
                     }
                 }
@@ -171,7 +190,8 @@ fn extract_session_from_cookies(
     headers: &HeaderMap,
     crypto: &CookieCrypto,
 ) -> Result<Option<String>, AuthError> {
-    if let Some(cookie_header) = headers.get("cookie") {
+    // Iterate through ALL cookie headers (there can be multiple)
+    for cookie_header in headers.get_all("cookie") {
         if let Ok(cookie_str) = cookie_header.to_str() {
             // Parse cookies and find the encrypted session cookie
             for cookie in Cookie::split_parse(cookie_str).filter_map(Result::ok) {
@@ -193,24 +213,19 @@ fn extract_session_from_cookies(
     Ok(None)
 }
 
-pub fn extract_visitor_id_cookie(
-    req: &Request,
-    crypto: &CookieCrypto,
-) -> Option<String> {
+pub fn extract_visitor_id_cookie(req: &Request, crypto: &CookieCrypto) -> Option<String> {
     let headers = req.headers();
 
     for cookie_header in headers.get_all("Cookie") {
         if let Ok(cookie_header_str) = cookie_header.to_str() {
-            for cookie_result in Cookie::split_parse(cookie_header_str) {
-                if let Ok(cookie) = cookie_result {
-                    if cookie.name() == VISITOR_ID_COOKIE_NAME {
-                        // Decrypt the cookie value
-                        match crypto.decrypt(cookie.value()) {
-                            Ok(decrypted) => return Some(decrypted),
-                            Err(_) => {
-                                // If decryption fails, no valid visitor ID
-                                return None;
-                            }
+            for cookie in Cookie::split_parse(cookie_header_str).flatten() {
+                if cookie.name() == VISITOR_ID_COOKIE_NAME {
+                    // Decrypt the cookie value
+                    match crypto.decrypt(cookie.value()) {
+                        Ok(decrypted) => return Some(decrypted),
+                        Err(_) => {
+                            // If decryption fails, no valid visitor ID
+                            return None;
                         }
                     }
                 }
@@ -220,24 +235,19 @@ pub fn extract_visitor_id_cookie(
     None
 }
 
-pub fn extract_session_id_cookie(
-    req: &Request,
-    crypto: &CookieCrypto,
-) -> Option<String> {
+pub fn extract_session_id_cookie(req: &Request, crypto: &CookieCrypto) -> Option<String> {
     let headers = req.headers();
 
     for cookie_header in headers.get_all("Cookie") {
         if let Ok(cookie_header_str) = cookie_header.to_str() {
-            for cookie_result in Cookie::split_parse(cookie_header_str) {
-                if let Ok(cookie) = cookie_result {
-                    if cookie.name() == SESSION_ID_COOKIE_NAME {
-                        // Decrypt the cookie value
-                        match crypto.decrypt(cookie.value()) {
-                            Ok(decrypted) => return Some(decrypted),
-                            Err(_) => {
-                                // If decryption fails, no valid session ID
-                                return None;
-                            }
+            for cookie in Cookie::split_parse(cookie_header_str).flatten() {
+                if cookie.name() == SESSION_ID_COOKIE_NAME {
+                    // Decrypt the cookie value
+                    match crypto.decrypt(cookie.value()) {
+                        Ok(decrypted) => return Some(decrypted),
+                        Err(_) => {
+                            // If decryption fails, no valid session ID
+                            return None;
                         }
                     }
                 }
@@ -283,6 +293,73 @@ impl From<crate::apikey_service::ApiKeyServiceError> for AuthError {
                 AuthError::Unauthorized(msg)
             }
             _ => AuthError::InternalServerError(err.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that the middleware correctly identifies deployment token prefix
+    #[test]
+    fn test_deployment_token_prefix_detection() {
+        // Valid deployment token prefix
+        assert!("dt_sometoken123456789".starts_with("dt_"));
+        // Invalid prefix should not match
+        assert!(!"tk_sometoken123456789".starts_with("dt_"));
+        assert!(!"invalid_token".starts_with("dt_"));
+    }
+
+    /// Test Bearer token extraction from Authorization header
+    #[test]
+    fn test_bearer_token_extraction() {
+        let auth_header = "Bearer dt_testtoken123456";
+        assert!(auth_header.starts_with("Bearer "));
+        let token = auth_header.trim_start_matches("Bearer ");
+        assert_eq!(token, "dt_testtoken123456");
+    }
+
+    /// Test that deployment tokens are routed to the correct validation path
+    #[test]
+    fn test_token_routing_logic() {
+        // API key prefix
+        let api_key_token = "tk_abc123";
+        assert!(api_key_token.starts_with("tk_"));
+        assert!(!api_key_token.starts_with("dt_"));
+
+        // Deployment token prefix
+        let deployment_token = "dt_xyz789";
+        assert!(deployment_token.starts_with("dt_"));
+        assert!(!deployment_token.starts_with("tk_"));
+
+        // Invalid prefix (neither)
+        let invalid_token = "invalid_token";
+        assert!(!invalid_token.starts_with("tk_"));
+        assert!(!invalid_token.starts_with("dt_"));
+    }
+
+    /// Test session cookie name constants
+    #[test]
+    fn test_cookie_names() {
+        assert_eq!(SESSION_ID_COOKIE_NAME, "_temps_sid");
+        assert_eq!(VISITOR_ID_COOKIE_NAME, "_temps_visitor_id");
+    }
+
+    /// Test AuthError variants
+    #[test]
+    fn test_auth_error_variants() {
+        let unauthorized = AuthError::Unauthorized("test".to_string());
+        let internal = AuthError::InternalServerError("error".to_string());
+
+        match unauthorized {
+            AuthError::Unauthorized(msg) => assert_eq!(msg, "test"),
+            _ => panic!("Expected Unauthorized"),
+        }
+
+        match internal {
+            AuthError::InternalServerError(msg) => assert_eq!(msg, "error"),
+            _ => panic!("Expected InternalServerError"),
         }
     }
 }

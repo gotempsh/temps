@@ -7,7 +7,9 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import {
   Select,
   SelectContent,
@@ -64,20 +66,20 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [tail, setTail] = useState<number>(1000)
   const [autoScroll, setAutoScroll] = useState(true)
+  const [showTimestamps, setShowTimestamps] = useState(false)
   const parentRef = useRef<HTMLDivElement>(null)
   const matchRefs = useRef<HTMLSpanElement[]>([])
-  const eventSourceRef = useRef<EventSource | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
   const containerWidth = useRef<number>(0)
   const isConnectingRef = useRef(false)
   const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
     count: logs.length,
     getScrollElement: () => parentRef.current,
     estimateSize: (index) => {
       return estimateLineHeight(logs[index], containerWidth.current)
     },
-    overscan: 5,
+    overscan: 20,
     measureElement: (element) => {
       return element?.getBoundingClientRect().height ?? 0
     },
@@ -89,6 +91,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   })
 
   // Fetch containers for selected environment
+  // IMPORTANT: Always refresh, never use cache
   const { data: containersData } = useQuery({
     ...listContainersOptions({
       path: {
@@ -97,6 +100,10 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
       },
     }),
     enabled: !!selectedTarget,
+    staleTime: 0, // Data is immediately stale
+    gcTime: 0, // Don't cache data (React Query v5)
+    refetchOnMount: 'always', // Always refetch on mount
+    refetchOnWindowFocus: true, // Refetch when window gains focus
   })
 
   // Auto-select first environment when environments are loaded
@@ -115,12 +122,12 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     }
   }, [containersData, selectedContainer])
 
-  // SSE connection effect
+  // WebSocket connection effect
   useEffect(() => {
     if (!selectedTarget) return
 
-    // If containers are loading or no container is selected yet, wait
-    if (containersData !== undefined && !selectedContainer) return
+    // Wait for container to be selected - don't connect without a specific container
+    if (!selectedContainer) return
 
     // Prevent multiple simultaneous connections
     if (isConnectingRef.current) {
@@ -131,8 +138,11 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     setRetryCount(0)
     setErrorMessage('')
 
-    const connectSSE = () => {
-      if (isConnectingRef.current) {
+    let isCleaningUp = false
+    let currentRetryCount = 0
+
+    const connectWS = () => {
+      if (isConnectingRef.current || isCleaningUp) {
         return
       }
 
@@ -153,23 +163,25 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
       if (tail) {
         params.append('tail', tail.toString())
       }
+      // Add timestamps parameter
+      params.append('timestamps', showTimestamps.toString())
 
-      // Use container-specific endpoint if container is selected, otherwise use default
-      const sseUrl = selectedContainer
-        ? `/api/projects/${project.id}/environments/${selectedTarget}/containers/${selectedContainer}/logs?${params.toString()}`
-        : `/api/projects/${project.id}/environments/${selectedTarget}/container-logs?${params.toString()}`
+      // Use container-specific endpoint (selectedContainer is guaranteed by the guard above)
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const wsUrl = `${protocol}//${window.location.host}/api/projects/${project.id}/environments/${selectedTarget}/containers/${selectedContainer}/logs?${params.toString()}`
 
       // Close existing connection if any
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close()
+      if (wsRef.current) {
+        wsRef.current.close(1000, 'Reconnecting')
       }
 
       try {
-        eventSourceRef.current = new EventSource(sseUrl)
+        wsRef.current = new WebSocket(wsUrl)
         setConnectionStatus('connecting')
 
-        eventSourceRef.current.onopen = () => {
+        wsRef.current.onopen = () => {
           setConnectionStatus('connected')
+          currentRetryCount = 0
           setRetryCount(0)
           setErrorMessage('')
           isConnectingRef.current = false
@@ -181,7 +193,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
           }
         }
 
-        eventSourceRef.current.onmessage = (event) => {
+        wsRef.current.onmessage = (event) => {
           try {
             // Try to parse as JSON first
             const parsed = JSON.parse(event.data)
@@ -212,51 +224,56 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
           }
         }
 
-        eventSourceRef.current.onerror = (error) => {
-          console.error('SSE error:', error)
+        wsRef.current.onerror = (error) => {
+          console.error('WebSocket error:', error)
           setErrorMessage('Connection failed')
           isConnectingRef.current = false
-          eventSourceRef.current?.close()
+        }
 
-          setRetryCount((prev) => {
-            const newRetryCount = prev + 1
+        wsRef.current.onclose = (event) => {
+          isConnectingRef.current = false
 
-            if (newRetryCount >= 3) {
-              setConnectionStatus('permanent_error')
-              setErrorMessage('Connection failed after multiple attempts')
-              return newRetryCount
-            }
+          // Don't reconnect if cleaning up or normal closure
+          if (isCleaningUp || event.code === 1000) {
+            return
+          }
 
-            // Temporary error - attempt to reconnect
-            setConnectionStatus('error')
-            const delay = Math.pow(2, newRetryCount) * 1000
+          // Increment retry count
+          currentRetryCount++
+          setRetryCount(currentRetryCount)
 
-            // Clear any existing retry timeout
-            if (retryTimeoutRef.current) {
-              clearTimeout(retryTimeoutRef.current)
-            }
+          if (currentRetryCount >= 3) {
+            setConnectionStatus('permanent_error')
+            setErrorMessage('Connection failed after multiple attempts')
+            return
+          }
 
-            retryTimeoutRef.current = setTimeout(() => {
-              if (eventSourceRef.current !== null) {
-                retryTimeoutRef.current = null
-                connectSSE()
-              }
-            }, delay)
+          // Temporary error - attempt to reconnect
+          setConnectionStatus('error')
+          const delay = Math.pow(2, currentRetryCount) * 1000
 
-            return newRetryCount
-          })
+          // Clear any existing retry timeout
+          if (retryTimeoutRef.current) {
+            clearTimeout(retryTimeoutRef.current)
+          }
+
+          retryTimeoutRef.current = setTimeout(() => {
+            retryTimeoutRef.current = null
+            connectWS()
+          }, delay)
         }
       } catch (error) {
-        console.error('Failed to create EventSource:', error)
+        console.error('Failed to create WebSocket:', error)
         setConnectionStatus('permanent_error')
         setErrorMessage('Failed to establish connection')
         isConnectingRef.current = false
       }
     }
 
-    connectSSE()
+    connectWS()
 
     return () => {
+      isCleaningUp = true
       isConnectingRef.current = false
 
       // Clear any pending retry timeout
@@ -265,10 +282,9 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
         retryTimeoutRef.current = null
       }
 
-      if (eventSourceRef.current) {
-        const es = eventSourceRef.current
-        eventSourceRef.current = null // Mark as intentionally closing
-        es.close()
+      if (wsRef.current) {
+        wsRef.current.close(1000, 'Component unmounting')
+        wsRef.current = null
       }
     }
   }, [
@@ -280,9 +296,10 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     startDate,
     endDate,
     tail,
+    showTimestamps,
   ])
 
-  // Shared connectSSE function for retry
+  // Shared connectWS function for retry
   const handleRetryConnection = useCallback(() => {
     setRetryCount(0)
     setConnectionStatus('connecting')
@@ -301,25 +318,28 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     if (tail) {
       params.append('tail', tail.toString())
     }
+    // Add timestamps parameter
+    params.append('timestamps', showTimestamps.toString())
 
-    const sseUrl = `/api/projects/${project.slug}/environments/${selectedTarget}/container-logs/stream?${params.toString()}`
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const wsUrl = `${protocol}//${window.location.host}/api/projects/${project.id}/environments/${selectedTarget}/containers/${selectedContainer}/logs?${params.toString()}`
 
     // Close existing connection if any
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close()
+    if (wsRef.current) {
+      wsRef.current.close()
     }
 
     try {
-      eventSourceRef.current = new EventSource(sseUrl)
+      wsRef.current = new WebSocket(wsUrl)
       setConnectionStatus('connecting')
 
-      eventSourceRef.current.onopen = () => {
+      wsRef.current.onopen = () => {
         setConnectionStatus('connected')
         setRetryCount(0)
         setErrorMessage('')
       }
 
-      eventSourceRef.current.onmessage = (event) => {
+      wsRef.current.onmessage = (event) => {
         try {
           // Try to parse as JSON first
           const parsed = JSON.parse(event.data)
@@ -350,20 +370,11 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
         }
       }
 
-      eventSourceRef.current.onerror = (err) => {
+      wsRef.current.onerror = () => {
         // Try to extract more details from the error event
         let errorMessage = 'Connection failed'
-        // Some browsers set err as Event, but some as ErrorEvent or MessageEvent
-        // Try to extract info:
-        if ('message' in err) {
-          errorMessage += `: ${err.message}`
-        } else if ('data' in err) {
-          errorMessage += `: ${err.data}`
-        } else if ('status' in err) {
-          errorMessage += ` (status: ${err.status})`
-        }
         setErrorMessage(errorMessage)
-        eventSourceRef.current?.close()
+        wsRef.current?.close()
 
         setRetryCount((prev) => {
           const newRetryCount = prev + 1
@@ -377,7 +388,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
 
           setTimeout(
             () => {
-              if (eventSourceRef.current !== null) {
+              if (wsRef.current !== null) {
                 handleRetryConnection()
               }
             },
@@ -391,7 +402,15 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
       setConnectionStatus('permanent_error')
       setErrorMessage('Failed to establish connection')
     }
-  }, [project.slug, selectedTarget, startDate, endDate, tail])
+  }, [
+    project.id,
+    selectedTarget,
+    selectedContainer,
+    startDate,
+    endDate,
+    tail,
+    showTimestamps,
+  ])
 
   // Update search functionality
   const scrollToMatch = (index: number, matches: number) => {
@@ -524,7 +543,22 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
               onValueChange={(value) => setSelectedContainer(value)}
             >
               <SelectTrigger className="w-full sm:w-[250px]">
-                <SelectValue placeholder="Select container" />
+                <SelectValue placeholder="Select container">
+                  {selectedContainer && containersData?.containers && (
+                    <div className="flex items-center gap-2 overflow-hidden">
+                      <span className="truncate">
+                        {
+                          containersData.containers.find(
+                            (c) => c.container_id === selectedContainer
+                          )?.container_name
+                        }
+                      </span>
+                      <span className="text-xs text-muted-foreground shrink-0">
+                        {selectedContainer.substring(0, 12)}
+                      </span>
+                    </div>
+                  )}
+                </SelectValue>
               </SelectTrigger>
               <SelectContent>
                 {containersData?.containers?.map((container) => (
@@ -533,7 +567,9 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                     value={container.container_id}
                   >
                     <div className="flex flex-col items-start text-left">
-                      <span>{container.container_name}</span>
+                      <span className="truncate max-w-[200px]">
+                        {container.container_name}
+                      </span>
                       <span className="text-xs text-muted-foreground">
                         {container.container_id.substring(0, 12)}
                       </span>
@@ -551,6 +587,22 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                 onChange={(e) => handleSearch(e.target.value)}
                 className="pl-9 w-full"
               />
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="show-timestamps"
+                checked={showTimestamps}
+                onCheckedChange={(checked) =>
+                  setShowTimestamps(checked === true)
+                }
+              />
+              <Label
+                htmlFor="show-timestamps"
+                className="text-sm font-normal cursor-pointer"
+              >
+                Show timestamps
+              </Label>
             </div>
           </div>
 
@@ -596,7 +648,7 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
             <div
               ref={parentRef}
               className={cn(
-                'h-[600px] overflow-auto p-4 font-mono text-sm bg-background text-foreground',
+                'h-[600px] overflow-auto p-4 font-mono text-xs bg-background text-foreground select-text',
                 connectionStatus === 'connecting' && 'opacity-50'
               )}
               onScroll={handleScroll}

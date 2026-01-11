@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use temps_screenshots::{
     LocalScreenshotProvider, RemoteScreenshotProvider, ScreenshotError, ScreenshotProvider,
-    ScreenshotService,
 };
 
 /// Test that the local provider can be created with default settings
@@ -59,10 +58,8 @@ async fn test_remote_provider_creation() {
 /// Test remote provider creation without API key
 #[tokio::test]
 async fn test_remote_provider_no_api_key() {
-    let provider = RemoteScreenshotProvider::new(
-        "https://screenshot.example.com/api".to_string(),
-        None,
-    );
+    let provider =
+        RemoteScreenshotProvider::new("https://screenshot.example.com/api".to_string(), None);
 
     assert!(provider.is_ok());
 }
@@ -70,11 +67,9 @@ async fn test_remote_provider_no_api_key() {
 /// Test that remote provider rejects invalid URLs
 #[tokio::test]
 async fn test_remote_provider_invalid_url() {
-    let provider = RemoteScreenshotProvider::new(
-        "https://screenshot.example.com/api".to_string(),
-        None,
-    )
-    .unwrap();
+    let provider =
+        RemoteScreenshotProvider::new("https://screenshot.example.com/api".to_string(), None)
+            .unwrap();
 
     let result = provider.capture_screenshot("invalid-url").await;
     assert!(result.is_err());
@@ -128,11 +123,7 @@ fn test_provider_names() {
     let local = LocalScreenshotProvider::new();
     assert_eq!(local.provider_name(), "local-headless-chrome");
 
-    let remote = RemoteScreenshotProvider::new(
-        "https://example.com".to_string(),
-        None,
-    )
-    .unwrap();
+    let remote = RemoteScreenshotProvider::new("https://example.com".to_string(), None).unwrap();
     assert_eq!(remote.provider_name(), "remote-api");
 }
 

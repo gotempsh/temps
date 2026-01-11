@@ -15,7 +15,7 @@ pub struct ErrorAnalyticsService {
     db: Arc<DatabaseConnection>,
 }
 
-/// Comprehensive error dashboard statistics
+/// Error dashboard statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorDashboardStats {
     // Total errors count
@@ -161,7 +161,7 @@ impl ErrorAnalyticsService {
         "1 hour".to_string()
     }
 
-    /// Get comprehensive dashboard statistics
+    /// Get dashboard statistics
     pub async fn get_dashboard_stats(
         &self,
         project_id: i32,
@@ -200,8 +200,7 @@ impl ErrorAnalyticsService {
         }
 
         let groups_sql = if let Some(_env_id) = environment_id {
-            format!(
-                r#"
+            r#"
                 SELECT COUNT(DISTINCT error_group_id) as count
                 FROM error_events
                 WHERE project_id = $1
@@ -209,17 +208,16 @@ impl ErrorAnalyticsService {
                     AND timestamp <= $3
                     AND environment_id = $4
                 "#
-            )
+            .to_string()
         } else {
-            format!(
-                r#"
+            r#"
                 SELECT COUNT(DISTINCT error_group_id) as count
                 FROM error_events
                 WHERE project_id = $1
                     AND timestamp >= $2
                     AND timestamp <= $3
                 "#
-            )
+            .to_string()
         };
 
         let group_count_result = if let Some(env_id) = environment_id {
@@ -262,9 +260,8 @@ impl ErrorAnalyticsService {
                 let prev_total = prev_query.count(self.db.as_ref()).await? as i64;
 
                 // Get previous period error groups count
-                let prev_groups_sql = if let Some(_) = environment_id {
-                    format!(
-                        r#"
+                let prev_groups_sql = if environment_id.is_some() {
+                    r#"
                         SELECT COUNT(DISTINCT error_group_id) as count
                         FROM error_events
                         WHERE project_id = $1
@@ -272,17 +269,16 @@ impl ErrorAnalyticsService {
                             AND timestamp <= $3
                             AND environment_id = $4
                         "#
-                    )
+                    .to_string()
                 } else {
-                    format!(
-                        r#"
+                    r#"
                         SELECT COUNT(DISTINCT error_group_id) as count
                         FROM error_events
                         WHERE project_id = $1
                             AND timestamp >= $2
                             AND timestamp <= $3
                         "#
-                    )
+                    .to_string()
                 };
 
                 let prev_group_count_result = if let Some(env_id) = environment_id {
@@ -324,19 +320,17 @@ impl ErrorAnalyticsService {
             0.0
         };
 
-        // Calculate total requests and error rate from request logs
-        // Note: request_logs.started_at and finished_at are stored as strings in ISO format
-        // We use raw SQL for timestamp comparison to cast string to timestamptz
+        // Calculate total requests and error rate from proxy logs
         let total_requests_sql = if let Some(env_id) = environment_id {
             Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 r#"
                     SELECT COUNT(*) as count
-                    FROM request_logs
+                    FROM proxy_logs
                     WHERE project_id = $1
                         AND environment_id = $2
-                        AND started_at::timestamptz >= $3
-                        AND started_at::timestamptz <= $4
+                        AND timestamp >= $3
+                        AND timestamp <= $4
                 "#,
                 vec![
                     project_id.into(),
@@ -350,10 +344,10 @@ impl ErrorAnalyticsService {
                 DatabaseBackend::Postgres,
                 r#"
                     SELECT COUNT(*) as count
-                    FROM request_logs
+                    FROM proxy_logs
                     WHERE project_id = $1
-                        AND started_at::timestamptz >= $2
-                        AND started_at::timestamptz <= $3
+                        AND timestamp >= $2
+                        AND timestamp <= $3
                 "#,
                 vec![project_id.into(), start_time.into(), end_time.into()],
             )

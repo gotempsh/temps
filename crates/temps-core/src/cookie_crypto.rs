@@ -1,3 +1,8 @@
+// Note: Deprecation warnings from generic-array 0.14.x are expected
+// These will be resolved when aes-gcm upgrades to 0.11.0 (currently in RC)
+// which uses generic-array 1.x
+#![allow(deprecated)]
+
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     Aes256Gcm, Key, Nonce,
@@ -17,7 +22,6 @@ pub enum CryptoError {
     #[error("Invalid key: {0}")]
     InvalidKey(String),
 }
-
 
 // Convert CryptoError to Problem Details
 impl From<CryptoError> for crate::problemdetails::Problem {
@@ -53,25 +57,24 @@ impl CookieCrypto {
                 .map_err(|e| CryptoError::InvalidKey(format!("Invalid hex key: {}", e)))?
         } else {
             return Err(CryptoError::InvalidKey(
-                "Key must be exactly 32 bytes or 64 hex characters".to_string()
+                "Key must be exactly 32 bytes or 64 hex characters".to_string(),
             ));
         };
 
         if key_bytes.len() != 32 {
             return Err(CryptoError::InvalidKey(
-                "Key must be exactly 32 bytes".to_string()
+                "Key must be exactly 32 bytes".to_string(),
             ));
         }
 
-        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-        let cipher = Aes256Gcm::new(key);
+        // Use the new API that doesn't allocate - just use the reference
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
         Ok(Self { cipher })
     }
 
     /// Creates a new CookieCrypto from a raw 32-byte array (for backward compatibility)
     pub fn from_bytes(secret_key: &[u8; 32]) -> Self {
-        let key = Key::<Aes256Gcm>::from_slice(secret_key);
-        let cipher = Aes256Gcm::new(key);
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(secret_key));
         Self { cipher }
     }
 
@@ -86,7 +89,7 @@ impl CookieCrypto {
         // Combine nonce + ciphertext and encode as base64
         let mut combined = nonce.to_vec();
         combined.extend_from_slice(&ciphertext);
-        
+
         Ok(general_purpose::URL_SAFE_NO_PAD.encode(&combined))
     }
 
@@ -103,15 +106,13 @@ impl CookieCrypto {
 
         // Split nonce and ciphertext
         let (nonce_bytes, ciphertext) = combined.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
 
         let plaintext = self
             .cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
             .map_err(|e| CryptoError::DecryptionError(e.to_string()))?;
 
-        String::from_utf8(plaintext)
-            .map_err(|_| CryptoError::InvalidFormat)
+        String::from_utf8(plaintext).map_err(|_| CryptoError::InvalidFormat)
     }
 
     /// Encrypt a numeric ID (i32) for use in cookies
@@ -127,7 +128,6 @@ impl CookieCrypto {
             .map_err(|_| CryptoError::InvalidFormat)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -147,10 +147,10 @@ mod tests {
     fn test_encrypt_decrypt_string() {
         let crypto = get_test_crypto();
         let original = "test_value_123";
-        
+
         let encrypted = crypto.encrypt(original).unwrap();
         let decrypted = crypto.decrypt(&encrypted).unwrap();
-        
+
         assert_eq!(original, decrypted);
     }
 
@@ -158,10 +158,10 @@ mod tests {
     fn test_encrypt_decrypt_id() {
         let crypto = get_test_crypto();
         let original_id = 12345;
-        
+
         let encrypted = crypto.encrypt_id(original_id).unwrap();
         let decrypted_id = crypto.decrypt_id(&encrypted).unwrap();
-        
+
         assert_eq!(original_id, decrypted_id);
     }
 
@@ -189,12 +189,15 @@ mod tests {
         let short_key = "short";
         let result = CookieCrypto::new(short_key);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Key must be exactly 32 bytes"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Key must be exactly 32 bytes"));
     }
 
     #[test]
     fn test_new_with_invalid_hex() {
-        let invalid_hex = "invalid_hex_key_with_64_chars_but_not_valid_hex_encoding_at_allz";  // Exactly 64 chars
+        let invalid_hex = "invalid_hex_key_with_64_chars_but_not_valid_hex_encoding_at_allz"; // Exactly 64 chars
         let result = CookieCrypto::new(invalid_hex);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid hex key"));

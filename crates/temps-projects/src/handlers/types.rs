@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use temps_core::UtcDateTime;
+use temps_entities::deployment_config::DeploymentConfig;
 use utoipa::ToSchema;
 
 use crate::services::custom_domains::CustomDomainService;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
 use temps_core::AuditLogger;
+use temps_presets::preset_config_schema::PresetConfigSchema;
 
 pub struct AppState {
     pub project_service: Arc<ProjectService>,
@@ -134,6 +136,23 @@ pub struct CreateProjectRequest {
     pub directory: String,
     pub main_branch: String,
     pub preset: String,
+    /// Preset-specific configuration
+    ///
+    /// Different presets accept different configuration options:
+    /// - **Dockerfile preset**: Accepts `DockerfilePresetConfig` with `dockerfile_path` and `build_context`
+    /// - **Nixpacks preset**: Uses `nixpacks.toml` file for configuration (no params needed)
+    /// - **Static presets** (Vite, Next.js, etc.): Accept `StaticPresetConfig` with build commands and output dir
+    ///
+    /// Example for Dockerfile preset:
+    /// ```json
+    /// {
+    ///   "dockerfilePath": "docker/Dockerfile",
+    ///   "buildContext": "./api"
+    /// }
+    /// ```
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<PresetConfigSchema>)]
+    pub preset_config: Option<serde_json::Value>,
     pub output_dir: Option<String>,
     pub build_command: Option<String>,
     pub install_command: Option<String>,
@@ -150,6 +169,18 @@ pub struct CreateProjectRequest {
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
     pub is_on_demand: Option<bool>,
+    /// Port exposed by the container (fallback when image has no EXPOSE directive)
+    ///
+    /// Priority order for port resolution:
+    /// 1. Image EXPOSE directive (auto-detected from built image)
+    /// 2. Environment-level exposed_port (overrides this value per environment)
+    /// 3. This project-level exposed_port (fallback)
+    /// 4. Default: 3000
+    ///
+    /// Only set this if your image doesn't use EXPOSE directive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 8080)]
+    pub exposed_port: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -157,7 +188,8 @@ pub struct TriggerPipelinePayload {
     pub branch: Option<String>,
     pub tag: Option<String>,
     pub commit: Option<String>,
-    pub environment_id: i32,
+    /// Optional environment ID - if not provided, will use the project's preview environment
+    pub environment_id: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -208,14 +240,14 @@ pub struct ProjectResponse {
     pub preset: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
-    pub automatic_deploy: bool,
-    pub cpu_request: Option<i32>,
-    pub cpu_limit: Option<i32>,
-    pub memory_request: Option<i32>,
-    pub memory_limit: Option<i32>,
-    pub performance_metrics_enabled: bool,
     pub last_deployment: Option<i64>,
     pub git_provider_connection_id: Option<i32>,
+    /// Deployment configuration (resources, autoscaling, features)
+    pub deployment_config: DeploymentConfig,
+    /// Attack mode - when enabled, requires CAPTCHA verification for all project environments
+    pub attack_mode: bool,
+    /// Enable automatic preview environment creation for each branch
+    pub enable_preview_environments: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -238,14 +270,58 @@ impl ProjectResponse {
             preset: project.preset,
             created_at: project.created_at.timestamp_millis(),
             updated_at: project.updated_at.timestamp_millis(),
-            automatic_deploy: project.automatic_deploy,
-            cpu_request: project.cpu_request,
-            cpu_limit: project.cpu_limit,
-            memory_request: project.memory_request,
-            memory_limit: project.memory_limit,
-            performance_metrics_enabled: project.performance_metrics_enabled,
             last_deployment: project.last_deployment.map(|d| d.timestamp_millis()),
             git_provider_connection_id: project.git_provider_connection_id,
+            attack_mode: project.attack_mode,
+            enable_preview_environments: project.enable_preview_environments,
+            deployment_config: DeploymentConfig {
+                cpu_request: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.cpu_request)
+                    .unwrap_or(None),
+                cpu_limit: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.cpu_limit)
+                    .unwrap_or(None),
+                memory_request: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.memory_request)
+                    .unwrap_or(None),
+                memory_limit: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.memory_limit)
+                    .unwrap_or(None),
+                exposed_port: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.exposed_port)
+                    .unwrap_or(None), // Not exposed in old Project struct
+                automatic_deploy: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.automatic_deploy)
+                    .unwrap_or(false),
+                performance_metrics_enabled: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.performance_metrics_enabled)
+                    .unwrap_or(false),
+                session_recording_enabled: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.session_recording_enabled)
+                    .unwrap_or(false), // Default for old projects
+                replicas: project
+                    .deployment_config
+                    .clone()
+                    .map(|c| c.replicas)
+                    .unwrap_or(1), // Default
+                security: project.deployment_config.clone().and_then(|c| c.security),
+            },
         }
     }
 }
@@ -344,6 +420,21 @@ pub struct UpdateDeploymentSettingsRequest {
 }
 
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateDeploymentConfigRequest {
+    pub cpu_request: Option<i32>,
+    pub cpu_limit: Option<i32>,
+    pub memory_request: Option<i32>,
+    pub memory_limit: Option<i32>,
+    pub exposed_port: Option<i32>,
+    pub automatic_deploy: Option<bool>,
+    pub performance_metrics_enabled: Option<bool>,
+    pub session_recording_enabled: Option<bool>,
+    pub replicas: Option<i32>,
+    pub security: Option<temps_entities::deployment_config::SecurityConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone, ToSchema)]
 pub struct UpdateProjectSettingsRequest {
     pub slug: Option<String>,
     pub git_provider_connection_id: Option<i32>,
@@ -352,6 +443,10 @@ pub struct UpdateProjectSettingsRequest {
     pub repo_name: Option<String>,
     pub preset: Option<String>,
     pub directory: Option<String>,
+    /// Enable/disable attack mode (CAPTCHA protection) for all project environments
+    pub attack_mode: Option<bool>,
+    /// Enable automatic preview environment creation for each branch
+    pub enable_preview_environments: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -642,6 +737,16 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
             CustomDomainError::DuplicateDomain(msg) => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Duplicate Domain")
                 .with_detail(msg),
+            CustomDomainError::CircularRedirect(msg) => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Circular Redirect")
+                    .with_detail(msg)
+            }
+            CustomDomainError::InvalidRedirectUrl(msg) => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Redirect URL")
+                    .with_detail(msg)
+            }
             CustomDomainError::Internal(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
@@ -654,5 +759,29 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ListCustomDomainsResponse {
     pub domains: Vec<CustomDomainResponse>,
+    pub total: usize,
+}
+
+// Preset-related types
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct PresetResponse {
+    /// Unique identifier slug for the preset
+    pub slug: String,
+    /// Display name/label for the preset
+    pub label: String,
+    /// Icon URL for the preset
+    pub icon_url: String,
+    /// Project type (server or static)
+    pub project_type: String,
+    /// Description of what this preset does
+    pub description: String,
+    /// Default port the application listens on (None for static sites)
+    #[schema(example = 3000)]
+    pub default_port: Option<u16>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct ListPresetsResponse {
+    pub presets: Vec<PresetResponse>,
     pub total: usize,
 }

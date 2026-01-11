@@ -93,16 +93,13 @@ impl From<GitProviderManagerError> for Problem {
     }
 }
 
-
 impl From<GitProviderError> for Problem {
     fn from(error: GitProviderError) -> Self {
         match error {
-            GitProviderError::DatabaseError(e) => {
-                problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_type("https://docs.temps.sh/errors/database_error")
-                    .with_title("Database Error")
-                    .with_detail(e.to_string())
-            }
+            GitProviderError::DatabaseError(e) => problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_type("https://docs.temps.sh/errors/database_error")
+                .with_title("Database Error")
+                .with_detail(e.to_string()),
             GitProviderError::ProviderNotFound(msg) => problem_new(StatusCode::NOT_FOUND)
                 .with_type("https://docs.temps.sh/errors/provider_not_found")
                 .with_title("Provider Not Found")
@@ -138,8 +135,6 @@ impl From<GitProviderError> for Problem {
         }
     }
 }
-
-
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateProviderRequest {
@@ -206,6 +201,37 @@ pub struct ProviderDeletionCheckResponse {
     pub message: String,
 }
 
+// Helper function to convert preset cache to Vec<ProjectPresetResponse>
+// This flattens all presets from all branches into a single list
+fn convert_preset_json(cache: Option<sea_orm::JsonValue>) -> Option<Vec<ProjectPresetResponse>> {
+    cache.and_then(|json| {
+        // Deserialize Json to RepositoryPresetCache
+        let cache: temps_entities::repositories::RepositoryPresetCache =
+            serde_json::from_value(json).ok()?;
+
+        // Flatten all presets from all branches into a single list
+        Some(
+            cache
+                .branches
+                .into_values()
+                .flat_map(|branch_data| {
+                    branch_data
+                        .presets
+                        .into_iter()
+                        .map(|p| ProjectPresetResponse {
+                            path: p.path,
+                            preset: p.preset,
+                            preset_label: p.preset_label,
+                            exposed_port: p.exposed_port.map(|port| port as i32),
+                            icon_url: p.icon_url,
+                            project_type: p.project_type,
+                        })
+                })
+                .collect(),
+        )
+    })
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ConnectionResponse {
     pub id: i32,
@@ -218,7 +244,7 @@ pub struct ConnectionResponse {
     pub is_expired: bool,
     pub syncing: bool,
     #[schema(value_type = Option<String>, format = DateTime)]
-    pub last_synced_at: Option<UtcDateTime>,    
+    pub last_synced_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = DateTime)]
     pub created_at: UtcDateTime,
     #[schema(value_type = String, format = DateTime)]
@@ -241,7 +267,11 @@ pub struct RepositoryResponse {
     pub updated_at: UtcDateTime,
     #[schema(value_type = String, format = DateTime)]
     pub pushed_at: UtcDateTime,
-    pub preset: Option<String>,
+    pub preset: Option<Vec<ProjectPresetResponse>>,
+    /// HTTPS clone URL (e.g., https://github.com/owner/repo.git)
+    pub clone_url: Option<String>,
+    /// SSH clone URL (e.g., git@github.com:owner/repo.git)
+    pub ssh_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -259,10 +289,17 @@ pub struct RepositorySyncResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectPresetResponse {
     pub path: String,
     pub preset: String,
     pub preset_label: String,
+    /// Default exposed port for this preset (e.g., 3000 for Next.js, 8000 for FastAPI)
+    pub exposed_port: Option<i32>,
+    /// Icon URL for the preset
+    pub icon_url: Option<String>,
+    /// Project type category (e.g., "frontend", "backend", "fullstack")
+    pub project_type: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -270,8 +307,7 @@ pub struct RepositoryPresetResponse {
     pub repository_id: i32,
     pub owner: String,
     pub name: String,
-    pub root_preset: Option<String>,
-    pub projects: Vec<ProjectPresetResponse>,
+    pub presets: Vec<ProjectPresetResponse>,
     #[schema(value_type = String, format = DateTime)]
     pub calculated_at: UtcDateTime,
 }
@@ -610,7 +646,9 @@ pub async fn sync_repositories(
             created_at: r.created_at,
             updated_at: r.updated_at,
             pushed_at: r.pushed_at,
-            preset: r.preset.clone(),
+            preset: convert_preset_json(r.preset.clone()),
+            clone_url: r.clone_url.clone(),
+            ssh_url: r.ssh_url.clone(),
         })
         .collect();
 
@@ -731,7 +769,9 @@ pub async fn list_repositories_by_connection(
             created_at: r.created_at,
             updated_at: r.updated_at,
             pushed_at: r.pushed_at,
-            preset: r.preset.clone(),
+            preset: convert_preset_json(r.preset.clone()),
+            clone_url: r.clone_url,
+            ssh_url: r.ssh_url,
         })
         .collect();
 
@@ -789,7 +829,9 @@ pub async fn list_repositories_by_provider(
             created_at: r.created_at,
             updated_at: r.updated_at,
             pushed_at: r.pushed_at,
-            preset: r.preset.clone(),
+            preset: convert_preset_json(r.preset.clone()),
+            clone_url: r.clone_url,
+            ssh_url: r.ssh_url,
         })
         .collect();
     Ok(Json(response))
@@ -797,7 +839,7 @@ pub async fn list_repositories_by_provider(
 
 /// List synced repositories with advanced filtering
 ///
-/// Lists repositories that have been synced to the database with comprehensive filtering options.
+/// Lists repositories that have been synced to the database with filtering options.
 /// This provides fast access to repository metadata with filtering by connection, search, and other criteria.
 #[utoipa::path(
     get,
@@ -901,7 +943,9 @@ pub async fn list_synced_repositories(
             created_at: r.created_at,
             updated_at: r.updated_at,
             pushed_at: r.pushed_at,
-            preset: r.preset.clone(),
+            preset: convert_preset_json(r.preset.clone()),
+            clone_url: r.clone_url,
+            ssh_url: r.ssh_url,
         })
         .collect();
 
@@ -966,14 +1010,16 @@ pub async fn get_repository_preset_by_name(
             repository_id: preset_result.repository_id,
             owner: preset_result.owner,
             name: preset_result.name,
-            root_preset: preset_result.root_preset,
-            projects: preset_result
-                .projects
+            presets: preset_result
+                .presets
                 .into_iter()
                 .map(|p| ProjectPresetResponse {
                     path: p.path,
                     preset: p.preset,
                     preset_label: p.preset_label,
+                    exposed_port: p.exposed_port.map(|port| port as i32),
+                    icon_url: p.icon_url,
+                    project_type: p.project_type,
                 })
                 .collect(),
             calculated_at: preset_result.calculated_at,
@@ -1055,7 +1101,9 @@ pub async fn get_repository_by_name(
             created_at: repository.created_at,
             updated_at: repository.updated_at,
             pushed_at: repository.pushed_at,
-            preset: repository.preset,
+            preset: convert_preset_json(repository.preset),
+            clone_url: repository.clone_url,
+            ssh_url: repository.ssh_url,
         }),
     ))
 }
@@ -1119,7 +1167,9 @@ pub async fn get_all_repositories_by_name(
             created_at: repository.created_at,
             updated_at: repository.updated_at,
             pushed_at: repository.pushed_at,
-            preset: repository.preset,
+            preset: convert_preset_json(repository.preset),
+            clone_url: repository.clone_url,
+            ssh_url: repository.ssh_url,
         })
         .collect();
 
@@ -1348,9 +1398,15 @@ pub async fn handle_git_provider_oauth_callback(
             format!("{}://{}/api", scheme, host)
         });
 
+    let user = auth.require_user().map_err(|msg| {
+        temps_core::problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("User Required")
+            .with_detail(msg)
+    })?;
+
     let connection = state
         .git_provider_manager
-        .handle_oauth_callback(provider_id, code, oauth_state, auth.user.id, host)
+        .handle_oauth_callback(provider_id, code, oauth_state, user.id, host)
         .await?;
 
     // Redirect to success page or dashboard
@@ -1526,7 +1582,7 @@ pub async fn create_github_pat_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersCreate);
 
-    let user_id = auth.user.id;
+    let user_id = auth.user_id();
 
     let provider = state
         .git_provider_manager
@@ -1572,7 +1628,7 @@ pub async fn create_gitlab_pat_provider(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersCreate);
 
-    let user_id = auth.user.id;
+    let user_id = auth.user_id();
 
     let provider = state
         .git_provider_manager
@@ -1693,14 +1749,16 @@ pub async fn get_repository_preset_live(
             repository_id: preset_result.repository_id,
             owner: preset_result.owner,
             name: preset_result.name,
-            root_preset: preset_result.root_preset,
-            projects: preset_result
-                .projects
+            presets: preset_result
+                .presets
                 .into_iter()
                 .map(|p| ProjectPresetResponse {
                     path: p.path,
                     preset: p.preset,
                     preset_label: p.preset_label,
+                    exposed_port: p.exposed_port.map(|port| port as i32),
+                    icon_url: p.icon_url,
+                    project_type: p.project_type,
                 })
                 .collect(),
             calculated_at: preset_result.calculated_at,

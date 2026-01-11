@@ -17,13 +17,13 @@
 /// ```
 use crate::context::AuthContext;
 use crate::permissions::Permission;
-use temps_core::error_builder::ErrorBuilder;
 use axum::{
     extract::FromRequestParts,
     http::{request::Parts, StatusCode},
     response::IntoResponse,
 };
 use std::marker::PhantomData;
+use temps_core::error_builder::ErrorBuilder;
 
 /// Marker trait for permission requirements
 pub trait PermissionRequirement: Send + Sync + 'static {
@@ -77,7 +77,7 @@ where
                 .title("Insufficient Permissions")
                 .detail(format!(
                     "This operation requires the {} permission",
-                    P::PERMISSION.to_string()
+                    P::PERMISSION
                 ))
                 .value("required_permission", P::PERMISSION.to_string())
                 .value("user_role", context.effective_role.to_string())

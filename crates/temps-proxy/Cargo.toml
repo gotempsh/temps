@@ -8,6 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-analytics = { path = "../temps-analytics" }
 temps-audit = { path = "../temps-audit" }
 temps-auth = { path = "../temps-auth" }
 temps-config = { path = "../temps-config" }
@@ -35,6 +36,8 @@ pingora-load-balancing = "0.6.0"
 pingora-proxy = "0.6.0"
 pingora-openssl = "0.6.0"
 rand = { workspace = true }
+hex = "0.4"
+sha2 = "0.10"
 serde_json = { workspace = true }
 uuid = { workspace = true }
 mime_guess = "2.0"
@@ -62,3 +65,4 @@ http-body-util = { workspace = true }
 tower = "0.4"
 anyhow = "1.0"
 lazy_static = "1.4"
+temps-presets = { path = "../temps-presets" }

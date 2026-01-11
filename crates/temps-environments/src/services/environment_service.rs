@@ -1,16 +1,15 @@
-use tracing::{info, warn};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DbErr, EntityTrait,
-    QueryFilter, QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder, Set,
+    TransactionTrait,
 };
 use serde::Serialize;
-use serde_json::json;
 use slug::slugify;
 use std::sync::Arc;
 use temps_core::problemdetails::Problem;
-use temps_core::{Job, JobQueue, EnvironmentCreatedJob};
+use temps_core::{EnvironmentCreatedJob, Job, JobQueue};
 use temps_entities::{environment_domains, environments, projects};
 use thiserror::Error;
+use tracing::{info, warn};
 
 #[derive(Error, Debug)]
 pub enum EnvironmentError {
@@ -115,6 +114,14 @@ impl EnvironmentService {
         format!("{}://{}.{}", protocol, environment_slug, base_domain)
     }
 
+    /// Compute the full FQDN for an environment (without protocol)
+    pub async fn compute_environment_fqdn(&self, environment_slug: &str) -> String {
+        let settings = self.config_service.get_settings().await.unwrap_or_default();
+        let base_domain = settings.preview_domain.clone();
+        format!("{}.{}", environment_slug, base_domain)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_environment(
         &self,
         project_id: i32,
@@ -125,8 +132,6 @@ impl EnvironmentService {
         memory_limit: Option<i32>,
         branch: String,
     ) -> anyhow::Result<environments::Model> {
-        use serde_json::json;
-
         // Start a transaction
         let txn = self.db.begin().await?;
 
@@ -148,16 +153,23 @@ impl EnvironmentService {
             slug: Set(env_slug.clone()),
             subdomain: Set(main_url.clone()),
             host: Set("".to_string()),
-            upstreams: Set(json!({})), // Fix: use serde_json::Value
+            upstreams: Set(temps_entities::upstream_config::UpstreamList::new()),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
             current_deployment_id: Set(None),
-            cpu_request: Set(cpu_request),
-            cpu_limit: Set(cpu_limit),
-            memory_request: Set(memory_request),
-            memory_limit: Set(memory_limit),
+            deployment_config: Set(Some(temps_entities::deployment_config::DeploymentConfig {
+                cpu_request,
+                cpu_limit,
+                memory_request,
+                memory_limit,
+                exposed_port: None,
+                automatic_deploy: false,
+                performance_metrics_enabled: false,
+                session_recording_enabled: false,
+                replicas: 1,
+                security: None,
+            })),
             branch: Set(Some(branch)),
-            replicas: Set(Some(1)),
             ..Default::default()
         };
 
@@ -190,7 +202,10 @@ impl EnvironmentService {
                     environment.id, e
                 );
             } else {
-                info!("Emitted EnvironmentCreated job for environment {}", environment.id);
+                info!(
+                    "Emitted EnvironmentCreated job for environment {}",
+                    environment.id
+                );
             }
         }
 
@@ -356,16 +371,17 @@ impl EnvironmentService {
             slug: Set(env_slug.clone()),
             subdomain: Set(main_url.clone()),
             host: Set("".to_string()),
-            upstreams: Set(json!({})),
+            upstreams: Set(temps_entities::upstream_config::UpstreamList::new()),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
             current_deployment_id: Set(None),
-            cpu_request: Set(None),
-            cpu_limit: Set(None),
-            memory_request: Set(None),
-            memory_limit: Set(None),
+            deployment_config: Set(replicas.map(|r| {
+                temps_entities::deployment_config::DeploymentConfig {
+                    replicas: r,
+                    ..Default::default()
+                }
+            })),
             branch: Set(Some(branch)),
-            replicas: Set(replicas.or(Some(1))),
             ..Default::default()
         };
 
@@ -411,13 +427,50 @@ impl EnvironmentService {
         let environment = self.get_environment(project_id_param, env_id).await?;
 
         // Update the environment with new settings
-        let mut active_model: environments::ActiveModel = environment.into();
-        active_model.cpu_request = Set(settings.cpu_request);
-        active_model.cpu_limit = Set(settings.cpu_limit);
-        active_model.memory_request = Set(settings.memory_request);
-        active_model.memory_limit = Set(settings.memory_limit);
+        let mut active_model: environments::ActiveModel = environment.clone().into();
+
+        // Update deployment config with new resource settings
+        let mut deployment_config = environment.deployment_config.clone().unwrap_or_default();
+
+        // Update only the fields that are provided
+        if settings.cpu_request.is_some() {
+            deployment_config.cpu_request = settings.cpu_request;
+        }
+        if settings.cpu_limit.is_some() {
+            deployment_config.cpu_limit = settings.cpu_limit;
+        }
+        if settings.memory_request.is_some() {
+            deployment_config.memory_request = settings.memory_request;
+        }
+        if settings.memory_limit.is_some() {
+            deployment_config.memory_limit = settings.memory_limit;
+        }
+        if settings.exposed_port.is_some() {
+            deployment_config.exposed_port = settings.exposed_port;
+        }
+        if let Some(replicas) = settings.replicas {
+            deployment_config.replicas = replicas;
+        }
+        if let Some(automatic_deploy) = settings.automatic_deploy {
+            deployment_config.automatic_deploy = automatic_deploy;
+        }
+        if let Some(performance_metrics_enabled) = settings.performance_metrics_enabled {
+            deployment_config.performance_metrics_enabled = performance_metrics_enabled;
+        }
+        if let Some(session_recording_enabled) = settings.session_recording_enabled {
+            deployment_config.session_recording_enabled = session_recording_enabled;
+        }
+        if let Some(security) = settings.security {
+            deployment_config.security = Some(security);
+        }
+
+        // Validate the deployment config
+        deployment_config.validate().map_err(|e| {
+            EnvironmentError::InvalidInput(format!("Invalid deployment config: {}", e))
+        })?;
+
+        active_model.deployment_config = Set(Some(deployment_config));
         active_model.branch = Set(settings.branch);
-        active_model.replicas = Set(settings.replicas);
         active_model.updated_at = Set(chrono::Utc::now());
 
         let updated_environment = active_model
@@ -433,27 +486,30 @@ impl EnvironmentService {
         project_id: i32,
         environment_id: i32,
     ) -> Result<Vec<environment_domains::Model>, EnvironmentError> {
-        // First verify that the environment belongs to the project
-        let environment_exists = environments::Entity::find()
+        // First verify that the environment belongs to the project and get it
+        let environment = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::Id.eq(environment_id))
             .one(self.db.as_ref())
             .await?;
 
-        if environment_exists.is_none() {
-            return Err(EnvironmentError::NotFound(format!(
-                ">>> Environment {} not found",
-                environment_id
-            )));
-        }
+        let env = environment.ok_or_else(|| {
+            EnvironmentError::NotFound(format!(">>> Environment {} not found", environment_id))
+        })?;
 
         // Get all domains for this environment
-        let domains = environment_domains::Entity::find()
+        let all_domains = environment_domains::Entity::find()
             .filter(environment_domains::Column::EnvironmentId.eq(environment_id))
             .all(self.db.as_ref())
             .await?;
 
-        Ok(domains)
+        // Filter out the default environment subdomain (which is auto-created and can't be removed)
+        let custom_domains: Vec<environment_domains::Model> = all_domains
+            .into_iter()
+            .filter(|d| d.domain != env.subdomain)
+            .collect();
+
+        Ok(custom_domains)
     }
 
     pub async fn add_environment_domain(
@@ -518,6 +574,48 @@ impl EnvironmentService {
             "Environment {} not found",
             env_id
         )))
+    }
+
+    /// Delete an environment permanently
+    ///
+    /// Prevents deletion of:
+    /// - Production environments (name = "Production" case-insensitive)
+    ///
+    /// Note: Active deployments should be cancelled before calling this method
+    /// Warning: This permanently deletes the environment and related data
+    pub async fn delete_environment(
+        &self,
+        project_id: i32,
+        env_id: i32,
+    ) -> Result<(), EnvironmentError> {
+        // Get the environment
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::Id.eq(env_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                EnvironmentError::NotFound(format!("Environment {} not found", env_id))
+            })?;
+
+        // Prevent deletion of production environments
+        if environment.name.to_lowercase() == "production" {
+            return Err(EnvironmentError::InvalidInput(
+                "Cannot delete production environment".to_string(),
+            ));
+        }
+
+        // Delete the environment permanently
+        environments::Entity::delete_by_id(env_id)
+            .exec(self.db.as_ref())
+            .await?;
+
+        info!(
+            "Permanently deleted environment {} (slug: {}) in project {}",
+            env_id, environment.slug, project_id
+        );
+
+        Ok(())
     }
 }
 

@@ -13,7 +13,10 @@ use temps_core::plugin::{
     MiddlewareCondition, MiddlewarePriority, PluginContext, PluginError, TempsMiddleware,
 };
 
-use crate::{apikey_service::ApiKeyService, auth_service::AuthService, user_service::UserService};
+use crate::{
+    apikey_service::ApiKeyService, auth_service::AuthService,
+    deployment_token_service::DeploymentTokenValidationService, user_service::UserService,
+};
 use temps_core::CookieCrypto;
 
 /// Authentication middleware that implements TempsMiddleware
@@ -23,6 +26,7 @@ pub struct AuthMiddleware {
     user_service: Arc<UserService>,
     cookie_crypto: Arc<CookieCrypto>,
     db: Arc<sea_orm::DatabaseConnection>,
+    deployment_token_service: DeploymentTokenValidationService,
 }
 
 impl AuthMiddleware {
@@ -33,12 +37,14 @@ impl AuthMiddleware {
         cookie_crypto: Arc<CookieCrypto>,
         db: Arc<sea_orm::DatabaseConnection>,
     ) -> Self {
+        let deployment_token_service = DeploymentTokenValidationService::new(db.clone());
         Self {
             api_key_service,
             auth_service,
             user_service,
             cookie_crypto,
             db,
+            deployment_token_service,
         }
     }
 }
@@ -117,6 +123,21 @@ impl AuthMiddleware {
                         } else {
                             None
                         }
+                    } else if token.starts_with("dt_") {
+                        // Try deployment token (they have a specific format: dt_...)
+                        if let Ok(validated) =
+                            self.deployment_token_service.validate_token(token).await
+                        {
+                            Some(crate::context::AuthContext::new_deployment_token(
+                                validated.project_id,
+                                validated.environment_id,
+                                validated.token_id,
+                                validated.name,
+                                validated.permissions,
+                            ))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -143,6 +164,7 @@ impl AuthMiddleware {
                         crate::permissions::Role::User
                     };
                     user = Some(session_user.clone());
+
                     Some(crate::context::AuthContext::new_session(
                         session_user,
                         user_role,
@@ -174,7 +196,7 @@ impl AuthMiddleware {
             .headers()
             .get("x-forwarded-proto")
             .and_then(|h| h.to_str().ok())
-            .map_or(false, |s| s == "https")
+            == Some("https")
         {
             "https"
         } else {
@@ -236,6 +258,7 @@ impl AuthMiddleware {
             }
         }
 
+        // Run the next middleware/handler
         Ok(next.run(req).await)
     }
 
@@ -247,7 +270,8 @@ impl AuthMiddleware {
     ) -> Option<String> {
         use cookie::Cookie;
 
-        if let Some(cookie_header) = headers.get("cookie") {
+        // Iterate through ALL cookie headers (there can be multiple)
+        for cookie_header in headers.get_all("cookie") {
             if let Ok(cookie_str) = cookie_header.to_str() {
                 // Parse cookies and find the "session" cookie for user authentication
                 for cookie in Cookie::split_parse(cookie_str).filter_map(Result::ok) {

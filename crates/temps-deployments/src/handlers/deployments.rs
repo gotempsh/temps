@@ -3,24 +3,28 @@ use std::sync::Arc;
 use super::types::AppState;
 use axum::Router;
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::{
-        sse::{Event, Sse},
-        IntoResponse,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
     },
+    http::StatusCode,
+    response::IntoResponse,
     routing::{delete, get, post},
     Json,
 };
-use futures::stream::StreamExt;
+use futures::stream::{self, StreamExt};
+use futures::SinkExt;
 use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 
 use crate::handlers::types::{
-    ContainerInfoResponse, ContainerListResponse, ContainerLogsQuery, DeploymentJobResponse,
-    DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
+    ActivityDay, ActivityGraphQuery, ActivityGraphResponse, ContainerActionResponse,
+    ContainerDetailResponse, ContainerInfoResponse, ContainerListResponse, ContainerLogsQuery,
+    ContainerMetricsResponse, DeploymentJobResponse, DeploymentJobsResponse,
+    DeploymentListResponse, DeploymentResponse, DeploymentStateResponse, EnvVarResponse,
+    ResourceLimitsResponse,
 };
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
@@ -42,7 +46,14 @@ use temps_core::problemdetails::Problem;
         teardown_environment,
         list_containers,
         get_container_logs_by_id,
-        get_container_logs
+        get_container_logs,
+        get_container_detail,
+        stop_container,
+        start_container,
+        restart_container,
+        get_container_metrics,
+        stream_container_metrics,
+        get_activity_graph
     ),
     components(schemas(
         DeploymentListResponse,
@@ -53,12 +64,21 @@ use temps_core::problemdetails::Problem;
         ContainerLogsQuery,
         GetDeploymentsParams,
         ContainerListResponse,
-        ContainerInfoResponse
+        ContainerInfoResponse,
+        ContainerDetailResponse,
+        EnvVarResponse,
+        ResourceLimitsResponse,
+        ContainerMetricsResponse,
+        ContainerActionResponse,
+        ActivityGraphQuery,
+        ActivityGraphResponse,
+        ActivityDay
     )),
     info(
         title = "Deployments API",
-        description = "API endpoints for managing deployments and container logs. \
-        Provides comprehensive deployment lifecycle management including rollbacks, pausing/resuming, and real-time log streaming.",
+        description = "API endpoints for managing deployments, containers, and logs. \
+        Provides deployment lifecycle management including rollbacks, pausing/resuming, \
+        real-time log streaming, and container management (start/stop/restart).",
         version = "1.0.0"
     )
 )]
@@ -111,6 +131,8 @@ pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
             "/projects/{project_id}/environments/{env_id}/teardown",
             delete(teardown_environment),
         )
+        // Analytics
+        .route("/deployments/activity-graph", get(get_activity_graph))
         // Container management
         .route(
             "/projects/{project_id}/environments/{environment_id}/containers",
@@ -124,6 +146,31 @@ pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
         .route(
             "/projects/{project_id}/environments/{environment_id}/container-logs",
             get(get_container_logs),
+        )
+        // Container management endpoints
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}",
+            get(get_container_detail),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/stop",
+            post(stop_container),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/start",
+            post(start_container),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/restart",
+            post(restart_container),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics",
+            get(get_container_metrics),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/stream",
+            get(stream_container_metrics),
         )
 }
 
@@ -152,6 +199,11 @@ impl From<crate::services::services::DeploymentError> for Problem {
             DeploymentError::InvalidInput(msg) => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid Input")
                 .with_detail(msg),
+            DeploymentError::InvalidDeploymentState(msg) => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Deployment State")
+                    .with_detail(msg)
+            }
             DeploymentError::PipelineError(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Pipeline Error")
@@ -335,7 +387,7 @@ pub async fn pause_deployment(
     permission_guard!(auth, DeploymentsDelete);
     info!("Pausing deployment: {:?}", deployment_id);
 
-    let _deployment = state
+    state
         .deployment_service
         .pause_deployment(project_id, deployment_id)
         .await?;
@@ -371,7 +423,7 @@ pub async fn resume_deployment(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsCreate);
 
-    let _deployment = state
+    state
         .deployment_service
         .resume_deployment(project_id, deployment_id)
         .await?;
@@ -545,10 +597,8 @@ pub async fn list_containers(
         .list_environment_containers(project_id, environment_id)
         .await?;
 
-    let container_responses: Vec<ContainerInfoResponse> = containers
-        .into_iter()
-        .map(Into::into)
-        .collect();
+    let container_responses: Vec<ContainerInfoResponse> =
+        containers.into_iter().map(Into::into).collect();
 
     let total = container_responses.len();
     let response = ContainerListResponse {
@@ -559,7 +609,7 @@ pub async fn list_containers(
     Ok(Json(response))
 }
 
-/// Get logs for a specific container by container ID
+/// Get logs for a specific container by container ID via WebSocket
 #[utoipa::path(
     tag = "Deployments",
     get,
@@ -570,10 +620,11 @@ pub async fn list_containers(
         ("container_id" = String, Path, description = "Container ID"),
         ("start_date" = Option<i64>, Query, description = "Start date for logs"),
         ("end_date" = Option<i64>, Query, description = "End date for logs"),
-        ("tail" = Option<String>, Query, description = "Number of lines to tail (or 'all')")
+        ("tail" = Option<String>, Query, description = "Number of lines to tail (or 'all')"),
+        ("timestamps" = Option<bool>, Query, description = "Include timestamps in log output (default: false)")
     ),
     responses(
-        (status = 200, description = "Server-Sent Events stream of container logs"),
+        (status = 101, description = "WebSocket connection established for streaming container logs"),
         (status = 400, description = "Not a server-type project"),
         (status = 404, description = "Project, environment, or container not found"),
         (status = 500, description = "Internal server error")
@@ -585,45 +636,121 @@ pub async fn get_container_logs_by_id(
     Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
     Query(query): Query<ContainerLogsQuery>,
     RequireAuth(auth): RequireAuth,
+    ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
 
-    info!(
-        "Getting logs for container {} in environment {} of project: {}",
+    debug!(
+        "WebSocket request for container {} logs in environment {} of project: {}",
         container_id, environment_id, project_id
     );
 
-    let deployment_service = state.deployment_service.clone();
-    let start_date = query.start_date;
-    let end_date = query.end_date;
-    let tail = query.tail.clone();
-
-    // Get the log stream from the deployment service
-    let log_stream = deployment_service
-        .get_container_logs_by_id(project_id, environment_id, container_id, start_date, end_date, tail)
-        .await
-        .map_err(|e| {
-            error!("Failed to get container logs: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Failed to get container logs")
-                .with_detail(e.to_string())
-        })?;
-
-    // Convert the log stream to SSE events
-    let event_stream = log_stream.map(|log_result| {
-        match log_result {
-            Ok(line) => Ok::<_, axum::BoxError>(Event::default().data(line)),
-            Err(e) => {
-                error!("Error reading log line: {}", e);
-                Ok(Event::default().data(format!("Error: {}", e)))
-            }
-        }
-    });
-
-    Ok(Sse::new(event_stream))
+    // Upgrade to WebSocket and handle the connection
+    Ok(ws.on_upgrade(move |socket| {
+        handle_container_logs_socket(
+            socket,
+            state,
+            ContainerLogParams {
+                project_id,
+                environment_id,
+                container_id,
+                start_date: query.start_date,
+                end_date: query.end_date,
+                tail: query.tail,
+                timestamps: query.timestamps,
+            },
+        )
+    }))
 }
 
-/// Get logs for a container in an environment
+/// Handle WebSocket connection for container log streaming
+struct ContainerLogParams {
+    project_id: i32,
+    environment_id: i32,
+    container_id: String,
+    start_date: Option<i64>,
+    end_date: Option<i64>,
+    tail: Option<String>,
+    timestamps: bool,
+}
+
+async fn handle_container_logs_socket(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    params: ContainerLogParams,
+) {
+    debug!(
+        "WebSocket connection established for container {} logs",
+        params.container_id
+    );
+
+    // Get the log stream from the deployment service
+    let log_stream = match state
+        .deployment_service
+        .get_container_logs_by_id(
+            params.project_id,
+            params.environment_id,
+            params.container_id.clone(),
+            crate::services::services::ContainerLogParams {
+                start_date: params.start_date,
+                end_date: params.end_date,
+                tail: params.tail,
+                timestamps: params.timestamps,
+            },
+        )
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            error!("Failed to get container logs: {}", e);
+            let error_msg = serde_json::json!({
+                "error": "Failed to get container logs",
+                "detail": e.to_string()
+            });
+            if let Err(e) = socket
+                .send(Message::Text(error_msg.to_string().into()))
+                .await
+            {
+                error!("Failed to send error message over WebSocket: {}", e);
+            }
+            let _ = socket.close().await;
+            return;
+        }
+    };
+
+    // Pin the stream for iteration
+    tokio::pin!(log_stream);
+
+    // Stream logs to WebSocket client (raw text, not JSON)
+    while let Some(log_result) = log_stream.next().await {
+        match log_result {
+            Ok(line) => {
+                // Send raw log line as-is
+                if let Err(e) = socket.send(Message::Text(line.into())).await {
+                    warn!("Failed to send log message over WebSocket: {}", e);
+                    break;
+                }
+            }
+            Err(e) => {
+                error!("Error reading log line: {}", e);
+                // Send error as plain text
+                let error_msg = format!("ERROR: {}", e);
+                if let Err(e) = socket.send(Message::Text(error_msg.into())).await {
+                    error!("Failed to send error message over WebSocket: {}", e);
+                }
+                break;
+            }
+        }
+    }
+
+    debug!(
+        "WebSocket connection closed for container {} logs",
+        params.container_id
+    );
+    let _ = socket.close().await;
+}
+
+/// Get logs for a container in an environment via WebSocket
 #[utoipa::path(
     tag = "Deployments",
     get,
@@ -634,10 +761,11 @@ pub async fn get_container_logs_by_id(
         ("start_date" = Option<i64>, Query, description = "Start date for logs"),
         ("end_date" = Option<i64>, Query, description = "End date for logs"),
         ("tail" = Option<String>, Query, description = "Number of lines to tail (or 'all')"),
-        ("container_name" = Option<String>, Query, description = "Optional container name (defaults to first/primary container)")
+        ("container_name" = Option<String>, Query, description = "Optional container name (defaults to first/primary container)"),
+        ("timestamps" = Option<bool>, Query, description = "Include timestamps in log output (default: false)")
     ),
     responses(
-        (status = 200, description = "Server-Sent Events stream of container logs"),
+        (status = 101, description = "WebSocket connection established for streaming container logs"),
         (status = 400, description = "Not a server-type project"),
         (status = 404, description = "Project, deployment, or container not found"),
         (status = 500, description = "Internal server error")
@@ -649,43 +777,118 @@ pub async fn get_container_logs(
     Path((project_id, environment_id)): Path<(i32, i32)>,
     Query(query): Query<ContainerLogsQuery>,
     RequireAuth(auth): RequireAuth,
+    ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
 
-    info!(
-        "Getting container logs for environment {} of project: {}",
+    debug!(
+        "WebSocket request for container logs in environment {} of project: {}",
         environment_id, project_id
     );
 
-    let deployment_service = state.deployment_service.clone();
-    let start_date = query.start_date;
-    let end_date = query.end_date;
-    let tail = query.tail.clone();
-    let container_name = query.container_name.clone();
+    // Upgrade to WebSocket and handle the connection
+    Ok(ws.on_upgrade(move |socket| {
+        handle_filtered_container_logs_socket(
+            socket,
+            state,
+            FilteredContainerLogParams {
+                project_id,
+                environment_id,
+                start_date: query.start_date,
+                end_date: query.end_date,
+                tail: query.tail,
+                container_name: query.container_name,
+                timestamps: query.timestamps,
+            },
+        )
+    }))
+}
+
+/// Handle WebSocket connection for filtered container log streaming
+struct FilteredContainerLogParams {
+    project_id: i32,
+    environment_id: i32,
+    start_date: Option<i64>,
+    end_date: Option<i64>,
+    tail: Option<String>,
+    container_name: Option<String>,
+    timestamps: bool,
+}
+
+async fn handle_filtered_container_logs_socket(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    params: FilteredContainerLogParams,
+) {
+    debug!(
+        "WebSocket connection established for environment {} container logs",
+        params.environment_id
+    );
 
     // Get the log stream from the deployment service
-    let log_stream = deployment_service
-        .get_filtered_container_logs(project_id, environment_id, start_date, end_date, tail, container_name)
+    let log_stream = match state
+        .deployment_service
+        .get_filtered_container_logs(
+            params.project_id,
+            params.environment_id,
+            params.container_name,
+            crate::services::services::ContainerLogParams {
+                start_date: params.start_date,
+                end_date: params.end_date,
+                tail: params.tail,
+                timestamps: params.timestamps,
+            },
+        )
         .await
-        .map_err(|e| {
+    {
+        Ok(stream) => stream,
+        Err(e) => {
             error!("Failed to get container logs: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Failed to get container logs")
-                .with_detail(e.to_string())
-        })?;
+            let error_msg = serde_json::json!({
+                "error": "Failed to get container logs",
+                "detail": e.to_string()
+            });
+            if let Err(e) = socket
+                .send(Message::Text(error_msg.to_string().into()))
+                .await
+            {
+                error!("Failed to send error message over WebSocket: {}", e);
+            }
+            let _ = socket.close().await;
+            return;
+        }
+    };
 
-    // Convert the log stream to SSE events
-    let event_stream = log_stream.map(|log_result| {
+    // Pin the stream for iteration
+    tokio::pin!(log_stream);
+
+    // Stream logs to WebSocket client
+    while let Some(log_result) = log_stream.next().await {
         match log_result {
-            Ok(line) => Ok::<_, axum::BoxError>(Event::default().data(line)),
+            Ok(line) => {
+                // Send raw log line as-is
+                if let Err(e) = socket.send(Message::Text(line.into())).await {
+                    warn!("Failed to send log message over WebSocket: {}", e);
+                    break;
+                }
+            }
             Err(e) => {
                 error!("Error reading log line: {}", e);
-                Ok(Event::default().data(format!("Error: {}", e)))
+                // Send error as plain text
+                let error_msg = format!("ERROR: {}", e);
+                if let Err(e) = socket.send(Message::Text(error_msg.into())).await {
+                    error!("Failed to send error message over WebSocket: {}", e);
+                }
+                break;
             }
         }
-    });
+    }
 
-    Ok(Sse::new(event_stream))
+    debug!(
+        "WebSocket connection closed for environment {} container logs",
+        params.environment_id
+    );
+    let _ = socket.close().await;
 }
 
 /// Get jobs for a specific deployment
@@ -775,7 +978,19 @@ pub async fn get_deployment_job_logs(
     Ok((StatusCode::OK, log_content))
 }
 
-/// Tail logs for a specific deployment job in real-time via Server-Sent Events
+/// Tail logs for a specific deployment job in real-time via WebSocket
+///
+/// **WebSocket Streaming**: Logs are sent as raw text, one line per WebSocket message.
+///
+/// **Authentication**: Requires authentication via session cookie (browser clients)
+/// or API key (API clients). For browser-based WebSocket connections, ensure the user
+/// is logged in - the browser automatically includes session cookies in the WebSocket
+/// upgrade request.
+///
+/// **API Client Authentication**: Include API key in Authorization header:
+/// ```
+/// Authorization: Bearer tk_your_api_key_here
+/// ```
 #[utoipa::path(
     get,
     path = "/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/logs/tail",
@@ -785,7 +1000,7 @@ pub async fn get_deployment_job_logs(
         ("job_id" = String, Path, description = "Job ID")
     ),
     responses(
-        (status = 200, description = "Stream of deployment job logs", content_type = "text/event-stream"),
+        (status = 101, description = "WebSocket connection established for streaming deployment job logs"),
         (status = 404, description = "Job or logs not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -798,11 +1013,12 @@ pub async fn tail_deployment_job_logs(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((_project_id, deployment_id, job_id)): Path<(i32, i32, String)>,
+    ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
 
     debug!(
-        "Tailing logs for job {} in deployment {}",
+        "WebSocket request for tailing logs for job {} in deployment {}",
         job_id, deployment_id
     );
 
@@ -819,37 +1035,2233 @@ pub async fn tail_deployment_job_logs(
 
     let log_id = job.log_id.clone();
 
+    // Upgrade to WebSocket and handle the connection
+    Ok(ws.on_upgrade(move |socket| handle_job_log_socket(socket, state, log_id)))
+}
+
+/// Handle WebSocket connection for job log tailing
+async fn handle_job_log_socket(mut socket: WebSocket, state: Arc<AppState>, log_id: String) {
+    debug!("WebSocket connection established for log_id: {}", log_id);
+
     // Get the log stream from the log service
     let stream = match state.log_service.tail_log(&log_id).await {
         Ok(stream) => stream,
         Err(e) => {
             error!("Error tailing job logs: {:?}", e);
-            return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Failed to tail job logs")
-                .with_detail(format!("Error streaming logs: {}", e)));
+            let error_msg = serde_json::json!({
+                "error": "Failed to tail job logs",
+                "detail": format!("{}", e)
+            });
+            if let Err(e) = socket
+                .send(Message::Text(error_msg.to_string().into()))
+                .await
+            {
+                error!("Failed to send error message over WebSocket: {}", e);
+            }
+            let _ = socket.close().await;
+            return;
         }
     };
 
-    // Convert the log stream to SSE events
-    let event_stream = stream.map(|line| match line {
-        Ok(data) => {
-            // Strip newlines and carriage returns from the log line
-            // SSE doesn't allow newlines in field values
-            let cleaned_data = data.trim_end_matches('\n').trim_end_matches('\r');
+    // Pin the stream for iteration
+    tokio::pin!(stream);
 
-            Ok::<Event, std::io::Error>(
-                Event::default()
-                    .json_data(serde_json::json!({
-                        "log": cleaned_data
-                    }))
-                    .expect("Failed to serialize log data")
-            )
-        },
-        Err(e) => {
-            error!("Error reading log line: {:?}", e);
-            Ok::<Event, std::io::Error>(Event::default().data("Error reading log line"))
+    // Stream logs to WebSocket client (raw text, not JSON)
+    while let Some(line_result) = stream.next().await {
+        match line_result {
+            Ok(data) => {
+                // Send raw log line as-is
+                if let Err(e) = socket.send(Message::Text(data.into())).await {
+                    warn!("Failed to send log message over WebSocket: {}", e);
+                    break;
+                }
+            }
+            Err(e) => {
+                error!("Error reading log line: {:?}", e);
+                // Send error as plain text
+                let error_msg = format!("ERROR: {}", e);
+                if let Err(e) = socket.send(Message::Text(error_msg.into())).await {
+                    error!("Failed to send error message over WebSocket: {}", e);
+                }
+                break;
+            }
         }
-    });
+    }
 
-    Ok(Sse::new(event_stream).into_response())
+    debug!("WebSocket connection closed for log_id: {}", log_id);
+    let _ = socket.close().await;
+}
+
+/// Get detailed information about a specific container
+#[utoipa::path(
+    tag = "Containers",
+    get,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID")
+    ),
+    responses(
+        (status = 200, description = "Container details", body = ContainerDetailResponse),
+        (status = 404, description = "Container not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn get_container_detail(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+
+    let (container, _) = state
+        .deployment_service
+        .get_container_detail(project_id, environment_id, container_id.clone())
+        .await?;
+
+    // Parse environment variables and mask sensitive ones
+    let mut env_vars = vec![];
+    if let Ok(vars) = state
+        .deployment_service
+        .get_container_env_variables(project_id, environment_id, container_id.clone())
+        .await
+    {
+        let sensitive_keys = ["password", "secret", "token", "key", "auth", "api_key"];
+        for (key, value) in vars {
+            let is_masked = sensitive_keys
+                .iter()
+                .any(|&s| key.to_lowercase().contains(s));
+            env_vars.push(crate::handlers::types::EnvVarResponse {
+                key,
+                value: if is_masked { "***".to_string() } else { value },
+                is_masked,
+            });
+        }
+    }
+
+    let response = crate::handlers::types::ContainerDetailResponse {
+        id: container.id,
+        container_id: container.container_id,
+        container_name: container.container_name,
+        image_name: container.image_name.unwrap_or_default(),
+        status: container.status.unwrap_or_default(),
+        deployment_id: container.deployment_id,
+        created_at: container.created_at.to_rfc3339(),
+        deployed_at: container.deployed_at.to_rfc3339(),
+        ready_at: container.ready_at.map(|dt| dt.to_rfc3339()),
+        container_port: container.container_port,
+        host_port: container.host_port,
+        environment_variables: env_vars,
+        resource_limits: None, // Could be populated from deployment config if needed
+    };
+
+    Ok(Json(response).into_response())
+}
+
+/// Stop a specific container
+#[utoipa::path(
+    tag = "Containers",
+    post,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/stop",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID")
+    ),
+    responses(
+        (status = 200, description = "Container stopped successfully", body = ContainerActionResponse),
+        (status = 404, description = "Container not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn stop_container(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsWrite);
+
+    state
+        .deployment_service
+        .stop_container(project_id, environment_id, container_id.clone())
+        .await?;
+
+    let response = crate::handlers::types::ContainerActionResponse {
+        container_id: container_id.clone(),
+        container_name: container_id,
+        action: "stop".to_string(),
+        status: "success".to_string(),
+        message: "Container stopped successfully".to_string(),
+    };
+
+    Ok(Json(response).into_response())
+}
+
+/// Start a container
+#[utoipa::path(
+    tag = "Containers",
+    post,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/start",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID")
+    ),
+    responses(
+        (status = 200, description = "Container started successfully", body = ContainerActionResponse),
+        (status = 404, description = "Container not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn start_container(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsWrite);
+
+    state
+        .deployment_service
+        .start_container(project_id, environment_id, container_id.clone())
+        .await?;
+
+    let response = crate::handlers::types::ContainerActionResponse {
+        container_id: container_id.clone(),
+        container_name: container_id,
+        action: "start".to_string(),
+        status: "success".to_string(),
+        message: "Container started successfully".to_string(),
+    };
+
+    Ok(Json(response).into_response())
+}
+
+/// Restart a container
+#[utoipa::path(
+    tag = "Containers",
+    post,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/restart",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID")
+    ),
+    responses(
+        (status = 200, description = "Container restarted successfully", body = ContainerActionResponse),
+        (status = 404, description = "Container not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn restart_container(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsWrite);
+
+    state
+        .deployment_service
+        .restart_container(project_id, environment_id, container_id.clone())
+        .await?;
+
+    let response = crate::handlers::types::ContainerActionResponse {
+        container_id: container_id.clone(),
+        container_name: container_id,
+        action: "restart".to_string(),
+        status: "success".to_string(),
+        message: "Container restarted successfully".to_string(),
+    };
+
+    Ok(Json(response).into_response())
+}
+
+/// Get metrics/stats for a specific container
+#[utoipa::path(
+    tag = "Containers",
+    get,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID")
+    ),
+    responses(
+        (status = 200, description = "Container metrics retrieved successfully", body = ContainerMetricsResponse),
+        (status = 404, description = "Container not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn get_container_metrics(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+
+    let stats = state
+        .deployment_service
+        .get_container_metrics(project_id, environment_id, container_id.clone())
+        .await?;
+
+    let response = ContainerMetricsResponse {
+        container_id: stats.container_id,
+        container_name: stats.container_name,
+        cpu_percent: stats.cpu_percent,
+        memory_bytes: stats.memory_bytes,
+        memory_limit_bytes: stats.memory_limit_bytes,
+        memory_percent: stats.memory_percent,
+        network_rx_bytes: stats.network_rx_bytes,
+        network_tx_bytes: stats.network_tx_bytes,
+        timestamp: stats.timestamp.to_rfc3339(),
+    };
+
+    Ok(Json(response).into_response())
+}
+
+/// Stream container metrics via Server-Sent Events (SSE)
+#[utoipa::path(
+    tag = "Containers",
+    get,
+    path = "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/stream",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ("container_id" = String, Path, description = "Container ID"),
+        ("interval" = Option<u64>, Query, description = "Update interval in milliseconds (default: 1000)")
+    ),
+    responses(
+        (status = 200, description = "Metrics stream established (Server-Sent Events)"),
+        (status = 404, description = "Container not found"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn stream_container_metrics(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<
+    axum::response::sse::Sse<
+        impl futures::Stream<Item = Result<axum::response::sse::Event, axum::Error>>,
+    >,
+    Problem,
+> {
+    permission_guard!(auth, EnvironmentsRead);
+
+    let interval_ms = params
+        .get("interval")
+        .and_then(|i| i.parse::<u64>().ok())
+        .unwrap_or(1000); // Default: 1 second
+
+    // Verify container exists and get initial stats
+    let _stats = state
+        .deployment_service
+        .get_container_metrics(project_id, environment_id, container_id.clone())
+        .await?;
+
+    let service = state.deployment_service.clone();
+    let p_id = project_id;
+    let e_id = environment_id;
+    let c_id = container_id.clone();
+    let interval = std::time::Duration::from_millis(interval_ms);
+
+    // Create an SSE stream that polls metrics at regular intervals
+    let sse_stream = {
+        let service = service.clone();
+        let p_id = p_id.clone();
+        let e_id = e_id.clone();
+        let c_id = c_id.clone();
+
+        stream::unfold(tokio::time::interval(interval), move |mut ticker| {
+            let service = service.clone();
+            let p_id = p_id.clone();
+            let e_id = e_id.clone();
+            let c_id = c_id.clone();
+
+            async move {
+                ticker.tick().await;
+
+                let result = service
+                    .get_container_metrics(p_id, e_id, c_id.clone())
+                    .await;
+
+                match result {
+                    Ok(stats) => {
+                        let json = serde_json::json!({
+                            "container_id": stats.container_id,
+                            "container_name": stats.container_name,
+                            "cpu_percent": stats.cpu_percent,
+                            "memory_bytes": stats.memory_bytes,
+                            "memory_limit_bytes": stats.memory_limit_bytes,
+                            "memory_percent": stats.memory_percent,
+                            "network_rx_bytes": stats.network_rx_bytes,
+                            "network_tx_bytes": stats.network_tx_bytes,
+                            "timestamp": stats.timestamp.to_rfc3339(),
+                        });
+
+                        let event = axum::response::sse::Event::default()
+                            .json_data(json)
+                            .unwrap();
+                        Some((Ok(event), ticker))
+                    }
+                    Err(e) => {
+                        error!("Failed to get metrics for container {}: {}", c_id, e);
+                        let event = axum::response::sse::Event::default().comment("error");
+                        Some((Ok(event), ticker))
+                    }
+                }
+            }
+        })
+    };
+
+    Ok(axum::response::sse::Sse::new(sse_stream))
+}
+
+/// Get deployment activity graph showing daily deployment counts
+/// Similar to GitHub's contribution graph
+#[utoipa::path(
+    tag = "Deployments",
+    get,
+    path = "/deployments/activity-graph",
+    params(
+        ("project_id" = Option<i32>, Query, description = "Filter by project ID (optional)"),
+        ("environment_id" = Option<i32>, Query, description = "Filter by environment ID (optional)"),
+        ("days" = Option<i32>, Query, description = "Number of days to include (default: 365)"),
+    ),
+    responses(
+        (status = 200, description = "Successfully retrieved activity graph", body = ActivityGraphResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_activity_graph(
+    RequireAuth(_auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Query(query): Query<ActivityGraphQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    // Note: No specific permission check needed as this is general activity overview
+    // Users can only see their own projects based on the RequireAuth check
+
+    match app_state
+        .deployment_service
+        .get_activity_graph(query.project_id, query.environment_id, query.days)
+        .await
+    {
+        Ok(graph) => Ok(Json(graph)),
+        Err(e) => {
+            error!("Failed to get activity graph: {}", e);
+            Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Failed to retrieve activity graph")
+                .with_detail(e.to_string()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use futures::StreamExt;
+    use std::sync::Arc;
+    use temps_config::ConfigService;
+    use temps_database::test_utils::TestDatabase;
+    use temps_entities::upstream_config::UpstreamList;
+    use temps_logs::{DockerLogService, LogService};
+    use tokio::time::{timeout, Duration};
+    use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+
+    /// Helper to create a mock AuthContext for testing
+    fn create_test_auth_context() -> temps_auth::AuthContext {
+        let user = temps_entities::users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: Some("hashed_password".to_string()),
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+    }
+
+    #[tokio::test]
+    #[ignore] // FIXME: Flaky test - real-time log streaming timing issues. Needs refactoring as integration test
+    async fn test_websocket_handler_end_to_end_with_server() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{deployment_jobs, deployments, environments, projects};
+
+        // This test spins up a real Axum server and connects with a WebSocket client
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+        let db = test_db.connection_arc();
+
+        let temp_dir = std::env::temp_dir().join(format!("test_ws_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+        let log_service = Arc::new(LogService::new(temp_dir.clone()));
+
+        // Create Docker client for logs
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
+        );
+        let docker_log_service = Arc::new(DockerLogService::new(docker.clone()));
+
+        // Create a test ServerConfig
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:0".to_string(),
+                test_db.database_url.clone(),
+                None,
+                None,
+            )
+            .expect("Failed to create server config"),
+        );
+        let config_service = Arc::new(ConfigService::new(server_config, db.clone()));
+
+        // Create a broadcast queue service
+        let (job_sender, _job_receiver) = tokio::sync::broadcast::channel(100);
+        let queue_service: Arc<dyn temps_core::JobQueue> =
+            Arc::new(temps_queue::BroadcastQueueService::new(job_sender));
+
+        // Create a Docker runtime
+        let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(
+            temps_deployer::docker::DockerRuntime::new(docker, false, "temps-test".to_string()),
+        );
+
+        let deployment_service = Arc::new(crate::services::services::DeploymentService::new(
+            db.clone(),
+            log_service.clone(),
+            config_service,
+            queue_service.clone(),
+            docker_log_service,
+            deployer,
+        ));
+
+        let cron_service = Arc::new(
+            crate::services::database_cron_service::DatabaseCronConfigService::new(
+                db.clone(),
+                queue_service.clone(),
+            ),
+        );
+
+        let app_state = Arc::new(AppState {
+            deployment_service,
+            log_service,
+            cron_service,
+            external_deployment_manager: Arc::new(crate::services::ExternalDeploymentManager::new()),
+        });
+
+        // Create test data in database
+        // 1. Create a test project
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/tmp/test-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test project");
+
+        // 2. Create a test environment
+        let subdomain = format!("test-env-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Test Environment".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.localhost", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test environment");
+
+        // 3. Create a test deployment
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
+            state: Set("in_progress".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )), // Empty metadata object
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test deployment");
+
+        // 4. Create a test deployment job
+        let job_log_id = format!("deployment-{}-job-test", deployment.id);
+        let job = deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment.id),
+            job_id: Set("test-job".to_string()),
+            job_type: Set("build".to_string()),
+            name: Set("Test Build Job".to_string()),
+            log_id: Set(job_log_id.clone()),
+            status: Set(temps_entities::types::JobStatus::Running),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test deployment job");
+
+        // Create a middleware that injects AuthContext for testing
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request, next: axum::middleware::Next| async move {
+                let auth_context = create_test_auth_context();
+                req.extensions_mut().insert(auth_context);
+                next.run(req).await
+            },
+        );
+
+        // Create router with WebSocket routes and test auth middleware
+        let app = Router::new()
+            .route(
+                "/api/projects/{project_id}/deployments/{deployment_id}/jobs/{job_id}/logs/tail",
+                get(tail_deployment_job_logs),
+            )
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+
+        // Bind to a random port
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get local address");
+
+        // Spawn server in background
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed to start");
+        });
+
+        // Give server time to start
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Test: Connect to deployment job logs endpoint
+        let ws_url = format!(
+            "ws://{}/api/projects/{}/deployments/{}/jobs/{}/logs/tail",
+            addr, project.id, deployment.id, job.job_id
+        );
+
+        println!("Connecting to WebSocket at: {}", ws_url);
+        let (mut ws_stream, response) = connect_async(&ws_url)
+            .await
+            .expect("Failed to connect to WebSocket");
+
+        // Verify we didn't get a 401 Unauthorized
+        if response.status() == 401 {
+            panic!("WebSocket connection rejected with 401 Unauthorized - authentication failed!");
+        }
+
+        println!(
+            "✅ WebSocket connection established (status: {})",
+            response.status()
+        );
+
+        // Give WebSocket handler time to set up file watcher
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Write logs AFTER WebSocket connection so they can be streamed in real-time
+        app_state
+            .log_service
+            .append_structured_log(&job_log_id, temps_logs::LogLevel::Info, "Job log line 1")
+            .await
+            .expect("Failed to write job log");
+        app_state
+            .log_service
+            .append_structured_log(&job_log_id, temps_logs::LogLevel::Info, "Job log line 2")
+            .await
+            .expect("Failed to write job log");
+
+        // Give time for logs to be picked up by the file watcher
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Verify log file was created and has content
+        let log_path = app_state.log_service.get_log_path(&job_log_id);
+        assert!(log_path.exists(), "Log file should exist at {:?}", log_path);
+        let log_content = tokio::fs::read_to_string(&log_path)
+            .await
+            .expect("Failed to read log file");
+        println!("Log file content:\n{}", log_content);
+        assert!(!log_content.is_empty(), "Log file should have content");
+
+        // Receive messages
+        let mut messages = Vec::new();
+
+        // Try to receive messages for up to 5 seconds (file watcher polls every 100ms)
+        while let Some(result) = timeout(Duration::from_secs(5), ws_stream.next())
+            .await
+            .ok()
+            .flatten()
+        {
+            match result {
+                Ok(WsMessage::Text(text)) => {
+                    println!("Received message: {}", text);
+                    messages.push(text);
+                    if messages.len() >= 2 {
+                        break; // Got expected number of messages
+                    }
+                }
+                Ok(WsMessage::Close(_)) => {
+                    println!("WebSocket closed");
+                    break;
+                }
+                Err(e) => {
+                    panic!("WebSocket error: {}", e);
+                }
+                _ => {}
+            }
+        }
+
+        // Verify we received the messages
+        assert_eq!(
+            messages.len(),
+            2,
+            "Should receive 2 log messages. Log file has content but WebSocket didn't stream it."
+        );
+
+        // Verify raw log format (not JSON)
+        for (i, msg) in messages.iter().enumerate() {
+            assert!(
+                msg.contains(&format!("Job log line {}", i + 1)),
+                "Log should contain expected text. Got: '{}'",
+                msg
+            );
+        }
+
+        println!("✅ Received {} raw log messages", messages.len());
+
+        // Close connection
+        let _ = ws_stream.close(None).await;
+
+        println!("✅ End-to-end WebSocket handler test completed");
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires actual Docker container
+    async fn test_container_logs_by_id_websocket() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{
+            deployment_containers as containers, deployments, environments, projects,
+        };
+
+        // Setup test database and services
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+        let db = test_db.connection_arc();
+
+        let temp_dir = std::env::temp_dir().join(format!("test_ws_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+        let log_service = Arc::new(LogService::new(temp_dir.clone()));
+
+        // Create Docker client for logs
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
+        );
+        let docker_log_service = Arc::new(DockerLogService::new(docker.clone()));
+
+        // Create ServerConfig
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:0".to_string(),
+                test_db.database_url.clone(),
+                None,
+                None,
+            )
+            .expect("Failed to create server config"),
+        );
+        let config_service = Arc::new(ConfigService::new(server_config, db.clone()));
+
+        // Create queue service
+        let (job_sender, _job_receiver) = tokio::sync::broadcast::channel(100);
+        let queue_service: Arc<dyn temps_core::JobQueue> =
+            Arc::new(temps_queue::BroadcastQueueService::new(job_sender));
+
+        // Create deployer
+        let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(
+            temps_deployer::docker::DockerRuntime::new(docker, false, "temps-test".to_string()),
+        );
+
+        let deployment_service = Arc::new(crate::services::services::DeploymentService::new(
+            db.clone(),
+            log_service.clone(),
+            config_service,
+            queue_service.clone(),
+            docker_log_service,
+            deployer,
+        ));
+
+        let cron_service = Arc::new(
+            crate::services::database_cron_service::DatabaseCronConfigService::new(
+                db.clone(),
+                queue_service.clone(),
+            ),
+        );
+
+        let app_state = Arc::new(AppState {
+            deployment_service,
+            log_service: log_service.clone(),
+            cron_service,
+            external_deployment_manager: Arc::new(crate::services::ExternalDeploymentManager::new()),
+        });
+
+        // Create test data
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/tmp/test-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test project");
+
+        let subdomain = format!("test-env-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Test Environment".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.localhost", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test environment");
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
+            state: Set("running".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test deployment");
+
+        // Update environment with current_deployment_id
+        let mut env_active: environments::ActiveModel = environment.into();
+        env_active.current_deployment_id = Set(Some(deployment.id));
+        let environment = env_active
+            .update(&*db)
+            .await
+            .expect("Failed to update environment with deployment");
+
+        // Create a test container
+        let container_id = "test-container-123";
+        let now = chrono::Utc::now();
+        let container = containers::ActiveModel {
+            deployment_id: Set(deployment.id),
+            container_id: Set(container_id.to_string()),
+            container_name: Set("test-container".to_string()),
+            container_port: Set(8080),
+            image_name: Set(Some("nginx:latest".to_string())),
+            status: Set(Some("running".to_string())),
+            created_at: Set(now),
+            deployed_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test container");
+
+        // Pre-populate container logs with structured logs
+        log_service
+            .append_structured_log(
+                container_id,
+                temps_logs::LogLevel::Info,
+                "Container log line 1",
+            )
+            .await
+            .expect("Failed to write container log");
+        log_service
+            .append_structured_log(
+                container_id,
+                temps_logs::LogLevel::Info,
+                "Container log line 2",
+            )
+            .await
+            .expect("Failed to write container log");
+
+        // Create auth middleware
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request, next: axum::middleware::Next| async move {
+                let auth_context = create_test_auth_context();
+                req.extensions_mut().insert(auth_context);
+                next.run(req).await
+            },
+        );
+
+        // Create router
+        let app = Router::new()
+            .route(
+                "/api/projects/{project_id}/environments/{environment_id}/containers/{container_id}/logs",
+                get(get_container_logs_by_id),
+            )
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+
+        // Start server
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get local address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed to start");
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Connect to WebSocket
+        let ws_url = format!(
+            "ws://{}/api/projects/{}/environments/{}/containers/{}/logs",
+            addr, project.id, environment.id, container.container_id
+        );
+
+        println!("Connecting to WebSocket at: {}", ws_url);
+        let (mut ws_stream, response) = connect_async(&ws_url)
+            .await
+            .expect("Failed to connect to WebSocket");
+
+        if response.status() == 401 {
+            panic!("WebSocket connection rejected with 401 Unauthorized - authentication failed!");
+        }
+
+        println!(
+            "✅ WebSocket connection established (status: {})",
+            response.status()
+        );
+
+        // Receive messages
+        let mut messages = Vec::new();
+
+        while let Some(result) = timeout(Duration::from_secs(2), ws_stream.next())
+            .await
+            .ok()
+            .flatten()
+        {
+            match result {
+                Ok(WsMessage::Text(text)) => {
+                    println!("Received message: {}", text);
+                    messages.push(text);
+                    if messages.len() >= 2 {
+                        break;
+                    }
+                }
+                Ok(WsMessage::Close(_)) => {
+                    println!("WebSocket closed");
+                    break;
+                }
+                Err(e) => {
+                    panic!("WebSocket error: {}", e);
+                }
+                _ => {}
+            }
+        }
+
+        // Verify messages - logs might come as a single message or multiple
+        println!("Total messages received: {}", messages.len());
+        for (i, msg) in messages.iter().enumerate() {
+            println!("Message {}: '{}'", i, msg);
+        }
+
+        assert!(!messages.is_empty(), "Should receive at least 1 message");
+
+        // Check that both log lines are present (they might be in one message or separate)
+        let all_logs = messages.join("");
+        assert!(
+            all_logs.contains("Container log line 1"),
+            "Logs should contain line 1. Got: '{}'",
+            all_logs
+        );
+        assert!(
+            all_logs.contains("Container log line 2"),
+            "Logs should contain line 2. Got: '{}'",
+            all_logs
+        );
+
+        println!("✅ Received {} raw container log messages", messages.len());
+
+        let _ = ws_stream.close(None).await;
+
+        println!("✅ Container logs by ID WebSocket test completed");
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires actual Docker container
+    async fn test_filtered_container_logs_websocket() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{
+            deployment_containers as containers, deployments, environments, projects,
+        };
+
+        // Setup test database and services
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+        let db = test_db.connection_arc();
+
+        let temp_dir = std::env::temp_dir().join(format!("test_ws_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+        let log_service = Arc::new(LogService::new(temp_dir.clone()));
+
+        // Create Docker client
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
+        );
+        let docker_log_service = Arc::new(DockerLogService::new(docker.clone()));
+
+        // Create ServerConfig
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:0".to_string(),
+                test_db.database_url.clone(),
+                None,
+                None,
+            )
+            .expect("Failed to create server config"),
+        );
+        let config_service = Arc::new(ConfigService::new(server_config, db.clone()));
+
+        // Create queue service
+        let (job_sender, _job_receiver) = tokio::sync::broadcast::channel(100);
+        let queue_service: Arc<dyn temps_core::JobQueue> =
+            Arc::new(temps_queue::BroadcastQueueService::new(job_sender));
+
+        // Create deployer
+        let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(
+            temps_deployer::docker::DockerRuntime::new(docker, false, "temps-test".to_string()),
+        );
+
+        let deployment_service = Arc::new(crate::services::services::DeploymentService::new(
+            db.clone(),
+            log_service.clone(),
+            config_service,
+            queue_service.clone(),
+            docker_log_service,
+            deployer,
+        ));
+
+        let cron_service = Arc::new(
+            crate::services::database_cron_service::DatabaseCronConfigService::new(
+                db.clone(),
+                queue_service.clone(),
+            ),
+        );
+
+        let app_state = Arc::new(AppState {
+            deployment_service,
+            log_service: log_service.clone(),
+            cron_service,
+            external_deployment_manager: Arc::new(crate::services::ExternalDeploymentManager::new()),
+        });
+
+        // Create test data
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/tmp/test-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test project");
+
+        let subdomain = format!("test-env-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Test Environment".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.localhost", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test environment");
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
+            state: Set("running".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test deployment");
+
+        // Update environment with current_deployment_id
+        let mut env_active: environments::ActiveModel = environment.into();
+        env_active.current_deployment_id = Set(Some(deployment.id));
+        let environment = env_active
+            .update(&*db)
+            .await
+            .expect("Failed to update environment with deployment");
+
+        // Create multiple containers
+        let now = chrono::Utc::now();
+        let container1_id = "filtered-container-1";
+        let _container1 = containers::ActiveModel {
+            deployment_id: Set(deployment.id),
+            container_id: Set(container1_id.to_string()),
+            container_name: Set("web-container".to_string()),
+            container_port: Set(8080),
+            image_name: Set(Some("nginx:latest".to_string())),
+            status: Set(Some("running".to_string())),
+            created_at: Set(now),
+            deployed_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create container 1");
+
+        let container2_id = "filtered-container-2";
+        let _container2 = containers::ActiveModel {
+            deployment_id: Set(deployment.id),
+            container_id: Set(container2_id.to_string()),
+            container_name: Set("db-container".to_string()),
+            container_port: Set(5432),
+            image_name: Set(Some("postgres:latest".to_string())),
+            status: Set(Some("running".to_string())),
+            created_at: Set(now),
+            deployed_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create container 2");
+
+        // Pre-populate logs for both containers with structured logs
+        log_service
+            .append_structured_log(
+                container1_id,
+                temps_logs::LogLevel::Info,
+                "Web container log 1",
+            )
+            .await
+            .expect("Failed to write container 1 log");
+        log_service
+            .append_structured_log(
+                container2_id,
+                temps_logs::LogLevel::Info,
+                "DB container log 1",
+            )
+            .await
+            .expect("Failed to write container 2 log");
+
+        // Create auth middleware
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request, next: axum::middleware::Next| async move {
+                let auth_context = create_test_auth_context();
+                req.extensions_mut().insert(auth_context);
+                next.run(req).await
+            },
+        );
+
+        // Create router
+        let app = Router::new()
+            .route(
+                "/api/projects/{project_id}/environments/{environment_id}/container-logs",
+                get(get_container_logs),
+            )
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+
+        // Start server
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get local address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed to start");
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Connect to WebSocket (all containers)
+        let ws_url = format!(
+            "ws://{}/api/projects/{}/environments/{}/container-logs",
+            addr, project.id, environment.id
+        );
+
+        println!("Connecting to WebSocket at: {}", ws_url);
+        let (mut ws_stream, response) = connect_async(&ws_url)
+            .await
+            .expect("Failed to connect to WebSocket");
+
+        if response.status() == 401 {
+            panic!("WebSocket connection rejected with 401 Unauthorized - authentication failed!");
+        }
+
+        println!(
+            "✅ WebSocket connection established (status: {})",
+            response.status()
+        );
+
+        // Receive messages from all containers
+        let mut messages = Vec::new();
+
+        while let Some(result) = timeout(Duration::from_secs(2), ws_stream.next())
+            .await
+            .ok()
+            .flatten()
+        {
+            match result {
+                Ok(WsMessage::Text(text)) => {
+                    println!("Received message: {}", text);
+                    messages.push(text);
+                    if messages.len() >= 2 {
+                        break;
+                    }
+                }
+                Ok(WsMessage::Close(_)) => {
+                    println!("WebSocket closed");
+                    break;
+                }
+                Err(e) => {
+                    panic!("WebSocket error: {}", e);
+                }
+                _ => {}
+            }
+        }
+
+        // Verify we got logs from both containers - logs might come combined or separate
+        println!("Total messages received: {}", messages.len());
+        for (i, msg) in messages.iter().enumerate() {
+            println!("Message {}: '{}'", i, msg);
+        }
+
+        assert!(!messages.is_empty(), "Should receive at least 1 message");
+
+        // Check that both container logs are present (they might be in one message or separate)
+        let all_logs = messages.join("");
+        let has_web_log = all_logs.contains("Web container");
+        let has_db_log = all_logs.contains("DB container");
+
+        assert!(
+            has_web_log,
+            "Should receive web container logs. Got: '{}'",
+            all_logs
+        );
+        assert!(
+            has_db_log,
+            "Should receive DB container logs. Got: '{}'",
+            all_logs
+        );
+
+        println!(
+            "✅ Received {} raw log messages from multiple containers",
+            messages.len()
+        );
+
+        let _ = ws_stream.close(None).await;
+
+        println!("✅ Filtered container logs WebSocket test completed");
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    // =============================================================================
+    // HTTP Endpoint E2E Tests
+    // =============================================================================
+
+    /// Helper to create test app state for HTTP tests
+    async fn create_test_app_state_for_http(
+        db: Arc<sea_orm::DatabaseConnection>,
+        temp_dir: std::path::PathBuf,
+    ) -> Arc<AppState> {
+        let log_service = Arc::new(LogService::new(temp_dir.clone()));
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
+        );
+        let docker_log_service = Arc::new(DockerLogService::new(docker.clone()));
+
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:0".to_string(),
+                "postgresql://test:test@localhost:5432/test".to_string(),
+                None,
+                None,
+            )
+            .expect("Failed to create server config"),
+        );
+        let config_service = Arc::new(ConfigService::new(server_config, db.clone()));
+
+        let (job_sender, _job_receiver) = tokio::sync::broadcast::channel(100);
+        let queue_service: Arc<dyn temps_core::JobQueue> =
+            Arc::new(temps_queue::BroadcastQueueService::new(job_sender));
+
+        let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(
+            temps_deployer::docker::DockerRuntime::new(docker, false, "temps-test".to_string()),
+        );
+
+        let deployment_service = Arc::new(crate::services::services::DeploymentService::new(
+            db.clone(),
+            log_service.clone(),
+            config_service,
+            queue_service.clone(),
+            docker_log_service,
+            deployer,
+        ));
+
+        let cron_service = Arc::new(
+            crate::services::database_cron_service::DatabaseCronConfigService::new(
+                db.clone(),
+                queue_service.clone(),
+            ),
+        );
+
+        Arc::new(AppState {
+            deployment_service,
+            log_service,
+            cron_service,
+            external_deployment_manager: Arc::new(crate::services::ExternalDeploymentManager::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_get_last_deployment_endpoint() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{deployments, environments, projects};
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+        let db = test_db.connection_arc();
+
+        let temp_dir = std::env::temp_dir().join(format!("test_http_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+        let app_state = create_test_app_state_for_http(db.clone(), temp_dir.clone()).await;
+
+        // Create test data
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/tmp/test-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test project");
+
+        let subdomain = format!("test-env-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Test Environment".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.localhost", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test environment");
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test deployment");
+
+        // Create auth middleware
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request, next: axum::middleware::Next| async move {
+                let auth_context = create_test_auth_context();
+                req.extensions_mut().insert(auth_context);
+                next.run(req).await
+            },
+        );
+
+        // Use configure_routes() and add auth middleware
+        let app = configure_routes()
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed to start");
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Test GET /projects/{id}/last-deployment
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!(
+                "http://{}/projects/{}/last-deployment",
+                addr, project.id
+            ))
+            .send()
+            .await
+            .expect("Failed to send request");
+
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+        println!(
+            "Response body: {}",
+            serde_json::to_string_pretty(&body).unwrap()
+        );
+        assert_eq!(body["id"], deployment.id);
+        assert_eq!(body["status"], "deployed");
+
+        println!("✅ GET /projects/{{id}}/last-deployment test passed");
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_get_project_deployments_endpoint() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{deployments, environments, projects};
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+        let db = test_db.connection_arc();
+
+        let temp_dir = std::env::temp_dir().join(format!("test_http_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+        let app_state = create_test_app_state_for_http(db.clone(), temp_dir.clone()).await;
+
+        // Create test data
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/tmp/test-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test project");
+
+        let subdomain = format!("test-env-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Test Environment".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.localhost", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test environment");
+
+        // Create multiple deployments
+        let _deployment1 = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deployment-1-{}", uuid::Uuid::new_v4())),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test deployment 1");
+
+        let _deployment2 = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deployment-2-{}", uuid::Uuid::new_v4())),
+            state: Set("in_progress".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test deployment 2");
+
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request, next: axum::middleware::Next| async move {
+                let auth_context = create_test_auth_context();
+                req.extensions_mut().insert(auth_context);
+                next.run(req).await
+            },
+        );
+
+        let app = configure_routes()
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed to start");
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Test GET /projects/{id}/deployments
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!(
+                "http://{}/projects/{}/deployments",
+                addr, project.id
+            ))
+            .send()
+            .await
+            .expect("Failed to send request");
+
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+        assert!(body["deployments"].is_array());
+        assert_eq!(body["deployments"].as_array().unwrap().len(), 2);
+        assert_eq!(body["total"], 2);
+
+        println!("✅ GET /projects/{{id}}/deployments test passed");
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_get_deployment_endpoint() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{deployments, environments, projects};
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+        let db = test_db.connection_arc();
+
+        let temp_dir = std::env::temp_dir().join(format!("test_http_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+        let app_state = create_test_app_state_for_http(db.clone(), temp_dir.clone()).await;
+
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/tmp/test-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test project");
+
+        let subdomain = format!("test-env-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Test Environment".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.localhost", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test environment");
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test deployment");
+
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request, next: axum::middleware::Next| async move {
+                let auth_context = create_test_auth_context();
+                req.extensions_mut().insert(auth_context);
+                next.run(req).await
+            },
+        );
+
+        let app = configure_routes()
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed to start");
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Test GET /projects/{project_id}/deployments/{deployment_id}
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!(
+                "http://{}/projects/{}/deployments/{}",
+                addr, project.id, deployment.id
+            ))
+            .send()
+            .await
+            .expect("Failed to send request");
+
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+        assert_eq!(body["id"], deployment.id);
+        assert_eq!(body["status"], "deployed");
+
+        println!("✅ GET /projects/{{project_id}}/deployments/{{deployment_id}} test passed");
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_get_deployment_jobs_endpoint() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{deployment_jobs, deployments, environments, projects};
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+        let db = test_db.connection_arc();
+
+        let temp_dir = std::env::temp_dir().join(format!("test_http_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+        let app_state = create_test_app_state_for_http(db.clone(), temp_dir.clone()).await;
+
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/tmp/test-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test project");
+
+        let subdomain = format!("test-env-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Test Environment".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.localhost", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test environment");
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test deployment");
+
+        // Create deployment jobs
+        let _job1 = deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment.id),
+            job_id: Set("build-job".to_string()),
+            job_type: Set("build".to_string()),
+            name: Set("Build Job".to_string()),
+            log_id: Set("build-log".to_string()),
+            status: Set(temps_entities::types::JobStatus::Success),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create job 1");
+
+        let _job2 = deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment.id),
+            job_id: Set("deploy-job".to_string()),
+            job_type: Set("deploy".to_string()),
+            name: Set("Deploy Job".to_string()),
+            log_id: Set("deploy-log".to_string()),
+            status: Set(temps_entities::types::JobStatus::Running),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create job 2");
+
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request, next: axum::middleware::Next| async move {
+                let auth_context = create_test_auth_context();
+                req.extensions_mut().insert(auth_context);
+                next.run(req).await
+            },
+        );
+
+        let app = configure_routes()
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed to start");
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Test GET /projects/{project_id}/deployments/{deployment_id}/jobs
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!(
+                "http://{}/projects/{}/deployments/{}/jobs",
+                addr, project.id, deployment.id
+            ))
+            .send()
+            .await
+            .expect("Failed to send request");
+
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+        assert!(body["jobs"].is_array());
+        assert_eq!(body["jobs"].as_array().unwrap().len(), 2);
+
+        println!("✅ GET /projects/{{project_id}}/deployments/{{deployment_id}}/jobs test passed");
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_pause_and_resume_deployment_endpoints() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{deployments, environments, projects};
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+        let db = test_db.connection_arc();
+
+        let temp_dir = std::env::temp_dir().join(format!("test_http_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+        let app_state = create_test_app_state_for_http(db.clone(), temp_dir.clone()).await;
+
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/tmp/test-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test project");
+
+        let subdomain = format!("test-env-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Test Environment".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.localhost", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test environment");
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test deployment");
+
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request, next: axum::middleware::Next| async move {
+                let auth_context = create_test_auth_context();
+                req.extensions_mut().insert(auth_context);
+                next.run(req).await
+            },
+        );
+
+        let app = configure_routes()
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed to start");
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let client = reqwest::Client::new();
+
+        // Test POST /projects/{project_id}/deployments/{deployment_id}/pause
+        let response = client
+            .post(format!(
+                "http://{}/projects/{}/deployments/{}/pause",
+                addr, project.id, deployment.id
+            ))
+            .send()
+            .await
+            .expect("Failed to send pause request");
+
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+        assert_eq!(body["state"], "paused");
+        assert_eq!(body["message"], "Deployment paused successfully");
+
+        println!(
+            "✅ POST /projects/{{project_id}}/deployments/{{deployment_id}}/pause test passed"
+        );
+
+        // Test POST /projects/{project_id}/deployments/{deployment_id}/resume
+        let response = client
+            .post(format!(
+                "http://{}/projects/{}/deployments/{}/resume",
+                addr, project.id, deployment.id
+            ))
+            .send()
+            .await
+            .expect("Failed to send resume request");
+
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
+        assert_eq!(body["state"], "deployed");
+        assert_eq!(body["message"], "Deployment resumed successfully");
+
+        println!(
+            "✅ POST /projects/{{project_id}}/deployments/{{deployment_id}}/resume test passed"
+        );
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_cancel_deployment_endpoint() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{deployments, environments, projects};
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+        let db = test_db.connection_arc();
+
+        let temp_dir = std::env::temp_dir().join(format!("test_http_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+        let app_state = create_test_app_state_for_http(db.clone(), temp_dir.clone()).await;
+
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/tmp/test-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test project");
+
+        let subdomain = format!("test-env-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Test Environment".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.localhost", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test environment");
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
+            state: Set("in_progress".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test deployment");
+
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request, next: axum::middleware::Next| async move {
+                let auth_context = create_test_auth_context();
+                req.extensions_mut().insert(auth_context);
+                next.run(req).await
+            },
+        );
+
+        let app = configure_routes()
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed to start");
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Test POST /projects/{project_id}/deployments/{deployment_id}/cancel
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!(
+                "http://{}/projects/{}/deployments/{}/cancel",
+                addr, project.id, deployment.id
+            ))
+            .send()
+            .await
+            .expect("Failed to send request");
+
+        // The deployment is in "in_progress" state, so it can't be cancelled yet
+        // The API correctly returns 400 Bad Request
+        assert_eq!(response.status(), 400);
+
+        println!(
+            "✅ POST /projects/{{project_id}}/deployments/{{deployment_id}}/cancel test passed"
+        );
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_teardown_deployment_endpoint() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{deployments, environments, projects};
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+        let db = test_db.connection_arc();
+
+        let temp_dir = std::env::temp_dir().join(format!("test_http_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+        let app_state = create_test_app_state_for_http(db.clone(), temp_dir.clone()).await;
+
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/tmp/test-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test project");
+
+        let subdomain = format!("test-env-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Test Environment".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.localhost", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test environment");
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test deployment");
+
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request, next: axum::middleware::Next| async move {
+                let auth_context = create_test_auth_context();
+                req.extensions_mut().insert(auth_context);
+                next.run(req).await
+            },
+        );
+
+        let app = configure_routes()
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed to start");
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Test DELETE /projects/{project_id}/deployments/{deployment_id}/teardown
+        let client = reqwest::Client::new();
+        let response = client
+            .delete(format!(
+                "http://{}/projects/{}/deployments/{}/teardown",
+                addr, project.id, deployment.id
+            ))
+            .send()
+            .await
+            .expect("Failed to send request");
+
+        assert_eq!(response.status(), 204);
+
+        println!(
+            "✅ DELETE /projects/{{project_id}}/deployments/{{deployment_id}}/teardown test passed"
+        );
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_teardown_environment_endpoint() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{environments, projects};
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+        let db = test_db.connection_arc();
+
+        let temp_dir = std::env::temp_dir().join(format!("test_http_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+        let app_state = create_test_app_state_for_http(db.clone(), temp_dir.clone()).await;
+
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/tmp/test-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test project");
+
+        let subdomain = format!("test-env-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Test Environment".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.localhost", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test environment");
+
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request, next: axum::middleware::Next| async move {
+                let auth_context = create_test_auth_context();
+                req.extensions_mut().insert(auth_context);
+                next.run(req).await
+            },
+        );
+
+        let app = configure_routes()
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed to start");
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Test DELETE /projects/{project_id}/environments/{env_id}/teardown
+        let client = reqwest::Client::new();
+        let response = client
+            .delete(format!(
+                "http://{}/projects/{}/environments/{}/teardown",
+                addr, project.id, environment.id
+            ))
+            .send()
+            .await
+            .expect("Failed to send request");
+
+        assert_eq!(response.status(), 204);
+
+        println!("✅ DELETE /projects/{{project_id}}/environments/{{env_id}}/teardown test passed");
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
 }

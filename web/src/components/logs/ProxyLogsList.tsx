@@ -209,8 +209,26 @@ export default function ProxyLogsList({
     }
   }
 
+  // Helper function to generate pagination button numbers
+  const getPaginationPages = (currentPage: number, totalPages: number) => {
+    const pageNumbers = []
+    const maxButtons = 5
+    let startPage = Math.max(1, currentPage - Math.floor(maxButtons / 2))
+    const endPage = Math.min(totalPages, startPage + maxButtons - 1)
+
+    if (endPage - startPage < maxButtons - 1) {
+      startPage = Math.max(1, endPage - maxButtons + 1)
+    }
+
+    for (let i = startPage; i <= endPage; i++) {
+      pageNumbers.push(i)
+    }
+
+    return pageNumbers
+  }
+
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 px-4 sm:px-0">
       <Card className="p-4">
         <CardHeader className="px-0">
           <div className="flex items-center justify-between">
@@ -236,9 +254,9 @@ export default function ProxyLogsList({
           </div>
         </CardHeader>
         <div className="space-y-4">
-          <div className="flex gap-4 flex-wrap">
+          <div className="flex gap-2 sm:gap-4 flex-wrap">
             <Select value={timeRange} onValueChange={handleTimeRangeChange}>
-              <SelectTrigger className="w-[180px]">
+              <SelectTrigger className="w-full sm:w-[180px]">
                 <SelectValue placeholder="Time Range" />
               </SelectTrigger>
               <SelectContent>
@@ -251,7 +269,7 @@ export default function ProxyLogsList({
               </SelectContent>
             </Select>
             <Select value={method} onValueChange={handleMethodChange}>
-              <SelectTrigger className="w-[180px]">
+              <SelectTrigger className="w-full sm:w-[180px]">
                 <SelectValue placeholder="HTTP Method" />
               </SelectTrigger>
               <SelectContent>
@@ -264,7 +282,7 @@ export default function ProxyLogsList({
               </SelectContent>
             </Select>
             <Select value={statusCode} onValueChange={handleStatusCodeChange}>
-              <SelectTrigger className="w-[200px]">
+              <SelectTrigger className="w-full sm:w-[200px]">
                 <SelectValue placeholder="Status Code" />
               </SelectTrigger>
               <SelectContent>
@@ -306,13 +324,13 @@ export default function ProxyLogsList({
             </Select>
             {showEnvironmentFilter &&
               (isLoading ? (
-                <Skeleton className="h-10 w-[200px]" />
+                <Skeleton className="h-10 w-full sm:w-[200px]" />
               ) : (
                 <Select
                   value={environment}
                   onValueChange={handleEnvironmentChange}
                 >
-                  <SelectTrigger className="w-[200px]">
+                  <SelectTrigger className="w-full sm:w-[200px]">
                     <SelectValue placeholder="Environment" />
                   </SelectTrigger>
                   <SelectContent>
@@ -326,7 +344,7 @@ export default function ProxyLogsList({
                 </Select>
               ))}
             <Select value={showBots} onValueChange={handleShowBotsChange}>
-              <SelectTrigger className="w-[180px]">
+              <SelectTrigger className="w-full sm:w-[180px]">
                 <SelectValue placeholder="Bot Filter" />
               </SelectTrigger>
               <SelectContent>
@@ -452,63 +470,49 @@ export default function ProxyLogsList({
 
           {/* Pagination */}
           {totalPages > 1 && (
-            <div className="flex items-center justify-between mt-6">
-              <div className="text-sm text-muted-foreground">
+            <div className="flex flex-col sm:flex-row items-center justify-between gap-4 mt-6">
+              <div className="text-xs sm:text-sm text-muted-foreground text-center sm:text-left">
                 Showing {(page - 1) * limit + 1} to{' '}
                 {Math.min(page * limit, logs?.total || 0)} of {logs?.total || 0}{' '}
                 logs
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1 sm:gap-2">
                 <Button
                   variant="outline"
                   size="sm"
                   onClick={() => setPage((p) => Math.max(1, p - 1))}
                   disabled={page === 1}
+                  className="h-8 px-2 sm:h-9 sm:px-3"
                 >
                   <ChevronLeft className="h-4 w-4" />
-                  Previous
+                  <span className="hidden sm:inline ml-1">Previous</span>
                 </Button>
-                <div className="flex items-center gap-1">
-                  {(() => {
-                    const pageNumbers = []
-                    const maxButtons = 5
-                    let startPage = Math.max(
-                      1,
-                      page - Math.floor(maxButtons / 2)
-                    )
-                    const endPage = Math.min(
-                      totalPages,
-                      startPage + maxButtons - 1
-                    )
-
-                    if (endPage - startPage < maxButtons - 1) {
-                      startPage = Math.max(1, endPage - maxButtons + 1)
-                    }
-
-                    for (let i = startPage; i <= endPage; i++) {
-                      pageNumbers.push(i)
-                    }
-
-                    return pageNumbers.map((pageNum) => (
-                      <Button
-                        key={pageNum}
-                        variant={pageNum === page ? 'default' : 'outline'}
-                        size="sm"
-                        onClick={() => setPage(pageNum)}
-                        className="w-10"
-                      >
-                        {pageNum}
-                      </Button>
-                    ))
-                  })()}
+                {/* Desktop only: Show numbered page buttons */}
+                <div className="hidden sm:flex items-center gap-1">
+                  {getPaginationPages(page, totalPages).map((pageNum) => (
+                    <Button
+                      key={pageNum}
+                      variant={pageNum === page ? 'default' : 'outline'}
+                      size="sm"
+                      onClick={() => setPage(pageNum)}
+                      className="w-10"
+                    >
+                      {pageNum}
+                    </Button>
+                  ))}
                 </div>
+                {/* Mobile only: Show current page info */}
+                <span className="sm:hidden text-xs text-muted-foreground px-2">
+                  {page} / {totalPages}
+                </span>
                 <Button
                   variant="outline"
                   size="sm"
                   onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
                   disabled={page === totalPages}
+                  className="h-8 px-2 sm:h-9 sm:px-3"
                 >
-                  Next
+                  <span className="hidden sm:inline mr-1">Next</span>
                   <ChevronRight className="h-4 w-4" />
                 </Button>
               </div>

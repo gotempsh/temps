@@ -32,6 +32,8 @@ anyhow = { workspace = true }
 rand = { workspace = true }
 axum = { workspace = true }
 axum-macros = { workspace = true }
+url = "2"
+urlencoding = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"

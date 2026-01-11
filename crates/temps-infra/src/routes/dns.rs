@@ -2,16 +2,16 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Query, State},
+    http::StatusCode,
     response::IntoResponse,
     routing::get,
     Json, Router,
-    http::StatusCode,
 };
 use tracing::info;
 use utoipa::OpenApi;
 
-use crate::types::{DnsLookupRequest, DnsLookupResponse, DnsLookupError};
 use crate::services::DnsService;
+use crate::types::{DnsLookupError, DnsLookupRequest, DnsLookupResponse};
 
 /// Application state trait for DNS routes
 pub trait DnsAppState: Send + Sync + 'static {
@@ -53,7 +53,11 @@ where
 {
     info!("Looking up DNS A records for domain: {}", request.domain);
 
-    match app_state.dns_service().lookup_a_records(&request.domain).await {
+    match app_state
+        .dns_service()
+        .lookup_a_records(&request.domain)
+        .await
+    {
         Ok(result) => {
             let response = DnsLookupResponse {
                 domain: request.domain.clone(),
@@ -78,8 +82,7 @@ pub fn configure_dns_routes<T>() -> Router<Arc<T>>
 where
     T: DnsAppState,
 {
-    Router::new()
-        .route("/dns/lookup", get(lookup_dns_a_records::<T>))
+    Router::new().route("/dns/lookup", get(lookup_dns_a_records::<T>))
 }
 
 #[cfg(test)]

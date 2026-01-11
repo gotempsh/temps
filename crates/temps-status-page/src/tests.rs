@@ -1,12 +1,11 @@
 use crate::services::*;
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
-use serde_json;
 use std::sync::Arc;
 use temps_config::{ConfigService, ServerConfig};
 use temps_core::{Job, JobQueue, JobReceiver, QueueError};
 use temps_database::test_utils::TestDatabase;
-use temps_entities::{deployments, environments, projects, status_monitors, types::{PipelineStatus, ProjectType}};
+use temps_entities::{deployments, environments, projects, status_monitors};
 
 fn create_test_config_service(db: &Arc<DatabaseConnection>) -> Arc<ConfigService> {
     let config = ServerConfig::new(
@@ -14,7 +13,8 @@ fn create_test_config_service(db: &Arc<DatabaseConnection>) -> Arc<ConfigService
         "postgres://test:test@localhost/test".to_string(),
         None,
         None,
-    ).expect("Failed to create test config");
+    )
+    .expect("Failed to create test config");
     Arc::new(ConfigService::new(Arc::new(config), db.clone()))
 }
 
@@ -157,7 +157,51 @@ mod integration_tests {
     use super::*;
     use async_trait::async_trait;
     use std::collections::VecDeque;
+    use temps_entities::{preset::Preset, upstream_config::UpstreamList};
     use tokio::sync::Mutex;
+
+    // Helper function to create unique test project (avoids deadlocks in parallel tests)
+    async fn create_unique_test_project(db: &Arc<DatabaseConnection>) -> projects::Model {
+        let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let slug = format!("test-project-{}", nanos);
+        let project = projects::ActiveModel {
+            name: Set(format!("Test Project {}", nanos)),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            slug: Set(slug.clone()),
+            directory: Set(format!("/test-{}", nanos)),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Nixpacks),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        project.insert(db.as_ref()).await.unwrap()
+    }
+
+    // Helper function to create unique test environment (avoids deadlocks in parallel tests)
+    async fn create_unique_test_environment(
+        db: &Arc<DatabaseConnection>,
+        project_id: i32,
+        name: &str,
+    ) -> environments::Model {
+        let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let slug = format!("{}-{}", name, nanos);
+        let subdomain = format!("{}-{}", name, nanos);
+        let environment = environments::ActiveModel {
+            project_id: Set(project_id),
+            name: Set(name.to_string()),
+            slug: Set(slug),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.test.local", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            branch: Set(Some("main".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        environment.insert(db.as_ref()).await.unwrap()
+    }
 
     // Mock Queue implementation for testing
     struct MockQueue {
@@ -195,8 +239,7 @@ mod integration_tests {
     impl JobReceiver for MockReceiver {
         async fn recv(&mut self) -> Result<Job, QueueError> {
             let mut jobs = self.jobs.lock().await;
-            jobs.pop_front()
-                .ok_or(QueueError::ChannelClosed)
+            jobs.pop_front().ok_or(QueueError::ChannelClosed)
         }
     }
 
@@ -205,12 +248,16 @@ mod integration_tests {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
 
-        // Create a project first
+        // Create a project first (use nanoseconds for uniqueness in parallel tests)
+        let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let project_slug = format!("test-project-{}", nanos);
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
-            slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
-            directory: Set("/test".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            slug: Set(project_slug.clone()),
+            preset: Set(Preset::NextJs),
+            directory: Set(format!("/test-{}", nanos)),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -219,13 +266,14 @@ mod integration_tests {
         let project = project.insert(db.as_ref()).await.unwrap();
 
         // Create an environment
+        let env_subdomain = format!("production-{}", nanos);
         let environment = environments::ActiveModel {
             project_id: Set(project.id),
             name: Set("production".to_string()),
-            slug: Set("production".to_string()),
-            subdomain: Set("production".to_string()),
-            host: Set("production.test.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            slug: Set(format!("production-{}", nanos)),
+            subdomain: Set(env_subdomain.clone()),
+            host: Set(format!("{}.test.local", env_subdomain)),
+            upstreams: Set(UpstreamList::default()),
             branch: Set(Some("main".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -265,12 +313,16 @@ mod integration_tests {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
 
-        // Create a project
+        // Create a project (use nanoseconds for uniqueness in parallel tests)
+        let nanos = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let project_slug = format!("test-project-{}", nanos);
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
-            slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
-            directory: Set("/test".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            slug: Set(project_slug.clone()),
+            preset: Set(Preset::NextJs),
+            directory: Set(format!("/test-{}", nanos)),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -279,13 +331,14 @@ mod integration_tests {
         let project = project.insert(db.as_ref()).await.unwrap();
 
         // Create an environment
+        let env_subdomain = format!("staging-{}", nanos);
         let environment = environments::ActiveModel {
             project_id: Set(project.id),
             name: Set("staging".to_string()),
-            slug: Set("staging".to_string()),
-            subdomain: Set("staging".to_string()),
-            host: Set("staging.test.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            slug: Set(format!("staging-{}", nanos)),
+            subdomain: Set(env_subdomain.clone()),
+            host: Set(format!("{}.test.local", env_subdomain)),
+            upstreams: Set(UpstreamList::default()),
             branch: Set(Some("staging".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -319,32 +372,9 @@ mod integration_tests {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
 
-        // Create a project
-        let project = projects::ActiveModel {
-            name: Set("Test Project".to_string()),
-            slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
-            directory: Set("/test".to_string()),
-            main_branch: Set("main".to_string()),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let project = project.insert(db.as_ref()).await.unwrap();
-
-        // Create an environment
-        let environment = environments::ActiveModel {
-            project_id: Set(project.id),
-            name: Set("test-env".to_string()),
-            slug: Set("test-env".to_string()),
-            subdomain: Set("test-env".to_string()),
-            host: Set("test-env.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let environment = environment.insert(db.as_ref()).await.unwrap();
+        // Create a project and environment (using helpers to avoid deadlocks)
+        let project = create_unique_test_project(&db).await;
+        let environment = create_unique_test_environment(&db, project.id, "test-env").await;
 
         let config_service = create_test_config_service(&db);
         let monitor_service = MonitorService::new(db.clone(), config_service);
@@ -357,7 +387,10 @@ mod integration_tests {
                 environment_id: environment.id,
                 check_interval_seconds: Some(60),
             };
-            monitor_service.create_monitor(project.id, request).await.unwrap();
+            monitor_service
+                .create_monitor(project.id, request)
+                .await
+                .unwrap();
         }
 
         // List all monitors for the project
@@ -374,32 +407,9 @@ mod integration_tests {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
 
-        // Create a project
-        let project = projects::ActiveModel {
-            name: Set("Test Project".to_string()),
-            slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
-            directory: Set("/test".to_string()),
-            main_branch: Set("main".to_string()),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let project = project.insert(db.as_ref()).await.unwrap();
-
-        // Create an environment
-        let environment = environments::ActiveModel {
-            project_id: Set(project.id),
-            name: Set("test-env".to_string()),
-            slug: Set("test-env".to_string()),
-            subdomain: Set("test-env".to_string()),
-            host: Set("test-env.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let environment = environment.insert(db.as_ref()).await.unwrap();
+        // Create a project and environment (using helpers to avoid deadlocks)
+        let project = create_unique_test_project(&db).await;
+        let environment = create_unique_test_environment(&db, project.id, "test-env").await;
 
         let config_service = create_test_config_service(&db);
         let monitor_service = MonitorService::new(db.clone(), config_service);
@@ -411,16 +421,14 @@ mod integration_tests {
             environment_id: environment.id,
             check_interval_seconds: Some(60),
         };
-        let monitor = monitor_service.create_monitor(project.id, request).await.unwrap();
+        let monitor = monitor_service
+            .create_monitor(project.id, request)
+            .await
+            .unwrap();
 
         // Record a check
         let check = monitor_service
-            .record_check(
-                monitor.id,
-                "operational".to_string(),
-                Some(150),
-                None,
-            )
+            .record_check(monitor.id, "operational".to_string(), Some(150), None)
             .await
             .unwrap();
 
@@ -443,32 +451,9 @@ mod integration_tests {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
 
-        // Create a project
-        let project = projects::ActiveModel {
-            name: Set("Test Project".to_string()),
-            slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
-            directory: Set("/test".to_string()),
-            main_branch: Set("main".to_string()),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let project = project.insert(db.as_ref()).await.unwrap();
-
-        // Create an environment
-        let environment = environments::ActiveModel {
-            project_id: Set(project.id),
-            name: Set("test-env".to_string()),
-            slug: Set("test-env".to_string()),
-            subdomain: Set("test-env".to_string()),
-            host: Set("test-env.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let environment = environment.insert(db.as_ref()).await.unwrap();
+        // Create a project and environment (using helpers to avoid deadlocks)
+        let project = create_unique_test_project(&db).await;
+        let environment = create_unique_test_environment(&db, project.id, "test-env").await;
 
         let incident_service = IncidentService::new(db.clone());
 
@@ -500,32 +485,9 @@ mod integration_tests {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();
 
-        // Create a project
-        let project = projects::ActiveModel {
-            name: Set("Test Project".to_string()),
-            slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
-            directory: Set("/test".to_string()),
-            main_branch: Set("main".to_string()),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let project = project.insert(db.as_ref()).await.unwrap();
-
-        // Create an environment
-        let environment = environments::ActiveModel {
-            project_id: Set(project.id),
-            name: Set("test-env".to_string()),
-            slug: Set("test-env".to_string()),
-            subdomain: Set("test-env".to_string()),
-            host: Set("test-env.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let environment = environment.insert(db.as_ref()).await.unwrap();
+        // Create a project and environment (using helpers to avoid deadlocks)
+        let project = create_unique_test_project(&db).await;
+        let environment = create_unique_test_environment(&db, project.id, "test-env").await;
 
         let incident_service = IncidentService::new(db.clone());
 
@@ -574,8 +536,10 @@ mod integration_tests {
         // Create a project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -614,8 +578,10 @@ mod integration_tests {
         // Create a project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -631,7 +597,7 @@ mod integration_tests {
             slug: Set("production".to_string()),
             subdomain: Set("production".to_string()),
             host: Set("production.test.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             branch: Set(Some("main".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -667,8 +633,10 @@ mod integration_tests {
         // Create a project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -684,7 +652,7 @@ mod integration_tests {
             slug: Set("production".to_string()),
             subdomain: Set("prod-subdomain".to_string()),
             host: Set("production.test.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             branch: Set(Some("main".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -720,7 +688,11 @@ mod integration_tests {
                     )
                     .await;
 
-                assert!(result.is_ok(), "Failed to create monitor: {:?}", result.err());
+                assert!(
+                    result.is_ok(),
+                    "Failed to create monitor: {:?}",
+                    result.err()
+                );
                 let monitor = result.unwrap();
                 assert_eq!(monitor.environment_id, Some(environment.id));
                 assert_eq!(monitor.project_id, project.id);
@@ -748,8 +720,10 @@ mod integration_tests {
         // Create a project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -765,7 +739,7 @@ mod integration_tests {
             slug: Set("staging".to_string()),
             subdomain: Set("staging-subdomain".to_string()),
             host: Set("staging.test.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             branch: Set(Some("staging".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -784,7 +758,10 @@ mod integration_tests {
                 environment_id: environment.id,
                 check_interval_seconds: Some(60),
             };
-            monitor_service.create_monitor(project.id, request).await.unwrap();
+            monitor_service
+                .create_monitor(project.id, request)
+                .await
+                .unwrap();
         }
 
         // Verify monitors exist
@@ -818,7 +795,12 @@ mod integration_tests {
                 // Delete each monitor
                 for monitor in monitors {
                     let result = monitor_service.delete_monitor(monitor.id).await;
-                    assert!(result.is_ok(), "Failed to delete monitor {}: {:?}", monitor.id, result.err());
+                    assert!(
+                        result.is_ok(),
+                        "Failed to delete monitor {}: {:?}",
+                        monitor.id,
+                        result.err()
+                    );
                 }
             }
             _ => panic!("Unexpected job type"),
@@ -840,8 +822,10 @@ mod integration_tests {
         // Create a project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -865,7 +849,10 @@ mod integration_tests {
         match receiver.recv().await.unwrap() {
             temps_core::Job::ProjectCreated(job) => {
                 // ProjectCreated doesn't create monitors, just log
-                println!("Received ProjectCreated job: project_id={}, name={}", job.project_id, job.project_name);
+                println!(
+                    "Received ProjectCreated job: project_id={}, name={}",
+                    job.project_id, job.project_name
+                );
             }
             _ => panic!("Unexpected job type"),
         }
@@ -888,7 +875,10 @@ mod integration_tests {
         match receiver.recv().await.unwrap() {
             temps_core::Job::ProjectDeleted(job) => {
                 // ProjectDeleted doesn't delete monitors directly, environments handle that
-                println!("Received ProjectDeleted job: project_id={}, name={}", job.project_id, job.project_name);
+                println!(
+                    "Received ProjectDeleted job: project_id={}, name={}",
+                    job.project_id, job.project_name
+                );
             }
             _ => panic!("Unexpected job type"),
         }
@@ -902,8 +892,10 @@ mod integration_tests {
         // Create a project
         let project = projects::ActiveModel {
             name: Set("Multi-Env Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("multi-env".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -927,7 +919,7 @@ mod integration_tests {
                 slug: Set(name.to_string()),
                 subdomain: Set(format!("{}-subdomain", name)),
                 host: Set(format!("{}.test.local", name)),
-                upstreams: Set(serde_json::json!([])),
+                upstreams: Set(UpstreamList::default()),
                 branch: Set(Some(name.to_string())),
                 created_at: Set(Utc::now()),
                 updated_at: Set(Utc::now()),
@@ -1017,8 +1009,10 @@ mod integration_tests {
         // Create a project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("test-project".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::NextJs),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -1036,7 +1030,7 @@ mod integration_tests {
                 slug: Set(format!("env-{}", i)),
                 subdomain: Set(format!("env-{}", i)),
                 host: Set(format!("env-{}.test.local", i)),
-                upstreams: Set(serde_json::json!([])),
+                upstreams: Set(UpstreamList::default()),
                 branch: Set(Some("main".to_string())),
                 created_at: Set(Utc::now()),
                 updated_at: Set(Utc::now()),
@@ -1057,7 +1051,9 @@ mod integration_tests {
             branch_ref: Set(Some("main".to_string())),
             slug: Set("test-deployment".to_string()),
             state: Set("deployed".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()

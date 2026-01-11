@@ -396,7 +396,9 @@ impl DomainService {
 
         debug!(
             "Completing {:?} challenge for domain {} with validation URL: {:?}",
-            challenge_type.clone(), domain_name, challenge.validation_url
+            challenge_type.clone(),
+            domain_name,
+            challenge.validation_url
         );
 
         // Complete the challenge with Let's Encrypt
@@ -662,11 +664,7 @@ impl DomainService {
         }
 
         // Allow wildcard domains
-        let domain_to_check = if domain.starts_with("*.") {
-            &domain[2..]
-        } else {
-            domain
-        };
+        let domain_to_check = domain.strip_prefix("*.").unwrap_or(domain);
 
         // Basic checks
         if domain_to_check.starts_with('.') || domain_to_check.ends_with('.') {
@@ -762,7 +760,12 @@ mod tests {
         let test_db = temps_database::test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
-        let encryption_service = Arc::new(EncryptionService::new("0000000000000000000000000000000000000000000000000000000000000000").unwrap());
+        let encryption_service = Arc::new(
+            EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap(),
+        );
         let repository = Arc::new(crate::tls::repository::DefaultCertificateRepository::new(
             test_db.db.clone(),
             encryption_service.clone(),

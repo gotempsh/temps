@@ -27,13 +27,15 @@ export function EnvironmentResourcesCard({
   onUpdate,
 }: EnvironmentResourcesCardProps) {
   const [formData, setFormData] = useState({
-    cpu_request: environment.cpu_request?.toString() ?? '',
-    cpu_limit: environment.cpu_limit?.toString() ?? '',
-    memory_request: environment.memory_request?.toString() ?? '',
-    memory_limit: environment.memory_limit?.toString() ?? '',
-    branch: environment.branch ?? '',
-    replicas: environment.replicas?.toString() ?? '1',
+    cpu_request: environment.deployment_config?.cpuRequest?.toString() ?? '',
+    cpu_limit: environment.deployment_config?.cpuLimit?.toString() ?? '',
+    memory_request:
+      environment.deployment_config?.memoryRequest?.toString() ?? '',
+    memory_limit: environment.deployment_config?.memoryLimit?.toString() ?? '',
+    replicas: environment.deployment_config?.replicas?.toString() ?? '1',
+    exposed_port: environment.deployment_config?.exposedPort?.toString() ?? '',
   })
+
   const updateEnvironmentSettings = useMutation({
     ...updateEnvironmentSettingsMutation(),
     meta: {
@@ -64,8 +66,10 @@ export function EnvironmentResourcesCard({
         memory_limit: formData.memory_limit
           ? parseInt(formData.memory_limit)
           : null,
-        branch: formData.branch || null,
         replicas: formData.replicas ? parseInt(formData.replicas) : null,
+        exposed_port: formData.exposed_port
+          ? parseInt(formData.exposed_port)
+          : null,
       },
     })
 
@@ -75,121 +79,142 @@ export function EnvironmentResourcesCard({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Resources</CardTitle>
+        <CardTitle>Resources & Scaling</CardTitle>
         <CardDescription>
-          Configure environment resources and scaling
+          Configure compute resources, scaling, and network settings for this
+          environment
         </CardDescription>
       </CardHeader>
       <CardContent>
         <form onSubmit={handleSubmit}>
           <div className="space-y-6">
+            {/* CPU Resources */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div className="space-y-4">
-                <div>
-                  <Label>CPU Request (millicores)</Label>
-                  <Input
-                    type="number"
-                    value={formData.cpu_request}
-                    onChange={(e) =>
-                      setFormData((prev) => ({
-                        ...prev,
-                        cpu_request: e.target.value,
-                      }))
-                    }
-                    placeholder="e.g., 100"
-                  />
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Minimum CPU resources (1000m = 1 CPU core)
-                  </p>
-                </div>
-                <div>
-                  <Label>CPU Limit (millicores)</Label>
-                  <Input
-                    type="number"
-                    value={formData.cpu_limit}
-                    onChange={(e) =>
-                      setFormData((prev) => ({
-                        ...prev,
-                        cpu_limit: e.target.value,
-                      }))
-                    }
-                    placeholder="e.g., 200"
-                  />
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Maximum CPU resources (1000m = 1 CPU core)
-                  </p>
+                <h3 className="text-sm font-medium">CPU Resources</h3>
+                <div className="space-y-4">
+                  <div>
+                    <Label>CPU Request (millicores)</Label>
+                    <Input
+                      type="number"
+                      value={formData.cpu_request}
+                      onChange={(e) =>
+                        setFormData((prev) => ({
+                          ...prev,
+                          cpu_request: e.target.value,
+                        }))
+                      }
+                      placeholder="e.g., 100"
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Minimum CPU resources (1000m = 1 CPU core)
+                    </p>
+                  </div>
+                  <div>
+                    <Label>CPU Limit (millicores)</Label>
+                    <Input
+                      type="number"
+                      value={formData.cpu_limit}
+                      onChange={(e) =>
+                        setFormData((prev) => ({
+                          ...prev,
+                          cpu_limit: e.target.value,
+                        }))
+                      }
+                      placeholder="e.g., 200"
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Maximum CPU resources (1000m = 1 CPU core)
+                    </p>
+                  </div>
                 </div>
               </div>
 
+              {/* Memory Resources */}
               <div className="space-y-4">
-                <div>
-                  <Label>Memory Request (MB)</Label>
-                  <Input
-                    type="number"
-                    value={formData.memory_request}
-                    onChange={(e) =>
-                      setFormData((prev) => ({
-                        ...prev,
-                        memory_request: e.target.value,
-                      }))
-                    }
-                    placeholder="e.g., 128"
-                  />
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Minimum memory allocation
-                  </p>
-                </div>
-                <div>
-                  <Label>Memory Limit (MB)</Label>
-                  <Input
-                    type="number"
-                    value={formData.memory_limit}
-                    onChange={(e) =>
-                      setFormData((prev) => ({
-                        ...prev,
-                        memory_limit: e.target.value,
-                      }))
-                    }
-                    placeholder="e.g., 256"
-                  />
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Maximum memory allocation
-                  </p>
+                <h3 className="text-sm font-medium">Memory Resources</h3>
+                <div className="space-y-4">
+                  <div>
+                    <Label>Memory Request (MB)</Label>
+                    <Input
+                      type="number"
+                      value={formData.memory_request}
+                      onChange={(e) =>
+                        setFormData((prev) => ({
+                          ...prev,
+                          memory_request: e.target.value,
+                        }))
+                      }
+                      placeholder="e.g., 128"
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Minimum memory allocation
+                    </p>
+                  </div>
+                  <div>
+                    <Label>Memory Limit (MB)</Label>
+                    <Input
+                      type="number"
+                      value={formData.memory_limit}
+                      onChange={(e) =>
+                        setFormData((prev) => ({
+                          ...prev,
+                          memory_limit: e.target.value,
+                        }))
+                      }
+                      placeholder="e.g., 256"
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Maximum memory allocation
+                    </p>
+                  </div>
                 </div>
               </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <div>
-                <Label>Git Branch</Label>
-                <Input
-                  value={formData.branch}
-                  onChange={(e) =>
-                    setFormData((prev) => ({ ...prev, branch: e.target.value }))
-                  }
-                  placeholder="e.g., main"
-                />
-                <p className="text-xs text-muted-foreground mt-1">
-                  Branch to deploy from
-                </p>
-              </div>
-              <div>
-                <Label>Replicas</Label>
-                <Input
-                  type="number"
-                  min="1"
-                  value={formData.replicas}
-                  onChange={(e) =>
-                    setFormData((prev) => ({
-                      ...prev,
-                      replicas: e.target.value,
-                    }))
-                  }
-                  placeholder="e.g., 1"
-                />
-                <p className="text-xs text-muted-foreground mt-1">
-                  Number of container instances
-                </p>
+            {/* Scaling & Network */}
+            <div className="border-t pt-6">
+              <h3 className="text-sm font-medium mb-4">Scaling & Network</h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div>
+                  <Label>Replicas</Label>
+                  <Input
+                    type="number"
+                    min="1"
+                    value={formData.replicas}
+                    onChange={(e) =>
+                      setFormData((prev) => ({
+                        ...prev,
+                        replicas: e.target.value,
+                      }))
+                    }
+                    placeholder="e.g., 1"
+                  />
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Number of container instances
+                  </p>
+                </div>
+
+                <div>
+                  <Label>Exposed Port (Override)</Label>
+                  <Input
+                    type="number"
+                    min="1"
+                    max="65535"
+                    value={formData.exposed_port}
+                    onChange={(e) =>
+                      setFormData((prev) => ({
+                        ...prev,
+                        exposed_port: e.target.value,
+                      }))
+                    }
+                    placeholder="Auto-detected from image"
+                  />
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Override the port for this environment. Priority: Image
+                    EXPOSE → This value → Project port → Default (3000)
+                  </p>
+                </div>
               </div>
             </div>
 

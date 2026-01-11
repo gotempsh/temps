@@ -1,0 +1,19 @@
+{
+  "name": "simple-nextjs",
+  "version": "1.0.0",
+  "description": "Simple Next.js app for testing Nixpacks deployment",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start -p ${PORT:-3000}",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "14.1.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -5,9 +5,10 @@
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use serde_json;
 use std::sync::Arc;
+use temps_core::EncryptionService;
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
-use tracing::{debug, info, warn};
 use temps_logs::LogService;
+use tracing::{debug, info};
 #[derive(Debug, Clone)]
 pub struct JobDefinition {
     pub job_id: String,
@@ -20,13 +21,16 @@ pub struct JobDefinition {
     pub required_for_completion: bool,
 }
 
+use super::deployment_token_service::DeploymentTokenService;
+
 /// Plans and creates workflow jobs based on project configuration
 pub struct WorkflowPlanner {
     db: Arc<DatabaseConnection>,
     log_service: Arc<LogService>,
-    external_service_manager: Option<Arc<temps_providers::ExternalServiceManager>>,
+    external_service_manager: Arc<temps_providers::ExternalServiceManager>,
     config_service: Arc<temps_config::ConfigService>,
     dsn_service: Arc<temps_error_tracking::DSNService>,
+    deployment_token_service: Arc<DeploymentTokenService>,
 }
 
 impl WorkflowPlanner {
@@ -36,13 +40,17 @@ impl WorkflowPlanner {
         external_service_manager: Arc<temps_providers::ExternalServiceManager>,
         config_service: Arc<temps_config::ConfigService>,
         dsn_service: Arc<temps_error_tracking::DSNService>,
+        encryption_service: Arc<EncryptionService>,
     ) -> Self {
+        let deployment_token_service =
+            Arc::new(DeploymentTokenService::new(db.clone(), encryption_service));
         Self {
             db,
             log_service,
-            external_service_manager: Some(external_service_manager),
+            external_service_manager,
             config_service,
             dsn_service,
+            deployment_token_service,
         }
     }
 
@@ -51,15 +59,26 @@ impl WorkflowPlanner {
     /// 1. Environment variables from the env_vars table for the specific environment (via env_var_environments junction table)
     /// 2. Runtime environment variables from external services linked to the project
     /// 3. Sentry DSN environment variables (SENTRY_DSN and NEXT_PUBLIC_SENTRY_DSN) - auto-generated per project/environment
+    /// 4. Deployment token environment variables (TEMPS_API_URL and TEMPS_API_TOKEN) - for API access from deployed apps
+    ///
+    /// IMPORTANT: If any external service fails to provide env vars, the entire deployment will fail
+    /// with a meaningful error message. This prevents silent failures where containers would be
+    /// missing critical configuration (e.g., database connection strings).
     async fn gather_environment_variables(
         &self,
         project: &projects::Model,
         environment: &environments::Model,
     ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        use temps_entities::{env_vars, env_var_environments, project_services};
         use std::collections::HashMap;
+        use temps_entities::{env_var_environments, env_vars, project_services};
 
         let mut env_vars_map = HashMap::new();
+
+        // Add default HOST environment variable
+        // This ensures containers bind to all network interfaces (0.0.0.0)
+        // which is required for external access via port mapping
+        // Can be overridden by user-defined environment variables
+        env_vars_map.insert("HOST".to_string(), "0.0.0.0".to_string());
 
         // 1. Get environment variables for this project and environment
         // Query through the env_var_environments junction table to get all env vars
@@ -84,7 +103,10 @@ impl WorkflowPlanner {
             }
         }
 
-        debug!("📦 Loaded {} environment variables from env_vars table via env_var_environments", env_vars_map.len());
+        debug!(
+            "📦 Loaded {} environment variables from env_vars table via env_var_environments",
+            env_vars_map.len()
+        );
 
         // 2. Get runtime environment variables from external services
         // First, get all services linked to this project
@@ -93,55 +115,86 @@ impl WorkflowPlanner {
             .all(self.db.as_ref())
             .await?;
 
-        debug!("🔌 Found {} external services linked to project {}", project_services_list.len(), project.id);
+        debug!(
+            "🔌 Found {} external services linked to project {}",
+            project_services_list.len(),
+            project.id
+        );
+
+        // Track failed services to provide detailed error messages
+        let mut failed_services: Vec<(i32, String)> = Vec::new();
 
         // Get runtime environment variables from each external service
-        if let Some(ref service_manager) = self.external_service_manager {
-            for project_service in project_services_list {
-                debug!("🔍 Fetching runtime env vars for service ID {}", project_service.service_id);
+        for project_service in project_services_list {
+            debug!(
+                "Fetching runtime env vars for service ID {} (project: {}, environment: {})",
+                project_service.service_id, project.id, environment.id
+            );
 
-                match service_manager
-                    .get_runtime_env_vars(
+            match self
+                .external_service_manager
+                .get_runtime_env_vars(project_service.service_id, project.id, environment.id)
+                .await
+            {
+                Ok(service_env_vars) => {
+                    debug!(
+                        "Got {} env vars from service {}: {}",
+                        service_env_vars.len(),
                         project_service.service_id,
-                        project.slug.clone(),
-                        environment.slug.clone(),
-                    )
-                    .await
-                {
-                    Ok(service_env_vars) => {
-                        debug!(
-                            "✅ Got {} env vars from service {}",
-                            service_env_vars.len(),
-                            project_service.service_id
-                        );
-                        // Merge service env vars into the main map
-                        env_vars_map.extend(service_env_vars);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "⚠️  Failed to get runtime env vars for service {}: {:?}",
-                            project_service.service_id, e
-                        );
-                    }
+                        service_env_vars
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    // Merge service env vars into the main map
+                    env_vars_map.extend(service_env_vars);
+                }
+                Err(e) => {
+                    // Collect the error - we'll fail the entire deployment if any service fails
+                    let error_msg = format!("{}", e);
+                    failed_services.push((project_service.service_id, error_msg));
+                    tracing::error!(
+                        "Failed to get runtime env vars for service {}: {}",
+                        project_service.service_id,
+                        e
+                    );
                 }
             }
-        } else if !project_services_list.is_empty() {
-            warn!(
-                "⚠️  Project has {} external services but ExternalServiceManager is not available. \
-                External service environment variables will NOT be included in deployment.",
-                project_services_list.len()
+        }
+
+        // CRITICAL: If any external service failed, fail the entire deployment
+        // This prevents silent failures where containers would be missing critical environment variables
+        if !failed_services.is_empty() {
+            let failure_details = failed_services
+                .iter()
+                .map(|(service_id, error)| format!("  • Service ID {}: {}", service_id, error))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let error_message = format!(
+                "Failed to gather environment variables from {} external service(s). \
+                The deployment cannot proceed without all required external services configured:\n{}",
+                failed_services.len(),
+                failure_details
             );
+
+            return Err(anyhow::anyhow!(error_message));
         }
 
         // 3. Get or create Sentry DSN for error tracking
         // Generate/fetch DSN for this project/environment combination
         // This ensures each environment has its own DSN for proper error isolation
-        debug!("🔑 Fetching or generating Sentry DSN for project {} environment {}", project.id, environment.id);
+        debug!(
+            "🔑 Fetching or generating Sentry DSN for project {} environment {}",
+            project.id, environment.id
+        );
 
         // Get base URL from config service for DSN generation
         match self.config_service.get_external_url_or_default().await {
             Ok(base_url) => {
-                match self.dsn_service
+                match self
+                    .dsn_service
                     .get_or_create_project_dsn(
                         project.id,
                         Some(environment.id),
@@ -152,7 +205,7 @@ impl WorkflowPlanner {
                 {
                     Ok(project_dsn) => {
                         debug!(
-                            "✅ Got DSN for project {} environment {}: {}",
+                            "Got DSN for project {} environment {}: {}",
                             project.id, environment.id, project_dsn.dsn
                         );
                         // Add both SENTRY_DSN and NEXT_PUBLIC_SENTRY_DSN for compatibility with different frameworks
@@ -160,24 +213,88 @@ impl WorkflowPlanner {
                         env_vars_map.insert("NEXT_PUBLIC_SENTRY_DSN".to_string(), project_dsn.dsn);
                     }
                     Err(e) => {
-                        warn!(
-                            "⚠️  Failed to get or create DSN for project {} environment {}: {:?}. \
+                        // Warn about Sentry DSN failure but don't fail the deployment
+                        // Sentry is optional for monitoring, not required for app functionality
+                        tracing::error!(
+                            "Failed to get or create DSN for project {} environment {}: {}. \
                             Sentry DSN environment variables will NOT be included.",
-                            project.id, environment.id, e
+                            project.id,
+                            environment.id,
+                            e
                         );
                     }
                 }
             }
             Err(e) => {
-                warn!(
-                    "⚠️  Failed to get external URL from config: {:?}. \
+                // Warn about external URL failure but don't fail the deployment
+                // Sentry is optional for monitoring, not required for app functionality
+                tracing::error!(
+                    "Failed to get external URL from config: {}. \
                     Sentry DSN environment variables will NOT be included.",
                     e
                 );
             }
         }
 
-        info!("✅ Gathered {} total environment variables for deployment", env_vars_map.len());
+        // 4. Get or create deployment token for API access
+        // This provides TEMPS_API_URL and TEMPS_API_TOKEN environment variables
+        // allowing deployed applications to access Temps APIs for:
+        // - Enriching visitor data
+        // - Sending emails
+        // - Other platform features
+        debug!(
+            "🔑 Getting or creating deployment token for project {} environment {}",
+            project.id, environment.id
+        );
+
+        match self.config_service.get_external_url_or_default().await {
+            Ok(base_url) => {
+                // Set the API URL - this is always available
+                env_vars_map.insert("TEMPS_API_URL".to_string(), format!("{}/api", base_url));
+
+                // Get or create the deployment token
+                match self
+                    .deployment_token_service
+                    .get_or_create_deployment_token(project.id, Some(environment.id))
+                    .await
+                {
+                    Ok(token) => {
+                        debug!(
+                            "Got deployment token for project {} environment {} (prefix: {}...)",
+                            project.id,
+                            environment.id,
+                            &token[..8.min(token.len())]
+                        );
+                        env_vars_map.insert("TEMPS_API_TOKEN".to_string(), token);
+                    }
+                    Err(e) => {
+                        // Warn about deployment token failure but don't fail the deployment
+                        // Deployment tokens are optional for API access
+                        tracing::warn!(
+                            "Failed to get or create deployment token for project {} environment {}: {}. \
+                            TEMPS_API_TOKEN environment variable will NOT be included.",
+                            project.id,
+                            environment.id,
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                // Warn about external URL failure but don't fail the deployment
+                tracing::warn!(
+                    "Failed to get external URL from config: {}. \
+                    TEMPS_API_URL and TEMPS_API_TOKEN environment variables will NOT be included.",
+                    e
+                );
+            }
+        }
+
+        info!(
+            "Gathered {} total environment variables for deployment: {}",
+            env_vars_map.len(),
+            env_vars_map.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
         Ok(env_vars_map)
     }
 
@@ -203,12 +320,14 @@ impl WorkflowPlanner {
             .ok_or_else(|| anyhow::anyhow!("Environment not found"))?;
 
         info!(
-            "📋 Planning workflow for deployment {} (project: {}, env: {})",
+            "Planning workflow for deployment {} (project: {}, env: {})",
             deployment_id, project.name, environment.name
         );
 
         // Determine jobs based on project configuration and deployment
-        let job_definitions = self.plan_jobs_for_project(&project, &environment, &deployment).await?;
+        let job_definitions = self
+            .plan_jobs_for_project(&project, &environment, &deployment)
+            .await?;
 
         debug!(
             "🔧 Creating {} jobs for deployment {}",
@@ -241,7 +360,7 @@ impl WorkflowPlanner {
             if let Some(config_obj) = job_config.as_object_mut() {
                 config_obj.insert(
                     "_required_for_completion".to_string(),
-                    serde_json::Value::Bool(job_def.required_for_completion)
+                    serde_json::Value::Bool(job_def.required_for_completion),
                 );
             }
 
@@ -264,19 +383,68 @@ impl WorkflowPlanner {
             };
 
             let created_job = job_record.insert(self.db.as_ref()).await?;
-            debug!(
-                "✅ Created job: {} ({})",
-                created_job.name, created_job.job_id
-            );
+            debug!("Created job: {} ({})", created_job.name, created_job.job_id);
             created_jobs.push(created_job);
         }
 
         info!(
-            "🎯 Successfully created {} jobs for deployment {}",
+            "Successfully created {} jobs for deployment {}",
             created_jobs.len(),
             deployment_id
         );
         Ok(created_jobs)
+    }
+
+    /// Determine the fallback port configuration for the container
+    ///
+    /// This method resolves manual port overrides during job planning.
+    /// The actual port used at deployment time is determined by inspecting the built image
+    /// in DeployImageJob.resolve_container_port() with this priority:
+    ///
+    /// 1. Image EXPOSE directive (inspected after build - highest priority)
+    /// 2. Environment-level exposed_port
+    /// 3. Project-level exposed_port
+    /// 4. Default: 3000
+    ///
+    /// Note: Image inspection happens in the deploy job (after build completes),
+    /// not during planning, since the image doesn't exist yet at planning time.
+    ///
+    /// # Arguments
+    /// * `environment` - Environment model with optional exposed_port
+    /// * `project` - Project model with optional exposed_port
+    /// * `image_name` - Unused (kept for API compatibility, inspection happens in deploy job)
+    async fn resolve_exposed_port(
+        &self,
+        environment: &environments::Model,
+        project: &projects::Model,
+        _image_name: Option<&str>, // Unused - inspection happens in deploy job after build
+    ) -> u16 {
+        // 1. Check environment-level port override (from deployment_config)
+        if let Some(ref deployment_config) = environment.deployment_config {
+            if let Some(port) = deployment_config.exposed_port {
+                debug!(
+                    "Using environment-level port override: {} (environment: {})",
+                    port, environment.name
+                );
+                return port as u16;
+            }
+        }
+
+        // 2. Check project-level port override (from deployment_config)
+        if let Some(ref deployment_config) = project.deployment_config {
+            if let Some(port) = deployment_config.exposed_port {
+                debug!(
+                    "Using project-level port override: {} (project: {})",
+                    port, project.name
+                );
+                return port as u16;
+            }
+        }
+
+        // 3. Default to 3000
+        // Note: Image EXPOSE directive will be checked in DeployImageJob after build completes
+        debug!("Using default port: 3000 (will be overridden by image EXPOSE if present)");
+        3000
     }
 
     /// Plan jobs based on project configuration
@@ -289,14 +457,19 @@ impl WorkflowPlanner {
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
 
-        debug!("🔍 Planning jobs for project: {}", project.name);
+        debug!("Planning jobs for project: {}", project.name);
 
         // Gather environment variables for the deployment
-        let env_vars = self.gather_environment_variables(project, environment).await?;
-        debug!("📦 Gathered {} environment variables for deployment", env_vars.len());
+        let env_vars = self
+            .gather_environment_variables(project, environment)
+            .await?;
+        debug!(
+            "📦 Gathered {} environment variables for deployment",
+            env_vars.len()
+        );
 
         // Check if git info is available
-        let has_git_info = project.repo_owner.is_some() && project.repo_name.is_some();
+        let has_git_info = !project.repo_owner.is_empty() && !project.repo_name.is_empty();
 
         // Job 1: Download repository (only if git info is available)
         if has_git_info {
@@ -321,19 +494,32 @@ impl WorkflowPlanner {
                 dependencies: vec![],
                 job_config: Some(serde_json::json!({
                     "branch_ref": branch_or_commit,
+                    "tag_ref": deployment.tag_ref,
                     "commit_sha": deployment.commit_sha,
                     "repo_owner": project.repo_owner,
                     "repo_name": project.repo_name,
                     "git_provider_connection_id": project.git_provider_connection_id,
+                    "git_url": project.git_url,
+                    "is_public_repo": project.is_public_repo,
                     "directory": project.directory
                 })),
                 required_for_completion: true, // Core deployment job
             });
         } else {
-            debug!("⚠️  Skipping download_repo job - no git info available");
+            debug!("Skipping download_repo job - no git info available");
         }
 
-        // Job 2: Build container image
+        // Check if this preset supports static deployment using temps-presets
+        // Get the preset instance and check if it has a static output directory
+        let preset_instance = temps_presets::get_preset_by_slug(project.preset.as_str());
+        let static_output_dir = preset_instance.as_ref().and_then(|p| p.static_output_dir());
+
+        debug!(
+            "Preset {} static output directory: {:?}",
+            project.preset, static_output_dir
+        );
+
+        // Job 2: Build container image (skip for static deployments)
         // The BuildImageJob will generate Dockerfile from preset if it doesn't exist
         // Depends on download_repo only if git info is available
         let build_dependencies = if has_git_info {
@@ -342,56 +528,166 @@ impl WorkflowPlanner {
             vec![]
         };
 
-        // Convert environment variables to build args
-        // This ensures env vars are available during the Docker build process
-        let mut build_args_map = serde_json::Map::new();
-        for (key, value) in &env_vars {
-            build_args_map.insert(key.clone(), serde_json::Value::String(value.clone()));
-        }
+        // Determine deployment strategy: Static or Container
+        let deploy_job_id = if let Some(output_dir) = static_output_dir {
+            // Static deployment path: BuildImageJob + DeployStaticJob
+            debug!("📦 Using static deployment for preset {}", project.preset);
+            debug!("📂 Static output directory: {}", output_dir);
 
-        jobs.push(JobDefinition {
-            job_id: "build_image".to_string(),
-            job_type: "BuildImageJob".to_string(),
-            name: "Build Container Image".to_string(),
-            description: Some("Build Docker image from source code".to_string()),
-            dependencies: build_dependencies,
-            job_config: Some(serde_json::json!({
-                "dockerfile_path": "Dockerfile",
-                "build_args": build_args_map
-            })),
-            required_for_completion: true, // Core deployment job
-        });
+            // Convert environment variables to build args
+            let mut build_args_map = serde_json::Map::new();
+            for (key, value) in &env_vars {
+                build_args_map.insert(key.clone(), serde_json::Value::String(value.clone()));
+            }
 
-        // Job 3: Deploy container
-        jobs.push(JobDefinition {
-            job_id: "deploy_container".to_string(),
-            job_type: "DeployImageJob".to_string(),
-            name: "Deploy Container".to_string(),
-            description: Some("Deploy the built container image".to_string()),
-            dependencies: vec!["build_image".to_string()],
-            job_config: Some(serde_json::json!({
-                "port": 3000,
-                "replicas": 1,
-                "environment_variables": env_vars
-            })),
-            required_for_completion: true, // Core deployment job
-        });
+            // Parse preset_config if present (for Dockerfile preset)
+            let mut dockerfile_path = "Dockerfile".to_string();
+            let mut build_context = project.directory.clone();
+
+            if let Some(temps_entities::preset::PresetConfig::Dockerfile(dockerfile_config)) =
+                &project.preset_config
+            {
+                if let Some(custom_dockerfile) = &dockerfile_config.dockerfile_path {
+                    dockerfile_path = custom_dockerfile.clone();
+                }
+                if let Some(custom_context) = &dockerfile_config.build_context {
+                    build_context = custom_context.clone();
+                }
+            }
+
+            // Job 2: Build image (for static deployments, this builds the static files inside container)
+            jobs.push(JobDefinition {
+                job_id: "build_image".to_string(),
+                job_type: "BuildImageJob".to_string(),
+                name: "Build Container Image".to_string(),
+                description: Some("Build Docker image and compile static files".to_string()),
+                dependencies: build_dependencies.clone(),
+                job_config: Some(serde_json::json!({
+                    "dockerfile_path": dockerfile_path,
+                    "build_args": build_args_map,
+                    "build_context": build_context
+                })),
+                required_for_completion: true,
+            });
+
+            // Job 3: Deploy static files (extracts from built image and deploys to filesystem)
+            jobs.push(JobDefinition {
+                job_id: "deploy_static".to_string(),
+                job_type: "DeployStaticJob".to_string(),
+                name: "Deploy Static Files".to_string(),
+                description: Some("Extract and deploy static files from container".to_string()),
+                dependencies: vec!["build_image".to_string()],
+                job_config: Some(serde_json::json!({
+                    "static_output_dir": output_dir,  // Path inside container (e.g., "/app/dist")
+                    "project_slug": project.slug,
+                    "environment_slug": environment.slug,
+                    "deployment_slug": deployment.slug
+                })),
+                required_for_completion: true,
+            });
+
+            "deploy_static".to_string()
+        } else {
+            // Container deployment path: BuildImageJob + DeployImageJob
+            debug!(
+                "🐳 Using container deployment for preset {}",
+                project.preset
+            );
+
+            // Convert environment variables to build args
+            let mut build_args_map = serde_json::Map::new();
+            for (key, value) in &env_vars {
+                build_args_map.insert(key.clone(), serde_json::Value::String(value.clone()));
+            }
+
+            // Parse preset_config if present (for Dockerfile preset)
+            let mut dockerfile_path = "Dockerfile".to_string();
+            let mut build_context = project.directory.clone();
+
+            if let Some(temps_entities::preset::PresetConfig::Dockerfile(dockerfile_config)) =
+                &project.preset_config
+            {
+                if let Some(custom_dockerfile) = &dockerfile_config.dockerfile_path {
+                    dockerfile_path = custom_dockerfile.clone();
+                }
+                if let Some(custom_context) = &dockerfile_config.build_context {
+                    build_context = custom_context.clone();
+                }
+            }
+
+            jobs.push(JobDefinition {
+                job_id: "build_image".to_string(),
+                job_type: "BuildImageJob".to_string(),
+                name: "Build Container Image".to_string(),
+                description: Some("Build Docker image from source code".to_string()),
+                dependencies: build_dependencies.clone(),
+                job_config: Some(serde_json::json!({
+                    "dockerfile_path": dockerfile_path,
+                    "build_args": build_args_map,
+                    "build_context": build_context
+                })),
+                required_for_completion: true,
+            });
+
+            // Deploy container
+            let image_name = format!("temps-{}:{}", project.slug, deployment.id);
+            let exposed_port = self
+                .resolve_exposed_port(environment, project, Some(&image_name))
+                .await;
+
+            debug!(
+                "📡 Container will expose port {} (image: {})",
+                exposed_port, image_name
+            );
+
+            let mut deploy_env_vars = env_vars.clone();
+            deploy_env_vars.insert("PORT".to_string(), exposed_port.to_string());
+
+            let replicas = environment
+                .deployment_config
+                .as_ref()
+                .map(|c| c.replicas)
+                .or_else(|| project.deployment_config.as_ref().map(|c| c.replicas))
+                .unwrap_or(1);
+
+            debug!("🔢 Planning deployment with {} replicas", replicas);
+
+            jobs.push(JobDefinition {
+                job_id: "deploy_container".to_string(),
+                job_type: "DeployImageJob".to_string(),
+                name: "Deploy Container".to_string(),
+                description: Some("Deploy the built container image".to_string()),
+                dependencies: vec!["build_image".to_string()],
+                job_config: Some(serde_json::json!({
+                    "port": exposed_port,
+                    "replicas": replicas,
+                    "environment_variables": deploy_env_vars,
+                    "image_name": image_name
+                })),
+                required_for_completion: true,
+            });
+
+            "deploy_container".to_string()
+        };
 
         // Job 4: Mark deployment as complete
         // This synthetic job marks the deployment as "Completed" and updates environment routing
         // It acts as a barrier between core deployment jobs and optional post-deployment jobs
+        // Depends on either deploy_static or deploy_container depending on deployment strategy
         jobs.push(JobDefinition {
             job_id: "mark_deployment_complete".to_string(),
             job_type: "MarkDeploymentCompleteJob".to_string(),
             name: "Mark Deployment Complete".to_string(),
-            description: Some("Mark deployment as complete and update environment routing".to_string()),
-            dependencies: vec!["deploy_container".to_string()],
+            description: Some(
+                "Mark deployment as complete and update environment routing".to_string(),
+            ),
+            dependencies: vec![deploy_job_id],
             job_config: Some(serde_json::json!({
                 "deployment_id": deployment.id
             })),
             required_for_completion: true, // Critical job - ensures deployment is marked complete
         });
-        debug!("✅ Added mark_deployment_complete job as barrier between core and optional jobs");
+        debug!("Added mark_deployment_complete job as barrier between core and optional jobs");
 
         // Job 5: Configure cron jobs (only if git info is available)
         // This job reads .temps.yaml from the repository and configures cron jobs
@@ -412,9 +708,11 @@ impl WorkflowPlanner {
                 })),
                 required_for_completion: false, // Post-deployment job - not required for deployment success
             });
-            debug!("✅ Added configure_crons job to workflow (runs after deployment is marked complete)");
+            debug!(
+                "Added configure_crons job to workflow (runs after deployment is marked complete)"
+            );
         } else {
-            debug!("⚠️  Skipping configure_crons job - no git info available");
+            debug!("Skipping configure_crons job - no git info available");
         }
 
         // Job 6: Take screenshot (only if screenshots are enabled in config)
@@ -434,16 +732,42 @@ impl WorkflowPlanner {
                 })),
                 required_for_completion: false, // Post-deployment job - not required for deployment success
             });
-            debug!("✅ Added take_screenshot job to workflow (screenshot service will be injected by plugin system)");
+            debug!("Added take_screenshot job to workflow (screenshot service will be injected by plugin system)");
         } else {
-            debug!("⚠️  Skipping screenshot job - screenshots are disabled in config");
+            debug!("Skipping screenshot job - screenshots are disabled in config");
         }
 
-        info!(
-            "📋 Planned {} jobs for project {}",
-            jobs.len(),
-            project.name
-        );
+        // Job 7: Scan for vulnerabilities (only if git info is available)
+        // This runs in parallel with other post-deployment jobs AFTER deployment is marked complete
+        // NOT required for deployment completion - if it fails, deployment still succeeds
+        if has_git_info {
+            jobs.push(JobDefinition {
+                job_id: "scan_vulnerabilities".to_string(),
+                job_type: "ScanVulnerabilitiesJob".to_string(),
+                name: "Scan Vulnerabilities".to_string(),
+                description: Some("Scan Docker image for security vulnerabilities".to_string()),
+                // Depends on mark_deployment_complete - ensures deployment is LIVE before scanning
+                // The image is available from build_image (stored in registry) but we scan after deployment
+                dependencies: vec!["mark_deployment_complete".to_string()],
+                job_config: Some(serde_json::json!({
+                    "deployment_id": deployment.id,
+                    "project_id": project.id,
+                    "environment_id": deployment.environment_id,
+                    "branch": deployment.branch_ref,
+                    "commit_hash": deployment.commit_sha,
+                    "download_job_id": "download_repo",
+                    "build_job_id": "build_image"
+                })),
+                required_for_completion: false, // Post-deployment job - not required for deployment success
+            });
+            debug!(
+                "Added scan_vulnerabilities job to workflow (runs after deployment is marked complete)"
+            );
+        } else {
+            debug!("Skipping vulnerability scan job - no git info available");
+        }
+
+        info!("Planned {} jobs for project {}", jobs.len(), project.name);
         Ok(jobs)
     }
 }
@@ -453,36 +777,55 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use sea_orm::Set;
+
+    use temps_config::{ConfigService, ServerConfig};
     use temps_core::EncryptionService;
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::types::ProjectType;
-    use temps_config::{ConfigService, ServerConfig};
-    use std::path::PathBuf;
+    use temps_entities::{preset::Preset, upstream_config::UpstreamList};
 
     fn create_test_config_service(db: Arc<DatabaseConnection>) -> Arc<ConfigService> {
-        let server_config = Arc::new(ServerConfig::new(
-            "127.0.0.1:3000".to_string(),
-            "postgresql://test".to_string(),
-            None,
-            Some("127.0.0.1:8000".to_string()),
-        ).unwrap());
+        let server_config = Arc::new(
+            ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgresql://test".to_string(),
+                None,
+                Some("127.0.0.1:8000".to_string()),
+            )
+            .unwrap(),
+        );
         Arc::new(ConfigService::new(server_config, db))
     }
 
-    fn create_test_dsn_service(db: Arc<DatabaseConnection>) -> Arc<temps_error_tracking::DSNService> {
+    fn create_test_dsn_service(
+        db: Arc<DatabaseConnection>,
+    ) -> Arc<temps_error_tracking::DSNService> {
         Arc::new(temps_error_tracking::DSNService::new(db))
     }
 
-    fn create_test_external_service_manager(db: Arc<DatabaseConnection>) -> Arc<temps_providers::ExternalServiceManager> {
-        let encryption_service = Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+    fn create_test_external_service_manager(
+        db: Arc<DatabaseConnection>,
+    ) -> Arc<temps_providers::ExternalServiceManager> {
+        let encryption_service = create_test_encryption_service();
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().ok().unwrap());
-        Arc::new(temps_providers::ExternalServiceManager::new(db, encryption_service, docker))
+        Arc::new(temps_providers::ExternalServiceManager::new(
+            db,
+            encryption_service,
+            docker,
+        ))
+    }
+
+    fn create_test_encryption_service() -> Arc<EncryptionService> {
+        Arc::new(
+            EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        )
     }
 
     async fn create_test_project(
         db: &DatabaseConnection,
-        project_type: ProjectType,
-        preset: Option<String>,
+        preset: Preset,
     ) -> Result<
         (projects::Model, environments::Model, deployments::Model),
         Box<dyn std::error::Error>,
@@ -491,13 +834,12 @@ mod tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            repo_owner: Set(Some("test-owner".to_string())),
-            repo_name: Set(Some("test-repo".to_string())),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
             main_branch: Set("main".to_string()),
             git_provider_connection_id: Set(Some(1)),
             preset: Set(preset),
             directory: Set("/".to_string()),
-            project_type: Set(project_type),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -510,7 +852,7 @@ mod tests {
             name: Set("Production".to_string()),
             slug: Set("production".to_string()),
             host: Set("test.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             subdomain: Set("test.example.com".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -524,7 +866,9 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("test-deployment".to_string()),
             state: Set("pending".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -542,17 +886,27 @@ mod tests {
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let planner = WorkflowPlanner::new(db.clone(), log_service, external_service_manager, config_service, dsn_service);
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service,
+            external_service_manager,
+            config_service,
+            dsn_service,
+            create_test_encryption_service(),
+        );
 
-        let (project, environment, deployment) =
-            create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
-                .await?;
+        let (_project, _environment, deployment) =
+            create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
 
         // Should create 5 jobs: download_repo, build_image, deploy_container, mark_deployment_complete, configure_crons
         // Screenshots may or may not be included depending on config
-        assert!(jobs.len() >= 5, "Expected at least 5 jobs, got {}", jobs.len());
+        assert!(
+            jobs.len() >= 5,
+            "Expected at least 5 jobs, got {}",
+            jobs.len()
+        );
 
         let job_ids: Vec<String> = jobs.iter().map(|j| j.job_id.clone()).collect();
         assert!(job_ids.contains(&"download_repo".to_string()));
@@ -564,7 +918,9 @@ mod tests {
         // Check that all jobs are in pending state
         for job in &jobs {
             assert_eq!(job.status, JobStatus::Pending);
-            assert!(job.log_id.contains(&format!("deployment-{}", deployment.id)));
+            assert!(job
+                .log_id
+                .contains(&format!("deployment-{}", deployment.id)));
         }
 
         Ok(())
@@ -578,19 +934,25 @@ mod tests {
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let planner = WorkflowPlanner::new(db.clone(), log_service, external_service_manager, config_service, dsn_service);
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service,
+            external_service_manager,
+            config_service,
+            dsn_service,
+            create_test_encryption_service(),
+        );
 
         // Create project without git info
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            repo_owner: Set(None), // No git info
-            repo_name: Set(None),
+            repo_owner: Set("".to_string()), // No git info
+            repo_name: Set("".to_string()),
             main_branch: Set("main".to_string()),
             git_provider_connection_id: Set(None),
-            preset: Set(Some("nextjs".to_string())),
+            preset: Set(Preset::NextJs),
             directory: Set("/".to_string()),
-            project_type: Set(ProjectType::Server),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -603,7 +965,7 @@ mod tests {
             name: Set("Production".to_string()),
             slug: Set("production".to_string()),
             host: Set("test.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             subdomain: Set("test.example.com".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -617,7 +979,9 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("test-deployment".to_string()),
             state: Set("pending".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -627,7 +991,11 @@ mod tests {
         // Should succeed and create only build_image, deploy_container, and mark_deployment_complete jobs
         // (no download_repo or configure_crons since git info is missing)
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
-        assert!(jobs.len() >= 3, "Expected at least 3 jobs, got {}", jobs.len());
+        assert!(
+            jobs.len() >= 3,
+            "Expected at least 3 jobs, got {}",
+            jobs.len()
+        );
 
         let job_ids: Vec<String> = jobs.iter().map(|j| j.job_id.clone()).collect();
         assert!(job_ids.contains(&"build_image".to_string()));
@@ -648,11 +1016,17 @@ mod tests {
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let planner = WorkflowPlanner::new(db.clone(), log_service, external_service_manager, config_service, dsn_service);
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service,
+            external_service_manager,
+            config_service,
+            dsn_service,
+            create_test_encryption_service(),
+        );
 
-        let (project, environment, deployment) =
-            create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
-                .await?;
+        let (_project, _environment, deployment) =
+            create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
 
@@ -665,8 +1039,14 @@ mod tests {
         let job_order: Vec<String> = jobs.iter().map(|j| j.job_id.clone()).collect();
         let download_index = job_order.iter().position(|x| x == "download_repo").unwrap();
         let build_index = job_order.iter().position(|x| x == "build_image").unwrap();
-        let deploy_index = job_order.iter().position(|x| x == "deploy_container").unwrap();
-        let mark_complete_index = job_order.iter().position(|x| x == "mark_deployment_complete").unwrap();
+        let deploy_index = job_order
+            .iter()
+            .position(|x| x == "deploy_container")
+            .unwrap();
+        let mark_complete_index = job_order
+            .iter()
+            .position(|x| x == "mark_deployment_complete")
+            .unwrap();
 
         assert!(download_index < build_index);
         assert!(build_index < deploy_index);
@@ -683,17 +1063,26 @@ mod tests {
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let planner = WorkflowPlanner::new(db.clone(), log_service, external_service_manager, config_service, dsn_service);
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service,
+            external_service_manager,
+            config_service,
+            dsn_service,
+            create_test_encryption_service(),
+        );
 
-        let (project, environment, deployment) =
-            create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
-                .await?;
+        let (_project, _environment, deployment) =
+            create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
 
         // Find specific jobs and check their dependencies
         let build_job = jobs.iter().find(|j| j.job_id == "build_image").unwrap();
-        let deploy_job = jobs.iter().find(|j| j.job_id == "deploy_container").unwrap();
+        let deploy_job = jobs
+            .iter()
+            .find(|j| j.job_id == "deploy_container")
+            .unwrap();
 
         // Check dependencies are stored correctly
         if let Some(build_deps) = &build_job.dependencies {
@@ -717,11 +1106,17 @@ mod tests {
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let planner = WorkflowPlanner::new(db.clone(), log_service, external_service_manager, config_service, dsn_service);
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service,
+            external_service_manager,
+            config_service,
+            dsn_service,
+            create_test_encryption_service(),
+        );
 
-        let (project, environment, deployment) =
-            create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
-                .await?;
+        let (_project, _environment, deployment) =
+            create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
 
@@ -735,7 +1130,10 @@ mod tests {
             assert!(config_obj.get("build_args").is_some());
         }
 
-        let deploy_job = jobs.iter().find(|j| j.job_id == "deploy_container").unwrap();
+        let deploy_job = jobs
+            .iter()
+            .find(|j| j.job_id == "deploy_container")
+            .unwrap();
         assert!(deploy_job.job_config.is_some());
 
         if let Some(config) = &deploy_job.job_config {
@@ -755,20 +1153,39 @@ mod tests {
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let planner = WorkflowPlanner::new(db.clone(), log_service, external_service_manager, config_service, dsn_service);
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service,
+            external_service_manager,
+            config_service,
+            dsn_service,
+            create_test_encryption_service(),
+        );
 
         let (project, environment, deployment) =
-            create_test_project(db.as_ref(), ProjectType::Server, Some("nextjs".to_string()))
-                .await?;
+            create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
 
         // Verify log_id format - should be hierarchical: {project_slug}/{env_slug}/{year}/{month}/{day}/{hour}/{minute}/deployment-{id}-job-{job_id}.log
         for job in &jobs {
-            assert!(job.log_id.contains(&project.slug), "log_id should contain project slug");
-            assert!(job.log_id.contains(&environment.slug), "log_id should contain environment slug");
-            assert!(job.log_id.contains(&format!("deployment-{}-job-{}.log", deployment.id, job.job_id)),
-                    "log_id should contain deployment-{}-job-{}.log", deployment.id, job.job_id);
+            assert!(
+                job.log_id.contains(&project.slug),
+                "log_id should contain project slug"
+            );
+            assert!(
+                job.log_id.contains(&environment.slug),
+                "log_id should contain environment slug"
+            );
+            assert!(
+                job.log_id.contains(&format!(
+                    "deployment-{}-job-{}.log",
+                    deployment.id, job.job_id
+                )),
+                "log_id should contain deployment-{}-job-{}.log",
+                deployment.id,
+                job.job_id
+            );
         }
 
         Ok(())

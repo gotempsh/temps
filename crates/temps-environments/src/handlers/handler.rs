@@ -1,10 +1,10 @@
-use super::audit::{EnvironmentSettingsUpdatedAudit, EnvironmentSettingsUpdatedFields};
+use super::audit::{
+    EnvironmentDeletedAudit, EnvironmentSettingsUpdatedAudit, EnvironmentSettingsUpdatedFields,
+};
 use super::types::AppState;
 use axum::Router;
 use axum::{
-    extract::{
-        Extension, Path, Query, State,
-    },
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post, put},
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::AuditContext;
 use temps_core::RequestMetadata;
-use tracing::error;
+use tracing::{error, info};
 use utoipa::OpenApi;
 
 use super::types::{
@@ -29,15 +29,25 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
     fn from(err: crate::services::env_var_service::EnvVarError) -> Self {
         use crate::services::env_var_service::EnvVarError;
         match err {
-            EnvVarError::NotFound(msg) => temps_core::error_builder::not_found().detail(msg).build(),
-            EnvVarError::InvalidInput(msg) => temps_core::error_builder::bad_request().detail(msg).build(),
+            EnvVarError::NotFound(msg) => {
+                temps_core::error_builder::not_found().detail(msg).build()
+            }
+            EnvVarError::InvalidInput(msg) => {
+                temps_core::error_builder::bad_request().detail(msg).build()
+            }
             EnvVarError::DatabaseConnectionError(msg) => {
-                temps_core::error_builder::internal_server_error().detail(msg).build()
+                temps_core::error_builder::internal_server_error()
+                    .detail(msg)
+                    .build()
             }
             EnvVarError::DatabaseError { reason } => {
-                temps_core::error_builder::internal_server_error().detail(reason).build()
+                temps_core::error_builder::internal_server_error()
+                    .detail(reason)
+                    .build()
             }
-            EnvVarError::Other(msg) => temps_core::error_builder::internal_server_error().detail(msg).build(),
+            EnvVarError::Other(msg) => temps_core::error_builder::internal_server_error()
+                .detail(msg)
+                .build(),
         }
     }
 }
@@ -135,15 +145,26 @@ pub async fn get_environment_domains(
         .await
         .map_err(Problem::from)?;
 
-    let response: Vec<EnvironmentDomainResponse> = domains
-        .into_iter()
-        .map(|d| EnvironmentDomainResponse {
+    let mut response: Vec<EnvironmentDomainResponse> = Vec::new();
+    for d in domains {
+        let fqdn = state
+            .environment_service
+            .compute_environment_fqdn(&d.domain)
+            .await;
+
+        let url = state
+            .environment_service
+            .compute_environment_url(&d.domain)
+            .await;
+
+        response.push(EnvironmentDomainResponse {
             id: d.id,
             environment_id: d.environment_id,
-            domain: d.domain,
+            domain: fqdn,
             created_at: d.created_at.timestamp_millis(),
-        })
-        .collect();
+            url,
+        });
+    }
 
     Ok(Json(response))
 }
@@ -179,11 +200,22 @@ pub async fn add_environment_domain(
         .await
         .map_err(Problem::from)?;
 
+    let fqdn = state
+        .environment_service
+        .compute_environment_fqdn(&domain.domain)
+        .await;
+
+    let url = state
+        .environment_service
+        .compute_environment_url(&domain.domain)
+        .await;
+
     let response = EnvironmentDomainResponse {
         id: domain.id,
         environment_id: domain.environment_id,
-        domain: domain.domain,
+        domain: fqdn,
         created_at: domain.created_at.timestamp_millis(),
+        url,
     };
 
     Ok((StatusCode::CREATED, Json(response)))
@@ -270,6 +302,7 @@ pub async fn get_environment_variables(
                     current_deployment_id: env.current_deployment_id,
                 })
                 .collect(),
+            include_in_preview: v.include_in_preview,
         })
         .collect();
 
@@ -307,6 +340,7 @@ pub async fn create_environment_variable(
             request.environment_ids,
             request.key,
             request.value,
+            request.include_in_preview,
         )
         .await
         .map_err(Problem::from)?;
@@ -327,6 +361,7 @@ pub async fn create_environment_variable(
                 current_deployment_id: env.current_deployment_id,
             })
             .collect(),
+        include_in_preview: var.include_in_preview,
     };
 
     Ok((StatusCode::CREATED, Json(response)))
@@ -395,6 +430,7 @@ pub async fn update_environment_variable(
             request.key,
             request.value,
             request.environment_ids,
+            request.include_in_preview,
         )
         .await?;
 
@@ -414,6 +450,7 @@ pub async fn update_environment_variable(
                 current_deployment_id: env.current_deployment_id,
             })
             .collect(),
+        include_in_preview: var.include_in_preview,
     };
 
     Ok(Json(response))
@@ -504,6 +541,7 @@ pub async fn update_environment_settings(
         memory_limit: settings.memory_limit,
         branch: settings.branch,
         replicas: settings.replicas,
+        security_updated: settings.security.is_some(),
     };
 
     let audit_event = EnvironmentSettingsUpdatedAudit {
@@ -523,6 +561,97 @@ pub async fn update_environment_settings(
     }
 
     Ok(Json(EnvironmentResponse::from(updated_environment)).into_response())
+}
+
+/// Delete an environment permanently
+///
+/// Permanently deletes an environment and all related data. Cannot delete:
+/// - Production environments (name = "Production")
+///
+/// Warning: This action is permanent and cannot be undone.
+/// Active deployments are automatically cancelled before deletion.
+#[utoipa::path(
+    delete,
+    path = "/projects/{project_id}/environments/{env_id}",
+    tag = "Projects",
+    responses(
+        (status = 204, description = "Environment permanently deleted"),
+        (status = 400, description = "Cannot delete production environment"),
+        (status = 404, description = "Project or environment not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("env_id" = i32, Path, description = "Environment ID")
+    )
+)]
+pub async fn delete_environment(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, env_id)): Path<(i32, i32)>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsDelete);
+
+    // Get environment details before deletion for audit log
+    let environment = state
+        .environment_service
+        .get_environment(project_id, env_id)
+        .await?;
+
+    let project = state.environment_service.get_project(project_id).await?;
+
+    // Cancel all active deployments for this environment
+    match state
+        .deployment_service
+        .cancel_all_environment_deployments(env_id)
+        .await
+    {
+        Ok(count) => {
+            if count > 0 {
+                info!(
+                    "Cancelled {} active deployment(s) before deleting environment {}",
+                    count, env_id
+                );
+            }
+        }
+        Err(e) => {
+            error!(
+                "Failed to cancel deployments for environment {}: {:?}",
+                env_id, e
+            );
+            // Continue with deletion even if cancellation fails
+        }
+    }
+
+    // Delete the environment
+    state
+        .environment_service
+        .delete_environment(project_id, env_id)
+        .await?;
+
+    // Create audit event
+    let audit_context = temps_core::AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    };
+
+    let audit_event = EnvironmentDeletedAudit {
+        context: audit_context,
+        project_id: project.id,
+        project_name: project.name,
+        project_slug: project.slug,
+        environment_id: environment.id,
+        environment_name: environment.name,
+        environment_slug: environment.slug,
+    };
+
+    if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
+        error!("Failed to create audit log: {:?}", e);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Create a new environment for a project
@@ -571,7 +700,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/projects/{project_id}/environments/{id_or_slug}",
-            get(get_environment),
+            get(get_environment).delete(delete_environment),
         )
         .route(
             "/projects/{project_id}/environments/{id_or_slug}/settings",
@@ -620,6 +749,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         get_environment,
         create_environment,
         update_environment_settings,
+        delete_environment,
         get_environment_domains,
         add_environment_domain,
         delete_environment_domain,

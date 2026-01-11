@@ -447,8 +447,6 @@ impl NotificationService {
     }
 
     fn get_batch_key(notification: &Notification) -> String {
-        // Create a key to group similar notifications
-        // You can customize this based on your needs
         format!(
             "{}:{}:{}",
             notification.notification_type, notification.priority, notification.title
@@ -845,6 +843,28 @@ fn default_backup_successes_enabled() -> bool {
     true
 }
 
+fn default_weekly_digest_enabled() -> bool {
+    true
+}
+
+fn default_digest_send_day() -> String {
+    "monday".to_string()
+}
+
+fn default_digest_send_time() -> String {
+    "09:00".to_string()
+}
+
+fn default_digest_sections() -> crate::digest::DigestSections {
+    crate::digest::DigestSections {
+        performance: true,
+        deployments: true,
+        errors: true,
+        funnels: true,
+        projects: true,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationPreferences {
     // Notification Channels
@@ -876,6 +896,16 @@ pub struct NotificationPreferences {
     // Route Monitoring
     pub route_downtime_enabled: bool,
     pub load_balancer_issues_enabled: bool,
+
+    // Weekly Digest Settings
+    #[serde(default = "default_weekly_digest_enabled")]
+    pub weekly_digest_enabled: bool,
+    #[serde(default = "default_digest_send_day")]
+    pub digest_send_day: String, // "monday" | "friday" | "sunday"
+    #[serde(default = "default_digest_send_time")]
+    pub digest_send_time: String, // "09:00" format (24-hour)
+    #[serde(default = "default_digest_sections")]
+    pub digest_sections: crate::digest::DigestSections,
 }
 
 impl Default for NotificationPreferences {
@@ -904,6 +934,11 @@ impl Default for NotificationPreferences {
 
             route_downtime_enabled: true,
             load_balancer_issues_enabled: true,
+
+            weekly_digest_enabled: true,
+            digest_send_day: "monday".to_string(),
+            digest_send_time: "09:00".to_string(),
+            digest_sections: crate::digest::DigestSections::default(),
         }
     }
 }
@@ -1271,11 +1306,13 @@ mod tests {
         let service = NotificationPreferencesService::new(test_db.connection_arc());
 
         // Create custom preferences
-        let mut custom_prefs = NotificationPreferences::default();
-        custom_prefs.email_enabled = false;
-        custom_prefs.slack_enabled = true;
-        custom_prefs.minimum_severity = "critical".to_string();
-        custom_prefs.error_threshold = 500;
+        let custom_prefs = NotificationPreferences {
+            email_enabled: false,
+            slack_enabled: true,
+            minimum_severity: "critical".to_string(),
+            error_threshold: 500,
+            ..Default::default()
+        };
 
         // Update preferences
         let updated = service
@@ -1319,17 +1356,21 @@ mod tests {
         let service = NotificationPreferencesService::new(test_db.connection_arc());
 
         // Create initial preferences
-        let mut initial_prefs = NotificationPreferences::default();
-        initial_prefs.email_enabled = false;
+        let initial_prefs = NotificationPreferences {
+            email_enabled: false,
+            ..Default::default()
+        };
         service
             .update_preferences(initial_prefs)
             .await
             .expect("Failed to create initial preferences");
 
         // Update with different values
-        let mut updated_prefs = NotificationPreferences::default();
-        updated_prefs.email_enabled = true;
-        updated_prefs.slack_enabled = true;
+        let updated_prefs = NotificationPreferences {
+            email_enabled: true,
+            slack_enabled: true,
+            ..Default::default()
+        };
 
         let result = service
             .update_preferences(updated_prefs)
@@ -1441,24 +1482,30 @@ mod tests {
         let service = NotificationPreferencesService::new(test_db.connection_arc());
 
         // First update
-        let mut prefs1 = NotificationPreferences::default();
-        prefs1.error_threshold = 100;
+        let prefs1 = NotificationPreferences {
+            error_threshold: 100,
+            ..Default::default()
+        };
         service
             .update_preferences(prefs1)
             .await
             .expect("Failed to update preferences");
 
         // Second update
-        let mut prefs2 = NotificationPreferences::default();
-        prefs2.error_threshold = 200;
+        let prefs2 = NotificationPreferences {
+            error_threshold: 200,
+            ..Default::default()
+        };
         service
             .update_preferences(prefs2)
             .await
             .expect("Failed to update preferences");
 
         // Third update
-        let mut prefs3 = NotificationPreferences::default();
-        prefs3.error_threshold = 300;
+        let prefs3 = NotificationPreferences {
+            error_threshold: 300,
+            ..Default::default()
+        };
         service
             .update_preferences(prefs3)
             .await

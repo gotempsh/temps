@@ -89,7 +89,7 @@ pub async fn list_api_keys(
     permission_guard!(auth, ApiKeysRead);
 
     let page = query.page.unwrap_or(1).max(1);
-    let page_size = query.page_size.unwrap_or(20).min(100).max(1);
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
 
     match state
         .api_key_service

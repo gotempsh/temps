@@ -269,7 +269,10 @@ impl ImportValidationRule for VolumePathRule {
             }
 
             // Check for potentially problematic destination paths
-            let dangerous_paths = ["/", "/bin", "/boot", "/dev", "/etc", "/lib", "/proc", "/root", "/sbin", "/sys", "/usr"];
+            let dangerous_paths = [
+                "/", "/bin", "/boot", "/dev", "/etc", "/lib", "/proc", "/root", "/sbin", "/sys",
+                "/usr",
+            ];
             if dangerous_paths.contains(&volume.destination.as_str()) {
                 return ValidationResult {
                     rule_id: self.rule_id().to_string(),

@@ -201,7 +201,11 @@ async fn ingest_sentry_envelope(
     {
         Ok(events) => events,
         Err(e) => {
-            tracing::error!("Failed to parse envelope: {:?}", e);
+            tracing::error!(
+                "Failed to parse envelope for project {}: {:?}",
+                project_id,
+                e
+            );
             return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
         }
     };
@@ -305,8 +309,10 @@ mod tests {
     use axum::body::Bytes;
     use axum::http::{HeaderName, HeaderValue};
     use axum_test::TestServer;
+    use chrono::Utc;
     use std::sync::Arc;
     use temps_database::test_utils::TestDatabase;
+    use temps_entities::preset::Preset;
 
     // Mock audit logger for tests
     #[derive(Clone)]
@@ -331,8 +337,8 @@ mod tests {
 
     async fn create_test_context() -> TestContext {
         use sea_orm::ActiveModelTrait;
-        use temps_entities::{projects, types::ProjectType};
         use sea_orm::Set;
+        use temps_entities::projects;
         use uuid::Uuid;
 
         // Create a test database with migrations
@@ -342,18 +348,14 @@ mod tests {
         let unique_slug = format!("test-project-{}", Uuid::new_v4());
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             slug: Set(unique_slug),
-            project_type: Set(ProjectType::Server),
-            automatic_deploy: Set(true),
-            is_web_app: Set(false),
-            performance_metrics_enabled: Set(false),
-            use_default_wildcard: Set(true),
-            is_public_repo: Set(false),
-            is_on_demand: Set(false),
-            created_at: Set(chrono::Utc::now()),
-            updated_at: Set(chrono::Utc::now()),
+            preset: Set(Preset::NextJs),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
             ..Default::default()
         }
         .insert(db.connection())
@@ -365,7 +367,13 @@ mod tests {
 
         // Generate a DSN for the test project
         let dsn = dsn_service
-            .generate_project_dsn(project.id, None, None, Some("Test DSN".to_string()), "localhost")
+            .generate_project_dsn(
+                project.id,
+                None,
+                None,
+                Some("Test DSN".to_string()),
+                "localhost",
+            )
             .await
             .unwrap();
 
@@ -401,7 +409,10 @@ mod tests {
         let response = server
             .post(&format!("/{}/envelope/", ctx.project_id))
             .content_type("application/octet-stream")
-            .add_header(HeaderName::from_static("x-sentry-auth"), HeaderValue::from_str(&auth_header).unwrap())
+            .add_header(
+                HeaderName::from_static("x-sentry-auth"),
+                HeaderValue::from_str(&auth_header).unwrap(),
+            )
             .bytes(Bytes::from(envelope_data))
             .await;
 
@@ -428,7 +439,10 @@ mod tests {
         let response = server
             .post(&format!("/{}/envelope/", ctx.project_id))
             .content_type("application/octet-stream")
-            .add_header(HeaderName::from_static("x-sentry-auth"), HeaderValue::from_str(&auth_header).unwrap())
+            .add_header(
+                HeaderName::from_static("x-sentry-auth"),
+                HeaderValue::from_str(&auth_header).unwrap(),
+            )
             .text(invalid_data)
             .await;
 
@@ -450,7 +464,10 @@ mod tests {
         let response = server
             .post(&format!("/{}/envelope/", ctx.project_id))
             .content_type("application/octet-stream")
-            .add_header(HeaderName::from_static("x-sentry-auth"), HeaderValue::from_str(&auth_header).unwrap())
+            .add_header(
+                HeaderName::from_static("x-sentry-auth"),
+                HeaderValue::from_str(&auth_header).unwrap(),
+            )
             .bytes(Bytes::from(envelope_data))
             .await;
 
@@ -506,7 +523,10 @@ mod tests {
         let response = server
             .post(&format!("/{}/envelope/", ctx.project_id))
             .content_type("application/octet-stream")
-            .add_header(HeaderName::from_static("x-sentry-auth"), HeaderValue::from_str(&auth_header).unwrap())
+            .add_header(
+                HeaderName::from_static("x-sentry-auth"),
+                HeaderValue::from_str(&auth_header).unwrap(),
+            )
             .text(invalid_envelope)
             .await;
 
@@ -598,7 +618,10 @@ mod tests {
                 http::HeaderName::from_static("content-encoding"),
                 http::HeaderValue::from_static("gzip"),
             )
-            .add_header(HeaderName::from_static("x-sentry-auth"), HeaderValue::from_str(&auth_header).unwrap())
+            .add_header(
+                HeaderName::from_static("x-sentry-auth"),
+                HeaderValue::from_str(&auth_header).unwrap(),
+            )
             .bytes(Bytes::from(compressed_data))
             .await;
 

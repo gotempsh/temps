@@ -15,6 +15,7 @@ temps-entities = { path = "../temps-entities" }
 temps-auth = { path = "../temps-auth" }
 temps-proxy = { path = "../temps-proxy" }
 temps-geo = { path = "../temps-geo" }
+temps-analytics = { path = "../temps-analytics" }
 
 # Web framework
 axum = { workspace = true }

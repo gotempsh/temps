@@ -1,10 +1,28 @@
 use super::build_system::{BuildSystem, MonorepoTool};
-use super::{PackageManager, Preset, ProjectType};
+use super::{DockerfileWithArgs, PackageManager, Preset, ProjectType};
+use async_trait::async_trait;
 use tracing::debug;
-use std::path::PathBuf;
+use std::path::Path;
+
+/// Security hardening for Node.js Alpine runner
+/// This approach provides security while maintaining compatibility:
+/// - Removes package managers to prevent runtime package installation
+/// - Creates a dedicated non-root user (nodejs:nodejs with UID/GID 1001)
+/// - Keeps CA certificates for HTTPS support (unlike distroless)
+/// - Maintains shell access for debugging if needed
+const NODEJS_ALPINE_SECURITY_HARDENING: &str = r#"# Security hardening - remove package manager and run as non-root
+# Create non-root user for running the application
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nodejs && \
+    # Remove package managers to prevent runtime package installation
+    rm -rf /sbin/apk /usr/bin/apk /etc/apk /var/cache/apk /lib/apk && \
+    rm -rf /var/lib/apt /usr/bin/apt* /usr/bin/dpkg* 2>/dev/null || true
+
+USER nodejs"#;
 
 pub struct NextJs;
 
+#[async_trait]
 impl Preset for NextJs {
     fn slug(&self) -> String {
         "nextjs".to_string()
@@ -19,28 +37,19 @@ impl Preset for NextJs {
     }
 
     fn icon_url(&self) -> String {
-        "https://example.com/nextjs-icon.png".to_string()
+        "/presets/nextjs.svg".to_string()
     }
 
-    fn dockerfile(
-        &self,
-        root_local_path: &PathBuf,
-        local_path: &PathBuf,
-        install_command: Option<&str>,
-        build_command: Option<&str>,
-        _output_dir: Option<&str>,
-        build_vars: Option<&Vec<String>>,
-        project_slug: &str,
-    ) -> String {
-        let project_slug = project_slug.replace("-", "_").to_lowercase();
-        debug!("Local path is {:?}", local_path.display());
-        let build_system = BuildSystem::detect(root_local_path);
+    async fn dockerfile(&self, config: super::DockerfileConfig<'_>) -> DockerfileWithArgs {
+        let project_slug = config.project_slug.replace("-", "_").to_lowercase();
+        debug!("Local path is {:?}", config.local_path.display());
+        let build_system = BuildSystem::detect(config.root_local_path);
         let package_manager = build_system.package_manager;
 
         // Calculate relative path from root to project directory for monorepos
-        let relative_path = if local_path != root_local_path {
-            local_path
-                .strip_prefix(root_local_path)
+        let relative_path = if config.local_path != config.root_local_path {
+            config.local_path
+                .strip_prefix(config.root_local_path)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default()
         } else {
@@ -51,9 +60,9 @@ impl Preset for NextJs {
 
         // Use provided commands or fall back to build system commands
         let build_system_install_cmd = &build_system.get_install_command();
-        let mut install_cmd = install_command.unwrap_or(build_system_install_cmd).to_string();
+        let mut install_cmd = config.install_command.unwrap_or(build_system_install_cmd).to_string();
         let build_system_build_cmd = &build_system.get_build_command(Some(&project_slug));
-        let mut build_cmd = build_command.unwrap_or(build_system_build_cmd).to_string();
+        let mut build_cmd = config.build_command.unwrap_or(build_system_build_cmd).to_string();
 
         // For Bun, ensure we use the full path in cache mount contexts
         if matches!(package_manager, PackageManager::Bun) {
@@ -61,11 +70,20 @@ impl Preset for NextJs {
             build_cmd = build_cmd.replace("bun ", "/root/.bun/bin/bun ");
         }
 
-        let (base_image, start_cmd, run_image) = match package_manager {
-            PackageManager::Bun => ("node:22", "npm run start", "node:22-alpine"),
-            PackageManager::Yarn => ("node:22-alpine", "npm run start", "node:22-alpine"),
-            _ => ("node:22", "npm run start", "node:22-alpine"),
+        // Use explicit path to Next.js binary with node
+        // Alpine has node available, so we use exec form with node
+        let start_cmd = format!("node\", \"/{}/node_modules/next/dist/bin/next\", \"start", project_slug);
+
+        // Build stage uses full Node.js image with package managers
+        let base_image = match package_manager {
+            PackageManager::Bun => "node:22",  // Bun needs apt for installation
+            PackageManager::Yarn => "node:22-alpine",
+            _ => "node:22",
         };
+
+        // Production stage uses hardened Alpine for security with full CA certificate support
+        // Secure: non-root user, package manager removed, proper HTTPS support
+        let run_image = "node:22-alpine";
 
         // Determine cache path based on whether it's a monorepo subproject
         let cache_path = if !relative_path.is_empty() {
@@ -74,12 +92,23 @@ impl Preset for NextJs {
             format!("/{project_slug}/.next/cache")
         };
 
-        // Prepare bun installation commands if needed
+        // Prepare package manager installation commands if needed
         let bun_setup = if matches!(package_manager, PackageManager::Bun) {
             r#"# Add Bun installation if needed
 RUN apt-get update && apt-get install -y curl unzip
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
+
+"#
+        } else if matches!(package_manager, PackageManager::Yarn) {
+            r#"# Enable corepack for Yarn Berry
+RUN corepack enable
+
+"#
+        } else if matches!(package_manager, PackageManager::Pnpm) {
+            r#"# Enable corepack for pnpm
+RUN corepack enable
+RUN corepack prepare pnpxm@latest --activate
 
 "#
         } else {
@@ -94,6 +123,16 @@ ENV PATH="/root/.bun/bin:${PATH}"
             format!("/{project_slug}")
         };
 
+        // Cache setup command depends on BuildKit availability
+        let cache_setup_cmd = if config.use_buildkit {
+            format!(
+                "RUN --mount=type=cache,target={},id=next_cache_{} \\\n    mkdir -p {}",
+                cache_path, project_slug, cache_path
+            )
+        } else {
+            format!("RUN mkdir -p {}", cache_path)
+        };
+
         let mut dockerfile = format!(
             r#"# syntax=docker/dockerfile:1.4
 
@@ -102,14 +141,13 @@ FROM {base_image} AS build
 WORKDIR /{project_slug}
 
 {bun_setup}# Setup caching for Next.js
-RUN --mount=type=cache,target={cache_path},id=next_cache_{project_slug} \
-    mkdir -p {cache_path}
+{cache_setup}
 
 "#,
             base_image = base_image,
             project_slug = project_slug,
-            cache_path = cache_path,
             bun_setup = bun_setup,
+            cache_setup = cache_setup_cmd,
         );
 
         // For monorepos, we need to copy the entire repository
@@ -117,11 +155,16 @@ RUN --mount=type=cache,target={cache_path},id=next_cache_{project_slug} \
             MonorepoTool::None => {
                 dockerfile.push_str("# Copy and install dependencies\nCOPY package*.json .\n");
 
-                // Add lock files based on package manager
+                // Add lock files and package manager configurations
                 match package_manager {
                     PackageManager::Bun => dockerfile.push_str("COPY bun.lock* .\n"),
-                    PackageManager::Yarn => dockerfile.push_str("COPY yarn.lock .\n"),
-                    PackageManager::Pnpm => dockerfile.push_str("COPY pnpm.lock .\n"),
+                    PackageManager::Yarn => {
+                        dockerfile.push_str("COPY yarn.lock .\n");
+                        // Copy Yarn Berry configuration files if they exist
+                        dockerfile.push_str("COPY .yarnrc.yml* .\n");
+                        dockerfile.push_str("COPY .yarn* ./.yarn/\n");
+                    },
+                    PackageManager::Pnpm => dockerfile.push_str("COPY pnpm-lock.yaml .\n"),
                     _ => {}
                 }
             }
@@ -135,13 +178,22 @@ RUN --mount=type=cache,target={cache_path},id=next_cache_{project_slug} \
             }
         }
 
+        // Install command depends on BuildKit availability
+        let install_cmd_line = if config.use_buildkit {
+            format!(
+                "RUN --mount=type=cache,target=/{}/cache/node_modules,id=node_modules_{} {}",
+                project_slug, project_slug, install_cmd
+            )
+        } else {
+            format!("RUN {}", install_cmd)
+        };
+
         dockerfile.push_str(&format!(
             r#"
 # Install dependencies
-RUN --mount=type=cache,target=/{project_slug}/cache/node_modules,id=node_modules_{project_slug} {install_cmd}
+{}
 "#,
-            project_slug = project_slug,
-            install_cmd = install_cmd,
+            install_cmd_line,
         ));
 
         // For non-monorepos, copy remaining files after install
@@ -150,123 +202,132 @@ RUN --mount=type=cache,target=/{project_slug}/cache/node_modules,id=node_modules
         }
 
         // Add build variables if present
-        if let Some(vars) = build_vars {
+        if let Some(vars) = config.build_vars {
             for var in vars {
                 dockerfile.push_str(&format!("ARG {}\n", var));
             }
         }
 
+        // Build command depends on BuildKit availability
+        let build_cmd_line = if config.use_buildkit {
+            format!(
+                "RUN --mount=type=cache,target={},id=next_cache_{} \\\n    {}",
+                cache_path, project_slug, build_cmd
+            )
+        } else {
+            format!("RUN {}", build_cmd)
+        };
+
         dockerfile.push_str(&format!(
             r#"
 # Build the application
-RUN --mount=type=cache,target={cache_path},id=next_cache_{project_slug} \
-    {build_cmd}
+{}
 
-# Stage 2: Production
-FROM {run_image}
+# Ensure public directory exists for COPY command
+RUN mkdir -p public
+
+# NOTE: We do NOT prune devDependencies for Next.js projects
+# Next.js needs TypeScript and other dev tools at runtime when using:
+# - next.config.ts (requires typescript)
+# - ESLint configs
+# - Custom build tools
+
+# Stage 2: Production using hardened Alpine Node.js
+# Secure: non-root user, package manager removed, full CA certificates for HTTPS
+FROM {run_image} AS runner
 WORKDIR /{project_slug}
 
-RUN apk update && apk add curl
+{alpine_hardening}
 
 "#,
+            build_cmd_line,
             project_slug = project_slug,
-            build_cmd = build_cmd,
             run_image = run_image,
-            cache_path = cache_path,
+            alpine_hardening = NODEJS_ALPINE_SECURITY_HARDENING,
         ));
 
-        // For monorepos, we need to copy only the specific project's built files
+        // Copy entire project from build stage
+        // This ensures all runtime files are available (drizzle, config, mydata, locales, etc.)
+        // Alpine uses nodejs:nodejs user (uid 1001)
         match build_system.monorepo_tool {
             MonorepoTool::None => {
                 dockerfile.push_str(&format!(
-                    "# Copy built files from build stage\nCOPY --from=build /{project_slug}/ /{project_slug}/\n",
+                    r#"# Copy entire project directory to ensure all runtime files are available
+# This includes: node_modules, .next, public, and ANY custom directories (drizzle, mydata, etc.)
+COPY --from=build --chown=nodejs:nodejs /{project_slug} /{project_slug}
+"#,
                     project_slug = project_slug
                 ));
-                // Copy lock file in production stage if present
-                match package_manager {
-                    PackageManager::Bun => dockerfile.push_str(&format!(
-                        "COPY --from=build /{project_slug}/bun.lock* /{project_slug}/bun.lock*\n",
-                        project_slug = project_slug
-                    )),
-                    PackageManager::Yarn => dockerfile.push_str(&format!(
-                        "COPY --from=build /{project_slug}/yarn.lock /{project_slug}/yarn.lock\n",
-                        project_slug = project_slug
-                    )),
-                    _ => {}
-                }
             }
             _ => {
-                let project_path = format!("/{project_slug}");
-
+                // For monorepos, copy the subdirectory
                 dockerfile.push_str(&format!(
-                    r#"# Copy the entire monorepo project
-COPY --from=build {project_path} /{project_slug}
-
-# Set working directory to the project path
-WORKDIR /{project_slug}/{relative_path}
+                    r#"# Copy entire project directory to ensure all runtime files are available
+# This includes: node_modules, .next, public, and ANY custom directories (drizzle, mydata, etc.)
+COPY --from=build --chown=nodejs:nodejs /{project_slug}/{relative_path} /{project_slug}
 "#,
-                    project_path = project_path,
                     project_slug = project_slug,
                     relative_path = relative_path
                 ));
             }
         }
 
-
-
+        // Set environment (already running as nodejs user via USER directive)
         dockerfile.push_str(
             r#"
 # Set production environment
-ENV NODE_ENV production
-ENV NEXT_TELEMETRY_DISABLED 1
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV HOSTNAME=0.0.0.0
+ENV PORT=3000
 
 EXPOSE 3000
 
 "#,
         );
 
-        // Add start command
-        dockerfile.push_str(&format!("CMD [\"{}\"]", start_cmd.replace(" ", "\", \"")));
+        // Add start command - distroless has node as entrypoint
+        dockerfile.push_str(&format!("CMD [\"{}\"]", start_cmd));
 
-        dockerfile
+        DockerfileWithArgs::new(dockerfile)
     }
 
-    fn dockerfile_with_build_dir(&self, _local_path: &PathBuf) -> String {
-        format!(
-            r#"
-# Use a lightweight Node.js image as the base
+    async fn dockerfile_with_build_dir(&self, _local_path: &Path) -> DockerfileWithArgs {
+        // Use hardened Alpine for security with full CA certificate support
+        let content = format!(r#"
+# Use hardened Alpine Node.js image
+# Secure: non-root user, package manager removed, full CA certificates for HTTPS
 FROM node:22-alpine AS runner
 
 WORKDIR /app
 
-# Add curl for health checks
-RUN apk add --no-cache curl
-
 # Set environment to production
-ENV NODE_ENV production
+ENV NODE_ENV=production
 
-# Copy the built Next.js application
-COPY .next/standalone ./
-COPY .next/static ./.next/static
-COPY public ./public
-COPY next.config.* ./
+{alpine_hardening}
+
+# Copy the built Next.js standalone application
+# Alpine uses nodejs:nodejs user (uid 1001)
+COPY --chown=nodejs:nodejs .next/standalone ./
+COPY --chown=nodejs:nodejs .next/static ./.next/static
+COPY --chown=nodejs:nodejs public ./public
 
 # Expose the port the app runs on
 EXPOSE 3000
 
 # Start the Next.js application
 CMD ["node", "server.js"]
-"#
-        )
+"#, alpine_hardening = NODEJS_ALPINE_SECURITY_HARDENING);
+        DockerfileWithArgs::new(content)
     }
 
-    fn install_command(&self, local_path: &PathBuf) -> String {
+    fn install_command(&self, local_path: &Path) -> String {
         PackageManager::detect(local_path)
             .install_command()
             .to_string()
     }
 
-    fn build_command(&self, local_path: &PathBuf) -> String {
+    fn build_command(&self, local_path: &Path) -> String {
         PackageManager::detect(local_path)
             .build_command()
             .to_string()
@@ -282,6 +343,7 @@ CMD ["node", "server.js"]
     }
 }
 
+
 impl std::fmt::Display for NextJs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.label())
@@ -291,67 +353,70 @@ impl std::fmt::Display for NextJs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DockerfileConfig;
 
-    #[test]
-    fn test_bun_dockerfile_uses_full_path() {
+    #[tokio::test]
+    async fn test_bun_dockerfile_uses_full_path() {
         // Create a temp directory with bun.lock to trigger Bun detection
         let temp_dir = std::env::temp_dir().join("test_nextjs_bun");
         std::fs::create_dir_all(&temp_dir).unwrap();
         std::fs::write(temp_dir.join("bun.lock"), "").unwrap();
 
         let preset = NextJs;
-        let dockerfile = preset.dockerfile(
-            &temp_dir,
-            &temp_dir,
-            None,
-            None,
-            None,
-            None,
-            "test-project",
-        );
+        let result = preset.dockerfile(DockerfileConfig {
+            use_buildkit: true,
+            root_local_path: &temp_dir,
+            local_path: &temp_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        }).await;
 
         // Verify Bun is installed
-        assert!(dockerfile.contains("curl -fsSL https://bun.sh/install | bash"));
-        assert!(dockerfile.contains("ENV PATH=\"/root/.bun/bin:${PATH}\""));
+        assert!(result.content.contains("curl -fsSL https://bun.sh/install | bash"));
+        assert!(result.content.contains("ENV PATH=\"/root/.bun/bin:${PATH}\""));
 
         // Verify commands use full path to bun
-        assert!(dockerfile.contains("/root/.bun/bin/bun install"));
-        assert!(dockerfile.contains("/root/.bun/bin/bun run build"));
+        assert!(result.content.contains("/root/.bun/bin/bun install"));
+        assert!(result.content.contains("/root/.bun/bin/bun run build"));
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 
-    #[test]
-    fn test_npm_dockerfile_no_bun_installation() {
+    #[tokio::test]
+    async fn test_npm_dockerfile_no_bun_installation() {
         // Create a temp directory with package-lock.json to trigger npm detection
         let temp_dir = std::env::temp_dir().join("test_nextjs_npm");
         std::fs::create_dir_all(&temp_dir).unwrap();
         std::fs::write(temp_dir.join("package-lock.json"), "").unwrap();
 
         let preset = NextJs;
-        let dockerfile = preset.dockerfile(
-            &temp_dir,
-            &temp_dir,
-            None,
-            None,
-            None,
-            None,
-            "test-project",
-        );
+        let result = preset.dockerfile(DockerfileConfig {
+            use_buildkit: true,
+            root_local_path: &temp_dir,
+            local_path: &temp_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        }).await;
 
         // Verify Bun is NOT installed
-        assert!(!dockerfile.contains("curl -fsSL https://bun.sh/install | bash"));
+        assert!(!result.content.contains("curl -fsSL https://bun.sh/install | bash"));
 
         // Verify npm commands are used
-        assert!(dockerfile.contains("npm install") || dockerfile.contains("npm ci"));
+        assert!(result.content.contains("npm install") || result.content.contains("npm ci"));
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 
-    #[test]
-    fn test_monorepo_subdirectory_build() {
+    #[tokio::test]
+    async fn test_monorepo_subdirectory_build() {
         // Create a temp monorepo structure
         let temp_dir = std::env::temp_dir().join("test_nextjs_monorepo");
         let subproject_dir = temp_dir.join("apps").join("web");
@@ -362,82 +427,467 @@ mod tests {
         std::fs::write(subproject_dir.join("package.json"), "{}").unwrap();
 
         let preset = NextJs;
-        let dockerfile = preset.dockerfile(
-            &temp_dir,
-            &subproject_dir,
-            None,
-            None,
-            None,
-            None,
-            "test-project",
-        );
+        let result = preset.dockerfile(DockerfileConfig {
+            use_buildkit: true,
+            root_local_path: &temp_dir,
+            local_path: &subproject_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        }).await;
 
         // Verify the entire repository is copied for monorepos
-        assert!(dockerfile.contains("# Copy entire repository for monorepo build"));
-        assert!(dockerfile.contains("COPY . ."));
+        assert!(result.content.contains("# Copy entire repository for monorepo build"));
+        assert!(result.content.contains("COPY . ."));
 
         // Verify WORKDIR is set to the subdirectory in build stage
-        assert!(dockerfile.contains("# Change to project subdirectory"));
-        assert!(dockerfile.contains("WORKDIR /test_project/apps/web"));
+        assert!(result.content.contains("# Change to project subdirectory"));
+        assert!(result.content.contains("WORKDIR /test_project/apps/web"));
 
-        // Verify WORKDIR is set to the subdirectory in production stage
-        assert!(dockerfile.contains("# Set working directory to the project path"));
+        // Verify entire project directory is copied in production stage (not selective files)
+        assert!(result.content.contains("# Copy entire project directory to ensure all runtime files are available"));
+        assert!(result.content.contains("# This includes: node_modules, .next, public, and ANY custom directories (drizzle, mydata, etc.)"));
+        // Verify the copy is from the subdirectory path (apps/web) with nodejs user ownership
+        assert!(result.content.contains("COPY --from=build --chown=nodejs:nodejs /test_project/apps/web /test_project"));
+
+        // Verify we do NOT prune devDependencies (TypeScript needed at runtime)
+        assert!(result.content.contains("# NOTE: We do NOT prune devDependencies for Next.js projects"));
+        assert!(!result.content.contains("npm prune --production"));
+        assert!(!result.content.contains("yarn install --production"));
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 
-    #[test]
-    fn test_non_monorepo_no_subdirectory_workdir() {
+    #[tokio::test]
+    async fn test_non_monorepo_no_subdirectory_workdir() {
         // Create a simple Next.js project (not a monorepo)
         let temp_dir = std::env::temp_dir().join("test_nextjs_simple");
         std::fs::create_dir_all(&temp_dir).unwrap();
         std::fs::write(temp_dir.join("package.json"), "{}").unwrap();
 
         let preset = NextJs;
-        let dockerfile = preset.dockerfile(
-            &temp_dir,
-            &temp_dir,
-            None,
-            None,
-            None,
-            None,
-            "test-project",
-        );
+        let result = preset.dockerfile(DockerfileConfig {
+            use_buildkit: true,
+            root_local_path: &temp_dir,
+            local_path: &temp_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        }).await;
 
         // Verify only one WORKDIR is set (the initial one) - no subdirectory WORKDIR
-        let workdir_count = dockerfile.matches("WORKDIR /test_project").count();
+        let workdir_count = result.content.matches("WORKDIR /test_project").count();
         assert_eq!(workdir_count, 2); // Once in build stage, once in production stage
 
         // Verify no subdirectory change
-        assert!(!dockerfile.contains("# Change to project subdirectory"));
+        assert!(!result.content.contains("# Change to project subdirectory"));
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 
-    #[test]
-    fn test_custom_install_and_build_commands_with_bun() {
+    #[tokio::test]
+    async fn test_npm_project_uses_alpine() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_npm_alpine");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(temp_dir.join("package-lock.json"), "").unwrap();
+
+        let preset = NextJs;
+        let result = preset.dockerfile(DockerfileConfig {
+            use_buildkit: true,
+            root_local_path: &temp_dir,
+            local_path: &temp_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        }).await;
+
+        // Verify Alpine is used for runner stage
+        assert!(result.content.contains("FROM node:22-alpine AS runner"));
+        // Verify CMD uses node with explicit path to next start
+        assert!(result.content.contains(r#"CMD ["node", "/test_project/node_modules/next/dist/bin/next", "start"]"#));
+        // Verify npm is used in build stage
+        assert!(result.content.contains("npm install") || result.content.contains("npm ci"));
+
+        // Cleanup
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_bun_project_uses_alpine() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_bun_alpine");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(temp_dir.join("bun.lock"), "").unwrap();
+
+        let preset = NextJs;
+        let result = preset.dockerfile(DockerfileConfig {
+            use_buildkit: true,
+            root_local_path: &temp_dir,
+            local_path: &temp_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        }).await;
+
+        // Verify Alpine is used for runner stage
+        assert!(result.content.contains("FROM node:22-alpine AS runner"));
+        // Verify CMD uses node with explicit path to next start
+        assert!(result.content.contains(r#"CMD ["node", "/test_project/node_modules/next/dist/bin/next", "start"]"#));
+        // Verify bun is installed in build stage
+        assert!(result.content.contains("curl -fsSL https://bun.sh/install | bash"));
+
+        // Cleanup
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_yarn_project_uses_alpine() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_yarn_alpine");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(temp_dir.join("yarn.lock"), "").unwrap();
+
+        let preset = NextJs;
+        let result = preset.dockerfile(DockerfileConfig {
+            use_buildkit: true,
+            root_local_path: &temp_dir,
+            local_path: &temp_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        }).await;
+
+        // Verify Alpine is used for runner stage
+        assert!(result.content.contains("FROM node:22-alpine AS runner"));
+        // Verify CMD uses node with explicit path to next start
+        assert!(result.content.contains(r#"CMD ["node", "/test_project/node_modules/next/dist/bin/next", "start"]"#));
+        // Verify corepack is enabled for yarn in build stage
+        assert!(result.content.contains("corepack enable"));
+
+        // Cleanup
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_custom_install_and_build_commands_with_bun() {
         let temp_dir = std::env::temp_dir().join("test_nextjs_custom_bun");
         std::fs::create_dir_all(&temp_dir).unwrap();
         std::fs::write(temp_dir.join("bun.lock"), "").unwrap();
 
         let preset = NextJs;
-        let dockerfile = preset.dockerfile(
-            &temp_dir,
-            &temp_dir,
-            Some("bun install --frozen-lockfile"),
-            Some("bun run build:prod"),
-            None,
-            None,
-            "test-project",
-        );
+        let result = preset.dockerfile(DockerfileConfig {
+            use_buildkit: true,
+            root_local_path: &temp_dir,
+            local_path: &temp_dir,
+            install_command: Some("bun install --frozen-lockfile"),
+            build_command: Some("bun run build:prod"),
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        }).await;
 
         // Verify custom commands are used with full bun path
-        assert!(dockerfile.contains("/root/.bun/bin/bun install --frozen-lockfile"));
-        assert!(dockerfile.contains("/root/.bun/bin/bun run build:prod"));
+        assert!(result.content.contains("/root/.bun/bin/bun install --frozen-lockfile"));
+        assert!(result.content.contains("/root/.bun/bin/bun run build:prod"));
 
         // Cleanup
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_dockerfile_uses_alpine_with_security() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_alpine_security");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let preset = NextJs;
+        let result = preset.dockerfile(DockerfileConfig {
+            use_buildkit: true,
+            root_local_path: &temp_dir,
+            local_path: &temp_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "test-project",
+        }).await;
+
+        // Verify Alpine is used for runner stage
+        assert!(
+            result.content.contains("FROM node:22-alpine AS runner"),
+            "Should use Alpine Node.js image for runner"
+        );
+
+        // Security: Creates non-root user nodejs with UID 1001
+        assert!(
+            result.content.contains("adduser --system --uid 1001 nodejs"),
+            "Should create nodejs user with UID 1001"
+        );
+
+        // Security: Runs as non-root user
+        assert!(
+            result.content.contains("USER nodejs"),
+            "Should run as nodejs user"
+        );
+
+        // Security: Package manager removal
+        assert!(
+            result.content.contains("rm -rf /sbin/apk"),
+            "Should remove apk package manager"
+        );
+
+        // Security: Files owned by nodejs user
+        assert!(
+            result.content.contains("--chown=nodejs:nodejs"),
+            "Should copy files with nodejs user ownership"
+        );
+
+        // Cleanup
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_dockerfile_with_build_dir_uses_alpine_with_security() {
+        let temp_dir = std::env::temp_dir().join("test_nextjs_build_dir_alpine");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let preset = NextJs;
+        let result = preset.dockerfile_with_build_dir(&temp_dir).await;
+
+        // Verify Alpine is used for runner stage
+        assert!(
+            result.content.contains("FROM node:22-alpine AS runner"),
+            "Should use Alpine Node.js image for runner"
+        );
+
+        // Security: Creates non-root user nodejs with UID 1001
+        assert!(
+            result.content.contains("adduser --system --uid 1001 nodejs"),
+            "Should create nodejs user with UID 1001"
+        );
+
+        // Security: Runs as non-root user
+        assert!(
+            result.content.contains("USER nodejs"),
+            "Should run as nodejs user"
+        );
+
+        // Security: Package manager removal
+        assert!(
+            result.content.contains("rm -rf /sbin/apk"),
+            "Should remove apk package manager"
+        );
+
+        // Security: Files owned by nodejs user
+        assert!(
+            result.content.contains("--chown=nodejs:nodejs"),
+            "Should copy files with nodejs user ownership"
+        );
+
+        // Cleanup
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    /// Integration test that builds and runs a real Next.js Docker image
+    /// This test requires Docker to be running and may take several minutes.
+    /// It uses the fixture at tests/fixtures/nextjs-hello-world
+    #[tokio::test]
+    async fn test_nextjs_docker_build_and_run() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        // Check if Docker is available
+        let docker_check = Command::new("docker")
+            .args(["info"])
+            .output();
+
+        if docker_check.is_err() || !docker_check.unwrap().status.success() {
+            println!("Docker is not available, skipping test");
+            return;
+        }
+
+        // Get the fixture path
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set");
+        let fixture_path = std::path::PathBuf::from(&manifest_dir)
+            .join("tests/fixtures/nextjs-hello-world");
+
+        if !fixture_path.exists() {
+            panic!("Fixture not found at {:?}", fixture_path);
+        }
+
+        // Create a temp directory and copy the fixture
+        let test_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let temp_dir = std::env::temp_dir().join(format!("nextjs_docker_test_{}", test_id));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Copy fixture files to temp directory
+        let copy_result = Command::new("cp")
+            .args(["-r", fixture_path.to_str().unwrap(), temp_dir.to_str().unwrap()])
+            .output()
+            .expect("Failed to copy fixture");
+
+        if !copy_result.status.success() {
+            panic!("Failed to copy fixture: {:?}", String::from_utf8_lossy(&copy_result.stderr));
+        }
+
+        let project_dir = temp_dir.join("nextjs-hello-world");
+
+        // Generate Dockerfile using the preset
+        let preset = NextJs;
+        let dockerfile_result = preset.dockerfile(DockerfileConfig {
+            use_buildkit: true,
+            root_local_path: &project_dir,
+            local_path: &project_dir,
+            install_command: None,
+            build_command: None,
+            output_dir: None,
+            build_vars: None,
+            project_slug: "nextjs-test",
+        }).await;
+
+        // Write the Dockerfile
+        let dockerfile_path = project_dir.join("Dockerfile");
+        std::fs::write(&dockerfile_path, &dockerfile_result.content)
+            .expect("Failed to write Dockerfile");
+
+        println!("Generated Dockerfile:\n{}", dockerfile_result.content);
+
+        // Build the Docker image
+        let image_name = format!("temps-nextjs-test:{}", test_id);
+        println!("Building Docker image: {}", image_name);
+
+        let build_result = Command::new("docker")
+            .args([
+                "build",
+                "-t", &image_name,
+                "-f", dockerfile_path.to_str().unwrap(),
+                project_dir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("Failed to execute docker build");
+
+        println!("Build stdout:\n{}", String::from_utf8_lossy(&build_result.stdout));
+        println!("Build stderr:\n{}", String::from_utf8_lossy(&build_result.stderr));
+
+        if !build_result.status.success() {
+            // Cleanup temp directory
+            std::fs::remove_dir_all(&temp_dir).ok();
+            panic!("Docker build failed: {}", String::from_utf8_lossy(&build_result.stderr));
+        }
+
+        // Run the container
+        let container_name = format!("temps-nextjs-test-{}", test_id);
+        let host_port = 3099; // Use a non-standard port to avoid conflicts
+
+        println!("Starting container: {}", container_name);
+
+        let run_result = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--name", &container_name,
+                "-p", &format!("{}:3000", host_port),
+                &image_name,
+            ])
+            .output()
+            .expect("Failed to execute docker run");
+
+        if !run_result.status.success() {
+            // Cleanup
+            Command::new("docker").args(["rmi", "-f", &image_name]).output().ok();
+            std::fs::remove_dir_all(&temp_dir).ok();
+            panic!("Docker run failed: {}", String::from_utf8_lossy(&run_result.stderr));
+        }
+
+        // Wait for the container to start and become healthy
+        println!("Waiting for container to become ready...");
+        let mut attempts = 0;
+        let max_attempts = 30;
+        let mut is_healthy = false;
+
+        while attempts < max_attempts {
+            std::thread::sleep(Duration::from_secs(2));
+            attempts += 1;
+
+            // Check container logs for "Ready" message
+            let logs_result = Command::new("docker")
+                .args(["logs", &container_name])
+                .output()
+                .expect("Failed to get container logs");
+
+            let logs = String::from_utf8_lossy(&logs_result.stdout);
+            let logs_stderr = String::from_utf8_lossy(&logs_result.stderr);
+
+            println!("Attempt {}/{} - Logs: {} {}", attempts, max_attempts, logs, logs_stderr);
+
+            // Check if Next.js is ready
+            if logs.contains("Ready") || logs_stderr.contains("Ready") ||
+               logs.contains("started server") || logs_stderr.contains("started server") {
+                is_healthy = true;
+                break;
+            }
+
+            // Also try HTTP request
+            let curl_result = Command::new("curl")
+                .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", &format!("http://localhost:{}", host_port)])
+                .output();
+
+            if let Ok(output) = curl_result {
+                let status = String::from_utf8_lossy(&output.stdout);
+                if status == "200" {
+                    is_healthy = true;
+                    println!("HTTP health check passed with status 200");
+                    break;
+                }
+            }
+        }
+
+        // Get final container logs for debugging
+        let final_logs = Command::new("docker")
+            .args(["logs", &container_name])
+            .output()
+            .expect("Failed to get final logs");
+
+        println!("Final container stdout:\n{}", String::from_utf8_lossy(&final_logs.stdout));
+        println!("Final container stderr:\n{}", String::from_utf8_lossy(&final_logs.stderr));
+
+        // Check container status
+        let inspect_result = Command::new("docker")
+            .args(["inspect", "--format", "{{.State.Status}}", &container_name])
+            .output()
+            .expect("Failed to inspect container");
+
+        let container_status = String::from_utf8_lossy(&inspect_result.stdout).trim().to_string();
+        println!("Container status: {}", container_status);
+
+        // Cleanup: Stop and remove container, remove image
+        println!("Cleaning up...");
+        Command::new("docker").args(["stop", &container_name]).output().ok();
+        Command::new("docker").args(["rm", "-f", &container_name]).output().ok();
+        Command::new("docker").args(["rmi", "-f", &image_name]).output().ok();
+        std::fs::remove_dir_all(&temp_dir).ok();
+
+        // Assert the container was healthy
+        assert!(
+            is_healthy || container_status == "running",
+            "Container did not become healthy within {} seconds. Status: {}",
+            max_attempts * 2,
+            container_status
+        );
+
+        println!("Test passed! Next.js container built and ran successfully.");
     }
 }

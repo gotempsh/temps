@@ -1,0 +1,545 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+      - "v*.*.*-*"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-linux-amd64:
+    name: Build Linux AMD64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libssl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-amd64-release
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install web dependencies
+        run: |
+          cd web
+          bun install
+
+      - name: Install wasm-pack and Build WASM
+        run: |
+          cargo install wasm-pack
+          cd crates/temps-captcha-wasm
+          bun run build
+
+      - name: Build release binary
+        run: cargo build --release --bin temps
+        env:
+          FORCE_WEB_BUILD: 1
+          CARGO_INCREMENTAL: 0
+          TEMPS_VERSION: ${{ github.ref_name }}
+
+      - name: Strip binary
+        run: strip target/release/temps
+
+      - name: Rename binary
+        run: cp target/release/temps temps
+
+      - name: Create tarball
+        run: |
+          tar -czf temps-linux-amd64.tar.gz temps
+          ls -lh temps-linux-amd64.tar.gz
+
+      - name: Generate checksum
+        run: |
+          sha256sum temps-linux-amd64.tar.gz > temps-linux-amd64.tar.gz.sha256
+          cat temps-linux-amd64.tar.gz.sha256
+
+      - name: Get binary info
+        run: |
+          file temps
+          ./temps --version || echo "Note: Binary may require runtime dependencies"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: temps-linux-amd64
+          path: |
+            temps-linux-amd64.tar.gz
+            temps-linux-amd64.tar.gz.sha256
+
+  build-darwin-amd64:
+    name: Build macOS AMD64
+    runs-on: macos-15-intel
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: darwin-amd64-release
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install web dependencies
+        run: |
+          cd web
+          bun install
+
+      - name: Install wasm-pack and Build WASM
+        run: |
+          cargo install wasm-pack
+          cd crates/temps-captcha-wasm
+          bun run build
+
+      - name: Build release binary
+        run: cargo build --release --bin temps --target x86_64-apple-darwin
+        env:
+          FORCE_WEB_BUILD: 1
+          CARGO_INCREMENTAL: 0
+          TEMPS_VERSION: ${{ github.ref_name }}
+
+      - name: Strip binary
+        run: strip target/x86_64-apple-darwin/release/temps
+
+      - name: Rename binary
+        run: cp target/x86_64-apple-darwin/release/temps temps
+
+      - name: Create tarball
+        run: |
+          tar -czf temps-darwin-amd64.tar.gz temps
+          ls -lh temps-darwin-amd64.tar.gz
+
+      - name: Generate checksum
+        run: |
+          shasum -a 256 temps-darwin-amd64.tar.gz > temps-darwin-amd64.tar.gz.sha256
+          cat temps-darwin-amd64.tar.gz.sha256
+
+      - name: Get binary info
+        run: |
+          file temps
+          ./temps --version || echo "Note: Binary may require runtime dependencies"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: temps-darwin-amd64
+          path: |
+            temps-darwin-amd64.tar.gz
+            temps-darwin-amd64.tar.gz.sha256
+
+  build-darwin-arm64:
+    name: Build macOS ARM64
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install web dependencies
+        run: |
+          cd web
+          bun install
+
+      - name: Install wasm-pack and Build WASM
+        run: |
+          cargo install wasm-pack
+          cd crates/temps-captcha-wasm
+          bun run build
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: darwin-arm64-release
+
+      - name: Build release binary
+        run: cargo build --release --bin temps --target aarch64-apple-darwin
+        env:
+          FORCE_WEB_BUILD: 1
+          CARGO_INCREMENTAL: 0
+          TEMPS_VERSION: ${{ github.ref_name }}
+
+      - name: Strip binary
+        run: strip target/aarch64-apple-darwin/release/temps
+
+      - name: Rename binary
+        run: cp target/aarch64-apple-darwin/release/temps temps
+
+      - name: Create tarball
+        run: |
+          tar -czf temps-darwin-arm64.tar.gz temps
+          ls -lh temps-darwin-arm64.tar.gz
+
+      - name: Generate checksum
+        run: |
+          shasum -a 256 temps-darwin-arm64.tar.gz > temps-darwin-arm64.tar.gz.sha256
+          cat temps-darwin-arm64.tar.gz.sha256
+
+      - name: Get binary info
+        run: |
+          file temps
+          ./temps --version || echo "Note: Binary may require runtime dependencies"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: temps-darwin-arm64
+          path: |
+            temps-darwin-arm64.tar.gz
+            temps-darwin-arm64.tar.gz.sha256
+
+  create-release:
+    name: Create Release
+    needs: [build-linux-amd64, build-darwin-amd64, build-darwin-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Organize artifacts
+        run: |
+          mkdir -p release
+          cp artifacts/temps-linux-amd64/* release/
+          cp artifacts/temps-darwin-amd64/* release/
+          cp artifacts/temps-darwin-arm64/* release/
+          ls -lh release/
+
+      - name: Create combined checksums file
+        run: |
+          cd release
+          cat temps-linux-amd64.tar.gz.sha256 > checksums.txt
+          cat temps-darwin-amd64.tar.gz.sha256 >> checksums.txt
+          cat temps-darwin-arm64.tar.gz.sha256 >> checksums.txt
+          echo "Combined checksums:"
+          cat checksums.txt
+
+      - name: Copy install script to release
+        run: |
+          cp scripts/install.sh release/install.sh
+          chmod +x release/install.sh
+
+      - name: Generate Homebrew formula
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          SHA256_LINUX_AMD64=$(awk '{print $1}' release/temps-linux-amd64.tar.gz.sha256)
+          SHA256_DARWIN_AMD64=$(awk '{print $1}' release/temps-darwin-amd64.tar.gz.sha256)
+          SHA256_DARWIN_ARM64=$(awk '{print $1}' release/temps-darwin-arm64.tar.gz.sha256)
+
+          echo "Generating Homebrew formula for version $VERSION"
+          echo "Linux AMD64 SHA256: $SHA256_LINUX_AMD64"
+          echo "macOS AMD64 SHA256: $SHA256_DARWIN_AMD64"
+          echo "macOS ARM64 SHA256: $SHA256_DARWIN_ARM64"
+
+          sed -e "s/{{VERSION}}/$VERSION/g" \
+              -e "s/{{SHA256_LINUX_AMD64}}/$SHA256_LINUX_AMD64/g" \
+              -e "s/{{SHA256_DARWIN_AMD64}}/$SHA256_DARWIN_AMD64/g" \
+              -e "s/{{SHA256_DARWIN_ARM64}}/$SHA256_DARWIN_ARM64/g" \
+              scripts/homebrew-formula.rb.template > release/temps.rb
+
+          echo "Generated formula:"
+          cat release/temps.rb
+
+      - name: Create release notes file
+        run: |
+          cat > release/release-notes.md << 'EOF'
+          ## Changes
+
+          See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref }}/CHANGELOG.md) for details.
+
+          ## Installation
+
+          ### Quick Install (Recommended)
+
+          **macOS, Linux, and WSL:**
+          ```bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/install.sh | bash
+          ```
+
+          ### Homebrew (macOS and Linux)
+
+          ```bash
+          # Download formula
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps.rb -o /tmp/temps.rb
+
+          # Install
+          brew install /tmp/temps.rb
+
+          # Verify
+          temps --version
+          ```
+
+          ### Manual Installation
+
+          #### Linux AMD64
+          ```bash
+          # Download
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-linux-amd64.tar.gz
+
+          # Extract
+          tar -xzf temps-linux-amd64.tar.gz
+
+          # Move to PATH
+          sudo mv temps /usr/local/bin/temps
+
+          # Verify
+          temps --version
+          ```
+
+          #### macOS AMD64 (Intel)
+          ```bash
+          # Download
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-darwin-amd64.tar.gz
+
+          # Extract
+          tar -xzf temps-darwin-amd64.tar.gz
+
+          # Move to PATH
+          sudo mv temps /usr/local/bin/temps
+
+          # Verify
+          temps --version
+          ```
+
+          #### macOS ARM64 (Apple Silicon)
+          ```bash
+          # Download
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/temps-darwin-arm64.tar.gz
+
+          # Extract
+          tar -xzf temps-darwin-arm64.tar.gz
+
+          # Move to PATH
+          sudo mv temps /usr/local/bin/temps
+
+          # Verify
+          temps --version
+          ```
+
+          ### Checksums
+          ```bash
+          # Download checksums
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/checksums.txt
+
+          # Verify checksum (Linux/macOS)
+          sha256sum -c checksums.txt --ignore-missing
+          ```
+          EOF
+
+          echo "Release notes created:"
+          cat release/release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Creating release ${{ github.ref_name }}..."
+
+          # Determine if this is a prerelease
+          if [[ "${{ github.ref_name }}" == *"-"* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+            echo "This is a pre-release"
+          else
+            PRERELEASE_FLAG="--latest"
+            echo "This is a stable release"
+          fi
+
+          gh release create ${{ github.ref_name }} \
+            --title "${{ github.ref_name }}" \
+            --notes-file release/release-notes.md \
+            $PRERELEASE_FLAG \
+            release/temps-linux-amd64.tar.gz \
+            release/temps-linux-amd64.tar.gz.sha256 \
+            release/temps-darwin-amd64.tar.gz \
+            release/temps-darwin-amd64.tar.gz.sha256 \
+            release/temps-darwin-arm64.tar.gz \
+            release/temps-darwin-arm64.tar.gz.sha256 \
+            release/checksums.txt \
+            release/install.sh \
+            release/temps.rb
+
+          echo ""
+          echo "✓ Release ${{ github.ref_name }} created successfully!"
+          echo ""
+          echo "View release at: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
+
+  build-and-push-docker:
+    name: Build and Push Docker Image (${{ matrix.platform }})
+    needs: [build-linux-amd64, build-darwin-amd64, build-darwin-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            artifact: temps-linux-amd64
+            tarball: temps-linux-amd64.tar.gz
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifacts
+
+      - name: Extract binary
+        run: |
+          cd artifacts
+          tar -xzf ${{ matrix.tarball }}
+          chmod +x temps
+          ls -lh temps
+          file temps
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Extract platform tag
+        id: platform_tag
+        run: |
+          PLATFORM_TAG=$(echo "${{ matrix.platform }}" | sed 's/\//-/g')
+          echo "tag=$PLATFORM_TAG" >> $GITHUB_OUTPUT
+          echo "Platform tag: $PLATFORM_TAG"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.release
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/temps:latest-${{ steps.platform_tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-${{ steps.platform_tag.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.title=Temps
+            org.opencontainers.image.description=Open-source platform for deploying and managing applications
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  create-docker-manifest:
+    name: Create Docker Manifest
+    needs: [build-and-push-docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Create and push manifest for latest
+        run: |
+          docker buildx imagetools create -t ghcr.io/${{ github.repository_owner }}/temps:latest \
+            ghcr.io/${{ github.repository_owner }}/temps:latest-linux-amd64
+
+      - name: Create and push manifest for version
+        run: |
+          docker buildx imagetools create -t ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }} \
+            ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-linux-amd64

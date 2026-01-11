@@ -133,7 +133,10 @@ impl SimpleTokenizer {
     }
 
     fn get_token_id(&self, word: &str) -> u32 {
-        *self.word_to_id.get(word).unwrap_or(&(self.vocab.len() as u32))
+        *self
+            .word_to_id
+            .get(word)
+            .unwrap_or(&(self.vocab.len() as u32))
     }
 }
 
@@ -243,10 +246,7 @@ mod tests {
 
     #[test]
     fn test_simple_tokenizer() {
-        let tokenizer = SimpleTokenizer::with_vocab(vec![
-            "hello".to_string(),
-            "world".to_string(),
-        ]);
+        let tokenizer = SimpleTokenizer::with_vocab(vec!["hello".to_string(), "world".to_string()]);
 
         let tokens = tokenizer.encode("hello world").unwrap();
         assert_eq!(tokens, vec![0, 1]);

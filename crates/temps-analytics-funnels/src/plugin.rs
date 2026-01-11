@@ -1,9 +1,9 @@
-use temps_core::plugin::{
-    PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
-};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use temps_core::plugin::{
+    PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
+};
 use tracing::debug;
 
 /// Funnels analytics plugin
@@ -40,8 +40,9 @@ impl TempsPlugin for FunnelsPlugin {
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let funnel_service = context.get_service::<crate::services::FunnelService>()?;
 
-        let routes = crate::handlers::handler::configure_routes()
-            .with_state(Arc::new(crate::handlers::types::AppState { funnel_service }));
+        let routes = crate::handlers::handler::configure_routes().with_state(Arc::new(
+            crate::handlers::types::AppState { funnel_service },
+        ));
 
         Some(PluginRoutes { router: routes })
     }

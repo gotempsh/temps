@@ -1,7 +1,8 @@
 use super::types::{
     AcmeOrderResponse, ChallengeError, ChallengeValidationStatus, CreateDomainRequest,
-    DnsCompletionResponse, DomainAppState, DomainChallengeResponse, DomainError, DomainResponse,
-    HttpChallengeDebugResponse, ListDomainsResponse, ListOrdersResponse, ProvisionResponse,
+    DnsChallengeRecordResult, DnsCompletionResponse, DomainAppState, DomainChallengeResponse,
+    DomainError, DomainResponse, HttpChallengeDebugResponse, ListDomainsResponse,
+    ListOrdersResponse, ProvisionResponse, SetupDnsChallengeRequest, SetupDnsChallengeResponse,
     TxtRecord,
 };
 use crate::tls::{ProviderError, RepositoryError, TlsError};
@@ -89,12 +90,10 @@ impl From<RepositoryError> for Problem {
                     .detail(msg)
                     .build()
             }
-            RepositoryError::Internal(msg) => {
-                ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .title("Internal Error")
-                    .detail(msg)
-                    .build()
-            }
+            RepositoryError::Internal(msg) => ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Internal Error")
+                .detail(msg)
+                .build(),
         }
     }
 }
@@ -191,7 +190,8 @@ impl From<DomainServiceError> for Problem {
         cancel_domain_order,
         get_domain_order,
         list_orders,
-        get_http_challenge_debug
+        get_http_challenge_debug,
+        setup_dns_challenge
     ),
     components(
         schemas(
@@ -207,7 +207,10 @@ impl From<DomainServiceError> for Problem {
             ListOrdersResponse,
             HttpChallengeDebugResponse,
             ChallengeValidationStatus,
-            ChallengeError
+            ChallengeError,
+            SetupDnsChallengeRequest,
+            SetupDnsChallengeResponse,
+            DnsChallengeRecordResult
         )
     ),
     info(
@@ -252,7 +255,14 @@ async fn create_domain(
     permission_guard!(auth, DomainsCreate);
 
     // Validate that the user has an email configured
-    let user_email = &auth.user.email;
+    // Deployment tokens are not allowed as we need a user email for Let's Encrypt
+    let user = auth.require_user().map_err(|msg| {
+        ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("User Required")
+            .detail(msg)
+            .build()
+    })?;
+    let user_email = &user.email;
     if user_email.is_empty() {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Email Required")
@@ -457,7 +467,14 @@ async fn provision_domain(
     permission_guard!(auth, DomainsWrite);
 
     // Validate that the user has an email configured
-    let user_email = &auth.user.email;
+    // Deployment tokens are not allowed as we need a user email for Let's Encrypt
+    let user = auth.require_user().map_err(|msg| {
+        ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("User Required")
+            .detail(msg)
+            .build()
+    })?;
+    let user_email = &user.email;
     if user_email.is_empty() {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Email Required")
@@ -611,7 +628,14 @@ async fn finalize_order(
     permission_guard!(auth, DomainsWrite);
 
     // Validate that the user has an email configured
-    let user_email = &auth.user.email;
+    // Deployment tokens are not allowed as we need a user email for Let's Encrypt
+    let user = auth.require_user().map_err(|msg| {
+        ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("User Required")
+            .detail(msg)
+            .build()
+    })?;
+    let user_email = &user.email;
     if user_email.is_empty() {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Email Required")
@@ -829,7 +853,14 @@ async fn renew_domain(
     permission_guard!(auth, DomainsWrite);
 
     // Validate that the user has an email configured
-    let user_email = &auth.user.email;
+    // Deployment tokens are not allowed as we need a user email for Let's Encrypt
+    let user = auth.require_user().map_err(|msg| {
+        ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("User Required")
+            .detail(msg)
+            .build()
+    })?;
+    let user_email = &user.email;
     if user_email.is_empty() {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Email Required")
@@ -1082,7 +1113,14 @@ async fn create_or_recreate_order(
     permission_guard!(auth, DomainsWrite);
 
     // Validate that the user has an email configured
-    let user_email = &auth.user.email;
+    // Deployment tokens are not allowed as we need a user email for Let's Encrypt
+    let user = auth.require_user().map_err(|msg| {
+        ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("User Required")
+            .detail(msg)
+            .build()
+    })?;
+    let user_email = &user.email;
     if user_email.is_empty() {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Email Required")
@@ -1226,15 +1264,11 @@ async fn list_orders(
 
     info!("Listing all ACME orders for user: {}", auth.user_id());
 
-    let acme_orders = app_state
-        .repository
-        .list_all_orders()
-        .await
-        .map_err(|e| {
-            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Failed to list orders")
-                .with_detail(e.to_string())
-        })?;
+    let acme_orders = app_state.repository.list_all_orders().await.map_err(|e| {
+        temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Failed to list orders")
+            .with_detail(e.to_string())
+    })?;
 
     let orders: Vec<AcmeOrderResponse> = acme_orders
         .into_iter()
@@ -1317,6 +1351,293 @@ async fn get_http_challenge_debug(
     ))
 }
 
+/// Setup DNS challenge records automatically using a DNS provider
+///
+/// This endpoint automatically creates the required DNS TXT records for ACME DNS-01 challenge
+/// validation using a configured DNS provider. The domain must have an active DNS challenge
+/// pending (created via POST /domains/{id}/order with dns-01 challenge type).
+///
+/// This is similar to how email domain DNS records are auto-provisioned.
+#[utoipa::path(
+    post,
+    path = "/domains/{domain_id}/setup-dns",
+    request_body = SetupDnsChallengeRequest,
+    responses(
+        (status = 200, description = "DNS records created successfully", body = SetupDnsChallengeResponse),
+        (status = 400, description = "Bad request - DNS provider not configured or no challenge pending"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Domain or DNS provider not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("domain_id" = i32, Path, description = "Domain ID")
+    ),
+    tag = "Domains",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn setup_dns_challenge(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<DomainAppState>>,
+    Path(domain_id): Path<i32>,
+    Json(request): Json<SetupDnsChallengeRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, DomainsWrite);
+
+    // Check if DNS provider service is available
+    let dns_provider_service = app_state.dns_provider_service.as_ref().ok_or_else(|| {
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("DNS Provider Service Not Configured")
+            .detail("DNS provider service is not configured on this server")
+            .build()
+    })?;
+
+    // Get the domain
+    let domain = app_state
+        .domain_service
+        .get_domain_by_id(domain_id)
+        .await
+        .map_err(|e| {
+            error!("Failed to get domain by ID {}: {}", domain_id, e);
+            e
+        })?
+        .ok_or_else(|| {
+            ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .title("Domain not found")
+                .detail(format!("Domain with ID {} not found", domain_id))
+                .build()
+        })?;
+
+    // Check if this is a DNS-01 challenge
+    if domain.verification_method != "dns-01" {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Challenge Type")
+            .detail(format!(
+                "Domain {} uses {} challenge type, but DNS auto-provisioning is only available for dns-01 challenges",
+                domain.domain, domain.verification_method
+            ))
+            .build());
+    }
+
+    // Get the ACME order with challenge data
+    let order = app_state
+        .repository
+        .find_acme_order_by_domain(domain_id)
+        .await?
+        .ok_or_else(|| {
+            ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .title("No Challenge Pending")
+                .detail(format!(
+                    "No ACME order found for domain {}. Please create an order first using POST /domains/{}/order",
+                    domain.domain, domain_id
+                ))
+                .build()
+        })?;
+
+    // Extract DNS TXT records from the order's authorizations
+    let authorizations = order.authorizations.clone().unwrap_or_default();
+    let dns_txt_records: Vec<(String, String)> = if let Some(records_json) = authorizations
+        .get("dns_txt_records")
+        .and_then(|v| v.as_array())
+    {
+        records_json
+            .iter()
+            .filter_map(|rec| {
+                let name = rec["name"].as_str()?.to_string();
+                let value = rec["value"].as_str()?.to_string();
+                Some((name, value))
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
+    if dns_txt_records.is_empty() {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("No DNS Records Found")
+            .detail("No DNS TXT records found in the challenge. The order may not have been created correctly.")
+            .build());
+    }
+
+    // Get the DNS provider
+    let dns_provider = dns_provider_service
+        .get(request.dns_provider_id)
+        .await
+        .map_err(|e| {
+            error!("Failed to get DNS provider: {}", e);
+            ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .title("DNS Provider Not Found")
+                .detail(format!(
+                    "DNS provider with ID {} not found",
+                    request.dns_provider_id
+                ))
+                .build()
+        })?;
+
+    // Create DNS provider instance
+    let provider_instance = dns_provider_service
+        .create_provider_instance(&dns_provider)
+        .map_err(|e| {
+            error!("Failed to create DNS provider instance: {}", e);
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("DNS Provider Error")
+                .detail(format!("Failed to initialize DNS provider: {}", e))
+                .build()
+        })?;
+
+    // Extract the base domain for the DNS provider
+    let base_domain = extract_base_domain(&domain.domain);
+
+    info!(
+        "Setting up {} DNS TXT record(s) for {} using provider {}",
+        dns_txt_records.len(),
+        domain.domain,
+        dns_provider.name
+    );
+
+    let mut results = Vec::new();
+    let mut records_created: u32 = 0;
+
+    // Create each DNS TXT record
+    for (name, value) in &dns_txt_records {
+        let result =
+            create_acme_txt_record(provider_instance.as_ref(), &base_domain, name, value).await;
+
+        if result.success {
+            records_created += 1;
+        }
+
+        results.push(result);
+    }
+
+    let total_records = dns_txt_records.len() as u32;
+    let all_success = records_created == total_records;
+
+    let message = if all_success {
+        format!(
+            "Successfully created all {} DNS TXT record(s) for {} challenge. You can now finalize the order.",
+            total_records, domain.domain
+        )
+    } else {
+        format!(
+            "Created {} of {} DNS TXT record(s) for {}. Some records may need manual configuration.",
+            records_created, total_records, domain.domain
+        )
+    };
+
+    info!("{}", message);
+
+    let response = SetupDnsChallengeResponse {
+        success: all_success,
+        records_created,
+        total_records,
+        results,
+        message,
+    };
+
+    Ok(Json(response))
+}
+
+/// Extract the base domain from a full domain name (e.g., "sub.example.com" -> "example.com")
+fn extract_base_domain(domain: &str) -> String {
+    // Handle wildcard domains
+    let domain = domain.strip_prefix("*.").unwrap_or(domain);
+
+    let parts: Vec<&str> = domain.split('.').collect();
+    if parts.len() >= 2 {
+        parts[parts.len() - 2..].join(".")
+    } else {
+        domain.to_string()
+    }
+}
+
+/// Create a single ACME challenge TXT record using the DNS provider
+/// This will first remove any existing TXT records with the same name before creating the new one
+async fn create_acme_txt_record(
+    provider: &dyn temps_dns::providers::DnsProvider,
+    base_domain: &str,
+    name: &str,
+    value: &str,
+) -> DnsChallengeRecordResult {
+    use temps_dns::providers::{DnsRecordContent, DnsRecordRequest, DnsRecordType};
+
+    // Extract the record name relative to the base domain
+    // e.g., "_acme-challenge.example.com" for base domain "example.com" -> "_acme-challenge"
+    let record_name = if name.ends_with(&format!(".{}", base_domain)) {
+        name.strip_suffix(&format!(".{}", base_domain))
+            .unwrap_or(name)
+            .to_string()
+    } else if name == base_domain {
+        "@".to_string()
+    } else {
+        name.to_string()
+    };
+
+    debug!(
+        "Creating TXT record: name={} (relative: {}), value={}, base_domain={}",
+        name, record_name, value, base_domain
+    );
+
+    // First, try to remove any existing TXT record with the same name
+    // This is important for ACME challenges as old tokens can interfere with validation
+    match provider
+        .remove_record(base_domain, &record_name, DnsRecordType::TXT)
+        .await
+    {
+        Ok(()) => {
+            debug!(
+                "Removed existing TXT record {} for {} before creating new one",
+                record_name, base_domain
+            );
+        }
+        Err(e) => {
+            // It's okay if removal fails (record might not exist)
+            debug!(
+                "No existing TXT record to remove for {} (or removal failed: {})",
+                record_name, e
+            );
+        }
+    }
+
+    let request = DnsRecordRequest {
+        name: record_name.clone(),
+        content: DnsRecordContent::TXT {
+            content: value.to_string(),
+        },
+        ttl: Some(120), // Short TTL for ACME challenges
+        proxied: false,
+    };
+
+    match provider.create_record(base_domain, request).await {
+        Ok(_record) => {
+            info!(
+                "Successfully created TXT record {} = {} for {}",
+                name, value, base_domain
+            );
+            DnsChallengeRecordResult {
+                name: name.to_string(),
+                value: value.to_string(),
+                success: true,
+                message: "TXT record created successfully".to_string(),
+            }
+        }
+        Err(e) => {
+            error!(
+                "Failed to create TXT record {} for {}: {}",
+                name, base_domain, e
+            );
+            DnsChallengeRecordResult {
+                name: name.to_string(),
+                value: value.to_string(),
+                success: false,
+                message: format!("Failed to create TXT record: {}", e),
+            }
+        }
+    }
+}
+
 pub fn configure_routes() -> Router<Arc<DomainAppState>> {
     Router::new()
         .route("/domains", post(create_domain))
@@ -1343,5 +1664,7 @@ pub fn configure_routes() -> Router<Arc<DomainAppState>> {
         .route("/domains/{domain_id}/order", get(get_domain_order))
         .route("/domains/{domain_id}/order", delete(cancel_domain_order))
         .route("/domains/{domain_id}/order/finalize", post(finalize_order))
+        // DNS challenge auto-provisioning
+        .route("/domains/{domain_id}/setup-dns", post(setup_dns_challenge))
         .route("/orders", get(list_orders))
 }

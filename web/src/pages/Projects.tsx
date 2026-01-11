@@ -1,21 +1,24 @@
 import { useEffect, useState } from 'react'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
 import { ProjectCardSkeleton } from '@/components/skeletons/ProjectCardSkeleton'
 import { Button } from '@/components/ui/button'
+import { KbdBadge } from '@/components/ui/kbd-badge'
 import {
   getProjectsOptions,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery } from '@tanstack/react-query'
 import { Plus, FolderPlus, GitBranch, Upload } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 
 const ITEMS_PER_PAGE = 8
 
 export function Projects() {
   const { setBreadcrumbs } = useBreadcrumbs()
+  const navigate = useNavigate()
   const [page, setPage] = useState(1)
 
   const { data: projectsData, isLoading } = useQuery({
@@ -35,6 +38,42 @@ export function Projects() {
   useEffect(() => {
     setBreadcrumbs([{ label: 'Projects' }])
   }, [setBreadcrumbs])
+
+  // Keyboard shortcut: N to create new project
+  useKeyboardShortcut({ key: 'n', path: '/projects/new' })
+
+  // Keyboard shortcuts: Ctrl+1 through Ctrl+9 to navigate to projects
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Check if user is typing in an input field
+      const target = e.target as HTMLElement
+      const isTyping =
+        target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable
+
+      // Only trigger if Ctrl (or Cmd on Mac) is pressed with a number key
+      if (
+        !isTyping &&
+        (e.ctrlKey || e.metaKey) &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key >= '1' &&
+        e.key <= '9'
+      ) {
+        const index = parseInt(e.key, 10) - 1
+        const projects = projectsData?.projects || []
+
+        if (projects[index]) {
+          e.preventDefault()
+          navigate(`/projects/${projects[index].slug}`)
+        }
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [projectsData?.projects, navigate])
 
   usePageTitle('Projects')
 
@@ -62,6 +101,7 @@ export function Projects() {
             <Link to="/projects/new" className="flex items-center gap-2">
               <Plus className="h-4 w-4" />
               New Project
+              <KbdBadge keys="N" />
             </Link>
           </Button>
         </div>
@@ -138,8 +178,12 @@ export function Projects() {
           )
         ) : (
           <>
-            {projectsData?.projects.map((project) => (
-              <ProjectCard key={project.id} project={project} />
+            {projectsData?.projects.map((project, index) => (
+              <ProjectCard
+                key={project.id}
+                project={project}
+                shortcutNumber={index < 9 ? index + 1 : undefined}
+              />
             ))}
           </>
         )}

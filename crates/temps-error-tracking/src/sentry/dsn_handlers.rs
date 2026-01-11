@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -7,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use utoipa::{OpenApi, ToSchema};
 
 use crate::sentry::{DSNService, ProjectDSN, SentryIngesterError};
@@ -41,10 +41,22 @@ pub struct DSNAppState {
 
 pub fn configure_dsn_routes() -> Router<Arc<DSNAppState>> {
     Router::new()
-        .route("/projects/{project_id}/dsns", post(create_dsn).get(list_dsns))
-        .route("/projects/{project_id}/dsns/get-or-create", post(get_or_create_dsn))
-        .route("/projects/{project_id}/dsns/{dsn_id}/regenerate", post(regenerate_dsn))
-        .route("/projects/{project_id}/dsns/{dsn_id}/revoke", post(revoke_dsn))
+        .route(
+            "/projects/{project_id}/dsns",
+            post(create_dsn).get(list_dsns),
+        )
+        .route(
+            "/projects/{project_id}/dsns/get-or-create",
+            post(get_or_create_dsn),
+        )
+        .route(
+            "/projects/{project_id}/dsns/{dsn_id}/regenerate",
+            post(regenerate_dsn),
+        )
+        .route(
+            "/projects/{project_id}/dsns/{dsn_id}/revoke",
+            post(revoke_dsn),
+        )
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -104,7 +116,9 @@ impl IntoResponse for SentryIngesterError {
             SentryIngesterError::ProjectNotFound => (StatusCode::NOT_FOUND, "Project not found"),
             SentryIngesterError::InvalidDSN => (StatusCode::NOT_FOUND, "DSN not found"),
             SentryIngesterError::Validation(msg) => (StatusCode::BAD_REQUEST, msg.leak() as &str),
-            SentryIngesterError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error"),
+            SentryIngesterError::Database(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "Database error")
+            }
         };
 
         (status, message).into_response()

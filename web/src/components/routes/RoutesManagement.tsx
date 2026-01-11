@@ -1,9 +1,7 @@
 'use client'
 
 import {
-  createRoute,
   deleteRoute,
-  ListDomainsResponse,
   ListRoutesResponse,
   RouteResponse,
   updateRoute,
@@ -18,6 +16,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import {
@@ -25,7 +24,6 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from '@/components/ui/dialog'
 import {
   DropdownMenu,
@@ -43,123 +41,45 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
-import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
-import { MoreHorizontal, Pencil, Plus, Router, Trash2 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { useForm, useWatch } from 'react-hook-form'
+import { Globe, Lock, MoreHorizontal, Pencil, Plus, Router, Trash2 } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
-interface NewRoute {
-  domain: string
-  host: string
-  port: number
-  domainInputType: 'select' | 'manual'
-  subdomain?: string
-}
-
 interface RoutesManagementProps {
   routes?: ListRoutesResponse
-  domains?: ListDomainsResponse
   isLoading: boolean
   reloadRoutes: () => void
 }
 
-const createRouteSchema = z
-  .object({
-    domain: z.string().min(1, 'Domain is required'),
-    host: z.string().min(1, 'Host is required'),
-    port: z.number().min(1, 'Port is required'),
-    domainInputType: z.enum(['select', 'manual']),
-    subdomain: z.string().optional(),
-  })
-  .refine(
-    (data) => {
-      // If domain is a wildcard, subdomain is required
-      if (data.domain && data.domain.includes('*.')) {
-        return data.subdomain && data.subdomain.trim().length > 0
-      }
-      return true
-    },
-    {
-      message: 'Subdomain is required for wildcard domains',
-      path: ['subdomain'],
-    }
-  )
+const editRouteSchema = z.object({
+  domain: z.string().min(1, 'Domain is required'),
+  host: z.string().min(1, 'Host is required'),
+  port: z.number().min(1, 'Port is required').max(65535, 'Port must be at most 65535'),
+})
 
-type CreateRouteFormData = z.infer<typeof createRouteSchema>
+type EditRouteFormData = z.infer<typeof editRouteSchema>
 
 export function RoutesManagement({
   routes,
-  domains,
   isLoading,
   reloadRoutes,
 }: RoutesManagementProps) {
-  const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [routeToDelete, setRouteToDelete] = useState<string | null>(null)
-
   const [editRoute, setEditRoute] = useState<RouteResponse | null>(null)
-  const { accessMode } = usePlatformCapabilities()
-  const isLocalMode = useMemo(() => accessMode === 'local', [accessMode])
-  // Check if domains are available
-  const hasAvailableDomains = domains?.domains && domains.domains.length > 0
-
-  const form = useForm<CreateRouteFormData>({
-    resolver: zodResolver(createRouteSchema),
-    defaultValues: {
-      domain: '',
-      host: '',
-      port: 80,
-      domainInputType:
-        isLocalMode || !hasAvailableDomains ? 'manual' : 'select',
-      subdomain: '',
-    },
-  })
-
-  // Mutations setup
-  const createRouteMutation = useMutation({
-    mutationFn: (route: NewRoute) => createRoute({ body: route }),
-    meta: {
-      errorTitle: 'Failed to create route',
-    },
-    onSuccess: ({ response }: any) => {
-      if (response.status >= 300) {
-        toast.error('Failed to create route')
-      } else {
-        form.reset({
-          domain: '',
-          host: '',
-          port: 80,
-          domainInputType:
-            isLocalMode || !hasAvailableDomains ? 'manual' : 'select',
-          subdomain: '',
-        })
-        setIsCreateDialogOpen(false)
-        toast.success('Route created successfully')
-        reloadRoutes()
-      }
-    },
-  })
 
   const updateRouteMutation = useMutation({
-    mutationFn: (route: NewRoute) =>
+    mutationFn: (data: { domain: string; host: string; port: number }) =>
       updateRoute({
-        path: { domain: route.domain },
+        path: { domain: data.domain },
         body: {
           enabled: true,
-          host: route.host,
-          port: route.port,
+          host: data.host,
+          port: data.port,
         },
       }),
     meta: {
@@ -187,61 +107,15 @@ export function RoutesManagement({
       setRouteToDelete(null)
     },
   })
-  const editForm = useForm<CreateRouteFormData>({
-    resolver: zodResolver(createRouteSchema),
+
+  const editForm = useForm<EditRouteFormData>({
+    resolver: zodResolver(editRouteSchema),
     defaultValues: {
       domain: '',
       host: '',
       port: 80,
-      domainInputType: 'manual',
-      subdomain: '',
     },
   })
-
-  const selectedDomain = useWatch({
-    control: form.control,
-    name: 'domain',
-  })
-  const isWildcardDomain = useMemo(
-    () => selectedDomain && selectedDomain.includes('*.'),
-    [selectedDomain]
-  )
-
-  const onSubmit = useCallback(
-    async (data: CreateRouteFormData) => {
-      let finalDomain = data.domain
-
-      // If it's a wildcard domain, subdomain is required
-      if (isWildcardDomain) {
-        if (!data.subdomain || data.subdomain.trim() === '') {
-          toast.error('Subdomain is required for wildcard domains')
-          return
-        }
-        finalDomain = data.domain.replace('*.', `${data.subdomain}.`)
-      }
-
-      await createRouteMutation.mutateAsync({
-        domain: finalDomain,
-        host: data.host,
-        port: data.port,
-        domainInputType: data.domainInputType,
-      })
-    },
-    [createRouteMutation, isWildcardDomain]
-  )
-
-  useEffect(() => {
-    if (!isCreateDialogOpen) {
-      form.reset({
-        domain: '',
-        host: '',
-        port: 80,
-        domainInputType:
-          isLocalMode || !hasAvailableDomains ? 'manual' : 'select',
-        subdomain: '',
-      })
-    }
-  }, [isCreateDialogOpen, isLocalMode, hasAvailableDomains, form])
 
   useEffect(() => {
     if (editRoute) {
@@ -249,26 +123,35 @@ export function RoutesManagement({
         domain: editRoute.domain,
         host: editRoute.host,
         port: editRoute.port,
-        domainInputType: 'manual',
-        subdomain: '',
       })
     }
   }, [editRoute, editForm])
 
-  const onEditSubmit = async (data: CreateRouteFormData) => {
+  const onEditSubmit = async (data: EditRouteFormData) => {
     await updateRouteMutation.mutateAsync({
       domain: data.domain,
       host: data.host,
       port: data.port,
-      domainInputType: 'manual',
     })
     editForm.reset()
   }
 
-  const domainInputType = useWatch({
-    control: form.control,
-    name: 'domainInputType',
-  })
+  const formatRouteType = (routeType: string) => {
+    if (routeType === 'tls') {
+      return (
+        <Badge variant="outline" className="gap-1">
+          <Lock className="h-3 w-3" />
+          TLS/SNI
+        </Badge>
+      )
+    }
+    return (
+      <Badge variant="secondary" className="gap-1">
+        <Globe className="h-3 w-3" />
+        HTTP
+      </Badge>
+    )
+  }
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -278,176 +161,12 @@ export function RoutesManagement({
             Configure custom domain routing and load balancing
           </p>
         </div>
-        <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
-          <DialogTrigger asChild>
-            <Button>
-              <Plus className="mr-2 h-4 w-4" />
-              Add Route
-            </Button>
-          </DialogTrigger>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>Add New Route</DialogTitle>
-            </DialogHeader>
-            <Form {...form}>
-              <form
-                onSubmit={form.handleSubmit(onSubmit)}
-                className="space-y-6"
-              >
-                {hasAvailableDomains && !isLocalMode && (
-                  <FormField
-                    control={form.control}
-                    name="domainInputType"
-                    render={({ field }) => (
-                      <FormItem className="space-y-1">
-                        <FormLabel>Domain Input Type</FormLabel>
-                        <FormControl>
-                          <RadioGroup
-                            onValueChange={field.onChange}
-                            value={field.value}
-                            className="flex gap-4"
-                          >
-                            <div className="flex items-center space-x-2">
-                              <RadioGroupItem value="select" id="select" />
-                              <Label htmlFor="select">
-                                Select Existing Domain
-                              </Label>
-                            </div>
-                            <div className="flex items-center space-x-2">
-                              <RadioGroupItem value="manual" id="manual" />
-                              <Label htmlFor="manual">Enter Manually</Label>
-                            </div>
-                          </RadioGroup>
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                )}
-
-                <FormField
-                  control={form.control}
-                  name="domain"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Domain</FormLabel>
-                      <FormControl>
-                        {domainInputType === 'select' &&
-                        hasAvailableDomains &&
-                        !isLocalMode ? (
-                          <Select
-                            onValueChange={field.onChange}
-                            value={field.value}
-                          >
-                            <FormControl>
-                              <SelectTrigger>
-                                <SelectValue placeholder="Select a domain" />
-                              </SelectTrigger>
-                            </FormControl>
-                            <SelectContent>
-                              {domains?.domains?.map((domain) => (
-                                <SelectItem
-                                  key={domain.id}
-                                  value={domain.domain}
-                                >
-                                  {domain.domain}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                        ) : (
-                          <Input placeholder="example.com" {...field} />
-                        )}
-                      </FormControl>
-                      {(isLocalMode || !hasAvailableDomains) && (
-                        <p className="text-sm text-muted-foreground">
-                          {isLocalMode
-                            ? 'Manual entry required in local development mode'
-                            : 'No domains available - enter domain manually'}
-                        </p>
-                      )}
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-
-                {isWildcardDomain && (
-                  <FormField
-                    control={form.control}
-                    name="subdomain"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Subdomain</FormLabel>
-                        <FormControl>
-                          <div className="flex items-center gap-1">
-                            <Input
-                              placeholder="subdomain"
-                              {...field}
-                              className="flex-1"
-                            />
-                            <span className="text-sm text-muted-foreground">
-                              {selectedDomain.replace('*', '')}
-                            </span>
-                          </div>
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                )}
-
-                <FormField
-                  control={form.control}
-                  name="host"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Host</FormLabel>
-                      <FormControl>
-                        <Input
-                          placeholder="localhost or IP address"
-                          {...field}
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-
-                <FormField
-                  control={form.control}
-                  name="port"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Port</FormLabel>
-                      <FormControl>
-                        <Input
-                          type="number"
-                          placeholder="3000"
-                          {...field}
-                          onChange={(e) =>
-                            field.onChange(Number(e.target.value))
-                          }
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-
-                <div className="flex justify-end">
-                  <Button
-                    type="submit"
-                    disabled={createRouteMutation.isPending}
-                  >
-                    {createRouteMutation.isPending
-                      ? 'Creating...'
-                      : 'Create Route'}
-                  </Button>
-                </div>
-              </form>
-            </Form>
-          </DialogContent>
-        </Dialog>
+        <Button asChild>
+          <Link to="/load-balancer/add">
+            <Plus className="mr-2 h-4 w-4" />
+            Add Route
+          </Link>
+        </Button>
       </div>
 
       {isLoading ? (
@@ -471,11 +190,13 @@ export function RoutesManagement({
         <EmptyState
           icon={Router}
           title="No routes configured"
-          description="Get started by adding a new route"
+          description="Get started by adding a new route to direct traffic to your backend services"
           action={
-            <Button onClick={() => setIsCreateDialogOpen(true)}>
-              <Plus className="mr-2 h-4 w-4" />
-              Add Route
+            <Button asChild>
+              <Link to="/load-balancer/add">
+                <Plus className="mr-2 h-4 w-4" />
+                Add Route
+              </Link>
             </Button>
           }
         />
@@ -488,11 +209,16 @@ export function RoutesManagement({
                 className="flex items-center justify-between p-4"
               >
                 <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <div>
-                      <h3 className="truncate font-medium">{route.domain}</h3>
-                      <p className="text-sm text-muted-foreground">
-                        {route.host}:{route.port}
+                  <div className="flex items-center gap-3">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <h3 className="truncate font-medium">{route.domain}</h3>
+                        {formatRouteType(route.route_type)}
+                      </div>
+                      <p className="text-sm text-muted-foreground mt-0.5">
+                        <span className="font-mono">
+                          {route.host}:{route.port}
+                        </span>
                       </p>
                     </div>
                   </div>
@@ -577,9 +303,11 @@ export function RoutesManagement({
                     <FormControl>
                       <Input
                         type="number"
-                        placeholder="3000"
-                        {...field}
-                        onChange={(e) => field.onChange(Number(e.target.value))}
+                        placeholder="8080"
+                        min={1}
+                        max={65535}
+                        value={field.value}
+                        onChange={(e) => field.onChange(Number(e.target.value) || 0)}
                       />
                     </FormControl>
                     <FormMessage />

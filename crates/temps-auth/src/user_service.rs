@@ -1,9 +1,5 @@
-use base32;
 use base64::Engine;
-use bcrypt;
 use chrono::Utc;
-use temps_core::UtcDateTime;
-use tracing::{error, info};
 use qrcode::QrCode;
 use rand::Rng;
 use sea_orm::{
@@ -12,9 +8,11 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::sync::Arc;
+use temps_core::UtcDateTime;
 use temps_entities::types::RoleType;
 use thiserror::Error;
 use totp_rs::{Algorithm, Secret, TOTP};
+use tracing::{debug, error, info, warn};
 
 // First add the custom error type at the top of the file
 #[derive(Error, Debug)]
@@ -381,12 +379,29 @@ impl UserService {
     ) -> anyhow::Result<UserWithRoles, UserServiceError> {
         let now = Utc::now();
 
-        // Hash password if provided
+        // Hash password if provided using Argon2 (same as auth_service for consistency)
         let password_hash = if let Some(pwd) = password {
-            Some(bcrypt::hash(pwd, bcrypt::DEFAULT_COST).map_err(|e| {
-                UserServiceError::Internal(format!("Failed to hash password: {}", e))
-            })?)
+            debug!("Hashing password with Argon2 for user: {}", username);
+            use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+
+            let salt = SaltString::generate(&mut OsRng);
+            let argon2 = argon2::Argon2::default();
+            let hash = argon2
+                .hash_password(pwd.as_bytes(), &salt)
+                .map_err(|e| {
+                    error!(
+                        "Failed to hash password with Argon2 for user {}: {}",
+                        username, e
+                    );
+                    UserServiceError::Internal(format!("Failed to hash password: {}", e))
+                })?
+                .to_string();
+            Some(hash)
         } else {
+            warn!(
+                "No password provided for user: {} - password_hash will be NULL",
+                username
+            );
             None
         };
 
@@ -450,14 +465,21 @@ impl UserService {
             return Err(UserServiceError::AlreadyDeleted(user_id));
         }
 
-        // Soft delete the user by setting deleted_at
+        // Soft delete the user by setting deleted_at and changing email to prevent duplicates
         let now = Utc::now();
+        let unix_epoch = now.timestamp();
+        let deleted_email = format!("deleted_{}_{}", unix_epoch, user.email);
+
         let mut user_update: temps_entities::users::ActiveModel = user.into();
         user_update.deleted_at = Set(Some(now));
+        user_update.email = Set(deleted_email);
 
         let deleted_user = user_update.update(self.db.as_ref()).await?;
 
-        info!("Soft deleted user with id: {}", user_id);
+        info!(
+            "Soft deleted user with id: {}, email changed to prevent duplicates",
+            user_id
+        );
         Ok(deleted_user)
     }
 
@@ -573,13 +595,21 @@ impl UserService {
             })
             .collect();
 
-        // Hash recovery codes before storing
+        // Hash recovery codes before storing using Argon2id
+        use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+        use argon2::Argon2;
+
+        let argon2 = Argon2::default();
         let hashed_recovery_codes: Vec<String> = recovery_codes
             .iter()
             .map(|code| {
-                bcrypt::hash(code, bcrypt::DEFAULT_COST).map_err(|e| {
-                    UserServiceError::Mfa(format!("Failed to hash recovery code: {}", e))
-                })
+                let salt = SaltString::generate(&mut OsRng);
+                argon2
+                    .hash_password(code.as_bytes(), &salt)
+                    .map(|hash| hash.to_string())
+                    .map_err(|e| {
+                        UserServiceError::Mfa(format!("Failed to hash recovery code: {}", e))
+                    })
             })
             .collect::<Result<Vec<String>, UserServiceError>>()?;
 
@@ -621,7 +651,7 @@ impl UserService {
         user_update.mfa_enabled = Set(false);
         user_update.mfa_recovery_codes = Set(Some(
             serde_json::to_string(&hashed_recovery_codes)
-                .map_err(|e| UserServiceError::Serialization(e))?,
+                .map_err(UserServiceError::Serialization)?,
         ));
 
         user_update.update(self.db.as_ref()).await?;
@@ -646,7 +676,7 @@ impl UserService {
         let secret = user
             .mfa_secret
             .clone()
-            .ok_or_else(|| UserServiceError::MfaNotSetup(user_id))?;
+            .ok_or(UserServiceError::MfaNotSetup(user_id))?;
 
         // Verify TOTP code
         let totp = TOTP::new(
@@ -695,21 +725,33 @@ impl UserService {
 
         let secret = user
             .mfa_secret
-            .ok_or_else(|| UserServiceError::MfaNotSetup(user_id))?;
+            .ok_or(UserServiceError::MfaNotSetup(user_id))?;
 
         // Check if it's a recovery code
         if let Some(recovery_codes) = user.mfa_recovery_codes {
-            let hashed_codes: Vec<String> = serde_json::from_str(&recovery_codes)
-                .map_err(|e| UserServiceError::Serialization(e))?;
+            let hashed_codes: Vec<String> =
+                serde_json::from_str(&recovery_codes).map_err(UserServiceError::Serialization)?;
 
             // Clone hashed_codes for later use
             let hashed_codes_clone = hashed_codes.clone();
 
-            // First check if the code matches any recovery code
+            // First check if the code matches any recovery code using Argon2id
+            use argon2::password_hash::{PasswordHash, PasswordVerifier};
+            use argon2::Argon2;
+
+            let argon2 = Argon2::default();
             for hashed_code in hashed_codes {
-                if bcrypt::verify(code, &hashed_code).map_err(|e| {
-                    UserServiceError::Encryption(format!("Failed to verify recovery code: {}", e))
-                })? {
+                let parsed_hash = PasswordHash::new(&hashed_code).map_err(|e| {
+                    UserServiceError::Encryption(format!(
+                        "Failed to parse recovery code hash: {}",
+                        e
+                    ))
+                })?;
+
+                if argon2
+                    .verify_password(code.as_bytes(), &parsed_hash)
+                    .is_ok()
+                {
                     // Remove used recovery code using the cloned vector
                     let new_codes: Vec<String> = hashed_codes_clone
                         .into_iter()
@@ -748,9 +790,8 @@ impl UserService {
         )
         .map_err(|e| UserServiceError::Mfa(format!("Failed to create TOTP: {}", e)))?;
 
-        Ok(totp
-            .check_current(code)
-            .map_err(|e| UserServiceError::Mfa(format!("Failed to verify TOTP code: {}", e)))?)
+        totp.check_current(code)
+            .map_err(|e| UserServiceError::Mfa(format!("Failed to verify TOTP code: {}", e)))
     }
 
     pub async fn disable_mfa(&self, user_id: i32) -> Result<(), UserServiceError> {

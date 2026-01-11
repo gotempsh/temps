@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "temps": {
+      "command": "npx",
+      "args": ["@temps-sdk/mcp"]
+    }
+  }
+}

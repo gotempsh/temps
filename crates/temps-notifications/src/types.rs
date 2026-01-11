@@ -170,7 +170,7 @@ impl Notification {
 
     /// Get the effective severity (from severity field or derived from priority)
     pub fn effective_severity(&self) -> NotificationSeverity {
-        self.severity.unwrap_or_else(|| match self.priority {
+        self.severity.unwrap_or(match self.priority {
             NotificationPriority::Low => NotificationSeverity::Info,
             NotificationPriority::Normal => NotificationSeverity::Warning,
             NotificationPriority::High => NotificationSeverity::Error,

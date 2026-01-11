@@ -1,5 +1,5 @@
-use sea_orm::entity::prelude::*;
 use async_trait::async_trait;
+use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
@@ -15,7 +15,7 @@ pub struct Model {
     pub title: String,
     pub description: Option<String>,
     pub severity: String, // minor, major, critical
-    pub status: String, // investigating, identified, monitoring, resolved
+    pub status: String,   // investigating, identified, monitoring, resolved
     pub started_at: DBDateTime,
     pub resolved_at: Option<DBDateTime>,
     pub created_at: DBDateTime,

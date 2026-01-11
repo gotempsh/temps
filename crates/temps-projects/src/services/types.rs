@@ -24,7 +24,6 @@ pub struct EnvVarWithEnvironments {
     pub environments: Vec<EnvVarEnvironment>,
 }
 
-
 #[derive(Deserialize)]
 pub struct UpdateDeploymentSettingsRequest {
     pub cpu_request: Option<i32>,
@@ -59,6 +58,9 @@ pub struct Project {
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
     pub is_on_demand: bool,
+    pub deployment_config: Option<temps_entities::prelude::DeploymentConfig>,
+    pub attack_mode: bool,
+    pub enable_preview_environments: bool,
 }
 
 #[derive(Deserialize)]
@@ -69,23 +71,16 @@ pub struct CreateProjectRequest {
     pub directory: String,
     pub main_branch: String,
     pub preset: String,
-    pub output_dir: Option<String>,
-    pub build_command: Option<String>,
-    pub install_command: Option<String>,
+    /// Preset-specific configuration (for Dockerfile preset, Nixpacks, etc.)
+    pub preset_config: Option<serde_json::Value>,
     pub environment_variables: Option<Vec<(String, String)>>,
     pub automatic_deploy: bool,
-    pub project_type: Option<String>,
-    pub is_web_app: bool,
-    pub performance_metrics_enabled: bool,
     pub storage_service_ids: Vec<i32>,
-    pub use_default_wildcard: Option<bool>,
-    pub custom_domain: Option<String>,
     pub is_public_repo: Option<bool>,
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
-    pub is_on_demand: Option<bool>,
+    pub exposed_port: Option<i32>,
 }
-
 
 #[derive(Deserialize)]
 pub struct CreateProjectFromTemplateRequest {
@@ -106,8 +101,6 @@ pub struct CreateGithubRepoRequest {
     #[serde(rename = "auto_init")]
     pub auto_init: bool,
 }
-
-
 
 // Types are defined directly in this file for simplicity
 

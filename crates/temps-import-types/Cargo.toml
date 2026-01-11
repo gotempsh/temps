@@ -24,7 +24,7 @@ sea-orm = { workspace = true }
 utoipa = { version = "5.4", features = ["chrono"] }
 
 # Optional for validation
-validator = { version = "0.18", optional = true, features = ["derive"] }
+validator = { version = "0.20", optional = true, features = ["derive"] }
 
 [features]
 default = []

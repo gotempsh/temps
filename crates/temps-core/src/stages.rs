@@ -3,11 +3,11 @@
 //! Legacy stage system that works alongside the new workflow system.
 //! These are kept for backward compatibility with existing stage-based deployments.
 
+use crate::UtcDateTime;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
-use crate::UtcDateTime;
 /// Stage execution status
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum StageStatus {
@@ -98,11 +98,7 @@ pub trait StageTracker: Send + Sync {
     ) -> Result<StageExecutionInfo, StageError>;
 
     /// Add log lines to a stage execution
-    async fn add_stage_logs(
-        &self,
-        execution_id: i32,
-        logs: Vec<String>,
-    ) -> Result<(), StageError>;
+    async fn add_stage_logs(&self, execution_id: i32, logs: Vec<String>) -> Result<(), StageError>;
 
     /// Get all stage executions for a deployment
     async fn get_deployment_stages(

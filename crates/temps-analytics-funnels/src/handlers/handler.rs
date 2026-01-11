@@ -74,7 +74,7 @@ pub async fn create_funnel(
             StatusCode::INTERNAL_SERVER_ERROR,
         )
         .title("Failed to create funnel")
-        .detail(&format!("Error creating funnel: {}", e))
+        .detail(format!("Error creating funnel: {}", e))
         .build()),
     }
 }
@@ -160,7 +160,7 @@ pub async fn get_funnel_metrics(
             Err(
                 temps_core::error_builder::ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .title(title)
-                    .detail(&format!("Error retrieving funnel metrics: {}", e))
+                    .detail(format!("Error retrieving funnel metrics: {}", e))
                     .build(),
             )
         }
@@ -210,7 +210,7 @@ pub async fn list_funnels(
             StatusCode::INTERNAL_SERVER_ERROR,
         )
         .title("Failed to retrieve funnels")
-        .detail(&format!("Error retrieving funnels: {}", e))
+        .detail(format!("Error retrieving funnels: {}", e))
         .build()),
     }
 }
@@ -273,7 +273,7 @@ pub async fn update_funnel(
             Err(
                 temps_core::error_builder::ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .title(title)
-                    .detail(&format!("Error updating funnel: {}", e))
+                    .detail(format!("Error updating funnel: {}", e))
                     .build(),
             )
         }
@@ -321,7 +321,7 @@ pub async fn delete_funnel(
             Err(
                 temps_core::error_builder::ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .title(title)
-                    .detail(&format!("Error deleting funnel: {}", e))
+                    .detail(format!("Error deleting funnel: {}", e))
                     .build(),
             )
         }
@@ -366,7 +366,7 @@ pub async fn get_unique_events(
             StatusCode::INTERNAL_SERVER_ERROR,
         )
         .title("Failed to retrieve event types")
-        .detail(&format!("Error: {}", e))
+        .detail(format!("Error: {}", e))
         .build()),
     }
 }
@@ -455,7 +455,7 @@ pub async fn preview_funnel_metrics(
             StatusCode::INTERNAL_SERVER_ERROR,
         )
         .title("Failed to preview funnel metrics")
-        .detail(&format!("Error: {}", e))
+        .detail(format!("Error: {}", e))
         .build()),
     }
 }

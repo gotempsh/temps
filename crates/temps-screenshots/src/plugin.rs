@@ -44,7 +44,16 @@ impl temps_core::plugin::TempsPlugin for ScreenshotsPlugin {
 
             let config_service = context.require_service::<ConfigService>();
 
-            // Check if screenshots are enabled
+            // Always create the screenshot service, even if disabled
+            // This is required because DeploymentsPlugin depends on it
+            let screenshot_service = ScreenshotService::new(config_service.clone())
+                .await
+                .map_err(|e| PluginError::PluginRegistrationFailed {
+                    plugin_name: "screenshots".to_string(),
+                    error: format!("Failed to create screenshot service: {}", e),
+                })?;
+
+            // Check if screenshots are enabled (for logging purposes only)
             let screenshots_enabled = config_service
                 .get_settings()
                 .await
@@ -52,31 +61,27 @@ impl temps_core::plugin::TempsPlugin for ScreenshotsPlugin {
                 .map(|s| s.screenshots.enabled)
                 .unwrap_or(false);
 
-            if !screenshots_enabled {
-                info!("Screenshots are disabled in configuration");
-                return Ok(());
+            if screenshots_enabled {
+                info!(
+                    "Screenshot service registered with provider: {}",
+                    screenshot_service.provider_name()
+                );
+            } else {
+                info!(
+                    "Screenshot service registered (provider: {}), but screenshots are disabled in configuration",
+                    screenshot_service.provider_name()
+                );
             }
-
-            let screenshot_service = ScreenshotService::new(config_service.clone())
-                .await
-                .map_err(|e| {
-                    PluginError::PluginRegistrationFailed {
-                        plugin_name: "screenshots".to_string(),
-                        error: format!("Failed to create screenshot service: {}", e),
-                    }
-                })?;
-
-            info!(
-                "Screenshot service registered with provider: {}",
-                screenshot_service.provider_name()
-            );
 
             context.register_service(Arc::new(screenshot_service));
             Ok(())
         })
     }
 
-    fn configure_routes(&self, _context: &PluginContext) -> Option<temps_core::plugin::PluginRoutes> {
+    fn configure_routes(
+        &self,
+        _context: &PluginContext,
+    ) -> Option<temps_core::plugin::PluginRoutes> {
         // Screenshots don't need HTTP routes - they're used internally by jobs
         None
     }

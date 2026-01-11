@@ -4,14 +4,18 @@
 
 use std::sync::Arc;
 use temps_config::ConfigService;
-use temps_core::plugin::{
-    PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext,
-};
+use temps_core::plugin::{PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext};
 use utoipa::OpenApi;
 
 use crate::{handler, service::FileService};
 
 pub struct StaticFilesPlugin {}
+
+impl Default for StaticFilesPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl StaticFilesPlugin {
     pub fn new() -> Self {

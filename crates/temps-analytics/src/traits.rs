@@ -10,6 +10,7 @@ use crate::types::{AnalyticsError, Page};
 
 /// Trait defining analytics operations for tracking and analyzing user behavior
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait Analytics: Send + Sync {
     /// Get top pages by view count
     async fn get_top_pages(
@@ -30,6 +31,7 @@ pub trait Analytics: Send + Sync {
         include_crawlers: Option<bool>,
         limit: Option<i32>,
         offset: Option<i32>,
+        has_activity_only: Option<bool>,
     ) -> Result<VisitorsResponse, AnalyticsError>;
 
     /// Get event counts
@@ -50,7 +52,7 @@ pub trait Analytics: Send + Sync {
         visitor_id: i32,
     ) -> Result<Option<crate::types::responses::VisitorRecord>, AnalyticsError>;
 
-    /// Get comprehensive visitor statistics
+    /// Get visitor statistics
     async fn get_visitor_statistics(
         &self,
         visitor_id: i32,
@@ -96,6 +98,7 @@ pub trait Analytics: Send + Sync {
         session_id: i32,
         project_id: i32,
         environment_id: Option<i32>,
+        visitor_id: Option<i32>,
         start_date: Option<UtcDateTime>,
         end_date: Option<UtcDateTime>,
         limit: Option<i32>,
@@ -107,6 +110,13 @@ pub trait Analytics: Send + Sync {
     async fn enrich_visitor_by_id(
         &self,
         visitor_id: i32,
+        enrichment_data: serde_json::Value,
+    ) -> Result<EnrichVisitorResponse, AnalyticsError>;
+
+    /// Enrich visitor by GUID (visitor_id string, may be encrypted with enc_ prefix)
+    async fn enrich_visitor_by_guid(
+        &self,
+        visitor_guid: &str,
         enrichment_data: serde_json::Value,
     ) -> Result<EnrichVisitorResponse, AnalyticsError>;
 
@@ -166,10 +176,30 @@ pub trait Analytics: Send + Sync {
         visitor_id: &str,
     ) -> Result<Option<crate::types::responses::VisitorWithGeolocation>, AnalyticsError>;
 
+    /// Get live visitors from visitor table with recent activity
+    async fn get_live_visitors(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        window_minutes: i32,
+    ) -> Result<Vec<crate::types::responses::LiveVisitorInfo>, AnalyticsError>;
+
     /// Get general stats across all projects
     async fn get_general_stats(
         &self,
         start_date: UtcDateTime,
         end_date: UtcDateTime,
     ) -> Result<crate::types::responses::GeneralStatsResponse, AnalyticsError>;
+
+    /// Get detailed analytics for a specific page path
+    /// Returns visitors, page views, activity over time, geographic distribution, and referrers
+    async fn get_page_path_detail(
+        &self,
+        project_id: i32,
+        page_path: &str,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        environment_id: Option<i32>,
+        bucket_interval: Option<&str>,
+    ) -> Result<crate::types::responses::PagePathDetailResponse, AnalyticsError>;
 }

@@ -2,37 +2,43 @@ import {
   getLastDeploymentOptions,
   getProjectBySlugOptions,
   getActiveVisitors2Options,
+  getRepositoryByNameOptions,
+  updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import NotFound from '@/components/global/NotFound'
 import { ProjectAnalytics } from '@/components/project/ProjectAnalytics'
 import { ProjectDeployments } from '@/components/project/ProjectDeployments'
-import { ProjectDetailSidebar } from '@/components/project/ProjectDetailSidebar'
+import {
+  ProjectDetailSidebar,
+  MobileSidebarProvider,
+} from '@/components/project/ProjectDetailSidebar'
+import { ProjectDetailHeader } from '@/components/project/ProjectDetailHeader'
 import { ProjectOverview } from '@/components/project/ProjectOverview'
 import { ProjectRuntime } from '@/components/project/ProjectRuntime'
+import { ProjectServices } from '@/components/project/ProjectServices'
 import { ProjectSettings } from '@/components/project/ProjectSettings'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
 import { MonitorDetail } from '@/components/project/MonitorDetail'
 import { ErrorTracking } from '@/components/projects/ErrorTracking'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
-import { Badge } from '@/components/ui/badge'
-import { buttonVariants } from '@/components/ui/button'
+import { EnvironmentsTabsView } from './EnvironmentsTabsView'
 import { Confetti } from '@/components/ui/confetti'
 import { Skeleton } from '@/components/ui/skeleton'
+import { SecurityOverview } from './security/SecurityOverview'
+import { ScanDetail } from './security/ScanDetail'
+import { VulnerabilityDetailPage } from './security/VulnerabilityDetailPage'
 
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { cn } from '@/lib/utils'
 import { DeploymentDetails } from '@/pages/DeploymentDetails'
 import { ErrorEventDetail } from './ErrorEventDetail'
 import { ErrorGroupDetail } from './ErrorGroupDetail'
 import RequestLogs from './RequestLogs'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import {
-  Link,
   Navigate,
   Route,
   Routes,
@@ -40,6 +46,10 @@ import {
   useSearchParams,
 } from 'react-router-dom'
 import { Card, CardContent } from '@/components/ui/card'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { ShieldAlert } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { toast } from 'sonner'
 
 export function ProjectDetail() {
   const { slug } = useParams()
@@ -77,8 +87,12 @@ export function ProjectDetail() {
     refetchInterval: (query) => {
       const data = query.state.data
       // Poll more frequently for active deployments
-      if (data && (data.status === 'pending' || data.status === 'building')) {
+      if (data && (data.status === 'pending' || data.status === 'running' || data.status === 'building')) {
         return 2500 // 2.5 seconds for active deployments
+      }
+      // Poll while waiting for screenshot to be generated
+      if (data && data.status === 'completed' && !data.screenshot_location) {
+        return 3000 // 3 seconds while waiting for screenshot
       }
       // Keep checking periodically for new deployments
       return 10000 // 10 seconds for completed/failed deployments
@@ -97,6 +111,46 @@ export function ProjectDetail() {
     enabled: !!project,
     refetchInterval: 15000, // Refresh every 30 seconds
   })
+
+  // Fetch repository details for clone URL
+  const { data: repository } = useQuery({
+    ...getRepositoryByNameOptions({
+      path: {
+        owner: project?.repo_owner || '',
+        name: project?.repo_name || '',
+      },
+    }),
+    enabled: !!project?.repo_owner && !!project?.repo_name,
+  })
+
+  // Mutation to disable attack mode
+  const queryClient = useQueryClient()
+  const disableAttackMode = useMutation({
+    ...updateProjectSettingsMutation(),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: getProjectBySlugOptions({
+          path: { slug: slug || '' },
+        }).queryKey,
+      })
+      toast.success('Attack mode disabled successfully')
+      refetch()
+    },
+    onError: (error: any) => {
+      toast.error(
+        error?.message || 'Failed to disable attack mode. Please try again.'
+      )
+    },
+  })
+
+  const handleDisableAttackMode = () => {
+    if (!project) return
+
+    disableAttackMode.mutate({
+      path: { project_id: project.id! },
+      body: { attack_mode: false },
+    })
+  }
 
   useEffect(() => {
     setBreadcrumbs([
@@ -124,7 +178,7 @@ export function ProjectDetail() {
     setSearchParams,
   ])
 
-  usePageTitle(project?.name ? `${project.name}` : '')
+  usePageTitle(project?.slug ? `${project.slug}` : '')
 
   if (error?.message?.includes('404') || (!isLoading && !project)) {
     return <NotFound />
@@ -215,131 +269,125 @@ export function ProjectDetail() {
   }
 
   return (
-    <div className="flex h-[calc(100vh-4rem)] w-full overflow-hidden">
-      <Confetti active={showConfetti} duration={4000} particleCount={100} />
-      <ProjectDetailSidebar project={project} />
-      <div className="flex flex-1 flex-col overflow-hidden">
-        <header className="flex h-16 shrink-0 items-center gap-2 border-b px-4">
-          <div className="flex flex-1 items-center justify-between gap-4">
-            <div className="flex items-center gap-4">
-              <Avatar className="size-8">
-                <AvatarImage src={`/api/projects/${project.id}/favicon`} />
-                <AvatarFallback>{project.name.charAt(0)}</AvatarFallback>
-              </Avatar>
-              <div className="flex flex-wrap items-center gap-2">
-                <h1 className="text-lg font-semibold">{project.name}</h1>
-                <Badge
-                  variant={project.last_deployment ? 'default' : 'outline'}
-                >
-                  {project.last_deployment ? 'Deployed' : 'Not deployed'}
-                </Badge>
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              {activeVisitorsCount !== undefined && (
-                <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-muted/30 rounded-full">
-                  <div
-                    className={`h-2 w-2 rounded-full ${activeVisitorsCount?.active_visitors > 0 ? 'bg-green-500 animate-pulse' : 'bg-gray-400'}`}
-                  />
-                  <span className="text-sm font-semibold">
-                    {activeVisitorsCount?.active_visitors}
+    <MobileSidebarProvider>
+      <div className="flex h-full w-full overflow-hidden">
+        <Confetti active={showConfetti} duration={4000} particleCount={100} />
+        <ProjectDetailSidebar project={project} />
+        <div className="flex flex-1 flex-col overflow-hidden">
+          <ProjectDetailHeader
+            project={project}
+            activeVisitorsCount={activeVisitorsCount}
+            repositoryCloneUrl={repository?.clone_url}
+            lastDeploymentUrl={lastDeployment?.url}
+            isLoadingLastDeployment={isLoadingLastDeployment}
+          />
+          <div className="flex-1 overflow-y-auto p-4">
+            {/* Attack Mode Banner */}
+            {(project as any).attack_mode && (
+              <Alert className="mb-4 border-primary bg-primary/10">
+                <ShieldAlert className="h-4 w-4 text-primary" />
+                <AlertDescription className="flex items-center justify-between">
+                  <span className="text-foreground">
+                    Attack Mode is enabled for this project
                   </span>
-                </div>
-              )}
-              <Link
-                to={`https://github.com/${project.repo_owner}/${project.repo_name}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className={cn(
-                  buttonVariants({
-                    variant: 'outline',
-                    size: 'sm',
-                  })
-                )}
-              >
-                Repository
-              </Link>
-              {lastDeployment && !isLoadingLastDeployment && (
-                <Link
-                  to={lastDeployment.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className={cn(
-                    buttonVariants({
-                      size: 'sm',
-                    })
-                  )}
-                >
-                  Visit
-                </Link>
-              )}
-            </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2 text-primary hover:bg-primary/20"
+                    onClick={handleDisableAttackMode}
+                    disabled={disableAttackMode.isPending}
+                  >
+                    {disableAttackMode.isPending ? 'Disabling...' : 'Disable'}
+                  </Button>
+                </AlertDescription>
+              </Alert>
+            )}
+            <Routes>
+              <Route index element={<Navigate to="project" replace />} />
+              <Route
+                path="project"
+                element={
+                  <ProjectOverview
+                    project={project}
+                    lastDeployment={lastDeployment}
+                  />
+                }
+              />
+              <Route
+                path="deployments"
+                element={<ProjectDeployments project={project} />}
+              />
+              <Route
+                path="deployments/:deploymentId"
+                element={<DeploymentDetails project={project} />}
+              />
+              <Route
+                path="analytics/*"
+                element={<ProjectAnalytics project={project} />}
+              />
+              <Route
+                path="storage"
+                element={<ProjectStorage project={project} />}
+              />
+              <Route
+                path="services/*"
+                element={<ProjectServices project={project} />}
+              />
+              <Route
+                path="runtime"
+                element={<ProjectRuntime project={project} />}
+              />
+              <Route
+                path="settings/*"
+                element={
+                  <ProjectSettings project={project} refetch={refetch} />
+                }
+              />
+              <Route
+                path="speed"
+                element={<ProjectSpeedInsights project={project} />}
+              />
+              <Route
+                path="logs/*"
+                element={<RequestLogs project={project} />}
+              />
+              <Route
+                path="monitors"
+                element={<ProjectMonitors project={project} />}
+              />
+              <Route
+                path="monitors/:monitorId"
+                element={<MonitorDetail project={project} />}
+              />
+              <Route
+                path="errors"
+                element={<ErrorTracking project={project} />}
+              />
+              <Route
+                path="errors/:errorGroupId"
+                element={<ErrorGroupDetail project={project} />}
+              />
+              <Route
+                path="errors/:errorGroupId/event/:eventId"
+                element={<ErrorEventDetail project={project} />}
+              />
+              <Route
+                path="security"
+                element={<SecurityOverview project={project} />}
+              />
+              <Route path="security/scans/:scanId" element={<ScanDetail />} />
+              <Route
+                path="security/scans/:scanId/vulnerabilities/:vulnId"
+                element={<VulnerabilityDetailPage />}
+              />
+              <Route
+                path="environments/*"
+                element={<EnvironmentsTabsView project={project} />}
+              />
+            </Routes>
           </div>
-        </header>
-        <div className="flex-1 overflow-y-auto p-4">
-          <Routes>
-            <Route index element={<Navigate to="project" replace />} />
-            <Route
-              path="project"
-              element={
-                <ProjectOverview
-                  project={project}
-                  lastDeployment={lastDeployment}
-                />
-              }
-            />
-            <Route
-              path="deployments"
-              element={<ProjectDeployments project={project} />}
-            />
-            <Route
-              path="deployments/:deploymentId"
-              element={<DeploymentDetails project={project} />}
-            />
-            <Route
-              path="analytics/*"
-              element={<ProjectAnalytics project={project} />}
-            />
-            <Route
-              path="storage"
-              element={<ProjectStorage project={project} />}
-            />
-            <Route
-              path="runtime"
-              element={<ProjectRuntime project={project} />}
-            />
-            <Route
-              path="settings/*"
-              element={<ProjectSettings project={project} refetch={refetch} />}
-            />
-            <Route
-              path="speed"
-              element={<ProjectSpeedInsights project={project} />}
-            />
-            <Route path="logs/*" element={<RequestLogs project={project} />} />
-            <Route
-              path="monitors"
-              element={<ProjectMonitors project={project} />}
-            />
-            <Route
-              path="monitors/:monitorId"
-              element={<MonitorDetail project={project} />}
-            />
-            <Route
-              path="errors"
-              element={<ErrorTracking project={project} />}
-            />
-            <Route
-              path="errors/:errorGroupId"
-              element={<ErrorGroupDetail project={project} />}
-            />
-            <Route
-              path="errors/:errorGroupId/event/:eventId"
-              element={<ErrorEventDetail project={project} />}
-            />
-          </Routes>
         </div>
       </div>
-    </div>
+    </MobileSidebarProvider>
   )
 }

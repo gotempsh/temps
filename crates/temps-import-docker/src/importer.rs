@@ -483,7 +483,9 @@ impl WorkloadImporter for DockerImporter {
             QueryFilter,
         };
         use std::time::Instant;
-        use temps_entities::{deployment_containers, deployments, environments, projects};
+        use temps_entities::{
+            deployment_containers, deployments, environments, prelude::DeploymentMetadata, projects,
+        };
 
         let start_time = Instant::now();
         info!(
@@ -530,18 +532,14 @@ impl WorkloadImporter for DockerImporter {
             context.project_name, context.preset
         );
 
-        // Get project type from preset
+        // Validate preset exists
         use temps_presets::get_preset_by_slug;
-        let project_type = match get_preset_by_slug(&context.preset) {
-            Some(preset_val) => preset_val.project_type().to_string(),
-            None => {
-                warnings.push(format!(
-                    "Preset '{}' not found, defaulting to 'server' project type",
-                    context.preset
-                ));
-                "server".to_string()
-            }
-        };
+        if get_preset_by_slug(&context.preset).is_none() {
+            warnings.push(format!(
+                "Preset '{}' not found, using default configuration",
+                context.preset
+            ));
+        }
 
         let create_project_request = temps_projects::services::types::CreateProjectRequest {
             name: context.project_name.clone(),
@@ -550,9 +548,7 @@ impl WorkloadImporter for DockerImporter {
             directory: context.directory.clone(),
             main_branch: context.main_branch.clone(),
             preset: context.preset.clone(),
-            output_dir: None,
-            build_command: None,
-            install_command: None,
+            preset_config: None,
             environment_variables: Some(
                 plan.deployment
                     .env_vars
@@ -562,16 +558,11 @@ impl WorkloadImporter for DockerImporter {
                     .collect(),
             ),
             automatic_deploy: false,
-            project_type: Some(project_type),
-            is_web_app: plan.project.is_web_app,
-            performance_metrics_enabled: false,
             storage_service_ids: vec![],
-            use_default_wildcard: Some(true),
-            custom_domain: None,
             is_public_repo: None,
             git_url: None,
             git_provider_connection_id: context.git_provider_connection_id,
-            is_on_demand: Some(false),
+            exposed_port: None,
         };
 
         let project = project_service
@@ -640,14 +631,13 @@ impl WorkloadImporter for DockerImporter {
 
         let deployment_number = deployment_count + 1;
         let deployment_slug = format!("{}-{}", project.slug, deployment_number);
-        let deployment_metadata = serde_json::json!({
-            "import_source": "docker",
-            "imported_at": chrono::Utc::now().to_rfc3339(),
-            "image": plan.deployment.image.clone(),
-            "ports": plan.deployment.ports.clone(),
-            "volumes": plan.deployment.volumes.clone(),
-            "env_vars_count": plan.deployment.env_vars.len(),
-        });
+
+        // Create typed deployment metadata
+        let deployment_metadata = DeploymentMetadata {
+            builder: Some("docker-import".to_string()),
+            labels: vec!["imported".to_string()],
+            ..Default::default()
+        };
 
         let now = chrono::Utc::now();
         let deployment = deployments::ActiveModel {
@@ -655,7 +645,7 @@ impl WorkloadImporter for DockerImporter {
             environment_id: Set(environment.id),
             slug: Set(deployment_slug.clone()),
             state: Set("completed".to_string()),
-            metadata: Set(deployment_metadata),
+            metadata: Set(Some(deployment_metadata)),
             image_name: Set(Some(plan.deployment.image.clone())),
             commit_message: Set(Some("Imported from Docker container".to_string())),
             deploying_at: Set(Some(now)),
@@ -937,18 +927,15 @@ impl DockerImporter {
             .as_ref()
             .and_then(|hc| hc.restart_policy.as_ref())
             .and_then(|rp| rp.name.as_ref())
-            .and_then(|name| match name {
+            .map(|name| match name {
                 RestartPolicyNameEnum::NO | RestartPolicyNameEnum::EMPTY => {
-                    Some(temps_import_types::RestartPolicy::No)
+                    temps_import_types::RestartPolicy::No
                 }
-                RestartPolicyNameEnum::ALWAYS => Some(temps_import_types::RestartPolicy::Always),
-                RestartPolicyNameEnum::ON_FAILURE => {
-                    Some(temps_import_types::RestartPolicy::OnFailure)
-                }
+                RestartPolicyNameEnum::ALWAYS => temps_import_types::RestartPolicy::Always,
+                RestartPolicyNameEnum::ON_FAILURE => temps_import_types::RestartPolicy::OnFailure,
                 RestartPolicyNameEnum::UNLESS_STOPPED => {
-                    Some(temps_import_types::RestartPolicy::UnlessStopped)
+                    temps_import_types::RestartPolicy::UnlessStopped
                 }
-                _ => None,
             });
 
         Ok(WorkloadSnapshot {
@@ -1067,14 +1054,6 @@ mod tests {
         // Verify project configuration
         assert_eq!(plan.project.name, "my-web-app");
         assert_eq!(plan.project.slug, "my-web-app");
-        assert_eq!(
-            plan.project.project_type,
-            temps_import_types::plan::ProjectType::Docker
-        );
-        assert!(
-            plan.project.is_web_app,
-            "Should be detected as web app due to ports"
-        );
 
         // Verify environment configuration
         assert_eq!(plan.environment.name, "production");
@@ -1147,7 +1126,7 @@ mod tests {
         // Verify metadata
         assert_eq!(plan.metadata.generator_version, "1.0.0");
         assert!(
-            plan.metadata.warnings.len() > 0,
+            !plan.metadata.warnings.is_empty(),
             "Should have warnings for bind mount"
         );
     }

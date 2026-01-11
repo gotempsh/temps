@@ -1,7 +1,6 @@
 import {
   createProjectMutation,
   getRepositoryBranchesOptions,
-  getRepositoryPresetLiveOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { RepositoryResponse } from '@/api/client/types.gen'
 import { ProjectConfigurator } from '@/components/project/ProjectConfigurator'
@@ -66,14 +65,6 @@ export function ImportProject() {
     setSelectedConnectionId(connectionId)
   }
 
-  // Get repository presets
-  const { data: repoInfo } = useQuery({
-    ...getRepositoryPresetLiveOptions({
-      path: { repository_id: selectedRepository?.id || 0 },
-    }),
-    enabled: !!selectedRepository?.id,
-  })
-
   // Fetch branches
   const { data: branchesData } = useQuery({
     ...getRepositoryBranchesOptions({
@@ -124,7 +115,7 @@ export function ImportProject() {
               ></div>
               <span>Select Repository</span>
               <div
-                className={`w-2 h-2 rounded-full ml-4 ${selectedRepository && repoInfo ? 'bg-primary' : 'bg-muted'}`}
+                className={`w-2 h-2 rounded-full ml-4 ${selectedRepository ? 'bg-primary' : 'bg-muted'}`}
               ></div>
               <span>Configure Project</span>
               <div className="w-2 h-2 bg-muted rounded-full ml-4"></div>
@@ -162,7 +153,7 @@ export function ImportProject() {
               </CardContent>
             </Card>
           </div>
-        ) : !branchesData || !repoInfo ? (
+        ) : !branchesData ? (
           <div className="space-y-6">
             <div>
               <h2 className="text-2xl font-bold">Configure Project</h2>
@@ -231,7 +222,6 @@ export function ImportProject() {
                 selectedRepository.updated_at || new Date().toISOString(),
             }}
             connectionId={selectedConnectionId!}
-            presetData={repoInfo}
             branches={branchesData?.branches}
             mode="inline"
             onSubmit={async (data) => {

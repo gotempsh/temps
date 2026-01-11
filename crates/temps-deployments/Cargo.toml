@@ -21,6 +21,7 @@ temps-queue = { path = "../temps-queue" }
 temps-providers = { path = "../temps-providers" }
 temps-presets = { path = "../temps-presets" }
 temps-screenshots = { path = "../temps-screenshots" }
+temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 serde = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
@@ -47,17 +48,18 @@ bytes = { workspace = true }
 http-body-util = { workspace = true }
 cron = "0.12"
 rand = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 testcontainers = { workspace = true }
 tokio-test = "0.4"
 mockall = "0.12"
+tokio-tungstenite = "0.24"
+tower = { workspace = true }
+env_logger = "0.11"
+tempfile = "3.8"
 
 [features]
 default = []
 integration-tests = []
-
-[[test]]
-name = "integration_tests"
-path = "tests/integration_tests.rs"
-required-features = ["integration-tests"]

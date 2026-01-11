@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use async_trait::async_trait;
 use pingora_core::{upstreams::peer::HttpPeer, Result as PingoraResult};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use temps_core::UtcDateTime;
-use temps_entities::{projects, environments, deployments};
+use temps_entities::{deployments, environments, projects};
 
 /// Context information about a request's project, environment, and deployment
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,8 +80,18 @@ impl Default for CookieConfig {
 /// Trait for resolving upstream peers based on host and request information
 #[async_trait]
 pub trait UpstreamResolver: Send + Sync {
-    /// Resolve the upstream peer for a given host and path
-    async fn resolve_peer(&self, host: &str, path: &str) -> PingoraResult<Box<HttpPeer>>;
+    /// Resolve the upstream peer for a given host, path, and optional SNI hostname
+    ///
+    /// The resolver will:
+    /// 1. First try SNI-based routing if sni_hostname is provided (for TLS routes)
+    /// 2. Then try HTTP Host-based routing (for HTTP routes)
+    /// 3. Fall back to console address if no route is found
+    async fn resolve_peer(
+        &self,
+        host: &str,
+        path: &str,
+        sni_hostname: Option<&str>,
+    ) -> PingoraResult<Box<HttpPeer>>;
 
     /// Check if a host has custom routing configured
     async fn has_custom_route(&self, host: &str) -> bool;
@@ -94,7 +104,10 @@ pub trait UpstreamResolver: Send + Sync {
 #[async_trait]
 pub trait RequestLogger: Send + Sync {
     /// Log a completed request with all metadata
-    async fn log_request(&self, data: RequestLogData) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn log_request(
+        &self,
+        data: RequestLogData,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// Log an error that occurred during request processing
     async fn log_error(
@@ -143,6 +156,7 @@ pub trait VisitorManager: Send + Sync {
         &self,
         visitor: &Visitor,
         is_https: bool,
+        context: Option<&ProjectContext>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>; // Returns Set-Cookie header value
 
     /// Check if visitor tracking should be enabled for this request
@@ -162,12 +176,22 @@ pub trait VisitorManager: Send + Sync {
 #[async_trait]
 pub trait SessionManager: Send + Sync {
     /// Get or create a session from encrypted cookie
+    ///
+    /// # Arguments
+    /// * `session_cookie` - Encrypted session cookie value
+    /// * `visitor` - The visitor associated with this session
+    /// * `context` - Project context for the request
+    /// * `referrer` - The HTTP Referer header value
+    /// * `query_string` - The URL query string (for UTM parameter extraction)
+    /// * `current_hostname` - The current site's hostname (for self-referral detection)
     async fn get_or_create_session(
         &self,
         session_cookie: Option<&str>,
         visitor: &Visitor,
         context: Option<&ProjectContext>,
         referrer: Option<&str>,
+        query_string: Option<&str>,
+        current_hostname: Option<&str>,
     ) -> Result<Session, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Generate encrypted session cookie
@@ -175,10 +199,14 @@ pub trait SessionManager: Send + Sync {
         &self,
         session: &Session,
         is_https: bool,
+        context: Option<&ProjectContext>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>; // Returns Set-Cookie header value
 
     /// Extend session expiry time
-    async fn extend_session(&self, session: &Session) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn extend_session(
+        &self,
+        session: &Session,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// Get session cookie configuration
     fn get_session_cookie_config(&self) -> &CookieConfig;

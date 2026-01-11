@@ -1,5 +1,5 @@
-use sea_orm::entity::prelude::*;
 use async_trait::async_trait;
+use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
@@ -15,6 +15,8 @@ pub struct Model {
     pub value: String,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
+    /// Include this environment variable in preview environments
+    pub include_in_preview: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -64,7 +66,7 @@ impl ActiveModelBehavior for ActiveModel {
         C: ConnectionTrait,
     {
         let now = chrono::Utc::now();
-        
+
         if insert {
             if self.created_at.is_not_set() {
                 self.created_at = Set(now);
@@ -75,7 +77,7 @@ impl ActiveModelBehavior for ActiveModel {
         } else {
             self.updated_at = Set(now);
         }
-        
+
         Ok(self)
     }
 }

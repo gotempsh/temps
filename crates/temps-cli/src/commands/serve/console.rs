@@ -7,11 +7,13 @@ use axum::response::Response;
 use axum::Router;
 use chrono;
 use colored::Colorize;
+use futures::FutureExt;
 use include_dir::{include_dir, Dir};
 use rand::Rng;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use std::future::IntoFuture;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use temps_analytics::AnalyticsPlugin;
 use temps_analytics_events::EventsPlugin;
@@ -21,6 +23,7 @@ use temps_analytics_session_replay::SessionReplayPlugin;
 use temps_audit::AuditPlugin;
 use temps_auth::{ApiKeyPlugin, AuthPlugin};
 use temps_backup::BackupPlugin;
+use temps_blob::BlobPlugin;
 use temps_config::ConfigPlugin;
 use temps_config::ServerConfig;
 use temps_core::plugin::PluginManager;
@@ -28,7 +31,9 @@ use temps_core::{CookieCrypto, EncryptionService};
 use temps_database::DbConnection;
 use temps_deployer::plugin::DeployerPlugin;
 use temps_deployments::DeploymentsPlugin;
+use temps_dns::DnsPlugin;
 use temps_domains::DomainsPlugin;
+use temps_email::EmailPlugin;
 use temps_entities::users;
 use temps_environments::EnvironmentsPlugin;
 use temps_error_tracking::ErrorTrackingPlugin;
@@ -36,7 +41,9 @@ use temps_geo::GeoPlugin;
 use temps_git::GitPlugin;
 use temps_import::ImportPlugin;
 use temps_infra::InfraPlugin;
+use temps_kv::KvPlugin;
 use temps_logs::LogsPlugin;
+use temps_monitoring::DiskSpaceMonitor;
 use temps_notifications::NotificationsPlugin;
 use temps_projects::ProjectsPlugin;
 use temps_providers::ProvidersPlugin;
@@ -45,6 +52,8 @@ use temps_queue::QueuePlugin;
 use temps_screenshots::ScreenshotsPlugin;
 use temps_static_files::StaticFilesPlugin;
 use temps_status_page::StatusPagePlugin;
+use temps_vulnerability_scanner::VulnerabilityScannerPlugin;
+use temps_webhooks::WebhooksPlugin;
 use tokio::net::TcpListener;
 use tracing::{debug, info};
 use utoipa_swagger_ui::SwaggerUi;
@@ -267,9 +276,7 @@ fn prompt_for_admin_email() -> anyhow::Result<Option<String>> {
     );
     println!(
         "{}",
-        "           🚀 Welcome to Temps!"
-            .bright_white()
-            .bold()
+        "           🚀 Welcome to Temps!".bright_white().bold()
     );
     println!(
         "{}",
@@ -384,6 +391,53 @@ async fn serve_static_file(req: Request) -> Response {
     }
 }
 
+/// Validate GeoLite2-City database exists in multiple locations
+/// Checks: current directory → data directory → home directory
+/// No system dependencies - database file must be placed manually
+fn validate_geolite2_database(default_db_path: &PathBuf) -> anyhow::Result<()> {
+    // Check multiple locations in order of preference
+    let search_paths = vec![
+        // 1. Current working directory (most convenient for local development)
+        PathBuf::from("./GeoLite2-City.mmdb"),
+        // 2. Data directory (from config)
+        default_db_path.clone(),
+    ];
+
+    // Try to find the database in any of the search paths
+    for path in &search_paths {
+        if path.exists() {
+            debug!("✓ GeoLite2 database found at: {}", path.display());
+            return Ok(());
+        }
+    }
+
+    // Database not found in any location
+    return Err(anyhow::anyhow!(
+        "❌ GeoLite2-City.mmdb not found\n\n\
+        The MaxMind GeoLite2 database is required for geolocation features.\n\n\
+        📍 Checked locations (in order):\n\
+        1. {}\n\
+        2. {}\n\n\
+        📥 Setup (once, takes 2 minutes):\n\
+        1. Visit: https://www.maxmind.com/en/geolite2/geolite2-free-data-sources\n\
+        2. Create free MaxMind account (if needed)\n\
+        3. Download 'GeoLite2-City' (GZIP format: .tar.gz)\n\
+        4. Extract the archive:\n\
+           tar xzf GeoLite2-City_*.tar.gz\n\n\
+        5. Copy the database file to any location above:\n\
+           # Option A: Current directory (recommended for local development)\n\
+           cp GeoLite2-City_*/GeoLite2-City.mmdb .\n\n\
+           # Option B: Data directory\n\
+           cp GeoLite2-City_*/GeoLite2-City.mmdb {}\n\n\
+        6. Start the server again\n\n\
+        🐳 For Docker users:\n\
+        See Dockerfile in the repository for embedding the database",
+        search_paths[0].display(),
+        search_paths[1].display(),
+        search_paths[1].display()
+    ));
+}
+
 /// Initialize and start the console API server
 pub async fn start_console_api(
     db: Arc<DbConnection>,
@@ -393,9 +447,68 @@ pub async fn start_console_api(
     route_table: Arc<temps_proxy::CachedPeerTable>,
     ready_signal: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> anyhow::Result<()> {
-    let docker = bollard::Docker::connect_with_defaults()
-        .map_err(|e| anyhow::anyhow!("Failed to connect to docker: {}", e))?;
+    // PRE-VALIDATE all plugin dependencies BEFORE initializing plugin manager
+    // This ensures clear error messages if any critical resources are missing
+    debug!("Pre-validating plugin dependencies...");
+
+    // 1. Validate Docker connectivity
+    debug!("Checking Docker daemon connectivity...");
+    let docker = match bollard::Docker::connect_with_defaults() {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "❌ Docker dependency check FAILED\n\n\
+                The system requires Docker to be running and accessible.\n\n\
+                Error details: {}\n\n\
+                Solutions:\n\
+                1. Ensure Docker daemon is running\n\
+                   - macOS: Check Docker Desktop application\n\
+                   - Linux: Run 'sudo systemctl start docker'\n\n\
+                2. Verify Docker socket permissions\n\
+                   - Linux: Run 'sudo usermod -aG docker $USER'\n\n\
+                3. Check Docker environment variables\n\
+                   - DOCKER_HOST may need to be set\n\n\
+                Deployment features will not be available until Docker is accessible.",
+                e
+            ));
+        }
+    };
     let docker = Arc::new(docker);
+    debug!("✓ Docker daemon is accessible");
+
+    // 2. Validate GeoPlugin dependencies (GeoLite2 database)
+    debug!("Checking GeoLite2 database...");
+    let geo_db_path = config.data_dir.join("GeoLite2-City.mmdb");
+    validate_geolite2_database(&geo_db_path)?;
+    debug!("✓ GeoLite2 database file found");
+
+    // 3. Validate logs directory is writable
+    debug!("Checking logs directory...");
+    let logs_dir = config.data_dir.join("logs");
+    if let Err(e) = std::fs::create_dir_all(&logs_dir) {
+        return Err(anyhow::anyhow!(
+            "❌ Logs directory creation FAILED\n\n\
+            Cannot create or access the logs directory.\n\n\
+            Path: {}\n\
+            Error: {}\n\n\
+            Solutions:\n\
+            1. Check directory permissions\n\
+               - Ensure write permissions to parent directory: {}\n\n\
+            2. Verify disk space\n\
+               - Run: df -h\n\n\
+            3. Check file ownership\n\
+               - Run: ls -la {}\n\n\
+            Logs are required for system diagnostics and operation tracking.",
+            logs_dir.display(),
+            e,
+            config.data_dir.display(),
+            config.data_dir.display()
+        ));
+    }
+    debug!("✓ Logs directory is accessible");
+
+    debug!("✓ All plugin dependencies validated successfully");
+
     // Initialize plugin manager
     let mut plugin_manager = PluginManager::new();
 
@@ -435,25 +548,25 @@ pub async fn start_console_api(
 
     // 3.1. EventsPlugin - provides custom events tracking (depends on database)
     debug!("Registering EventsPlugin");
-    let events_plugin = Box::new(EventsPlugin::default());
+    let events_plugin = Box::new(EventsPlugin);
     plugin_manager.register_plugin(events_plugin);
 
     // 3.2. FunnelsPlugin - provides funnel analytics (depends on database)
     debug!("Registering FunnelsPlugin");
-    let funnels_plugin = Box::new(FunnelsPlugin::default());
+    let funnels_plugin = Box::new(FunnelsPlugin);
     plugin_manager.register_plugin(funnels_plugin);
 
     // 3.3. SessionReplayPlugin - provides session replay (depends on database)
     debug!("Registering SessionReplayPlugin");
-    let session_replay_plugin = Box::new(SessionReplayPlugin::default());
+    let session_replay_plugin = Box::new(SessionReplayPlugin);
     plugin_manager.register_plugin(session_replay_plugin);
 
     // 3.4. PerformancePlugin - provides performance metrics (depends on database)
     debug!("Registering PerformancePlugin");
-    let performance_plugin = Box::new(PerformancePlugin::default());
+    let performance_plugin = Box::new(PerformancePlugin);
     plugin_manager.register_plugin(performance_plugin);
 
-    // 4. GeoPlugin - provides geolocation services (depends on database)
+    // 4. GeoPlugin - provides geolocation services (database validated in pre-validation)
     debug!("Registering GeoPlugin");
     let geo_plugin = Box::new(GeoPlugin::new());
     plugin_manager.register_plugin(geo_plugin);
@@ -478,15 +591,41 @@ pub async fn start_console_api(
     let notifications_plugin = Box::new(NotificationsPlugin::new());
     plugin_manager.register_plugin(notifications_plugin);
 
-    // 4. DomainsPlugin - provides DNS and TLS certificate management (depends on config and database)
+    // 4. DnsPlugin - provides DNS provider management (depends on database and encryption)
+    // Must be registered before DomainsPlugin and EmailPlugin so DnsProviderService is available
+    debug!("Registering DnsPlugin");
+    let dns_plugin = Box::new(DnsPlugin::new());
+    plugin_manager.register_plugin(dns_plugin);
+
+    // 4.5. DomainsPlugin - provides TLS certificate management (depends on config, database, and DnsProviderService)
     debug!("Registering DomainsPlugin");
     let domains_plugin = Box::new(DomainsPlugin::new());
     plugin_manager.register_plugin(domains_plugin);
+
+    // 7.1. EmailPlugin - provides email sending and domain management (depends on database, encryption, and optionally DnsProviderService)
+    debug!("Registering EmailPlugin");
+    let email_plugin = Box::new(EmailPlugin::new());
+    plugin_manager.register_plugin(email_plugin);
+
+    // 7.5. WebhooksPlugin - provides webhook delivery and management (depends on database and encryption)
+    debug!("Registering WebhooksPlugin");
+    let webhooks_plugin = Box::new(WebhooksPlugin::new());
+    plugin_manager.register_plugin(webhooks_plugin);
 
     // 5. ProvidersPlugin - provides external service management (depends on database and encryption)
     debug!("Registering ProvidersPlugin");
     let providers_plugin = Box::new(ProvidersPlugin::new());
     plugin_manager.register_plugin(providers_plugin);
+
+    // 5.1. KvPlugin - provides key-value storage (depends on database, docker)
+    debug!("Registering KvPlugin");
+    let kv_plugin = Box::new(KvPlugin::new());
+    plugin_manager.register_plugin(kv_plugin);
+
+    // 5.2. BlobPlugin - provides blob storage (depends on database, docker)
+    debug!("Registering BlobPlugin");
+    let blob_plugin = Box::new(BlobPlugin::new());
+    plugin_manager.register_plugin(blob_plugin);
 
     // 5.5. EnvironmentsPlugin - provides environment management (depends on config)
     debug!("Registering EnvironmentsPlugin");
@@ -512,7 +651,13 @@ pub async fn start_console_api(
     let error_tracking_plugin = Box::new(ErrorTrackingPlugin::new());
     plugin_manager.register_plugin(error_tracking_plugin);
 
-    // 9. DeploymentsPlugin - provides deployment orchestration (depends on deployer and screenshots)
+    // 8.5. VulnerabilityScannerPlugin - provides vulnerability scanning (depends on database and audit)
+    // MUST be registered before DeploymentsPlugin since deployments depend on vulnerability scanner services
+    debug!("Registering VulnerabilityScannerPlugin");
+    let vulnerability_scanner_plugin = Box::new(VulnerabilityScannerPlugin::new());
+    plugin_manager.register_plugin(vulnerability_scanner_plugin);
+
+    // 9. DeploymentsPlugin - provides deployment orchestration (depends on deployer, screenshots, and vulnerability scanner)
     debug!("Registering DeploymentsPlugin");
     let deployments_plugin = Box::new(DeploymentsPlugin::new());
     plugin_manager.register_plugin(deployments_plugin);
@@ -554,10 +699,24 @@ pub async fn start_console_api(
 
     // Initialize all plugins
     debug!("Initializing plugins");
-    plugin_manager
-        .initialize_plugins()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to initialize plugins: {}", e))?;
+    if let Err(e) = plugin_manager.initialize_plugins().await {
+        let error_msg = format!("{}", e);
+        tracing::error!("❌ Plugin initialization FAILED");
+        tracing::error!("Error: {}", error_msg);
+        tracing::error!("Error details: {:?}", e);
+        tracing::error!("");
+        tracing::error!("Most common causes:");
+        tracing::error!("  • Missing GeoLite2-City.mmdb file");
+        tracing::error!("  • Database connection failed");
+        tracing::error!("  • Service initialization error");
+        tracing::error!("");
+        tracing::error!("Check the error message above for details.");
+        return Err(anyhow::anyhow!(
+            "Plugin initialization failed: {}",
+            error_msg
+        ));
+    }
+    debug!("All plugins initialized successfully");
 
     // Check if any users exist, if not prompt for admin email
     let service_context = plugin_manager.service_context();
@@ -602,7 +761,6 @@ pub async fn start_console_api(
                     mfa_recovery_codes: Set(None),
                     created_at: Set(now),
                     updated_at: Set(now),
-                    ..Default::default()
                 };
 
                 system_user
@@ -643,6 +801,69 @@ pub async fn start_console_api(
         debug!("Backup scheduler started in background");
         // Note: Currently no graceful shutdown mechanism for cancellation_token
         // In the future, this could be wired to a shutdown signal handler
+    }
+
+    // Start certificate renewal scheduler (optional - fails gracefully if TlsService unavailable)
+    if let Some(tls_service) = service_context.get_service::<temps_domains::TlsService>() {
+        let cancellation_token = tokio_util::sync::CancellationToken::new();
+        let scheduler_token = cancellation_token.clone();
+        let scheduler_service = tls_service.clone();
+
+        tokio::spawn(async move {
+            debug!("Starting certificate renewal scheduler");
+            // Catch any panics to prevent scheduler issues from crashing the main task
+            let result = std::panic::AssertUnwindSafe(async {
+                scheduler_service
+                    .start_certificate_renewal_scheduler(scheduler_token)
+                    .await
+            })
+            .catch_unwind()
+            .await;
+
+            match result {
+                Ok(Ok(())) => {
+                    debug!("Certificate renewal scheduler completed normally");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Certificate renewal scheduler error (non-fatal): {}", e);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Certificate renewal scheduler panicked (non-fatal) - scheduler stopped"
+                    );
+                }
+            }
+        });
+
+        debug!("Certificate renewal scheduler started in background");
+    } else {
+        tracing::warn!(
+            "TlsService not available - certificate renewal scheduler disabled. \
+             This is non-fatal but automatic certificate renewal will not work."
+        );
+    }
+
+    // Start disk space monitoring if ConfigService and NotificationService are available
+    if let (Some(config_service), Some(notification_service)) = (
+        service_context.get_service::<temps_config::ConfigService>(),
+        service_context.get_service::<dyn temps_core::notifications::NotificationService>(),
+    ) {
+        let data_dir = config.data_dir.clone();
+        let monitor = Arc::new(DiskSpaceMonitor::new(
+            config_service.clone(),
+            notification_service,
+            data_dir,
+        ));
+
+        tokio::spawn(async move {
+            monitor.start_monitoring().await;
+        });
+
+        debug!("Disk space monitoring started in background");
+    } else {
+        tracing::warn!(
+            "ConfigService or NotificationService not available - disk space monitoring disabled."
+        );
     }
 
     // Build the application with all plugin routes and OpenAPI schemas

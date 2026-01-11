@@ -6,7 +6,8 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use temps_core::{Job, ProjectCreatedJob, ProjectDeletedJob, ProjectUpdatedJob};
-use temps_entities::{projects, types::ProjectType};
+use temps_entities::projects;
+use temps_git::services::public_repo::PublicRepoProviderFactory;
 
 use serde::Serialize;
 
@@ -14,6 +15,7 @@ use super::types::{
     CreateProjectRequest, Project, ProjectError, ProjectStatistics, UpdateDeploymentSettingsRequest,
 };
 use super::{EnvVarService, EnvVarWithEnvironments};
+use crate::handlers::UpdateDeploymentConfigRequest;
 use temps_presets::get_preset_by_slug;
 // Placeholder functions - these should be implemented properly or imported from other services
 
@@ -139,60 +141,58 @@ impl ProjectService {
         };
 
         let project_slug = self.generate_unique_project_slug(&request.name).await?;
-        // check preset
-        let project_type_val = match get_preset_by_slug(request.preset.as_str()) {
-            Some(preset_val) => {
-                let project_type_val = preset_val.project_type();
-                project_type_val.to_string()
-            }
-            None => {
-                // Check if project_type is provided in the request, otherwise use preset's project_type
-                match request.project_type {
-                    Some(ref pt) => match pt.as_str() {
-                        "static" => "static".to_string(),
-                        "server" => "server".to_string(),
-                        _ => return Err(ProjectError::Other("Invalid project type".to_string())),
-                    },
-                    None => {
-                        return Err(ProjectError::Other(
-                            "Preset or project_type is required".to_string(),
-                        ))
-                    }
-                }
-            }
-        };
-        let project_type_enum = match project_type_val.as_str() {
-            "static" => ProjectType::Static,
-            "server" => ProjectType::Server,
-            _ => return Err(ProjectError::Other("Invalid project type".to_string())),
-        };
+        // Get preset info and determine project type
+        let preset_info = get_preset_by_slug(request.preset.as_str()).ok_or_else(|| {
+            ProjectError::InvalidInput(format!("Invalid preset: {}", request.preset))
+        })?;
+
+        let _project_type_enum = preset_info.project_type();
+
+        // Parse preset string to enum
+        let preset = request
+            .preset
+            .parse::<temps_entities::preset::Preset>()
+            .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset: {}", e)))?;
+
+        // Parse preset_config from JSON if provided
+        let preset_config: Option<temps_entities::preset::PresetConfig> = request
+            .preset_config
+            .map(|json_value| {
+                serde_json::from_value(json_value).map_err(|e| {
+                    ProjectError::InvalidInput(format!("Invalid preset_config: {}", e))
+                })
+            })
+            .transpose()?;
+
+        // Create deployment config with resource and deployment settings
+        let deployment_config = Some(temps_entities::deployment_config::DeploymentConfig {
+            cpu_request: Some(DEFAULT_CPU_REQUEST),
+            cpu_limit: Some(DEFAULT_CPU_LIMIT),
+            memory_request: Some(DEFAULT_MEMORY_REQUEST),
+            memory_limit: Some(DEFAULT_MEMORY_LIMIT),
+            exposed_port: request.exposed_port,
+            automatic_deploy: request.automatic_deploy,
+            performance_metrics_enabled: false, // Default to false
+            session_recording_enabled: false,
+            replicas: 1, // Default replicas
+            security: None,
+        });
 
         let project = projects::ActiveModel {
             name: Set(request.name),
-            repo_name: Set(request.repo_name),
-            repo_owner: Set(request.repo_owner),
+            repo_name: Set(request.repo_name.unwrap_or_else(|| "unknown".to_string())),
+            repo_owner: Set(request.repo_owner.unwrap_or_else(|| "unknown".to_string())),
             directory: Set(normalized_directory),
             main_branch: Set(request.main_branch),
-            preset: Set(Some(request.preset)),
+            preset: Set(preset), // Now required, not Option
+            preset_config: Set(preset_config),
+            deployment_config: Set(deployment_config),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
             slug: Set(project_slug),
-            cpu_request: Set(Some(DEFAULT_CPU_REQUEST)),
-            cpu_limit: Set(Some(DEFAULT_CPU_LIMIT)),
-            memory_request: Set(Some(DEFAULT_MEMORY_REQUEST)),
-            memory_limit: Set(Some(DEFAULT_MEMORY_LIMIT)),
-            output_dir: Set(request.output_dir),
-            build_command: Set(request.build_command),
-            install_command: Set(request.install_command),
-            automatic_deploy: Set(request.automatic_deploy),
-            project_type: Set(project_type_enum),
-            use_default_wildcard: Set(request.use_default_wildcard.unwrap_or(true)),
-            custom_domain: Set(request.custom_domain),
             is_public_repo: Set(request.is_public_repo.unwrap_or(false)),
             git_url: Set(request.git_url),
             git_provider_connection_id: Set(request.git_provider_connection_id),
-            is_web_app: Set(request.is_web_app),
-            performance_metrics_enabled: Set(request.performance_metrics_enabled),
             deleted_at: Set(None),
             last_deployment: Set(None),
             ..Default::default()
@@ -282,7 +282,7 @@ impl ProjectService {
             );
         }
         // Queue initial deployment/pipeline job if project has repository information
-        if project_found_db.repo_owner.is_some() && project_found_db.repo_name.is_some() {
+        if !project_found_db.repo_owner.is_empty() && !project_found_db.repo_name.is_empty() {
             info!(
                 "Queueing initial deployment job for project: {}",
                 project_found_db.id
@@ -421,14 +421,21 @@ impl ProjectService {
             normalized_directory
         };
 
+        // Parse preset string to enum
+        let preset = request
+            .preset
+            .parse::<temps_entities::preset::Preset>()
+            .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset: {}", e)))?;
+
         // Update the project
         let mut active_project: projects::ActiveModel = project.into();
         active_project.name = Set(request.name);
-        active_project.repo_name = Set(request.repo_name);
-        active_project.repo_owner = Set(request.repo_owner);
+        active_project.repo_name = Set(request.repo_name.unwrap_or_else(|| "unknown".to_string()));
+        active_project.repo_owner =
+            Set(request.repo_owner.unwrap_or_else(|| "unknown".to_string()));
         active_project.directory = Set(normalized_directory);
         active_project.main_branch = Set(request.main_branch);
-        active_project.preset = Set(Some(request.preset));
+        active_project.preset = Set(preset); // No longer Optional
         active_project.updated_at = Set(chrono::Utc::now());
 
         let project_found = active_project.update(self.db.as_ref()).await?;
@@ -511,7 +518,7 @@ impl ProjectService {
             environment_domains, environments, project_custom_domains, project_services, projects,
         };
 
-        // NOTE: We're NOT deleting analytics_events, visitor, traces, logs, request_logs, or performance_metrics
+        // NOTE: We're NOT deleting analytics_events, visitor, traces, logs, proxy_logs, or performance_metrics
         // These are kept for historical/audit purposes and can be very large tables
         info!("Keeping analytics data, visitor data, traces, and logs for historical purposes");
 
@@ -653,6 +660,7 @@ impl ProjectService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_project_settings(
         &self,
         project_id: i32,
@@ -663,6 +671,8 @@ impl ProjectService {
         repo_name: Option<String>,
         preset: Option<String>,
         directory: Option<String>,
+        attack_mode: Option<bool>,
+        enable_preview_environments: Option<bool>,
     ) -> Result<Project, ProjectError> {
         // Get the current project
         let mut project = projects::Entity::find_by_id(project_id)
@@ -756,6 +766,44 @@ impl ProjectService {
             }
         }
 
+        // Update attack_mode if provided
+        if let Some(attack_mode_value) = attack_mode {
+            // Reload project to ensure we have the latest state
+            let project = projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ProjectError::NotFound(format!(
+                    "Project {} not found",
+                    project_id
+                )))?;
+
+            let mut active_project: projects::ActiveModel = project.into();
+            active_project.attack_mode = Set(attack_mode_value);
+            active_project.update(self.db.as_ref()).await?;
+        }
+
+        // Update preview environment settings if any are provided
+        let needs_preview_update = enable_preview_environments.is_some();
+
+        if needs_preview_update {
+            // Reload project to ensure we have the latest state
+            let project = projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ProjectError::NotFound(format!(
+                    "Project {} not found",
+                    project_id
+                )))?;
+
+            let mut active_project: projects::ActiveModel = project.into();
+
+            if let Some(enable_preview) = enable_preview_environments {
+                active_project.enable_preview_environments = Set(enable_preview);
+            }
+
+            active_project.update(self.db.as_ref()).await?;
+        }
+
         // Update git-related fields if any are provided
         let needs_git_update = main_branch.is_some()
             || repo_owner.is_some()
@@ -779,13 +827,17 @@ impl ProjectService {
                 active_project.main_branch = Set(branch);
             }
             if let Some(owner) = repo_owner {
-                active_project.repo_owner = Set(Some(owner));
+                active_project.repo_owner = Set(owner);
             }
             if let Some(name) = repo_name {
-                active_project.repo_name = Set(Some(name));
+                active_project.repo_name = Set(name);
             }
             if let Some(preset_value) = preset {
-                active_project.preset = Set(Some(preset_value));
+                // Parse preset string to enum
+                let preset_enum = preset_value
+                    .parse::<temps_entities::preset::Preset>()
+                    .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset: {}", e)))?;
+                active_project.preset = Set(preset_enum);
             }
             if let Some(dir) = directory {
                 active_project.directory = Set(dir);
@@ -851,14 +903,20 @@ impl ProjectService {
                 project_id
             )))?;
 
-        // Update automatic_deploy setting
-        let mut active_project: projects::ActiveModel = project.into();
-        active_project.automatic_deploy = Set(automatic_deploy);
+        // Update automatic_deploy setting in deployment_config
+        let mut active_project: projects::ActiveModel = project.clone().into();
+
+        // Update deployment config with new automatic_deploy value
+        let mut deployment_config = project.deployment_config.clone().unwrap_or_default();
+        deployment_config.automatic_deploy = automatic_deploy;
+        active_project.deployment_config = Set(Some(deployment_config));
+
         let updated_project = active_project.update(self.db.as_ref()).await?;
 
         Ok(Self::map_db_project_to_project(updated_project))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_git_settings(
         &self,
         project_id: i32,
@@ -919,12 +977,16 @@ impl ProjectService {
         // Update the project
         let mut active_project: projects::ActiveModel = project.into();
         active_project.main_branch = Set(main_branch);
-        active_project.repo_owner = Set(Some(repo_owner));
-        active_project.repo_name = Set(Some(repo_name));
+        active_project.repo_owner = Set(repo_owner);
+        active_project.repo_name = Set(repo_name);
         active_project.directory = Set(directory);
 
         if let Some(preset_value) = preset {
-            active_project.preset = Set(Some(preset_value));
+            // Parse preset string to enum
+            let preset_enum = preset_value
+                .parse::<temps_entities::preset::Preset>()
+                .map_err(|e| ProjectError::InvalidInput(format!("Invalid preset: {}", e)))?;
+            active_project.preset = Set(preset_enum);
         }
 
         if let Some(connection_id) = git_provider_connection_id {
@@ -1023,11 +1085,16 @@ impl ProjectService {
         };
 
         // Update the project with new settings
-        let mut active_project: projects::ActiveModel = project.into();
-        active_project.cpu_request = Set(settings.cpu_request);
-        active_project.cpu_limit = Set(settings.cpu_limit);
-        active_project.memory_request = Set(settings.memory_request);
-        active_project.memory_limit = Set(settings.memory_limit);
+        let mut active_project: projects::ActiveModel = project.clone().into();
+
+        // Update deployment config with new resource settings
+        let mut deployment_config = project.deployment_config.clone().unwrap_or_default();
+        deployment_config.cpu_request = settings.cpu_request;
+        deployment_config.cpu_limit = settings.cpu_limit;
+        deployment_config.memory_request = settings.memory_request;
+        deployment_config.memory_limit = settings.memory_limit;
+        active_project.deployment_config = Set(Some(deployment_config));
+
         let updated_project = active_project.update(self.db.as_ref()).await?;
 
         // Emit ProjectUpdated job
@@ -1050,6 +1117,88 @@ impl ProjectService {
 
         Ok(Self::map_db_project_to_project(updated_project))
     }
+
+    /// Update deployment configuration for a project
+    pub async fn update_project_deployment_config(
+        &self,
+        project_id: i32,
+        config: UpdateDeploymentConfigRequest,
+    ) -> Result<Project, ProjectError> {
+        // Find project by ID or slug
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                ProjectError::NotFound(format!("Project with id {} not found", project_id))
+            })?;
+
+        // Get existing deployment config or create default
+        let mut deployment_config = project.deployment_config.clone().unwrap_or_default();
+
+        // Update only the fields that are provided
+        if let Some(cpu_request) = config.cpu_request {
+            deployment_config.cpu_request = Some(cpu_request);
+        }
+        if let Some(cpu_limit) = config.cpu_limit {
+            deployment_config.cpu_limit = Some(cpu_limit);
+        }
+        if let Some(memory_request) = config.memory_request {
+            deployment_config.memory_request = Some(memory_request);
+        }
+        if let Some(memory_limit) = config.memory_limit {
+            deployment_config.memory_limit = Some(memory_limit);
+        }
+        if let Some(exposed_port) = config.exposed_port {
+            deployment_config.exposed_port = Some(exposed_port);
+        }
+        if let Some(automatic_deploy) = config.automatic_deploy {
+            deployment_config.automatic_deploy = automatic_deploy;
+        }
+        if let Some(performance_metrics_enabled) = config.performance_metrics_enabled {
+            deployment_config.performance_metrics_enabled = performance_metrics_enabled;
+        }
+        if let Some(session_recording_enabled) = config.session_recording_enabled {
+            deployment_config.session_recording_enabled = session_recording_enabled;
+        }
+        if let Some(replicas) = config.replicas {
+            deployment_config.replicas = replicas;
+        }
+        if let Some(security) = config.security {
+            deployment_config.security = Some(security);
+        }
+
+        // Validate the deployment config
+        deployment_config
+            .validate()
+            .map_err(|e| ProjectError::InvalidInput(format!("Invalid deployment config: {}", e)))?;
+
+        // Update the project
+        let mut active_project: projects::ActiveModel = project.clone().into();
+        active_project.deployment_config = Set(Some(deployment_config));
+
+        let updated_project = active_project.update(self.db.as_ref()).await?;
+
+        // Emit ProjectUpdated job
+        let project_updated_job = Job::ProjectUpdated(ProjectUpdatedJob {
+            project_id: updated_project.id,
+            project_name: updated_project.name.clone(),
+        });
+
+        if let Err(e) = self.queue_service.send(project_updated_job).await {
+            warn!(
+                "Failed to emit ProjectUpdated job for project {}: {}",
+                updated_project.id, e
+            );
+        } else {
+            info!(
+                "Emitted ProjectUpdated job for project {} (deployment config update)",
+                updated_project.id
+            );
+        }
+
+        Ok(Self::map_db_project_to_project(updated_project))
+    }
+
     /// Generate a unique project slug by checking for collisions and appending a short UUID if needed
     pub async fn generate_unique_project_slug(&self, name: &str) -> Result<String, ProjectError> {
         let base_slug = slugify(name);
@@ -1099,34 +1248,50 @@ impl ProjectService {
     }
 
     pub fn map_db_project_to_project(db_project: projects::Model) -> Project {
+        // Extract deployment config fields
+        let deployment_config = db_project.deployment_config.clone();
+
+        // Convert preset enum to string for backwards compatibility
+        let preset_str = format!("{:?}", db_project.preset).to_lowercase();
+
         Project {
             id: db_project.id,
             slug: db_project.slug,
             name: db_project.name,
-            repo_name: db_project.repo_name,
-            repo_owner: db_project.repo_owner,
+            repo_name: Some(db_project.repo_name),
+            repo_owner: Some(db_project.repo_owner),
             directory: db_project.directory,
             main_branch: db_project.main_branch,
-            preset: db_project.preset,
+            preset: Some(preset_str),
             created_at: db_project.created_at,
             updated_at: db_project.updated_at,
-            automatic_deploy: db_project.automatic_deploy,
-            cpu_request: db_project.cpu_request,
-            cpu_limit: db_project.cpu_limit,
-            memory_request: db_project.memory_request,
-            memory_limit: db_project.memory_limit,
-            performance_metrics_enabled: db_project.performance_metrics_enabled,
+            automatic_deploy: deployment_config
+                .clone()
+                .map(|c| c.automatic_deploy)
+                .unwrap_or(false),
+            cpu_request: deployment_config.clone().and_then(|c| c.cpu_request),
+            cpu_limit: deployment_config.clone().and_then(|c| c.cpu_limit),
+            memory_request: deployment_config.clone().and_then(|c| c.memory_request),
+            memory_limit: deployment_config.clone().and_then(|c| c.memory_limit),
+            performance_metrics_enabled: deployment_config
+                .clone()
+                .map(|c| c.performance_metrics_enabled)
+                .unwrap_or(false),
             last_deployment: db_project.last_deployment,
-            project_type: match db_project.project_type {
-                ProjectType::Static => "static".to_string(),
-                ProjectType::Server => "server".to_string(),
+            project_type: if db_project.preset == temps_entities::preset::Preset::Static {
+                "static".to_string()
+            } else {
+                "server".to_string()
             },
-            use_default_wildcard: db_project.use_default_wildcard,
-            custom_domain: db_project.custom_domain,
+            use_default_wildcard: true, // Deprecated field, always true
+            custom_domain: None,        // Deprecated field, use project_domains table
             is_public_repo: db_project.is_public_repo,
             git_url: db_project.git_url,
             git_provider_connection_id: db_project.git_provider_connection_id,
-            is_on_demand: db_project.is_on_demand,
+            is_on_demand: false, // Deprecated field, default to false
+            deployment_config: deployment_config.clone(),
+            attack_mode: db_project.attack_mode,
+            enable_preview_environments: db_project.enable_preview_environments,
         }
     }
 
@@ -1197,15 +1362,49 @@ impl ProjectService {
         project: &temps_entities::projects::Model,
         _environment: &temps_entities::environments::Model,
     ) -> Result<(), ProjectError> {
+        // Fetch the latest commit from the git provider if connection exists
+        let commit_sha = if let Some(connection_id) = project.git_provider_connection_id {
+            match self
+                .git_provider_manager
+                .get_branch_latest_commit(
+                    connection_id,
+                    &project.repo_owner,
+                    &project.repo_name,
+                    &project.main_branch,
+                )
+                .await
+            {
+                Ok(commit) => {
+                    info!(
+                        "Fetched latest commit for project {}: {} - {}",
+                        project.id, commit.sha, commit.message
+                    );
+                    commit.sha
+                }
+                Err(e) => {
+                    // Log error but don't fail - fall back to a generic commit
+                    tracing::warn!(
+                        "Failed to fetch latest commit for project {}: {}. Using fallback.",
+                        project.id,
+                        e
+                    );
+                    "HEAD".to_string()
+                }
+            }
+        } else {
+            // No git provider connection, use fallback
+            "HEAD".to_string()
+        };
+
         // Create a GitPushEvent job to trigger the initial deployment
         // The deployment service's job processor will handle creating the pipeline and deployment
         let git_push_job = temps_core::GitPushEventJob {
-            owner: project.repo_owner.clone().unwrap_or_default(),
-            repo: project.repo_name.clone().unwrap_or_default(),
+            owner: project.repo_owner.clone(),
+            repo: project.repo_name.clone(),
             branch: Some(project.main_branch.clone()),
-            tag: None,                     // No tag for initial deployment
-            commit: "initial".to_string(), // Placeholder commit for initial deployment
-            project_id: project.id,        // Include project_id
+            tag: None, // No tag for initial deployment
+            commit: commit_sha.clone(),
+            project_id: project.id, // Include project_id
         };
 
         self.queue_service
@@ -1214,11 +1413,12 @@ impl ProjectService {
             .map_err(|e| ProjectError::Other(format!("Failed to queue deployment job: {}", e)))?;
 
         info!(
-            "Queued GitPushEvent job for initial deployment of project {} (owner: {}, repo: {}, branch: {})",
+            "Queued GitPushEvent job for initial deployment of project {} (owner: {}, repo: {}, branch: {}, commit: {})",
             project.id,
-            project.repo_owner.as_ref().unwrap_or(&"unknown".to_string()),
-            project.repo_name.as_ref().unwrap_or(&"unknown".to_string()),
-            project.main_branch
+            &project.repo_owner,
+            &project.repo_name,
+            project.main_branch,
+            commit_sha
         );
 
         Ok(())
@@ -1253,7 +1453,7 @@ impl ProjectService {
             })?;
 
         // Validate project has repository information
-        if project.repo_owner.is_none() || project.repo_name.is_none() {
+        if project.repo_owner.is_empty() || project.repo_name.is_empty() {
             return Err(ProjectError::InvalidInput(
                 "Project must have repository information to trigger pipeline".to_string(),
             ));
@@ -1266,13 +1466,13 @@ impl ProjectService {
         let commit_to_use = if let Some(commit) = commit {
             commit
         } else if let Some(connection_id) = project.git_provider_connection_id {
-            // Fetch latest commit from the branch
+            // Fetch latest commit from the branch using authenticated git provider
             match self
                 .git_provider_manager
                 .get_branch_latest_commit(
                     connection_id,
-                    &project.repo_owner.clone().unwrap(),
-                    &project.repo_name.clone().unwrap(),
+                    &project.repo_owner,
+                    &project.repo_name,
                     &branch_to_use,
                 )
                 .await
@@ -1292,6 +1492,65 @@ impl ProjectService {
                     format!("manual-trigger-{}", chrono::Utc::now().timestamp())
                 }
             }
+        } else if project.is_public_repo {
+            // For public repos without git provider connection, fetch from public API
+            let provider_name = if let Some(ref git_url) = project.git_url {
+                if git_url.contains("github.com") {
+                    "github"
+                } else if git_url.contains("gitlab.com") {
+                    "gitlab"
+                } else {
+                    return Err(ProjectError::InvalidInput(format!(
+                        "Unknown git provider for public repo URL: {}. Only GitHub and GitLab public repos are supported.",
+                        git_url
+                    )));
+                }
+            } else {
+                // No git_url, try to infer from repo structure (assume GitHub for public repos)
+                "github"
+            };
+
+            let provider = PublicRepoProviderFactory::create(provider_name).map_err(|e| {
+                ProjectError::Other(format!(
+                    "Failed to create public repo provider for {}: {}",
+                    provider_name, e
+                ))
+            })?;
+
+            let branches = provider
+                .list_branches(&project.repo_owner, &project.repo_name)
+                .await
+                .map_err(|e| {
+                    ProjectError::Other(format!(
+                        "Failed to fetch branches from public repo {}/{}: {}. The repository may not exist, be private, or the provider API may be unavailable.",
+                        project.repo_owner, project.repo_name, e
+                    ))
+                })?;
+
+            // Find the target branch
+            let branch_info = branches
+                .iter()
+                .find(|b| b.name == branch_to_use)
+                .ok_or_else(|| {
+                    ProjectError::NotFound(format!(
+                        "Branch '{}' not found in public repo {}/{}. Available branches: {}",
+                        branch_to_use,
+                        project.repo_owner,
+                        project.repo_name,
+                        branches
+                            .iter()
+                            .take(10)
+                            .map(|b| b.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                })?;
+
+            info!(
+                "Fetched latest commit from public repo {}/{} branch {}: {}",
+                project.repo_owner, project.repo_name, branch_to_use, branch_info.commit_sha
+            );
+            branch_info.commit_sha.clone()
         } else {
             warn!("No git provider connection found for project, using placeholder commit");
             format!("manual-trigger-{}", chrono::Utc::now().timestamp())
@@ -1299,12 +1558,12 @@ impl ProjectService {
 
         // Create GitPushEvent job to trigger pipeline
         let git_push_job = temps_core::GitPushEventJob {
-            owner: project.repo_owner.clone().unwrap(),
-            repo: project.repo_name.clone().unwrap(),
+            owner: project.repo_owner.clone(),
+            repo: project.repo_name.clone(),
             branch: Some(branch_to_use.clone()),
             tag: tag.clone(),
             commit: commit_to_use.clone(),
-            project_id: project_id, // Include project_id
+            project_id, // Include project_id
         };
 
         // Send the job to the queue
@@ -1334,13 +1593,13 @@ impl ProjectService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_database::test_utils::TestDatabase;
-    use std::sync::Arc;
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_core::{JobQueue, QueueError};
-    use temps_core::async_trait::async_trait;
+    use std::sync::Arc;
     use std::sync::Mutex;
-
+    use temps_core::async_trait::async_trait;
+    use temps_core::{JobQueue, QueueError};
+    use temps_database::test_utils::TestDatabase;
+    use temps_entities::preset::Preset;
     // Mock JobQueue for testing
     struct MockJobQueue {
         jobs: Arc<Mutex<Vec<Job>>>,
@@ -1385,10 +1644,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let config_service = Arc::new(temps_config::ConfigService::new(
-            server_config,
-            db.clone(),
-        ));
+        let config_service = Arc::new(temps_config::ConfigService::new(server_config, db.clone()));
 
         // Create ExternalServiceManager
         let encryption_service = Arc::new(
@@ -1401,7 +1657,7 @@ mod tests {
         // Create Docker client for ExternalServiceManager
         let docker = Arc::new(
             bollard::Docker::connect_with_local_defaults()
-                .expect("Docker connection required for tests")
+                .expect("Docker connection required for tests"),
         );
 
         let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
@@ -1450,15 +1706,12 @@ mod tests {
         let project = temps_entities::projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             directory: Set("test-project".to_string()),
             git_provider_connection_id: Set(None),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
-            preset: Set(Some("docker".to_string())),
-            cpu_request: Set(Some(100)),
-            cpu_limit: Set(Some(500)),
-            memory_request: Set(Some(128)),
-            memory_limit: Set(Some(512)),
+            preset: Set(Preset::Nixpacks),
             ..Default::default()
         };
 
@@ -1471,22 +1724,15 @@ mod tests {
             repo_owner: None,
             directory: "/".to_string(),
             main_branch: "develop".to_string(),
-            preset: "nodejs".to_string(),
-            output_dir: None,
-            build_command: None,
-            install_command: None,
+            preset: Preset::Nixpacks.to_string(),
+            preset_config: None,
             environment_variables: None,
-            automatic_deploy: false,
-            project_type: None,
-            is_web_app: false,
-            performance_metrics_enabled: false,
-            storage_service_ids: vec![],
-            use_default_wildcard: None,
-            custom_domain: None,
-            is_public_repo: None,
             git_url: None,
             git_provider_connection_id: None,
-            is_on_demand: None,
+            automatic_deploy: false,
+            exposed_port: None,
+            is_public_repo: None,
+            storage_service_ids: vec![],
         };
 
         let result = project_service
@@ -1524,15 +1770,12 @@ mod tests {
         let project = temps_entities::projects::ActiveModel {
             name: Set("Settings Test Project".to_string()),
             slug: Set("settings-test-project".to_string()),
+            repo_name: Set("settings-test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             directory: Set("settings-test-project".to_string()),
             git_provider_connection_id: Set(None),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
-            preset: Set(Some("docker".to_string())),
-            cpu_request: Set(Some(100)),
-            cpu_limit: Set(Some(500)),
-            memory_request: Set(Some(128)),
-            memory_limit: Set(Some(512)),
+            preset: Set(Preset::Nixpacks),
             ..Default::default()
         };
 
@@ -1547,7 +1790,9 @@ mod tests {
                 Some("develop".to_string()),
                 None,
                 None,
-                Some("nodejs".to_string()),
+                Some(Preset::Nixpacks.to_string()),
+                None,
+                None,
                 None,
             )
             .await;
@@ -1583,15 +1828,12 @@ mod tests {
         let project = temps_entities::projects::ActiveModel {
             name: Set("Event Data Test".to_string()),
             slug: Set("event-data-test".to_string()),
+            repo_name: Set("event-data-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             directory: Set("event-data-test".to_string()),
             git_provider_connection_id: Set(None),
             main_branch: Set("main".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Server),
-            preset: Set(Some("docker".to_string())),
-            cpu_request: Set(Some(100)),
-            cpu_limit: Set(Some(500)),
-            memory_request: Set(Some(128)),
-            memory_limit: Set(Some(512)),
+            preset: Set(Preset::Nixpacks),
             ..Default::default()
         };
 
@@ -1605,22 +1847,15 @@ mod tests {
             repo_owner: None,
             directory: "/".to_string(),
             main_branch: "main".to_string(),
-            preset: "docker".to_string(),
-            output_dir: None,
-            build_command: None,
-            install_command: None,
+            preset: Preset::Nixpacks.as_str().to_string(),
+            preset_config: None,
             environment_variables: None,
             automatic_deploy: false,
-            project_type: None,
-            is_web_app: false,
-            performance_metrics_enabled: false,
             storage_service_ids: vec![],
-            use_default_wildcard: None,
-            custom_domain: None,
             is_public_repo: None,
             git_url: None,
             git_provider_connection_id: None,
-            is_on_demand: None,
+            exposed_port: None,
         };
 
         project_service

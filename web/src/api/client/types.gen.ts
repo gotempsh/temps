@@ -40,6 +40,65 @@ export type ActiveVisitorsResponse = {
     window_minutes: number;
 };
 
+/**
+ * Daily activity count for a single day
+ */
+export type ActivityDay = {
+    /**
+     * Number of deployments on this day
+     */
+    count: number;
+    /**
+     * Date in YYYY-MM-DD format
+     */
+    date: string;
+    /**
+     * Intensity level (0-4) for visualization
+     * 0: No activity, 1: Low (1-2), 2: Medium (3-5), 3: High (6-10), 4: Very High (11+)
+     */
+    level: number;
+};
+
+/**
+ * Query parameters for activity graph endpoint
+ */
+export type ActivityGraphQuery = {
+    /**
+     * Number of days to include (default: 365 for last year)
+     */
+    days?: number;
+    /**
+     * Optional environment ID to filter activity
+     */
+    environment_id?: number | null;
+    /**
+     * Optional project ID to filter activity
+     */
+    project_id?: number | null;
+};
+
+/**
+ * Response for activity graph showing daily deployment activity
+ */
+export type ActivityGraphResponse = {
+    /**
+     * Array of daily activity counts
+     */
+    days: Array<ActivityDay>;
+    /**
+     * Date range end (YYYY-MM-DD)
+     */
+    end_date: string;
+    /**
+     * Date range start (YYYY-MM-DD)
+     */
+    start_date: string;
+    /**
+     * Total count of activities across all days
+     */
+    total_count: number;
+};
+
 export type AddEnvironmentDomainRequest = {
     domain: string;
     is_primary: boolean;
@@ -52,6 +111,14 @@ export type AddEventsRequest = {
 export type AddEventsResponse = {
     event_count: number;
     message: string;
+};
+
+/**
+ * Request to add a managed domain
+ */
+export type AddManagedDomainApiRequest = {
+    auto_manage?: boolean;
+    domain: string;
 };
 
 export type AggregatedBucketItem = {
@@ -108,6 +175,12 @@ export type AnalyticsMetrics = {
     views_per_visit: number;
 };
 
+export type AnalyticsSessionEventsResponse = {
+    events: Array<SessionEvent>;
+    session_id: string;
+    total_events: number;
+};
+
 export type ApiKeyListResponse = {
     api_keys: Array<ApiKeyResponse>;
     total: number;
@@ -131,22 +204,30 @@ export type ApiKeyResponse = {
  */
 export type AppSettings = {
     allow_readonly_external_access?: boolean;
+    disk_space_alert?: DiskSpaceAlertSettings;
     dns_provider?: DnsProviderSettings;
+    docker_registry?: DockerRegistrySettings;
     external_url?: string | null;
     letsencrypt?: LetsEncryptSettings;
     preview_domain?: string;
+    rate_limiting?: RateLimitSettings;
     screenshots?: ScreenshotSettings;
+    security_headers?: SecurityHeadersSettings;
 };
 
 /**
  * Safe response for application settings that masks sensitive fields
  */
 export type AppSettingsResponse = {
+    disk_space_alert: DiskSpaceAlertSettings;
     dns_provider: DnsProviderSettingsMasked;
+    docker_registry: DockerRegistrySettingsMasked;
     external_url?: string | null;
     letsencrypt: LetsEncryptSettings;
     preview_domain: string;
+    rate_limiting: RateLimitSettings;
     screenshots: ScreenshotSettings;
+    security_headers: SecurityHeadersSettings;
 };
 
 export type AssignRoleRequest = {
@@ -245,6 +326,40 @@ export type AuthTokenResponse = {
 };
 
 /**
+ * Available Docker container that can be imported as a service
+ */
+export type AvailableContainerInfo = {
+    /**
+     * Container ID or name
+     */
+    container_id: string;
+    /**
+     * Container display name
+     */
+    container_name: string;
+    /**
+     * Exposed ports (e.g., [5432] for PostgreSQL, [6379] for Redis)
+     */
+    exposed_ports?: Array<number>;
+    /**
+     * Docker image name (e.g., "postgres:17-alpine")
+     */
+    image: string;
+    /**
+     * Whether the container is currently running
+     */
+    is_running: boolean;
+    /**
+     * Service type this container represents
+     */
+    service_type: ServiceTypeRoute;
+    /**
+     * Extracted version from image
+     */
+    version: string;
+};
+
+/**
  * Response containing all available permissions for frontend validation
  */
 export type AvailablePermissions = {
@@ -302,6 +417,54 @@ export type BackupScheduleResponse = {
     updated_at: number;
 };
 
+/**
+ * Response after uploading a blob
+ */
+export type BlobResponse = {
+    /**
+     * Content type of the blob
+     */
+    contentType: string;
+    /**
+     * Original pathname
+     */
+    pathname: string;
+    /**
+     * Size in bytes
+     */
+    size: number;
+    /**
+     * Upload timestamp
+     */
+    uploadedAt: string;
+    /**
+     * URL path to access the blob
+     */
+    url: string;
+};
+
+/**
+ * Response for Blob service status
+ */
+export type BlobStatusResponse = {
+    /**
+     * Docker image being used
+     */
+    docker_image?: string | null;
+    /**
+     * Whether the Blob service is enabled
+     */
+    enabled: boolean;
+    /**
+     * Whether the service is healthy
+     */
+    healthy: boolean;
+    /**
+     * Current version (if running)
+     */
+    version?: string | null;
+};
+
 export type BranchInfo = {
     commit_sha: string;
     name: string;
@@ -348,6 +511,25 @@ export type BuildConfiguration = {
      * Target stage (for multi-stage builds)
      */
     target?: string | null;
+};
+
+/**
+ * Challenge configuration (future feature)
+ * For CAPTCHA, JS challenges, proof-of-work, etc.
+ */
+export type ChallengeConfig = {
+    /**
+     * Challenge type: "captcha", "js_challenge", "proof_of_work"
+     */
+    challengeType: string;
+    /**
+     * Challenge difficulty level (1-10)
+     */
+    difficulty: number;
+    /**
+     * Paths that require challenges
+     */
+    protectedPaths?: Array<string>;
 };
 
 export type ChallengeError = {
@@ -428,6 +610,53 @@ export type ConnectionResponse = {
     user_id?: number | null;
 };
 
+/**
+ * Connection test result
+ */
+export type ConnectionTestResult = {
+    message: string;
+    success: boolean;
+};
+
+/**
+ * Response indicating success of container state change
+ */
+export type ContainerActionResponse = {
+    action: string;
+    container_id: string;
+    container_name: string;
+    message: string;
+    status: string;
+};
+
+/**
+ * Detailed container information with environment variables and metrics
+ */
+export type ContainerDetailResponse = {
+    container_id: string;
+    container_name: string;
+    /**
+     * Port inside the container
+     */
+    container_port: number;
+    created_at: string;
+    deployed_at: string;
+    deployment_id: number;
+    /**
+     * Environment variables (sensitive values masked)
+     */
+    environment_variables: Array<EnvVarResponse>;
+    /**
+     * Port on the host machine
+     */
+    host_port?: number | null;
+    id: number;
+    image_name: string;
+    ready_at?: string | null;
+    resource_limits?: null | ResourceLimitsResponse;
+    status: string;
+};
+
 export type ContainerInfoResponse = {
     container_id: string;
     container_name: string;
@@ -442,9 +671,106 @@ export type ContainerListResponse = {
 };
 
 export type ContainerLogsQuery = {
+    /**
+     * Optional container name to get logs from (if deployment has multiple containers)
+     */
+    container_name?: string | null;
     end_date?: number | null;
     start_date?: number | null;
     tail?: string | null;
+    /**
+     * Include timestamps in log output (default: false)
+     */
+    timestamps?: boolean;
+};
+
+/**
+ * Container resource metrics (CPU, memory usage)
+ */
+export type ContainerMetricsResponse = {
+    container_id: string;
+    container_name: string;
+    /**
+     * CPU usage percentage (0-100)
+     */
+    cpu_percent: number;
+    /**
+     * Memory usage in bytes
+     */
+    memory_bytes: number;
+    /**
+     * Memory limit in bytes (if set)
+     */
+    memory_limit_bytes?: number | null;
+    /**
+     * Memory usage percentage (0-100) if limit is set
+     */
+    memory_percent?: number | null;
+    /**
+     * Network bytes received
+     */
+    network_rx_bytes: number;
+    /**
+     * Network bytes transmitted
+     */
+    network_tx_bytes: number;
+    /**
+     * Timestamp of metrics collection
+     */
+    timestamp: string;
+};
+
+export type ContainerResponse = {
+    /**
+     * Can this container hold other containers?
+     */
+    can_contain_containers: boolean;
+    /**
+     * Can this container hold entities (tables, collections, etc.)?
+     */
+    can_contain_entities: boolean;
+    /**
+     * Type of child containers (if can_contain_containers is true)
+     */
+    child_container_type?: string | null;
+    /**
+     * Container type (database, schema, keyspace, bucket, etc.)
+     */
+    container_type: string;
+    /**
+     * Hint for UI on expected entity count (small = sidebar, large = pagination)
+     */
+    entity_count_hint?: string | null;
+    /**
+     * Label for entity type (if can_contain_entities is true)
+     */
+    entity_type_label?: string | null;
+    /**
+     * Additional metadata
+     */
+    metadata: unknown;
+    /**
+     * Container name
+     */
+    name: string;
+};
+
+/**
+ * Request to copy a blob
+ */
+export type CopyBlobRequest = {
+    /**
+     * Source blob URL or pathname
+     */
+    fromUrl: string;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    projectId?: number | null;
+    /**
+     * Destination pathname
+     */
+    toPathname: string;
 };
 
 export type CreateApiKeyRequest = {
@@ -483,6 +809,28 @@ export type CreateDsnRequest = {
     name?: string | null;
 };
 
+/**
+ * Request to create a new DNS provider
+ */
+export type CreateDnsProviderRequest = {
+    /**
+     * Provider credentials
+     */
+    credentials: DnsProviderCredentials;
+    /**
+     * Optional description
+     */
+    description?: string | null;
+    /**
+     * User-friendly name
+     */
+    name: string;
+    /**
+     * Provider type
+     */
+    provider_type: DnsProviderType;
+};
+
 export type CreateDomainRequest = {
     /**
      * Challenge type for Let's Encrypt validation. Options: "http-01" (default) or "dns-01"
@@ -491,19 +839,49 @@ export type CreateDomainRequest = {
     domain: string;
 };
 
+export type CreateEmailDomainRequest = {
+    /**
+     * Domain name (e.g., "updates.example.com")
+     */
+    domain: string;
+    /**
+     * Provider ID to use for this domain
+     */
+    provider_id: number;
+};
+
 export type CreateEmailProviderRequest = {
-    config: EmailConfig;
-    enabled?: boolean | null;
+    /**
+     * User-friendly name for the provider
+     */
     name: string;
+    /**
+     * Provider type
+     */
+    provider_type: EmailProviderTypeRoute;
+    /**
+     * Cloud region
+     */
+    region: string;
+    scaleway_credentials?: null | ScalewayCredentialsRequest;
+    ses_credentials?: null | SesCredentialsRequest;
 };
 
 export type CreateEnvironmentRequest = {
     branch: string;
     name: string;
+    /**
+     * If true, set this environment as the preview environment for the project
+     */
+    set_as_preview?: boolean;
 };
 
 export type CreateEnvironmentVariableRequest = {
     environment_ids: Array<number>;
+    /**
+     * Include this environment variable in preview environments (default: true)
+     */
+    include_in_preview?: boolean;
     key: string;
     value: string;
 };
@@ -511,7 +889,7 @@ export type CreateEnvironmentVariableRequest = {
 export type CreateExternalServiceRequest = {
     name: string;
     parameters: {
-        [key: string]: string;
+        [key: string]: unknown;
     };
     service_type: ServiceTypeRoute;
     version?: string | null;
@@ -558,6 +936,24 @@ export type CreateIncidentRequest = {
     monitor_id?: number | null;
     severity: string;
     title: string;
+};
+
+/**
+ * Request to create an IP access control rule
+ */
+export type CreateIpAccessControlRequest = {
+    /**
+     * Action to take: "block" or "allow"
+     */
+    action: string;
+    /**
+     * IP address in CIDR notation (e.g., "192.168.1.1" or "10.0.0.0/24")
+     */
+    ip_address: string;
+    /**
+     * Optional reason for the action
+     */
+    reason?: string | null;
 };
 
 export type CreateMonitorRequest = {
@@ -617,6 +1013,18 @@ export type CreateProjectRequest = {
         string,
         string
     ]> | null;
+    /**
+     * Port exposed by the container (fallback when image has no EXPOSE directive)
+     *
+     * Priority order for port resolution:
+     * 1. Image EXPOSE directive (auto-detected from built image)
+     * 2. Environment-level exposed_port (overrides this value per environment)
+     * 3. This project-level exposed_port (fallback)
+     * 4. Default: 3000
+     *
+     * Only set this if your image doesn't use EXPOSE directive.
+     */
+    exposed_port?: number | null;
     git_provider_connection_id?: number | null;
     git_url?: string | null;
     install_command?: string | null;
@@ -628,6 +1036,7 @@ export type CreateProjectRequest = {
     output_dir?: string | null;
     performance_metrics_enabled?: boolean;
     preset: string;
+    preset_config?: null | PresetConfigSchema;
     project_type?: string | null;
     repo_name?: string | null;
     repo_owner?: string | null;
@@ -646,6 +1055,11 @@ export type CreateRouteRequest = {
     domain: string;
     host: string;
     port: number;
+    /**
+     * Route type: "http" (default) matches on HTTP Host header,
+     * "tls" matches on TLS SNI hostname for TCP passthrough
+     */
+    route_type?: string | null;
 };
 
 export type CreateS3SourceRequest = {
@@ -676,6 +1090,25 @@ export type CreateUserRequest = {
     password?: string | null;
     roles: Array<string>;
     username: string;
+};
+
+export type CreateWebhookRequestBody = {
+    /**
+     * Whether the webhook is enabled
+     */
+    enabled?: boolean | null;
+    /**
+     * Event types to subscribe to
+     */
+    events: Array<string>;
+    /**
+     * Secret for HMAC signature verification (optional)
+     */
+    secret?: string | null;
+    /**
+     * Target URL for webhook delivery
+     */
+    url: string;
 };
 
 export type CronExecutionInfo = {
@@ -732,6 +1165,155 @@ export type CustomDomainResponse = {
     status: string;
     status_code?: number | null;
     updated_at: number;
+};
+
+/**
+ * Request to delete keys
+ */
+export type DelRequest = {
+    /**
+     * The key(s) to delete
+     */
+    keys: Array<string>;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
+};
+
+/**
+ * Response for delete operation
+ */
+export type DelResponse = {
+    /**
+     * Number of keys deleted
+     */
+    deleted: number;
+};
+
+/**
+ * Request to delete blobs
+ */
+export type DeleteBlobRequest = {
+    /**
+     * Pathnames to delete (relative to project)
+     */
+    pathnames: Array<string>;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    projectId?: number | null;
+};
+
+/**
+ * Response after deleting blobs
+ */
+export type DeleteBlobResponse = {
+    /**
+     * Number of blobs deleted
+     */
+    deleted: number;
+};
+
+/**
+ * Deployment configuration shared between projects and environments
+ *
+ * This configuration can be set at the project level (as defaults) and
+ * overridden at the environment level for specific deployments.
+ *
+ * Note: Environment variables are managed separately and are not part of this config.
+ */
+export type DeploymentConfig = {
+    /**
+     * Enable automatic deployments on git push
+     */
+    automaticDeploy?: boolean;
+    /**
+     * CPU limit in millicores (e.g., 2000 = 2 CPUs)
+     */
+    cpuLimit?: number | null;
+    /**
+     * CPU request in millicores (e.g., 100 = 0.1 CPU, 1000 = 1 CPU)
+     */
+    cpuRequest?: number | null;
+    /**
+     * Port exposed by the container
+     * If not specified, will be auto-detected from Docker image or default to 3000
+     */
+    exposedPort?: number | null;
+    /**
+     * Memory limit in megabytes (e.g., 512 = 512MB)
+     */
+    memoryLimit?: number | null;
+    /**
+     * Memory request in megabytes (e.g., 128 = 128MB)
+     */
+    memoryRequest?: number | null;
+    /**
+     * Enable performance metrics collection (speed insights)
+     */
+    performanceMetricsEnabled?: boolean;
+    /**
+     * Number of replicas/instances to run
+     * Defaults to 1 replica
+     */
+    replicas?: number;
+    security?: null | SecurityConfig;
+    /**
+     * Enable session recording for analytics
+     */
+    sessionRecordingEnabled?: boolean;
+};
+
+/**
+ * Deployment configuration snapshot for deployments
+ *
+ * This extends DeploymentConfig with environment variables to capture
+ * the complete state of a deployment at the time it was created.
+ */
+export type DeploymentConfigSnapshot = {
+    /**
+     * Enable automatic deployments on git push
+     */
+    automaticDeploy?: boolean;
+    /**
+     * CPU limit in millicores
+     */
+    cpuLimit?: number | null;
+    /**
+     * CPU request in millicores
+     */
+    cpuRequest?: number | null;
+    /**
+     * Environment variables used for this deployment
+     */
+    environmentVariables?: {
+        [key: string]: string;
+    };
+    /**
+     * Port exposed by the container
+     */
+    exposedPort?: number | null;
+    /**
+     * Memory limit in megabytes
+     */
+    memoryLimit?: number | null;
+    /**
+     * Memory request in megabytes
+     */
+    memoryRequest?: number | null;
+    /**
+     * Enable performance metrics collection
+     */
+    performanceMetricsEnabled?: boolean;
+    /**
+     * Number of replicas
+     */
+    replicas?: number;
+    /**
+     * Enable session recording
+     */
+    sessionRecordingEnabled?: boolean;
 };
 
 /**
@@ -821,6 +1403,49 @@ export type DeploymentListResponse = {
     total: number;
 };
 
+/**
+ * Deployment metadata - typed information about the deployment
+ */
+export type DeploymentMetadata = {
+    /**
+     * Build duration in milliseconds
+     */
+    buildDurationMs?: number | null;
+    /**
+     * Docker builder used (e.g., "nixpacks", "dockerfile")
+     */
+    builder?: string | null;
+    /**
+     * Deployment duration in milliseconds
+     */
+    deploymentDurationMs?: number | null;
+    /**
+     * Dockerfile path if using Dockerfile builder
+     */
+    dockerfilePath?: string | null;
+    /**
+     * Number of files in the build output
+     */
+    fileCount?: number | null;
+    gitPushEvent?: null | GitPushEvent;
+    /**
+     * Total size of the built image in bytes
+     */
+    imageSizeBytes?: number | null;
+    /**
+     * Whether this is a rollback deployment
+     */
+    isRollback?: boolean;
+    /**
+     * Custom labels/tags for the deployment
+     */
+    labels?: Array<string>;
+    /**
+     * ID of the deployment this was rolled back from (if applicable)
+     */
+    rolledBackFromId?: number | null;
+};
+
 export type DeploymentResponse = {
     branch?: string | null;
     cancelled_reason?: string | null;
@@ -829,11 +1454,13 @@ export type DeploymentResponse = {
     commit_hash?: string | null;
     commit_message?: string | null;
     created_at: number;
+    deployment_config?: null | DeploymentConfigSnapshot;
     environment: DeploymentEnvironmentResponse;
     environment_id: number;
     finished_at?: number | null;
     id: number;
     is_current: boolean;
+    metadata?: null | DeploymentMetadata;
     project_id: number;
     screenshot_location?: string | null;
     started_at?: number | null;
@@ -857,6 +1484,47 @@ export type DeviceCount = {
     count: number;
     device_type: string;
     percentage: number;
+};
+
+/**
+ * Sections that can be included in the weekly digest
+ * Note: `#[serde(default)]` allows backward compatibility when deserializing
+ * old data that may have `security` and `resources` fields instead of `projects`
+ */
+export type DigestSections = {
+    deployments?: boolean;
+    errors?: boolean;
+    funnels?: boolean;
+    performance?: boolean;
+    projects?: boolean;
+};
+
+/**
+ * Response after disabling Blob service
+ */
+export type DisableBlobResponse = {
+    /**
+     * Human-readable message
+     */
+    message: string;
+    /**
+     * Whether the operation succeeded
+     */
+    success: boolean;
+};
+
+/**
+ * Response after disabling KV service
+ */
+export type DisableKvResponse = {
+    /**
+     * Status message
+     */
+    message: string;
+    /**
+     * Whether the service was successfully disabled
+     */
+    success: boolean;
 };
 
 export type DisableMfaRequest = {
@@ -885,6 +1553,50 @@ export type DiscoverResponse = {
      * Discovered workloads
      */
     workloads: Array<WorkloadDescriptor>;
+};
+
+/**
+ * Disk space alert settings for monitoring disk usage
+ */
+export type DiskSpaceAlertSettings = {
+    /**
+     * Interval in seconds between disk space checks
+     */
+    check_interval_seconds?: number;
+    /**
+     * Whether disk space alerts are enabled
+     */
+    enabled?: boolean;
+    /**
+     * Path to monitor (defaults to data directory)
+     */
+    monitor_path?: string | null;
+    /**
+     * Threshold percentage (0-100) at which to trigger alerts
+     */
+    threshold_percent?: number;
+};
+
+/**
+ * Result of a single DNS TXT record creation for ACME challenge
+ */
+export type DnsChallengeRecordResult = {
+    /**
+     * Human-readable message about the operation
+     */
+    message: string;
+    /**
+     * TXT record name (e.g., "_acme-challenge.example.com")
+     */
+    name: string;
+    /**
+     * Whether the record was created successfully
+     */
+    success: boolean;
+    /**
+     * TXT record value (the ACME challenge token)
+     */
+    value: string;
 };
 
 export type DnsCompletionResponse = {
@@ -938,6 +1650,61 @@ export type DnsLookupResponse = {
     records: Array<string>;
 };
 
+/**
+ * DNS provider credentials (API-facing)
+ */
+export type DnsProviderCredentials = {
+    account_id?: string | null;
+    api_token: string;
+    type: 'cloudflare';
+} | {
+    api_key: string;
+    api_user: string;
+    client_ip?: string | null;
+    sandbox?: boolean;
+    type: 'namecheap';
+} | {
+    access_key_id: string;
+    region?: string | null;
+    secret_access_key: string;
+    session_token?: string | null;
+    type: 'route53';
+} | {
+    api_token: string;
+    type: 'digitalocean';
+} | {
+    private_key: string;
+    project_id: string;
+    service_account_email: string;
+    type: 'gcp';
+} | {
+    client_id: string;
+    client_secret: string;
+    resource_group: string;
+    subscription_id: string;
+    tenant_id: string;
+    type: 'azure';
+};
+
+/**
+ * DNS provider response
+ */
+export type DnsProviderResponse = {
+    created_at: string;
+    /**
+     * Masked credentials for display
+     */
+    credentials: unknown;
+    description?: string | null;
+    id: number;
+    is_active: boolean;
+    last_error?: string | null;
+    last_used_at?: string | null;
+    name: string;
+    provider_type: string;
+    updated_at: string;
+};
+
 export type DnsProviderSettings = {
     cloudflare_api_key?: string | null;
     provider?: string;
@@ -949,6 +1716,254 @@ export type DnsProviderSettings = {
 export type DnsProviderSettingsMasked = {
     cloudflare_api_key?: string | null;
     provider: string;
+};
+
+/**
+ * Supported DNS provider types
+ */
+export type DnsProviderType = 'cloudflare' | 'namecheap' | 'route53' | 'digitalocean' | 'gcp' | 'azure' | 'manual';
+
+/**
+ * A DNS record
+ */
+export type DnsRecord = {
+    /**
+     * Record content
+     */
+    content: DnsRecordContent;
+    /**
+     * Fully qualified domain name
+     */
+    fqdn: string;
+    /**
+     * Provider-specific record ID (if exists)
+     */
+    id?: string | null;
+    /**
+     * Provider-specific metadata
+     */
+    metadata?: {
+        [key: string]: string;
+    };
+    /**
+     * Record name (without zone, e.g., "www" or "@" for root)
+     */
+    name: string;
+    /**
+     * Whether this record is proxied (Cloudflare-specific)
+     */
+    proxied?: boolean;
+    /**
+     * Time to live in seconds
+     */
+    ttl: number;
+    /**
+     * Zone/domain this record belongs to
+     */
+    zone: string;
+};
+
+/**
+ * DNS record content - varies by record type
+ */
+export type DnsRecordContent = {
+    type: 'A';
+    /**
+     * A record - IPv4 address (as string, e.g., "192.0.2.1")
+     */
+    value: {
+        address: string;
+    };
+} | {
+    type: 'AAAA';
+    /**
+     * AAAA record - IPv6 address (as string, e.g., "2001:db8::1")
+     */
+    value: {
+        address: string;
+    };
+} | {
+    type: 'CNAME';
+    /**
+     * CNAME record - canonical name
+     */
+    value: {
+        target: string;
+    };
+} | {
+    type: 'TXT';
+    /**
+     * TXT record - text content
+     */
+    value: {
+        content: string;
+    };
+} | {
+    type: 'MX';
+    /**
+     * MX record - mail exchange
+     */
+    value: {
+        priority: number;
+        target: string;
+    };
+} | {
+    type: 'NS';
+    /**
+     * NS record - nameserver
+     */
+    value: {
+        nameserver: string;
+    };
+} | {
+    type: 'SRV';
+    /**
+     * SRV record - service
+     */
+    value: {
+        port: number;
+        priority: number;
+        target: string;
+        weight: number;
+    };
+} | {
+    type: 'CAA';
+    /**
+     * CAA record - certification authority authorization
+     */
+    value: {
+        flags: number;
+        tag: string;
+        value: string;
+    };
+} | {
+    type: 'PTR';
+    /**
+     * PTR record - pointer
+     */
+    value: {
+        target: string;
+    };
+};
+
+export type DnsRecordResponse = {
+    /**
+     * DNS record name (host)
+     */
+    name: string;
+    /**
+     * Priority (for MX records)
+     */
+    priority?: number | null;
+    /**
+     * Record type: TXT, CNAME, MX
+     */
+    record_type: string;
+    /**
+     * Verification status: unknown, verified, pending, failed
+     */
+    status: DnsRecordStatusResponse;
+    /**
+     * DNS record value
+     */
+    value: string;
+};
+
+/**
+ * Result of a single DNS record creation
+ */
+export type DnsRecordSetupResult = {
+    /**
+     * Whether the operation was automatic or manual
+     */
+    automatic: boolean;
+    /**
+     * Human-readable message
+     */
+    message: string;
+    /**
+     * Record name
+     */
+    name: string;
+    /**
+     * Record type (TXT, CNAME, MX)
+     */
+    record_type: string;
+    /**
+     * Whether the record was created successfully
+     */
+    success: boolean;
+};
+
+/**
+ * DNS record verification status
+ */
+export type DnsRecordStatusResponse = 'unknown' | 'verified' | 'pending' | 'failed';
+
+/**
+ * A DNS zone (domain managed by the provider)
+ */
+export type DnsZone = {
+    /**
+     * Provider-specific zone ID
+     */
+    id: string;
+    /**
+     * Provider-specific metadata
+     */
+    metadata?: {
+        [key: string]: string;
+    };
+    /**
+     * Zone name (domain)
+     */
+    name: string;
+    /**
+     * Nameservers for this zone
+     */
+    nameservers: Array<string>;
+    /**
+     * Zone status
+     */
+    status: string;
+};
+
+export type DockerRegistrySettings = {
+    ca_certificate?: string | null;
+    enabled?: boolean;
+    password?: string | null;
+    registry_url?: string | null;
+    tls_verify?: boolean;
+    username?: string | null;
+};
+
+/**
+ * Docker registry settings with masked sensitive fields
+ */
+export type DockerRegistrySettingsMasked = {
+    ca_certificate?: string | null;
+    enabled: boolean;
+    password?: string | null;
+    registry_url?: string | null;
+    tls_verify: boolean;
+    username?: string | null;
+};
+
+/**
+ * Configuration for Dockerfile preset
+ * Allows customizing the Dockerfile path and build context for Docker-based deployments
+ */
+export type DockerfilePresetConfig = {
+    /**
+     * Custom build context path (relative to repository root)
+     * If not specified, uses the project's directory setting
+     */
+    buildContext?: string | null;
+    /**
+     * Custom Dockerfile path (relative to build context)
+     * If not specified, defaults to "Dockerfile" in the build context
+     */
+    dockerfilePath?: string | null;
 };
 
 export type DomainChallengeResponse = {
@@ -1005,10 +2020,149 @@ export type EmailConfig = {
     username: string;
 };
 
+export type EmailDomainResponse = {
+    created_at: string;
+    domain: string;
+    id: number;
+    last_verified_at?: string | null;
+    provider_id: number;
+    status: string;
+    updated_at: string;
+    verification_error?: string | null;
+};
+
+export type EmailDomainWithDnsResponse = {
+    dns_records: Array<DnsRecordResponse>;
+    domain: EmailDomainResponse;
+};
+
+export type EmailProviderResponse = {
+    created_at: string;
+    /**
+     * Masked credentials for display
+     */
+    credentials: unknown;
+    id: number;
+    is_active: boolean;
+    name: string;
+    provider_type: EmailProviderTypeRoute;
+    region: string;
+    updated_at: string;
+};
+
+export type EmailProviderTypeRoute = 'ses' | 'scaleway';
+
+export type EmailResponse = {
+    bcc_addresses?: Array<string> | null;
+    cc_addresses?: Array<string> | null;
+    created_at: string;
+    domain_id?: number | null;
+    error_message?: string | null;
+    from_address: string;
+    from_name?: string | null;
+    headers?: {
+        [key: string]: string;
+    } | null;
+    html_body?: string | null;
+    id: string;
+    project_id?: number | null;
+    provider_message_id?: string | null;
+    reply_to?: string | null;
+    sent_at?: string | null;
+    status: string;
+    subject: string;
+    tags?: Array<string> | null;
+    text_body?: string | null;
+    to_addresses: Array<string>;
+};
+
+export type EmailStatsResponse = {
+    /**
+     * Emails captured without sending (Mailhog mode - no provider configured)
+     */
+    captured: number;
+    failed: number;
+    queued: number;
+    sent: number;
+    total: number;
+};
+
 export type EmailStatusResponse = {
     email_configured: boolean;
     magic_link_available: boolean;
     password_reset_available: boolean;
+};
+
+/**
+ * Request to enable Blob service
+ */
+export type EnableBlobRequest = {
+    /**
+     * Docker image to use (optional, defaults to RustFS)
+     */
+    docker_image?: string | null;
+    /**
+     * Root password for S3 access
+     */
+    root_password?: string | null;
+    /**
+     * Root user for S3 access
+     */
+    root_user?: string | null;
+};
+
+/**
+ * Response after enabling Blob service
+ */
+export type EnableBlobResponse = {
+    /**
+     * Human-readable message
+     */
+    message: string;
+    /**
+     * Current status
+     */
+    status: BlobStatusResponse;
+    /**
+     * Whether the operation succeeded
+     */
+    success: boolean;
+};
+
+/**
+ * Request to enable the KV service
+ */
+export type EnableKvRequest = {
+    /**
+     * Docker image to use (optional, uses default if not provided)
+     */
+    docker_image?: string | null;
+    /**
+     * Maximum memory allocation (e.g., "256mb", "1gb")
+     */
+    max_memory?: string | null;
+    /**
+     * Enable data persistence
+     */
+    persistence?: boolean;
+};
+
+/**
+ * Response after enabling KV service
+ */
+export type EnableKvResponse = {
+    /**
+     * Status message
+     */
+    message: string;
+    /**
+     * Current service status
+     */
+    status: KvStatusResponse;
+    /**
+     * Whether the service was successfully enabled
+     */
+    success: boolean;
 };
 
 export type EnrichVisitorRequest = {
@@ -1021,6 +2175,72 @@ export type EnrichVisitorResponse = {
     message: string;
     success: boolean;
     visitor_id: string;
+};
+
+export type EntityInfoResponse = {
+    /**
+     * Full container path
+     */
+    container_path: Array<string>;
+    /**
+     * Entity name
+     */
+    entity: string;
+    /**
+     * Entity type
+     */
+    entity_type: string;
+    /**
+     * Field definitions
+     */
+    fields: Array<FieldResponse>;
+    /**
+     * Additional metadata (content_type, last_modified, etag, etc.)
+     */
+    metadata?: unknown;
+    /**
+     * Approximate row count (for tables/collections)
+     */
+    row_count?: number | null;
+    /**
+     * Size in bytes (for objects/files)
+     */
+    size_bytes?: number | null;
+    /**
+     * JSON Schema for sort options (if supported)
+     */
+    sort_schema?: unknown;
+};
+
+export type EntityResponse = {
+    /**
+     * Entity type (table, view, collection, etc.)
+     */
+    entity_type: string;
+    /**
+     * Entity name (table/collection)
+     */
+    name: string;
+    /**
+     * Approximate row count
+     */
+    row_count?: number | null;
+    /**
+     * Size in bytes (for files/objects)
+     */
+    size_bytes?: number | null;
+};
+
+/**
+ * Environment variable with masked sensitive values
+ */
+export type EnvVarResponse = {
+    /**
+     * Whether this is a sensitive/masked value
+     */
+    is_masked: boolean;
+    key: string;
+    value: string;
 };
 
 /**
@@ -1046,6 +2266,10 @@ export type EnvironmentDomainResponse = {
     domain: string;
     environment_id: number;
     id: number;
+    /**
+     * Full URL for this domain (e.g., https://buildtolearndev-production.example.com)
+     */
+    url: string;
 };
 
 export type EnvironmentInfo = {
@@ -1057,17 +2281,18 @@ export type EnvironmentInfo = {
 
 export type EnvironmentResponse = {
     branch?: string | null;
-    cpu_limit?: number | null;
-    cpu_request?: number | null;
     created_at: number;
     current_deployment_id?: number | null;
+    deployment_config?: null | DeploymentConfig;
     id: number;
+    /**
+     * Indicates if this is a preview environment (auto-created per branch)
+     * For preview environments, 'branch' contains the feature branch name
+     */
+    is_preview: boolean;
     main_url: string;
-    memory_limit?: number | null;
-    memory_request?: number | null;
     name: string;
     project_id: number;
-    replicas?: number | null;
     slug: string;
     updated_at: number;
 };
@@ -1092,6 +2317,10 @@ export type EnvironmentVariable = {
 
 export type EnvironmentVariableInfo = {
     name: string;
+    /**
+     * Whether this variable contains sensitive data (passwords, keys, tokens)
+     */
+    sensitive: boolean;
     value: string;
 };
 
@@ -1099,6 +2328,10 @@ export type EnvironmentVariableResponse = {
     created_at: number;
     environments: Array<EnvironmentInfo>;
     id: number;
+    /**
+     * Include this environment variable in preview environments
+     */
+    include_in_preview: boolean;
     key: string;
     updated_at: number;
     value: string;
@@ -1276,6 +2509,12 @@ export type EventTypeBreakdownQuery = {
     start_date: string;
 };
 
+export type EventTypeResponse = {
+    category: string;
+    description: string;
+    event_type: string;
+};
+
 export type EventTypesResponse = {
     events: Array<EventType>;
 };
@@ -1351,11 +2590,102 @@ export type ExecuteImportResponse = {
     status: ImportExecutionStatus;
 };
 
+export type ExecuteOperationRequest = {
+    operation: string;
+};
+
+/**
+ * Request to set expiration on a key
+ */
+export type ExpireRequest = {
+    /**
+     * The key to set expiration on
+     */
+    key: string;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
+    /**
+     * Expiration time in seconds
+     */
+    seconds: number;
+};
+
+/**
+ * Response for expire operation
+ */
+export type ExpireResponse = {
+    /**
+     * True if expiration was set, false if key doesn't exist
+     */
+    success: boolean;
+};
+
+export type ExplorerSupportResponse = {
+    /**
+     * Capabilities supported by this service
+     */
+    capabilities: Array<string>;
+    /**
+     * JSON Schema for filter format with embedded UI hints (if supported)
+     */
+    filter_schema?: unknown;
+    /**
+     * Hierarchy levels (describes the navigation structure)
+     */
+    hierarchy: Array<HierarchyLevel>;
+    /**
+     * Reason why explorer is not supported (if applicable)
+     */
+    reason?: string | null;
+    /**
+     * Service type
+     */
+    service_type: string;
+    /**
+     * Whether the service supports query explorer functionality
+     */
+    supported: boolean;
+};
+
+/**
+ * Response for external image operations
+ */
+export type ExternalImageResponse = {
+    digest?: string | null;
+    id: string;
+    image_ref: string;
+    pushed_at: string;
+    size?: number | null;
+};
+
+/**
+ * Response type for external service backup
+ */
+export type ExternalServiceBackupResponse = {
+    backup_id: number;
+    backup_type: string;
+    checksum?: string | null;
+    compression_type: string;
+    created_by: number;
+    error_message?: string | null;
+    expires_at?: string | null;
+    finished_at?: string | null;
+    id: number;
+    metadata: unknown;
+    s3_location: string;
+    service_id: number;
+    size_bytes?: number | null;
+    started_at: string;
+    state: string;
+};
+
 export type ExternalServiceDetails = {
     current_parameters?: {
         [key: string]: string;
     } | null;
-    parameters: Array<ServiceParameter>;
+    parameter_schema?: unknown;
     service: ExternalServiceInfo;
 };
 
@@ -1368,6 +2698,21 @@ export type ExternalServiceInfo = {
     status: string;
     updated_at: string;
     version?: string | null;
+};
+
+export type FieldResponse = {
+    /**
+     * Field type (Int32, String, Timestamp, etc.)
+     */
+    field_type: string;
+    /**
+     * Field name
+     */
+    name: string;
+    /**
+     * Whether the field is nullable
+     */
+    nullable: boolean;
 };
 
 export type FunnelMetricsResponse = {
@@ -1446,6 +2791,20 @@ export type GeoLocationResponse = {
     timezone?: string | null;
 };
 
+/**
+ * Geographic restrictions configuration (future feature)
+ */
+export type GeoRestrictionsConfig = {
+    /**
+     * Allow traffic only from specific countries
+     */
+    allowedCountries?: Array<string>;
+    /**
+     * Block traffic from specific countries (ISO 3166-1 alpha-2 codes)
+     */
+    blockedCountries?: Array<string>;
+};
+
 export type GetDeploymentsParams = {
     environment_id?: number | null;
     page?: number | null;
@@ -1483,6 +2842,30 @@ export type GetProjectSessionReplaysResponse = {
     total_count: number;
 };
 
+/**
+ * Request to get a value by key
+ */
+export type GetRequest = {
+    /**
+     * The key to retrieve
+     */
+    key: string;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
+};
+
+/**
+ * Response for get operation
+ */
+export type GetResponse = {
+    /**
+     * The value, or null if not found
+     */
+    value?: unknown;
+};
+
 export type GetSessionReplayResponse = {
     session: SessionReplayWithVisitorDto;
 };
@@ -1497,6 +2880,28 @@ export type GetVisitorSessionsResponse = {
     per_page: number;
     sessions: Array<SessionReplayWithVisitorDto>;
     total_count: number;
+};
+
+/**
+ * Git push event information that triggered the deployment
+ */
+export type GitPushEvent = {
+    /**
+     * Branch that was pushed
+     */
+    branch: string;
+    /**
+     * Commit SHA
+     */
+    commit: string;
+    /**
+     * Repository owner/organization
+     */
+    owner: string;
+    /**
+     * Repository name
+     */
+    repo: string;
 };
 
 export type GroupedPageMetric = {
@@ -1541,6 +2946,14 @@ export type HasEventsResponse = {
     has_events: boolean;
 };
 
+export type HasMetricsQuery = {
+    project_id: number;
+};
+
+export type HasMetricsResponse = {
+    has_metrics: boolean;
+};
+
 /**
  * Health check configuration
  */
@@ -1565,6 +2978,32 @@ export type HealthCheckConfiguration = {
      * Timeout for each check (seconds)
      */
     timeout: number;
+};
+
+/**
+ * Describes a level in the data source hierarchy
+ */
+export type HierarchyLevel = {
+    /**
+     * Can list containers at this level?
+     */
+    can_list_containers: boolean;
+    /**
+     * Can list entities at this level?
+     */
+    can_list_entities: boolean;
+    /**
+     * Type of container at this level
+     */
+    container_type: string;
+    /**
+     * Level number (0 = root)
+     */
+    level: number;
+    /**
+     * Human-readable name for this level
+     */
+    name: string;
 };
 
 export type HourlyPageSessions = {
@@ -1614,6 +3053,34 @@ export type HttpChallengeDebugResponse = {
  * Import execution status
  */
 export type ImportExecutionStatus = 'pending' | 'inprogress' | 'completed' | 'failed';
+
+/**
+ * Request to import a Docker container as a managed service
+ */
+export type ImportExternalServiceRequest = {
+    /**
+     * Container ID or name to import
+     */
+    container_id: string;
+    /**
+     * Name to register the service as in Temps
+     */
+    name: string;
+    /**
+     * Service configuration parameters
+     */
+    parameters: {
+        [key: string]: unknown;
+    };
+    /**
+     * Service type
+     */
+    service_type: ServiceTypeRoute;
+    /**
+     * Optional version override
+     */
+    version?: string | null;
+};
 
 /**
  * Complete import plan describing all operations to onboard a workload
@@ -1804,9 +3271,106 @@ export type IncidentUpdateResponse = {
     status: string;
 };
 
+/**
+ * Request to increment a value
+ */
+export type IncrRequest = {
+    /**
+     * Amount to increment by (default: 1)
+     */
+    amount?: number | null;
+    /**
+     * The key to increment
+     */
+    key: string;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
+};
+
+/**
+ * Response for increment operation
+ */
+export type IncrResponse = {
+    /**
+     * New value after increment
+     */
+    value: number;
+};
+
 export type InitAuthResponse = {
     auth_url: string;
     session_token: string;
+};
+
+/**
+ * Query parameters for listing IP access control rules
+ */
+export type IpAccessControlQuery = {
+    /**
+     * Filter by action ("block" or "allow")
+     */
+    action?: string | null;
+};
+
+/**
+ * Response model for IP access control rules
+ */
+export type IpAccessControlResponse = {
+    action: string;
+    created_at: string;
+    created_by?: number | null;
+    id: number;
+    ip_address: string;
+    reason?: string | null;
+    updated_at: string;
+};
+
+/**
+ * Request to get keys matching a pattern
+ */
+export type KeysRequest = {
+    /**
+     * Pattern to match (supports * and ? wildcards)
+     */
+    pattern: string;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
+};
+
+/**
+ * Response for keys operation
+ */
+export type KeysResponse = {
+    /**
+     * List of matching keys
+     */
+    keys: Array<string>;
+};
+
+/**
+ * Response for KV service status
+ */
+export type KvStatusResponse = {
+    /**
+     * Docker image being used
+     */
+    docker_image?: string | null;
+    /**
+     * Whether the KV service is enabled
+     */
+    enabled: boolean;
+    /**
+     * Whether the underlying Redis service is healthy
+     */
+    healthy: boolean;
+    /**
+     * Service version
+     */
+    version?: string | null;
 };
 
 export type LetsEncryptSettings = {
@@ -1853,6 +3417,46 @@ export type ListAuditLogsQuery = {
     user_id?: number | null;
 };
 
+/**
+ * Query parameters for listing blobs
+ */
+export type ListBlobsQuery = {
+    /**
+     * Continuation token for pagination
+     */
+    cursor?: string | null;
+    /**
+     * Maximum number of items to return
+     */
+    limit?: number | null;
+    /**
+     * Prefix to filter by
+     */
+    prefix?: string | null;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
+};
+
+/**
+ * Response for listing blobs
+ */
+export type ListBlobsResponse = {
+    /**
+     * List of blobs
+     */
+    blobs: Array<BlobResponse>;
+    /**
+     * Continuation token for next page
+     */
+    cursor?: string | null;
+    /**
+     * Whether there are more results
+     */
+    hasMore: boolean;
+};
+
 export type ListCustomDomainsResponse = {
     domains: Array<CustomDomainResponse>;
     total: number;
@@ -1860,6 +3464,17 @@ export type ListCustomDomainsResponse = {
 
 export type ListDomainsResponse = {
     domains: Array<DomainResponse>;
+};
+
+export type ListEntitiesQuery = {
+    /**
+     * Maximum number of entities to return
+     */
+    limit?: number;
+    /**
+     * Continuation token for pagination (backend-specific)
+     */
+    token?: string | null;
 };
 
 export type ListErrorEventsQuery = {
@@ -1880,6 +3495,51 @@ export type ListErrorGroupsQuery = {
 
 export type ListOrdersResponse = {
     orders: Array<AcmeOrderResponse>;
+};
+
+export type ListPresetsResponse = {
+    presets: Array<PresetResponse>;
+    total: number;
+};
+
+export type ListScansQuery = {
+    page?: number | null;
+    page_size?: number | null;
+};
+
+export type ListVulnerabilitiesQuery = {
+    page?: number | null;
+    page_size?: number | null;
+    severity?: string | null;
+};
+
+export type LiveVisitorInfo = {
+    city?: string | null;
+    country?: string | null;
+    country_code?: string | null;
+    crawler_name?: string | null;
+    custom_data?: unknown;
+    environment_id: number;
+    first_seen: string;
+    id: number;
+    ip_address?: string | null;
+    ip_address_id?: number | null;
+    is_crawler: boolean;
+    is_eu?: boolean | null;
+    last_seen: string;
+    latitude?: number | null;
+    longitude?: number | null;
+    project_id: number;
+    region?: string | null;
+    timezone?: string | null;
+    user_agent?: string | null;
+    visitor_id: string;
+};
+
+export type LiveVisitorsListResponse = {
+    total_count: number;
+    visitors: Array<LiveVisitorInfo>;
+    window_minutes: number;
 };
 
 export type LocationCount = {
@@ -1903,6 +3563,22 @@ export type LoginRequest = {
 
 export type MagicLinkRequest = {
     email: string;
+};
+
+/**
+ * Managed domain response
+ */
+export type ManagedDomainResponse = {
+    auto_manage: boolean;
+    created_at: string;
+    domain: string;
+    id: number;
+    provider_id: number;
+    updated_at: string;
+    verification_error?: string | null;
+    verified: boolean;
+    verified_at?: string | null;
+    zone_id?: string | null;
 };
 
 export type MetricsOverTimeResponse = {
@@ -1962,6 +3638,28 @@ export type MfaVerificationRequest = {
     code: string;
 };
 
+/**
+ * Miscellaneous validation result
+ */
+export type MiscResult = {
+    /**
+     * Gravatar URL if available
+     */
+    gravatar_url?: string | null;
+    /**
+     * Whether the email provider is a B2C (consumer) email provider
+     */
+    is_b2c: boolean;
+    /**
+     * Whether the email is from a disposable email provider
+     */
+    is_disposable: boolean;
+    /**
+     * Whether the email is a role-based account (e.g., admin@, info@)
+     */
+    is_role_account: boolean;
+};
+
 export type MonitorResponse = {
     check_interval_seconds: number;
     created_at: string;
@@ -1980,6 +3678,24 @@ export type MonitorStatus = {
     current_status: string;
     monitor: MonitorResponse;
     uptime_percentage: number;
+};
+
+/**
+ * MX (Mail Exchange) validation result
+ */
+export type MxResult = {
+    /**
+     * Whether the domain accepts mail
+     */
+    accepts_mail: boolean;
+    /**
+     * Error message if MX lookup failed
+     */
+    error?: string | null;
+    /**
+     * List of MX records for the domain
+     */
+    records: Array<string>;
 };
 
 /**
@@ -2007,12 +3723,24 @@ export type NetworkMode = 'bridge' | 'host' | 'none' | {
     custom: string;
 };
 
+/**
+ * Configuration for Nixpacks preset
+ * Nixpacks auto-detects your application and uses nixpacks.toml for configuration
+ * No additional parameters needed - configuration is expressed in nixpacks.toml file
+ */
+export type NixpacksPresetConfig = {
+    [key: string]: unknown;
+};
+
 export type NotificationPreferencesResponse = {
     backup_failures_enabled: boolean;
     backup_successes_enabled: boolean;
     batch_similar_notifications: boolean;
     build_errors_enabled: boolean;
     deployment_failures_enabled: boolean;
+    digest_sections: DigestSections;
+    digest_send_day: string;
+    digest_send_time: string;
     dns_changes_enabled: boolean;
     domain_expiration_enabled: boolean;
     email_enabled: boolean;
@@ -2027,6 +3755,7 @@ export type NotificationPreferencesResponse = {
     slack_enabled: boolean;
     ssl_days_before_expiration: number;
     ssl_expiration_enabled: boolean;
+    weekly_digest_enabled: boolean;
 };
 
 export type NotificationProviderResponse = {
@@ -2043,6 +3772,67 @@ export type OperatingSystemCount = {
     count: number;
     operating_system: string;
     percentage: number;
+};
+
+export type OperationResultResponse = {
+    data?: unknown;
+    executed_at: string;
+    message: string;
+    operation: string;
+    success: boolean;
+};
+
+export type OperationResultsResponse = {
+    deployment_id: string;
+    operations: Array<OperationResultResponse>;
+};
+
+/**
+ * Time bucket data point for page activity graph
+ */
+export type PageActivityBucket = {
+    /**
+     * Average time on page in seconds
+     */
+    avg_time_seconds: number;
+    /**
+     * Number of page views in this bucket
+     */
+    page_views: number;
+    /**
+     * Timestamp for this bucket (ISO 8601)
+     */
+    timestamp: string;
+    /**
+     * Number of unique visitors in this bucket
+     */
+    visitors: number;
+};
+
+/**
+ * Geographic distribution of visitors for a page
+ */
+export type PageCountryStats = {
+    /**
+     * Country name
+     */
+    country: string;
+    /**
+     * ISO country code (2-letter)
+     */
+    country_code?: string | null;
+    /**
+     * Number of page views from this country
+     */
+    page_views: number;
+    /**
+     * Percentage of total visitors
+     */
+    percentage: number;
+    /**
+     * Number of unique visitors from this country
+     */
+    visitors: number;
 };
 
 /**
@@ -2062,6 +3852,74 @@ export type PageHourlySessionsResponse = {
     hours: number;
     page_path: string;
     total_sessions: number;
+};
+
+/**
+ * Query parameters for page path detail analytics
+ */
+export type PagePathDetailQuery = {
+    /**
+     * Bucket interval for time series: 'hour', 'day', 'week', 'month' (default: auto)
+     */
+    bucket_interval?: string | null;
+    end_date: string;
+    environment_id?: number | null;
+    /**
+     * The specific page path to get details for (URL-encoded)
+     */
+    page_path: string;
+    project_id: number;
+    start_date: string;
+};
+
+/**
+ * Detailed analytics response for a specific page path
+ */
+export type PagePathDetailResponse = {
+    /**
+     * Time series data for activity graph
+     */
+    activity_over_time: Array<PageActivityBucket>;
+    /**
+     * Average time on page in seconds
+     */
+    avg_time_on_page: number;
+    /**
+     * Bounce rate percentage (0-100)
+     */
+    bounce_rate: number;
+    /**
+     * Bucket interval used for time series ('hour', 'day', etc.)
+     */
+    bucket_interval: string;
+    /**
+     * Geographic distribution of visitors
+     */
+    countries: Array<PageCountryStats>;
+    /**
+     * Entry rate - percentage of sessions that started on this page
+     */
+    entry_rate: number;
+    /**
+     * Exit rate - percentage of sessions that ended on this page
+     */
+    exit_rate: number;
+    /**
+     * The page path being analyzed
+     */
+    page_path: string;
+    /**
+     * Top referrers to this page
+     */
+    referrers: Array<PageReferrerStats>;
+    /**
+     * Total page views in the date range
+     */
+    total_page_views: number;
+    /**
+     * Total unique visitors to this page in the date range
+     */
+    unique_visitors: number;
 };
 
 export type PagePathInfo = {
@@ -2086,6 +3944,24 @@ export type PagePathsResponse = {
     total_count: number;
 };
 
+/**
+ * Referrer source for the page
+ */
+export type PageReferrerStats = {
+    /**
+     * Percentage of total visits
+     */
+    percentage: number;
+    /**
+     * Referrer URL or domain
+     */
+    referrer: string;
+    /**
+     * Number of visits from this referrer
+     */
+    visits: number;
+};
+
 export type PageSessionComparison = {
     avg_duration_seconds: number;
     date: string;
@@ -2102,7 +3978,6 @@ export type PageSessionStats = {
     page_path: string;
     total_page_views: number;
     total_sessions: number;
-    total_time_seconds: number;
 };
 
 export type PageSessionStatsQuery = {
@@ -2121,6 +3996,40 @@ export type PageVisit = {
 export type PagesComparisonResponse = {
     comparisons: Array<PageSessionComparison>;
     page_paths: Array<string>;
+};
+
+export type PaginatedEmailsResponse = {
+    data: Array<EmailResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type PaginatedEntitiesResponse = {
+    /**
+     * Number of entities returned
+     */
+    count: number;
+    /**
+     * List of entities
+     */
+    entities: Array<EntityResponse>;
+    /**
+     * Whether there are more entities available
+     */
+    has_more: boolean;
+    /**
+     * Limit used for this request
+     */
+    limit: number;
+    /**
+     * Continuation token for next page (S3, etc.)
+     */
+    next_token?: string | null;
+    /**
+     * Total number of entities (if available)
+     */
+    total?: number | null;
 };
 
 export type PaginatedErrorEventsResponse = {
@@ -2298,6 +4207,69 @@ export type PortMapping = {
 };
 
 /**
+ * Union type for preset configurations
+ * Use the appropriate configuration type based on your preset
+ */
+export type PresetConfigSchema = DockerfilePresetConfig | NixpacksPresetConfig | StaticPresetConfig;
+
+/**
+ * Detected preset information
+ */
+export type PresetInfo = {
+    /**
+     * Default exposed port for this preset
+     */
+    exposed_port?: number | null;
+    /**
+     * Icon URL for this preset
+     */
+    icon_url?: string | null;
+    /**
+     * Path where preset was detected (empty for root)
+     */
+    path: string;
+    /**
+     * Preset slug (e.g., "nextjs", "fastapi")
+     */
+    preset: string;
+    /**
+     * Human-readable preset label
+     */
+    preset_label: string;
+    /**
+     * Project type (e.g., "frontend", "backend", "fullstack")
+     */
+    project_type: string;
+};
+
+export type PresetResponse = {
+    /**
+     * Default port the application listens on (None for static sites)
+     */
+    default_port?: number | null;
+    /**
+     * Description of what this preset does
+     */
+    description: string;
+    /**
+     * Icon URL for the preset
+     */
+    icon_url: string;
+    /**
+     * Display name/label for the preset
+     */
+    label: string;
+    /**
+     * Project type (server or static)
+     */
+    project_type: string;
+    /**
+     * Unique identifier slug for the preset
+     */
+    slug: string;
+};
+
+/**
  * Representation of a Problem error to return to the client.
  * Follows RFC 7807 - Problem Details for HTTP APIs
  */
@@ -2361,10 +4333,28 @@ export type ProjectDsnResponse = {
     public_key: string;
 };
 
+export type ProjectInfo = {
+    created_at: string;
+    id: number;
+    slug: string;
+};
+
 export type ProjectPresetResponse = {
+    /**
+     * Default exposed port for this preset (e.g., 3000 for Next.js, 8000 for FastAPI)
+     */
+    exposedPort?: number | null;
+    /**
+     * Icon URL for the preset
+     */
+    iconUrl?: string | null;
     path: string;
     preset: string;
-    preset_label: string;
+    presetLabel: string;
+    /**
+     * Project type category (e.g., "frontend", "backend", "fullstack")
+     */
+    projectType: string;
 };
 
 export type ProjectQuery = {
@@ -2373,19 +4363,25 @@ export type ProjectQuery = {
 };
 
 export type ProjectResponse = {
-    automatic_deploy: boolean;
-    cpu_limit?: number | null;
-    cpu_request?: number | null;
+    /**
+     * Attack mode - when enabled, requires CAPTCHA verification for all project environments
+     */
+    attack_mode: boolean;
     created_at: number;
+    /**
+     * Deployment configuration (resources, autoscaling, features)
+     */
+    deployment_config: DeploymentConfig;
     directory: string;
+    /**
+     * Enable automatic preview environment creation for each branch
+     */
+    enable_preview_environments: boolean;
     git_provider_connection_id?: number | null;
     id: number;
     last_deployment?: number | null;
     main_branch: string;
-    memory_limit?: number | null;
-    memory_request?: number | null;
     name: string;
-    performance_metrics_enabled: boolean;
     preset?: string | null;
     repo_name?: string | null;
     repo_owner?: string | null;
@@ -2395,7 +4391,7 @@ export type ProjectResponse = {
 
 export type ProjectServiceInfo = {
     id: number;
-    project_id: number;
+    project: ProjectInfo;
     service: ExternalServiceInfo;
 };
 
@@ -2539,6 +4535,14 @@ export type ProviderDeletionCheckResponse = {
     projects_in_use: Array<ProjectUsageInfoResponse>;
 };
 
+export type ProviderMetadata = {
+    color: string;
+    description: string;
+    display_name: string;
+    icon_url: string;
+    service_type: ServiceTypeRoute;
+};
+
 export type ProviderResponse = {
     auth_method: string;
     base_url?: string | null;
@@ -2590,10 +4594,12 @@ export type ProxyLogResponse = {
     response_size_bytes?: number | null;
     response_time_ms?: number | null;
     routing_status: string;
+    session_id?: number | null;
     status_code: number;
     timestamp: string;
     upstream_host?: string | null;
     user_agent?: string | null;
+    visitor_id?: number | null;
 };
 
 /**
@@ -2605,6 +4611,176 @@ export type ProxyLogsPaginatedResponse = {
     page_size: number;
     total: number;
     total_pages: number;
+};
+
+/**
+ * Proxy configuration for email validation
+ */
+export type ProxyRequest = {
+    /**
+     * Proxy host
+     */
+    host: string;
+    /**
+     * Optional proxy password
+     */
+    password?: string | null;
+    /**
+     * Proxy port
+     */
+    port: number;
+    /**
+     * Optional proxy username
+     */
+    username?: string | null;
+};
+
+/**
+ * Response for preset detection
+ */
+export type PublicPresetResponse = {
+    /**
+     * Branch name where presets were detected
+     */
+    branch: string;
+    /**
+     * List of detected presets
+     */
+    presets: Array<PresetInfo>;
+};
+
+/**
+ * Public repository information
+ */
+export type PublicRepositoryInfo = {
+    /**
+     * Default branch name
+     */
+    default_branch: string;
+    /**
+     * Repository description
+     */
+    description?: string | null;
+    /**
+     * Fork count
+     */
+    forks: number;
+    /**
+     * Full repository name (owner/repo)
+     */
+    full_name: string;
+    /**
+     * Primary programming language
+     */
+    language?: string | null;
+    /**
+     * Repository name
+     */
+    name: string;
+    /**
+     * Repository owner
+     */
+    owner: string;
+    /**
+     * Star count
+     */
+    stars: number;
+};
+
+/**
+ * Request to push an external image
+ */
+export type PushImageRequest = {
+    image_ref: string;
+    metadata?: unknown;
+};
+
+export type QueryDataRequest = {
+    /**
+     * JSON filters (backend-specific format)
+     */
+    filters?: unknown;
+    /**
+     * Maximum number of rows to return
+     */
+    limit?: number;
+    /**
+     * Number of rows to skip
+     */
+    offset?: number;
+    /**
+     * Sort by field name
+     */
+    sort_by?: string | null;
+    /**
+     * Sort order (asc/desc)
+     */
+    sort_order?: string | null;
+};
+
+export type QueryDataResponse = {
+    /**
+     * Query execution time in milliseconds
+     */
+    execution_time_ms: number;
+    /**
+     * Field definitions
+     */
+    fields: Array<FieldResponse>;
+    /**
+     * Number of rows returned in this response
+     */
+    returned_count: number;
+    /**
+     * Data rows (array of JSON objects)
+     */
+    rows: Array<unknown>;
+    /**
+     * Total number of rows matching the query (before limit/offset)
+     */
+    total_count: number;
+};
+
+/**
+ * Rate limiting configuration (subset of global RateLimitSettings)
+ */
+export type RateLimitConfig = {
+    /**
+     * Blacklist specific IPs for this project/environment
+     */
+    blacklistIps?: Array<string>;
+    /**
+     * Override rate limit per hour
+     */
+    maxRequestsPerHour?: number | null;
+    /**
+     * Override rate limit per minute
+     */
+    maxRequestsPerMinute?: number | null;
+    /**
+     * Whitelist specific IPs for this project/environment
+     */
+    whitelistIps?: Array<string>;
+};
+
+export type RateLimitSettings = {
+    blacklist_ips?: Array<string>;
+    enabled?: boolean;
+    max_requests_per_hour?: number;
+    max_requests_per_minute?: number;
+    whitelist_ips?: Array<string>;
+};
+
+/**
+ * Email reachability status
+ */
+export type ReachabilityStatus = 'safe' | 'risky' | 'invalid' | 'unknown';
+
+/**
+ * Record list response
+ */
+export type RecordListResponse = {
+    records: Array<DnsRecord>;
 };
 
 export type ReferrerCount = {
@@ -2650,12 +4826,15 @@ export type RepositoryPresetResponse = {
     calculated_at: string;
     name: string;
     owner: string;
-    projects: Array<ProjectPresetResponse>;
+    presets: Array<ProjectPresetResponse>;
     repository_id: number;
-    root_preset?: string | null;
 };
 
 export type RepositoryResponse = {
+    /**
+     * HTTPS clone URL (e.g., https://github.com/owner/repo.git)
+     */
+    clone_url?: string | null;
     created_at: string;
     default_branch: string;
     description?: string | null;
@@ -2664,9 +4843,13 @@ export type RepositoryResponse = {
     language?: string | null;
     name: string;
     owner: string;
-    preset?: string | null;
+    preset?: Array<ProjectPresetResponse> | null;
     private: boolean;
     pushed_at: string;
+    /**
+     * SSH clone URL (e.g., git@github.com:owner/repo.git)
+     */
+    ssh_url?: string | null;
     updated_at: string;
 };
 
@@ -2674,95 +4857,6 @@ export type RepositorySyncResponse = {
     repositories: Array<RepositoryResponse>;
     synced_at: string;
     total_count: number;
-};
-
-/**
- * Response model for request logs - includes all fields from request_logs entity
- */
-export type RequestLogResponse = {
-    branch?: string | null;
-    browser?: string | null;
-    browser_version?: string | null;
-    commit?: string | null;
-    crawler_name?: string | null;
-    date: string;
-    deployment_id: number;
-    elapsed_time?: number | null;
-    environment_id: number;
-    finished_at: string;
-    headers?: string | null;
-    host: string;
-    id: number;
-    ip_address?: string | null;
-    ip_address_id?: number | null;
-    is_crawler: boolean;
-    is_entry_page: boolean;
-    is_mobile: boolean;
-    is_static_file?: boolean | null;
-    level: string;
-    message: string;
-    method: string;
-    operating_system?: string | null;
-    project_id: number;
-    referrer?: string | null;
-    request_headers?: string | null;
-    request_id: string;
-    request_path: string;
-    session_id?: number | null;
-    started_at: string;
-    status_code: number;
-    user_agent: string;
-    visitor_id?: number | null;
-};
-
-export type RequestLogsQuery = {
-    /**
-     * Deployment ID (optional)
-     */
-    deployment_id?: number | null;
-    /**
-     * End date filter (milliseconds since epoch)
-     */
-    end_date?: number | null;
-    /**
-     * Environment ID (optional)
-     */
-    environment_id?: number | null;
-    /**
-     * Page size/limit (default: 20, max: 100)
-     */
-    limit?: number | null;
-    /**
-     * HTTP method filter (optional, e.g., GET, POST, PUT, DELETE)
-     */
-    method?: string | null;
-    /**
-     * Offset for pagination (auto-calculated from page if not provided)
-     */
-    offset?: number | null;
-    /**
-     * Page number (default: 1)
-     */
-    page?: number | null;
-    /**
-     * Project ID (optional - if not provided, returns all system logs)
-     */
-    project_id?: number | null;
-    /**
-     * Start date filter (milliseconds since epoch)
-     */
-    start_date?: number | null;
-    /**
-     * HTTP status code filter (optional)
-     */
-    status_code?: number | null;
-};
-
-export type RequestLogsResponse = {
-    logs: Array<RequestLogResponse>;
-    page: number;
-    page_size: number;
-    total: number;
 };
 
 export type ResetPasswordRequest = {
@@ -2793,6 +4887,16 @@ export type ResourceLimits = {
 };
 
 /**
+ * Container resource limits
+ */
+export type ResourceLimitsResponse = {
+    cpu_limit?: number | null;
+    cpu_request?: number | null;
+    memory_limit?: number | null;
+    memory_request?: number | null;
+};
+
+/**
  * Information about a role
  */
 export type RoleInfo = {
@@ -2817,6 +4921,10 @@ export type RouteResponse = {
     host: string;
     id: number;
     port: number;
+    /**
+     * Route type: "http" or "tls"
+     */
+    route_type: string;
     updated_at: number;
 };
 
@@ -2849,6 +4957,17 @@ export type RunBackupRequest = {
     backup_type: string;
 };
 
+export type RunExternalServiceBackupRequest = {
+    /**
+     * Type of backup to perform (e.g., "full", "incremental")
+     */
+    backup_type?: string | null;
+    /**
+     * ID of the S3 source to store the backup
+     */
+    s3_source_id: number;
+};
+
 /**
  * Response type for S3 source
  */
@@ -2865,10 +4984,167 @@ export type S3SourceResponse = {
     updated_at: number;
 };
 
+export type ScalewayCredentialsRequest = {
+    api_key: string;
+    project_id: string;
+};
+
+export type ScanResponse = {
+    branch?: string | null;
+    commit_hash?: string | null;
+    completed_at?: string | null;
+    created_at: string;
+    critical_count: number;
+    deployment_id?: number | null;
+    environment_id?: number | null;
+    error_message?: string | null;
+    high_count: number;
+    id: number;
+    low_count: number;
+    medium_count: number;
+    project_id: number;
+    scanner_type: string;
+    scanner_version?: string | null;
+    started_at: string;
+    status: string;
+    total_count: number;
+    unknown_count: number;
+    updated_at: string;
+};
+
 export type ScreenshotSettings = {
     enabled?: boolean;
     provider?: string;
     url?: string;
+};
+
+/**
+ * Security configuration for projects and environments
+ *
+ * This configuration can be set at three levels:
+ * 1. Global (in settings table) - applies to all projects
+ * 2. Project level - overrides global settings for specific project
+ * 3. Environment level - overrides project settings for specific environment
+ *
+ * The inheritance chain: Environment > Project > Global
+ */
+export type SecurityConfig = {
+    /**
+     * Attack mode configuration (future: "off", "challenge", "block")
+     * Placeholder for DDoS protection, bot detection, etc.
+     */
+    attackMode?: string | null;
+    challengeConfig?: null | ChallengeConfig;
+    /**
+     * Enable/disable security features at this level
+     * If None, inherits from parent level
+     */
+    enabled?: boolean | null;
+    geoRestrictions?: null | GeoRestrictionsConfig;
+    headers?: null | SecurityHeadersConfig;
+    rateLimiting?: null | RateLimitConfig;
+};
+
+/**
+ * Security headers configuration (subset of global SecurityHeadersSettings)
+ */
+export type SecurityHeadersConfig = {
+    /**
+     * Custom CSP (only used if preset is "custom")
+     */
+    contentSecurityPolicy?: string | null;
+    /**
+     * Use a preset: "strict", "moderate", "permissive", "disabled", "custom"
+     */
+    preset?: string | null;
+    /**
+     * Referrer-Policy override
+     */
+    referrerPolicy?: string | null;
+    /**
+     * HSTS override
+     */
+    strictTransportSecurity?: string | null;
+    /**
+     * X-Frame-Options override
+     */
+    xFrameOptions?: string | null;
+};
+
+export type SecurityHeadersSettings = {
+    content_security_policy?: string | null;
+    enabled?: boolean;
+    permissions_policy?: string | null;
+    preset?: string;
+    referrer_policy?: string;
+    strict_transport_security?: string;
+    x_content_type_options?: string;
+    x_frame_options?: string;
+    x_xss_protection?: string;
+};
+
+export type SendEmailRequestBody = {
+    /**
+     * BCC recipients
+     */
+    bcc?: Array<string> | null;
+    /**
+     * CC recipients
+     */
+    cc?: Array<string> | null;
+    /**
+     * Sender email address (domain will be auto-extracted for lookup)
+     */
+    from: string;
+    /**
+     * Sender display name
+     */
+    from_name?: string | null;
+    /**
+     * Custom headers
+     */
+    headers?: {
+        [key: string]: string;
+    } | null;
+    /**
+     * HTML body content
+     */
+    html?: string | null;
+    /**
+     * Reply-to address
+     */
+    reply_to?: string | null;
+    /**
+     * Email subject
+     */
+    subject: string;
+    /**
+     * Tags for categorization
+     */
+    tags?: Array<string> | null;
+    /**
+     * Plain text body content
+     */
+    text?: string | null;
+    /**
+     * Recipient email addresses
+     */
+    to: Array<string>;
+};
+
+export type SendEmailResponseBody = {
+    /**
+     * Email ID
+     */
+    id: string;
+    /**
+     * Provider message ID
+     */
+    provider_message_id?: string | null;
+    /**
+     * Email status
+     */
+    status: string;
 };
 
 export type SentryEventRequest = {
@@ -2909,6 +5185,7 @@ export type ServiceAccessInfo = {
 };
 
 export type ServiceParameter = {
+    choices?: Array<string> | null;
     default_value?: string | null;
     description: string;
     encrypted: boolean;
@@ -2922,7 +5199,12 @@ export type ServiceTypeInfo = {
     service_type: ServiceTypeRoute;
 };
 
-export type ServiceTypeRoute = 'postgres' | 'redis' | 's3';
+export type ServiceTypeRoute = 'mongodb' | 'postgres' | 'redis' | 's3' | 'kv' | 'blob';
+
+export type SesCredentialsRequest = {
+    access_key_id: string;
+    secret_access_key: string;
+};
 
 export type SessionDetails = {
     duration_seconds: number;
@@ -2968,8 +5250,10 @@ export type SessionEventsQuery = {
 
 export type SessionEventsResponse = {
     events: Array<SessionEvent>;
-    session_id: string;
-    total_events: number;
+    limit: number;
+    offset: number;
+    session_id: number;
+    total_count: number;
 };
 
 export type SessionLogsQuery = {
@@ -2980,6 +5264,7 @@ export type SessionLogsQuery = {
     project_id: number;
     sort_order?: string | null;
     start_date?: string | null;
+    visitor_id?: number | null;
 };
 
 export type SessionLogsResponse = {
@@ -3092,10 +5377,126 @@ export type SessionSummary = {
 };
 
 /**
+ * Request to set a value
+ */
+export type SetRequest = {
+    /**
+     * Expire in seconds
+     */
+    ex?: number | null;
+    /**
+     * The key to set
+     */
+    key: string;
+    /**
+     * Only set if key does not exist
+     */
+    nx?: boolean;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
+    /**
+     * Expire in milliseconds
+     */
+    px?: number | null;
+    /**
+     * The value to store (can be any JSON value)
+     */
+    value: unknown;
+    /**
+     * Only set if key exists
+     */
+    xx?: boolean;
+};
+
+/**
+ * Response for set operation
+ */
+export type SetResponse = {
+    /**
+     * Always "OK" on success
+     */
+    result: string;
+};
+
+/**
  * Response for successful settings update
  */
 export type SettingsUpdateResponse = {
     message: string;
+};
+
+/**
+ * Request to setup DNS challenge records using a configured DNS provider
+ */
+export type SetupDnsChallengeRequest = {
+    /**
+     * The ID of the DNS provider to use for creating the TXT records
+     */
+    dns_provider_id: number;
+};
+
+/**
+ * Response from DNS challenge setup operation
+ */
+export type SetupDnsChallengeResponse = {
+    /**
+     * Human-readable summary message
+     */
+    message: string;
+    /**
+     * Number of TXT records that were successfully created
+     */
+    records_created: number;
+    /**
+     * Results for each individual TXT record
+     */
+    results: Array<DnsChallengeRecordResult>;
+    /**
+     * Overall success status (true if all records were created)
+     */
+    success: boolean;
+    /**
+     * Total number of TXT records required for the challenge
+     */
+    total_records: number;
+};
+
+/**
+ * Request to setup DNS records using a configured DNS provider
+ */
+export type SetupDnsRequest = {
+    /**
+     * The ID of the DNS provider to use for creating records
+     */
+    dns_provider_id: number;
+};
+
+/**
+ * Response from DNS setup operation
+ */
+export type SetupDnsResponse = {
+    /**
+     * Human-readable summary message
+     */
+    message: string;
+    /**
+     * Number of records that were successfully created
+     */
+    records_created: number;
+    /**
+     * Results for each individual record
+     */
+    results: Array<DnsRecordSetupResult>;
+    /**
+     * Overall success status
+     */
+    success: boolean;
+    /**
+     * Total number of records attempted
+     */
+    total_records: number;
 };
 
 export type SlackConfig = {
@@ -3183,6 +5584,36 @@ export type SmartFilter = {
         path: string;
         value: string;
     };
+};
+
+/**
+ * SMTP validation result
+ */
+export type SmtpResult = {
+    /**
+     * Whether we could connect to the SMTP server
+     */
+    can_connect_smtp: boolean;
+    /**
+     * Error message if SMTP check failed
+     */
+    error?: string | null;
+    /**
+     * Whether the mailbox appears to have a full inbox
+     */
+    has_full_inbox: boolean;
+    /**
+     * Whether this is a catch-all domain
+     */
+    is_catch_all: boolean;
+    /**
+     * Whether the email is deliverable
+     */
+    is_deliverable: boolean;
+    /**
+     * Whether the mailbox is disabled
+     */
+    is_disabled: boolean;
 };
 
 /**
@@ -3295,6 +5726,48 @@ export type SpeedMetricsPayload = {
     viewportWidth?: number | null;
 };
 
+/**
+ * Configuration for static site presets (Vite, Next.js, Docusaurus, etc.)
+ * These presets build static sites that are served via a web server
+ */
+export type StaticPresetConfig = {
+    /**
+     * Custom build command (overrides preset default)
+     */
+    buildCommand?: string | null;
+    /**
+     * Custom build context path (relative to repository root)
+     * Useful for monorepo setups where the app is in a subdirectory
+     */
+    buildContext?: string | null;
+    /**
+     * Custom install command (overrides auto-detected package manager)
+     */
+    installCommand?: string | null;
+    /**
+     * Custom output directory (overrides preset default)
+     * Common values: "dist", "build", ".next", "out"
+     */
+    outputDir?: string | null;
+};
+
+/**
+ * Filters for statistics queries
+ */
+export type StatsFilters = {
+    client_ip?: string | null;
+    deployment_id?: number | null;
+    device_type?: string | null;
+    environment_id?: number | null;
+    host?: string | null;
+    is_bot?: boolean | null;
+    method?: string | null;
+    project_id?: number | null;
+    request_source?: string | null;
+    routing_status?: string | null;
+    status_code?: number | null;
+};
+
 export type StatusBucket = {
     avg_response_time_ms?: number | null;
     bucket_start: string;
@@ -3360,6 +5833,28 @@ export type SyncedRepositoryListQuery = {
     sort?: string | null;
 };
 
+/**
+ * Syntax validation result
+ */
+export type SyntaxResult = {
+    /**
+     * The domain part of the email
+     */
+    domain?: string | null;
+    /**
+     * Whether the email syntax is valid
+     */
+    is_valid_syntax: boolean;
+    /**
+     * Suggested email correction if available
+     */
+    suggestion?: string | null;
+    /**
+     * The username part of the email
+     */
+    username?: string | null;
+};
+
 export type TagInfo = {
     commit_sha: string;
     name: string;
@@ -3369,21 +5864,119 @@ export type TagListResponse = {
     tags: Array<TagInfo>;
 };
 
+/**
+ * Request body for testing an email provider
+ */
+export type TestEmailRequest = {
+    /**
+     * Sender email address (must be verified with the provider)
+     */
+    from: string;
+    /**
+     * Sender display name
+     */
+    from_name?: string | null;
+};
+
+/**
+ * Response for test email endpoint
+ */
+export type TestEmailResponse = {
+    /**
+     * Error message if the test failed
+     */
+    error?: string | null;
+    /**
+     * Provider message ID if successful
+     */
+    provider_message_id?: string | null;
+    /**
+     * The email address the test was sent to
+     */
+    sent_to: string;
+    /**
+     * Whether the test email was sent successfully
+     */
+    success: boolean;
+};
+
 export type TestProviderResponse = {
     message?: string | null;
     success: boolean;
 };
 
+/**
+ * Time bucket statistics response
+ */
+export type TimeBucketStats = {
+    /**
+     * Average response time in milliseconds
+     */
+    avg_response_time_ms: number;
+    /**
+     * Bucket timestamp in RFC3339 format
+     */
+    bucket: string;
+    /**
+     * Number of errors (status >= 400)
+     */
+    error_count: number;
+    /**
+     * Total number of requests in this bucket
+     */
+    request_count: number;
+    /**
+     * Total request bytes
+     */
+    total_request_bytes: number;
+    /**
+     * Total response bytes
+     */
+    total_response_bytes: number;
+};
+
+/**
+ * Response for time bucket stats
+ */
+export type TimeBucketStatsResponse = {
+    bucket_interval: string;
+    end_time: string;
+    start_time: string;
+    stats: Array<TimeBucketStats>;
+};
+
 export type TlsMode = 'None' | 'Starttls' | 'Tls';
+
+/**
+ * Today's stats response
+ */
+export type TodayStatsResponse = {
+    /**
+     * Date for which stats are returned
+     */
+    date: string;
+    /**
+     * Total requests today
+     */
+    total_requests: number;
+};
 
 export type TokenRenewalRequest = {
     refresh_token: string;
 };
 
+export type TriggerDigestResponse = {
+    message: string;
+    success: boolean;
+};
+
 export type TriggerPipelinePayload = {
     branch?: string | null;
     commit?: string | null;
-    environment_id: number;
+    /**
+     * Optional environment ID - if not provided, will use the project's preview environment
+     */
+    environment_id?: number | null;
     tag?: string | null;
 };
 
@@ -3394,6 +5987,43 @@ export type TriggerPipelineResponse = {
     message: string;
     project_id: number;
     tag?: string | null;
+};
+
+export type TriggerScanRequest = {
+    /**
+     * Environment ID to scan (uses the current deployment for this environment)
+     */
+    environment_id: number;
+};
+
+export type TriggerScanResponse = {
+    message: string;
+    scan_id: number;
+    status: string;
+};
+
+/**
+ * Request to get TTL for a key
+ */
+export type TtlRequest = {
+    /**
+     * The key to check TTL for
+     */
+    key: string;
+    /**
+     * Project ID (required for API key/session auth, optional for deployment tokens)
+     */
+    project_id?: number | null;
+};
+
+/**
+ * Response for TTL operation
+ */
+export type TtlResponse = {
+    /**
+     * TTL in seconds, -1 if no expiration, -2 if key doesn't exist
+     */
+    ttl: number;
 };
 
 export type TxtRecord = {
@@ -3442,12 +6072,72 @@ export type UpdateAutomaticDeployRequest = {
     automatic_deploy: boolean;
 };
 
+/**
+ * Request to update Blob service configuration
+ */
+export type UpdateBlobRequest = {
+    /**
+     * Docker image to use (e.g., "minio/minio:RELEASE.2025-09-07T16-13-09Z")
+     */
+    docker_image?: string | null;
+};
+
+/**
+ * Response after updating Blob service
+ */
+export type UpdateBlobResponse = {
+    /**
+     * Human-readable message
+     */
+    message: string;
+    /**
+     * Current status
+     */
+    status: BlobStatusResponse;
+    /**
+     * Whether the operation succeeded
+     */
+    success: boolean;
+};
+
 export type UpdateCustomDomainRequest = {
     branch?: string | null;
     domain?: string | null;
     environment_id?: number | null;
     redirect_to?: string | null;
     status_code?: number | null;
+};
+
+export type UpdateDeploymentConfigRequest = {
+    automaticDeploy?: boolean | null;
+    cpuLimit?: number | null;
+    cpuRequest?: number | null;
+    exposedPort?: number | null;
+    memoryLimit?: number | null;
+    memoryRequest?: number | null;
+    performanceMetricsEnabled?: boolean | null;
+    replicas?: number | null;
+    security?: null | SecurityConfig;
+    sessionRecordingEnabled?: boolean | null;
+};
+
+/**
+ * Request to update a DNS provider
+ */
+export type UpdateDnsProviderRequest = {
+    credentials?: null | DnsProviderCredentials;
+    /**
+     * New description
+     */
+    description?: string | null;
+    /**
+     * Active status
+     */
+    is_active?: boolean | null;
+    /**
+     * New name
+     */
+    name?: string | null;
 };
 
 export type UpdateEmailProviderRequest = {
@@ -3457,12 +6147,35 @@ export type UpdateEmailProviderRequest = {
 };
 
 export type UpdateEnvironmentSettingsRequest = {
+    /**
+     * Enable/disable automatic deployments for this environment
+     */
+    automatic_deploy?: boolean | null;
     branch?: string | null;
     cpu_limit?: number | null;
     cpu_request?: number | null;
+    /**
+     * Port exposed by the container (overrides project-level port for this environment)
+     *
+     * Priority order for port resolution:
+     * 1. Image EXPOSE directive (auto-detected from built image)
+     * 2. This environment-level exposed_port (overrides project setting)
+     * 3. Project-level exposed_port (fallback)
+     * 4. Default: 3000
+     */
+    exposed_port?: number | null;
     memory_limit?: number | null;
     memory_request?: number | null;
+    /**
+     * Enable/disable performance metrics collection
+     */
+    performance_metrics_enabled?: boolean | null;
     replicas?: number | null;
+    security?: null | SecurityConfig;
+    /**
+     * Enable/disable session recording
+     */
+    session_recording_enabled?: boolean | null;
 };
 
 export type UpdateErrorGroupRequest = {
@@ -3471,8 +6184,13 @@ export type UpdateErrorGroupRequest = {
 };
 
 export type UpdateExternalServiceRequest = {
+    /**
+     * Docker image to use for the service (e.g., "postgres:17-alpine", "timescale/timescaledb-ha:pg17")
+     * When provided, the service will be recreated with the new image while preserving data
+     */
+    docker_image?: string | null;
     parameters: {
-        [key: string]: string;
+        [key: string]: unknown;
     };
 };
 
@@ -3490,12 +6208,66 @@ export type UpdateIncidentStatusRequest = {
     status: string;
 };
 
+/**
+ * Request to update an IP access control rule
+ */
+export type UpdateIpAccessControlRequest = {
+    /**
+     * Optional new action
+     */
+    action?: string | null;
+    /**
+     * Optional new IP address
+     */
+    ip_address?: string | null;
+    /**
+     * Optional new reason
+     */
+    reason?: string | null;
+};
+
+/**
+ * Request to update KV service configuration
+ */
+export type UpdateKvRequest = {
+    /**
+     * Docker image to use (e.g., "redis:8-alpine", "redis:8-alpine")
+     */
+    docker_image?: string | null;
+};
+
+/**
+ * Response after updating KV service
+ */
+export type UpdateKvResponse = {
+    /**
+     * Status message
+     */
+    message: string;
+    /**
+     * Current service status
+     */
+    status: KvStatusResponse;
+    /**
+     * Whether the operation succeeded
+     */
+    success: boolean;
+};
+
 export type UpdatePreferencesRequest = {
     preferences: NotificationPreferencesResponse;
 };
 
 export type UpdateProjectSettingsRequest = {
+    /**
+     * Enable/disable attack mode (CAPTCHA protection) for all project environments
+     */
+    attack_mode?: boolean | null;
     directory?: string | null;
+    /**
+     * Enable automatic preview environment creation for each branch
+     */
+    enable_preview_environments?: boolean | null;
     git_provider_connection_id?: number | null;
     main_branch?: string | null;
     preset?: string | null;
@@ -3514,6 +6286,11 @@ export type UpdateRouteRequest = {
     enabled: boolean;
     host: string;
     port: number;
+    /**
+     * Route type: "http" (default) matches on HTTP Host header,
+     * "tls" matches on TLS SNI hostname for TCP passthrough
+     */
+    route_type?: string | null;
 };
 
 export type UpdateS3SourceRequest = {
@@ -3600,6 +6377,33 @@ export type UpdateUserRequest = {
     name?: string | null;
 };
 
+export type UpdateWebhookRequestBody = {
+    /**
+     * Whether the webhook is enabled
+     */
+    enabled?: boolean | null;
+    /**
+     * Event types to subscribe to
+     */
+    events?: Array<string> | null;
+    /**
+     * Secret for HMAC signature verification
+     */
+    secret?: string | null;
+    /**
+     * Target URL for webhook delivery
+     */
+    url?: string | null;
+};
+
+export type UpgradeExternalServiceRequest = {
+    /**
+     * Docker image to upgrade to (e.g., "postgres:17-alpine")
+     * This will trigger pg_upgrade for PostgreSQL or equivalent upgrade procedures for other services
+     */
+    docker_image: string;
+};
+
 export type UptimeDataPoint = {
     error_message?: string | null;
     response_time_ms?: number | null;
@@ -3619,6 +6423,47 @@ export type UserResponse = {
     mfa_enabled: boolean;
     name: string;
     username: string;
+};
+
+/**
+ * Request body for validating an email address
+ */
+export type ValidateEmailRequest = {
+    /**
+     * Email address to validate
+     */
+    email: string;
+    proxy?: null | ProxyRequest;
+};
+
+/**
+ * Complete email validation response
+ */
+export type ValidateEmailResponse = {
+    /**
+     * The email address that was validated
+     */
+    email: string;
+    /**
+     * Overall reachability status: safe, risky, invalid, or unknown
+     */
+    is_reachable: ReachabilityStatus;
+    /**
+     * Miscellaneous validation result
+     */
+    misc: MiscResult;
+    /**
+     * MX record validation result
+     */
+    mx: MxResult;
+    /**
+     * SMTP validation result
+     */
+    smtp: SmtpResult;
+    /**
+     * Syntax validation result
+     */
+    syntax: SyntaxResult;
 };
 
 /**
@@ -3750,37 +6595,47 @@ export type ViewsOverTimeQuery = {
 };
 
 export type VisitorDetails = {
-    bounce_rate: number;
     city?: string | null;
     country?: string | null;
+    country_code?: string | null;
     crawler_name?: string | null;
     custom_data?: unknown;
-    engagement_rate: number;
+    environment_id: number;
     first_seen: string;
     id: number;
+    ip_address?: string | null;
+    ip_address_id?: number | null;
     is_crawler: boolean;
+    is_eu?: boolean | null;
     last_seen: string;
-    location?: string | null;
-    total_events: number;
-    total_page_views: number;
-    total_sessions: number;
-    total_time_seconds: number;
+    latitude?: number | null;
+    longitude?: number | null;
+    project_id: number;
+    region?: string | null;
+    timezone?: string | null;
     user_agent?: string | null;
     visitor_id: string;
 };
 
 export type VisitorInfo = {
-    browser?: string | null;
+    city?: string | null;
+    country?: string | null;
+    country_code?: string | null;
     crawler_name?: string | null;
+    custom_data?: unknown;
+    environment_id: number;
     first_seen: string;
     id: number;
+    ip_address?: string | null;
+    ip_address_id?: number | null;
     is_crawler: boolean;
+    is_eu?: boolean | null;
     last_seen: string;
-    location?: string | null;
-    page_views: number;
-    sessions_count: number;
-    total_time_seconds: number;
-    unique_pages: number;
+    latitude?: number | null;
+    longitude?: number | null;
+    project_id: number;
+    region?: string | null;
+    timezone?: string | null;
     user_agent?: string | null;
     visitor_id: string;
 };
@@ -3827,7 +6682,6 @@ export type VisitorStats = {
     total_events: number;
     total_page_views: number;
     total_sessions: number;
-    total_time_seconds: number;
     visitor_id: number;
 };
 
@@ -3856,6 +6710,11 @@ export type VisitorWithGeolocation = {
 export type VisitorsListQuery = {
     end_date: string;
     environment_id?: number | null;
+    /**
+     * Filter to only include visitors with recorded activity (events/sessions).
+     * When true, excludes "ghost" visitors that have no events.
+     */
+    has_activity_only?: boolean | null;
     include_crawlers?: boolean | null;
     limit?: number | null;
     offset?: number | null;
@@ -3895,6 +6754,55 @@ export type VolumeMount = {
  * Volume type
  */
 export type VolumeType = 'bind' | 'volume' | 'tmpfs';
+
+export type VulnerabilityResponse = {
+    class?: string | null;
+    created_at: string;
+    cvss_score?: number | null;
+    description?: string | null;
+    fixed_version?: string | null;
+    id: number;
+    installed_version: string;
+    last_modified_date?: string | null;
+    package_name: string;
+    primary_url?: string | null;
+    published_date?: string | null;
+    references?: unknown;
+    scan_id: number;
+    severity: string;
+    target?: string | null;
+    title: string;
+    type?: string | null;
+    vulnerability_id: string;
+};
+
+export type WebhookDeliveryResponse = {
+    attempt_number: number;
+    created_at: string;
+    delivered_at?: string | null;
+    error_message?: string | null;
+    event_id: string;
+    event_type: string;
+    id: number;
+    /**
+     * JSON payload that was sent to the webhook endpoint
+     */
+    payload: string;
+    status_code?: number | null;
+    success: boolean;
+    webhook_id: number;
+};
+
+export type WebhookResponse = {
+    created_at: string;
+    enabled: boolean;
+    events: Array<string>;
+    has_secret: boolean;
+    id: number;
+    project_id: number;
+    updated_at: string;
+    url: string;
+};
 
 /**
  * Brief descriptor for discovered workloads (used in listing)
@@ -3946,6 +6854,13 @@ export type WorkloadStatus = 'running' | 'paused' | 'stopped' | 'exited' | 'fail
  * Workload type
  */
 export type WorkloadType = 'container' | 'function' | 'static-site' | 'server-side-app' | 'worker' | 'database' | 'message-queue' | 'cache' | 'other';
+
+/**
+ * Zone list response
+ */
+export type ZoneListResponse = {
+    zones: Array<DnsZone>;
+};
 
 /**
  * Response type for S3 source
@@ -4277,6 +7192,46 @@ export type GetGeneralStatsResponses = {
 
 export type GetGeneralStatsResponse = GetGeneralStatsResponses[keyof GetGeneralStatsResponses];
 
+export type GetLiveVisitorsListData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID (optional)
+         */
+        environment_id?: number;
+        /**
+         * Time window in minutes for live visitors (default: 5)
+         */
+        window_minutes?: number;
+    };
+    url: '/analytics/live-visitors';
+};
+
+export type GetLiveVisitorsListErrors = {
+    /**
+     * Invalid parameters or project not found
+     */
+    400: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetLiveVisitorsListResponses = {
+    /**
+     * Successfully retrieved live visitors list
+     */
+    200: LiveVisitorsListResponse;
+};
+
+export type GetLiveVisitorsListResponse = GetLiveVisitorsListResponses[keyof GetLiveVisitorsListResponses];
+
 export type GetPageHourlySessionsData = {
     body?: never;
     path?: never;
@@ -4328,6 +7283,58 @@ export type GetPageHourlySessionsResponses = {
 };
 
 export type GetPageHourlySessionsResponse = GetPageHourlySessionsResponses[keyof GetPageHourlySessionsResponses];
+
+export type GetPagePathDetailData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * The page path to get details for (URL-encoded)
+         */
+        page_path: string;
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID (optional)
+         */
+        environment_id?: number;
+        /**
+         * Start date in ISO 8601 format
+         */
+        start_date: string;
+        /**
+         * End date in ISO 8601 format
+         */
+        end_date: string;
+        /**
+         * Bucket interval for time series: 'hour', 'day', 'week', 'month' (default: auto based on date range)
+         */
+        bucket_interval?: string;
+    };
+    url: '/analytics/page-path-detail';
+};
+
+export type GetPagePathDetailErrors = {
+    /**
+     * Invalid parameters or project not found
+     */
+    400: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPagePathDetailResponses = {
+    /**
+     * Successfully retrieved page path detail analytics
+     */
+    200: PagePathDetailResponse;
+};
+
+export type GetPagePathDetailResponse = GetPagePathDetailResponses[keyof GetPagePathDetailResponses];
 
 export type GetPagePathsData = {
     body?: never;
@@ -4576,6 +7583,10 @@ export type GetVisitorsData = {
          * Number of visitors to skip (default: 0)
          */
         offset?: number;
+        /**
+         * Filter to only include visitors with recorded activity (events/sessions). When true, excludes ghost visitors (default: true)
+         */
+        has_activity_only?: boolean;
     };
     url: '/analytics/visitors';
 };
@@ -4739,9 +7750,9 @@ export type EnrichVisitorData = {
     body: EnrichVisitorRequest;
     path: {
         /**
-         * Visitor numeric ID
+         * Visitor ID - can be numeric ID, GUID, or encrypted GUID (enc_xxx)
          */
-        visitor_id: number;
+        visitor_id: string;
     };
     query: {
         /**
@@ -5548,6 +8559,41 @@ export type VerifyMfaChallengeResponses = {
 
 export type VerifyMfaChallengeResponse = VerifyMfaChallengeResponses[keyof VerifyMfaChallengeResponses];
 
+export type RunExternalServiceBackupData = {
+    body: RunExternalServiceBackupRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/backups/external-services/{id}/run';
+};
+
+export type RunExternalServiceBackupErrors = {
+    /**
+     * Invalid request
+     */
+    400: ProblemDetails;
+    /**
+     * External service or S3 source not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RunExternalServiceBackupError = RunExternalServiceBackupErrors[keyof RunExternalServiceBackupErrors];
+
+export type RunExternalServiceBackupResponses = {
+    /**
+     * Backup started successfully
+     */
+    200: ExternalServiceBackupResponse;
+};
+
+export type RunExternalServiceBackupResponse = RunExternalServiceBackupResponses[keyof RunExternalServiceBackupResponses];
+
 export type ListS3SourcesData = {
     body?: never;
     path?: never;
@@ -6013,6 +9059,781 @@ export type GetBackupResponses = {
 
 export type GetBackupResponse = GetBackupResponses[keyof GetBackupResponses];
 
+export type BlobDeleteData = {
+    body: DeleteBlobRequest;
+    path?: never;
+    query?: never;
+    url: '/blob';
+};
+
+export type BlobDeleteErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type BlobDeleteError = BlobDeleteErrors[keyof BlobDeleteErrors];
+
+export type BlobDeleteResponses = {
+    /**
+     * Blobs deleted successfully
+     */
+    200: DeleteBlobResponse;
+};
+
+export type BlobDeleteResponse = BlobDeleteResponses[keyof BlobDeleteResponses];
+
+export type BlobListData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Maximum number of items to return
+         */
+        limit?: number;
+        /**
+         * Prefix to filter by
+         */
+        prefix?: string;
+        /**
+         * Continuation token for pagination
+         */
+        cursor?: string;
+    };
+    url: '/blob';
+};
+
+export type BlobListErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type BlobListError = BlobListErrors[keyof BlobListErrors];
+
+export type BlobListResponses = {
+    /**
+     * List of blobs
+     */
+    200: ListBlobsResponse;
+};
+
+export type BlobListResponse = BlobListResponses[keyof BlobListResponses];
+
+export type BlobPutData = {
+    /**
+     * Binary blob data
+     */
+    body: string;
+    path?: never;
+    query?: never;
+    url: '/blob';
+};
+
+export type BlobPutErrors = {
+    /**
+     * Invalid request
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type BlobPutError = BlobPutErrors[keyof BlobPutErrors];
+
+export type BlobPutResponses = {
+    /**
+     * Blob uploaded successfully
+     */
+    201: BlobResponse;
+};
+
+export type BlobPutResponse = BlobPutResponses[keyof BlobPutResponses];
+
+export type BlobCopyData = {
+    body: CopyBlobRequest;
+    path?: never;
+    query?: never;
+    url: '/blob/copy';
+};
+
+export type BlobCopyErrors = {
+    /**
+     * Invalid request
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Source blob not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type BlobCopyError = BlobCopyErrors[keyof BlobCopyErrors];
+
+export type BlobCopyResponses = {
+    /**
+     * Blob copied successfully
+     */
+    200: BlobResponse;
+};
+
+export type BlobCopyResponse = BlobCopyResponses[keyof BlobCopyResponses];
+
+export type BlobDisableData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/blob/disable';
+};
+
+export type BlobDisableErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type BlobDisableResponses = {
+    /**
+     * Blob service disabled
+     */
+    200: DisableBlobResponse;
+};
+
+export type BlobDisableResponse = BlobDisableResponses[keyof BlobDisableResponses];
+
+export type BlobEnableData = {
+    body: EnableBlobRequest;
+    path?: never;
+    query?: never;
+    url: '/blob/enable';
+};
+
+export type BlobEnableErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type BlobEnableResponses = {
+    /**
+     * Blob service enabled
+     */
+    200: EnableBlobResponse;
+};
+
+export type BlobEnableResponse = BlobEnableResponses[keyof BlobEnableResponses];
+
+export type BlobStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/blob/status';
+};
+
+export type BlobStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type BlobStatusResponses = {
+    /**
+     * Blob service status
+     */
+    200: BlobStatusResponse;
+};
+
+export type BlobStatusResponse2 = BlobStatusResponses[keyof BlobStatusResponses];
+
+export type BlobUpdateData = {
+    body: UpdateBlobRequest;
+    path?: never;
+    query?: never;
+    url: '/blob/update';
+};
+
+export type BlobUpdateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Blob service not enabled
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type BlobUpdateResponses = {
+    /**
+     * Blob service updated
+     */
+    200: UpdateBlobResponse;
+};
+
+export type BlobUpdateResponse = BlobUpdateResponses[keyof BlobUpdateResponses];
+
+export type BlobDownloadData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Blob path
+         */
+        path: string;
+    };
+    query?: never;
+    url: '/blob/{project_id}/{path}';
+};
+
+export type BlobDownloadErrors = {
+    /**
+     * Blob not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type BlobDownloadError = BlobDownloadErrors[keyof BlobDownloadErrors];
+
+export type BlobDownloadResponses = {
+    /**
+     * Blob content
+     */
+    200: unknown;
+};
+
+export type BlobHeadData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Blob path
+         */
+        path: string;
+    };
+    query?: never;
+    url: '/blob/{project_id}/{path}';
+};
+
+export type BlobHeadErrors = {
+    /**
+     * Blob not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type BlobHeadError = BlobHeadErrors[keyof BlobHeadErrors];
+
+export type BlobHeadResponses = {
+    /**
+     * Blob metadata in headers
+     */
+    200: unknown;
+};
+
+export type GetActivityGraphData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter by project ID (optional)
+         */
+        project_id?: number;
+        /**
+         * Filter by environment ID (optional)
+         */
+        environment_id?: number;
+        /**
+         * Number of days to include (default: 365)
+         */
+        days?: number;
+    };
+    url: '/deployments/activity-graph';
+};
+
+export type GetActivityGraphErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetActivityGraphResponses = {
+    /**
+     * Successfully retrieved activity graph
+     */
+    200: ActivityGraphResponse;
+};
+
+export type GetActivityGraphResponse = GetActivityGraphResponses[keyof GetActivityGraphResponses];
+
+export type GetScanByDeploymentData = {
+    body?: never;
+    path: {
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+    };
+    query?: never;
+    url: '/deployments/{deployment_id}/vulnerability-scan';
+};
+
+export type GetScanByDeploymentErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No scan found for deployment
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetScanByDeploymentError = GetScanByDeploymentErrors[keyof GetScanByDeploymentErrors];
+
+export type GetScanByDeploymentResponses = {
+    /**
+     * Scan for the specified deployment
+     */
+    200: ScanResponse;
+};
+
+export type GetScanByDeploymentResponse = GetScanByDeploymentResponses[keyof GetScanByDeploymentResponses];
+
+export type ListProvidersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/dns-providers';
+};
+
+export type ListProvidersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type ListProvidersResponses = {
+    /**
+     * List of DNS providers
+     */
+    200: Array<DnsProviderResponse>;
+};
+
+export type ListProvidersResponse = ListProvidersResponses[keyof ListProvidersResponses];
+
+export type CreateProviderData = {
+    body: CreateDnsProviderRequest;
+    path?: never;
+    query?: never;
+    url: '/dns-providers';
+};
+
+export type CreateProviderErrors = {
+    /**
+     * Invalid request or connection test failed
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type CreateProviderResponses = {
+    /**
+     * DNS provider created
+     */
+    201: DnsProviderResponse;
+};
+
+export type CreateProviderResponse = CreateProviderResponses[keyof CreateProviderResponses];
+
+export type DeleteProviderData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}';
+};
+
+export type DeleteProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type DeleteProviderResponses = {
+    /**
+     * DNS provider deleted
+     */
+    204: void;
+};
+
+export type DeleteProviderResponse = DeleteProviderResponses[keyof DeleteProviderResponses];
+
+export type GetProviderData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}';
+};
+
+export type GetProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type GetProviderResponses = {
+    /**
+     * DNS provider details
+     */
+    200: DnsProviderResponse;
+};
+
+export type GetProviderResponse = GetProviderResponses[keyof GetProviderResponses];
+
+export type UpdateProviderData = {
+    body: UpdateDnsProviderRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}';
+};
+
+export type UpdateProviderErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type UpdateProviderResponses = {
+    /**
+     * DNS provider updated
+     */
+    200: DnsProviderResponse;
+};
+
+export type UpdateProviderResponse = UpdateProviderResponses[keyof UpdateProviderResponses];
+
+export type ListManagedDomainsData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}/domains';
+};
+
+export type ListManagedDomainsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type ListManagedDomainsResponses = {
+    /**
+     * List of managed domains
+     */
+    200: Array<ManagedDomainResponse>;
+};
+
+export type ListManagedDomainsResponse = ListManagedDomainsResponses[keyof ListManagedDomainsResponses];
+
+export type AddManagedDomainData = {
+    body: AddManagedDomainApiRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}/domains';
+};
+
+export type AddManagedDomainErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type AddManagedDomainResponses = {
+    /**
+     * Managed domain added
+     */
+    201: ManagedDomainResponse;
+};
+
+export type AddManagedDomainResponse = AddManagedDomainResponses[keyof AddManagedDomainResponses];
+
+export type TestProviderConnectionData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}/test';
+};
+
+export type TestProviderConnectionErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type TestProviderConnectionResponses = {
+    /**
+     * Connection test result
+     */
+    200: ConnectionTestResult;
+};
+
+export type TestProviderConnectionResponse = TestProviderConnectionResponses[keyof TestProviderConnectionResponses];
+
+export type ListProviderZonesData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/dns-providers/{id}/zones';
+};
+
+export type ListProviderZonesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+};
+
+export type ListProviderZonesResponses = {
+    /**
+     * List of zones
+     */
+    200: ZoneListResponse;
+};
+
+export type ListProviderZonesResponse = ListProviderZonesResponses[keyof ListProviderZonesResponses];
+
+export type RemoveManagedDomainData = {
+    body?: never;
+    path: {
+        provider_id: number;
+        domain: string;
+    };
+    query?: never;
+    url: '/dns-providers/{provider_id}/domains/{domain}';
+};
+
+export type RemoveManagedDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type RemoveManagedDomainResponses = {
+    /**
+     * Managed domain removed
+     */
+    204: void;
+};
+
+export type RemoveManagedDomainResponse = RemoveManagedDomainResponses[keyof RemoveManagedDomainResponses];
+
+export type VerifyManagedDomainData = {
+    body?: never;
+    path: {
+        provider_id: number;
+        domain: string;
+    };
+    query?: never;
+    url: '/dns-providers/{provider_id}/domains/{domain}/verify';
+};
+
+export type VerifyManagedDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+};
+
+export type VerifyManagedDomainResponses = {
+    /**
+     * Domain verification result
+     */
+    200: ManagedDomainResponse;
+};
+
+export type VerifyManagedDomainResponse = VerifyManagedDomainResponses[keyof VerifyManagedDomainResponses];
+
 export type LookupDnsARecordsData = {
     body?: never;
     path?: never;
@@ -6281,6 +10102,50 @@ export type FinalizeOrderResponses = {
 
 export type FinalizeOrderResponse = FinalizeOrderResponses[keyof FinalizeOrderResponses];
 
+export type SetupDnsChallengeData = {
+    body: SetupDnsChallengeRequest;
+    path: {
+        /**
+         * Domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/domains/{domain_id}/setup-dns';
+};
+
+export type SetupDnsChallengeErrors = {
+    /**
+     * Bad request - DNS provider not configured or no challenge pending
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain or DNS provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetupDnsChallengeResponses = {
+    /**
+     * DNS records created successfully
+     */
+    200: SetupDnsChallengeResponse;
+};
+
+export type SetupDnsChallengeResponse2 = SetupDnsChallengeResponses[keyof SetupDnsChallengeResponses];
+
 export type DeleteDomainData = {
     body?: never;
     path: {
@@ -6529,6 +10394,690 @@ export type CheckDomainStatusResponses = {
 
 export type CheckDomainStatusResponse = CheckDomainStatusResponses[keyof CheckDomainStatusResponses];
 
+export type ListDomains2Data = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/email-domains';
+};
+
+export type ListDomains2Errors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDomains2Responses = {
+    /**
+     * List of email domains
+     */
+    200: Array<EmailDomainResponse>;
+};
+
+export type ListDomains2Response = ListDomains2Responses[keyof ListDomains2Responses];
+
+export type CreateDomain2Data = {
+    body: CreateEmailDomainRequest;
+    path?: never;
+    query?: never;
+    url: '/email-domains';
+};
+
+export type CreateDomain2Errors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateDomain2Responses = {
+    /**
+     * Domain created successfully
+     */
+    201: EmailDomainWithDnsResponse;
+};
+
+export type CreateDomain2Response = CreateDomain2Responses[keyof CreateDomain2Responses];
+
+export type GetDomainByNameData = {
+    body?: never;
+    path: {
+        /**
+         * Domain name (e.g., 'mail.example.com')
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/email-domains/by-domain/{domain}';
+};
+
+export type GetDomainByNameErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDomainByNameResponses = {
+    /**
+     * Email domain details with DNS records
+     */
+    200: EmailDomainWithDnsResponse;
+};
+
+export type GetDomainByNameResponse = GetDomainByNameResponses[keyof GetDomainByNameResponses];
+
+export type DeleteDomain2Data = {
+    body?: never;
+    path: {
+        /**
+         * Domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}';
+};
+
+export type DeleteDomain2Errors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteDomain2Responses = {
+    /**
+     * Domain deleted
+     */
+    204: void;
+};
+
+export type DeleteDomain2Response = DeleteDomain2Responses[keyof DeleteDomain2Responses];
+
+export type GetDomainData = {
+    body?: never;
+    path: {
+        /**
+         * Domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}';
+};
+
+export type GetDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDomainResponses = {
+    /**
+     * Email domain details with DNS records
+     */
+    200: EmailDomainWithDnsResponse;
+};
+
+export type GetDomainResponse = GetDomainResponses[keyof GetDomainResponses];
+
+export type GetDomainDnsRecordsData = {
+    body?: never;
+    path: {
+        /**
+         * Domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/dns-records';
+};
+
+export type GetDomainDnsRecordsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDomainDnsRecordsResponses = {
+    /**
+     * DNS records for the domain
+     */
+    200: Array<DnsRecordResponse>;
+};
+
+export type GetDomainDnsRecordsResponse = GetDomainDnsRecordsResponses[keyof GetDomainDnsRecordsResponses];
+
+export type SetupDnsData = {
+    body: SetupDnsRequest;
+    path: {
+        /**
+         * Email Domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/setup-dns';
+};
+
+export type SetupDnsErrors = {
+    /**
+     * Invalid request or DNS provider not configured
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetupDnsResponses = {
+    /**
+     * DNS records setup result
+     */
+    200: SetupDnsResponse;
+};
+
+export type SetupDnsResponse2 = SetupDnsResponses[keyof SetupDnsResponses];
+
+export type VerifyDomainData = {
+    body?: never;
+    path: {
+        /**
+         * Domain ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-domains/{id}/verify';
+};
+
+export type VerifyDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Domain not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type VerifyDomainResponses = {
+    /**
+     * Domain verification result with DNS records
+     */
+    200: EmailDomainWithDnsResponse;
+};
+
+export type VerifyDomainResponse = VerifyDomainResponses[keyof VerifyDomainResponses];
+
+export type ListProviders2Data = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/email-providers';
+};
+
+export type ListProviders2Errors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListProviders2Responses = {
+    /**
+     * List of email providers
+     */
+    200: Array<EmailProviderResponse>;
+};
+
+export type ListProviders2Response = ListProviders2Responses[keyof ListProviders2Responses];
+
+export type CreateProvider2Data = {
+    body: CreateEmailProviderRequest;
+    path?: never;
+    query?: never;
+    url: '/email-providers';
+};
+
+export type CreateProvider2Errors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateProvider2Responses = {
+    /**
+     * Provider created successfully
+     */
+    201: EmailProviderResponse;
+};
+
+export type CreateProvider2Response = CreateProvider2Responses[keyof CreateProvider2Responses];
+
+export type DeleteProvider2Data = {
+    body?: never;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-providers/{id}';
+};
+
+export type DeleteProvider2Errors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteProvider2Responses = {
+    /**
+     * Provider deleted
+     */
+    204: void;
+};
+
+export type DeleteProvider2Response = DeleteProvider2Responses[keyof DeleteProvider2Responses];
+
+export type GetProvider2Data = {
+    body?: never;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-providers/{id}';
+};
+
+export type GetProvider2Errors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetProvider2Responses = {
+    /**
+     * Email provider details
+     */
+    200: EmailProviderResponse;
+};
+
+export type GetProvider2Response = GetProvider2Responses[keyof GetProvider2Responses];
+
+export type TestProviderData = {
+    body: TestEmailRequest;
+    path: {
+        /**
+         * Provider ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/email-providers/{id}/test';
+};
+
+export type TestProviderErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type TestProviderResponses = {
+    /**
+     * Test email result
+     */
+    200: TestEmailResponse;
+};
+
+export type TestProviderResponse2 = TestProviderResponses[keyof TestProviderResponses];
+
+export type ListEmailsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        domain_id?: number | null;
+        project_id?: number | null;
+        status?: string | null;
+        from_address?: string | null;
+        page?: number | null;
+        page_size?: number | null;
+    };
+    url: '/emails';
+};
+
+export type ListEmailsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListEmailsResponses = {
+    /**
+     * List of emails
+     */
+    200: PaginatedEmailsResponse;
+};
+
+export type ListEmailsResponse = ListEmailsResponses[keyof ListEmailsResponses];
+
+export type SendEmailData = {
+    body: SendEmailRequestBody;
+    path?: never;
+    query?: never;
+    url: '/emails';
+};
+
+export type SendEmailErrors = {
+    /**
+     * Invalid request or domain not verified
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SendEmailResponses = {
+    /**
+     * Email sent successfully
+     */
+    201: SendEmailResponseBody;
+};
+
+export type SendEmailResponse = SendEmailResponses[keyof SendEmailResponses];
+
+export type GetEmailStatsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Optional domain ID to filter stats
+         */
+        domain_id?: number;
+    };
+    url: '/emails/stats';
+};
+
+export type GetEmailStatsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetEmailStatsResponses = {
+    /**
+     * Email statistics
+     */
+    200: EmailStatsResponse;
+};
+
+export type GetEmailStatsResponse = GetEmailStatsResponses[keyof GetEmailStatsResponses];
+
+export type ValidateEmailData = {
+    body: ValidateEmailRequest;
+    path?: never;
+    query?: never;
+    url: '/emails/validate';
+};
+
+export type ValidateEmailErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ValidateEmailResponses = {
+    /**
+     * Email validation result
+     */
+    200: ValidateEmailResponse;
+};
+
+export type ValidateEmailResponse2 = ValidateEmailResponses[keyof ValidateEmailResponses];
+
+export type GetEmailData = {
+    body?: never;
+    path: {
+        /**
+         * Email ID (UUID)
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/emails/{id}';
+};
+
+export type GetEmailErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Email not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetEmailResponses = {
+    /**
+     * Email details
+     */
+    200: EmailResponse;
+};
+
+export type GetEmailResponse = GetEmailResponses[keyof GetEmailResponses];
+
 export type ListServicesData = {
     body?: never;
     path?: never;
@@ -6579,6 +11128,33 @@ export type CreateServiceResponses = {
 
 export type CreateServiceResponse = CreateServiceResponses[keyof CreateServiceResponses];
 
+export type ListAvailableContainersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/external-services/available-containers';
+};
+
+export type ListAvailableContainersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListAvailableContainersResponses = {
+    /**
+     * List of available containers
+     */
+    200: Array<AvailableContainerInfo>;
+};
+
+export type ListAvailableContainersResponse = ListAvailableContainersResponses[keyof ListAvailableContainersResponses];
+
 export type GetServiceBySlugData = {
     body?: never;
     path: {
@@ -6610,6 +11186,41 @@ export type GetServiceBySlugResponses = {
 };
 
 export type GetServiceBySlugResponse = GetServiceBySlugResponses[keyof GetServiceBySlugResponses];
+
+export type ImportExternalServiceData = {
+    body: ImportExternalServiceRequest;
+    path?: never;
+    query?: never;
+    url: '/external-services/import';
+};
+
+export type ImportExternalServiceErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ImportExternalServiceResponses = {
+    /**
+     * Service imported successfully
+     */
+    201: ExternalServiceInfo;
+};
+
+export type ImportExternalServiceResponse = ImportExternalServiceResponses[keyof ImportExternalServiceResponses];
 
 export type ListProjectServicesData = {
     body?: never;
@@ -6679,6 +11290,61 @@ export type GetProjectServiceEnvironmentVariablesResponses = {
 
 export type GetProjectServiceEnvironmentVariablesResponse = GetProjectServiceEnvironmentVariablesResponses[keyof GetProjectServiceEnvironmentVariablesResponses];
 
+export type GetProvidersMetadataData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/external-services/providers/metadata';
+};
+
+export type GetProvidersMetadataErrors = {
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetProvidersMetadataResponses = {
+    /**
+     * List of provider metadata
+     */
+    200: Array<ProviderMetadata>;
+};
+
+export type GetProvidersMetadataResponse = GetProvidersMetadataResponses[keyof GetProvidersMetadataResponses];
+
+export type GetProviderMetadataData = {
+    body?: never;
+    path: {
+        /**
+         * Service type (mongodb, postgres, redis, s3)
+         */
+        service_type: string;
+    };
+    query?: never;
+    url: '/external-services/providers/metadata/{service_type}';
+};
+
+export type GetProviderMetadataErrors = {
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetProviderMetadataResponses = {
+    /**
+     * Provider metadata
+     */
+    200: ProviderMetadata;
+};
+
+export type GetProviderMetadataResponse = GetProviderMetadataResponses[keyof GetProviderMetadataResponses];
+
 export type GetServiceTypesData = {
     body?: never;
     path?: never;
@@ -6727,12 +11393,10 @@ export type GetServiceTypeParametersErrors = {
 
 export type GetServiceTypeParametersResponses = {
     /**
-     * Service type parameters
+     * Service type parameter schema
      */
-    200: Array<ServiceParameter>;
+    200: unknown;
 };
-
-export type GetServiceTypeParametersResponse = GetServiceTypeParametersResponses[keyof GetServiceTypeParametersResponses];
 
 export type DeleteServiceData = {
     body?: never;
@@ -6747,6 +11411,10 @@ export type DeleteServiceData = {
 };
 
 export type DeleteServiceErrors = {
+    /**
+     * Cannot delete: service is still linked to projects
+     */
+    400: unknown;
     /**
      * Service not found
      */
@@ -7143,6 +11811,360 @@ export type StopServiceResponses = {
 };
 
 export type StopServiceResponse = StopServiceResponses[keyof StopServiceResponses];
+
+export type UpgradeServiceData = {
+    body: UpgradeExternalServiceRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/upgrade';
+};
+
+export type UpgradeServiceErrors = {
+    /**
+     * Invalid request or upgrade not supported
+     */
+    400: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpgradeServiceResponses = {
+    /**
+     * Service upgraded successfully
+     */
+    200: ExternalServiceInfo;
+};
+
+export type UpgradeServiceResponse = UpgradeServiceResponses[keyof UpgradeServiceResponses];
+
+export type ListRootContainersData = {
+    body?: never;
+    path: {
+        service_id: number;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/containers';
+};
+
+export type ListRootContainersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListRootContainersResponses = {
+    /**
+     * List of root containers
+     */
+    200: Array<ContainerResponse>;
+};
+
+export type ListRootContainersResponse = ListRootContainersResponses[keyof ListRootContainersResponses];
+
+export type ListContainersAtPathData = {
+    body?: never;
+    path: {
+        service_id: number;
+        path: string;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/containers/{path}';
+};
+
+export type ListContainersAtPathErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service or container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListContainersAtPathResponses = {
+    /**
+     * List of containers
+     */
+    200: Array<ContainerResponse>;
+};
+
+export type ListContainersAtPathResponse = ListContainersAtPathResponses[keyof ListContainersAtPathResponses];
+
+export type ListEntitiesData = {
+    body?: never;
+    path: {
+        service_id: number;
+        path: string;
+    };
+    query?: {
+        /**
+         * Maximum number of entities to return (default: 100, max: 1000)
+         */
+        limit?: number;
+        /**
+         * Continuation token for pagination
+         */
+        token?: string;
+    };
+    url: '/external-services/{service_id}/query/containers/{path}/entities';
+};
+
+export type ListEntitiesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service or container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListEntitiesResponses = {
+    /**
+     * Paginated list of entities
+     */
+    200: PaginatedEntitiesResponse;
+};
+
+export type ListEntitiesResponse = ListEntitiesResponses[keyof ListEntitiesResponses];
+
+export type GetEntityInfoData = {
+    body?: never;
+    path: {
+        service_id: number;
+        path: string;
+        entity: string;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/containers/{path}/entities/{entity}';
+};
+
+export type GetEntityInfoErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service, container, or entity not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetEntityInfoResponses = {
+    /**
+     * Entity details
+     */
+    200: EntityInfoResponse;
+};
+
+export type GetEntityInfoResponse = GetEntityInfoResponses[keyof GetEntityInfoResponses];
+
+export type QueryDataData = {
+    body: QueryDataRequest;
+    path: {
+        service_id: number;
+        path: string;
+        entity: string;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/containers/{path}/entities/{entity}/data';
+};
+
+export type QueryDataErrors = {
+    /**
+     * Invalid query
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service, container, or entity not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type QueryDataResponses = {
+    /**
+     * Query results
+     */
+    200: QueryDataResponse;
+};
+
+export type QueryDataResponse2 = QueryDataResponses[keyof QueryDataResponses];
+
+export type DownloadObjectData = {
+    body?: never;
+    path: {
+        service_id: number;
+        path: string;
+        entity: string;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/containers/{path}/entities/{entity}/download';
+};
+
+export type DownloadObjectErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Object not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DownloadObjectResponses = {
+    /**
+     * Object data stream
+     */
+    200: Blob | File;
+};
+
+export type DownloadObjectResponse = DownloadObjectResponses[keyof DownloadObjectResponses];
+
+export type GetContainerInfoData = {
+    body?: never;
+    path: {
+        service_id: number;
+        path: string;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/containers/{path}/info';
+};
+
+export type GetContainerInfoErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service or container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetContainerInfoResponses = {
+    /**
+     * Container information
+     */
+    200: ContainerResponse;
+};
+
+export type GetContainerInfoResponse = GetContainerInfoResponses[keyof GetContainerInfoResponses];
+
+export type CheckExplorerSupportData = {
+    body?: never;
+    path: {
+        service_id: number;
+    };
+    query?: never;
+    url: '/external-services/{service_id}/query/explorer-support';
+};
+
+export type CheckExplorerSupportErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CheckExplorerSupportResponses = {
+    /**
+     * Explorer support information
+     */
+    200: ExplorerSupportResponse;
+};
+
+export type CheckExplorerSupportResponse = CheckExplorerSupportResponses[keyof CheckExplorerSupportResponses];
 
 export type GetFileData = {
     body?: never;
@@ -7710,7 +12732,7 @@ export type CreateGitlabPatProviderResponses = {
 
 export type CreateGitlabPatProviderResponse = CreateGitlabPatProviderResponses[keyof CreateGitlabPatProviderResponses];
 
-export type DeleteProviderData = {
+export type DeleteProvider3Data = {
     body?: never;
     path: {
         /**
@@ -7722,7 +12744,7 @@ export type DeleteProviderData = {
     url: '/git-providers/{provider_id}';
 };
 
-export type DeleteProviderErrors = {
+export type DeleteProvider3Errors = {
     /**
      * Provider has connections and cannot be deleted
      */
@@ -7741,14 +12763,14 @@ export type DeleteProviderErrors = {
     500: unknown;
 };
 
-export type DeleteProviderResponses = {
+export type DeleteProvider3Responses = {
     /**
      * Provider deleted successfully
      */
     204: void;
 };
 
-export type DeleteProviderResponse = DeleteProviderResponses[keyof DeleteProviderResponses];
+export type DeleteProvider3Response = DeleteProvider3Responses[keyof DeleteProvider3Responses];
 
 export type GetGitProviderData = {
     body?: never;
@@ -8017,6 +13039,164 @@ export type DeleteProviderSafelyResponses = {
 
 export type DeleteProviderSafelyResponse = DeleteProviderSafelyResponses[keyof DeleteProviderSafelyResponses];
 
+export type GetPublicRepositoryData = {
+    body?: never;
+    path: {
+        /**
+         * Git provider (github or gitlab)
+         */
+        provider: string;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query?: never;
+    url: '/git/public/{provider}/{owner}/{repo}';
+};
+
+export type GetPublicRepositoryErrors = {
+    /**
+     * Provider not supported
+     */
+    400: unknown;
+    /**
+     * Repository not found
+     */
+    404: unknown;
+    /**
+     * API rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPublicRepositoryResponses = {
+    /**
+     * Repository information
+     */
+    200: PublicRepositoryInfo;
+};
+
+export type GetPublicRepositoryResponse = GetPublicRepositoryResponses[keyof GetPublicRepositoryResponses];
+
+export type GetPublicBranchesData = {
+    body?: never;
+    path: {
+        /**
+         * Git provider (github or gitlab)
+         */
+        provider: string;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query?: {
+        /**
+         * Force fetch fresh data, bypassing cache (default: false)
+         */
+        fresh?: boolean;
+    };
+    url: '/git/public/{provider}/{owner}/{repo}/branches';
+};
+
+export type GetPublicBranchesErrors = {
+    /**
+     * Provider not supported
+     */
+    400: unknown;
+    /**
+     * Repository not found
+     */
+    404: unknown;
+    /**
+     * API rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPublicBranchesResponses = {
+    /**
+     * List of branches
+     */
+    200: BranchListResponse;
+};
+
+export type GetPublicBranchesResponse = GetPublicBranchesResponses[keyof GetPublicBranchesResponses];
+
+export type DetectPublicPresetsData = {
+    body?: never;
+    path: {
+        /**
+         * Git provider (github or gitlab)
+         */
+        provider: string;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query?: {
+        /**
+         * Branch name to detect presets for (default: repository's default branch)
+         */
+        branch?: string | null;
+        /**
+         * Force fetch fresh data, bypassing cache (default: false)
+         */
+        fresh?: boolean;
+    };
+    url: '/git/public/{provider}/{owner}/{repo}/presets';
+};
+
+export type DetectPublicPresetsErrors = {
+    /**
+     * Provider not supported
+     */
+    400: unknown;
+    /**
+     * Repository or branch not found
+     */
+    404: unknown;
+    /**
+     * API rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DetectPublicPresetsResponses = {
+    /**
+     * Detected presets
+     */
+    200: PublicPresetResponse;
+};
+
+export type DetectPublicPresetsResponse = DetectPublicPresetsResponses[keyof DetectPublicPresetsResponses];
+
 export type DiscoverWorkloadsData = {
     body: DiscoverRequest;
     path?: never;
@@ -8272,6 +13452,492 @@ export type GetIncidentUpdatesResponses = {
 };
 
 export type GetIncidentUpdatesResponse = GetIncidentUpdatesResponses[keyof GetIncidentUpdatesResponses];
+
+export type ListIpAccessControlData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter by action ("block" or "allow")
+         */
+        action?: string | null;
+    };
+    url: '/ip-access-control';
+};
+
+export type ListIpAccessControlErrors = {
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListIpAccessControlResponses = {
+    /**
+     * List of IP access control rules
+     */
+    200: Array<IpAccessControlResponse>;
+};
+
+export type ListIpAccessControlResponse = ListIpAccessControlResponses[keyof ListIpAccessControlResponses];
+
+export type CreateIpAccessControlData = {
+    body: CreateIpAccessControlRequest;
+    path?: never;
+    query?: never;
+    url: '/ip-access-control';
+};
+
+export type CreateIpAccessControlErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Duplicate IP address
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateIpAccessControlResponses = {
+    /**
+     * IP access control rule created
+     */
+    201: IpAccessControlResponse;
+};
+
+export type CreateIpAccessControlResponse = CreateIpAccessControlResponses[keyof CreateIpAccessControlResponses];
+
+export type CheckIpBlockedData = {
+    body?: never;
+    path: {
+        /**
+         * IP address to check
+         */
+        ip: string;
+    };
+    query?: never;
+    url: '/ip-access-control/check/{ip}';
+};
+
+export type CheckIpBlockedErrors = {
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CheckIpBlockedResponses = {
+    /**
+     * IP block status
+     */
+    200: unknown;
+};
+
+export type DeleteIpAccessControlData = {
+    body?: never;
+    path: {
+        /**
+         * IP access control rule ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/ip-access-control/{id}';
+};
+
+export type DeleteIpAccessControlErrors = {
+    /**
+     * IP access control rule not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteIpAccessControlResponses = {
+    /**
+     * IP access control rule deleted
+     */
+    204: void;
+};
+
+export type DeleteIpAccessControlResponse = DeleteIpAccessControlResponses[keyof DeleteIpAccessControlResponses];
+
+export type GetIpAccessControlData = {
+    body?: never;
+    path: {
+        /**
+         * IP access control rule ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/ip-access-control/{id}';
+};
+
+export type GetIpAccessControlErrors = {
+    /**
+     * IP access control rule not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetIpAccessControlResponses = {
+    /**
+     * IP access control rule details
+     */
+    200: IpAccessControlResponse;
+};
+
+export type GetIpAccessControlResponse = GetIpAccessControlResponses[keyof GetIpAccessControlResponses];
+
+export type UpdateIpAccessControlData = {
+    body: UpdateIpAccessControlRequest;
+    path: {
+        /**
+         * IP access control rule ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/ip-access-control/{id}';
+};
+
+export type UpdateIpAccessControlErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * IP access control rule not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateIpAccessControlResponses = {
+    /**
+     * IP access control rule updated
+     */
+    200: IpAccessControlResponse;
+};
+
+export type UpdateIpAccessControlResponse = UpdateIpAccessControlResponses[keyof UpdateIpAccessControlResponses];
+
+export type KvDelData = {
+    body: DelRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/del';
+};
+
+export type KvDelErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvDelResponses = {
+    /**
+     * Keys deleted
+     */
+    200: DelResponse;
+};
+
+export type KvDelResponse = KvDelResponses[keyof KvDelResponses];
+
+export type KvDisableData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/kv/disable';
+};
+
+export type KvDisableErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvDisableResponses = {
+    /**
+     * KV service disabled
+     */
+    200: DisableKvResponse;
+};
+
+export type KvDisableResponse = KvDisableResponses[keyof KvDisableResponses];
+
+export type KvEnableData = {
+    body: EnableKvRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/enable';
+};
+
+export type KvEnableErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvEnableResponses = {
+    /**
+     * KV service enabled
+     */
+    200: EnableKvResponse;
+};
+
+export type KvEnableResponse = KvEnableResponses[keyof KvEnableResponses];
+
+export type KvExpireData = {
+    body: ExpireRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/expire';
+};
+
+export type KvExpireErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvExpireResponses = {
+    /**
+     * Expiration set
+     */
+    200: ExpireResponse;
+};
+
+export type KvExpireResponse = KvExpireResponses[keyof KvExpireResponses];
+
+export type KvGetData = {
+    body: GetRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/get';
+};
+
+export type KvGetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvGetResponses = {
+    /**
+     * Value retrieved
+     */
+    200: GetResponse;
+};
+
+export type KvGetResponse = KvGetResponses[keyof KvGetResponses];
+
+export type KvIncrData = {
+    body: IncrRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/incr';
+};
+
+export type KvIncrErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvIncrResponses = {
+    /**
+     * Value incremented
+     */
+    200: IncrResponse;
+};
+
+export type KvIncrResponse = KvIncrResponses[keyof KvIncrResponses];
+
+export type KvKeysData = {
+    body: KeysRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/keys';
+};
+
+export type KvKeysErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvKeysResponses = {
+    /**
+     * Keys retrieved
+     */
+    200: KeysResponse;
+};
+
+export type KvKeysResponse = KvKeysResponses[keyof KvKeysResponses];
+
+export type KvSetData = {
+    body: SetRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/set';
+};
+
+export type KvSetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvSetResponses = {
+    /**
+     * Value set
+     */
+    200: SetResponse;
+};
+
+export type KvSetResponse = KvSetResponses[keyof KvSetResponses];
+
+export type KvStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/kv/status';
+};
+
+export type KvStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvStatusResponses = {
+    /**
+     * KV service status
+     */
+    200: KvStatusResponse;
+};
+
+export type KvStatusResponse2 = KvStatusResponses[keyof KvStatusResponses];
+
+export type KvTtlData = {
+    body: TtlRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/ttl';
+};
+
+export type KvTtlErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvTtlResponses = {
+    /**
+     * TTL retrieved
+     */
+    200: TtlResponse;
+};
+
+export type KvTtlResponse = KvTtlResponses[keyof KvTtlResponses];
+
+export type KvUpdateData = {
+    body: UpdateKvRequest;
+    path?: never;
+    query?: never;
+    url: '/kv/update';
+};
+
+export type KvUpdateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * KV service not enabled
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type KvUpdateResponses = {
+    /**
+     * KV service updated
+     */
+    200: UpdateKvResponse;
+};
+
+export type KvUpdateResponse = KvUpdateResponses[keyof KvUpdateResponses];
 
 export type ListRoutesData = {
     body?: never;
@@ -8875,7 +14541,7 @@ export type UpdateSlackProviderResponses = {
 
 export type UpdateSlackProviderResponse = UpdateSlackProviderResponses[keyof UpdateSlackProviderResponses];
 
-export type DeleteProvider2Data = {
+export type DeleteProvider4Data = {
     body?: never;
     path: {
         /**
@@ -8887,7 +14553,7 @@ export type DeleteProvider2Data = {
     url: '/notification-providers/{id}';
 };
 
-export type DeleteProvider2Errors = {
+export type DeleteProvider4Errors = {
     /**
      * Provider not found
      */
@@ -8898,14 +14564,14 @@ export type DeleteProvider2Errors = {
     500: unknown;
 };
 
-export type DeleteProvider2Responses = {
+export type DeleteProvider4Responses = {
     /**
      * Successfully deleted provider
      */
     204: void;
 };
 
-export type DeleteProvider2Response = DeleteProvider2Responses[keyof DeleteProvider2Responses];
+export type DeleteProvider4Response = DeleteProvider4Responses[keyof DeleteProvider4Responses];
 
 export type GetNotificationProviderData = {
     body?: never;
@@ -8939,7 +14605,7 @@ export type GetNotificationProviderResponses = {
 
 export type GetNotificationProviderResponse = GetNotificationProviderResponses[keyof GetNotificationProviderResponses];
 
-export type UpdateProviderData = {
+export type UpdateProvider2Data = {
     body: UpdateProviderRequest;
     path: {
         /**
@@ -8951,7 +14617,7 @@ export type UpdateProviderData = {
     url: '/notification-providers/{id}';
 };
 
-export type UpdateProviderErrors = {
+export type UpdateProvider2Errors = {
     /**
      * Provider not found
      */
@@ -8962,16 +14628,16 @@ export type UpdateProviderErrors = {
     500: unknown;
 };
 
-export type UpdateProviderResponses = {
+export type UpdateProvider2Responses = {
     /**
      * Successfully updated provider
      */
     200: NotificationProviderResponse;
 };
 
-export type UpdateProviderResponse = UpdateProviderResponses[keyof UpdateProviderResponses];
+export type UpdateProvider2Response = UpdateProvider2Responses[keyof UpdateProvider2Responses];
 
-export type TestProviderData = {
+export type TestProvider2Data = {
     body?: never;
     path: {
         /**
@@ -8983,7 +14649,7 @@ export type TestProviderData = {
     url: '/notification-providers/{id}/test';
 };
 
-export type TestProviderErrors = {
+export type TestProvider2Errors = {
     /**
      * Provider not found
      */
@@ -8994,14 +14660,14 @@ export type TestProviderErrors = {
     500: unknown;
 };
 
-export type TestProviderResponses = {
+export type TestProvider2Responses = {
     /**
      * Test result
      */
     200: TestProviderResponse;
 };
 
-export type TestProviderResponse2 = TestProviderResponses[keyof TestProviderResponses];
+export type TestProvider2Response = TestProvider2Responses[keyof TestProvider2Responses];
 
 export type ListOrdersData = {
     body?: never;
@@ -9029,6 +14695,36 @@ export type ListOrdersResponses = {
 };
 
 export type ListOrdersResponse2 = ListOrdersResponses[keyof ListOrdersResponses];
+
+export type HasPerformanceMetricsData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    url: '/performance/has-metrics';
+};
+
+export type HasPerformanceMetricsErrors = {
+    /**
+     * Internal server error
+     */
+    500: ErrorResponse;
+};
+
+export type HasPerformanceMetricsError = HasPerformanceMetricsErrors[keyof HasPerformanceMetricsErrors];
+
+export type HasPerformanceMetricsResponses = {
+    /**
+     * Successfully checked performance metrics availability
+     */
+    200: HasMetricsResponse;
+};
+
+export type HasPerformanceMetricsResponse = HasPerformanceMetricsResponses[keyof HasPerformanceMetricsResponses];
 
 export type GetPerformanceMetricsData = {
     body?: never;
@@ -9234,6 +14930,33 @@ export type GetPublicIpResponses = {
      */
     200: unknown;
 };
+
+export type ListPresetsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/presets';
+};
+
+export type ListPresetsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListPresetsResponses = {
+    /**
+     * List of available presets
+     */
+    200: ListPresetsResponse;
+};
+
+export type ListPresetsResponse2 = ListPresetsResponses[keyof ListPresetsResponses];
 
 export type GetProjectsData = {
     body?: never;
@@ -9952,6 +15675,50 @@ export type LinkCustomDomainToCertificateResponses = {
 
 export type LinkCustomDomainToCertificateResponse = LinkCustomDomainToCertificateResponses[keyof LinkCustomDomainToCertificateResponses];
 
+export type UpdateProjectDeploymentConfigData = {
+    body: UpdateDeploymentConfigRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployment-config';
+};
+
+export type UpdateProjectDeploymentConfigErrors = {
+    /**
+     * Invalid deployment configuration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateProjectDeploymentConfigResponses = {
+    /**
+     * Deployment configuration updated successfully
+     */
+    200: ProjectResponse;
+};
+
+export type UpdateProjectDeploymentConfigResponse = UpdateProjectDeploymentConfigResponses[keyof UpdateProjectDeploymentConfigResponses];
+
 export type GetDeploymentData = {
     body?: never;
     path: {
@@ -10095,12 +15862,124 @@ export type TailDeploymentJobLogsErrors = {
     500: unknown;
 };
 
-export type TailDeploymentJobLogsResponses = {
-    /**
-     * Stream of deployment job logs
-     */
-    200: unknown;
+export type GetDeploymentOperationsData = {
+    body?: never;
+    path: {
+        project_id: number;
+        deployment_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/operations';
 };
+
+export type GetDeploymentOperationsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Deployment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDeploymentOperationsResponses = {
+    /**
+     * List of operations
+     */
+    200: OperationResultsResponse;
+};
+
+export type GetDeploymentOperationsResponse = GetDeploymentOperationsResponses[keyof GetDeploymentOperationsResponses];
+
+export type ExecuteDeploymentOperationData = {
+    body: ExecuteOperationRequest;
+    path: {
+        project_id: number;
+        deployment_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/operations';
+};
+
+export type ExecuteDeploymentOperationErrors = {
+    /**
+     * Invalid operation
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Deployment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ExecuteDeploymentOperationResponses = {
+    /**
+     * Operation executed
+     */
+    202: OperationResultResponse;
+};
+
+export type ExecuteDeploymentOperationResponse = ExecuteDeploymentOperationResponses[keyof ExecuteDeploymentOperationResponses];
+
+export type GetDeploymentOperationStatusData = {
+    body?: never;
+    path: {
+        project_id: number;
+        deployment_id: string;
+        operation_type: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/operations/{operation_type}';
+};
+
+export type GetDeploymentOperationStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Operation not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDeploymentOperationStatusResponses = {
+    /**
+     * Operation status
+     */
+    200: OperationResultResponse;
+};
+
+export type GetDeploymentOperationStatusResponse = GetDeploymentOperationStatusResponses[keyof GetDeploymentOperationStatusResponses];
 
 export type PauseDeploymentData = {
     body?: never;
@@ -10645,6 +16524,46 @@ export type CreateEnvironmentResponses = {
 
 export type CreateEnvironmentResponse = CreateEnvironmentResponses[keyof CreateEnvironmentResponses];
 
+export type DeleteEnvironmentData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        env_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{env_id}';
+};
+
+export type DeleteEnvironmentErrors = {
+    /**
+     * Cannot delete production environment
+     */
+    400: unknown;
+    /**
+     * Project or environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteEnvironmentResponses = {
+    /**
+     * Environment permanently deleted
+     */
+    204: void;
+};
+
+export type DeleteEnvironmentResponse = DeleteEnvironmentResponses[keyof DeleteEnvironmentResponses];
+
 export type GetEnvironmentData = {
     body?: never;
     path: {
@@ -11027,6 +16946,14 @@ export type GetContainerLogsData = {
          * Number of lines to tail (or 'all')
          */
         tail?: string;
+        /**
+         * Optional container name (defaults to first/primary container)
+         */
+        container_name?: string;
+        /**
+         * Include timestamps in log output (default: false)
+         */
+        timestamps?: boolean;
     };
     url: '/projects/{project_id}/environments/{environment_id}/container-logs';
 };
@@ -11037,20 +16964,13 @@ export type GetContainerLogsErrors = {
      */
     400: unknown;
     /**
-     * Project or deployment not found
+     * Project, deployment, or container not found
      */
     404: unknown;
     /**
      * Internal server error
      */
     500: unknown;
-};
-
-export type GetContainerLogsResponses = {
-    /**
-     * Server-Sent Events stream of container logs
-     */
-    200: unknown;
 };
 
 export type ListContainersData = {
@@ -11093,6 +17013,46 @@ export type ListContainersResponses = {
 
 export type ListContainersResponse = ListContainersResponses[keyof ListContainersResponses];
 
+export type GetContainerDetailData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}';
+};
+
+export type GetContainerDetailErrors = {
+    /**
+     * Container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetContainerDetailResponses = {
+    /**
+     * Container details
+     */
+    200: ContainerDetailResponse;
+};
+
+export type GetContainerDetailResponse = GetContainerDetailResponses[keyof GetContainerDetailResponses];
+
 export type GetContainerLogsByIdData = {
     body?: never;
     path: {
@@ -11122,6 +17082,10 @@ export type GetContainerLogsByIdData = {
          * Number of lines to tail (or 'all')
          */
         tail?: string;
+        /**
+         * Include timestamps in log output (default: false)
+         */
+        timestamps?: boolean;
     };
     url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/logs';
 };
@@ -11141,12 +17105,208 @@ export type GetContainerLogsByIdErrors = {
     500: unknown;
 };
 
-export type GetContainerLogsByIdResponses = {
+export type GetContainerMetricsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics';
+};
+
+export type GetContainerMetricsErrors = {
     /**
-     * Server-Sent Events stream of container logs
+     * Container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetContainerMetricsResponses = {
+    /**
+     * Container metrics retrieved successfully
+     */
+    200: ContainerMetricsResponse;
+};
+
+export type GetContainerMetricsResponse = GetContainerMetricsResponses[keyof GetContainerMetricsResponses];
+
+export type StreamContainerMetricsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+    };
+    query?: {
+        /**
+         * Update interval in milliseconds (default: 1000)
+         */
+        interval?: number;
+    };
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/stream';
+};
+
+export type StreamContainerMetricsErrors = {
+    /**
+     * Container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type StreamContainerMetricsResponses = {
+    /**
+     * Metrics stream established (Server-Sent Events)
      */
     200: unknown;
 };
+
+export type RestartContainerData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/restart';
+};
+
+export type RestartContainerErrors = {
+    /**
+     * Container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RestartContainerResponses = {
+    /**
+     * Container restarted successfully
+     */
+    200: ContainerActionResponse;
+};
+
+export type RestartContainerResponse = RestartContainerResponses[keyof RestartContainerResponses];
+
+export type StartContainerData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/start';
+};
+
+export type StartContainerErrors = {
+    /**
+     * Container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type StartContainerResponses = {
+    /**
+     * Container started successfully
+     */
+    200: ContainerActionResponse;
+};
+
+export type StartContainerResponse = StartContainerResponses[keyof StartContainerResponses];
+
+export type StopContainerData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Container ID
+         */
+        container_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/containers/{container_id}/stop';
+};
+
+export type StopContainerErrors = {
+    /**
+     * Container not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type StopContainerResponses = {
+    /**
+     * Container stopped successfully
+     */
+    200: ContainerActionResponse;
+};
+
+export type StopContainerResponse = StopContainerResponses[keyof StopContainerResponses];
 
 export type GetErrorDashboardStatsData = {
     body?: never;
@@ -12177,6 +18337,114 @@ export type GetHourlyVisitsResponses = {
 
 export type GetHourlyVisitsResponse = GetHourlyVisitsResponses[keyof GetHourlyVisitsResponses];
 
+export type ListExternalImagesData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/images';
+};
+
+export type ListExternalImagesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListExternalImagesResponses = {
+    /**
+     * List of external images
+     */
+    200: Array<ExternalImageResponse>;
+};
+
+export type ListExternalImagesResponse = ListExternalImagesResponses[keyof ListExternalImagesResponses];
+
+export type PushExternalImageData = {
+    body: PushImageRequest;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/images/push';
+};
+
+export type PushExternalImageErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type PushExternalImageResponses = {
+    /**
+     * Image pushed successfully
+     */
+    201: ExternalImageResponse;
+};
+
+export type PushExternalImageResponse = PushExternalImageResponses[keyof PushExternalImageResponses];
+
+export type GetExternalImageData = {
+    body?: never;
+    path: {
+        project_id: number;
+        image_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/images/{image_id}';
+};
+
+export type GetExternalImageErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Image not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetExternalImageResponses = {
+    /**
+     * Image details
+     */
+    200: ExternalImageResponse;
+};
+
+export type GetExternalImageResponse = GetExternalImageResponses[keyof GetExternalImageResponses];
+
 export type ListIncidentsData = {
     body?: never;
     path: {
@@ -12496,6 +18764,533 @@ export type GetUniqueCountsResponses = {
 
 export type GetUniqueCountsResponse = GetUniqueCountsResponses[keyof GetUniqueCountsResponses];
 
+export type ListProjectScansData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Page number (default: 1)
+         */
+        page?: number;
+        /**
+         * Page size (default: 20, max: 100)
+         */
+        page_size?: number;
+    };
+    url: '/projects/{project_id}/vulnerability-scans';
+};
+
+export type ListProjectScansErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListProjectScansError = ListProjectScansErrors[keyof ListProjectScansErrors];
+
+export type ListProjectScansResponses = {
+    /**
+     * List of vulnerability scans
+     */
+    200: Array<ScanResponse>;
+};
+
+export type ListProjectScansResponse = ListProjectScansResponses[keyof ListProjectScansResponses];
+
+export type TriggerScanData = {
+    body: TriggerScanRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/vulnerability-scans';
+};
+
+export type TriggerScanErrors = {
+    /**
+     * Invalid request
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type TriggerScanError = TriggerScanErrors[keyof TriggerScanErrors];
+
+export type TriggerScanResponses = {
+    /**
+     * Scan triggered successfully
+     */
+    202: TriggerScanResponse;
+};
+
+export type TriggerScanResponse2 = TriggerScanResponses[keyof TriggerScanResponses];
+
+export type GetLatestScansPerEnvironmentData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/vulnerability-scans/environments';
+};
+
+export type GetLatestScansPerEnvironmentErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetLatestScansPerEnvironmentError = GetLatestScansPerEnvironmentErrors[keyof GetLatestScansPerEnvironmentErrors];
+
+export type GetLatestScansPerEnvironmentResponses = {
+    /**
+     * Latest scans per environment for current deployments
+     */
+    200: Array<ScanResponse>;
+};
+
+export type GetLatestScansPerEnvironmentResponse = GetLatestScansPerEnvironmentResponses[keyof GetLatestScansPerEnvironmentResponses];
+
+export type GetLatestScanData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Filter by environment ID
+         */
+        environment_id?: number;
+    };
+    url: '/projects/{project_id}/vulnerability-scans/latest';
+};
+
+export type GetLatestScanErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No scans found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetLatestScanError = GetLatestScanErrors[keyof GetLatestScanErrors];
+
+export type GetLatestScanResponses = {
+    /**
+     * Latest scan for project
+     */
+    200: ScanResponse;
+};
+
+export type GetLatestScanResponse = GetLatestScanResponses[keyof GetLatestScanResponses];
+
+export type ListWebhooksData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks';
+};
+
+export type ListWebhooksErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListWebhooksResponses = {
+    /**
+     * List of webhooks
+     */
+    200: Array<WebhookResponse>;
+};
+
+export type ListWebhooksResponse = ListWebhooksResponses[keyof ListWebhooksResponses];
+
+export type CreateWebhookData = {
+    body: CreateWebhookRequestBody;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks';
+};
+
+export type CreateWebhookErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateWebhookResponses = {
+    /**
+     * Webhook created
+     */
+    201: WebhookResponse;
+};
+
+export type CreateWebhookResponse = CreateWebhookResponses[keyof CreateWebhookResponses];
+
+export type DeleteWebhookData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks/{webhook_id}';
+};
+
+export type DeleteWebhookErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Webhook not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteWebhookResponses = {
+    /**
+     * Webhook deleted
+     */
+    204: void;
+};
+
+export type DeleteWebhookResponse = DeleteWebhookResponses[keyof DeleteWebhookResponses];
+
+export type GetWebhookData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks/{webhook_id}';
+};
+
+export type GetWebhookErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Webhook not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetWebhookResponses = {
+    /**
+     * Webhook details
+     */
+    200: WebhookResponse;
+};
+
+export type GetWebhookResponse = GetWebhookResponses[keyof GetWebhookResponses];
+
+export type UpdateWebhookData = {
+    body: UpdateWebhookRequestBody;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks/{webhook_id}';
+};
+
+export type UpdateWebhookErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Webhook not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateWebhookResponses = {
+    /**
+     * Webhook updated
+     */
+    200: WebhookResponse;
+};
+
+export type UpdateWebhookResponse = UpdateWebhookResponses[keyof UpdateWebhookResponses];
+
+export type ListDeliveriesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+    };
+    query?: {
+        /**
+         * Number of deliveries to return (default: 50)
+         */
+        limit?: number;
+    };
+    url: '/projects/{project_id}/webhooks/{webhook_id}/deliveries';
+};
+
+export type ListDeliveriesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListDeliveriesResponses = {
+    /**
+     * List of deliveries
+     */
+    200: Array<WebhookDeliveryResponse>;
+};
+
+export type ListDeliveriesResponse = ListDeliveriesResponses[keyof ListDeliveriesResponses];
+
+export type GetDeliveryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+        /**
+         * Delivery ID
+         */
+        delivery_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}';
+};
+
+export type GetDeliveryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Delivery not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDeliveryResponses = {
+    /**
+     * Delivery details including full payload
+     */
+    200: WebhookDeliveryResponse;
+};
+
+export type GetDeliveryResponse = GetDeliveryResponses[keyof GetDeliveryResponses];
+
+export type RetryDeliveryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+        /**
+         * Delivery ID
+         */
+        delivery_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry';
+};
+
+export type RetryDeliveryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Delivery not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RetryDeliveryResponses = {
+    /**
+     * Delivery retried
+     */
+    200: WebhookDeliveryResponse;
+};
+
+export type RetryDeliveryResponse = RetryDeliveryResponses[keyof RetryDeliveryResponses];
+
 export type GetProxyLogsData = {
     body?: never;
     path?: never;
@@ -12512,6 +19307,14 @@ export type GetProxyLogsData = {
          * Filter by deployment ID
          */
         deployment_id?: number | null;
+        /**
+         * Filter by session ID
+         */
+        session_id?: number | null;
+        /**
+         * Filter by visitor ID
+         */
+        visitor_id?: number | null;
         /**
          * Start date for filtering (ISO 8601 format)
          */
@@ -12683,6 +19486,158 @@ export type GetProxyLogByRequestIdResponses = {
 };
 
 export type GetProxyLogByRequestIdResponse = GetProxyLogByRequestIdResponses[keyof GetProxyLogByRequestIdResponses];
+
+export type GetTimeBucketStatsData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Start time (ISO 8601 format)
+         */
+        start_time: string;
+        /**
+         * End time (ISO 8601 format)
+         */
+        end_time: string;
+        /**
+         * Bucket interval (e.g., "1 hour", "1 day", "5 minutes")
+         */
+        bucket_interval?: string;
+        /**
+         * Filter by HTTP method
+         */
+        method?: string;
+        /**
+         * Filter by client IP
+         */
+        client_ip?: string;
+        /**
+         * Filter by project ID
+         */
+        project_id?: number;
+        /**
+         * Filter by environment ID
+         */
+        environment_id?: number;
+        /**
+         * Filter by deployment ID
+         */
+        deployment_id?: number;
+        /**
+         * Filter by host
+         */
+        host?: string;
+        /**
+         * Filter by status code
+         */
+        status_code?: number;
+        /**
+         * Filter by routing status
+         */
+        routing_status?: string;
+        /**
+         * Filter by request source
+         */
+        request_source?: string;
+        /**
+         * Filter by bot detection
+         */
+        is_bot?: boolean;
+        /**
+         * Filter by device type
+         */
+        device_type?: string;
+    };
+    url: '/proxy-logs/stats/time-buckets';
+};
+
+export type GetTimeBucketStatsErrors = {
+    /**
+     * Invalid parameters
+     */
+    400: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetTimeBucketStatsResponses = {
+    /**
+     * Time-bucketed statistics
+     */
+    200: TimeBucketStatsResponse;
+};
+
+export type GetTimeBucketStatsResponse = GetTimeBucketStatsResponses[keyof GetTimeBucketStatsResponses];
+
+export type GetTodayStatsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter by HTTP method
+         */
+        method?: string | null;
+        /**
+         * Filter by client IP
+         */
+        client_ip?: string | null;
+        /**
+         * Filter by project ID
+         */
+        project_id?: number | null;
+        /**
+         * Filter by environment ID
+         */
+        environment_id?: number | null;
+        /**
+         * Filter by deployment ID
+         */
+        deployment_id?: number | null;
+        /**
+         * Filter by host
+         */
+        host?: string | null;
+        /**
+         * Filter by status code
+         */
+        status_code?: number | null;
+        /**
+         * Filter by routing status
+         */
+        routing_status?: string | null;
+        /**
+         * Filter by request source
+         */
+        request_source?: string | null;
+        /**
+         * Filter by bot detection
+         */
+        is_bot?: boolean | null;
+        /**
+         * Filter by device type
+         */
+        device_type?: string | null;
+    };
+    url: '/proxy-logs/stats/today';
+};
+
+export type GetTodayStatsErrors = {
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetTodayStatsResponses = {
+    /**
+     * Today's request count
+     */
+    200: TodayStatsResponse;
+};
+
+export type GetTodayStatsResponse = GetTodayStatsResponses[keyof GetTodayStatsResponses];
 
 export type GetProxyLogByIdData = {
     body?: never;
@@ -13241,7 +20196,7 @@ export type GetSessionEvents2Responses = {
     /**
      * Successfully retrieved session events
      */
-    200: SessionEventsResponse;
+    200: AnalyticsSessionEventsResponse;
 };
 
 export type GetSessionEvents2Response = GetSessionEvents2Responses[keyof GetSessionEvents2Responses];
@@ -13943,6 +20898,184 @@ export type AddEventsResponses = {
 
 export type AddEventsResponse2 = AddEventsResponses[keyof AddEventsResponses];
 
+export type DeleteScanData = {
+    body?: never;
+    path: {
+        /**
+         * Scan ID
+         */
+        scan_id: number;
+    };
+    query?: never;
+    url: '/vulnerability-scans/{scan_id}';
+};
+
+export type DeleteScanErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Scan not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteScanError = DeleteScanErrors[keyof DeleteScanErrors];
+
+export type DeleteScanResponses = {
+    /**
+     * Scan deleted
+     */
+    204: void;
+};
+
+export type DeleteScanResponse = DeleteScanResponses[keyof DeleteScanResponses];
+
+export type GetScanData = {
+    body?: never;
+    path: {
+        /**
+         * Scan ID
+         */
+        scan_id: number;
+    };
+    query?: never;
+    url: '/vulnerability-scans/{scan_id}';
+};
+
+export type GetScanErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Scan not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetScanError = GetScanErrors[keyof GetScanErrors];
+
+export type GetScanResponses = {
+    /**
+     * Scan details
+     */
+    200: ScanResponse;
+};
+
+export type GetScanResponse = GetScanResponses[keyof GetScanResponses];
+
+export type GetScanVulnerabilitiesData = {
+    body?: never;
+    path: {
+        /**
+         * Scan ID
+         */
+        scan_id: number;
+    };
+    query?: {
+        /**
+         * Page number (default: 1)
+         */
+        page?: number;
+        /**
+         * Page size (default: 20, max: 100)
+         */
+        page_size?: number;
+        /**
+         * Filter by severity (CRITICAL, HIGH, MEDIUM, LOW)
+         */
+        severity?: string;
+    };
+    url: '/vulnerability-scans/{scan_id}/vulnerabilities';
+};
+
+export type GetScanVulnerabilitiesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Scan not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetScanVulnerabilitiesError = GetScanVulnerabilitiesErrors[keyof GetScanVulnerabilitiesErrors];
+
+export type GetScanVulnerabilitiesResponses = {
+    /**
+     * List of vulnerabilities
+     */
+    200: Array<VulnerabilityResponse>;
+};
+
+export type GetScanVulnerabilitiesResponse = GetScanVulnerabilitiesResponses[keyof GetScanVulnerabilitiesResponses];
+
+export type ListEventTypesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/webhook-event-types';
+};
+
+export type ListEventTypesResponses = {
+    /**
+     * List of available event types
+     */
+    200: Array<EventTypeResponse>;
+};
+
+export type ListEventTypesResponse = ListEventTypesResponses[keyof ListEventTypesResponses];
+
+export type TriggerWeeklyDigestData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/weekly-digest/trigger';
+};
+
+export type TriggerWeeklyDigestErrors = {
+    /**
+     * Failed to generate digest
+     */
+    500: unknown;
+};
+
+export type TriggerWeeklyDigestResponses = {
+    /**
+     * Weekly digest triggered successfully
+     */
+    200: TriggerDigestResponse;
+};
+
+export type TriggerWeeklyDigestResponse = TriggerWeeklyDigestResponses[keyof TriggerWeeklyDigestResponses];
+
 export type ListAuditLogsData = {
     body?: never;
     path?: never;
@@ -14027,111 +21160,6 @@ export type GetAuditLogResponses = {
 };
 
 export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
-
-export type GetRequestLogsData = {
-    body?: never;
-    path?: never;
-    query?: {
-        /**
-         * Project ID (optional - if not provided, returns all system logs)
-         */
-        project_id?: number;
-        /**
-         * Environment ID (optional)
-         */
-        environment_id?: number;
-        /**
-         * Deployment ID (optional)
-         */
-        deployment_id?: number;
-        /**
-         * HTTP status code filter (optional)
-         */
-        status_code?: number;
-        /**
-         * HTTP method filter (optional)
-         */
-        method?: string;
-        /**
-         * Start date filter in milliseconds since epoch (optional)
-         */
-        start_date?: number;
-        /**
-         * End date filter in milliseconds since epoch (optional)
-         */
-        end_date?: number;
-        /**
-         * Page number (default: 1)
-         */
-        page?: number;
-        /**
-         * Page size/limit (default: 20, max: 100)
-         */
-        limit?: number;
-        /**
-         * Offset for pagination (auto-calculated from page if not provided)
-         */
-        offset?: number;
-    };
-    url: 'request-logs';
-};
-
-export type GetRequestLogsErrors = {
-    /**
-     * Invalid query parameters
-     */
-    400: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type GetRequestLogsResponses = {
-    /**
-     * List of request logs
-     */
-    200: RequestLogsResponse;
-};
-
-export type GetRequestLogsResponse = GetRequestLogsResponses[keyof GetRequestLogsResponses];
-
-export type GetRequestLogByIdData = {
-    body?: never;
-    path: {
-        /**
-         * Request log ID
-         */
-        id: number;
-    };
-    query?: {
-        /**
-         * Project ID (optional - if not provided, searches all system logs)
-         */
-        project_id?: number;
-    };
-    url: 'request-logs/{id}';
-};
-
-export type GetRequestLogByIdErrors = {
-    /**
-     * Request log not found
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type GetRequestLogByIdResponses = {
-    /**
-     * Request log found
-     */
-    200: RequestLogResponse;
-};
-
-export type GetRequestLogByIdResponse = GetRequestLogByIdResponses[keyof GetRequestLogByIdResponses];
 
 export type ClientOptions = {
     baseUrl: `${string}://${string}/api` | (string & {});

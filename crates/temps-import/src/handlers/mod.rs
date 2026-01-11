@@ -15,8 +15,8 @@ use temps_core::problemdetails::Problem;
 use utoipa::OpenApi;
 
 use types::{
-    CreatePlanRequest, CreatePlanResponse, DiscoverRequest, DiscoverResponse,
-    ExecuteImportRequest, ExecuteImportResponse, ImportSourceInfo, ImportStatusResponse,
+    CreatePlanRequest, CreatePlanResponse, DiscoverRequest, DiscoverResponse, ExecuteImportRequest,
+    ExecuteImportResponse, ImportSourceInfo, ImportStatusResponse,
 };
 
 /// Configure routes for the import API
@@ -103,7 +103,12 @@ async fn create_plan(
 
     let result = state
         .import_orchestrator
-        .create_plan(auth.user_id(), request.source, request.workload_id, request.repository_id)
+        .create_plan(
+            auth.user_id(),
+            request.source,
+            request.workload_id,
+            request.repository_id,
+        )
         .await?;
 
     Ok(Json(result))

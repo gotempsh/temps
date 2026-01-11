@@ -24,12 +24,6 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
-import {
   Form,
   FormControl,
   FormDescription,
@@ -40,7 +34,6 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import {
   Select,
   SelectContent,
@@ -68,6 +61,7 @@ import { toast } from 'sonner'
 import { z } from 'zod'
 import FrameworkIcon from '../FrameworkIcon'
 import { TimeAgo } from '@/components/utils/TimeAgo'
+import { FrameworkSelector } from '../FrameworkSelector'
 
 interface GitSettingsProps {
   project: ProjectResponse
@@ -101,15 +95,12 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
       errorTitle: 'Failed to update automatic deploy settings',
     },
   })
-  const [showAllPresets, setShowAllPresets] = useState(false)
   const [isEditingSettings, setIsEditingSettings] = useState(false)
-  const [isManualMode, setIsManualMode] = useState(false)
-  const [isDirectoryDialogOpen, setIsDirectoryDialogOpen] = useState(false)
-  const [showCustomDirectory, setShowCustomDirectory] = useState(false)
-  const [customDirectoryInput, setCustomDirectoryInput] = useState('')
   const [isCustomBranch, setIsCustomBranch] = useState(false)
   const [customBranch, setCustomBranch] = useState('')
-  const [selectedProvider, setSelectedProvider] = useState<number | null>(null)
+  const [selectedProvider, setSelectedProvider] = useState<number | null>(
+    () => project?.git_provider_connection_id || null
+  )
   const [selectedRepository, setSelectedRepository] =
     useState<RepositoryResponse | null>(null)
   const [isSelectingRepository, setIsSelectingRepository] = useState(false)
@@ -123,6 +114,26 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
       directory: project?.directory || '',
     },
   })
+
+  // Sync form with project values when project changes
+  useEffect(() => {
+    if (project) {
+      form.reset({
+        branch: project.main_branch || '',
+        preset: project.preset || '',
+        directory: project.directory || '',
+      })
+    }
+  }, [project, form])
+
+  // Watch preset changes for directory field behavior
+  const currentPreset = useWatch({
+    control: form.control,
+    name: 'preset',
+  })
+
+  // State to track if user wants to manually override directory
+  const [allowDirectoryOverride, setAllowDirectoryOverride] = useState(false)
 
   // Fetch git providers
   const { data: providersData, isLoading: isLoadingProviders } = useQuery({
@@ -152,12 +163,6 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
       ),
     [providers, currentConnection?.provider_id]
   )
-  // Set selected provider based on project's git provider connection
-  useEffect(() => {
-    if (project?.git_provider_connection_id && providers.length > 0) {
-      setSelectedProvider(project.git_provider_connection_id)
-    }
-  }, [project?.git_provider_connection_id, providers])
 
   // Fetch branches from repository
   const {
@@ -204,6 +209,13 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
   const branches = useMemo(() => branchesData?.branches || [], [branchesData])
   const currentBranch = useWatch({ control: form.control, name: 'branch' })
 
+  // Derive if the current branch is custom (not in the branches list)
+  const isCurrentBranchCustom = useMemo(() => {
+    if (!currentBranch || branches.length === 0) return false
+    const branchNames = branches.map((b: any) => b.name || b)
+    return !branchNames.includes(currentBranch)
+  }, [currentBranch, branches])
+
   // Get repository ID for live preset detection
   const { data: repositoryData } = useQuery({
     queryKey: [
@@ -243,17 +255,6 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
       !!project?.git_provider_connection_id,
   })
 
-  // Check if current branch is in the list or is custom
-  useEffect(() => {
-    if (currentBranch && branches.length > 0) {
-      const branchNames = branches.map((b: any) => b.name || b)
-      if (!branchNames.includes(currentBranch)) {
-        setIsCustomBranch(true)
-        setCustomBranch(currentBranch)
-      }
-    }
-  }, [currentBranch, branches])
-
   // Get live preset detection for the repository
   const presetQuery = useQuery({
     ...getRepositoryPresetLiveOptions({
@@ -263,27 +264,13 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
   })
 
   const presets = useMemo(() => {
-    if (presetQuery.data?.projects && presetQuery.data.projects.length > 0) {
-      // Map live preset data from projects
-      const projectPresets = presetQuery.data.projects.map((project: any) => ({
-        value: project.preset,
-        label: project.preset_label || project.preset,
-        directory: project.path || './',
+    if (presetQuery.data?.presets && presetQuery.data.presets.length > 0) {
+      // Map live preset data from presets array (new schema)
+      const projectPresets = presetQuery.data.presets.map((preset: any) => ({
+        value: preset.preset,
+        label: preset.preset_label || preset.preset,
+        directory: preset.path || './',
       }))
-
-      // Add root preset if available and not already in projects
-      if (
-        presetQuery.data.root_preset &&
-        !presetQuery.data.projects.some(
-          (p: any) => p.preset === presetQuery.data.root_preset
-        )
-      ) {
-        projectPresets.unshift({
-          value: presetQuery.data.root_preset,
-          label: presetQuery.data.root_preset,
-          directory: './',
-        })
-      }
 
       return projectPresets
     }
@@ -299,10 +286,13 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
   // Unified handler for all git settings
   const handleUpdateSettings = async (values: GitSettingsFormValues) => {
     try {
+      // Extract just the preset name from "preset::path" format for backend
+      const [presetName] = values.preset?.split('::') || ['']
+
       await updateGithubRepo.mutateAsync({
         body: {
           main_branch: values.branch,
-          preset: values.preset,
+          preset: presetName,
           directory: values.directory!,
           repo_owner: project.repo_owner!,
           repo_name: project.repo_name!,
@@ -328,13 +318,17 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
 
     // Update the project with the selected repository
     try {
+      // Extract just the preset name from "preset::path" format for backend
+      const formPreset = form.getValues('preset')
+      const [presetName] = formPreset?.split('::') || ['']
+
       // Update repository information
       await updateGithubRepo.mutateAsync({
         body: {
           repo_owner: repo.owner,
           repo_name: repo.name,
           directory: form.getValues('directory') || './',
-          preset: form.getValues('preset'),
+          preset: presetName,
           main_branch:
             form.getValues('branch') || repo.default_branch || 'main',
         },
@@ -378,7 +372,7 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
     )
     refetch()
   }
-  const directory = useWatch({ control: form.control, name: 'directory' })
+
   return (
     <div className="space-y-6">
       <h3 className="text-lg font-medium">Git Settings</h3>
@@ -413,25 +407,116 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
                 <CardContent className="space-y-6">
                   {/* Repository Info */}
                   <div className="space-y-2">
-                    <Label>Connected Repository</Label>
-                    <div className="flex items-center gap-2 p-4 rounded-lg border bg-muted/50">
-                      <GithubIcon className="h-5 w-5" />
-                      <a
-                        href={getGithubRepoUrl(
-                          project.repo_owner,
-                          project.repo_name
-                        )}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="font-medium hover:underline"
-                      >
-                        {project.repo_owner}/{project.repo_name}
-                      </a>
+                    <div className="flex items-center justify-between">
+                      <Label>Connected Repository</Label>
+                      {isEditingSettings && (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setIsSelectingRepository(true)}
+                        >
+                          Change Repository
+                        </Button>
+                      )}
                     </div>
-                    <p className="text-xs text-muted-foreground">
-                      Seamlessly create Deployments for any commits pushed to
-                      your Git repository.
-                    </p>
+                    {isSelectingRepository && isEditingSettings ? (
+                      <div className="space-y-4">
+                        {/* Git Provider Selection */}
+                        <div className="space-y-2">
+                          <Label htmlFor="change-provider">
+                            Git Provider Connection
+                          </Label>
+                          <Select
+                            value={
+                              selectedProvider?.toString() ||
+                              project.git_provider_connection_id?.toString()
+                            }
+                            onValueChange={(value) => {
+                              setSelectedProvider(Number(value))
+                              setSelectedRepository(null)
+                            }}
+                          >
+                            <SelectTrigger id="change-provider">
+                              <SelectValue placeholder="Select a git provider" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {providers.map((provider) => (
+                                <SelectItem
+                                  key={provider.id}
+                                  value={provider.id.toString()}
+                                >
+                                  <div className="flex items-center gap-2">
+                                    <GithubIcon className="h-4 w-4" />
+                                    {provider.name}
+                                    {provider.is_default && (
+                                      <Badge
+                                        variant="secondary"
+                                        className="ml-2"
+                                      >
+                                        Default
+                                      </Badge>
+                                    )}
+                                  </div>
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+
+                        {/* Repository Selection */}
+                        {(selectedProvider ||
+                          project.git_provider_connection_id) && (
+                          <RepositorySelector
+                            connectionId={
+                              selectedProvider ||
+                              project.git_provider_connection_id!
+                            }
+                            onSelect={(repo) => {
+                              handleRepositorySelect(repo)
+                              setIsSelectingRepository(false)
+                            }}
+                            selectedRepository={selectedRepository}
+                            title="Select New Repository"
+                            description="Choose a repository from your connected git provider"
+                            showAsCard={false}
+                          />
+                        )}
+
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            setIsSelectingRepository(false)
+                            setSelectedRepository(null)
+                          }}
+                        >
+                          Cancel
+                        </Button>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="flex items-center gap-2 p-4 rounded-lg border bg-muted/50">
+                          <GithubIcon className="h-5 w-5" />
+                          <a
+                            href={getGithubRepoUrl(
+                              project.repo_owner,
+                              project.repo_name
+                            )}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="font-medium hover:underline"
+                          >
+                            {project.repo_owner}/{project.repo_name}
+                          </a>
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          Seamlessly create Deployments for any commits pushed
+                          to your Git repository.
+                        </p>
+                      </>
+                    )}
                   </div>
 
                   {/* Git Connection Info */}
@@ -593,205 +678,194 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
                         )}
                       />
 
-                      {/* Mode Toggle */}
-                      <div className="flex items-center justify-between p-3 rounded-lg border bg-muted/50">
-                        <div className="flex items-center gap-2">
-                          <Label className="text-sm">Configuration Mode</Label>
-                          <p className="text-xs text-muted-foreground">
-                            {isManualMode
-                              ? 'Manual entry'
-                              : 'Auto-detected from repository'}
-                          </p>
-                        </div>
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          onClick={() => setIsManualMode(!isManualMode)}
-                        >
-                          {isManualMode ? 'Use Auto-detect' : 'Manual Mode'}
-                        </Button>
-                      </div>
+                      <FormField
+                        control={form.control}
+                        name="preset"
+                        render={({ field }) => {
+                          // Convert stored preset value to select format
+                          const getSelectValue = () => {
+                            if (field.value === 'custom') return 'custom'
+                            if (!field.value) return ''
 
-                      {isManualMode ? (
-                        <>
-                          {/* Manual Mode - Direct Inputs */}
-                          <FormField
-                            control={form.control}
-                            name="preset"
-                            render={({ field }) => (
-                              <FormItem>
-                                <FormLabel>Framework Preset</FormLabel>
-                                <FormControl>
-                                  <Input
-                                    {...field}
-                                    placeholder="e.g., nextjs, vite, rsbuild"
-                                  />
-                                </FormControl>
-                                <FormDescription>
-                                  Enter the framework preset manually
-                                </FormDescription>
-                                <FormMessage />
-                              </FormItem>
-                            )}
-                          />
+                            // Get the current directory to match with preset path
+                            const currentDirectory =
+                              form.getValues('directory') || './'
 
-                          <FormField
-                            control={form.control}
-                            name="directory"
-                            render={({ field }) => (
-                              <FormItem>
+                            // Normalize directory for comparison (remove leading ./)
+                            const normalizeDir = (dir: string) => {
+                              if (!dir || dir === '.' || dir === './')
+                                return 'root'
+                              return dir.startsWith('./') ? dir.slice(2) : dir
+                            }
+
+                            const normalizedCurrentDir =
+                              normalizeDir(currentDirectory)
+
+                            // Find matching preset by both name AND path
+                            const matchingPreset =
+                              presetQuery.data?.presets?.find((p: any) => {
+                                const normalizedPresetPath = normalizeDir(
+                                  p.path
+                                )
+                                return (
+                                  p.preset === field.value &&
+                                  normalizedPresetPath === normalizedCurrentDir
+                                )
+                              })
+
+                            if (matchingPreset) {
+                              return `${matchingPreset.preset}::${normalizeDir(matchingPreset.path)}`
+                            }
+
+                            // Fallback: if no exact match, find by preset name only
+                            const fallbackPreset =
+                              presetQuery.data?.presets?.find(
+                                (p: any) => p.preset === field.value
+                              )
+                            if (fallbackPreset) {
+                              return `${fallbackPreset.preset}::${normalizeDir(fallbackPreset.path)}`
+                            }
+
+                            // Return just the slug if not found in detected presets
+                            return field.value
+                          }
+
+                          const selectValue = getSelectValue()
+
+                          return (
+                            <FormItem>
+                              <FormControl>
+                                <FrameworkSelector
+                                  presetData={presetQuery.data}
+                                  isLoading={presetQuery.isLoading}
+                                  error={presetQuery.error}
+                                  selectedPreset={selectValue}
+                                  onSelectPreset={(value) => {
+                                    if (value === 'custom') {
+                                      field.onChange('custom')
+                                      form.setValue('directory', './')
+                                    } else {
+                                      const [_presetName, presetPath] =
+                                        value.split('::')
+                                      // Store the full preset::path value for proper selection tracking
+                                      field.onChange(value)
+
+                                      // Treat empty, '.', and 'root' as root directory
+                                      if (
+                                        presetPath &&
+                                        presetPath !== 'root' &&
+                                        presetPath !== '.' &&
+                                        presetPath.trim() !== ''
+                                      ) {
+                                        // Remove leading ./ if present in the path
+                                        const cleanPath = presetPath.startsWith(
+                                          './'
+                                        )
+                                          ? presetPath.slice(2)
+                                          : presetPath
+                                        form.setValue(
+                                          'directory',
+                                          `./${cleanPath}`
+                                        )
+                                      } else {
+                                        form.setValue('directory', './')
+                                      }
+                                    }
+                                  }}
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )
+                        }}
+                      />
+
+                      <FormField
+                        control={form.control}
+                        name="directory"
+                        render={({ field }) => {
+                          const isCustomPreset = currentPreset === 'custom'
+                          const canEditDirectory =
+                            isCustomPreset || allowDirectoryOverride
+
+                          return (
+                            <FormItem>
+                              <div className="flex items-center justify-between">
                                 <FormLabel>Root Directory</FormLabel>
-                                <FormControl>
-                                  <Input {...field} placeholder="./" />
-                                </FormControl>
-                                <FormDescription>
-                                  The directory in your repository containing
-                                  the project
-                                </FormDescription>
-                                <FormMessage />
-                              </FormItem>
-                            )}
-                          />
-                        </>
-                      ) : (
-                        <>
-                          {/* Auto Mode - Detected Presets */}
-                          {presetQuery.isLoading ? (
-                            <div className="flex items-center gap-2 text-sm text-muted-foreground p-4">
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                              Detecting frameworks in repository...
-                            </div>
-                          ) : (
-                            <>
-                              <FormField
-                                control={form.control}
-                                name="preset"
-                                render={({ field }) => (
-                                  <FormItem>
-                                    <FormLabel>Framework Preset</FormLabel>
-                                    {showAllPresets ? (
-                                      <FormControl>
-                                        <div className="space-y-4">
-                                          <ScrollArea className="h-[400px] pr-4">
-                                            <div className="grid grid-cols-2 gap-4 p-4">
-                                              {presets.map((preset) => (
-                                                <Card
-                                                  key={preset.value}
-                                                  className={`cursor-pointer transition-all hover:bg-accent ${field.value === preset.value ? 'ring-2 ring-primary' : ''}`}
-                                                  onClick={() => {
-                                                    field.onChange(preset.value)
-                                                    form.setValue(
-                                                      'directory',
-                                                      preset.directory
-                                                    )
-                                                    setShowAllPresets(false)
-                                                  }}
-                                                >
-                                                  <CardContent className="p-6">
-                                                    <div className="flex flex-col items-center gap-2 text-center">
-                                                      <FrameworkIcon
-                                                        preset={
-                                                          preset.value as any
-                                                        }
-                                                      />
-                                                      <div className="font-medium">
-                                                        {preset.label}
-                                                      </div>
-                                                      <div className="text-sm text-muted-foreground">
-                                                        {preset.directory}
-                                                      </div>
-                                                    </div>
-                                                  </CardContent>
-                                                </Card>
-                                              ))}
-                                            </div>
-                                          </ScrollArea>
-                                          <Button
-                                            type="button"
-                                            variant="outline"
-                                            className="w-full"
-                                            onClick={() =>
-                                              setShowAllPresets(false)
-                                            }
-                                          >
-                                            Close
-                                          </Button>
-                                        </div>
-                                      </FormControl>
-                                    ) : (
-                                      <FormControl>
-                                        <div className="flex items-center space-x-4">
-                                          <Card className="grow">
-                                            <CardContent className="flex items-center justify-between p-4">
-                                              <div className="flex items-center space-x-2">
-                                                <FrameworkIcon
-                                                  preset={field.value as any}
-                                                />
-                                                <div>
-                                                  {presets.find(
-                                                    (p) =>
-                                                      p.value === field.value
-                                                  )?.label ||
-                                                    field.value ||
-                                                    'Select preset'}
-                                                </div>
-                                              </div>
-                                              <div className="text-sm text-muted-foreground">
-                                                {presets.find(
-                                                  (p) => p.value === field.value
-                                                )?.directory || directory}
-                                              </div>
-                                            </CardContent>
-                                          </Card>
-                                          <Button
-                                            type="button"
-                                            variant="outline"
-                                            onClick={() =>
-                                              setShowAllPresets(true)
-                                            }
-                                          >
-                                            Change
-                                          </Button>
-                                        </div>
-                                      </FormControl>
-                                    )}
-                                    <FormDescription>
-                                      {presets.length > 0
-                                        ? `${presets.length} framework${presets.length > 1 ? 's' : ''} detected in repository`
-                                        : 'Using default presets'}
-                                    </FormDescription>
-                                    <FormMessage />
-                                  </FormItem>
+                                {!isCustomPreset && !allowDirectoryOverride && (
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() =>
+                                      setAllowDirectoryOverride(true)
+                                    }
+                                    className="h-auto py-1 px-2 text-xs"
+                                  >
+                                    Edit manually
+                                  </Button>
                                 )}
-                              />
-
-                              <FormField
-                                control={form.control}
-                                name="directory"
-                                render={({ field }) => (
-                                  <FormItem>
-                                    <FormLabel>Root Directory</FormLabel>
-                                    <FormControl>
-                                      <div className="flex items-center gap-2 p-3 rounded-lg border bg-muted/50">
-                                        <FolderIcon className="h-4 w-4 text-muted-foreground" />
-                                        <span className="font-mono text-sm">
-                                          {field.value}
-                                        </span>
-                                      </div>
-                                    </FormControl>
-                                    <FormDescription>
-                                      Directory is set automatically based on
-                                      selected preset
-                                    </FormDescription>
-                                    <FormMessage />
-                                  </FormItem>
+                                {!isCustomPreset && allowDirectoryOverride && (
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() => {
+                                      setAllowDirectoryOverride(false)
+                                      // Reset to preset-based directory if available
+                                      const presetValue =
+                                        form.getValues('preset')
+                                      if (
+                                        presetValue &&
+                                        presetValue !== 'custom'
+                                      ) {
+                                        const [, presetPath] =
+                                          presetValue.split('::')
+                                        if (
+                                          presetPath &&
+                                          presetPath !== 'root'
+                                        ) {
+                                          const cleanPath =
+                                            presetPath.startsWith('./')
+                                              ? presetPath.slice(2)
+                                              : presetPath
+                                          form.setValue(
+                                            'directory',
+                                            `./${cleanPath}`
+                                          )
+                                        } else {
+                                          form.setValue('directory', './')
+                                        }
+                                      }
+                                    }}
+                                    className="h-auto py-1 px-2 text-xs"
+                                  >
+                                    Reset to preset
+                                  </Button>
                                 )}
-                              />
-                            </>
-                          )}
-                        </>
-                      )}
+                              </div>
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  placeholder="./"
+                                  readOnly={!canEditDirectory}
+                                  className={
+                                    !canEditDirectory
+                                      ? 'bg-muted cursor-not-allowed'
+                                      : ''
+                                  }
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                {canEditDirectory
+                                  ? 'Enter the directory path manually'
+                                  : 'Directory is set automatically based on selected preset'}
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )
+                        }}
+                      />
                     </>
                   ) : (
                     <>
@@ -977,225 +1051,200 @@ export function GitSettings({ project, refetch }: GitSettingsProps) {
                   </div>
                 )}
 
-                {/* Framework Preset Selection */}
-                <Form {...form}>
-                  <FormField
-                    control={form.control}
-                    name="preset"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Framework Preset</FormLabel>
-                        {showAllPresets ? (
-                          <FormControl>
-                            <div className="space-y-4">
-                              <ScrollArea className="h-[400px] pr-4">
-                                <div className="grid grid-cols-2 gap-4 p-4">
-                                  {presets.map((preset) => (
-                                    <Card
-                                      key={preset.value}
-                                      className={`cursor-pointer transition-all hover:bg-accent ${field.value === preset.value ? 'ring-2 ring-primary' : ''}`}
-                                      onClick={() => {
-                                        field.onChange(preset.value)
+                {/* Framework Preset Selection - Using FrameworkSelector */}
+                {selectedRepository && (
+                  <Form {...form}>
+                    <FormField
+                      control={form.control}
+                      name="preset"
+                      render={({ field }) => {
+                        // Convert stored preset value to select format
+                        const getSelectValue = () => {
+                          if (field.value === 'custom') return 'custom'
+                          if (!field.value) return ''
+
+                          // Get the current directory to match with preset path
+                          const currentDirectory =
+                            form.getValues('directory') || './'
+
+                          // Normalize directory for comparison (remove leading ./)
+                          const normalizeDir = (dir: string) => {
+                            if (!dir || dir === '.' || dir === './')
+                              return 'root'
+                            return dir.startsWith('./') ? dir.slice(2) : dir
+                          }
+
+                          const normalizedCurrentDir =
+                            normalizeDir(currentDirectory)
+
+                          // Find matching preset by both name AND path
+                          const matchingPreset =
+                            presetQuery.data?.presets?.find((p: any) => {
+                              const normalizedPresetPath = normalizeDir(p.path)
+                              return (
+                                p.preset === field.value &&
+                                normalizedPresetPath === normalizedCurrentDir
+                              )
+                            })
+
+                          if (matchingPreset) {
+                            return `${matchingPreset.preset}::${normalizeDir(matchingPreset.path)}`
+                          }
+
+                          // Fallback: if no exact match, find by preset name only
+                          const fallbackPreset =
+                            presetQuery.data?.presets?.find(
+                              (p: any) => p.preset === field.value
+                            )
+                          if (fallbackPreset) {
+                            return `${fallbackPreset.preset}::${normalizeDir(fallbackPreset.path)}`
+                          }
+
+                          // Return just the slug if not found in detected presets
+                          return field.value
+                        }
+
+                        const selectValue = getSelectValue()
+
+                        return (
+                          <FormItem>
+                            <FormControl>
+                              <FrameworkSelector
+                                presetData={presetQuery.data}
+                                isLoading={presetQuery.isLoading}
+                                error={presetQuery.error}
+                                selectedPreset={selectValue}
+                                onSelectPreset={(value) => {
+                                  if (value === 'custom') {
+                                    field.onChange('custom')
+                                    form.setValue('directory', './')
+                                  } else {
+                                    const [_presetName, presetPath] =
+                                      value.split('::')
+                                    // Store the full preset::path value for proper selection tracking
+                                    field.onChange(value)
+
+                                    // Treat empty, '.', and 'root' as root directory
+                                    if (
+                                      presetPath &&
+                                      presetPath !== 'root' &&
+                                      presetPath !== '.' &&
+                                      presetPath.trim() !== ''
+                                    ) {
+                                      // Remove leading ./ if present in the path
+                                      const cleanPath = presetPath.startsWith(
+                                        './'
+                                      )
+                                        ? presetPath.slice(2)
+                                        : presetPath
+                                      form.setValue(
+                                        'directory',
+                                        `./${cleanPath}`
+                                      )
+                                    } else {
+                                      form.setValue('directory', './')
+                                    }
+                                  }
+                                }}
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )
+                      }}
+                    />
+
+                    {/* Directory Field */}
+                    <FormField
+                      control={form.control}
+                      name="directory"
+                      render={({ field }) => {
+                        const isCustomPreset = currentPreset === 'custom'
+                        const canEditDirectory =
+                          isCustomPreset || allowDirectoryOverride
+
+                        return (
+                          <FormItem>
+                            <div className="flex items-center justify-between">
+                              <FormLabel>Root Directory</FormLabel>
+                              {!isCustomPreset && !allowDirectoryOverride && (
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="sm"
+                                  onClick={() =>
+                                    setAllowDirectoryOverride(true)
+                                  }
+                                  className="h-auto py-1 px-2 text-xs"
+                                >
+                                  Edit manually
+                                </Button>
+                              )}
+                              {!isCustomPreset && allowDirectoryOverride && (
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="sm"
+                                  onClick={() => {
+                                    setAllowDirectoryOverride(false)
+                                    // Reset to preset-based directory if available
+                                    const presetValue = form.getValues('preset')
+                                    if (
+                                      presetValue &&
+                                      presetValue !== 'custom'
+                                    ) {
+                                      const [, presetPath] =
+                                        presetValue.split('::')
+                                      if (presetPath && presetPath !== 'root') {
+                                        const cleanPath = presetPath.startsWith(
+                                          './'
+                                        )
+                                          ? presetPath.slice(2)
+                                          : presetPath
                                         form.setValue(
                                           'directory',
-                                          preset.directory
+                                          `./${cleanPath}`
                                         )
-                                        setShowAllPresets(false)
-                                      }}
-                                    >
-                                      <CardContent className="p-6">
-                                        <div className="flex flex-col items-center gap-2 text-center">
-                                          <FrameworkIcon
-                                            preset={preset.value as any}
-                                          />
-                                          <div className="font-medium">
-                                            {preset.label}
-                                          </div>
-                                          <div className="text-sm text-muted-foreground">
-                                            {preset.directory}
-                                          </div>
-                                        </div>
-                                      </CardContent>
-                                    </Card>
-                                  ))}
-                                </div>
-                              </ScrollArea>
-                            </div>
-                          </FormControl>
-                        ) : (
-                          <FormControl>
-                            <div className="flex items-center space-x-4">
-                              <Card className="grow">
-                                <CardContent className="flex items-center justify-between p-4">
-                                  <div className="flex items-center space-x-2">
-                                    <FrameworkIcon
-                                      preset={field.value as any}
-                                    />
-                                    <div>
-                                      {presets.find(
-                                        (p) => p.value === field.value
-                                      )?.label || 'Select preset'}
-                                    </div>
-                                  </div>
-                                  <div className="text-sm text-muted-foreground">
-                                    {
-                                      presets.find(
-                                        (p) => p.value === field.value
-                                      )?.directory
+                                      } else {
+                                        form.setValue('directory', './')
+                                      }
                                     }
-                                  </div>
-                                </CardContent>
-                              </Card>
-                              <Button
-                                type="button"
-                                variant="outline"
-                                onClick={() => setShowAllPresets(true)}
-                              >
-                                Change
-                              </Button>
+                                  }}
+                                  className="h-auto py-1 px-2 text-xs"
+                                >
+                                  Reset to preset
+                                </Button>
+                              )}
                             </div>
-                          </FormControl>
-                        )}
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-
-                  {/* Directory Field */}
-                  <FormField
-                    control={form.control}
-                    name="directory"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Directory</FormLabel>
-                        <FormControl>
-                          <Input {...field} placeholder="./" />
-                        </FormControl>
-                        <FormDescription>
-                          The directory in your repository containing the
-                          project to deploy
-                        </FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                </Form>
+                            <FormControl>
+                              <Input
+                                {...field}
+                                placeholder="./"
+                                readOnly={!canEditDirectory}
+                                className={
+                                  !canEditDirectory
+                                    ? 'bg-muted cursor-not-allowed'
+                                    : ''
+                                }
+                              />
+                            </FormControl>
+                            <FormDescription>
+                              {canEditDirectory
+                                ? 'Enter the directory path manually'
+                                : 'Directory is set automatically based on selected preset'}
+                            </FormDescription>
+                            <FormMessage />
+                          </FormItem>
+                        )
+                      }}
+                    />
+                  </Form>
+                )}
               </CardContent>
             </Card>
           )}
         </div>
       )}
-
-      {/* Directory Selection Dialog */}
-      <Dialog
-        open={isDirectoryDialogOpen}
-        onOpenChange={setIsDirectoryDialogOpen}
-      >
-        <DialogContent className="sm:max-w-[500px]">
-          <DialogHeader>
-            <DialogTitle>Root Directory</DialogTitle>
-          </DialogHeader>
-          <div className="py-4">
-            <p className="text-sm text-muted-foreground mb-4">
-              Select the directory where your source code is located.
-            </p>
-            <div className="space-y-2">
-              <div className="flex items-center gap-2 mb-4">
-                <GithubIcon className="h-5 w-5" />
-                <span className="font-medium">
-                  {project.repo_owner}/{project.repo_name}
-                </span>
-              </div>
-              <div className="border rounded-md divide-y">
-                {presets.map((preset) => (
-                  <div
-                    key={preset.value}
-                    className={`flex items-center gap-3 p-3 cursor-pointer hover:bg-accent ${
-                      !showCustomDirectory && directory === preset.directory
-                        ? 'bg-accent'
-                        : ''
-                    }`}
-                    onClick={() => {
-                      setShowCustomDirectory(false)
-                      form.setValue('directory', preset.directory)
-                      setIsDirectoryDialogOpen(false)
-                    }}
-                  >
-                    <input
-                      type="radio"
-                      checked={
-                        !showCustomDirectory && directory === preset.directory
-                      }
-                      onChange={() => {}}
-                      className="h-4 w-4"
-                    />
-                    <div className="flex-1">
-                      <div className="flex items-center gap-2">
-                        <FrameworkIcon
-                          preset={preset.value as any}
-                          className="h-5 w-5"
-                        />
-                        <span>{preset.label}</span>
-                      </div>
-                      <span className="text-sm text-muted-foreground">
-                        {preset.directory}
-                      </span>
-                    </div>
-                  </div>
-                ))}
-                <div
-                  className={`flex items-center gap-3 p-3 cursor-pointer hover:bg-accent ${showCustomDirectory ? 'bg-accent' : ''}`}
-                  onClick={() => setShowCustomDirectory(true)}
-                >
-                  <input
-                    type="radio"
-                    checked={showCustomDirectory}
-                    onChange={() => {}}
-                    className="h-4 w-4"
-                  />
-                  <div className="flex-1">
-                    <div className="flex items-center gap-2">
-                      <FolderIcon className="h-5 w-5" />
-                      <span>Custom Directory</span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {showCustomDirectory && (
-                <div className="mt-4 space-y-2">
-                  <div>
-                    <div className="font-medium text-sm mb-1.5">
-                      Enter Directory Path
-                    </div>
-                    <div className="flex gap-2">
-                      <Input
-                        value={customDirectoryInput}
-                        onChange={(e) =>
-                          setCustomDirectoryInput(e.target.value)
-                        }
-                        placeholder="e.g., ./apps/frontend"
-                      />
-                      <Button
-                        onClick={() => {
-                          form.setValue('directory', customDirectoryInput)
-                          setIsDirectoryDialogOpen(false)
-                        }}
-                      >
-                        Confirm
-                      </Button>
-                    </div>
-                    <p className="text-sm text-muted-foreground">
-                      Enter the relative path to your project&apos;s root
-                      directory
-                    </p>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
     </div>
   )
 }

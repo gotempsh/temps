@@ -53,6 +53,45 @@ import { format } from 'date-fns'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 
+// Helper component to display permissions with show more/less functionality
+interface PermissionsDisplayProps {
+  permissions: string[]
+}
+
+function PermissionsDisplay({ permissions }: PermissionsDisplayProps) {
+  const [showAll, setShowAll] = useState(false)
+  const displayPermissions = showAll ? permissions : permissions.slice(0, 10)
+  const hasMore = permissions.length > 10
+
+  return (
+    <>
+      <div className="flex flex-wrap gap-2 mt-2">
+        {displayPermissions.map((permission: string) => (
+          <Badge key={permission} variant="secondary">
+            {permission}
+          </Badge>
+        ))}
+      </div>
+      <div className="flex items-center justify-between mt-2">
+        <p className="text-sm text-muted-foreground">
+          Total: {permissions.length} permission
+          {permissions.length !== 1 ? 's' : ''}
+        </p>
+        {hasMore && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-sm h-auto p-0"
+            onClick={() => setShowAll(!showAll)}
+          >
+            {showAll ? 'Show less' : `Show ${permissions.length - 10} more`}
+          </Button>
+        )}
+      </div>
+    </>
+  )
+}
+
 export default function ApiKeyDetail() {
   const navigate = useNavigate()
   const { id } = useParams<{ id: string }>()
@@ -413,57 +452,15 @@ export default function ApiKeyDetail() {
 
               <div>
                 <Label className="text-muted-foreground">Permissions</Label>
-                {(() => {
-                  // Get role-based permissions if not custom
-                  const rolePermissions =
-                    apiKey.role_type !== 'custom'
-                      ? permissionsData?.roles.find(
-                          (r) => r.name === apiKey.role_type
-                        )?.permissions || []
-                      : []
-
-                  // Use custom permissions or role permissions
-                  const allPermissions =
+                <PermissionsDisplay
+                  permissions={
                     apiKey.role_type === 'custom' && apiKey.permissions
                       ? apiKey.permissions
-                      : rolePermissions
-
-                  const [showAll, setShowAll] = useState(false)
-                  const displayPermissions = showAll
-                    ? allPermissions
-                    : allPermissions.slice(0, 10)
-                  const hasMore = allPermissions.length > 10
-
-                  return (
-                    <>
-                      <div className="flex flex-wrap gap-2 mt-2">
-                        {displayPermissions.map((permission: string) => (
-                          <Badge key={permission} variant="secondary">
-                            {permission}
-                          </Badge>
-                        ))}
-                      </div>
-                      <div className="flex items-center justify-between mt-2">
-                        <p className="text-sm text-muted-foreground">
-                          Total: {allPermissions.length} permission
-                          {allPermissions.length !== 1 ? 's' : ''}
-                        </p>
-                        {hasMore && (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="text-sm h-auto p-0"
-                            onClick={() => setShowAll(!showAll)}
-                          >
-                            {showAll
-                              ? 'Show less'
-                              : `Show ${allPermissions.length - 10} more`}
-                          </Button>
-                        )}
-                      </div>
-                    </>
-                  )
-                })()}
+                      : permissionsData?.roles.find(
+                          (r) => r.name === apiKey.role_type
+                        )?.permissions || []
+                  }
+                />
               </div>
             </>
           ) : (

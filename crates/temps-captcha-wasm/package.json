@@ -1,0 +1,27 @@
+{
+  "name": "temps-captcha-wasm",
+  "version": "0.1.0",
+  "description": "WebAssembly proof-of-work solver for Temps CAPTCHA",
+  "main": "pkg/temps_captcha_wasm.js",
+  "types": "pkg/temps_captcha_wasm.d.ts",
+  "files": [
+    "pkg"
+  ],
+  "scripts": {
+    "build": "wasm-pack build --target web --release",
+    "build:dev": "wasm-pack build --target web --dev",
+    "test": "wasm-pack test --headless --firefox"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/temps"
+  },
+  "keywords": [
+    "wasm",
+    "captcha",
+    "proof-of-work",
+    "ddos-protection"
+  ],
+  "author": "Temps Team",
+  "license": "MIT OR Apache-2.0"
+}

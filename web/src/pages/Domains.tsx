@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { listDomainsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { DomainsManagement } from '@/components/domains/DomainsManagement'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useEffect } from 'react'
 
@@ -18,6 +19,9 @@ export function Domains() {
   useEffect(() => {
     setBreadcrumbs([{ label: 'Domains' }])
   }, [setBreadcrumbs])
+
+  // Keyboard shortcut: N to add new domain
+  useKeyboardShortcut({ key: 'n', path: '/domains/add' })
 
   usePageTitle('Domains')
 

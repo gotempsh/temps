@@ -88,17 +88,16 @@ let router: Router = Router::new()
 - `GET /dns/lookup?domain=<domain>` - DNS A record lookup for a domain
 */
 
-pub mod types;
-pub mod services;
-pub mod routes;
 pub mod plugin;
+pub mod routes;
+pub mod services;
+pub mod types;
 
 // Re-export commonly used types and services
-pub use types::{
-    PlatformInfo, ServerMode, ServiceAccessInfo,
-    PublicIpInfo, PrivateIpInfo, NetworkInterface,
-    DnsLookupRequest, DnsLookupResponse, DnsLookupError
-};
-pub use services::{PlatformInfoService, DnsService};
-pub use routes::{configure_routes, InfraAppState, PlatformInfoApiDoc, DnsApiDoc, DnsAppState};
 pub use plugin::{InfraPlugin, InfraState};
+pub use routes::{configure_routes, DnsApiDoc, DnsAppState, InfraAppState, PlatformInfoApiDoc};
+pub use services::{DnsService, PlatformInfoService};
+pub use types::{
+    DnsLookupError, DnsLookupRequest, DnsLookupResponse, NetworkInterface, PlatformInfo,
+    PrivateIpInfo, PublicIpInfo, ServerMode, ServiceAccessInfo,
+};

@@ -4,6 +4,10 @@ import { useTheme } from 'next-themes'
 import { useMemo } from 'react'
 
 const serviceLogos: Record<ServiceType, { src: string; alt: string }> = {
+  mongodb: {
+    src: '/storage/mongodb.svg',
+    alt: 'MongoDB logo',
+  },
   postgres: {
     src: '/storage/postgresql.svg',
     alt: 'PostgreSQL logo',

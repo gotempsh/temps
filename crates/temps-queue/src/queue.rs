@@ -2,9 +2,8 @@ use std::sync::Arc;
 
 use temps_core::async_trait::async_trait;
 use temps_core::{
-    CalculateRepositoryPresetJob, Job, JobQueue, JobReceiver,
-    ProvisionCertificateJob, QueueError, RenewCertificateJob,
-    UpdateRepoFrameworkJob,
+    CalculateRepositoryPresetJob, Job, JobQueue, JobReceiver, ProvisionCertificateJob, QueueError,
+    RenewCertificateJob, UpdateRepoFrameworkJob,
 };
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc};
@@ -415,7 +414,6 @@ impl QueueService {
             })?;
         Ok(())
     }
-
 
     pub async fn launch_certificate_provision(
         &self,

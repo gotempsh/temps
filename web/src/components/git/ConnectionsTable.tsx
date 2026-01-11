@@ -2,6 +2,8 @@
 
 import { useState } from 'react'
 import { ConnectionResponse, ProviderResponse } from '@/api/client/types.gen'
+import { deleteConnectionMutation } from '@/api/client/@tanstack/react-query.gen'
+import { isGitHubApp, isGitLabOAuth } from '@/lib/provider'
 import { UpdateTokenDialog } from '@/components/git/UpdateTokenDialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -13,6 +15,16 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import {
   CheckCircle2,
@@ -26,6 +38,7 @@ import {
   ChevronsRight,
   ExternalLink,
   Key,
+  Trash2,
 } from 'lucide-react'
 import {
   Select,
@@ -34,14 +47,17 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 
 interface ConnectionsTableProps {
   connections: ConnectionResponse[]
   provider?: ProviderResponse
   onSyncRepository: (connectionId: number) => void
   onAuthorize?: () => void
+  onInstallGitHubApp?: () => void
   isSyncing: boolean
-  isAuthorizing?: boolean
+  onConnectionDeleted?: () => void
 }
 
 const PAGE_SIZES = [5, 10, 20, 50] as const
@@ -51,9 +67,11 @@ export function ConnectionsTable({
   provider,
   onSyncRepository,
   onAuthorize,
+  onInstallGitHubApp,
   isSyncing,
-  isAuthorizing = false,
+  onConnectionDeleted,
 }: ConnectionsTableProps) {
+  const queryClient = useQueryClient()
   const [currentPage, setCurrentPage] = useState(1)
   const [pageSize, setPageSize] = useState(10)
   const [updateTokenDialog, setUpdateTokenDialog] = useState<{
@@ -64,6 +82,29 @@ export function ConnectionsTable({
     open: false,
     connectionId: 0,
     connectionName: '',
+  })
+  const [deleteDialog, setDeleteDialog] = useState<{
+    open: boolean
+    connectionId: number
+    connectionName: string
+  }>({
+    open: false,
+    connectionId: 0,
+    connectionName: '',
+  })
+
+  const deleteConnectionMut = useMutation({
+    ...deleteConnectionMutation(),
+    onSuccess: () => {
+      toast.success('Connection deleted successfully')
+      queryClient.invalidateQueries({ queryKey: ['listConnections'] })
+      setDeleteDialog({ open: false, connectionId: 0, connectionName: '' })
+      // Call the callback to refresh connections in parent component
+      onConnectionDeleted?.()
+    },
+    onError: () => {
+      toast.error('Failed to delete connection')
+    },
   })
 
   const totalItems = connections.length
@@ -87,13 +128,15 @@ export function ConnectionsTable({
     setCurrentPage(1) // Reset to first page when changing page size
   }
 
-  // Helper to check if provider is OAuth-based (GitHub App or GitLab OAuth)
-  const isOAuthProvider =
+  // Helper to check if provider is PAT-based (GitHub PAT or GitLab PAT)
+  const isPATProvider =
     provider &&
     ((provider.provider_type === 'github' &&
-      (provider.auth_method === 'app' ||
-        provider.auth_method === 'github_app')) ||
-      (provider.provider_type === 'gitlab' && provider.auth_method === 'oauth'))
+      (provider.auth_method === 'pat' ||
+        provider.auth_method === 'github_pat')) ||
+      (provider.provider_type === 'gitlab' &&
+        (provider.auth_method === 'pat' ||
+          provider.auth_method === 'gitlab_pat')))
 
   if (totalItems === 0) {
     return null // Let parent handle empty state
@@ -102,21 +145,18 @@ export function ConnectionsTable({
   return (
     <div className="space-y-4">
       {/* Action Buttons */}
-      {isOAuthProvider && onAuthorize && (
-        <div className="flex justify-end">
-          <Button
-            variant="default"
-            size="sm"
-            onClick={onAuthorize}
-            disabled={isAuthorizing}
-            className="gap-2"
-          >
-            <ExternalLink className="h-4 w-4" />
-            {isAuthorizing ? 'Authorizing...' : 'Authorize'}
-          </Button>
-        </div>
+      {provider && isGitHubApp(provider) && (
+        <Button onClick={onInstallGitHubApp} className="gap-2">
+          <ExternalLink className="h-4 w-4" />
+          Install GitHub App
+        </Button>
       )}
-
+      {provider && isGitLabOAuth(provider) && (
+        <Button onClick={onAuthorize} className="gap-2">
+          <ExternalLink className="h-4 w-4" />
+          Authorize
+        </Button>
+      )}
       {/* Table */}
       <div className="overflow-x-auto">
         <Table>
@@ -221,20 +261,41 @@ export function ConnectionsTable({
                         className={`h-4 w-4 ${isSyncing ? 'animate-spin' : ''}`}
                       />
                     </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() =>
-                        setUpdateTokenDialog({
-                          open: true,
-                          connectionId: connection.id,
-                          connectionName: connection.account_name,
-                        })
-                      }
-                      title="Update access token"
-                    >
-                      <Key className="h-4 w-4" />
-                    </Button>
+                    {/* Only show Update Token button for PAT-based providers */}
+                    {isPATProvider && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() =>
+                          setUpdateTokenDialog({
+                            open: true,
+                            connectionId: connection.id,
+                            connectionName: connection.account_name,
+                          })
+                        }
+                        title="Update access token"
+                      >
+                        <Key className="h-4 w-4" />
+                      </Button>
+                    )}
+                    {/* Only show Delete button for GitHub App providers */}
+                    {provider && isGitHubApp(provider) && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() =>
+                          setDeleteDialog({
+                            open: true,
+                            connectionId: connection.id,
+                            connectionName: connection.account_name,
+                          })
+                        }
+                        title="Delete connection"
+                        className="text-destructive hover:text-destructive"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    )}
                   </div>
                 </TableCell>
               </TableRow>
@@ -333,6 +394,55 @@ export function ConnectionsTable({
           })
         }
       />
+
+      {/* Delete Connection Confirmation Dialog */}
+      <AlertDialog
+        open={deleteDialog.open}
+        onOpenChange={(open) =>
+          setDeleteDialog({
+            ...deleteDialog,
+            open,
+          })
+        }
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete Connection</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to delete the connection for{' '}
+              <strong>{deleteDialog.connectionName}</strong>? This action cannot
+              be undone and will remove all associated repositories from this
+              connection.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleteConnectionMut.isPending}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() =>
+                deleteConnectionMut.mutate({
+                  path: { connection_id: deleteDialog.connectionId },
+                })
+              }
+              disabled={deleteConnectionMut.isPending}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deleteConnectionMut.isPending ? (
+                <>
+                  <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                  Deleting...
+                </>
+              ) : (
+                <>
+                  <Trash2 className="mr-2 h-4 w-4" />
+                  Delete
+                </>
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

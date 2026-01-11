@@ -1,8 +1,8 @@
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashMap;
-use temps_core::AuditOperation;
 pub use temps_core::AuditContext;
+use temps_core::AuditOperation;
 
 // Re-export AuditContext from temps_audit
 
@@ -47,6 +47,16 @@ pub struct BackupRunAudit {
     pub source_id: i32,
     pub source_name: String,
     pub backup_id: String,
+    pub backup_type: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceBackupRunAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub service_name: String,
+    pub service_type: String,
+    pub backup_id: i32,
     pub backup_type: String,
 }
 
@@ -147,6 +157,29 @@ impl AuditOperation for BackupScheduleStatusChangedAudit {
 impl AuditOperation for BackupRunAudit {
     fn operation_type(&self) -> String {
         "BACKUP_RUN".to_string()
+    }
+
+    fn user_id(&self) -> i32 {
+        self.context.user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for ExternalServiceBackupRunAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_BACKUP_RUN".to_string()
     }
 
     fn user_id(&self) -> i32 {

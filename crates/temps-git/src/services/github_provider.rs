@@ -17,7 +17,9 @@ use tracing::{debug, error, info};
 #[derive(Deserialize)]
 struct OAuthTokenResponse {
     access_token: String,
+    #[allow(dead_code)]
     token_type: Option<String>,
+    #[allow(dead_code)]
     scope: Option<String>,
 }
 
@@ -59,6 +61,7 @@ struct GitHubOwner {
 #[derive(Deserialize)]
 struct InstallationRepositoriesResponse {
     repositories: Vec<GitHubRepo>,
+    #[allow(dead_code)]
     total_count: i32,
 }
 
@@ -298,7 +301,7 @@ impl GitHubProvider {
                     .get("X-RateLimit-Remaining")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<i32>().ok())
-                    .map_or(false, |remaining| remaining == 0)
+                    == Some(0)
                 {
                     Err(GitProviderError::RateLimitExceeded)
                 } else {
@@ -438,7 +441,7 @@ impl GitProviderService for GitHubProvider {
                     .get("X-RateLimit-Remaining")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<i32>().ok())
-                    .map_or(false, |remaining| remaining == 0)
+                    == Some(0)
                 {
                     Err(GitProviderError::RateLimitExceeded)
                 } else {
@@ -924,7 +927,7 @@ impl GitProviderService for GitHubProvider {
             author_email: commit_response.commit.author.email,
             date: DateTime::parse_from_rfc3339(&commit_response.commit.author.date)
                 .map(|dt| dt.into())
-                .unwrap_or_else(|_| chrono::Utc::now().into()),
+                .unwrap_or_else(|_| chrono::Utc::now()),
         })
     }
 
@@ -1321,5 +1324,22 @@ impl GitProviderService for GitHubProvider {
 
         info!("Successfully downloaded archive to {:?}", target_path);
         Ok(())
+    }
+
+    async fn create_source(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+    ) -> Result<Box<dyn temps_presets::source::ProjectSource>, GitProviderError> {
+        let octocrab = self.get_octocrab_client(access_token).await?;
+
+        Ok(Box::new(crate::sources::GitHubSource::new(
+            std::sync::Arc::new(octocrab),
+            owner.to_string(),
+            repo.to_string(),
+            reference.to_string(),
+        )))
     }
 }

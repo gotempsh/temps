@@ -5,10 +5,9 @@ import { Card, CardContent } from '@/components/ui/card'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useQuery } from '@tanstack/react-query'
-import { Camera, GitBranch, GitCommit, Settings } from 'lucide-react'
+import { Camera, ExternalLink, GitBranch, Settings } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { DeploymentStatusBadge } from '../deployment/DeploymentStatusBadge'
-import { CopyButton } from '../ui/copy-button'
 
 interface LastDeploymentProps {
   deployment: DeploymentResponse
@@ -70,7 +69,9 @@ export function LastDeployment({
                     <p className="text-gray-400 text-lg">
                       {deployment.status === 'completed'
                         ? 'Generating screenshot...'
-                        : 'Building...'}
+                        : deployment.status === 'running'
+                          ? 'Deployment in progress...'
+                          : 'Waiting for deployment...'}
                     </p>
                   </CardContent>
                 </Card>
@@ -81,31 +82,33 @@ export function LastDeployment({
             <h3 className="text-lg font-semibold mb-2">
               Deployment Information
             </h3>
-            {/* <div className="space-y-2 mb-4 flex flex-col gap-2"> */}
             <div className="flex flex-col items-start gap-2 mb-4">
               {deployment.environment.domains.map((domain) => {
+                const url = domain.startsWith('http')
+                  ? domain
+                  : `https://${domain}`
                 return (
-                  <CopyButton
+                  <div
                     key={domain}
-                    value={domain}
-                    className="p-0 h-auto hover:bg-transparent w-full text-left"
-                    variant="ghost"
+                    className="flex items-center gap-1 cursor-pointer hover:opacity-80 transition-opacity"
+                    onClick={() => window.open(url, '_blank')}
                   >
-                    <span className="text-sm text-muted-foreground">
+                    <span className="text-sm text-muted-foreground truncate">
                       {domain}
                     </span>
-                  </CopyButton>
+                    <ExternalLink className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                  </div>
                 )
               })}
-              <CopyButton
-                value={deployment.url}
-                className="p-0 h-auto hover:bg-transparent w-full text-left"
-                variant="ghost"
+              <div
+                className="flex items-center gap-1 cursor-pointer hover:opacity-80 transition-opacity"
+                onClick={() => window.open(deployment.url, '_blank')}
               >
-                <span className="text-sm text-muted-foreground">
+                <span className="text-sm text-muted-foreground truncate">
                   {deployment.url}
                 </span>
-              </CopyButton>
+                <ExternalLink className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+              </div>
             </div>
 
             <h4 className="text-sm font-semibold mb-2">Status</h4>
@@ -117,22 +120,13 @@ export function LastDeployment({
               </span>
             </div>
 
-            {deployment.message && (
-              <div className="mb-4">
-                <p className="text-sm text-muted-foreground">
-                  {deployment.message}
-                </p>
-              </div>
-            )}
-
             <h4 className="text-sm font-semibold mb-2">Source</h4>
             <div className="text-sm space-y-1">
               <p className="flex items-center text-muted-foreground">
                 <GitBranch className="mr-2 h-4 w-4" />
                 {deployment.branch}
               </p>
-              <p className="flex items-center text-muted-foreground">
-                <GitCommit className="mr-2 h-4 w-4" />
+              <p className="flex items-start text-muted-foreground">
                 {deployment.commit_hash?.slice(0, 7)}&nbsp;
                 <span className="font-medium text-foreground ml-1">
                   {deployment.commit_message}

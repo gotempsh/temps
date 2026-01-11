@@ -21,11 +21,12 @@ use cookie::Cookie;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 pub use temps_core::AuditContext;
-use temps_core::RequestMetadata;
+use temps_core::{problemdetails, RequestMetadata};
 use temps_entities::types::RoleType;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::types::{
@@ -50,7 +51,13 @@ use temps_core::problemdetails::{new as problem_new, Problem};
     tag = "Authentication"
 )]
 pub async fn get_current_user(RequireAuth(auth): RequireAuth) -> impl IntoResponse {
-    let user = auth.user;
+    // Require a user for this endpoint (deployment tokens not allowed)
+    let user = match auth.require_user() {
+        Ok(u) => u,
+        Err(msg) => {
+            return (StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response();
+        }
+    };
     let user_response = UserResponse {
         id: user.id,
         username: user.name.clone(),
@@ -84,7 +91,13 @@ pub async fn logout(
     Extension(metadata): Extension<RequestMetadata>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let user = auth.user;
+    // Require a user for this endpoint (deployment tokens not allowed)
+    let user = match auth.require_user() {
+        Ok(u) => u,
+        Err(msg) => {
+            return (StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response();
+        }
+    };
     let audit_context = AuditContext {
         user_id: user.id,
         ip_address: Some(metadata.ip_address.to_string()),
@@ -1074,8 +1087,8 @@ async fn assign_role(
 
     // Verify role type is valid
     let role_type = match RoleType::from_str(&assign_req.role_type) {
-        Some(rt) => rt,
-        None => {
+        Ok(rt) => rt,
+        Err(_) => {
             error!("Invalid role type: {}", assign_req.role_type);
             return Err(temps_core::error_builder::bad_request()
                 .detail(format!("Invalid role type: {}", assign_req.role_type))
@@ -1147,11 +1160,18 @@ async fn create_user(
         create_req.email.clone().unwrap_or("no email".to_string())
     );
 
+    // Debug: Check if password was provided
+    if create_req.password.is_some() {
+        debug!("Password provided for new user (will be hashed)");
+    } else {
+        warn!("No password provided for new user - user will not be able to login with password!");
+    }
+
     // Convert role strings to RoleTypes
     let roles: Vec<RoleType> = create_req
         .roles
         .iter()
-        .filter_map(|r| RoleType::from_str(r))
+        .filter_map(|r| RoleType::from_str(r).ok())
         .collect();
 
     let user = app_state
@@ -1317,8 +1337,8 @@ async fn remove_role(
 
     // Verify role type is valid
     let role_type = match RoleType::from_str(&role_type) {
-        Some(rt) => rt,
-        None => {
+        Ok(rt) => rt,
+        Err(_) => {
             error!("Invalid role type: {}", role_type);
             return Err(temps_core::error_builder::bad_request()
                 .detail(format!("Invalid role type: {}", role_type))
@@ -1390,7 +1410,11 @@ async fn update_self(
 
     let updated_user = app_state
         .user_service
-        .update_user(auth.user_id(), update_req.email.clone(), update_req.name.clone())
+        .update_user(
+            auth.user_id(),
+            update_req.email.clone(),
+            update_req.name.clone(),
+        )
         .await?;
 
     // Create audit log
@@ -1595,6 +1619,13 @@ async fn verify_and_enable_mfa(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, UsersWrite);
 
+    // Require a user for this endpoint (deployment tokens not allowed)
+    let user = auth.require_user().map_err(|msg| {
+        problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("User Required")
+            .with_detail(msg)
+    })?;
+
     app_state
         .user_service
         .verify_and_enable_mfa(auth.user_id(), &req.code)
@@ -1608,7 +1639,7 @@ async fn verify_and_enable_mfa(
 
     let mfa_audit = MfaEnabledAudit {
         context: audit_context,
-        username: auth.user.name.clone(),
+        username: user.name.clone(),
     };
 
     if let Err(e) = app_state.audit_service.create_audit_log(&mfa_audit).await {
@@ -1641,6 +1672,13 @@ async fn disable_mfa(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, UsersWrite);
 
+    // Require a user for this endpoint (deployment tokens not allowed)
+    let user = auth.require_user().map_err(|msg| {
+        problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("User Required")
+            .with_detail(msg)
+    })?;
+
     // First verify code and then disable MFA
     app_state
         .user_service
@@ -1655,7 +1693,7 @@ async fn disable_mfa(
 
     let mfa_audit = MfaDisabledAudit {
         context: audit_context,
-        username: auth.user.name.clone(),
+        username: user.name.clone(),
     };
 
     if let Err(e) = app_state.audit_service.create_audit_log(&mfa_audit).await {

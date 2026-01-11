@@ -16,7 +16,8 @@ use temps_core::plugin::{
 use crate::BroadcastQueueService;
 
 // Global storage to keep the receiver alive and prevent channel closure
-static KEEP_ALIVE_RECEIVER: Mutex<Option<tokio::sync::broadcast::Receiver<temps_core::Job>>> = Mutex::new(None);
+static KEEP_ALIVE_RECEIVER: Mutex<Option<tokio::sync::broadcast::Receiver<temps_core::Job>>> =
+    Mutex::new(None);
 
 /// Queue Plugin for managing job queues and background processing
 pub struct QueuePlugin {
@@ -43,7 +44,10 @@ impl TempsPlugin for QueuePlugin {
         context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            tracing::debug!("🔧 QueuePlugin: Starting service registration with capacity: {}", self.queue_capacity);
+            tracing::debug!(
+                "🔧 QueuePlugin: Starting service registration with capacity: {}",
+                self.queue_capacity
+            );
 
             // Create BroadcastQueueService with receiver to keep channel alive
             let (queue_service, keep_alive_receiver) =

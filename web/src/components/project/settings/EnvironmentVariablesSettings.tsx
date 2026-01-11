@@ -31,22 +31,31 @@ import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Eye, EyeOff, KeyRound, Plus, Upload } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Textarea } from '@/components/ui/textarea'
 import { Checkbox } from '@/components/ui/checkbox'
+import { KbdBadge } from '@/components/ui/kbd-badge'
+import { ImportEnvDialog } from '@/components/ui/import-env-dialog'
+import { Switch } from '@/components/ui/switch'
+import { Label } from '@/components/ui/label'
 
 interface EnvironmentVariableRowProps {
   variable: EnvironmentVariableResponse
   project: ProjectResponse
   refetchEnvVariables: () => void
+  isSelected: boolean
+  onSelect: (id: number) => void
+  showAllValues: boolean
 }
 
 function EnvironmentVariableRow({
   variable,
   project,
   refetchEnvVariables,
+  isSelected,
+  onSelect,
+  showAllValues,
 }: EnvironmentVariableRowProps) {
   const [isVisible, setIsVisible] = useState(false)
   const [isEditing, setIsEditing] = useState(false)
@@ -60,14 +69,23 @@ function EnvironmentVariableRow({
         key: variable.key,
       },
     }),
-    enabled: isVisible || isEditing,
+    enabled: isVisible || isEditing || showAllValues,
   })
 
   useEffect(() => {
     if (data && typeof data === 'object' && 'value' in data) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setEditValue(data.value)
     }
   }, [data])
+
+  useEffect(() => {
+    setIsVisible(showAllValues)
+    if (showAllValues) {
+      refetch()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showAllValues])
 
   const dataValue = useMemo(() => data?.value ?? '', [data])
 
@@ -117,6 +135,12 @@ function EnvironmentVariableRow({
     number[]
   >(variable.environments.map((env) => env.id))
 
+  // Update selected environments when variable changes (after refetch)
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setSelectedEditEnvironments(variable.environments.map((env) => env.id))
+  }, [variable.environments])
+
   const handleEdit = async () => {
     if (isEditing) {
       await updateMutation.mutateAsync({
@@ -131,6 +155,7 @@ function EnvironmentVariableRow({
         },
       })
       setIsEditModalOpen(false)
+      setIsEditing(false)
     } else {
       setIsEditing(true)
       setIsEditModalOpen(true)
@@ -147,18 +172,29 @@ function EnvironmentVariableRow({
 
   return (
     <>
-      <div className="py-4 flex items-center justify-between">
-        <div className="space-y-1">
-          <p className="font-medium">{variable.key}</p>
-          <div className="flex gap-2">
-            {variable.environments.map((env) => (
-              <span
-                key={env.name}
-                className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
-              >
-                {env.name}
-              </span>
-            ))}
+      <div className="py-4 flex items-center justify-between gap-4">
+        <div className="flex items-center gap-3 flex-1">
+          <Checkbox
+            checked={isSelected}
+            onCheckedChange={() => onSelect(variable.id)}
+          />
+          <div className="space-y-1 flex-1">
+            <p className="font-medium">{variable.key}</p>
+            <div className="flex gap-2">
+              {variable.environments.map((env) => (
+                <span
+                  key={env.name}
+                  className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
+                >
+                  {env.name}
+                </span>
+              ))}
+              {variable.include_in_preview && (
+                <span className="inline-flex items-center rounded-full px-2 py-1 text-xs font-medium bg-blue-500/10 text-blue-700 dark:text-blue-400 border border-blue-500/20">
+                  Preview
+                </span>
+              )}
+            </div>
           </div>
         </div>
         <div className="flex gap-2">
@@ -309,24 +345,9 @@ interface AddEnvironmentVariableDialogProps {
     key: string
     value: string
     environments: number[]
+    includeInPreview: boolean
   }) => Promise<void>
   allEnvironments: any[]
-}
-
-interface ParsedEnvVariable {
-  key: string
-  value: string
-  selected: boolean
-}
-
-interface ImportEnvDialogProps {
-  isOpen: boolean
-  onOpenChange: (open: boolean) => void
-  onImport: (
-    variables: { key: string; value: string; environments: number[] }[]
-  ) => Promise<void>
-  allEnvironments: any[]
-  existingKeys: Set<string>
 }
 
 function AddEnvironmentVariableDialog({
@@ -338,30 +359,47 @@ function AddEnvironmentVariableDialog({
   const [key, setKey] = useState('')
   const [value, setValue] = useState('')
   const [selectedEnvironments, setSelectedEnvironments] = useState<number[]>([])
+  const [includeInPreview, setIncludeInPreview] = useState(false)
+  const [hasInitialized, setHasInitialized] = useState(false)
 
-  // Default-select all environments when the dialog opens
+  // Default-select all environments when the dialog first opens
+  // But allow deselecting when includeInPreview is true
   useEffect(() => {
-    if (
-      isOpen &&
-      allEnvironments.length > 0 &&
-      selectedEnvironments.length === 0
-    ) {
-      setSelectedEnvironments(allEnvironments.map((env) => env.id))
+    if (isOpen && allEnvironments.length > 0) {
+      if (!hasInitialized) {
+        // Only auto-select on first open
+        setSelectedEnvironments(allEnvironments.map((env) => env.id))
+        setHasInitialized(true)
+      }
+    } else if (!isOpen) {
+      // Reset initialization flag when dialog closes
+      setHasInitialized(false)
     }
-  }, [isOpen, allEnvironments, selectedEnvironments.length])
+  }, [isOpen, allEnvironments, hasInitialized])
 
   const handleSubmit = async () => {
-    if (!key || !value || selectedEnvironments.length === 0) {
-      toast.error(
-        'Please fill in all fields and select at least one environment'
-      )
+    // Validate key and value are filled
+    if (!key || !value) {
+      toast.error('Please fill in all fields')
       return
     }
 
-    await onSubmit({ key, value, environments: selectedEnvironments })
+    // Require at least one environment ONLY if includeInPreview is false
+    if (!includeInPreview && selectedEnvironments.length === 0) {
+      toast.error('Please select at least one environment')
+      return
+    }
+
+    await onSubmit({
+      key,
+      value,
+      environments: selectedEnvironments,
+      includeInPreview,
+    })
     setKey('')
     setValue('')
     setSelectedEnvironments([])
+    setIncludeInPreview(false)
   }
 
   return (
@@ -399,7 +437,14 @@ function AddEnvironmentVariableDialog({
               />
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">Environments</label>
+              <div className="flex items-center gap-2">
+                <label className="text-sm font-medium">Environments</label>
+                {includeInPreview && (
+                  <span className="text-xs text-muted-foreground">
+                    (Optional when including in preview)
+                  </span>
+                )}
+              </div>
               <div className="flex flex-wrap gap-2">
                 {allEnvironments.map((env) => (
                   <Button
@@ -424,6 +469,21 @@ function AddEnvironmentVariableDialog({
                 ))}
               </div>
             </div>
+            <div className="flex items-center justify-between space-x-2 rounded-lg border p-4">
+              <div className="flex-1 space-y-1">
+                <Label htmlFor="include-preview" className="text-sm font-medium">
+                  Include in Preview Environments
+                </Label>
+                <p className="text-sm text-muted-foreground">
+                  Automatically add this variable to preview environments
+                </p>
+              </div>
+              <Switch
+                id="include-preview"
+                checked={includeInPreview}
+                onCheckedChange={setIncludeInPreview}
+              />
+            </div>
           </div>
           <DialogFooter>
             <Button
@@ -434,6 +494,7 @@ function AddEnvironmentVariableDialog({
                 setKey('')
                 setValue('')
                 setSelectedEnvironments([])
+                setIncludeInPreview(false)
               }}
             >
               Cancel
@@ -441,342 +502,6 @@ function AddEnvironmentVariableDialog({
             <Button type="submit">Save Variable</Button>
           </DialogFooter>
         </form>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-function ImportEnvDialog({
-  isOpen,
-  onOpenChange,
-  onImport,
-  allEnvironments,
-  existingKeys,
-}: ImportEnvDialogProps) {
-  const [parsedVariables, setParsedVariables] = useState<ParsedEnvVariable[]>(
-    []
-  )
-  const [selectedEnvironments, setSelectedEnvironments] = useState<number[]>([])
-  const [isImporting, setIsImporting] = useState(false)
-  const fileInputRef = useRef<HTMLInputElement>(null)
-  const [rawContent, setRawContent] = useState('')
-
-  // Default-select all environments when the dialog opens
-  useEffect(() => {
-    if (
-      isOpen &&
-      allEnvironments.length > 0 &&
-      selectedEnvironments.length === 0
-    ) {
-      setSelectedEnvironments(allEnvironments.map((env: any) => env.id))
-    }
-  }, [isOpen, allEnvironments, selectedEnvironments.length])
-
-  const parseEnvFile = (content: string) => {
-    const lines = content.split('\n')
-    const variables: ParsedEnvVariable[] = []
-
-    for (const line of lines) {
-      const trimmedLine = line.trim()
-
-      // Skip empty lines and comments
-      if (!trimmedLine || trimmedLine.startsWith('#')) {
-        continue
-      }
-
-      // Parse KEY=VALUE format
-      const equalIndex = trimmedLine.indexOf('=')
-      if (equalIndex > 0) {
-        const key = trimmedLine.substring(0, equalIndex).trim()
-        let value = trimmedLine.substring(equalIndex + 1).trim()
-
-        // Remove surrounding quotes if present
-        if (
-          (value.startsWith('"') && value.endsWith('"')) ||
-          (value.startsWith("'") && value.endsWith("'"))
-        ) {
-          value = value.substring(1, value.length - 1)
-        }
-
-        // Check if key already exists
-        const alreadyExists = existingKeys.has(key)
-
-        variables.push({
-          key,
-          value,
-          selected: !alreadyExists, // Auto-select only new variables
-        })
-      }
-    }
-
-    return variables
-  }
-
-  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0]
-    if (!file) return
-
-    const reader = new FileReader()
-    reader.onload = (e) => {
-      const content = e.target?.result as string
-      setRawContent(content)
-      const parsed = parseEnvFile(content)
-      setParsedVariables(parsed)
-
-      if (parsed.length === 0) {
-        toast.error('No valid environment variables found in the file')
-      } else {
-        toast.success(
-          `Found ${parsed.length} environment variable${parsed.length !== 1 ? 's' : ''}`
-        )
-      }
-    }
-    reader.readAsText(file)
-  }
-
-  const handlePasteContent = () => {
-    if (!rawContent.trim()) {
-      toast.error('Please paste or upload .env file content')
-      return
-    }
-    const parsed = parseEnvFile(rawContent)
-    setParsedVariables(parsed)
-
-    if (parsed.length === 0) {
-      toast.error('No valid environment variables found')
-    } else {
-      toast.success(
-        `Found ${parsed.length} environment variable${parsed.length !== 1 ? 's' : ''}`
-      )
-    }
-  }
-
-  const toggleVariable = (index: number) => {
-    setParsedVariables((prev) =>
-      prev.map((v, i) => (i === index ? { ...v, selected: !v.selected } : v))
-    )
-  }
-
-  const toggleAll = () => {
-    const allSelected = parsedVariables.every((v) => v.selected)
-    setParsedVariables((prev) =>
-      prev.map((v) => ({ ...v, selected: !allSelected }))
-    )
-  }
-
-  const handleImport = async () => {
-    const selectedVars = parsedVariables.filter((v) => v.selected)
-
-    if (selectedVars.length === 0) {
-      toast.error('Please select at least one variable to import')
-      return
-    }
-
-    if (selectedEnvironments.length === 0) {
-      toast.error('Please select at least one environment')
-      return
-    }
-
-    setIsImporting(true)
-    try {
-      await onImport(
-        selectedVars.map((v) => ({
-          key: v.key,
-          value: v.value,
-          environments: selectedEnvironments,
-        }))
-      )
-
-      // Reset state
-      setParsedVariables([])
-      setSelectedEnvironments([])
-      setRawContent('')
-      if (fileInputRef.current) {
-        fileInputRef.current.value = ''
-      }
-      onOpenChange(false)
-    } finally {
-      setIsImporting(false)
-    }
-  }
-
-  const selectedCount = parsedVariables.filter((v) => v.selected).length
-
-  return (
-    <Dialog open={isOpen} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-3xl max-h-[80vh] flex flex-col">
-        <DialogHeader>
-          <DialogTitle>Import Environment Variables</DialogTitle>
-          <DialogDescription>
-            Upload a .env file or paste its contents to import multiple
-            variables at once.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="space-y-4 py-4 flex-1 overflow-auto">
-          <div className="space-y-2">
-            <label className="text-sm font-medium">Upload .env file</label>
-            <div className="flex gap-2">
-              <Input
-                ref={fileInputRef}
-                type="file"
-                accept=".env,.env.local,.env.production,.env.development,text/plain"
-                onChange={handleFileUpload}
-                className="flex-1"
-              />
-            </div>
-          </div>
-
-          <div className="relative">
-            <div className="absolute inset-0 flex items-center">
-              <span className="w-full border-t" />
-            </div>
-            <div className="relative flex justify-center text-xs uppercase">
-              <span className="bg-background px-2 text-muted-foreground">
-                Or paste content
-              </span>
-            </div>
-          </div>
-
-          <div className="space-y-2">
-            <label className="text-sm font-medium">.env file content</label>
-            <Textarea
-              placeholder="DATABASE_URL=postgresql://localhost:5432/db&#10;API_KEY=your_api_key_here&#10;NODE_ENV=production"
-              value={rawContent}
-              onChange={(e) => setRawContent(e.target.value)}
-              className="font-mono text-xs min-h-[120px]"
-            />
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={handlePasteContent}
-              className="w-full"
-            >
-              Parse Content
-            </Button>
-          </div>
-
-          {parsedVariables.length > 0 && (
-            <>
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <label className="text-sm font-medium">
-                    Select variables to import ({selectedCount}/
-                    {parsedVariables.length})
-                  </label>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={toggleAll}
-                  >
-                    {parsedVariables.every((v) => v.selected)
-                      ? 'Deselect All'
-                      : 'Select All'}
-                  </Button>
-                </div>
-                <div className="border rounded-md max-h-[250px] overflow-auto">
-                  <div className="divide-y">
-                    {parsedVariables.map((variable, index) => {
-                      const alreadyExists = existingKeys.has(variable.key)
-                      return (
-                        <div
-                          key={index}
-                          className={cn(
-                            'flex items-start gap-3 p-3 hover:bg-muted/50',
-                            alreadyExists && 'bg-amber-50 dark:bg-amber-950/20'
-                          )}
-                        >
-                          <Checkbox
-                            checked={variable.selected}
-                            onCheckedChange={() => toggleVariable(index)}
-                            className="mt-1"
-                          />
-                          <div className="flex-1 space-y-1 min-w-0">
-                            <div className="flex items-center gap-2">
-                              <p className="font-medium font-mono text-sm">
-                                {variable.key}
-                              </p>
-                              {alreadyExists && (
-                                <span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900 text-amber-800 dark:text-amber-200">
-                                  Already exists
-                                </span>
-                              )}
-                            </div>
-                            <p className="font-mono text-xs text-muted-foreground truncate">
-                              {variable.value}
-                            </p>
-                          </div>
-                        </div>
-                      )
-                    })}
-                  </div>
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <label className="text-sm font-medium">
-                  Target Environments
-                </label>
-                <div className="flex flex-wrap gap-2">
-                  {allEnvironments.map((env: any) => (
-                    <Button
-                      type="button"
-                      key={env.id}
-                      variant={
-                        selectedEnvironments.includes(env.id)
-                          ? 'default'
-                          : 'outline'
-                      }
-                      size="sm"
-                      onClick={() => {
-                        setSelectedEnvironments((prev) =>
-                          prev.includes(env.id)
-                            ? prev.filter((e) => e !== env.id)
-                            : [...prev, env.id]
-                        )
-                      }}
-                    >
-                      {env.name}
-                    </Button>
-                  ))}
-                </div>
-              </div>
-            </>
-          )}
-        </div>
-
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => {
-              onOpenChange(false)
-              setParsedVariables([])
-              setSelectedEnvironments([])
-              setRawContent('')
-              if (fileInputRef.current) {
-                fileInputRef.current.value = ''
-              }
-            }}
-          >
-            Cancel
-          </Button>
-          <Button
-            type="button"
-            onClick={handleImport}
-            disabled={
-              selectedCount === 0 ||
-              selectedEnvironments.length === 0 ||
-              isImporting
-            }
-          >
-            {isImporting
-              ? 'Importing...'
-              : `Import ${selectedCount} Variable${selectedCount !== 1 ? 's' : ''}`}
-          </Button>
-        </DialogFooter>
       </DialogContent>
     </Dialog>
   )
@@ -896,6 +621,11 @@ export function EnvironmentVariablesSettings({
 }: EnvironmentVariablesSettingsProps) {
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
   const [isImportDialogOpen, setIsImportDialogOpen] = useState(false)
+  const [selectedVariables, setSelectedVariables] = useState<Set<number>>(
+    new Set()
+  )
+  const [isBulkDeleteDialogOpen, setIsBulkDeleteDialogOpen] = useState(false)
+  const [showAllValues, setShowAllValues] = useState(false)
   const queryClient = useQueryClient()
 
   const {
@@ -927,6 +657,7 @@ export function EnvironmentVariablesSettings({
     key: string
     value: string
     environments: number[]
+    includeInPreview: boolean
   }) => {
     await createMutation.mutateAsync({
       path: {
@@ -936,12 +667,13 @@ export function EnvironmentVariablesSettings({
         key: values.key,
         value: values.value,
         environment_ids: values.environments,
+        include_in_preview: values.includeInPreview,
       },
     })
   }
 
   const handleImportVariables = async (
-    variables: { key: string; value: string; environments: number[] }[]
+    variables: { key: string; value: string; environments?: number[] }[]
   ) => {
     let successCount = 0
     let errorCount = 0
@@ -955,7 +687,7 @@ export function EnvironmentVariablesSettings({
           body: {
             key: variable.key,
             value: variable.value,
-            environment_ids: variable.environments,
+            environment_ids: variable.environments || [],
           },
         })
         successCount++
@@ -991,11 +723,105 @@ export function EnvironmentVariablesSettings({
     }),
   })
 
+  const deleteMutation = useMutation({
+    ...deleteEnvironmentVariableMutation(),
+    meta: {
+      errorTitle: 'Failed to delete environment variable',
+    },
+  })
+
+  // Keyboard shortcut to add new variable (N key)
+  // IMPORTANT: This useEffect must be called BEFORE any early returns to follow React's Rules of Hooks
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Check if the key is 'N' and no input/textarea is focused
+      if (
+        e.key === 'n' &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.shiftKey &&
+        !e.altKey
+      ) {
+        const target = e.target as HTMLElement
+        // Only trigger if not typing in an input/textarea
+        if (
+          target.tagName !== 'INPUT' &&
+          target.tagName !== 'TEXTAREA' &&
+          !target.isContentEditable
+        ) {
+          e.preventDefault()
+          setIsAddDialogOpen(true)
+        }
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [])
+
+  const handleSelectVariable = (id: number) => {
+    setSelectedVariables((prev) => {
+      const newSet = new Set(prev)
+      if (newSet.has(id)) {
+        newSet.delete(id)
+      } else {
+        newSet.add(id)
+      }
+      return newSet
+    })
+  }
+
+  const handleSelectAll = () => {
+    if (selectedVariables.size === (envVariables?.length ?? 0)) {
+      setSelectedVariables(new Set())
+    } else {
+      setSelectedVariables(new Set((envVariables ?? []).map((v) => v.id)))
+    }
+  }
+
+  const handleBulkDelete = async () => {
+    let successCount = 0
+    let errorCount = 0
+
+    for (const varId of selectedVariables) {
+      try {
+        await deleteMutation.mutateAsync({
+          path: {
+            project_id: project.id,
+            var_id: varId,
+          },
+        })
+        successCount++
+      } catch {
+        errorCount++
+      }
+    }
+
+    if (successCount > 0) {
+      toast.success(
+        `Successfully deleted ${successCount} variable${successCount !== 1 ? 's' : ''}`
+      )
+    }
+    if (errorCount > 0) {
+      toast.error(
+        `Failed to delete ${errorCount} variable${errorCount !== 1 ? 's' : ''}`
+      )
+    }
+
+    setSelectedVariables(new Set())
+    setIsBulkDeleteDialogOpen(false)
+    queryClient.invalidateQueries({ queryKey: ['environmentVariables'] })
+    refetch()
+  }
+
   if (isLoading) {
     return <EnvironmentVariablesLoadingState />
   }
 
   const hasVariables = (envVariables?.length ?? 0) > 0
+  const selectedCount = selectedVariables.size
+  const allSelected =
+    selectedCount === (envVariables?.length ?? 0) && hasVariables
 
   return (
     <div className="space-y-6">
@@ -1012,6 +838,32 @@ export function EnvironmentVariablesSettings({
           </div>
           {hasVariables && (
             <div className="flex gap-2">
+              {selectedCount > 0 && (
+                <Button
+                  variant="destructive"
+                  onClick={() => setIsBulkDeleteDialogOpen(true)}
+                >
+                  Delete {selectedCount} Variable
+                  {selectedCount !== 1 ? 's' : ''}
+                </Button>
+              )}
+              <Button
+                variant="outline"
+                onClick={() => setShowAllValues(!showAllValues)}
+                title={showAllValues ? 'Hide all values' : 'Show all values'}
+              >
+                {showAllValues ? (
+                  <>
+                    <EyeOff className="h-4 w-4 mr-2" />
+                    Hide all
+                  </>
+                ) : (
+                  <>
+                    <Eye className="h-4 w-4 mr-2" />
+                    Show all
+                  </>
+                )}
+              </Button>
               <Button
                 variant="outline"
                 onClick={() => setIsImportDialogOpen(true)}
@@ -1022,6 +874,7 @@ export function EnvironmentVariablesSettings({
               <Button onClick={() => setIsAddDialogOpen(true)}>
                 <Plus className="h-4 w-4 mr-2" />
                 Add Variable
+                <KbdBadge keys={['N']} className="ml-2" />
               </Button>
             </div>
           )}
@@ -1051,20 +904,37 @@ export function EnvironmentVariablesSettings({
                 <Button onClick={() => setIsAddDialogOpen(true)}>
                   <Plus className="h-4 w-4 mr-2" />
                   Add Variable
+                  <KbdBadge keys={['N']} className="ml-2" />
                 </Button>
               </div>
             </EmptyPlaceholder>
           ) : (
-            <div className="divide-y divide-border">
-              {(envVariables ?? []).map((variable) => (
-                <EnvironmentVariableRow
-                  key={variable.id}
-                  variable={variable}
-                  project={project}
-                  refetchEnvVariables={() => refetch()}
+            <>
+              <div className="flex items-center gap-3 py-3 border-b">
+                <Checkbox
+                  checked={allSelected}
+                  onCheckedChange={handleSelectAll}
                 />
-              ))}
-            </div>
+                <span className="text-sm font-medium">
+                  {selectedCount > 0
+                    ? `${selectedCount} of ${envVariables?.length ?? 0} selected`
+                    : 'Select all'}
+                </span>
+              </div>
+              <div className="divide-y divide-border">
+                {(envVariables ?? []).map((variable) => (
+                  <EnvironmentVariableRow
+                    key={variable.id}
+                    variable={variable}
+                    project={project}
+                    refetchEnvVariables={() => refetch()}
+                    isSelected={selectedVariables.has(variable.id)}
+                    onSelect={handleSelectVariable}
+                    showAllValues={showAllValues}
+                  />
+                ))}
+              </div>
+            </>
           )}
         </div>
       </div>
@@ -1082,6 +952,62 @@ export function EnvironmentVariablesSettings({
         allEnvironments={allEnvironments ?? []}
         existingKeys={existingKeys}
       />
+
+      <AlertDialog
+        open={isBulkDeleteDialogOpen}
+        onOpenChange={setIsBulkDeleteDialogOpen}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete Multiple Variables</AlertDialogTitle>
+            <AlertDialogDescription className="space-y-3">
+              <p>
+                Are you sure you want to delete {selectedCount} environment
+                variable{selectedCount !== 1 ? 's' : ''}? This action cannot be
+                undone.
+              </p>
+              {selectedCount > 0 && (
+                <div className="space-y-2">
+                  <p className="text-sm font-medium text-foreground">
+                    Variables to be deleted:
+                  </p>
+                  <div className="max-h-[200px] overflow-auto border rounded-md p-3 space-y-1">
+                    {(envVariables ?? [])
+                      .filter((v) => selectedVariables.has(v.id))
+                      .map((v) => (
+                        <div
+                          key={v.id}
+                          className="text-sm font-mono flex items-center justify-between"
+                        >
+                          <span>{v.key}</span>
+                          <div className="flex gap-1">
+                            {v.environments.map((env) => (
+                              <span
+                                key={env.name}
+                                className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-secondary text-secondary-foreground"
+                              >
+                                {env.name}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                </div>
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleBulkDelete}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              Delete {selectedCount} Variable{selectedCount !== 1 ? 's' : ''}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

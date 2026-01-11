@@ -6,18 +6,18 @@ use async_trait::async_trait;
 use chrono::{DateTime, Timelike as _, Utc};
 use cron::Schedule;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, Set,
 };
-use temps_core::UtcDateTime;
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
+use temps_core::UtcDateTime;
 use temps_database::DbConnection;
 use temps_entities::{cron_executions, crons, deployment_containers, deployments};
+use thiserror::Error;
 use tokio::time::{self, Duration};
 use tracing::{debug, error, info, warn};
-use thiserror::Error;
 
 use crate::jobs::configure_crons::{CronConfig, CronConfigError, CronConfigService};
 
@@ -215,7 +215,7 @@ impl CronConfigService for DatabaseCronConfigService {
                     })?;
 
                     info!(
-                        "✅ Updated cron job '{}' with schedule '{}', next run at {:?}",
+                        "Updated cron job '{}' with schedule '{}', next run at {:?}",
                         cron.path, cron_config.schedule, next_run
                     );
                 }
@@ -247,7 +247,7 @@ impl CronConfigService for DatabaseCronConfigService {
                     match new_cron.insert(self.db.as_ref()).await {
                         Ok(cron) => {
                             info!(
-                                "✅ Created cron job '{}' with schedule '{}', next run at {:?}",
+                                "Created cron job '{}' with schedule '{}', next run at {:?}",
                                 cron.path, cron.schedule, cron.next_run
                             );
                         }
@@ -264,7 +264,7 @@ impl CronConfigService for DatabaseCronConfigService {
         }
 
         info!(
-            "✅ Successfully configured cron jobs for project {} in environment {}",
+            "Successfully configured cron jobs for project {} in environment {}",
             project_id, environment_id
         );
 
@@ -489,7 +489,11 @@ impl DatabaseCronConfigService {
                     last_successful_run: None,
                 };
 
-                if let Err(queue_err) = self.queue.send(temps_core::Job::CronInvocationError(error_data)).await {
+                if let Err(queue_err) = self
+                    .queue
+                    .send(temps_core::Job::CronInvocationError(error_data))
+                    .await
+                {
                     warn!(
                         "Failed to send cron error notification for cron {}: {}",
                         cron.id, queue_err
@@ -533,8 +537,15 @@ impl DatabaseCronConfigService {
             env_id: cron.environment_id,
         })?;
 
-        // Use container port to construct URL
-        Ok(format!("http://localhost:{}", container.container_port))
+        // Use deployment mode to determine the correct host/port for container access
+        let host_port = container.host_port.unwrap_or(container.container_port) as u16;
+        let url = temps_core::DeploymentMode::build_container_url(
+            &container.container_name,
+            container.container_port as u16,
+            host_port,
+            None,
+        );
+        Ok(url)
     }
 
     async fn execute_cron(
@@ -553,7 +564,7 @@ impl DatabaseCronConfigService {
             .map_err(|e| CronServiceError::ExecutionError {
                 cron_id: cron.id,
                 url: url.clone(),
-                message: format!("Failed with status: {}", e.to_string()),
+                message: format!("Failed with status: {}", e),
             })?;
 
         if !response.status().is_success() {
@@ -572,6 +583,7 @@ impl DatabaseCronConfigService {
 mod tests {
     use super::*;
     use temps_database::test_utils::TestDatabase;
+    use temps_entities::upstream_config::UpstreamList;
 
     // Mock queue for tests
     struct MockQueue;
@@ -590,16 +602,24 @@ mod tests {
     // Helper function to create test project and environment
     async fn create_test_project_and_environment(
         db: &DatabaseConnection,
-    ) -> Result<(temps_entities::projects::Model, temps_entities::environments::Model), Box<dyn std::error::Error>> {
-        use temps_entities::{projects, environments, types::ProjectType};
+    ) -> Result<
+        (
+            temps_entities::projects::Model,
+            temps_entities::environments::Model,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        use temps_entities::{environments, projects};
 
         // Create project
         let project = projects::ActiveModel {
             name: Set("test-project".to_string()),
             slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             directory: Set("test-directory".to_string()),
             main_branch: Set("main".to_string()),
-            project_type: Set(ProjectType::Server),
+            preset: Set(temps_entities::preset::Preset::Static),
             ..Default::default()
         };
         let project = project.insert(db).await?;
@@ -611,7 +631,7 @@ mod tests {
             slug: Set("test-env".to_string()),
             subdomain: Set("test-env".to_string()),
             host: Set("test-env.local".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             ..Default::default()
         };
         let environment = environment.insert(db).await?;

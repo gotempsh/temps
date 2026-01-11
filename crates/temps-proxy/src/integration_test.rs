@@ -4,32 +4,63 @@ mod integration_tests {
 
     use temps_database::test_utils::TestDatabase;
 
-    use crate::*;
     use crate::test_utils::*;
+    use crate::*;
+
     fn create_crypto_cookie_crypto() -> Arc<temps_core::CookieCrypto> {
         let encryption_key = "default-32-byte-key-for-testing!";
-        Arc::new(temps_core::CookieCrypto::new(encryption_key).expect("Failed to create cookie crypto"))
+        Arc::new(
+            temps_core::CookieCrypto::new(encryption_key).expect("Failed to create cookie crypto"),
+        )
+    }
+
+    fn create_test_server_config() -> Arc<temps_config::ServerConfig> {
+        let config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgresql://test@localhost/test".to_string(),
+            None,
+            None,
+        )
+        .expect("Failed to create test ServerConfig");
+        Arc::new(config)
     }
 
     #[tokio::test]
     #[ignore] // TODO: Fix runtime nesting error
     async fn test_proxy_service_creation() -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone()).await.unwrap();
+        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
+            .await
+            .unwrap();
         let server_config = ProxyConfig::default();
-
+        let config = create_test_server_config();
         // Create route table and load routes
         let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
         route_table.load_routes().await?;
 
         // Create the proxy service
-        let proxy_service = create_proxy_service(test_db.db.clone(), server_config, create_crypto_cookie_crypto(), route_table)?;
+        let proxy_service = create_proxy_service(
+            test_db.db.clone(),
+            server_config,
+            create_crypto_cookie_crypto(),
+            route_table,
+            config,
+        )?;
 
         // Verify the proxy service was created successfully
-        assert_eq!(proxy_service.upstream_resolver().get_lb_strategy("example.com").await, Some("round_robin".to_string()));
+        assert_eq!(
+            proxy_service
+                .upstream_resolver()
+                .get_lb_strategy("example.com")
+                .await,
+            Some("round_robin".to_string())
+        );
 
         // Test that it doesn't crash on basic operations
-        let has_route = proxy_service.upstream_resolver().has_custom_route("nonexistent.com").await;
+        let has_route = proxy_service
+            .upstream_resolver()
+            .has_custom_route("nonexistent.com")
+            .await;
         assert!(!has_route);
 
         test_db.cleanup().await?;
@@ -40,23 +71,39 @@ mod integration_tests {
     #[ignore] // TODO: Fix runtime nesting error
     async fn test_upstream_resolution() -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone()).await.unwrap();
+        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
+            .await
+            .unwrap();
         let server_config = ProxyConfig::default();
 
         // Create test data
-        let _custom_route = test_db.create_test_custom_route("custom.example.com").await?;
+        let _custom_route = test_db
+            .create_test_custom_route("custom.example.com")
+            .await?;
 
         // Create route table and load routes
         let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
         route_table.load_routes().await?;
-
-        let proxy_service = create_proxy_service(test_db.db.clone(), server_config, create_crypto_cookie_crypto(), route_table)?;
+        let config = create_test_server_config();
+        let proxy_service = create_proxy_service(
+            test_db.db.clone(),
+            server_config,
+            create_crypto_cookie_crypto(),
+            route_table,
+            config,
+        )?;
 
         // Test custom route resolution
-        let has_custom = proxy_service.upstream_resolver().has_custom_route("custom.example.com").await;
+        let has_custom = proxy_service
+            .upstream_resolver()
+            .has_custom_route("custom.example.com")
+            .await;
         assert!(has_custom);
 
-        let no_custom = proxy_service.upstream_resolver().has_custom_route("nonexistent.com").await;
+        let no_custom = proxy_service
+            .upstream_resolver()
+            .has_custom_route("nonexistent.com")
+            .await;
         assert!(!no_custom);
 
         test_db.cleanup().await?;
@@ -67,9 +114,11 @@ mod integration_tests {
     #[ignore] // TODO: Fix runtime nesting error
     async fn test_project_context_resolution() -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone()).await.unwrap();
+        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
+            .await
+            .unwrap();
         let server_config = ProxyConfig::default();
-
+        let config = create_test_server_config();
         // Create test project
         let (project, environment, deployment) = test_db.create_test_project().await?;
 
@@ -77,10 +126,19 @@ mod integration_tests {
         let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
         route_table.load_routes().await?;
 
-        let proxy_service = create_proxy_service(test_db.db.clone(), server_config, create_crypto_cookie_crypto(), route_table)?;
+        let proxy_service = create_proxy_service(
+            test_db.db.clone(),
+            server_config,
+            create_crypto_cookie_crypto(),
+            route_table,
+            config,
+        )?;
 
         // Test project context resolution
-        let context = proxy_service.project_context_resolver().resolve_context("test.example.com").await;
+        let context = proxy_service
+            .project_context_resolver()
+            .resolve_context("test.example.com")
+            .await;
         assert!(context.is_some());
 
         let context = context.unwrap();
@@ -89,7 +147,10 @@ mod integration_tests {
         assert_eq!(context.deployment.id, deployment.id);
 
         // Test non-existent domain
-        let no_context = proxy_service.project_context_resolver().resolve_context("nonexistent.com").await;
+        let no_context = proxy_service
+            .project_context_resolver()
+            .resolve_context("nonexistent.com")
+            .await;
         assert!(no_context.is_none());
 
         test_db.cleanup().await?;
@@ -100,43 +161,51 @@ mod integration_tests {
     #[ignore] // TODO: Fix runtime nesting error
     async fn test_visitor_tracking() -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone()).await.unwrap();
+        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
+            .await
+            .unwrap();
         let server_config = ProxyConfig::default();
-
+        let config = create_test_server_config();
         // Create route table and load routes
         let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
         route_table.load_routes().await?;
 
-        let proxy_service = create_proxy_service(test_db.db.clone(), server_config, create_crypto_cookie_crypto(), route_table)?;
+        let proxy_service = create_proxy_service(
+            test_db.db.clone(),
+            server_config,
+            create_crypto_cookie_crypto(),
+            route_table,
+            config,
+        )?;
 
         // Test visitor tracking decisions
-        assert!(proxy_service.visitor_manager().should_track_visitor(
-            "/",
-            Some("text/html"),
-            200,
-            None
-        ).await);
+        assert!(
+            proxy_service
+                .visitor_manager()
+                .should_track_visitor("/", Some("text/html"), 200, None)
+                .await
+        );
 
-        assert!(!proxy_service.visitor_manager().should_track_visitor(
-            "/api/_temps/health",
-            Some("application/json"),
-            200,
-            None
-        ).await);
+        assert!(
+            !proxy_service
+                .visitor_manager()
+                .should_track_visitor("/api/_temps/health", Some("application/json"), 200, None)
+                .await
+        );
 
-        assert!(!proxy_service.visitor_manager().should_track_visitor(
-            "/assets/style.css",
-            Some("text/css"),
-            200,
-            None
-        ).await);
+        assert!(
+            !proxy_service
+                .visitor_manager()
+                .should_track_visitor("/assets/style.css", Some("text/css"), 200, None)
+                .await
+        );
 
-        assert!(proxy_service.visitor_manager().should_track_visitor(
-            "/some-page",
-            Some("text/html"),
-            404,
-            None
-        ).await);
+        assert!(
+            proxy_service
+                .visitor_manager()
+                .should_track_visitor("/some-page", Some("text/html"), 404, None)
+                .await
+        );
 
         test_db.cleanup().await?;
         Ok(())
@@ -146,14 +215,22 @@ mod integration_tests {
     #[ignore] // TODO: Fix runtime nesting error
     async fn test_cookie_generation() -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone()).await.unwrap();
+        let test_db = TestDBMockOperations::new(test_db_mock.connection_arc().clone())
+            .await
+            .unwrap();
         let server_config = ProxyConfig::default();
-
+        let config = create_test_server_config();
         // Create route table and load routes
         let route_table = Arc::new(CachedPeerTable::new(test_db.db.clone()));
         route_table.load_routes().await?;
 
-        let proxy_service = create_proxy_service(test_db.db.clone(), server_config, create_crypto_cookie_crypto(), route_table)?;
+        let proxy_service = create_proxy_service(
+            test_db.db.clone(),
+            server_config,
+            create_crypto_cookie_crypto(),
+            route_table,
+            config,
+        )?;
 
         // Create test visitor
         let visitor = Visitor {
@@ -164,7 +241,10 @@ mod integration_tests {
         };
 
         // Test visitor cookie generation
-        let visitor_cookie = proxy_service.visitor_manager().generate_visitor_cookie(&visitor, false).await
+        let visitor_cookie = proxy_service
+            .visitor_manager()
+            .generate_visitor_cookie(&visitor, false, None)
+            .await
             .map_err(|e| format!("Failed to generate visitor cookie: {:?}", e))?;
         assert!(visitor_cookie.contains("_temps_visitor_id"));
         assert!(visitor_cookie.contains("Path=/"));
@@ -178,7 +258,10 @@ mod integration_tests {
             is_new_session: true,
         };
 
-        let session_cookie = proxy_service.session_manager().generate_session_cookie(&session, false).await
+        let session_cookie = proxy_service
+            .session_manager()
+            .generate_session_cookie(&session, false, None)
+            .await
             .map_err(|e| format!("Failed to generate session cookie: {:?}", e))?;
         assert!(session_cookie.contains("_temps_sid"));
         assert!(session_cookie.contains("Path=/"));

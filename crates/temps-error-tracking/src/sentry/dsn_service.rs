@@ -1,12 +1,10 @@
 use chrono::Utc;
 use rand::Rng;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set,
-};
+use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::sync::Arc;
 use temps_entities::{project_dsns, projects};
 
-use super::types::{SentryIngesterError, ParsedDSN, ProjectDSN};
+use super::types::{ParsedDSN, ProjectDSN, SentryIngesterError};
 
 /// Service for managing Data Source Names (DSNs) for error tracking
 pub struct DSNService {
@@ -322,10 +320,7 @@ impl DSNService {
             .replace("http://", "")
             .replace(":8080", "");
 
-        let dsn = format!(
-            "https://{}@{}/{}",
-            updated_dsn.public_key, host, project_id
-        );
+        let dsn = format!("https://{}@{}/{}", updated_dsn.public_key, host, project_id);
 
         Ok(ProjectDSN {
             id: updated_dsn.id,
@@ -415,7 +410,7 @@ impl DSNService {
 mod tests {
     use super::*;
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::projects;
+    use temps_entities::{preset::Preset, projects};
 
     async fn setup_test_db() -> TestDatabase {
         TestDatabase::with_migrations()
@@ -424,22 +419,17 @@ mod tests {
     }
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
-        use temps_entities::types::ProjectType;
         use uuid::Uuid;
 
         let unique_slug = format!("test-project-{}", Uuid::new_v4());
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             slug: Set(unique_slug),
-            project_type: Set(ProjectType::Server),
-            automatic_deploy: Set(true),
-            is_web_app: Set(false),
-            performance_metrics_enabled: Set(false),
-            use_default_wildcard: Set(true),
-            is_public_repo: Set(false),
-            is_on_demand: Set(false),
+            preset: Set(Preset::NextJs),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -553,4 +543,3 @@ mod tests {
         assert!(!is_valid);
     }
 }
-

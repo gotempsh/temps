@@ -35,5 +35,11 @@ pub fn create_test_context(
     environment_id: i32,
 ) -> WorkflowContext {
     let log_writer = Arc::new(MockLogWriter::new(1));
-    WorkflowContext::new(workflow_run_id, deployment_id, project_id, environment_id, log_writer)
+    WorkflowContext::new(
+        workflow_run_id,
+        deployment_id,
+        project_id,
+        environment_id,
+        log_writer,
+    )
 }

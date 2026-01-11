@@ -8,6 +8,7 @@ import { ConnectionsTable } from '@/components/git/ConnectionsTable'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { CopyButton } from '@/components/ui/copy-button'
 import {
   Card,
   CardContent,
@@ -50,15 +51,7 @@ import {
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
-
-// Helper function to check if provider is GitHub App
-const isGitHubApp = (provider: ProviderResponse) =>
-  provider.provider_type === 'github' &&
-  (provider.auth_method === 'app' || provider.auth_method === 'github_app')
-
-// Helper function to check if provider is GitLab OAuth
-const isGitLabOAuth = (provider: ProviderResponse) =>
-  provider.provider_type === 'gitlab' && provider.auth_method === 'oauth'
+import { isGitHubApp, isGitLabOAuth } from '@/lib/provider'
 
 export default function GitProviderDetail() {
   const navigate = useNavigate()
@@ -153,6 +146,21 @@ export default function GitProviderDetail() {
       ])
     }
   }, [provider, setBreadcrumbs])
+
+  // Detect GitHub App creation from query parameter
+  useEffect(() => {
+    const searchParams = new URLSearchParams(window.location.search)
+    if (searchParams.has('github_app_created')) {
+      // Show success message
+      toast.success('GitHub App created successfully!', {
+        description: 'You can now install it to connect your repositories.',
+        duration: 5000,
+      })
+
+      // Clean up the query param from the URL
+      window.history.replaceState({}, '', window.location.pathname)
+    }
+  }, [])
 
   usePageTitle(provider ? `${provider.name} - Git Provider` : 'Git Provider')
 
@@ -295,7 +303,7 @@ export default function GitProviderDetail() {
             {isGitLabOAuth(provider) && (
               <Button onClick={handleAuthorize} className="gap-2">
                 <ExternalLink className="h-4 w-4" />
-                Authorize GitLab
+                Authorize
               </Button>
             )}
           </div>
@@ -343,13 +351,17 @@ export default function GitProviderDetail() {
                 <Separator />
                 {provider.base_url && (
                   <>
-                    <div className="flex justify-between items-center">
+                    <div className="flex justify-between items-center gap-3">
                       <Label className="text-sm font-medium">Base URL</Label>
-                      <div className="flex items-center gap-1 text-sm">
-                        <Globe className="h-3 w-3" />
-                        <span className="truncate max-w-48">
-                          {provider.base_url}
-                        </span>
+                      <div className="flex items-center gap-2 text-sm min-w-0">
+                        <Globe className="h-3 w-3 flex-shrink-0" />
+                        <div className="flex items-center gap-2">
+                          <span className="break-all">{provider.base_url}</span>
+                          <CopyButton
+                            value={provider.base_url}
+                            className="h-7 w-7 p-0 hover:bg-accent hover:text-accent-foreground rounded-md flex-shrink-0 items-center"
+                          />
+                        </div>
                       </div>
                     </div>
                     <Separator />
@@ -456,42 +468,14 @@ export default function GitProviderDetail() {
         {/* Git Connections Table */}
         <Card>
           <CardHeader>
-            <div className="flex items-center justify-between">
-              <div>
-                <CardTitle className="flex items-center gap-2">
-                  <Database className="h-5 w-5" />
-                  Git Connections
-                </CardTitle>
-                <CardDescription>
-                  All Git connections associated with this provider
-                </CardDescription>
-              </div>
-              {connections && connections.length > 0 && (
-                <>
-                  {isGitHubApp(provider) && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => handleInstallGitHubApp(provider)}
-                      className="gap-2"
-                    >
-                      <ExternalLink className="h-4 w-4" />
-                      Install GitHub App
-                    </Button>
-                  )}
-                  {isGitLabOAuth(provider) && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={handleAuthorize}
-                      className="gap-2"
-                    >
-                      <ExternalLink className="h-4 w-4" />
-                      Authorize GitLab
-                    </Button>
-                  )}
-                </>
-              )}
+            <div>
+              <CardTitle className="flex items-center gap-2">
+                <Database className="h-5 w-5" />
+                Git Connections
+              </CardTitle>
+              <CardDescription>
+                All Git connections associated with this provider
+              </CardDescription>
             </div>
           </CardHeader>
           <CardContent>
@@ -520,7 +504,7 @@ export default function GitProviderDetail() {
                 {isGitLabOAuth(provider) && (
                   <Button onClick={handleAuthorize} className="gap-2">
                     <ExternalLink className="h-4 w-4" />
-                    Authorize GitLab
+                    Authorize
                   </Button>
                 )}
               </div>
@@ -530,7 +514,9 @@ export default function GitProviderDetail() {
                 provider={provider}
                 onSyncRepository={handleSyncRepositories}
                 onAuthorize={handleAuthorize}
+                onInstallGitHubApp={() => handleInstallGitHubApp(provider)}
                 isSyncing={syncMutation.isPending}
+                onConnectionDeleted={refetchConnections}
               />
             )}
           </CardContent>

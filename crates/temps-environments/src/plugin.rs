@@ -44,7 +44,7 @@ impl TempsPlugin for EnvironmentsPlugin {
             // Create EnvironmentService with queue service
             let environment_service = Arc::new(
                 EnvironmentService::new(db.clone(), config_service)
-                    .with_queue_service(queue_service)
+                    .with_queue_service(queue_service),
             );
             context.register_service(environment_service);
             let env_var_service = Arc::new(EnvVarService::new(db.clone()));
@@ -58,15 +58,17 @@ impl TempsPlugin for EnvironmentsPlugin {
         let environment_service = context.require_service::<EnvironmentService>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
         let env_var_service = context.require_service::<EnvVarService>();
-        let app_state = Arc::new(crate::handlers::AppState {
+        let deployment_service = context.require_service::<dyn temps_core::DeploymentCanceller>();
+
+        let app_state = crate::handlers::create_environment_app_state(
             environment_service,
             env_var_service,
             audit_service,
-        });
+            deployment_service,
+        );
+
         let routes = crate::handlers::configure_routes().with_state(app_state);
-        Some(PluginRoutes {
-            router: routes,
-        })
+        Some(PluginRoutes { router: routes })
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
@@ -86,7 +88,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_environments_plugin_default() {
-        let environments_plugin = EnvironmentsPlugin::default();
+        let environments_plugin = EnvironmentsPlugin;
         assert_eq!(environments_plugin.name(), "environments");
     }
 }

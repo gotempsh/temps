@@ -29,7 +29,7 @@ export function EditFunnel({ project }: EditFunnelProps) {
     message: string
   } | null>(null)
 
-  usePageTitle(`Edit Funnel - ${project.name}`)
+  usePageTitle(`Edit Funnel - ${project.slug}`)
 
   // Fetch all funnels to get the specific one
   const { data: funnels, isLoading } = useQuery({

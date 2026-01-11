@@ -17,6 +17,8 @@ notify = { workspace = true }
 bollard = { workspace = true }
 futures-util = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 # Plugin dependencies
 temps-core = { path = "../temps-core" }
 utoipa = { workspace = true }

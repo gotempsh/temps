@@ -1,4 +1,7 @@
-use crate::services::{NotificationService, NotificationPreferencesService, NotificationPreferences, TlsMode};
+use crate::digest::DigestService;
+use crate::services::{
+    NotificationPreferences, NotificationPreferencesService, NotificationService, TlsMode,
+};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -6,28 +9,31 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use tracing::{error, info};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
+use tracing::{error, info};
 use utoipa::OpenApi;
 
 pub struct NotificationState {
     notification_service: Arc<NotificationService>,
     notification_preferences_service: Arc<NotificationPreferencesService>,
+    digest_service: Arc<DigestService>,
 }
 
 impl NotificationState {
     pub fn new(
         notification_service: Arc<NotificationService>,
         notification_preferences_service: Arc<NotificationPreferencesService>,
+        digest_service: Arc<DigestService>,
     ) -> Self {
         Self {
             notification_service,
             notification_preferences_service,
+            digest_service,
         }
     }
 }
@@ -52,6 +58,7 @@ impl NotificationState {
         get_preferences,
         update_preferences,
         delete_preferences,
+        trigger_weekly_digest,
     ),
     components(
         schemas(
@@ -68,6 +75,7 @@ impl NotificationState {
             UpdateEmailProviderRequest,
             NotificationPreferencesResponse,
             UpdatePreferencesRequest,
+            TriggerDigestResponse,
         )
     ),
     info(
@@ -208,7 +216,7 @@ async fn list_notification_providers(
                         error!("Failed to decrypt provider config: {}", e);
                         ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                             .title("Failed to decrypt provider configurations")
-                            .detail(&format!("Error: {}", e))
+                            .detail(format!("Error: {}", e))
                             .build()
                     })?;
                 response_vec.push(NotificationProviderResponse {
@@ -227,7 +235,7 @@ async fn list_notification_providers(
             error!("Failed to list notification providers: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to list notification providers")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -266,7 +274,7 @@ async fn get_notification_provider(
                     error!("Failed to decrypt provider config: {}", e);
                     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                         .title("Failed to decrypt provider configuration")
-                        .detail(&format!("Error: {}", e))
+                        .detail(format!("Error: {}", e))
                         .build()
                 })?;
             let response = NotificationProviderResponse {
@@ -288,7 +296,7 @@ async fn get_notification_provider(
             error!("Failed to get notification provider {}: {}", id, e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -329,7 +337,7 @@ async fn create_notification_provider(
                     error!("Failed to decrypt provider config: {}", e);
                     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                         .title("Failed to decrypt provider configuration")
-                        .detail(&format!("Error: {}", e))
+                        .detail(format!("Error: {}", e))
                         .build()
                 })?;
             let response = NotificationProviderResponse {
@@ -347,7 +355,7 @@ async fn create_notification_provider(
             error!("Failed to create notification provider: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to create notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -401,7 +409,7 @@ async fn update_provider(
                     error!("Failed to decrypt provider config: {}", e);
                     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                         .title("Failed to decrypt provider configuration")
-                        .detail(&format!("Error: {}", e))
+                        .detail(format!("Error: {}", e))
                         .build()
                 })?;
             let response = NotificationProviderResponse {
@@ -423,7 +431,7 @@ async fn update_provider(
             error!("Failed to update notification provider {}: {}", id, e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to update notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -463,7 +471,7 @@ async fn delete_provider(
             error!("Failed to delete notification provider {}: {}", id, e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to delete notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -518,7 +526,7 @@ async fn test_provider(
                 },
                 Json(TestProviderResponse {
                     success: false,
-                    message: Some(format!("Test failed: {}", e.to_string())),
+                    message: Some(format!("Test failed: {}", e)),
                 }),
             ))
         }
@@ -561,7 +569,7 @@ async fn create_slack_provider(
                     error!("Failed to decrypt provider config: {}", e);
                     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                         .title("Failed to decrypt provider configuration")
-                        .detail(&format!("Error: {}", e))
+                        .detail(format!("Error: {}", e))
                         .build()
                 })?;
             let response = NotificationProviderResponse {
@@ -579,7 +587,7 @@ async fn create_slack_provider(
             error!("Failed to create Slack notification provider: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to create Slack notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -621,7 +629,7 @@ async fn create_email_provider(
                     error!("Failed to decrypt provider config: {}", e);
                     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                         .title("Failed to decrypt provider configuration")
-                        .detail(&format!("Error: {}", e))
+                        .detail(format!("Error: {}", e))
                         .build()
                 })?;
             let response = NotificationProviderResponse {
@@ -639,7 +647,7 @@ async fn create_email_provider(
             error!("Failed to create Email notification provider: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to create Email notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -690,7 +698,7 @@ async fn update_slack_provider(
                     error!("Failed to decrypt provider config: {}", e);
                     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                         .title("Failed to decrypt provider configuration")
-                        .detail(&format!("Error: {}", e))
+                        .detail(format!("Error: {}", e))
                         .build()
                 })?;
             let response = NotificationProviderResponse {
@@ -712,7 +720,7 @@ async fn update_slack_provider(
             error!("Failed to update Slack notification provider {}: {}", id, e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to update Slack notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -763,7 +771,7 @@ async fn update_email_provider(
                     error!("Failed to decrypt provider config: {}", e);
                     ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                         .title("Failed to decrypt provider configuration")
-                        .detail(&format!("Error: {}", e))
+                        .detail(format!("Error: {}", e))
                         .build()
                 })?;
             let response = NotificationProviderResponse {
@@ -785,7 +793,7 @@ async fn update_email_provider(
             error!("Failed to update Email notification provider {}: {}", id, e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to update Email notification provider")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -823,6 +831,12 @@ pub struct NotificationPreferencesResponse {
     // Route Monitoring
     pub route_downtime_enabled: bool,
     pub load_balancer_issues_enabled: bool,
+
+    // Weekly Digest Settings
+    pub weekly_digest_enabled: bool,
+    pub digest_send_day: String,
+    pub digest_send_time: String,
+    pub digest_sections: crate::digest::DigestSections,
 }
 
 impl From<NotificationPreferences> for NotificationPreferencesResponse {
@@ -847,6 +861,10 @@ impl From<NotificationPreferences> for NotificationPreferencesResponse {
             retention_policy_violations_enabled: prefs.retention_policy_violations_enabled,
             route_downtime_enabled: prefs.route_downtime_enabled,
             load_balancer_issues_enabled: prefs.load_balancer_issues_enabled,
+            weekly_digest_enabled: prefs.weekly_digest_enabled,
+            digest_send_day: prefs.digest_send_day,
+            digest_send_time: prefs.digest_send_time,
+            digest_sections: prefs.digest_sections,
         }
     }
 }
@@ -876,16 +894,24 @@ async fn get_preferences(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationPreferencesRead);
 
-    info!("Getting notification preferences for user {}", auth.user_id());
-    match app_state.notification_preferences_service.get_preferences().await {
-        Ok(preferences) => {
-            Ok((StatusCode::OK, Json(NotificationPreferencesResponse::from(preferences))))
-        }
+    info!(
+        "Getting notification preferences for user {}",
+        auth.user_id()
+    );
+    match app_state
+        .notification_preferences_service
+        .get_preferences()
+        .await
+    {
+        Ok(preferences) => Ok((
+            StatusCode::OK,
+            Json(NotificationPreferencesResponse::from(preferences)),
+        )),
         Err(e) => {
             error!("Failed to get notification preferences: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get notification preferences")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -913,7 +939,10 @@ async fn update_preferences(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationPreferencesWrite);
 
-    info!("Updating notification preferences for user {}", auth.user_id());
+    info!(
+        "Updating notification preferences for user {}",
+        auth.user_id()
+    );
     let db_preferences = NotificationPreferences {
         email_enabled: request.preferences.email_enabled,
         slack_enabled: request.preferences.slack_enabled,
@@ -931,20 +960,31 @@ async fn update_preferences(
         backup_failures_enabled: request.preferences.backup_failures_enabled,
         backup_successes_enabled: request.preferences.backup_successes_enabled,
         s3_connection_issues_enabled: request.preferences.s3_connection_issues_enabled,
-        retention_policy_violations_enabled: request.preferences.retention_policy_violations_enabled,
+        retention_policy_violations_enabled: request
+            .preferences
+            .retention_policy_violations_enabled,
         route_downtime_enabled: request.preferences.route_downtime_enabled,
         load_balancer_issues_enabled: request.preferences.load_balancer_issues_enabled,
+        weekly_digest_enabled: request.preferences.weekly_digest_enabled,
+        digest_send_day: request.preferences.digest_send_day.clone(),
+        digest_send_time: request.preferences.digest_send_time.clone(),
+        digest_sections: request.preferences.digest_sections.clone(),
     };
 
-    match app_state.notification_preferences_service.update_preferences(db_preferences).await {
-        Ok(preferences) => {
-            Ok((StatusCode::OK, Json(NotificationPreferencesResponse::from(preferences))))
-        }
+    match app_state
+        .notification_preferences_service
+        .update_preferences(db_preferences)
+        .await
+    {
+        Ok(preferences) => Ok((
+            StatusCode::OK,
+            Json(NotificationPreferencesResponse::from(preferences)),
+        )),
         Err(e) => {
             error!("Failed to update notification preferences: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to update notification preferences")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
@@ -970,19 +1010,86 @@ async fn delete_preferences(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationPreferencesWrite);
 
-    info!("Deleting notification preferences for user {}", auth.user_id());
-    match app_state.notification_preferences_service.delete_preferences().await {
-        Ok(_) => {
-            Ok(StatusCode::NO_CONTENT)
-        }
+    info!(
+        "Deleting notification preferences for user {}",
+        auth.user_id()
+    );
+    match app_state
+        .notification_preferences_service
+        .delete_preferences()
+        .await
+    {
+        Ok(_) => Ok(StatusCode::NO_CONTENT),
         Err(e) => {
             error!("Failed to delete notification preferences: {}", e);
             Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to delete notification preferences")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build())
         }
     }
+}
+
+/// Trigger weekly digest generation manually
+#[utoipa::path(
+    post,
+    path = "/weekly-digest/trigger",
+    responses(
+        (status = 200, description = "Weekly digest triggered successfully", body = TriggerDigestResponse),
+        (status = 500, description = "Failed to generate digest")
+    ),
+    tag = "Notification Preferences",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn trigger_weekly_digest(
+    State(app_state): State<Arc<NotificationState>>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, NotificationPreferencesWrite);
+
+    info!("Manually triggering weekly digest generation");
+
+    // Get current preferences to determine which sections to include
+    let preferences = app_state
+        .notification_preferences_service
+        .get_preferences()
+        .await
+        .map_err(|e| {
+            error!("Failed to get preferences: {}", e);
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Failed to get preferences")
+                .detail(format!("Error: {}", e))
+                .build()
+        })?;
+
+    match app_state
+        .digest_service
+        .generate_and_send_weekly_digest(preferences.digest_sections)
+        .await
+    {
+        Ok(_) => {
+            info!("Weekly digest generated and sent successfully");
+            Ok(Json(TriggerDigestResponse {
+                success: true,
+                message: "Weekly digest generated and sent successfully".to_string(),
+            }))
+        }
+        Err(e) => {
+            error!("Failed to generate weekly digest: {}", e);
+            Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Failed to generate weekly digest")
+                .detail(format!("Error: {}", e))
+                .build())
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct TriggerDigestResponse {
+    pub success: bool,
+    pub message: String,
 }
 
 pub fn configure_routes() -> Router<Arc<NotificationState>> {
@@ -1012,23 +1119,26 @@ pub fn configure_routes() -> Router<Arc<NotificationState>> {
         .route("/notification-preferences", get(get_preferences))
         .route("/notification-preferences", put(update_preferences))
         .route("/notification-preferences", delete(delete_preferences))
+        .route("/weekly-digest/trigger", post(trigger_weekly_digest))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::{Request, StatusCode};
     use axum::body::Body;
+    use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use temps_database::test_utils::TestDatabase;
-    use testcontainers::{runners::AsyncRunner, ContainerAsync, GenericImage, core::ContainerPort};
-    use tokio;
+    use testcontainers::{core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage};
+
     use tower::ServiceExt;
 
     struct TestSetup {
         pub test_db: TestDatabase,
+        #[allow(dead_code)]
         pub mailpit_container: ContainerAsync<GenericImage>,
         pub mailpit_smtp_port: u16,
+        #[allow(dead_code)]
         pub mailpit_web_port: u16,
         pub notification_state: Arc<NotificationState>,
     }
@@ -1053,26 +1163,33 @@ mod tests {
 
             // Create encryption service
             let encryption_service = Arc::new(
-                temps_core::EncryptionService::new("0000000000000000000000000000000000000000000000000000000000000000")
-                    .expect("Failed to create encryption service")
+                temps_core::EncryptionService::new(
+                    "0000000000000000000000000000000000000000000000000000000000000000",
+                )
+                .expect("Failed to create encryption service"),
             );
 
             // Create notification service
-            let notification_service = Arc::new(
-                crate::services::NotificationService::new(
-                    test_db.connection_arc(),
-                    encryption_service.clone()
-                )
-            );
+            let notification_service = Arc::new(crate::services::NotificationService::new(
+                test_db.connection_arc(),
+                encryption_service.clone(),
+            ));
 
             // Create notification preferences service
             let notification_preferences_service = Arc::new(
-                crate::services::NotificationPreferencesService::new(test_db.connection_arc())
+                crate::services::NotificationPreferencesService::new(test_db.connection_arc()),
             );
+
+            // Create digest service
+            let digest_service = Arc::new(crate::digest::DigestService::new(
+                test_db.connection_arc(),
+                notification_service.clone(),
+            ));
 
             let notification_state = Arc::new(NotificationState::new(
                 notification_service,
                 notification_preferences_service,
+                digest_service,
             ));
 
             Ok(TestSetup {

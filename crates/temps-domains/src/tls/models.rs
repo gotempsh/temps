@@ -39,6 +39,7 @@ pub struct HttpChallengeData {
     pub token: String,
     pub key_authorization: String,
     pub validation_url: Option<String>,
+    pub order_url: Option<String>,
     pub created_at: UtcDateTime,
 }
 
@@ -71,8 +72,8 @@ pub struct AcmeOrder {
     pub certificate_url: Option<String>,
     pub error: Option<String>,
     pub error_type: Option<String>,
-    pub token: Option<String>,  // For fast HTTP-01 challenge lookups (indexed)
-    pub key_authorization: Option<String>,  // For fast HTTP-01 challenge lookups
+    pub token: Option<String>, // For fast HTTP-01 challenge lookups (indexed)
+    pub key_authorization: Option<String>, // For fast HTTP-01 challenge lookups
     pub created_at: UtcDateTime,
     pub updated_at: UtcDateTime,
     pub expires_at: Option<UtcDateTime>,
@@ -171,7 +172,7 @@ pub enum RenewalResult {
     /// DNS-01 renewal started, awaiting user DNS update
     /// CRITICAL: current_certificate remains Active
     AwaitingDnsValidation {
-        current_certificate: Certificate,  // Still Active!
+        current_certificate: Certificate, // Still Active!
         challenge_data: DnsChallengeData,
         instructions: String,
         renewal_id: i32,
@@ -179,7 +180,7 @@ pub enum RenewalResult {
 
     /// HTTP-01 challenge initiated, awaiting validation
     AwaitingHttpValidation {
-        current_certificate: Certificate,  // Still Active!
+        current_certificate: Certificate, // Still Active!
         challenge_data: HttpChallengeData,
         instructions: String,
         renewal_id: i32,
@@ -221,7 +222,7 @@ impl From<temps_entities::domains::Model> for Certificate {
             domain: entity.domain,
             certificate_pem: entity.certificate.unwrap_or_default(),
             private_key_pem: entity.private_key.unwrap_or_default(),
-            expiration_time: entity.expiration_time.unwrap_or_else(|| chrono::Utc::now()),
+            expiration_time: entity.expiration_time.unwrap_or_else(chrono::Utc::now),
             last_renewed: entity.last_renewed,
             is_wildcard: entity.is_wildcard,
             verification_method: entity.verification_method,
@@ -240,9 +241,11 @@ impl From<&Certificate> for temps_entities::domains::ActiveModel {
             CertificateStatus::Pending => ("pending".to_string(), None, None),
             CertificateStatus::PendingDns => ("pending_dns".to_string(), None, None),
             CertificateStatus::PendingValidation => ("pending_validation".to_string(), None, None),
-            CertificateStatus::Failed { error, error_type } => {
-                ("failed".to_string(), Some(error.clone()), Some(error_type.clone()))
-            }
+            CertificateStatus::Failed { error, error_type } => (
+                "failed".to_string(),
+                Some(error.clone()),
+                Some(error_type.clone()),
+            ),
             CertificateStatus::Expired => ("expired".to_string(), None, None),
         };
 

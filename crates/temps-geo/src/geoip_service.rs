@@ -1,9 +1,9 @@
-use tracing::{info, debug};
 use maxminddb::geoip2;
 use rand::seq::SliceRandom;
 use serde::Serialize;
 use std::net::IpAddr;
 use thiserror::Error;
+use tracing::{debug, info};
 
 #[derive(Debug, Serialize, Clone)]
 pub struct GeoLocation {
@@ -20,7 +20,7 @@ pub struct GeoLocation {
 #[derive(Error, Debug)]
 pub enum GeoIpError {
     #[error("Failed to open MaxMind database: {0}")]
-    DatabaseError(#[from] maxminddb::MaxMindDBError),
+    DatabaseError(#[from] maxminddb::MaxMindDbError),
     #[error("IP address not found in database")]
     NotFound(String),
     #[error("IO error: {0}")]
@@ -134,18 +134,18 @@ impl GeoIpService {
     pub fn new() -> Result<Self, GeoIpError> {
         // Check if we should use mock service for local development
         let use_mock = std::env::var("TEMPS_GEO_MOCK")
-            .unwrap_or_else(|_| "false".to_string())
-            .to_lowercase() == "true";
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
 
         if use_mock {
             info!("Using mock GeoIP service for local development");
-            Ok(Self::Mock(MockGeoIpService::new()))
-        } else {
-            let db_path = std::env::current_dir()?.join("GeoLite2-City.mmdb");
-            debug!("Loading MaxMind database from: {:?}", db_path);
-            let reader = maxminddb::Reader::open_readfile(db_path)?;
-            Ok(Self::MaxMind(MaxMindGeoIpService { reader }))
+            return Ok(Self::Mock(MockGeoIpService::new()));
         }
+
+        let db_path = std::env::current_dir()?.join("GeoLite2-City.mmdb");
+        debug!("Loading MaxMind database from: {:?}", db_path);
+        let reader = maxminddb::Reader::open_readfile(db_path)?;
+        Ok(Self::MaxMind(MaxMindGeoIpService { reader }))
     }
 
     pub async fn geolocate(&self, ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
@@ -163,67 +163,59 @@ pub struct MaxMindGeoIpService {
 impl MaxMindGeoIpService {
     pub async fn geolocate(&self, ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
         info!("Geolocating IP: {}", ip);
-        let city_result: Result<geoip2::City, maxminddb::MaxMindDBError> = self.reader.lookup(ip);
 
-        match city_result {
-            Ok(city) => {
-                let country = city
-                    .country
-                    .as_ref()
-                    .and_then(|c| c.names.as_ref())
-                    .and_then(|n| n.get("en").cloned())
-                    .map(|s| s.to_string());
+        let lookup_result = self.reader.lookup(ip)?;
 
-                let country_code = city
-                    .country
-                    .as_ref()
-                    .and_then(|c| c.iso_code.clone())
-                    .map(|s| s.to_string());
+        let city_data = lookup_result
+            .decode::<geoip2::City>()
+            .map_err(|e| GeoIpError::NotFound(format!("Failed to decode city data: {}", e)))?
+            .ok_or_else(|| GeoIpError::NotFound(format!("No data found for IP: {}", ip)))?;
 
-                let city_name = city
-                    .city
-                    .as_ref()
-                    .and_then(|c| c.names.as_ref())
-                    .and_then(|n| n.get("en").cloned())
-                    .map(|s| s.to_string());
+        Ok(Self::extract_geo_location(&city_data))
+    }
 
-                let region = city
-                    .subdivisions
-                    .as_ref()
-                    .and_then(|subs| subs.first())
-                    .and_then(|sub| sub.names.as_ref())
-                    .and_then(|n| n.get("en").cloned())
-                    .map(|s| s.to_string());
+    fn extract_geo_location(city_data: &geoip2::City<'_>) -> GeoLocation {
+        // Extract country information
+        let country = city_data.country.names.english.map(String::from);
+        let country_code = city_data.country.iso_code.map(String::from);
+        let is_eu = city_data.country.is_in_european_union.unwrap_or(false);
 
-                let location = city.location.as_ref();
-                let latitude = location.and_then(|l| l.latitude);
-                let longitude = location.and_then(|l| l.longitude);
-                let timezone = location.and_then(|l| l.time_zone.clone()).map(|s| s.to_string());
+        // Extract city name
+        let city_name = city_data.city.names.english.map(String::from);
 
-                let is_eu = city
-                    .country
-                    .as_ref()
-                    .and_then(|c| c.is_in_european_union)
-                    .unwrap_or(false);
+        // Extract region from first subdivision
+        let region = city_data
+            .subdivisions
+            .first()
+            .and_then(|sub| sub.names.english)
+            .map(String::from);
 
-                Ok(GeoLocation {
-                    country,
-                    country_code,
-                    city: city_name,
-                    latitude,
-                    longitude,
-                    region,
-                    timezone,
-                    is_eu,
-                })
-            }
-            Err(e) => Err(GeoIpError::NotFound(format!("IP lookup failed: {}", e))),
+        // Extract location data
+        let latitude = city_data.location.latitude;
+        let longitude = city_data.location.longitude;
+        let timezone = city_data.location.time_zone.map(String::from);
+
+        GeoLocation {
+            country,
+            country_code,
+            city: city_name,
+            latitude,
+            longitude,
+            region,
+            timezone,
+            is_eu,
         }
     }
 }
 
 /// Mock GeoIP service for local development
 pub struct MockGeoIpService;
+
+impl Default for MockGeoIpService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl MockGeoIpService {
     pub fn new() -> Self {
@@ -234,20 +226,7 @@ impl MockGeoIpService {
         // For localhost/private IPs, return random city data
         if ip.is_loopback() || Self::is_private_ip(&ip) {
             info!("Mock geolocating IP: {} (localhost/private)", ip);
-            let mut rng = rand::thread_rng();
-            let mock_city = MOCK_CITIES.choose(&mut rng)
-                .ok_or_else(|| GeoIpError::Other("Failed to select mock city".to_string()))?;
-
-            return Ok(GeoLocation {
-                country: Some(mock_city.country.to_string()),
-                country_code: Some(mock_city.country_code.to_string()),
-                city: Some(mock_city.city.to_string()),
-                latitude: Some(mock_city.latitude),
-                longitude: Some(mock_city.longitude),
-                region: Some(mock_city.region.to_string()),
-                timezone: Some(mock_city.timezone.to_string()),
-                is_eu: mock_city.is_eu,
-            });
+            return Self::random_mock_location();
         }
 
         // For other IPs, return a generic response
@@ -264,14 +243,28 @@ impl MockGeoIpService {
         })
     }
 
+    fn random_mock_location() -> Result<GeoLocation, GeoIpError> {
+        let mut rng = rand::thread_rng();
+        let mock_city = MOCK_CITIES
+            .choose(&mut rng)
+            .ok_or_else(|| GeoIpError::Other("Failed to select mock city".to_string()))?;
+
+        Ok(GeoLocation {
+            country: Some(mock_city.country.to_string()),
+            country_code: Some(mock_city.country_code.to_string()),
+            city: Some(mock_city.city.to_string()),
+            latitude: Some(mock_city.latitude),
+            longitude: Some(mock_city.longitude),
+            region: Some(mock_city.region.to_string()),
+            timezone: Some(mock_city.timezone.to_string()),
+            is_eu: mock_city.is_eu,
+        })
+    }
+
     fn is_private_ip(ip: &IpAddr) -> bool {
         match ip {
-            IpAddr::V4(ipv4) => {
-                ipv4.is_private() || ipv4.is_link_local()
-            }
-            IpAddr::V6(ipv6) => {
-                ipv6.is_loopback() || ipv6.is_unique_local()
-            }
+            IpAddr::V4(ipv4) => ipv4.is_private() || ipv4.is_link_local(),
+            IpAddr::V6(ipv6) => ipv6.is_loopback() || ipv6.is_unique_local(),
         }
     }
 }

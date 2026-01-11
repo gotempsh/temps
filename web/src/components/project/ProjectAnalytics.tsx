@@ -10,11 +10,14 @@ import {
   BrowsersChart,
   LocationsChart,
   PagesChart,
+  ReferrersChart,
 } from '@/components/analytics/overview'
 import { Pages } from '@/components/analytics/Pages'
 import { SessionReplays } from '@/components/analytics/SessionReplays'
 import { FunnelDetail } from '@/components/funnel/FunnelDetail'
 import { FunnelManagement } from '@/components/funnel/FunnelManagement'
+import { LiveVisitorsList } from '@/components/visitors/LiveVisitorsList'
+import { LiveVisitors } from '@/pages/LiveVisitors'
 import { Button } from '@/components/ui/button'
 import { Calendar } from '@/components/ui/calendar'
 import {
@@ -672,6 +675,10 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
       <Route path="requests/*" element={<RequestLogs project={project} />} />
       <Route path="funnels/*" element={<FunnelAnalytics project={project} />} />
       <Route
+        path="live-visitors"
+        element={<LiveVisitors project={project} />}
+      />
+      <Route
         path="visitors/*"
         element={<VisitorAnalytics project={project} />}
       />
@@ -872,6 +879,12 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
               environment={selectedEnvironment}
             />
             <LocationsChart
+              project={project}
+              startDate={startDate}
+              endDate={endDate}
+              environment={selectedEnvironment}
+            />
+            <ReferrersChart
               project={project}
               startDate={startDate}
               endDate={endDate}
@@ -1107,18 +1120,10 @@ export default function RootLayout({
     </html>
   );
 }`,
-      apiRouteCode: `// app/api/_temps/[...path]/route.ts
-import { createTempsAnalyticsHandler } from '@temps-sdk/react-analytics/server';
-
-const handler = createTempsAnalyticsHandler({
-  projectId: '${project.slug}',
-  apiKey: process.env.TEMPS_API_KEY!, // Get this from your Temps dashboard
-});
-
-export const POST = handler;
-export const GET = handler;`,
       envExample: `# .env.local
-TEMPS_API_KEY=your_api_key_here # Get this from your Temps dashboard`,
+TEMPS_API_KEY=your_api_key_here # Get this from your Temps dashboard
+NEXT_PUBLIC_PROJECT_SLUG=${project.slug}
+NEXT_PUBLIC_TEMPS_API_URL=https://your-temps-instance.com`,
     },
     {
       id: 'nextjs-pages',
@@ -1141,22 +1146,40 @@ function MyApp({ Component, pageProps }: AppProps) {
 
 export default MyApp;`,
       apiRouteCode: `// pages/api/_temps/[...path].ts
-import { createTempsAnalyticsHandler } from '@temps-sdk/react-analytics/server';
 import type { NextApiRequest, NextApiResponse } from 'next';
 
-const handler = createTempsAnalyticsHandler({
-  projectId: '${project.slug}',
-  apiKey: process.env.TEMPS_API_KEY!,
-});
-
-export default function tempsHandler(
+export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse
 ) {
-  return handler(req, res);
+  if (req.method === 'POST') {
+    // Forward analytics events to Temps API
+    const response = await fetch(\`\${process.env.NEXT_PUBLIC_TEMPS_API_URL}/api/analytics/\${process.env.NEXT_PUBLIC_PROJECT_SLUG}/events\`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': \`Bearer \${process.env.TEMPS_API_KEY}\`,
+      },
+      body: JSON.stringify(req.body),
+    });
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: 'Failed to send analytics' });
+    }
+
+    return res.status(200).json({ success: true });
+  }
+
+  if (req.method === 'GET') {
+    return res.status(200).json({ status: 'ok' });
+  }
+
+  return res.status(405).json({ error: 'Method not allowed' });
 }`,
       envExample: `# .env.local
-TEMPS_API_KEY=your_api_key_here # Get this from your Temps dashboard`,
+TEMPS_API_KEY=your_api_key_here # Get this from your Temps dashboard
+NEXT_PUBLIC_PROJECT_SLUG=${project.slug}
+NEXT_PUBLIC_TEMPS_API_URL=https://your-temps-instance.com`,
     },
     {
       id: 'vite',
@@ -1178,8 +1201,6 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
     </TempsAnalyticsProvider>
   </React.StrictMode>,
 )`,
-      apiRouteCode: null,
-      envExample: null,
     },
     {
       id: 'react',
@@ -1205,8 +1226,6 @@ root.render(
     </TempsAnalyticsProvider>
   </React.StrictMode>
 );`,
-      apiRouteCode: null,
-      envExample: null,
     },
     {
       id: 'remix',
@@ -1244,24 +1263,6 @@ export default function App() {
     </html>
   );
 }`,
-      apiRouteCode: `// app/routes/api._temps.$.tsx
-import { createTempsAnalyticsHandler } from '@temps-sdk/react-analytics/server';
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-
-const handler = createTempsAnalyticsHandler({
-  projectId: '${project.slug}',
-  apiKey: process.env.TEMPS_API_KEY!,
-});
-
-export async function loader({ request }: LoaderFunctionArgs) {
-  return handler(request);
-}
-
-export async function action({ request }: ActionFunctionArgs) {
-  return handler(request);
-}`,
-      envExample: `# .env
-TEMPS_API_KEY=your_api_key_here # Get this from your Temps dashboard`,
     },
   ]
 
@@ -1456,102 +1457,34 @@ TEMPS_API_KEY=your_api_key_here # Get this from your Temps dashboard`,
               />
             </div>
           </div>
-
-          {/* Step 3: API Route (for Next.js/Remix) */}
-          {selectedFrameworkData.apiRouteCode && (
-            <div className="space-y-3">
-              <div className="flex items-center gap-2">
-                <span className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs text-primary-foreground">
-                  3
-                </span>
-                <h4 className="font-medium">Create the API route</h4>
-              </div>
-              <div className="relative ml-8">
-                <div className="flex items-center gap-2 mb-2">
-                  <FileCode className="h-4 w-4 text-muted-foreground" />
-                  <span className="text-sm text-muted-foreground">
-                    Create a new API route to handle analytics:
-                  </span>
-                </div>
-                <CodeBlock
-                  language={
-                    selectedFrameworkData.id.includes('next')
-                      ? 'typescript'
-                      : 'javascript'
-                  }
-                  code={selectedFrameworkData.apiRouteCode}
-                  title={
-                    selectedFrameworkData.id.includes('next')
-                      ? selectedFrameworkData.id === 'nextjs-app'
-                        ? 'app/api/_temps/[...path]/route.ts'
-                        : 'pages/api/_temps/[...path].ts'
-                      : 'API Route'
-                  }
-                />
-              </div>
-            </div>
-          )}
-
-          {/* Step 4: Environment Variables */}
-          {selectedFrameworkData.envExample && (
-            <div className="space-y-3">
-              <div className="flex items-center gap-2">
-                <span className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs text-primary-foreground">
-                  {selectedFrameworkData.apiRouteCode ? '4' : '3'}
-                </span>
-                <h4 className="font-medium">Add environment variables</h4>
-              </div>
-              <div className="relative ml-8">
-                <div className="flex items-center gap-2 mb-2">
-                  <FileCode className="h-4 w-4 text-muted-foreground" />
-                  <span className="text-sm text-muted-foreground">
-                    Add to your environment file:
-                  </span>
-                </div>
-                <CodeBlock
-                  language="bash"
-                  code={selectedFrameworkData.envExample}
-                  title=".env.local"
-                />
-              </div>
-            </div>
-          )}
         </CardContent>
       </Card>
 
       {/* Additional Configuration */}
       <Card>
         <CardHeader>
-          <CardTitle>Advanced Configuration</CardTitle>
+          <CardTitle>Usage Examples</CardTitle>
           <CardDescription>
-            Customize analytics behavior and track custom events
+            Learn how to use the analytics SDK in your application
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <Tabs defaultValue="events" className="w-full">
-            <TabsList className="grid w-full grid-cols-2">
-              <TabsTrigger value="events">Track Events</TabsTrigger>
-              <TabsTrigger value="pageviews">Track Page Views</TabsTrigger>
-            </TabsList>
-            <div className="mt-4">
-              {/* Custom Events Tab Content */}
-              <div
-                className="data-[state=active]:block hidden"
-                data-state="active"
-              >
-                <div className="space-y-3">
-                  <p className="text-sm text-muted-foreground">
-                    Use the useAnalytics hook to track custom events:
-                  </p>
-                  <CodeBlock
-                    language="javascript"
-                    code={`import { useAnalytics } from '@temps-sdk/react-analytics';
+          <div className="space-y-6">
+            {/* Custom Events Example */}
+            <div className="space-y-3">
+              <h4 className="font-medium">Track Custom Events</h4>
+              <p className="text-sm text-muted-foreground">
+                Use the useAnalytics hook to track custom events with metadata:
+              </p>
+              <CodeBlock
+                language="javascript"
+                code={`import { useAnalytics } from '@temps-sdk/react-analytics';
 
 function MyComponent() {
   const { track } = useAnalytics();
 
   const handleClick = () => {
-    // Track a custom event
+    // Track a custom event with properties
     track('button_click', {
       button_id: 'subscribe',
       page: '/pricing',
@@ -1565,43 +1498,39 @@ function MyComponent() {
     </button>
   );
 }`}
-                  />
-                </div>
-              </div>
-              {/* Page Views Tab Content */}
-              <div
-                className="data-[state=active]:block hidden"
-                data-state="inactive"
-              >
-                <div className="space-y-3">
-                  <p className="text-sm text-muted-foreground">
-                    Page views are automatically tracked, but you can also track
-                    them manually:
-                  </p>
-                  <CodeBlock
-                    language="javascript"
-                    code={`import { useAnalytics } from '@temps-sdk/react-analytics';
+              />
+            </div>
+
+            {/* Identify Users Example */}
+            <div className="space-y-3">
+              <h4 className="font-medium">Identify Users</h4>
+              <p className="text-sm text-muted-foreground">
+                Associate analytics with specific users:
+              </p>
+              <CodeBlock
+                language="javascript"
+                code={`import { useAnalytics } from '@temps-sdk/react-analytics';
 import { useEffect } from 'react';
 
-function MyPage() {
-  const { pageView } = useAnalytics();
+function UserProfile({ user }) {
+  const { identify } = useAnalytics();
 
   useEffect(() => {
-    // Manually track a page view
-    pageView({
-      path: '/custom-page',
-      title: 'Custom Page Title',
-      referrer: document.referrer
-    });
-  }, []);
+    if (user) {
+      // Identify the user with their details
+      identify(user.id, {
+        email: user.email,
+        name: user.name,
+        plan: user.subscription.plan
+      });
+    }
+  }, [user]);
 
-  return <div>Your page content</div>;
+  return <div>Profile content</div>;
 }`}
-                  />
-                </div>
-              </div>
+              />
             </div>
-          </Tabs>
+          </div>
         </CardContent>
       </Card>
 
@@ -1665,7 +1594,7 @@ function MyPage() {
           <Button
             variant="outline"
             onClick={() =>
-              window.open('https://docs.temps.app/analytics', '_blank')
+              window.open('https://docs.temps.sh/analytics', '_blank')
             }
           >
             View Documentation
@@ -1673,7 +1602,7 @@ function MyPage() {
           <Button
             variant="outline"
             onClick={() =>
-              window.open('https://github.com/temps/analytics/issues', '_blank')
+              window.open('https://github.com/gotempsh/temps/issues', '_blank')
             }
           >
             Report an Issue

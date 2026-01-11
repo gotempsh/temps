@@ -44,14 +44,17 @@ impl CtrlCShutdownSignal {
                 info!("All resources cleaned up within timeout");
             }
             Err(_) => {
-                warn!("Cleanup timeout exceeded ({:?}), forcing shutdown", self.cleanup_timeout);
+                warn!(
+                    "Cleanup timeout exceeded ({:?}), forcing shutdown",
+                    self.cleanup_timeout
+                );
             }
         }
     }
 
     async fn cleanup_deployments(&self) {
+        use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter};
         use temps_entities::deployments;
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
 
         debug!("Cancelling running deployments...");
 
@@ -59,9 +62,18 @@ impl CtrlCShutdownSignal {
         match deployments::Entity::update_many()
             .filter(deployments::Column::State.eq("running"))
             .col_expr(deployments::Column::State, Expr::value("cancelled"))
-            .col_expr(deployments::Column::CancelledReason, Expr::value("Server shutdown"))
-            .col_expr(deployments::Column::FinishedAt, Expr::current_timestamp().into())
-            .col_expr(deployments::Column::UpdatedAt, Expr::current_timestamp().into())
+            .col_expr(
+                deployments::Column::CancelledReason,
+                Expr::value("Server shutdown"),
+            )
+            .col_expr(
+                deployments::Column::FinishedAt,
+                Expr::current_timestamp().into(),
+            )
+            .col_expr(
+                deployments::Column::UpdatedAt,
+                Expr::current_timestamp().into(),
+            )
             .exec(self.db.as_ref())
             .await
         {
@@ -82,19 +94,21 @@ impl CtrlCShutdownSignal {
     async fn cleanup_database(&self) {
         debug!("Cleaning up database connections...");
 
-        // Clone the Arc to get ownership for closing
-        // Note: This will only close this reference; other references may still exist
-        let db = Arc::try_unwrap(Arc::clone(&self.db))
-            .unwrap_or_else(|arc| {
-                debug!("Database still has other references, cannot close directly");
-                return (*arc).clone(); // Get a clone if we can't unwrap
-            });
-
-        // Close the database connection gracefully
-        if let Err(e) = db.close().await {
-            warn!("Error closing database connection: {}", e);
-        } else {
-            debug!("Database connection closed successfully");
+        // Try to unwrap the Arc to get ownership for closing
+        // Note: If there are other references, we can't close it directly
+        match Arc::try_unwrap(Arc::clone(&self.db)) {
+            Ok(db) => {
+                // We got exclusive ownership, close the connection
+                if let Err(e) = db.close().await {
+                    warn!("Error closing database connection: {}", e);
+                } else {
+                    debug!("Database connection closed successfully");
+                }
+            }
+            Err(_arc) => {
+                // Other references still exist, cannot close
+                debug!("Database still has other references, skipping close");
+            }
         }
 
         debug!("Database cleanup completed");
@@ -128,7 +142,9 @@ impl ProxyShutdownSignal for CtrlCShutdownSignal {
         let data_dir = self.data_dir.clone();
 
         Box::pin(async move {
-            tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl-c signal");
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to listen for ctrl-c signal");
             info!("Received Ctrl+C, initiating graceful shutdown...");
 
             // Create a new instance for cleanup since we moved into the async block

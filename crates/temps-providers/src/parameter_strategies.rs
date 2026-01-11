@@ -1,0 +1,860 @@
+use serde_json::{json, Value as JsonValue};
+use std::collections::HashMap;
+
+/// Strategy for validating and managing parameters for a specific service type
+pub trait ParameterStrategy: Send + Sync {
+    /// Validate parameters for service creation - ensures all required parameters are present
+    fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String>;
+
+    /// Auto-generate missing optional parameters (port, docker_image, etc.)
+    fn auto_generate_missing(&self, params: &mut HashMap<String, JsonValue>) -> Result<(), String>;
+
+    /// Validate parameters for update - ensures only updateable parameters are being changed
+    fn validate_for_update(&self, updates: &HashMap<String, JsonValue>) -> Result<(), String>;
+
+    /// List of parameter keys that can be updated after service creation
+    fn updateable_keys(&self) -> Vec<&'static str>;
+
+    /// List of parameter keys that are read-only after service creation
+    fn readonly_keys(&self) -> Vec<&'static str>;
+
+    /// Merge updates into existing parameters, rejecting any readonly parameter changes
+    fn merge_updates(
+        &self,
+        existing: &mut HashMap<String, JsonValue>,
+        updates: HashMap<String, JsonValue>,
+    ) -> Result<(), String>;
+
+    /// Get JSON schema for this service's parameters (for UI validation)
+    fn get_schema(&self) -> Option<JsonValue>;
+
+    /// Friendly name for error messages
+    fn service_name(&self) -> &'static str;
+}
+
+/// PostgreSQL parameter strategy
+pub struct PostgresParameterStrategy;
+
+impl ParameterStrategy for PostgresParameterStrategy {
+    fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        if !params.contains_key("database") || is_empty_value(params.get("database")) {
+            return Err("'database' is required for PostgreSQL".to_string());
+        }
+        if !params.contains_key("username") || is_empty_value(params.get("username")) {
+            return Err("'username' is required for PostgreSQL".to_string());
+        }
+        // Password is optional - will be auto-generated if not provided
+        Ok(())
+    }
+
+    fn auto_generate_missing(&self, params: &mut HashMap<String, JsonValue>) -> Result<(), String> {
+        // Auto-assign port if not provided
+        if is_empty_value(params.get("port")) {
+            if let Some(port) = find_available_port(5432) {
+                params.insert("port".to_string(), JsonValue::String(port.to_string()));
+            }
+        }
+
+        // Default docker_image if not provided
+        if is_empty_value(params.get("docker_image")) {
+            params.insert(
+                "docker_image".to_string(),
+                JsonValue::String("postgres:17-alpine".to_string()),
+            );
+        }
+
+        // Auto-generate password if not provided
+        if is_empty_value(params.get("password")) {
+            params.insert(
+                "password".to_string(),
+                JsonValue::String(generate_secure_password()),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn validate_for_update(&self, updates: &HashMap<String, JsonValue>) -> Result<(), String> {
+        for key in updates.keys() {
+            if !self.updateable_keys().contains(&key.as_str()) {
+                return Err(format!(
+                    "Cannot update parameter '{}' for PostgreSQL. Read-only parameters: {}. Updateable parameters: {}",
+                    key,
+                    self.readonly_keys().join(", "),
+                    self.updateable_keys().join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn updateable_keys(&self) -> Vec<&'static str> {
+        vec!["port", "docker_image", "max_connections", "ssl_mode"]
+    }
+
+    fn readonly_keys(&self) -> Vec<&'static str> {
+        vec!["database", "username", "password", "host"]
+    }
+
+    fn merge_updates(
+        &self,
+        existing: &mut HashMap<String, JsonValue>,
+        updates: HashMap<String, JsonValue>,
+    ) -> Result<(), String> {
+        self.validate_for_update(&updates)?;
+
+        for (key, value) in updates {
+            existing.insert(key, value);
+        }
+        Ok(())
+    }
+
+    fn get_schema(&self) -> Option<JsonValue> {
+        Some(json!({
+            "type": "object",
+            "title": "PostgreSQL Parameters",
+            "required": ["database", "username"],
+            "properties": {
+                "database": {
+                    "type": "string",
+                    "description": "Database name (read-only after creation)",
+                    "example": "myapp_db"
+                },
+                "username": {
+                    "type": "string",
+                    "description": "Database user (read-only after creation)",
+                    "example": "postgres"
+                },
+                "password": {
+                    "type": "string",
+                    "description": "User password (read-only after creation, auto-generated if not provided)",
+                    "example": "secure_password"
+                },
+                "host": {
+                    "type": "string",
+                    "description": "Host address (read-only after creation)",
+                    "default": "localhost"
+                },
+                "port": {
+                    "type": "integer",
+                    "description": "Port (updateable)",
+                    "default": 5432
+                },
+                "max_connections": {
+                    "type": "integer",
+                    "description": "Maximum connections (updateable)",
+                    "default": 100
+                },
+                "docker_image": {
+                    "type": "string",
+                    "description": "Docker image (updateable, e.g., postgres:17-alpine)",
+                    "default": "postgres:17-alpine"
+                }
+            },
+            "readonly": ["database", "username", "password", "host"]
+        }))
+    }
+
+    fn service_name(&self) -> &'static str {
+        "PostgreSQL"
+    }
+}
+
+/// Redis parameter strategy
+pub struct RedisParameterStrategy;
+
+impl ParameterStrategy for RedisParameterStrategy {
+    fn validate_for_creation(&self, _params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        // Redis doesn't require parameters for creation
+        Ok(())
+    }
+
+    fn auto_generate_missing(&self, params: &mut HashMap<String, JsonValue>) -> Result<(), String> {
+        // Auto-assign port if not provided
+        if is_empty_value(params.get("port")) {
+            if let Some(port) = find_available_port(6379) {
+                params.insert("port".to_string(), JsonValue::String(port.to_string()));
+            }
+        }
+
+        // Default docker_image if not provided
+        if is_empty_value(params.get("docker_image")) {
+            params.insert(
+                "docker_image".to_string(),
+                JsonValue::String("redis:8-alpine".to_string()),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn validate_for_update(&self, updates: &HashMap<String, JsonValue>) -> Result<(), String> {
+        for key in updates.keys() {
+            if !self.updateable_keys().contains(&key.as_str()) {
+                return Err(format!(
+                    "Cannot update parameter '{}' for Redis. Read-only parameters: {}. Updateable parameters: {}",
+                    key,
+                    self.readonly_keys().join(", "),
+                    self.updateable_keys().join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn updateable_keys(&self) -> Vec<&'static str> {
+        vec!["port", "docker_image"]
+    }
+
+    fn readonly_keys(&self) -> Vec<&'static str> {
+        vec!["password"]
+    }
+
+    fn merge_updates(
+        &self,
+        existing: &mut HashMap<String, JsonValue>,
+        updates: HashMap<String, JsonValue>,
+    ) -> Result<(), String> {
+        self.validate_for_update(&updates)?;
+
+        for (key, value) in updates {
+            existing.insert(key, value);
+        }
+        Ok(())
+    }
+
+    fn get_schema(&self) -> Option<JsonValue> {
+        Some(json!({
+            "type": "object",
+            "title": "Redis Parameters",
+            "properties": {
+                "password": {
+                    "type": "string",
+                    "description": "Redis password (read-only after creation)",
+                    "example": "secure_password"
+                },
+                "port": {
+                    "type": "integer",
+                    "description": "Port (updateable)",
+                    "default": 6379
+                },
+                "docker_image": {
+                    "type": "string",
+                    "description": "Docker image (updateable, e.g., redis:8-alpine)",
+                    "default": "redis:8-alpine"
+                }
+            },
+            "readonly": ["password"]
+        }))
+    }
+
+    fn service_name(&self) -> &'static str {
+        "Redis"
+    }
+}
+
+/// S3/MinIO parameter strategy
+pub struct S3ParameterStrategy;
+
+impl ParameterStrategy for S3ParameterStrategy {
+    fn validate_for_creation(&self, _params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        // S3/MinIO doesn't require parameters for creation
+        Ok(())
+    }
+
+    fn auto_generate_missing(&self, params: &mut HashMap<String, JsonValue>) -> Result<(), String> {
+        // Auto-assign port if not provided
+        if is_empty_value(params.get("port")) {
+            if let Some(port) = find_available_port(9000) {
+                params.insert("port".to_string(), JsonValue::String(port.to_string()));
+            }
+        }
+
+        // Default docker_image if not provided (pinned to specific version for reproducibility)
+        if is_empty_value(params.get("docker_image")) {
+            params.insert(
+                "docker_image".to_string(),
+                JsonValue::String("minio/minio:RELEASE.2025-09-07T16-13-09Z".to_string()),
+            );
+        }
+
+        // Auto-generate access_key if not provided
+        if is_empty_value(params.get("access_key")) {
+            params.insert(
+                "access_key".to_string(),
+                JsonValue::String("minioadmin".to_string()),
+            );
+        }
+
+        // Auto-generate secret_key if not provided
+        if is_empty_value(params.get("secret_key")) {
+            params.insert(
+                "secret_key".to_string(),
+                JsonValue::String("minioadmin".to_string()),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn validate_for_update(&self, updates: &HashMap<String, JsonValue>) -> Result<(), String> {
+        for key in updates.keys() {
+            if !self.updateable_keys().contains(&key.as_str()) {
+                return Err(format!(
+                    "Cannot update parameter '{}' for S3/MinIO. Read-only parameters: {}. Updateable parameters: {}",
+                    key,
+                    self.readonly_keys().join(", "),
+                    self.updateable_keys().join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn updateable_keys(&self) -> Vec<&'static str> {
+        vec!["port", "docker_image"]
+    }
+
+    fn readonly_keys(&self) -> Vec<&'static str> {
+        vec!["access_key", "secret_key"]
+    }
+
+    fn merge_updates(
+        &self,
+        existing: &mut HashMap<String, JsonValue>,
+        updates: HashMap<String, JsonValue>,
+    ) -> Result<(), String> {
+        self.validate_for_update(&updates)?;
+
+        for (key, value) in updates {
+            existing.insert(key, value);
+        }
+        Ok(())
+    }
+
+    fn get_schema(&self) -> Option<JsonValue> {
+        Some(json!({
+            "type": "object",
+            "title": "S3/MinIO Parameters",
+            "properties": {
+                "access_key": {
+                    "type": "string",
+                    "description": "Access key (read-only after creation)",
+                    "example": "minioadmin"
+                },
+                "secret_key": {
+                    "type": "string",
+                    "description": "Secret key (read-only after creation)",
+                    "example": "minioadmin"
+                },
+                "port": {
+                    "type": "integer",
+                    "description": "Port (updateable)",
+                    "default": 9000
+                },
+                "docker_image": {
+                    "type": "string",
+                    "description": "Docker image (updateable, e.g., minio/minio:RELEASE.2025-09-07T16-13-09Z)",
+                    "default": "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+                }
+            },
+            "readonly": ["access_key", "secret_key"]
+        }))
+    }
+
+    fn service_name(&self) -> &'static str {
+        "S3/MinIO"
+    }
+}
+
+/// RustFS/Blob parameter strategy (high-performance S3-compatible storage)
+pub struct RustfsParameterStrategy;
+
+impl ParameterStrategy for RustfsParameterStrategy {
+    fn validate_for_creation(&self, _params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        // RustFS doesn't require parameters for creation
+        Ok(())
+    }
+
+    fn auto_generate_missing(&self, params: &mut HashMap<String, JsonValue>) -> Result<(), String> {
+        // Auto-assign port if not provided
+        if is_empty_value(params.get("port")) {
+            if let Some(port) = find_available_port(9000) {
+                params.insert("port".to_string(), JsonValue::String(port.to_string()));
+            }
+        }
+
+        // Auto-assign console_port if not provided
+        // IMPORTANT: Start search AFTER the API port to avoid assigning the same port
+        if is_empty_value(params.get("console_port")) {
+            let api_port: u16 = params
+                .get("port")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(9000);
+            // Start searching from max(api_port + 1, 9001) to ensure different port
+            let console_start = std::cmp::max(api_port + 1, 9001);
+            if let Some(port) = find_available_port(console_start) {
+                params.insert(
+                    "console_port".to_string(),
+                    JsonValue::String(port.to_string()),
+                );
+            }
+        }
+
+        // Default docker_image if not provided
+        if is_empty_value(params.get("docker_image")) {
+            params.insert(
+                "docker_image".to_string(),
+                JsonValue::String("rustfs/rustfs:1.0.0-alpha.78".to_string()),
+            );
+        }
+
+        // Default host if not provided
+        if is_empty_value(params.get("host")) {
+            params.insert(
+                "host".to_string(),
+                JsonValue::String("localhost".to_string()),
+            );
+        }
+
+        // Default region if not provided
+        if is_empty_value(params.get("region")) {
+            params.insert(
+                "region".to_string(),
+                JsonValue::String("us-east-1".to_string()),
+            );
+        }
+
+        // Auto-generate access_key if not provided
+        if is_empty_value(params.get("access_key")) {
+            params.insert(
+                "access_key".to_string(),
+                JsonValue::String(generate_access_key()),
+            );
+        }
+
+        // Auto-generate secret_key if not provided
+        if is_empty_value(params.get("secret_key")) {
+            params.insert(
+                "secret_key".to_string(),
+                JsonValue::String(generate_secret_key()),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn validate_for_update(&self, updates: &HashMap<String, JsonValue>) -> Result<(), String> {
+        for key in updates.keys() {
+            if !self.updateable_keys().contains(&key.as_str()) {
+                return Err(format!(
+                    "Cannot update parameter '{}' for RustFS/Blob. Read-only parameters: {}. Updateable parameters: {}",
+                    key,
+                    self.readonly_keys().join(", "),
+                    self.updateable_keys().join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn updateable_keys(&self) -> Vec<&'static str> {
+        vec!["port", "console_port", "docker_image"]
+    }
+
+    fn readonly_keys(&self) -> Vec<&'static str> {
+        vec!["access_key", "secret_key", "host", "region"]
+    }
+
+    fn merge_updates(
+        &self,
+        existing: &mut HashMap<String, JsonValue>,
+        updates: HashMap<String, JsonValue>,
+    ) -> Result<(), String> {
+        self.validate_for_update(&updates)?;
+
+        for (key, value) in updates {
+            existing.insert(key, value);
+        }
+        Ok(())
+    }
+
+    fn get_schema(&self) -> Option<JsonValue> {
+        Some(json!({
+            "type": "object",
+            "title": "RustFS/Blob Parameters",
+            "properties": {
+                "access_key": {
+                    "type": "string",
+                    "description": "Access key (read-only after creation, auto-generated)",
+                    "example": "AKIAIOSFODNN7EXAMPLE"
+                },
+                "secret_key": {
+                    "type": "string",
+                    "description": "Secret key (read-only after creation, auto-generated)",
+                    "example": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+                },
+                "host": {
+                    "type": "string",
+                    "description": "Host address (read-only after creation)",
+                    "default": "localhost"
+                },
+                "region": {
+                    "type": "string",
+                    "description": "S3 region (read-only after creation)",
+                    "default": "us-east-1"
+                },
+                "port": {
+                    "type": "integer",
+                    "description": "API port (updateable)",
+                    "default": 9000
+                },
+                "console_port": {
+                    "type": "integer",
+                    "description": "Console port (updateable)",
+                    "default": 9001
+                },
+                "docker_image": {
+                    "type": "string",
+                    "description": "Docker image (updateable)",
+                    "default": "rustfs/rustfs:1.0.0-alpha.78"
+                }
+            },
+            "readonly": ["access_key", "secret_key", "host", "region"]
+        }))
+    }
+
+    fn service_name(&self) -> &'static str {
+        "RustFS/Blob"
+    }
+}
+
+/// MongoDB parameter strategy
+pub struct MongodbParameterStrategy;
+
+impl ParameterStrategy for MongodbParameterStrategy {
+    fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
+        if !params.contains_key("database") || is_empty_value(params.get("database")) {
+            return Err("'database' is required for MongoDB".to_string());
+        }
+        if !params.contains_key("username") || is_empty_value(params.get("username")) {
+            return Err("'username' is required for MongoDB".to_string());
+        }
+        // Password is optional - will be auto-generated if not provided
+        Ok(())
+    }
+
+    fn auto_generate_missing(&self, params: &mut HashMap<String, JsonValue>) -> Result<(), String> {
+        // Auto-assign port if not provided
+        if is_empty_value(params.get("port")) {
+            if let Some(port) = find_available_port(27017) {
+                params.insert("port".to_string(), JsonValue::String(port.to_string()));
+            }
+        }
+
+        // Default docker_image if not provided
+        if is_empty_value(params.get("docker_image")) {
+            params.insert(
+                "docker_image".to_string(),
+                JsonValue::String("mongo:latest".to_string()),
+            );
+        }
+
+        // Auto-generate password if not provided
+        if is_empty_value(params.get("password")) {
+            params.insert(
+                "password".to_string(),
+                JsonValue::String(generate_secure_password()),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn validate_for_update(&self, updates: &HashMap<String, JsonValue>) -> Result<(), String> {
+        for key in updates.keys() {
+            if !self.updateable_keys().contains(&key.as_str()) {
+                return Err(format!(
+                    "Cannot update parameter '{}' for MongoDB. Read-only parameters: {}. Updateable parameters: {}",
+                    key,
+                    self.readonly_keys().join(", "),
+                    self.updateable_keys().join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn updateable_keys(&self) -> Vec<&'static str> {
+        vec!["port", "docker_image"]
+    }
+
+    fn readonly_keys(&self) -> Vec<&'static str> {
+        vec!["database", "username", "password"]
+    }
+
+    fn merge_updates(
+        &self,
+        existing: &mut HashMap<String, JsonValue>,
+        updates: HashMap<String, JsonValue>,
+    ) -> Result<(), String> {
+        self.validate_for_update(&updates)?;
+
+        for (key, value) in updates {
+            existing.insert(key, value);
+        }
+        Ok(())
+    }
+
+    fn get_schema(&self) -> Option<JsonValue> {
+        Some(json!({
+            "type": "object",
+            "title": "MongoDB Parameters",
+            "required": ["database", "username"],
+            "properties": {
+                "database": {
+                    "type": "string",
+                    "description": "Database name (read-only after creation)",
+                    "example": "myapp_db"
+                },
+                "username": {
+                    "type": "string",
+                    "description": "Database user (read-only after creation)",
+                    "example": "mongoadmin"
+                },
+                "password": {
+                    "type": "string",
+                    "description": "User password (read-only after creation, auto-generated if not provided)",
+                    "example": "secure_password"
+                },
+                "port": {
+                    "type": "integer",
+                    "description": "Port (updateable)",
+                    "default": 27017
+                },
+                "docker_image": {
+                    "type": "string",
+                    "description": "Docker image (updateable, e.g., mongo:latest)",
+                    "default": "mongo:latest"
+                }
+            },
+            "readonly": ["database", "username", "password"]
+        }))
+    }
+
+    fn service_name(&self) -> &'static str {
+        "MongoDB"
+    }
+}
+
+/// Helper: Get strategy for a service type
+pub fn get_strategy(service_type: &str) -> Option<Box<dyn ParameterStrategy>> {
+    match service_type {
+        "postgres" => Some(Box::new(PostgresParameterStrategy)),
+        "redis" => Some(Box::new(RedisParameterStrategy)),
+        "s3" => Some(Box::new(S3ParameterStrategy)),
+        "mongodb" => Some(Box::new(MongodbParameterStrategy)),
+        // RustFS is used for both standalone rustfs and temps blob service
+        "rustfs" | "blob" => Some(Box::new(RustfsParameterStrategy)),
+        // KV service uses Redis backend
+        "kv" => Some(Box::new(RedisParameterStrategy)),
+        _ => None,
+    }
+}
+
+// ============= Helper Functions =============
+
+fn is_empty_value(value: Option<&JsonValue>) -> bool {
+    match value {
+        None => true,
+        Some(JsonValue::Null) => true,
+        Some(JsonValue::String(s)) => s.is_empty(),
+        _ => false,
+    }
+}
+
+fn find_available_port(start_port: u16) -> Option<u16> {
+    use std::net::TcpListener;
+    // Simple OS-level port check - Docker port conflicts will be handled at container creation time
+    // with proper error handling and retry logic
+    (start_port..start_port + 1000).find(|&port| TcpListener::bind(("0.0.0.0", port)).is_ok())
+}
+
+fn generate_secure_password() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let charset: &[u8] =
+        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*_-+=";
+    (0..32)
+        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .collect()
+}
+
+/// Generate an S3-style access key (20 uppercase alphanumeric characters)
+fn generate_access_key() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let charset: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    (0..20)
+        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .collect()
+}
+
+/// Generate an S3-style secret key (40 alphanumeric characters with special chars)
+fn generate_secret_key() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let charset: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
+    (0..40)
+        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_postgres_readonly_parameters() {
+        let strategy = PostgresParameterStrategy;
+        assert!(strategy.readonly_keys().contains(&"database"));
+        assert!(strategy.readonly_keys().contains(&"username"));
+        assert!(strategy.readonly_keys().contains(&"password"));
+        assert!(strategy.readonly_keys().contains(&"host"));
+    }
+
+    #[test]
+    fn test_postgres_updateable_parameters() {
+        let strategy = PostgresParameterStrategy;
+        assert!(strategy.updateable_keys().contains(&"docker_image"));
+        assert!(strategy.updateable_keys().contains(&"port"));
+        assert!(strategy.updateable_keys().contains(&"max_connections"));
+        assert!(strategy.updateable_keys().contains(&"ssl_mode"));
+    }
+
+    #[test]
+    fn test_postgres_rejects_readonly_update() {
+        let strategy = PostgresParameterStrategy;
+        let mut updates = HashMap::new();
+        updates.insert(
+            "username".to_string(),
+            JsonValue::String("newuser".to_string()),
+        );
+
+        let result = strategy.validate_for_update(&updates);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Cannot update parameter 'username'"));
+    }
+
+    #[test]
+    fn test_postgres_allows_updateable_parameters() {
+        let strategy = PostgresParameterStrategy;
+        let mut updates = HashMap::new();
+        updates.insert(
+            "docker_image".to_string(),
+            JsonValue::String("postgres:17-alpine".to_string()),
+        );
+        updates.insert("port".to_string(), JsonValue::String("5433".to_string()));
+
+        let result = strategy.validate_for_update(&updates);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_redis_readonly_password() {
+        let strategy = RedisParameterStrategy;
+        let mut updates = HashMap::new();
+        updates.insert(
+            "password".to_string(),
+            JsonValue::String("newpass".to_string()),
+        );
+
+        let result = strategy.validate_for_update(&updates);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_redis_updateable_docker_image() {
+        let strategy = RedisParameterStrategy;
+        let mut updates = HashMap::new();
+        updates.insert(
+            "docker_image".to_string(),
+            JsonValue::String("redis:8-alpine".to_string()),
+        );
+
+        let result = strategy.validate_for_update(&updates);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mongodb_updateable_docker_image() {
+        let strategy = MongodbParameterStrategy;
+        let mut updates = HashMap::new();
+        updates.insert(
+            "docker_image".to_string(),
+            JsonValue::String("mongo:9.0".to_string()),
+        );
+
+        let result = strategy.validate_for_update(&updates);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mongodb_validation_requires_database() {
+        let strategy = MongodbParameterStrategy;
+        let params = HashMap::new();
+
+        let result = strategy.validate_for_creation(&params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("database"));
+    }
+
+    #[test]
+    fn test_merge_updates_rejects_readonly() {
+        let strategy = PostgresParameterStrategy;
+        let mut existing = HashMap::new();
+        existing.insert(
+            "database".to_string(),
+            JsonValue::String("mydb".to_string()),
+        );
+        existing.insert(
+            "username".to_string(),
+            JsonValue::String("user".to_string()),
+        );
+
+        let mut updates = HashMap::new();
+        updates.insert(
+            "username".to_string(),
+            JsonValue::String("newuser".to_string()),
+        );
+
+        let result = strategy.merge_updates(&mut existing, updates);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_merge_updates_allows_updateable() {
+        let strategy = PostgresParameterStrategy;
+        let mut existing = HashMap::new();
+        existing.insert(
+            "docker_image".to_string(),
+            JsonValue::String("postgres:16-alpine".to_string()),
+        );
+
+        let mut updates = HashMap::new();
+        updates.insert(
+            "docker_image".to_string(),
+            JsonValue::String("postgres:17-alpine".to_string()),
+        );
+
+        let result = strategy.merge_updates(&mut existing, updates);
+        assert!(result.is_ok());
+        assert_eq!(
+            existing.get("docker_image").and_then(|v| v.as_str()),
+            Some("postgres:17-alpine")
+        );
+    }
+}

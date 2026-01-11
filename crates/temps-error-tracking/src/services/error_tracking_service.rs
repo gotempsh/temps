@@ -1,6 +1,6 @@
 use sea_orm::DatabaseConnection;
-use temps_core::UtcDateTime;
 use std::sync::Arc;
+use temps_core::UtcDateTime;
 
 use super::error_analytics_service::{ErrorAnalyticsService, ErrorDashboardStats};
 use super::error_crud_service::ErrorCRUDService;
@@ -40,6 +40,7 @@ impl ErrorTrackingService {
     }
 
     /// List error groups (delegates to CRUD service)
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_error_groups(
         &self,
         project_id: i32,

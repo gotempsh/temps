@@ -10,7 +10,6 @@ use tokio::{
     fs as tokio_fs,
     io::{AsyncReadExt, AsyncWriteExt},
 };
-use uuid;
 // Well-known paths relative to data_dir
 pub const STATIC_DIR_NAME: &str = "static";
 pub const PIPELINE_LOGS_DIR_NAME: &str = "logs";
@@ -415,7 +414,6 @@ impl ConfigService {
                 data: Set(settings.to_json()),
                 created_at: Set(now),
                 updated_at: Set(now),
-                ..Default::default()
             };
             new_settings.insert(self.db.as_ref()).await?;
         }
@@ -571,12 +569,10 @@ impl ConfigService {
         // Construct the URL as [protocol]://{slug}.{preview_domain}[:port]
         // Only include port if it's non-standard (not 443 for https, not 80 for http)
         let url = if let Some(port) = port {
-            let is_standard_port = (protocol == "https" && port == 443) || (protocol == "http" && port == 80);
+            let is_standard_port =
+                (protocol == "https" && port == 443) || (protocol == "http" && port == 80);
             if is_standard_port {
-                format!(
-                    "{}://{}.{}",
-                    protocol, deployment_slug, preview_domain
-                )
+                format!("{}://{}.{}", protocol, deployment_slug, preview_domain)
             } else {
                 format!(
                     "{}://{}.{}:{}",
@@ -584,10 +580,7 @@ impl ConfigService {
                 )
             }
         } else {
-            format!(
-                "{}://{}.{}",
-                protocol, deployment_slug, preview_domain
-            )
+            format!("{}://{}.{}", protocol, deployment_slug, preview_domain)
         };
 
         Ok(url)

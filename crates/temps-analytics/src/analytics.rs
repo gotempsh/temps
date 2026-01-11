@@ -10,19 +10,16 @@ use sea_orm::{
     QueryFilter, QueryOrder, Statement,
 };
 use std::sync::Arc;
-use temps_core::{EncryptionService, UtcDateTime};
+use temps_core::{CookieCrypto, UtcDateTime};
 use temps_entities::{events, request_sessions, visitor};
 
 pub struct AnalyticsService {
     db: Arc<DatabaseConnection>,
-    encryption_service: Arc<EncryptionService>,
+    cookie_crypto: Arc<CookieCrypto>,
 }
 impl AnalyticsService {
-    pub fn new(db: Arc<DatabaseConnection>, encryption_service: Arc<EncryptionService>) -> Self {
-        AnalyticsService {
-            db,
-            encryption_service,
-        }
+    pub fn new(db: Arc<DatabaseConnection>, cookie_crypto: Arc<CookieCrypto>) -> Self {
+        AnalyticsService { db, cookie_crypto }
     }
 }
 
@@ -117,11 +114,8 @@ impl Analytics for AnalyticsService {
             "e.timestamp <= $3".to_string(),
             "e.event_name IS NOT NULL".to_string(),
         ];
-        let mut values: Vec<sea_orm::Value> = vec![
-            project_id.into(),
-            start_date.into(),
-            end_date.into(),
-        ];
+        let mut values: Vec<sea_orm::Value> =
+            vec![project_id.into(), start_date.into(), end_date.into()];
         let mut param_index = 4;
 
         // Default to true - only return custom events by default
@@ -191,10 +185,7 @@ impl Analytics for AnalyticsService {
             ORDER BY ec.count DESC
             LIMIT ${}
             "#,
-            select_field,
-            where_clause,
-            group_by_field,
-            param_index
+            select_field, where_clause, group_by_field, param_index
         );
         values.push((limit_val as i64).into());
 
@@ -233,66 +224,97 @@ impl Analytics for AnalyticsService {
         include_crawlers: Option<bool>,
         limit: Option<i32>,
         offset: Option<i32>,
+        has_activity_only: Option<bool>,
     ) -> Result<VisitorsResponse, AnalyticsError> {
         // Build WHERE conditions with parameterized queries
-        let mut where_conditions = vec![
-            "e.project_id = $1".to_string(),
-            "e.timestamp >= $2".to_string(),
-            "e.timestamp <= $3".to_string(),
-        ];
-        let mut values: Vec<sea_orm::Value> = vec![
-            project_id.into(),
-            start_date.into(),
-            end_date.into(),
-        ];
-        let mut param_index = 4;
+        let mut where_conditions = vec!["v.project_id = $1".to_string()];
+        let mut values: Vec<sea_orm::Value> = vec![project_id.into()];
+        let mut param_index = 2;
 
+        // Add environment filter if provided
         if let Some(env_id) = environment_id {
-            where_conditions.push(format!("e.environment_id = ${}", param_index));
+            where_conditions.push(format!("v.environment_id = ${}", param_index));
             values.push(env_id.into());
             param_index += 1;
         }
 
+        // Add crawler filter if requested
         if include_crawlers == Some(false) {
-            where_conditions.push("e.is_crawler = false".to_string());
+            where_conditions.push("v.is_crawler = false".to_string());
         }
+
+        // Add has_activity filter to exclude ghost visitors
+        if has_activity_only == Some(true) {
+            where_conditions.push("v.has_activity = true".to_string());
+        }
+
+        // Add date range filter - check last_seen is within range
+        where_conditions.push(format!("v.last_seen >= ${}", param_index));
+        values.push(start_date.into());
+        param_index += 1;
+
+        where_conditions.push(format!("v.last_seen <= ${}", param_index));
+        values.push(end_date.into());
+        param_index += 1;
 
         let limit_val = limit.unwrap_or(50).min(100);
         let offset_val = offset.unwrap_or(0);
 
         let where_clause = where_conditions.join(" AND ");
+
+        // Count total before applying limit/offset
+        let count_sql = format!(
+            r#"
+            SELECT COUNT(*) as total
+            FROM visitor v
+            WHERE {}
+            "#,
+            where_clause
+        );
+
+        #[derive(FromQueryResult)]
+        struct CountResult {
+            total: i64,
+        }
+
+        let count_results = CountResult::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &count_sql,
+            values.clone(),
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        let total_count = count_results.first().map(|r| r.total).unwrap_or(0);
+
+        // Query visitors with geolocation data
         let sql_query = format!(
             r#"
-            WITH visitor_summary AS (
-                SELECT
-                    v.id,
-                    v.visitor_id,
-                    MIN(e.timestamp) as first_seen,
-                    MAX(e.timestamp) as last_seen,
-                    COUNT(DISTINCT e.session_id) as session_count,
-                    COUNT(*) FILTER (WHERE e.event_type = 'page_view') as page_views,
-                    COUNT(DISTINCT e.page_path) as unique_pages,
-                    ARRAY_AGG(DISTINCT ig.country) FILTER (WHERE ig.country IS NOT NULL) as countries,
-                    ARRAY_AGG(DISTINCT e.browser) FILTER (WHERE e.browser IS NOT NULL) as browsers
-                FROM visitor v
-                INNER JOIN events e ON v.id = e.visitor_id
-                LEFT JOIN ip_geolocations ig ON e.ip_geolocation_id = ig.id
-                WHERE {}
-                GROUP BY v.id, v.visitor_id
-            )
             SELECT
-                id,
-                visitor_id,
-                first_seen,
-                last_seen,
-                session_count,
-                page_views,
-                unique_pages,
-                countries[1] as country,
-                browsers[1] as browser,
-                (SELECT COUNT(*) FROM visitor_summary) as total_count
-            FROM visitor_summary
-            ORDER BY last_seen DESC
+                v.id,
+                v.visitor_id,
+                v.project_id,
+                v.environment_id,
+                v.first_seen,
+                v.last_seen,
+                v.user_agent,
+                v.ip_address_id,
+                v.is_crawler,
+                v.crawler_name,
+                v.custom_data,
+                ig.ip_address,
+                ig.latitude,
+                ig.longitude,
+                ig.region,
+                ig.city,
+                ig.country,
+                ig.country_code,
+                ig.timezone,
+                ig.is_eu
+            FROM visitor v
+            LEFT JOIN ip_geolocations ig ON v.ip_address_id = ig.id
+            WHERE {}
+            ORDER BY v.last_seen DESC
             LIMIT ${} OFFSET ${}
             "#,
             where_clause,
@@ -308,49 +330,64 @@ impl Analytics for AnalyticsService {
         struct VisitorResult {
             id: i32,
             visitor_id: String,
+            project_id: i32,
+            environment_id: i32,
             first_seen: UtcDateTime,
             last_seen: UtcDateTime,
-            session_count: i64,
-            page_views: i64,
-            unique_pages: i64,
+            user_agent: Option<String>,
+            ip_address_id: Option<i32>,
+            is_crawler: bool,
+            crawler_name: Option<String>,
+            custom_data: Option<serde_json::Value>,
+            ip_address: Option<String>,
+            latitude: Option<f64>,
+            longitude: Option<f64>,
+            region: Option<String>,
+            city: Option<String>,
             country: Option<String>,
-            browser: Option<String>,
-            total_count: i64,
+            country_code: Option<String>,
+            timezone: Option<String>,
+            is_eu: Option<bool>,
         }
 
         let results = VisitorResult::find_by_statement(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            sql_query,
+            &sql_query,
             values,
         ))
         .all(self.db.as_ref())
         .await?;
-
-        let total_count = results.first().map(|r| r.total_count).unwrap_or(0);
 
         let visitors = results
             .into_iter()
             .map(|r| crate::types::responses::VisitorInfo {
                 id: r.id,
                 visitor_id: r.visitor_id,
+                project_id: r.project_id,
+                environment_id: r.environment_id,
                 first_seen: r.first_seen,
                 last_seen: r.last_seen,
-                user_agent: None, // Would need to fetch from request logs
-                location: r.country.clone(),
-                is_crawler: false, // Would need to fetch from events
-                crawler_name: None,
-                sessions_count: r.session_count,
-                page_views: r.page_views,
-                unique_pages: r.unique_pages,
-                browser: r.browser.clone(),
-                total_time_seconds: 0, // Would need to calculate from sessions
+                user_agent: r.user_agent,
+                ip_address_id: r.ip_address_id,
+                is_crawler: r.is_crawler,
+                crawler_name: r.crawler_name,
+                custom_data: r.custom_data,
+                ip_address: r.ip_address,
+                latitude: r.latitude,
+                longitude: r.longitude,
+                region: r.region,
+                city: r.city,
+                country: r.country,
+                country_code: r.country_code,
+                timezone: r.timezone,
+                is_eu: r.is_eu,
             })
             .collect();
 
         Ok(VisitorsResponse {
             visitors,
-            total_count: total_count,
-            filtered_count: total_count, // For now, same as total
+            total_count,
+            filtered_count: total_count,
         })
     }
     /// Get visitor basic info from database
@@ -375,7 +412,7 @@ impl Analytics for AnalyticsService {
         }))
     }
 
-    /// Get comprehensive visitor statistics
+    /// Get visitor statistics
     async fn get_visitor_statistics(
         &self,
         visitor_id: i32,
@@ -414,7 +451,6 @@ impl Analytics for AnalyticsService {
                 total_sessions,
                 total_page_views,
                 total_events,
-                total_time_seconds,
                 CASE WHEN total_sessions > 0
                      THEN total_time_seconds::float / total_sessions::float
                      ELSE 0 END as average_session_duration,
@@ -434,7 +470,6 @@ impl Analytics for AnalyticsService {
             total_sessions: i64,
             total_page_views: i64,
             total_events: i64,
-            total_time_seconds: i64,
             average_session_duration: f64,
             bounce_rate: f64,
             engagement_rate: f64,
@@ -550,7 +585,6 @@ impl Analytics for AnalyticsService {
                 total_sessions: s.total_sessions,
                 total_page_views: s.total_page_views,
                 total_events: s.total_events,
-                total_time_seconds: s.total_time_seconds,
                 average_session_duration: s.average_session_duration,
                 bounce_rate: s.bounce_rate,
                 engagement_rate: s.engagement_rate,
@@ -583,74 +617,54 @@ impl Analytics for AnalyticsService {
         visitor_id: i32,
     ) -> Result<Option<VisitorDetails>, AnalyticsError> {
         let sql_query = r#"
-            WITH visitor_stats AS (
-                SELECT
-                    v.id,
-                    v.visitor_id,
-                    MIN(e.timestamp) as first_seen,
-                    MAX(e.timestamp) as last_seen,
-                    COUNT(DISTINCT e.session_id) as total_sessions,
-                    COUNT(*) FILTER (WHERE e.event_type = 'page_view') as total_page_views,
-                    COUNT(*) as total_events,
-                    COALESCE(SUM(e.time_on_page), 0) as total_time_seconds,
-                    COUNT(*) FILTER (WHERE e.is_bounce = true) as bounce_count,
-                    COUNT(*) FILTER (WHERE e.event_type NOT IN ('page_view', 'page_leave')) as engagement_count,
-                    STRING_AGG(DISTINCT e.user_agent, ', ') as user_agents,
-                    STRING_AGG(DISTINCT ig.country, ', ') as countries,
-                    STRING_AGG(DISTINCT ig.city, ', ') as cities,
-                    BOOL_OR(e.is_crawler) as is_crawler,
-                    STRING_AGG(DISTINCT e.crawler_name, ', ') as crawler_names,
-                    v.custom_data
-                FROM visitor v
-                LEFT JOIN events e ON v.id = e.visitor_id
-                LEFT JOIN ip_geolocations ig ON e.ip_geolocation_id = ig.id
-                WHERE v.id = $1
-                GROUP BY v.id, v.visitor_id, v.custom_data
-            )
             SELECT
-                id,
-                visitor_id,
-                first_seen,
-                last_seen,
-                user_agents as user_agent,
-                COALESCE(countries || ', ' || cities, countries, cities) as location,
-                countries as country,
-                cities as city,
-                is_crawler,
-                crawler_names as crawler_name,
-                total_sessions,
-                total_page_views,
-                total_events,
-                COALESCE(total_time_seconds, 0)::bigint as total_time_seconds,
-                CASE WHEN total_sessions > 0
-                     THEN bounce_count::float / total_sessions::float * 100
-                     ELSE 0 END as bounce_rate,
-                CASE WHEN total_sessions > 0
-                     THEN engagement_count::float / total_events::float * 100
-                     ELSE 0 END as engagement_rate,
-                custom_data
-            FROM visitor_stats
+                v.id,
+                v.visitor_id,
+                v.project_id,
+                v.environment_id,
+                v.first_seen,
+                v.last_seen,
+                v.user_agent,
+                v.ip_address_id,
+                v.is_crawler,
+                v.crawler_name,
+                v.custom_data,
+                ig.ip_address,
+                ig.latitude,
+                ig.longitude,
+                ig.region,
+                ig.city,
+                ig.country,
+                ig.country_code,
+                ig.timezone,
+                ig.is_eu
+            FROM visitor v
+            LEFT JOIN ip_geolocations ig ON v.ip_address_id = ig.id
+            WHERE v.id = $1
             "#;
 
         #[derive(FromQueryResult)]
         struct DetailResult {
             id: i32,
             visitor_id: String,
+            project_id: i32,
+            environment_id: i32,
             first_seen: UtcDateTime,
             last_seen: UtcDateTime,
             user_agent: Option<String>,
-            location: Option<String>,
-            country: Option<String>,
-            city: Option<String>,
+            ip_address_id: Option<i32>,
             is_crawler: bool,
             crawler_name: Option<String>,
-            total_sessions: i64,
-            total_page_views: i64,
-            total_events: i64,
-            total_time_seconds: i64,
-            bounce_rate: f64,
-            engagement_rate: f64,
-            custom_data: Option<String>,
+            custom_data: Option<serde_json::Value>,
+            ip_address: Option<String>,
+            latitude: Option<f64>,
+            longitude: Option<f64>,
+            region: Option<String>,
+            city: Option<String>,
+            country: Option<String>,
+            country_code: Option<String>,
+            timezone: Option<String>,
+            is_eu: Option<bool>,
         }
 
         let result = DetailResult::find_by_statement(Statement::from_sql_and_values(
@@ -664,21 +678,24 @@ impl Analytics for AnalyticsService {
         Ok(result.map(|r| VisitorDetails {
             id: r.id,
             visitor_id: r.visitor_id,
+            project_id: r.project_id,
+            environment_id: r.environment_id,
             first_seen: r.first_seen,
             last_seen: r.last_seen,
             user_agent: r.user_agent,
-            location: r.location,
-            country: r.country,
-            city: r.city,
+            ip_address_id: r.ip_address_id,
             is_crawler: r.is_crawler,
             crawler_name: r.crawler_name,
-            total_sessions: r.total_sessions,
-            total_page_views: r.total_page_views,
-            total_events: r.total_events,
-            total_time_seconds: r.total_time_seconds,
-            bounce_rate: r.bounce_rate,
-            engagement_rate: r.engagement_rate,
-            custom_data: r.custom_data.and_then(|s| serde_json::from_str(&s).ok()),
+            custom_data: r.custom_data,
+            ip_address: r.ip_address,
+            latitude: r.latitude,
+            longitude: r.longitude,
+            region: r.region,
+            city: r.city,
+            country: r.country,
+            country_code: r.country_code,
+            timezone: r.timezone,
+            is_eu: r.is_eu,
         }))
     }
 
@@ -890,14 +907,10 @@ impl Analytics for AnalyticsService {
             })?;
 
         // Build WHERE conditions with parameterized queries
-        let mut where_conditions = vec![
-            "session_id = $1".to_string(),
-            "project_id = $2".to_string(),
-        ];
-        let mut values: Vec<sea_orm::Value> = vec![
-            request_session.session_id.into(),
-            project_id.into(),
-        ];
+        let mut where_conditions =
+            vec!["session_id = $1".to_string(), "project_id = $2".to_string()];
+        let mut values: Vec<sea_orm::Value> =
+            vec![request_session.session_id.into(), project_id.into()];
         let mut param_index = 3;
 
         if let Some(env_id) = environment_id {
@@ -1013,6 +1026,7 @@ impl Analytics for AnalyticsService {
         session_id: i32,
         project_id: i32,
         environment_id: Option<i32>,
+        visitor_id: Option<i32>,
         start_date: Option<UtcDateTime>,
         end_date: Option<UtcDateTime>,
         limit: Option<i32>,
@@ -1030,33 +1044,31 @@ impl Analytics for AnalyticsService {
         let limit_val = limit.unwrap_or(100).min(1000) as u64;
         let offset_val = offset.unwrap_or(0) as u64;
 
-        // Build query with filters
-        let mut query = temps_entities::request_logs::Entity::find()
-            .filter(temps_entities::request_logs::Column::SessionId.eq(request_session.id))
-            .filter(temps_entities::request_logs::Column::ProjectId.eq(project_id));
+        // Build query with filters using proxy_logs
+        let mut query = temps_entities::proxy_logs::Entity::find()
+            .filter(temps_entities::proxy_logs::Column::SessionId.eq(request_session.id))
+            .filter(temps_entities::proxy_logs::Column::ProjectId.eq(project_id));
 
         if let Some(env_id) = environment_id {
-            query = query.filter(temps_entities::request_logs::Column::EnvironmentId.eq(env_id));
+            query = query.filter(temps_entities::proxy_logs::Column::EnvironmentId.eq(env_id));
+        }
+
+        if let Some(vis_id) = visitor_id {
+            query = query.filter(temps_entities::proxy_logs::Column::VisitorId.eq(vis_id));
         }
 
         if let Some(start) = start_date {
-            query = query.filter(
-                temps_entities::request_logs::Column::StartedAt
-                    .gte(start.format("%Y-%m-%d %H:%M:%S").to_string()),
-            );
+            query = query.filter(temps_entities::proxy_logs::Column::Timestamp.gte(start));
         }
 
         if let Some(end) = end_date {
-            query = query.filter(
-                temps_entities::request_logs::Column::StartedAt
-                    .lte(end.format("%Y-%m-%d %H:%M:%S").to_string()),
-            );
+            query = query.filter(temps_entities::proxy_logs::Column::Timestamp.lte(end));
         }
 
         // Apply ordering
         query = match sort_order.as_deref() {
-            Some("asc") => query.order_by_asc(temps_entities::request_logs::Column::StartedAt),
-            _ => query.order_by_desc(temps_entities::request_logs::Column::StartedAt),
+            Some("asc") => query.order_by_asc(temps_entities::proxy_logs::Column::Timestamp),
+            _ => query.order_by_desc(temps_entities::proxy_logs::Column::Timestamp),
         };
 
         // Get total count
@@ -1082,14 +1094,18 @@ impl Analytics for AnalyticsService {
             .map(|r| crate::types::responses::SessionRequestLog {
                 id: r.id,
                 method: r.method,
-                path: r.request_path,
-                status_code: r.status_code as i16,
-                response_time_ms: r.elapsed_time,
-                created_at: r.started_at.parse().unwrap_or_default(),
-                user_agent: Some(r.user_agent),
+                path: r.path,
+                status_code: r.status_code,
+                response_time_ms: r.response_time_ms,
+                created_at: r.timestamp,
+                user_agent: r.user_agent,
                 referrer: r.referrer,
-                response_headers: r.headers,
-                request_headers: r.request_headers,
+                response_headers: r
+                    .response_headers
+                    .and_then(|v| serde_json::to_string(&v).ok()),
+                request_headers: r
+                    .request_headers
+                    .and_then(|v| serde_json::to_string(&v).ok()),
             })
             .collect();
 
@@ -1163,6 +1179,78 @@ impl Analytics for AnalyticsService {
         })
     }
 
+    /// Enrich visitor by GUID (visitor_id string, may be encrypted with enc_ prefix)
+    async fn enrich_visitor_by_guid(
+        &self,
+        visitor_guid: &str,
+        enrichment_data: serde_json::Value,
+    ) -> Result<EnrichVisitorResponse, AnalyticsError> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_entities::visitor;
+
+        // Handle encrypted visitor ID (enc_ prefix)
+        let actual_visitor_id = if let Some(encrypted) = visitor_guid.strip_prefix("enc_") {
+            match self.cookie_crypto.decrypt(encrypted) {
+                Ok(decrypted) => decrypted,
+                Err(_) => {
+                    return Err(AnalyticsError::InvalidVisitorId(visitor_guid.to_string()));
+                }
+            }
+        } else {
+            visitor_guid.to_string()
+        };
+
+        // Find the visitor by visitor_id (guid)
+        let visitor = visitor::Entity::find()
+            .filter(visitor::Column::VisitorId.eq(&actual_visitor_id))
+            .one(self.db.as_ref())
+            .await
+            .map_err(AnalyticsError::from)?;
+
+        // Early return if visitor not found
+        let Some(visitor_model) = visitor else {
+            return Ok(EnrichVisitorResponse {
+                success: false,
+                visitor_id: actual_visitor_id,
+                message: "Visitor not found".to_string(),
+            });
+        };
+
+        let mut active_model: visitor::ActiveModel = visitor_model.into();
+
+        // Merge enrichment_data with existing custom_data (if any)
+        let merged_custom_data = match &active_model.custom_data {
+            sea_orm::ActiveValue::Set(Some(existing_json)) => {
+                let mut existing_map = match existing_json.as_object() {
+                    Some(map) => map.clone(),
+                    None => serde_json::Map::new(),
+                };
+                if let Some(new_map) = enrichment_data.as_object() {
+                    for (k, v) in new_map {
+                        existing_map.insert(k.clone(), v.clone());
+                    }
+                }
+                serde_json::Value::Object(existing_map)
+            }
+            _ => enrichment_data.clone(),
+        };
+
+        // Set the merged custom_data as serde_json::Value
+        active_model.custom_data = Set(Some(merged_custom_data));
+
+        // Save the updated visitor
+        active_model
+            .update(self.db.as_ref())
+            .await
+            .map_err(AnalyticsError::from)?;
+
+        Ok(EnrichVisitorResponse {
+            success: true,
+            visitor_id: actual_visitor_id,
+            message: "Visitor enriched successfully".to_string(),
+        })
+    }
+
     /// Check if analytics events exist
     async fn has_analytics_events(
         &self,
@@ -1208,10 +1296,9 @@ impl Analytics for AnalyticsService {
         }
 
         // Use provided dates or default to last 24 hours
-        let (start, end) = if start_date.is_some() && end_date.is_some() {
-            (start_date.unwrap(), end_date.unwrap())
-        } else if start_date.is_some() {
-            let start = start_date.unwrap();
+        let (start, end) = if let (Some(start), Some(end)) = (start_date, end_date) {
+            (start, end)
+        } else if let Some(start) = start_date {
             (start, start + chrono::Duration::days(1))
         } else {
             // Default to last 24 hours
@@ -1275,8 +1362,7 @@ impl Analytics for AnalyticsService {
             ORDER BY page_view_count DESC
             LIMIT ${}
             "#,
-            where_clause,
-            param_index
+            where_clause, param_index
         );
 
         // Add LIMIT as parameter
@@ -1370,7 +1456,7 @@ WHERE project_id = $1
         let query = if let Some(limit) = limit {
             format!(
                 r#"
-                SELECT 
+                SELECT
                     e.session_id,
                     e.visitor_id,
                     MIN(e.timestamp) as session_start,
@@ -1393,7 +1479,7 @@ WHERE project_id = $1
         } else {
             format!(
                 r#"
-                SELECT 
+                SELECT
                     e.session_id,
                     e.visitor_id,
                     MIN(e.timestamp) as session_start,
@@ -1622,12 +1708,10 @@ WHERE project_id = $1
         use temps_entities::{ip_geolocations, visitor};
 
         // Handle encrypted visitor IDs (enc_ prefix)
-        let actual_visitor_id = if visitor_id.starts_with("enc_") {
-            match self.encryption_service.decrypt(visitor_id) {
-                Ok(decrypted_bytes) => match String::from_utf8(decrypted_bytes) {
-                    Ok(s) => s,
-                    Err(_) => return Err(AnalyticsError::InvalidVisitorId(visitor_id.to_string())),
-                },
+        let actual_visitor_id = if let Some(encrypted) = visitor_id.strip_prefix("enc_") {
+            // Strip the enc_ prefix and decrypt using CookieCrypto
+            match self.cookie_crypto.decrypt(encrypted) {
+                Ok(decrypted) => decrypted,
                 Err(_) => return Err(AnalyticsError::InvalidVisitorId(visitor_id.to_string())),
             }
         } else {
@@ -1673,6 +1757,107 @@ WHERE project_id = $1
         }
     }
 
+    async fn get_live_visitors(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        window_minutes: i32,
+    ) -> Result<Vec<crate::types::responses::LiveVisitorInfo>, AnalyticsError> {
+        let sql = r#"
+            SELECT
+                v.id,
+                v.visitor_id,
+                v.project_id,
+                v.environment_id,
+                v.first_seen,
+                v.last_seen,
+                v.user_agent,
+                v.ip_address_id,
+                v.is_crawler,
+                v.crawler_name,
+                v.custom_data,
+                ig.ip_address,
+                ig.latitude,
+                ig.longitude,
+                ig.region,
+                ig.city,
+                ig.country,
+                ig.country_code,
+                ig.timezone,
+                ig.is_eu
+            FROM visitor v
+            LEFT JOIN ip_geolocations ig ON v.ip_address_id = ig.id
+            WHERE v.project_id = $1
+              AND ($2::int IS NULL OR v.environment_id = $2)
+              AND v.last_seen >= NOW() - INTERVAL '1 minute' * $3
+            ORDER BY v.last_seen DESC
+        "#;
+
+        #[derive(FromQueryResult)]
+        struct LiveVisitorRow {
+            id: i32,
+            visitor_id: String,
+            project_id: i32,
+            environment_id: i32,
+            first_seen: UtcDateTime,
+            last_seen: UtcDateTime,
+            user_agent: Option<String>,
+            ip_address_id: Option<i32>,
+            is_crawler: bool,
+            crawler_name: Option<String>,
+            custom_data: Option<serde_json::Value>,
+            ip_address: Option<String>,
+            latitude: Option<f64>,
+            longitude: Option<f64>,
+            region: Option<String>,
+            city: Option<String>,
+            country: Option<String>,
+            country_code: Option<String>,
+            timezone: Option<String>,
+            is_eu: Option<bool>,
+        }
+
+        let rows = LiveVisitorRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            vec![
+                project_id.into(),
+                environment_id.into(),
+                window_minutes.into(),
+            ],
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        let visitors = rows
+            .into_iter()
+            .map(|row| crate::types::responses::LiveVisitorInfo {
+                id: row.id,
+                visitor_id: row.visitor_id,
+                project_id: row.project_id,
+                environment_id: row.environment_id,
+                first_seen: row.first_seen,
+                last_seen: row.last_seen,
+                user_agent: row.user_agent,
+                ip_address_id: row.ip_address_id,
+                is_crawler: row.is_crawler,
+                crawler_name: row.crawler_name,
+                custom_data: row.custom_data,
+                ip_address: row.ip_address,
+                latitude: row.latitude,
+                longitude: row.longitude,
+                region: row.region,
+                city: row.city,
+                country: row.country,
+                country_code: row.country_code,
+                timezone: row.timezone,
+                is_eu: row.is_eu,
+            })
+            .collect();
+
+        Ok(visitors)
+    }
+
     async fn get_general_stats(
         &self,
         start_date: UtcDateTime,
@@ -1680,40 +1865,42 @@ WHERE project_id = $1
     ) -> Result<crate::types::responses::GeneralStatsResponse, AnalyticsError> {
         // Query to get overall stats across all projects
         let total_stats_sql = r#"
-            WITH visitor_stats AS (
-                SELECT
-                    COUNT(DISTINCT v.id) as unique_visitors,
-                    COUNT(DISTINCT rs.id) as total_visits,
-                    COUNT(DISTINCT e.id) as total_events
-                FROM visitor v
-                INNER JOIN events e ON v.id = e.visitor_id
-                    AND e.timestamp >= $1 AND e.timestamp <= $2
-                LEFT JOIN request_sessions rs ON v.id = rs.visitor_id
-                    AND rs.started_at >= $1 AND rs.started_at <= $2
-                WHERE v.first_seen >= $1 AND v.last_seen <= $2
-            ),
-            page_views AS (
-                SELECT COUNT(DISTINCT e.visitor_id) as total_page_views
-                FROM events e
-                INNER JOIN visitor v ON e.visitor_id = v.id
-                WHERE e.event_type = 'page_view'
-                AND e.timestamp >= $1 AND e.timestamp <= $2
-            ),
-            project_count AS (
-                SELECT COUNT(*) as total_projects
-                FROM projects p
-            )
+            -- Optimized: avoids join fan-out, uses half-open (>= $1 AND < $2) intervals
+            WITH
+                unique_visitors AS (
+                    SELECT COUNT(DISTINCT e.visitor_id) AS n
+                    FROM events e
+                    WHERE e.timestamp >= $1 AND e.timestamp < $2
+                ),
+                total_visits AS (
+                    SELECT COUNT(*) AS n
+                    FROM request_sessions rs
+                    WHERE rs.started_at >= $1 AND rs.started_at < $2
+                ),
+                total_events AS (
+                    SELECT COUNT(*) AS n
+                    FROM events e
+                    WHERE e.timestamp >= $1 AND e.timestamp < $2
+                ),
+                total_page_views AS (
+                    SELECT COUNT(*) AS n
+                    FROM events e
+                    WHERE e.event_type = 'page_view'
+                      AND e.timestamp >= $1 AND e.timestamp < $2
+                ),
+                total_projects AS (
+                    SELECT COUNT(*) AS n
+                    FROM projects p
+                )
             SELECT
-                vs.unique_visitors,
-                vs.total_visits,
-                pv.total_page_views,
-                vs.total_events,
-                pc.total_projects,
+                unique_visitors.n AS unique_visitors,
+                total_visits.n AS total_visits,
+                total_page_views.n AS total_page_views,
+                total_events.n AS total_events,
+                total_projects.n AS total_projects,
                 0.0::double precision as avg_bounce_rate,
                 0.0::double precision as avg_engagement_rate
-            FROM visitor_stats vs
-            CROSS JOIN page_views pv
-            CROSS JOIN project_count pc
+            FROM unique_visitors, total_visits, total_page_views, total_events, total_projects
         "#;
 
         #[derive(FromQueryResult)]
@@ -1755,14 +1942,351 @@ WHERE project_id = $1
             project_breakdown: Vec::new(),
         })
     }
+
+    /// Get detailed analytics for a specific page path
+    async fn get_page_path_detail(
+        &self,
+        project_id: i32,
+        page_path: &str,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        environment_id: Option<i32>,
+        bucket_interval: Option<&str>,
+    ) -> Result<crate::types::responses::PagePathDetailResponse, AnalyticsError> {
+        // Determine bucket interval based on date range if not specified
+        let duration = end_date - start_date;
+        let interval = bucket_interval.unwrap_or_else(|| {
+            if duration.num_days() <= 1 {
+                "hour"
+            } else if duration.num_days() <= 31 {
+                "day"
+            } else if duration.num_days() <= 180 {
+                "week"
+            } else {
+                "month"
+            }
+        });
+
+        let (pg_interval, date_trunc_unit) = match interval {
+            "hour" => ("1 hour", "hour"),
+            "day" => ("1 day", "day"),
+            "week" => ("1 week", "week"),
+            "month" => ("1 month", "month"),
+            _ => ("1 day", "day"),
+        };
+
+        // Build environment filter
+        let env_filter = environment_id
+            .map(|id| format!("AND e.environment_id = {}", id))
+            .unwrap_or_default();
+
+        // 1. Get overall page stats
+        let stats_sql = format!(
+            r#"
+            WITH page_events AS (
+                SELECT
+                    e.visitor_id,
+                    e.session_id,
+                    e.timestamp,
+                    e.is_bounce,
+                    e.time_on_page,
+                    e.referrer,
+                    ROW_NUMBER() OVER (PARTITION BY e.session_id ORDER BY e.timestamp ASC) as event_order_asc,
+                    ROW_NUMBER() OVER (PARTITION BY e.session_id ORDER BY e.timestamp DESC) as event_order_desc
+                FROM events e
+                WHERE e.project_id = $1
+                  AND e.page_path = $2
+                  AND e.event_type = 'page_view'
+                  AND e.timestamp >= $3
+                  AND e.timestamp < $4
+                  {}
+            ),
+            session_stats AS (
+                SELECT
+                    COUNT(DISTINCT session_id) as total_sessions,
+                    COUNT(*) FILTER (WHERE event_order_asc = 1) as entry_count,
+                    COUNT(*) FILTER (WHERE event_order_desc = 1) as exit_count
+                FROM page_events
+            )
+            SELECT
+                COUNT(DISTINCT pe.visitor_id) as unique_visitors,
+                COUNT(*) as total_page_views,
+                COALESCE(AVG(NULLIF(pe.time_on_page, 0)), 0)::float8 as avg_time_on_page,
+                CASE WHEN COUNT(*) > 0
+                     THEN (COUNT(*) FILTER (WHERE pe.is_bounce = true))::float / COUNT(*)::float * 100
+                     ELSE 0 END as bounce_rate,
+                CASE WHEN ss.total_sessions > 0
+                     THEN ss.entry_count::float / ss.total_sessions::float * 100
+                     ELSE 0 END as entry_rate,
+                CASE WHEN ss.total_sessions > 0
+                     THEN ss.exit_count::float / ss.total_sessions::float * 100
+                     ELSE 0 END as exit_rate
+            FROM page_events pe
+            CROSS JOIN session_stats ss
+            GROUP BY ss.total_sessions, ss.entry_count, ss.exit_count
+            "#,
+            env_filter
+        );
+
+        #[derive(FromQueryResult)]
+        struct PageStats {
+            unique_visitors: i64,
+            total_page_views: i64,
+            avg_time_on_page: f64,
+            bounce_rate: f64,
+            entry_rate: f64,
+            exit_rate: f64,
+        }
+
+        let stats = PageStats::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &stats_sql,
+            vec![
+                project_id.into(),
+                page_path.into(),
+                start_date.into(),
+                end_date.into(),
+            ],
+        ))
+        .one(self.db.as_ref())
+        .await?
+        .unwrap_or(PageStats {
+            unique_visitors: 0,
+            total_page_views: 0,
+            avg_time_on_page: 0.0,
+            bounce_rate: 0.0,
+            entry_rate: 0.0,
+            exit_rate: 0.0,
+        });
+
+        // 2. Get time series data for activity graph
+        let activity_sql = format!(
+            r#"
+            WITH time_buckets AS (
+                SELECT generate_series(
+                    date_trunc('{}', $3::timestamptz),
+                    date_trunc('{}', $4::timestamptz),
+                    '{}'::interval
+                ) AS bucket
+            ),
+            page_activity AS (
+                SELECT
+                    date_trunc('{}', e.timestamp) as bucket,
+                    COUNT(DISTINCT e.visitor_id) as visitors,
+                    COUNT(*) as page_views,
+                    COALESCE(AVG(NULLIF(e.time_on_page, 0)), 0)::float8 as avg_time_seconds
+                FROM events e
+                WHERE e.project_id = $1
+                  AND e.page_path = $2
+                  AND e.event_type = 'page_view'
+                  AND e.timestamp >= $3
+                  AND e.timestamp < $4
+                  {}
+                GROUP BY date_trunc('{}', e.timestamp)
+            )
+            SELECT
+                tb.bucket::timestamptz as timestamp,
+                COALESCE(pa.visitors, 0) as visitors,
+                COALESCE(pa.page_views, 0) as page_views,
+                COALESCE(pa.avg_time_seconds, 0)::float8 as avg_time_seconds
+            FROM time_buckets tb
+            LEFT JOIN page_activity pa ON tb.bucket = pa.bucket
+            ORDER BY tb.bucket
+            "#,
+            date_trunc_unit,
+            date_trunc_unit,
+            pg_interval,
+            date_trunc_unit,
+            env_filter,
+            date_trunc_unit
+        );
+
+        #[derive(FromQueryResult)]
+        struct ActivityBucket {
+            timestamp: UtcDateTime,
+            visitors: i64,
+            page_views: i64,
+            avg_time_seconds: f64,
+        }
+
+        let activity_results = ActivityBucket::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &activity_sql,
+            vec![
+                project_id.into(),
+                page_path.into(),
+                start_date.into(),
+                end_date.into(),
+            ],
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        let activity_over_time: Vec<crate::types::responses::PageActivityBucket> = activity_results
+            .into_iter()
+            .map(|b| crate::types::responses::PageActivityBucket {
+                timestamp: b.timestamp,
+                visitors: b.visitors,
+                page_views: b.page_views,
+                avg_time_seconds: b.avg_time_seconds,
+            })
+            .collect();
+
+        // 3. Get geographic distribution by country
+        let countries_sql = format!(
+            r#"
+            WITH country_stats AS (
+                SELECT
+                    COALESCE(ig.country, 'Unknown') as country,
+                    ig.country_code,
+                    COUNT(DISTINCT e.visitor_id) as visitors,
+                    COUNT(*) as page_views
+                FROM events e
+                LEFT JOIN ip_geolocations ig ON e.ip_geolocation_id = ig.id
+                WHERE e.project_id = $1
+                  AND e.page_path = $2
+                  AND e.event_type = 'page_view'
+                  AND e.timestamp >= $3
+                  AND e.timestamp < $4
+                  {}
+                GROUP BY COALESCE(ig.country, 'Unknown'), ig.country_code
+            ),
+            total AS (
+                SELECT SUM(visitors) as total_visitors FROM country_stats
+            )
+            SELECT
+                cs.country,
+                cs.country_code,
+                cs.visitors,
+                cs.page_views,
+                CASE WHEN t.total_visitors > 0
+                     THEN cs.visitors::float / t.total_visitors::float * 100
+                     ELSE 0 END as percentage
+            FROM country_stats cs
+            CROSS JOIN total t
+            ORDER BY cs.visitors DESC
+            LIMIT 50
+            "#,
+            env_filter
+        );
+
+        #[derive(FromQueryResult)]
+        struct CountryStats {
+            country: String,
+            country_code: Option<String>,
+            visitors: i64,
+            page_views: i64,
+            percentage: f64,
+        }
+
+        let country_results = CountryStats::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &countries_sql,
+            vec![
+                project_id.into(),
+                page_path.into(),
+                start_date.into(),
+                end_date.into(),
+            ],
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        let countries: Vec<crate::types::responses::PageCountryStats> = country_results
+            .into_iter()
+            .map(|c| crate::types::responses::PageCountryStats {
+                country: c.country,
+                country_code: c.country_code,
+                visitors: c.visitors,
+                page_views: c.page_views,
+                percentage: c.percentage,
+            })
+            .collect();
+
+        // 4. Get top referrers
+        let referrers_sql = format!(
+            r#"
+            WITH referrer_stats AS (
+                SELECT
+                    COALESCE(NULLIF(e.referrer, ''), 'Direct') as referrer,
+                    COUNT(*) as visits
+                FROM events e
+                WHERE e.project_id = $1
+                  AND e.page_path = $2
+                  AND e.event_type = 'page_view'
+                  AND e.timestamp >= $3
+                  AND e.timestamp < $4
+                  {}
+                GROUP BY COALESCE(NULLIF(e.referrer, ''), 'Direct')
+            ),
+            total AS (
+                SELECT SUM(visits) as total_visits FROM referrer_stats
+            )
+            SELECT
+                rs.referrer,
+                rs.visits,
+                CASE WHEN t.total_visits > 0
+                     THEN rs.visits::float / t.total_visits::float * 100
+                     ELSE 0 END as percentage
+            FROM referrer_stats rs
+            CROSS JOIN total t
+            ORDER BY rs.visits DESC
+            LIMIT 20
+            "#,
+            env_filter
+        );
+
+        #[derive(FromQueryResult)]
+        struct ReferrerStats {
+            referrer: String,
+            visits: i64,
+            percentage: f64,
+        }
+
+        let referrer_results = ReferrerStats::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &referrers_sql,
+            vec![
+                project_id.into(),
+                page_path.into(),
+                start_date.into(),
+                end_date.into(),
+            ],
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        let referrers: Vec<crate::types::responses::PageReferrerStats> = referrer_results
+            .into_iter()
+            .map(|r| crate::types::responses::PageReferrerStats {
+                referrer: r.referrer,
+                visits: r.visits,
+                percentage: r.percentage,
+            })
+            .collect();
+
+        Ok(crate::types::responses::PagePathDetailResponse {
+            page_path: page_path.to_string(),
+            unique_visitors: stats.unique_visitors,
+            total_page_views: stats.total_page_views,
+            avg_time_on_page: stats.avg_time_on_page,
+            bounce_rate: stats.bounce_rate,
+            entry_rate: stats.entry_rate,
+            exit_rate: stats.exit_rate,
+            activity_over_time,
+            countries,
+            referrers,
+            bucket_interval: interval.to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{test_helpers::AnalyticsTestHelper, test_utils::AnalyticsTestUtils};
+    use crate::testing::test_utils::AnalyticsTestUtils;
     use crate::{cleanup_test_analytics, create_test_analytics_service};
-    use chrono::DateTime;
+
     use UtcDateTime;
 
     #[tokio::test]
@@ -1770,8 +2294,9 @@ mod tests {
         let db = AnalyticsTestUtils::create_test_db("test_analytics_service_creation")
             .await
             .unwrap();
-        let encryption_service = Arc::new(EncryptionService::new_from_password("test_password"));
-        let service = AnalyticsService::new(db, encryption_service);
+        let cookie_crypto =
+            Arc::new(temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap());
+        let service = AnalyticsService::new(db, cookie_crypto);
 
         // Test that the service was created successfully
         assert!(std::ptr::addr_of!(service) as usize != 0);
@@ -1781,12 +2306,14 @@ mod tests {
     async fn test_get_top_pages() -> anyhow::Result<()> {
         let (service, db, _container) = create_test_analytics_service!("test_get_top_pages");
 
-        let start_date = chrono::NaiveDateTime::parse_from_str("2024-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
-            .unwrap()
-            .and_utc();
-        let end_date = chrono::NaiveDateTime::parse_from_str("2024-01-31 23:59:59", "%Y-%m-%d %H:%M:%S")
-            .unwrap()
-            .and_utc();
+        let start_date =
+            chrono::NaiveDateTime::parse_from_str("2024-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+                .unwrap()
+                .and_utc();
+        let end_date =
+            chrono::NaiveDateTime::parse_from_str("2024-01-31 23:59:59", "%Y-%m-%d %H:%M:%S")
+                .unwrap()
+                .and_utc();
 
         let pages = service
             .get_top_pages(1, 10, Some(start_date), Some(end_date))
@@ -1811,12 +2338,14 @@ mod tests {
         let (service, db, _container) =
             create_test_analytics_service!("test_empty_results_for_invalid_project");
 
-        let start_date = chrono::NaiveDateTime::parse_from_str("2024-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
-            .unwrap()
-            .and_utc();
-        let end_date = chrono::NaiveDateTime::parse_from_str("2024-01-31 23:59:59", "%Y-%m-%d %H:%M:%S")
-            .unwrap()
-            .and_utc();
+        let start_date =
+            chrono::NaiveDateTime::parse_from_str("2024-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+                .unwrap()
+                .and_utc();
+        let end_date =
+            chrono::NaiveDateTime::parse_from_str("2024-01-31 23:59:59", "%Y-%m-%d %H:%M:%S")
+                .unwrap()
+                .and_utc();
 
         // Use a non-existent project ID
         let invalid_project_id = 9999;
@@ -1880,8 +2409,6 @@ mod tests {
         );
 
         // If this test compiles, it proves our parameterized query pattern is correct
-        assert!(true, "Parameterized queries compile correctly");
+        // No assertion needed - compilation itself is the test
     }
-
-
 }

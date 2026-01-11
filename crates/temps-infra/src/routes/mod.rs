@@ -1,11 +1,11 @@
 use axum::Router;
 use std::sync::Arc;
 
-pub mod platform;
 pub mod dns;
+pub mod platform;
 
-pub use platform::*;
 pub use dns::*;
+pub use platform::*;
 
 /// Configure all infrastructure routes (platform + DNS)
 pub fn configure_routes<T>() -> Router<Arc<T>>

@@ -23,9 +23,10 @@ impl ErrorCRUDService {
         use temps_entities::error_events::ErrorEventData;
 
         // Parse structured data from JSONB
-        let data = event.data.as_ref().and_then(|v| {
-            ErrorEventData::from_json_value(v)
-        });
+        let data = event
+            .data
+            .as_ref()
+            .and_then(ErrorEventData::from_json_value);
 
         ErrorEventDomain {
             id: event.id,
@@ -37,80 +38,165 @@ impl ErrorCRUDService {
             exception_value: event.exception_value,
 
             // Extract from nested data structures
-            stack_trace: data.as_ref().and_then(|d| d.stack_trace.as_ref()).and_then(|st| {
-                serde_json::to_value(st).ok()
-            }),
+            stack_trace: data
+                .as_ref()
+                .and_then(|d| d.stack_trace.as_ref())
+                .and_then(|st| serde_json::to_value(st).ok()),
 
             // Request context
             url: data.as_ref().and_then(|d| d.request.as_ref()?.url.clone()),
-            user_agent: data.as_ref().and_then(|d| d.request.as_ref()?.user_agent.clone()),
-            referrer: data.as_ref().and_then(|d| d.request.as_ref()?.referrer.clone()),
-            method: data.as_ref().and_then(|d| d.request.as_ref()?.method.clone()),
-            headers: data.as_ref().and_then(|d| d.request.as_ref()?.headers.clone()),
-            request_cookies: data.as_ref().and_then(|d| d.request.as_ref()?.cookies.clone()),
-            request_query_string: data.as_ref().and_then(|d| d.request.as_ref()?.query_string.clone()),
-            request_data: data.as_ref().and_then(|d| d.request.as_ref()?.post_data.clone()),
+            user_agent: data
+                .as_ref()
+                .and_then(|d| d.request.as_ref()?.user_agent.clone()),
+            referrer: data
+                .as_ref()
+                .and_then(|d| d.request.as_ref()?.referrer.clone()),
+            method: data
+                .as_ref()
+                .and_then(|d| d.request.as_ref()?.method.clone()),
+            headers: data
+                .as_ref()
+                .and_then(|d| d.request.as_ref()?.headers.clone()),
+            request_cookies: data
+                .as_ref()
+                .and_then(|d| d.request.as_ref()?.cookies.clone()),
+            request_query_string: data
+                .as_ref()
+                .and_then(|d| d.request.as_ref()?.query_string.clone()),
+            request_data: data
+                .as_ref()
+                .and_then(|d| d.request.as_ref()?.post_data.clone()),
             request_context: None,
 
             // User context
             user_id: data.as_ref().and_then(|d| d.user.as_ref()?.user_id.clone()),
             user_email: data.as_ref().and_then(|d| d.user.as_ref()?.email.clone()),
-            user_username: data.as_ref().and_then(|d| d.user.as_ref()?.username.clone()),
-            user_ip_address: data.as_ref().and_then(|d| d.user.as_ref()?.ip_address.clone()),
+            user_username: data
+                .as_ref()
+                .and_then(|d| d.user.as_ref()?.username.clone()),
+            user_ip_address: data
+                .as_ref()
+                .and_then(|d| d.user.as_ref()?.ip_address.clone()),
             user_segment: data.as_ref().and_then(|d| d.user.as_ref()?.segment.clone()),
-            session_id: data.as_ref().and_then(|d| d.user.as_ref()?.session_id.clone()),
+            session_id: data
+                .as_ref()
+                .and_then(|d| d.user.as_ref()?.session_id.clone()),
             user_context: data.as_ref().and_then(|d| d.user.as_ref()?.custom.clone()),
 
             // Device context
-            browser: data.as_ref().and_then(|d| d.device.as_ref()?.browser.clone()),
-            browser_version: data.as_ref().and_then(|d| d.device.as_ref()?.browser_version.clone()),
+            browser: data
+                .as_ref()
+                .and_then(|d| d.device.as_ref()?.browser.clone()),
+            browser_version: data
+                .as_ref()
+                .and_then(|d| d.device.as_ref()?.browser_version.clone()),
             operating_system: data.as_ref().and_then(|d| d.device.as_ref()?.os.clone()),
-            operating_system_version: data.as_ref().and_then(|d| d.device.as_ref()?.os_version.clone()),
-            device_type: data.as_ref().and_then(|d| d.device.as_ref()?.device_type.clone()),
+            operating_system_version: data
+                .as_ref()
+                .and_then(|d| d.device.as_ref()?.os_version.clone()),
+            device_type: data
+                .as_ref()
+                .and_then(|d| d.device.as_ref()?.device_type.clone()),
             screen_width: data.as_ref().and_then(|d| d.device.as_ref()?.screen_width),
             screen_height: data.as_ref().and_then(|d| d.device.as_ref()?.screen_height),
-            viewport_width: data.as_ref().and_then(|d| d.device.as_ref()?.viewport_width),
-            viewport_height: data.as_ref().and_then(|d| d.device.as_ref()?.viewport_height),
-            locale: data.as_ref().and_then(|d| d.device.as_ref()?.locale.clone()),
-            timezone: data.as_ref().and_then(|d| d.device.as_ref()?.timezone.clone()),
+            viewport_width: data
+                .as_ref()
+                .and_then(|d| d.device.as_ref()?.viewport_width),
+            viewport_height: data
+                .as_ref()
+                .and_then(|d| d.device.as_ref()?.viewport_height),
+            locale: data
+                .as_ref()
+                .and_then(|d| d.device.as_ref()?.locale.clone()),
+            timezone: data
+                .as_ref()
+                .and_then(|d| d.device.as_ref()?.timezone.clone()),
             os_name: data.as_ref().and_then(|d| d.device.as_ref()?.os.clone()),
-            os_version: data.as_ref().and_then(|d| d.device.as_ref()?.os_version.clone()),
-            os_build: data.as_ref().and_then(|d| d.device.as_ref()?.os_build.clone()),
-            os_kernel_version: data.as_ref().and_then(|d| d.device.as_ref()?.os_kernel_version.clone()),
-            device_arch: data.as_ref().and_then(|d| d.device.as_ref()?.device_arch.clone()),
-            device_processor_count: data.as_ref().and_then(|d| d.device.as_ref()?.processor_count),
-            device_processor_frequency: data.as_ref().and_then(|d| d.device.as_ref()?.processor_frequency),
+            os_version: data
+                .as_ref()
+                .and_then(|d| d.device.as_ref()?.os_version.clone()),
+            os_build: data
+                .as_ref()
+                .and_then(|d| d.device.as_ref()?.os_build.clone()),
+            os_kernel_version: data
+                .as_ref()
+                .and_then(|d| d.device.as_ref()?.os_kernel_version.clone()),
+            device_arch: data
+                .as_ref()
+                .and_then(|d| d.device.as_ref()?.device_arch.clone()),
+            device_processor_count: data
+                .as_ref()
+                .and_then(|d| d.device.as_ref()?.processor_count),
+            device_processor_frequency: data
+                .as_ref()
+                .and_then(|d| d.device.as_ref()?.processor_frequency),
             device_memory_size: data.as_ref().and_then(|d| d.device.as_ref()?.memory_size),
             device_free_memory: data.as_ref().and_then(|d| d.device.as_ref()?.free_memory),
-            device_boot_time: data.as_ref().and_then(|d| d.device.as_ref()?.boot_time.as_ref()).and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.to_utc())
-            }),
+            device_boot_time: data
+                .as_ref()
+                .and_then(|d| d.device.as_ref()?.boot_time.as_ref())
+                .and_then(|s| {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .ok()
+                        .map(|dt| dt.to_utc())
+                }),
 
             // Environment context
-            release_version: data.as_ref().and_then(|d| d.environment.as_ref()?.release.clone()),
-            build_number: data.as_ref().and_then(|d| d.environment.as_ref()?.build.clone()),
-            server_name: data.as_ref().and_then(|d| d.environment.as_ref()?.server_name.clone()),
-            environment: data.as_ref().and_then(|d| d.environment.as_ref()?.environment.clone()),
-            sdk_name: data.as_ref().and_then(|d| d.environment.as_ref()?.sdk_name.clone()),
-            sdk_version: data.as_ref().and_then(|d| d.environment.as_ref()?.sdk_version.clone()),
-            sdk_integrations: data.as_ref().and_then(|d| d.environment.as_ref()?.sdk_integrations.as_ref()).and_then(|v| {
-                serde_json::to_value(v).ok()
-            }),
-            platform: data.as_ref().and_then(|d| d.environment.as_ref()?.platform.clone()),
-            runtime_name: data.as_ref().and_then(|d| d.environment.as_ref()?.runtime_name.clone()),
-            runtime_version: data.as_ref().and_then(|d| d.environment.as_ref()?.runtime_version.clone()),
-            app_start_time: data.as_ref().and_then(|d| d.environment.as_ref()?.app_start_time.as_ref()).and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.to_utc())
-            }),
-            app_memory: data.as_ref().and_then(|d| d.environment.as_ref()?.app_memory),
+            release_version: data
+                .as_ref()
+                .and_then(|d| d.environment.as_ref()?.release.clone()),
+            build_number: data
+                .as_ref()
+                .and_then(|d| d.environment.as_ref()?.build.clone()),
+            server_name: data
+                .as_ref()
+                .and_then(|d| d.environment.as_ref()?.server_name.clone()),
+            environment: data
+                .as_ref()
+                .and_then(|d| d.environment.as_ref()?.environment.clone()),
+            sdk_name: data
+                .as_ref()
+                .and_then(|d| d.environment.as_ref()?.sdk_name.clone()),
+            sdk_version: data
+                .as_ref()
+                .and_then(|d| d.environment.as_ref()?.sdk_version.clone()),
+            sdk_integrations: data
+                .as_ref()
+                .and_then(|d| d.environment.as_ref()?.sdk_integrations.as_ref())
+                .and_then(|v| serde_json::to_value(v).ok()),
+            platform: data
+                .as_ref()
+                .and_then(|d| d.environment.as_ref()?.platform.clone()),
+            runtime_name: data
+                .as_ref()
+                .and_then(|d| d.environment.as_ref()?.runtime_name.clone()),
+            runtime_version: data
+                .as_ref()
+                .and_then(|d| d.environment.as_ref()?.runtime_version.clone()),
+            app_start_time: data
+                .as_ref()
+                .and_then(|d| d.environment.as_ref()?.app_start_time.as_ref())
+                .and_then(|s| {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .ok()
+                        .map(|dt| dt.to_utc())
+                }),
+            app_memory: data
+                .as_ref()
+                .and_then(|d| d.environment.as_ref()?.app_memory),
 
             // Trace context
-            transaction_name: data.as_ref().and_then(|d| d.trace.as_ref()?.transaction.clone()),
-            breadcrumbs: data.as_ref().and_then(|d| d.trace.as_ref()?.breadcrumbs.as_ref()).and_then(|v| {
-                serde_json::to_value(v).ok()
-            }),
+            transaction_name: data
+                .as_ref()
+                .and_then(|d| d.trace.as_ref()?.transaction.clone()),
+            breadcrumbs: data
+                .as_ref()
+                .and_then(|d| d.trace.as_ref()?.breadcrumbs.as_ref())
+                .and_then(|v| serde_json::to_value(v).ok()),
             extra_context: data.as_ref().and_then(|d| d.trace.as_ref()?.extra.clone()),
-            contexts: data.as_ref().and_then(|d| d.trace.as_ref()?.contexts.clone()),
+            contexts: data
+                .as_ref()
+                .and_then(|d| d.trace.as_ref()?.contexts.clone()),
 
             project_id: event.project_id,
             environment_id: event.environment_id,
@@ -126,6 +212,7 @@ impl ErrorCRUDService {
     }
 
     /// List error groups with filtering and pagination
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_error_groups(
         &self,
         project_id: i32,
@@ -275,10 +362,7 @@ impl ErrorCRUDService {
         let total = paginator.num_items().await?;
         let events = paginator.fetch_page(page - 1).await?;
 
-        let domain_events = events
-            .into_iter()
-            .map(Self::to_domain)
-            .collect();
+        let domain_events = events.into_iter().map(Self::to_domain).collect();
 
         Ok((domain_events, total))
     }
@@ -315,7 +399,7 @@ impl ErrorCRUDService {
 mod tests {
     use super::*;
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::{error_events, error_groups, projects};
+    use temps_entities::{error_groups, projects};
 
     /// Test: Manual error resolution workflow
     ///
@@ -326,7 +410,6 @@ mod tests {
     /// 3. Ignore errors with "ignored" status
     /// 4. Proper error handling for non-existent groups
     /// 5. Project isolation - can't update groups from other projects
-
     async fn setup_test_db() -> TestDatabase {
         TestDatabase::with_migrations()
             .await
@@ -334,24 +417,20 @@ mod tests {
     }
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
-        use temps_entities::types::ProjectType;
+        use temps_entities::preset::Preset;
         use uuid::Uuid;
 
         let unique_slug = format!("test-project-{}", Uuid::new_v4());
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             directory: Set("/test".to_string()),
             main_branch: Set("main".to_string()),
             slug: Set(unique_slug),
-            project_type: Set(ProjectType::Server),
-            automatic_deploy: Set(true),
-            is_web_app: Set(false),
-            performance_metrics_enabled: Set(false),
-            use_default_wildcard: Set(true),
-            is_public_repo: Set(false),
-            is_on_demand: Set(false),
-            created_at: Set(chrono::Utc::now()),
-            updated_at: Set(chrono::Utc::now()),
+            preset: Set(Preset::NextJs),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
             ..Default::default()
         };
 
@@ -362,7 +441,11 @@ mod tests {
             .id
     }
 
-    async fn create_test_error_group(db: &Arc<DatabaseConnection>, project_id: i32, status: &str) -> i32 {
+    async fn create_test_error_group(
+        db: &Arc<DatabaseConnection>,
+        project_id: i32,
+        status: &str,
+    ) -> i32 {
         let group = error_groups::ActiveModel {
             title: Set("Test Error".to_string()),
             error_type: Set("TypeError".to_string()),
@@ -396,9 +479,9 @@ mod tests {
         for status in valid_statuses {
             assert!(
                 status == "unresolved"
-                || status == "resolved"
-                || status == "ignored"
-                || status == "assigned",
+                    || status == "resolved"
+                    || status == "ignored"
+                    || status == "assigned",
                 "Status {} should be valid",
                 status
             );
@@ -409,13 +492,13 @@ mod tests {
     fn test_error_group_status_transitions() {
         // Document valid status transitions
         let transitions = vec![
-            ("unresolved", "resolved"),   // Fix deployed
-            ("unresolved", "ignored"),    // Known/acceptable error
-            ("unresolved", "assigned"),   // Assigned to developer
-            ("assigned", "resolved"),     // Developer fixed it
-            ("assigned", "unresolved"),   // Unassign
-            ("ignored", "unresolved"),    // No longer acceptable
-            ("resolved", "unresolved"),   // Regression (reopen)
+            ("unresolved", "resolved"), // Fix deployed
+            ("unresolved", "ignored"),  // Known/acceptable error
+            ("unresolved", "assigned"), // Assigned to developer
+            ("assigned", "resolved"),   // Developer fixed it
+            ("assigned", "unresolved"), // Unassign
+            ("ignored", "unresolved"),  // No longer acceptable
+            ("resolved", "unresolved"), // Regression (reopen)
         ];
 
         for (from, to) in transitions {
@@ -525,7 +608,10 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ErrorTrackingError::GroupNotFound));
+        assert!(matches!(
+            result.unwrap_err(),
+            ErrorTrackingError::GroupNotFound
+        ));
     }
 
     #[tokio::test]
@@ -544,7 +630,10 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ErrorTrackingError::GroupNotFound));
+        assert!(matches!(
+            result.unwrap_err(),
+            ErrorTrackingError::GroupNotFound
+        ));
     }
 
     #[tokio::test]
@@ -557,7 +646,7 @@ mod tests {
         let project_id = create_test_project(&db).await;
 
         // Create multiple error groups
-        for i in 0..5 {
+        for _i in 0..5 {
             create_test_error_group(&db, project_id, "unresolved").await;
         }
 

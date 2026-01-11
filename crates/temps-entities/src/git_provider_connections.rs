@@ -1,5 +1,5 @@
-use sea_orm::entity::prelude::*;
 use async_trait::async_trait;
+use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
@@ -18,7 +18,7 @@ pub struct Model {
     pub token_expires_at: Option<DBDateTime>,
     pub refresh_token_expires_at: Option<DBDateTime>,
     pub installation_id: Option<String>, // Provider-specific installation ID
-    pub metadata: Option<Json>, // Provider-specific metadata
+    pub metadata: Option<Json>,          // Provider-specific metadata
     pub is_active: bool,
     pub is_expired: bool, // True if PAT token has been validated and found to be expired
     pub syncing: bool,
@@ -70,7 +70,7 @@ impl ActiveModelBehavior for ActiveModel {
         C: ConnectionTrait,
     {
         let now = chrono::Utc::now();
-        
+
         if insert {
             if self.created_at.is_not_set() {
                 self.created_at = Set(now);
@@ -81,7 +81,7 @@ impl ActiveModelBehavior for ActiveModel {
         } else {
             self.updated_at = Set(now);
         }
-        
+
         Ok(self)
     }
 }

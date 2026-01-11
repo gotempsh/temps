@@ -19,13 +19,16 @@ pub type LogCallback =
     std::sync::Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub mod docker;
-pub mod nixpacks;
 pub mod plugin;
+pub mod static_deployer;
 
 #[derive(Error, Debug)]
 pub enum BuilderError {
     #[error("Build failed: {0}")]
     BuildFailed(String),
+
+    #[error("Build cancelled by user")]
+    BuildCancelled,
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
@@ -70,6 +73,7 @@ pub struct BuildRequest {
     pub context_path: PathBuf,
     pub dockerfile_path: Option<PathBuf>,
     pub build_args: HashMap<String, String>,
+    pub build_args_buildkit: HashMap<String, String>,
     pub platform: Option<String>,
     pub log_path: PathBuf,
 }
@@ -157,6 +161,27 @@ pub struct ContainerInfo {
     pub created_at: UtcDateTime,
     pub ports: Vec<PortMapping>,
     pub environment_vars: HashMap<String, String>,
+}
+
+/// Container performance statistics (CPU, memory, network)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerStats {
+    pub container_id: String,
+    pub container_name: String,
+    /// CPU usage percentage (0-100)
+    pub cpu_percent: f64,
+    /// Memory usage in bytes
+    pub memory_bytes: u64,
+    /// Memory limit in bytes (if set)
+    pub memory_limit_bytes: Option<u64>,
+    /// Memory usage percentage (0-100) if limit is set
+    pub memory_percent: Option<f64>,
+    /// Network bytes received
+    pub network_rx_bytes: u64,
+    /// Network bytes transmitted
+    pub network_tx_bytes: u64,
+    /// Timestamp of metrics collection
+    pub timestamp: UtcDateTime,
 }
 
 /// Configuration for stopping containers
@@ -326,6 +351,12 @@ pub trait ContainerDeployer: Send + Sync {
     /// Get container information
     async fn get_container_info(&self, container_id: &str) -> Result<ContainerInfo, DeployerError>;
 
+    /// Get container performance metrics (CPU, memory, network)
+    async fn get_container_stats(
+        &self,
+        container_id: &str,
+    ) -> Result<ContainerStats, DeployerError>;
+
     /// List running containers
     async fn list_containers(&self) -> Result<Vec<ContainerInfo>, DeployerError>;
 
@@ -423,7 +454,8 @@ mod tests {
             image_name: "test-image:latest".to_string(),
             context_path: context_path.clone(),
             dockerfile_path: Some(context_path.join("Dockerfile")),
-            build_args,
+            build_args: build_args.clone(),
+            build_args_buildkit: build_args.clone(),
             platform: Some("linux/amd64".to_string()),
             log_path,
         };
@@ -632,6 +664,7 @@ mod tests {
             context_path: PathBuf::from("/tmp/build"),
             dockerfile_path: None,
             build_args: HashMap::new(),
+            build_args_buildkit: HashMap::new(),
             platform: None,
             log_path: PathBuf::from("/tmp/build.log"),
         };
@@ -701,7 +734,8 @@ CMD ["echo", "Hello from container"]
             image_name: "test-app:v1.0".to_string(),
             context_path: temp_dir.path().to_path_buf(),
             dockerfile_path: Some(dockerfile_path.clone()),
-            build_args,
+            build_args: build_args.clone(),
+            build_args_buildkit: build_args.clone(),
             platform: Some("linux/amd64".to_string()),
             log_path: temp_dir.path().join("build.log"),
         };
@@ -713,7 +747,7 @@ CMD ["echo", "Hello from container"]
 
     #[test]
     fn test_multiple_port_mappings() {
-        let port_mappings = vec![
+        let port_mappings = [
             PortMapping {
                 host_port: 8080,
                 container_port: 80,
@@ -782,7 +816,7 @@ CMD ["echo", "Hello from container"]
     }
 
     #[test]
-    fn test_comprehensive_type_validation() {
+    fn test_type_validation() {
         // Test all our public types can be created and used
 
         // Test ResourceLimits

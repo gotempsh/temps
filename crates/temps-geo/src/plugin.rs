@@ -44,18 +44,17 @@ impl TempsPlugin for GeoPlugin {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
 
             // Create GeoIpService
-            let geo_ip_service = Arc::new(GeoIpService::new()
-                .map_err(|e| PluginError::PluginRegistrationFailed {
+            let geo_ip_service = Arc::new(GeoIpService::new().map_err(|e| {
+                PluginError::PluginRegistrationFailed {
                     plugin_name: "geo".to_string(),
                     error: e.to_string(),
-                })?);
+                }
+            })?);
             context.register_service(geo_ip_service.clone());
 
             // Create IpAddressService (depends on GeoIpService)
-            let ip_address_service = Arc::new(IpAddressService::new(
-                db.clone(),
-                geo_ip_service.clone(),
-            ));
+            let ip_address_service =
+                Arc::new(IpAddressService::new(db.clone(), geo_ip_service.clone()));
             context.register_service(ip_address_service);
 
             tracing::debug!("Geo plugin services registered successfully");
@@ -95,7 +94,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_geo_plugin_default() {
-        let geo_plugin = GeoPlugin::default();
+        let geo_plugin = GeoPlugin;
         assert_eq!(geo_plugin.name(), "geo");
     }
 }

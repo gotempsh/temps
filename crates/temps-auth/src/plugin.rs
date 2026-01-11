@@ -14,7 +14,6 @@ use temps_core::plugin::{
     PluginContext, PluginError, PluginMiddlewareCollection, PluginRoutes,
     ServiceRegistrationContext, TempsPlugin,
 };
-use tracing;
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
@@ -195,7 +194,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_plugin_default() {
-        let auth_plugin = AuthPlugin::default();
+        let auth_plugin = AuthPlugin;
         assert_eq!(auth_plugin.name(), "auth");
     }
 }

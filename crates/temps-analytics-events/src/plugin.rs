@@ -1,9 +1,9 @@
-use temps_core::plugin::{
-    PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
-};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use temps_core::plugin::{
+    PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
+};
 use tracing::debug;
 
 /// Analytics events tracking plugin
@@ -40,8 +40,8 @@ impl TempsPlugin for EventsPlugin {
         let route_table = context.get_service::<temps_proxy::CachedPeerTable>()?;
         let ip_address_service = context.get_service::<temps_geo::IpAddressService>()?;
 
-        let routes = crate::handlers::configure_routes()
-            .with_state(Arc::new(crate::handlers::AppState {
+        let routes =
+            crate::handlers::configure_routes().with_state(Arc::new(crate::handlers::AppState {
                 events_service,
                 route_table,
                 ip_address_service,

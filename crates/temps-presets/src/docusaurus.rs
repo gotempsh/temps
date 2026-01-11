@@ -1,9 +1,11 @@
-use std::path::PathBuf;
+use std::path::Path;
 
-use super::{PackageManager, Preset, ProjectType};
+use super::{DockerfileWithArgs, PackageManager, Preset, ProjectType};
+use async_trait::async_trait;
 
 pub struct Docusaurus;
 
+#[async_trait]
 impl Preset for Docusaurus {
     fn slug(&self) -> String {
         "docusaurus".to_string()
@@ -18,20 +20,11 @@ impl Preset for Docusaurus {
     }
 
     fn icon_url(&self) -> String {
-        "https://example.com/docusaurus-icon.png".to_string()
+        "/presets/docusaurus.svg".to_string()
     }
 
-    fn dockerfile(
-        &self,
-        _root_local_path: &PathBuf,
-        local_path: &PathBuf,
-        install_command: Option<&str>,
-        build_command: Option<&str>,
-        _output_dir: Option<&str>,
-        build_vars: Option<&Vec<String>>,
-        _project_slug: &str,
-    ) -> String {
-        let pkg_manager = PackageManager::detect(local_path);
+    async fn dockerfile(&self, config: super::DockerfileConfig<'_>) -> DockerfileWithArgs {
+        let pkg_manager = PackageManager::detect(config.local_path);
 
         let lockfile = match pkg_manager {
             PackageManager::Bun => "COPY package.json bun.lock* ./",
@@ -55,11 +48,11 @@ RUN {}
 "#,
             pkg_manager.base_image(),
             lockfile,
-            install_command.unwrap_or(pkg_manager.install_command())
+            config.install_command.unwrap_or(pkg_manager.install_command())
         );
 
         // Add build variables if present
-        if let Some(vars) = build_vars {
+        if let Some(vars) = config.build_vars {
             for var in vars {
                 dockerfile.push_str(&format!("ARG {}\n", var));
             }
@@ -69,6 +62,9 @@ RUN {}
             r#"
 # Copy the rest of the application code
 COPY . .
+
+# Set production environment for build
+ENV NODE_ENV=production
 
 # Build the application
 RUN {}
@@ -85,12 +81,16 @@ RUN {}
 # Copy necessary files from the builder stage
 COPY --from=builder /app/build ./build
 
+# Set production environment
+ENV NODE_ENV=production
+
 # Expose the port the app runs on
 EXPOSE 3000
 
+# Serve the static files (serve binds to 0.0.0.0 by default in Docker)
 CMD ["serve", "-s", "build", "-l", "3000"]
 "#,
-            build_command.unwrap_or(pkg_manager.build_command()),
+            config.build_command.unwrap_or(pkg_manager.build_command()),
             pkg_manager.base_image(),
             match pkg_manager {
                 PackageManager::Bun => "bun install -g serve",
@@ -100,12 +100,11 @@ CMD ["serve", "-s", "build", "-l", "3000"]
             }
         ));
 
-        dockerfile
+        DockerfileWithArgs::new(dockerfile)
     }
 
-    fn dockerfile_with_build_dir(&self, _local_path: &PathBuf) -> String {
-        format!(
-            r#"
+    async fn dockerfile_with_build_dir(&self, _local_path: &Path) -> DockerfileWithArgs {
+        let content = r#"
 # Use a lightweight base image
 FROM oven/bun:1.2-alpine
 
@@ -117,30 +116,37 @@ COPY build ./build
 # Install serve globally
 RUN bun install -g serve
 
+# Set production environment
+ENV NODE_ENV=production
+
 # Expose the port the app runs on
 EXPOSE 3000
 
-# Use serve to host the static files
+# Use serve to host the static files (binds to 0.0.0.0 by default in Docker)
 CMD ["serve", "-s", "build", "-l", "3000"]
-      
-"#,
-        )
+
+"#;
+        DockerfileWithArgs::new(content.to_string())
     }
 
-    fn install_command(&self, local_path: &PathBuf) -> String {
+    fn install_command(&self, local_path: &Path) -> String {
         PackageManager::detect(local_path)
             .install_command()
             .to_string()
     }
 
-    fn build_command(&self, local_path: &PathBuf) -> String {
+    fn build_command(&self, local_path: &Path) -> String {
         PackageManager::detect(local_path)
             .build_command()
             .to_string()
     }
 
     fn dirs_to_upload(&self) -> Vec<String> {
-        vec!["build".to_string()]
+        vec!["/app/build".to_string()]
+    }
+
+    fn static_output_dir(&self) -> Option<String> {
+        Some("/app/build".to_string())
     }
 }
 

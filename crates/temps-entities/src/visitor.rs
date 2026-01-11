@@ -9,13 +9,16 @@ pub struct Model {
     pub visitor_id: String,
     pub project_id: i32,
     pub environment_id: i32,
-    pub first_seen: DBDateTime,  
+    pub first_seen: DBDateTime,
     pub last_seen: DBDateTime,
     pub user_agent: Option<String>,
     pub ip_address_id: Option<i32>,
     pub is_crawler: bool,
     pub crawler_name: Option<String>,
-    pub custom_data: Option<serde_json::Value>, // JSON string containing user-provided data
+    #[sea_orm(column_type = "JsonBinary")]
+    pub custom_data: Option<serde_json::Value>,
+    /// Flag indicating visitor has recorded events/sessions (not a "ghost" visitor)
+    pub has_activity: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

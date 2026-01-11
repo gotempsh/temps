@@ -9,6 +9,13 @@ homepage.workspace = true
 
 [dependencies]
 temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
 temps-database = { path = "../temps-database" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
 serde = { workspace = true }
+sysinfo = "0.33"
+thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }

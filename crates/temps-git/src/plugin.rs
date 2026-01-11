@@ -19,7 +19,7 @@ use temps_core::{EncryptionService, JobQueue};
 use tracing;
 use utoipa::{openapi::OpenApi, OpenApi as OpenApiTrait};
 
-use crate::handlers::{self, GitProvidersApiDoc};
+use crate::handlers::{self, GitProvidersApiDoc, PublicRepositoriesApiDoc};
 use crate::services::{
     git_provider_manager::GitProviderManager, github::GithubAppService,
     repository::RepositoryService,
@@ -27,6 +27,12 @@ use crate::services::{
 
 /// Git Plugin for managing Git provider integrations
 pub struct GitPlugin;
+
+impl Default for GitPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl GitPlugin {
     pub fn new() -> Self {
@@ -136,7 +142,9 @@ impl TempsPlugin for GitPlugin {
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        Some(GitProvidersApiDoc::openapi())
+        let mut schema = GitProvidersApiDoc::openapi();
+        schema.merge(PublicRepositoriesApiDoc::openapi());
+        Some(schema)
     }
 }
 
@@ -144,14 +152,17 @@ impl TempsPlugin for GitPlugin {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use temps_core::plugin::PluginStateRegistry;
+
     use temps_core::QueueError;
     use temps_core::{Job, JobReceiver};
 
     // Mock implementations for testing
+    #[allow(dead_code)]
     struct MockConfigService;
+    #[allow(dead_code)]
     struct MockAuditService;
 
+    #[allow(dead_code)]
     struct MockJobQueue;
 
     #[async_trait]

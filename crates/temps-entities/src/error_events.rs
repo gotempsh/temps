@@ -314,7 +314,9 @@ impl ActiveModelBehavior for ActiveModel {}
 impl Model {
     /// Get typed data from JSONB column
     pub fn get_data(&self) -> Option<ErrorEventData> {
-        self.data.as_ref().and_then(|v| serde_json::from_value(v.clone()).ok())
+        self.data
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
     }
 
     /// Set data from typed struct

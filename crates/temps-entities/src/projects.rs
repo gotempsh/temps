@@ -1,9 +1,11 @@
-use sea_orm::entity::prelude::*;
 use async_trait::async_trait;
+use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
-use super::types::ProjectType;
 use temps_core::DBDateTime;
+
+use super::deployment_config::DeploymentConfig;
+use super::preset::{Preset, PresetConfig};
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "projects")]
@@ -11,34 +13,34 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub name: String,
-    pub repo_name: Option<String>,
-    pub repo_owner: Option<String>,
+    /// Repository name (required)
+    pub repo_name: String,
+    /// Repository owner/namespace (required)
+    pub repo_owner: String,
     pub directory: String,
     pub main_branch: String,
-    pub preset: Option<String>,
+    /// Preset/framework type (required - every project must have a preset)
+    pub preset: Preset,
+    /// Preset-specific configuration (e.g., NextJsConfig with custom build commands)
+    /// This is typed based on the preset enum variant
+    pub preset_config: Option<PresetConfig>,
+    /// Deployment configuration (CPU, memory, port, analytics, auto-deploy settings, security)
+    /// These serve as defaults for all environments unless overridden
+    /// Security settings are in deployment_config.security
+    pub deployment_config: Option<DeploymentConfig>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
     pub slug: String,
     pub is_deleted: bool,
     pub deleted_at: Option<DBDateTime>,
-    pub cpu_request: Option<i32>,
-    pub cpu_limit: Option<i32>,
-    pub memory_request: Option<i32>,
-    pub memory_limit: Option<i32>,
-    pub build_command: Option<String>,
-    pub install_command: Option<String>,
-    pub output_dir: Option<String>,
-    pub automatic_deploy: bool,
-    pub project_type: ProjectType,
-    pub is_web_app: bool,
-    pub performance_metrics_enabled: bool,
     pub last_deployment: Option<DBDateTime>,
-    pub use_default_wildcard: bool,
-    pub custom_domain: Option<String>,
     pub is_public_repo: bool,
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
-    pub is_on_demand: bool,
+    /// Attack mode - when enabled, requires CAPTCHA verification for all visitors
+    pub attack_mode: bool,
+    /// Enable automatic preview environment creation for each branch
+    pub enable_preview_environments: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -80,7 +82,7 @@ impl ActiveModelBehavior for ActiveModel {
         C: ConnectionTrait,
     {
         let now = chrono::Utc::now();
-        
+
         if insert {
             if self.created_at.is_not_set() {
                 self.created_at = Set(now);
@@ -91,7 +93,7 @@ impl ActiveModelBehavior for ActiveModel {
         } else {
             self.updated_at = Set(now);
         }
-        
+
         Ok(self)
     }
 }

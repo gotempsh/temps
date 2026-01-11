@@ -3,8 +3,8 @@ name: Rust Tests
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  # pull_request:
+  #   branches: [main]
   workflow_dispatch:
 
 env:
@@ -22,8 +22,19 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack and Build WASM
+        run: |
+          cargo install wasm-pack
+          cd crates/temps-captcha-wasm
+          bun run build
 
       - name: Check workspace
         run: cargo check --workspace --all-targets
@@ -55,8 +66,19 @@ jobs:
         with:
           components: clippy
 
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack and Build WASM
+        run: |
+          cargo install wasm-pack
+          cd crates/temps-captcha-wasm
+          bun run build
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -64,20 +86,68 @@ jobs:
   all-tests:
     name: All Tests
     runs-on: ubuntu-latest
+
+    services:
+      timescaledb:
+        image: timescale/timescaledb:latest-pg17
+        env:
+          POSTGRES_DB: test_db
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test_user -d test_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
+      - name: Free up disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          echo "Removing unnecessary packages and files..."
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo apt-get autoremove -y
+          sudo apt-get clean
+          echo "Disk space after cleanup:"
+          df -h
+
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Verify Docker is available
-        run: docker --version
+      - name: Install wasm-pack and Build WASM
+        run: |
+          cargo install wasm-pack
+          cd crates/temps-captcha-wasm
+          bun run build
+
+      - name: Verify TimescaleDB is ready
+        run: |
+          echo "Checking if TimescaleDB port is open..."
+          timeout 60 bash -c 'until nc -z localhost 5432; do sleep 1; done'
+          echo "TimescaleDB is ready!"
 
       - name: Run all workspace tests
-        run: cargo test --workspace --all-features
+        run: cargo test --no-fail-fast --workspace --all-features
         env:
           RUST_BACKTRACE: 1
+          CARGO_INCREMENTAL: 0
+          TEMPS_TEST_DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db

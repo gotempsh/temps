@@ -11,7 +11,7 @@ use std::sync::Arc;
 use temps_core::UtcDateTime;
 use temps_database::DbConnection;
 use temps_entities::{self, repositories};
-use temps_entities::{git_provider_connections, git_providers};
+use temps_entities::{git_provider_connections, git_providers, projects};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -81,13 +81,13 @@ pub enum PackageManager {
     Unknown,
 }
 
-impl ToString for PackageManager {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for PackageManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PackageManager::Bun => "bun".to_string(),
-            PackageManager::Npm => "npm".to_string(),
-            PackageManager::Yarn => "yarn".to_string(),
-            PackageManager::Unknown => "Unknown".to_string(),
+            PackageManager::Bun => write!(f, "bun"),
+            PackageManager::Npm => write!(f, "npm"),
+            PackageManager::Yarn => write!(f, "yarn"),
+            PackageManager::Unknown => write!(f, "Unknown"),
         }
     }
 }
@@ -116,16 +116,16 @@ pub enum Framework {
     Unknown,
 }
 
-impl ToString for Framework {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for Framework {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Framework::NextJs => "Next.js".to_string(),
-            Framework::Vite => "Vite".to_string(),
-            Framework::CreateReactApp => "Create React App".to_string(),
-            Framework::Unknown => "Unknown".to_string(),
-            Framework::Rsbuild => "Rsbuild".to_string(),
-            Framework::Docusaurus => "Docusaurus".to_string(), // Add Docusaurus string conversion
-            Framework::Dockerfile => "Dockerfile".to_string(), // Add Dockerfile string conversion
+            Framework::NextJs => write!(f, "Next.js"),
+            Framework::Vite => write!(f, "Vite"),
+            Framework::CreateReactApp => write!(f, "Create React App"),
+            Framework::Unknown => write!(f, "Unknown"),
+            Framework::Rsbuild => write!(f, "Rsbuild"),
+            Framework::Docusaurus => write!(f, "Docusaurus"), // Add Docusaurus string conversion
+            Framework::Dockerfile => write!(f, "Dockerfile"), // Add Dockerfile string conversion
         }
     }
 }
@@ -523,6 +523,93 @@ impl GithubAppService {
             }
         }
     }
+    /// Store a repository from webhook payload (simplified version with limited fields)
+    pub async fn store_repository_from_webhook(
+        &self,
+        repo: &octocrab::models::webhook_events::InstallationEventRepository,
+        installation_id_p: i32,
+    ) -> Result<(), GithubAppServiceError> {
+        info!(
+            "Storing repository from webhook payload: {}",
+            repo.full_name
+        );
+
+        // Get the git provider connection for this installation
+        let connection_id = self
+            .git_provider_manager
+            .get_connection_by_installation_id(&installation_id_p.to_string())
+            .await
+            .map(|conn| conn.id)
+            .map_err(|e| {
+                GithubAppServiceError::NotFound(format!(
+                    "No connection found for installation {}: {}",
+                    installation_id_p, e
+                ))
+            })?;
+
+        let repo_owner = repo.full_name.split('/').next().unwrap_or("");
+
+        // Check if the repository already exists in the database
+        let existing_repo = repositories::Entity::find()
+            .filter(repositories::Column::FullName.eq(&repo.full_name))
+            .one(self.db.as_ref())
+            .await?;
+
+        let repo_model = repositories::ActiveModel {
+            id: if let Some(existing) = existing_repo {
+                Set(existing.id)
+            } else {
+                sea_orm::NotSet
+            },
+            git_provider_connection_id: Set(connection_id),
+            clone_url: Set(None),
+            ssh_url: Set(None),
+            owner: Set(repo_owner.to_string()),
+            name: Set(repo.name.clone()),
+            full_name: Set(repo.full_name.clone()),
+            description: Set(None),
+            private: Set(repo.private),
+            fork: Set(false),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            pushed_at: Set(chrono::Utc::now()),
+            size: Set(0),
+            stargazers_count: Set(0),
+            watchers_count: Set(0),
+            language: Set(None),
+            default_branch: Set("main".to_string()),
+            open_issues_count: Set(0),
+            topics: Set(String::new()),
+            repo_object: Set(String::new()),
+            installation_id: Set(Some(installation_id_p)),
+            preset: Set(None),
+        };
+
+        let saved_repo = repo_model.save(self.db.as_ref()).await?;
+
+        // Queue framework detection job
+        if let Err(e) = self
+            .queue_service
+            .send(temps_core::jobs::Job::UpdateRepoFramework(
+                temps_core::jobs::UpdateRepoFrameworkJob {
+                    repo_id: saved_repo.id.unwrap(),
+                },
+            ))
+            .await
+        {
+            warn!(
+                "Failed to queue framework detection for repository {}: {}",
+                repo.full_name, e
+            );
+        }
+
+        info!(
+            "Successfully stored repository from webhook payload: {} (framework detection queued)",
+            repo.full_name
+        );
+        Ok(())
+    }
+
     pub async fn store_repository(
         &self,
         repo: &octocrab::models::Repository,
@@ -535,7 +622,20 @@ impl GithubAppService {
         );
 
         let repo_owner = repo.owner.as_ref().map(|o| o.login.as_str()).unwrap_or("");
-        let full_name_val = repo.full_name.clone().unwrap_or_else(|| "".to_string());
+        let full_name_val = repo.full_name.clone().unwrap_or_default();
+
+        // Get the git provider connection for this installation
+        let git_provider_connection_id = self
+            .git_provider_manager
+            .get_connection_by_installation_id(&installation_id_p.to_string())
+            .await
+            .map(|conn| conn.id)
+            .map_err(|e| {
+                GithubAppServiceError::NotFound(format!(
+                    "No connection found for installation {}: {}",
+                    installation_id_p, e
+                ))
+            })?;
 
         // Check if the repository already exists in the database
         let existing_repo = repositories::Entity::find()
@@ -560,8 +660,7 @@ impl GithubAppService {
             } else {
                 sea_orm::NotSet
             },
-            framework_last_updated_at: Set(None),
-            git_provider_connection_id: Set(None),
+            git_provider_connection_id: Set(git_provider_connection_id),
             clone_url: Set(repo.clone_url.as_ref().map(|url| url.to_string())),
             ssh_url: Set(repo.ssh_url.as_ref().map(|url| url.to_string())),
             owner: Set(repo_owner.to_string()),
@@ -584,9 +683,6 @@ impl GithubAppService {
             open_issues_count: Set(repo.open_issues_count.unwrap_or(0) as i32),
             topics: Set(topics_p.unwrap_or_default()),
             repo_object: Set(serde_json::to_string(&repo).unwrap_or_default()),
-            framework: Set(None),
-            framework_version: Set(None),
-            package_manager: Set(None),
             installation_id: Set(Some(installation_id_p)),
             preset: Set(None),
         };
@@ -627,17 +723,38 @@ impl GithubAppService {
             .get_repositories_for_installation(installation_id_p, git_provider_connection_id)
             .await?;
 
+        // Get the git provider connection for this installation
+        let connection_id = if let Some(id) = git_provider_connection_id {
+            id
+        } else {
+            self.git_provider_manager
+                .get_connection_by_installation_id(&installation_id_p.to_string())
+                .await
+                .map(|conn| conn.id)
+                .map_err(|e| {
+                    GithubAppServiceError::NotFound(format!(
+                        "No connection found for installation {}: {}",
+                        installation_id_p, e
+                    ))
+                })?
+        };
+
         // Use SeaORM transaction
         let txn = self.db.begin().await?;
 
         // Process repositories in batches using upsert
+        let repos_count = repos.len();
+        info!(
+            "Processing {} repositories for installation {}",
+            repos_count, installation_id_p
+        );
+
         for repo in repos {
             let repo_owner = repo.full_name.split('/').next().unwrap_or("").to_string();
 
             let repo_model = repositories::ActiveModel {
-                framework_last_updated_at: Set(Some(chrono::Utc::now())),
                 id: sea_orm::NotSet,
-                git_provider_connection_id: Set(git_provider_connection_id),
+                git_provider_connection_id: Set(connection_id),
                 clone_url: Set(None),
                 ssh_url: Set(None),
                 owner: Set(repo_owner.clone()),
@@ -648,7 +765,7 @@ impl GithubAppService {
                 fork: Set(false),
                 created_at: Set(repo.created_at),
                 updated_at: Set(repo.updated_at),
-                pushed_at: Set(repo.pushed_at.unwrap_or_else(|| chrono::Utc::now())),
+                pushed_at: Set(repo.pushed_at.unwrap_or_else(chrono::Utc::now)),
                 size: Set(0),
                 stargazers_count: Set(repo.stargazers_count),
                 watchers_count: Set(repo.watchers_count),
@@ -657,9 +774,6 @@ impl GithubAppService {
                 open_issues_count: Set(0),
                 topics: Set(String::new()),
                 repo_object: Set(String::new()),
-                framework: Set(None),
-                framework_version: Set(None),
-                package_manager: Set(None),
                 installation_id: Set(Some(installation_id_p)),
                 preset: Set(None),
             };
@@ -672,14 +786,15 @@ impl GithubAppService {
 
             if let Some(existing) = existing_repo {
                 // Update existing repository
+                debug!("Updating existing repository: {}", repo.full_name);
                 let mut active_repo: repositories::ActiveModel = existing.into();
-                active_repo.git_provider_connection_id = Set(git_provider_connection_id);
+                active_repo.git_provider_connection_id = Set(connection_id);
                 active_repo.owner = Set(repo_owner);
                 active_repo.name = Set(repo.name.clone());
                 active_repo.installation_id = Set(Some(installation_id_p));
                 active_repo.private = Set(repo.private);
                 active_repo.updated_at = Set(chrono::Utc::now());
-                active_repo.pushed_at = Set(repo.pushed_at.unwrap_or_else(|| chrono::Utc::now()));
+                active_repo.pushed_at = Set(repo.pushed_at.unwrap_or_else(chrono::Utc::now));
                 active_repo.stargazers_count = Set(repo.stargazers_count);
                 active_repo.watchers_count = Set(repo.watchers_count);
                 active_repo.language = Set(Some(repo.language.clone()));
@@ -687,9 +802,15 @@ impl GithubAppService {
                 active_repo.update(&txn).await?;
             } else {
                 // Insert new repository
+                debug!("Inserting new repository: {}", repo.full_name);
                 repo_model.save(&txn).await?;
             }
         }
+
+        info!(
+            "Completed storing {} repositories for installation {}",
+            repos_count, installation_id_p
+        );
 
         // Update last_synced_at
         self.update_last_synced_at(installation_id_p).await?;
@@ -735,7 +856,6 @@ impl GithubAppService {
                 error!("Failed to get installation: {:?}", e);
                 GithubAppServiceError::GithubApiError(e.to_string())
             })?;
-
         // Get access token for the installation
         let create_access_token = CreateInstallationAccessToken::default();
         let gh_access_tokens_url = Url::parse(installation.access_tokens_url.as_ref().unwrap())
@@ -777,7 +897,7 @@ impl GithubAppService {
             })?;
 
         // Pass the connection ID to sync_repositories
-        self.sync_repositories(installation_id_p, Some(connection.id))
+        self.sync_repositories(installation.id.0 as i32, Some(connection.id))
             .await?;
         info!("Created new GitHub App installation: {}", installation_id_p);
         Ok(connection)
@@ -788,18 +908,36 @@ impl GithubAppService {
         installation_id_p: i32,
         git_provider_connection_id: Option<i32>,
     ) -> Result<(GitHubAppData, Vec<Repository>), GithubAppServiceError> {
-        info!("Fetching repositories for the current installation");
+        info!(
+            "Fetching repositories for installation_id: {}, connection_id: {:?}",
+            installation_id_p, git_provider_connection_id
+        );
 
         // Use the provided connection_id or try to find one for this installation
         let connection_id = if let Some(id) = git_provider_connection_id {
+            info!("Using provided connection_id: {}", id);
             id
         } else {
             // Try to get connection by installation_id
+            info!(
+                "Looking up connection by installation_id: {}",
+                installation_id_p
+            );
             self.git_provider_manager
                 .get_connection_by_installation_id(&installation_id_p.to_string())
                 .await
-                .map(|conn| conn.id)
+                .map(|conn| {
+                    info!(
+                        "Found connection {} for installation {}",
+                        conn.id, installation_id_p
+                    );
+                    conn.id
+                })
                 .map_err(|e| {
+                    error!(
+                        "Failed to find connection for installation {}: {}",
+                        installation_id_p, e
+                    );
                     GithubAppServiceError::NotFound(format!(
                         "No connection found for installation {}: {}",
                         installation_id_p, e
@@ -819,12 +957,28 @@ impl GithubAppService {
                 ("page", page.to_string()),
             ];
 
+            info!(
+                "Fetching repositories page {} for installation {}",
+                page, installation_id_p
+            );
             let installed_repos: InstallationRepositories = octocrab
                 .get("/installation/repositories", Some(&params))
                 .await
-                .map_err(|e| GithubAppServiceError::GithubApiError(e.to_string()))?;
+                .map_err(|e| {
+                    error!(
+                        "Failed to fetch repositories page {} for installation {}: {}",
+                        page, installation_id_p, e
+                    );
+                    GithubAppServiceError::GithubApiError(e.to_string())
+                })?;
             let repos = installed_repos.repositories.clone();
             let repos_len = repos.len();
+
+            info!(
+                "Retrieved {} repositories on page {} for installation {}",
+                repos_len, page, installation_id_p
+            );
+
             let repositories: Vec<Repository> = repos
                 .into_iter()
                 .map(|repo| Repository {
@@ -841,7 +995,7 @@ impl GithubAppService {
                     description: repo.description,
                     framework: Some(Framework::Unknown.to_string()),
                     installation_id: installation_id_p,
-                    pushed_at: repo.pushed_at.map(|date| date),
+                    pushed_at: repo.pushed_at,
                     stargazers_count: repo.stargazers_count.map_or(0, |count| count as i32),
                     watchers_count: repo.watchers_count.map_or(0, |count| count as i32),
                     language: repo
@@ -865,8 +1019,9 @@ impl GithubAppService {
         }
 
         info!(
-            "Retrieved {} repositories for the current installation",
-            all_repositories.len()
+            "Successfully retrieved {} total repositories for installation {}",
+            all_repositories.len(),
+            installation_id_p
         );
 
         Ok((github_app, all_repositories))
@@ -1060,7 +1215,7 @@ impl GithubAppService {
         active_provider
             .update(self.db.as_ref())
             .await
-            .map_err(|e| GithubAppServiceError::DatabaseError(e))?;
+            .map_err(GithubAppServiceError::DatabaseError)?;
 
         info!(
             "Updated ping_received_at to {} for GitHub App with id: {}",
@@ -1134,7 +1289,7 @@ impl GithubAppService {
                             // Check if this installation belongs to this app
                             if let Some(installation_app_id) = installation.app_id {
                                 if app_data.app_id == installation_app_id.0 as i32 {
-                                    info!("Found installation {} belongs to GitHub App: {} (app_id: {})", 
+                                    info!("Found installation {} belongs to GitHub App: {} (app_id: {})",
                                         installation_id_p, app_data.name, installation_app_id.0);
                                     found_app = Some(app_data);
                                     break;
@@ -1252,6 +1407,47 @@ impl GithubAppService {
             installation_id_p
         );
 
+        // Convert installation_id to string for database query
+        let installation_id_str = installation_id_p.to_string();
+
+        // Find all connections associated with this installation
+        let connections = git_provider_connections::Entity::find()
+            .filter(
+                git_provider_connections::Column::InstallationId.eq(installation_id_str.clone()),
+            )
+            .all(self.db.as_ref())
+            .await
+            .map_err(|e| GithubAppServiceError::DatabaseError(e))?;
+
+        if connections.is_empty() {
+            warn!(
+                "No connections found for installation {}, proceeding with deletion",
+                installation_id_p
+            );
+        } else {
+            // Check if any projects depend on these connections
+            let connection_ids: Vec<i32> = connections.iter().map(|c| c.id).collect();
+
+            let dependent_projects = projects::Entity::find()
+                .filter(projects::Column::GitProviderConnectionId.is_in(connection_ids.clone()))
+                .all(self.db.as_ref())
+                .await
+                .map_err(|e| GithubAppServiceError::DatabaseError(e))?;
+
+            if !dependent_projects.is_empty() {
+                let project_names: Vec<String> =
+                    dependent_projects.iter().map(|p| p.name.clone()).collect();
+                let conflict_msg = format!(
+                    "Cannot delete installation {} - {} project(s) depend on it: {}",
+                    installation_id_p,
+                    dependent_projects.len(),
+                    project_names.join(", ")
+                );
+                warn!("{}", conflict_msg);
+                return Err(GithubAppServiceError::Conflict(conflict_msg));
+            }
+        }
+
         // Delete the installation through git_provider_manager
         self.git_provider_manager
             .delete_installation(installation_id_p)
@@ -1268,6 +1464,323 @@ impl GithubAppService {
             installation_id_p
         );
         Ok(())
+    }
+
+    /// Verify if a GitHub App installation still exists and is accessible
+    /// Returns true if the installation is active, false if it has been deleted or suspended
+    pub async fn verify_installation(
+        &self,
+        installation_id_p: i32,
+    ) -> Result<bool, GithubAppServiceError> {
+        debug!(
+            "Verifying GitHub installation with ID: {}",
+            installation_id_p
+        );
+
+        // Get the connection to find which app owns this installation
+        let connection = self
+            .git_provider_manager
+            .get_connection_by_installation_id(&installation_id_p.to_string())
+            .await
+            .map_err(|e| {
+                GithubAppServiceError::NotFound(format!(
+                    "GitHub App Installation with id {} not found in database: {}",
+                    installation_id_p, e
+                ))
+            })?;
+
+        // Get the provider to extract app credentials
+        let provider = self
+            .git_provider_manager
+            .get_provider(connection.provider_id)
+            .await
+            .map_err(|e| {
+                GithubAppServiceError::NotFound(format!(
+                    "GitHub App provider {} not found: {}",
+                    connection.provider_id, e
+                ))
+            })?;
+
+        let app_data = self.extract_github_app_data(&provider).await?;
+
+        // Try to get the installation from GitHub API
+        let (octocrab, _) = self
+            .get_github_app_client_by_app_id(app_data.app_id)
+            .await?;
+
+        match octocrab
+            .apps()
+            .installation(InstallationId(installation_id_p as u64))
+            .await
+        {
+            Ok(_installation) => {
+                // Installation exists and is accessible
+                debug!(
+                    "Installation {} is active and accessible",
+                    installation_id_p
+                );
+                Ok(true)
+            }
+            Err(e) => {
+                // Check if it's a 404 (installation deleted) or other error
+                let error_str = e.to_string();
+                if error_str.contains("404") || error_str.contains("Not Found") {
+                    info!(
+                        "Installation {} no longer exists (404 from GitHub API)",
+                        installation_id_p
+                    );
+                    Ok(false)
+                } else {
+                    // Other errors (rate limiting, network issues, etc.)
+                    warn!(
+                        "Error checking installation {}: {}",
+                        installation_id_p, error_str
+                    );
+                    Err(GithubAppServiceError::GithubApiError(format!(
+                        "Failed to verify installation: {}",
+                        error_str
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Check and deactivate installations that are no longer accessible
+    /// This should be called periodically (e.g., via a cron job)
+    /// Returns the number of installations that were deactivated
+    pub async fn check_and_deactivate_stale_installations(
+        &self,
+    ) -> Result<usize, GithubAppServiceError> {
+        info!("Checking for stale GitHub installations");
+
+        // Get all GitHub providers and their connections
+        let providers = self
+            .git_provider_manager
+            .get_github_app_providers()
+            .await
+            .map_err(|e| {
+                GithubAppServiceError::Other(format!("Failed to get GitHub providers: {}", e))
+            })?;
+
+        let mut all_connections = Vec::new();
+        for provider in providers {
+            let connections = self
+                .git_provider_manager
+                .get_provider_connections(provider.id)
+                .await
+                .map_err(|e| {
+                    GithubAppServiceError::Other(format!(
+                        "Failed to get connections for provider {}: {}",
+                        provider.id, e
+                    ))
+                })?;
+            all_connections.extend(connections);
+        }
+
+        let mut deactivated_count = 0;
+
+        for connection in all_connections {
+            // Skip non-GitHub or already inactive connections
+            if !connection.is_active {
+                continue;
+            }
+
+            // Parse installation_id from installation_id field
+            let installation_id = match &connection.installation_id {
+                Some(id_str) => match id_str.parse::<i32>() {
+                    Ok(id) => id,
+                    Err(_) => {
+                        warn!(
+                            "Invalid installation_id format for connection {}: {}",
+                            connection.id, id_str
+                        );
+                        continue;
+                    }
+                },
+                None => {
+                    // Skip connections without installation_id (OAuth connections)
+                    continue;
+                }
+            };
+
+            // Verify if the installation still exists
+            match self.verify_installation(installation_id).await {
+                Ok(is_active) => {
+                    if !is_active {
+                        info!(
+                            "Installation {} is no longer active, marking as disabled",
+                            installation_id
+                        );
+
+                        // Deactivate the installation
+                        if let Err(e) = self.delete_installation(installation_id).await {
+                            error!(
+                                "Failed to deactivate installation {}: {}",
+                                installation_id, e
+                            );
+                        } else {
+                            deactivated_count += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Log the error but continue checking other installations
+                    warn!("Failed to verify installation {}: {}", installation_id, e);
+                }
+            }
+        }
+
+        info!(
+            "Finished checking installations, deactivated {} installations",
+            deactivated_count
+        );
+        Ok(deactivated_count)
+    }
+
+    /// Create a GitHubSource for framework detection and file access
+    ///
+    /// # Arguments
+    /// * `provider_id` - GitHub App provider ID
+    /// * `owner` - Repository owner (username or organization)
+    /// * `repo` - Repository name
+    /// * `reference` - Branch name, tag, or commit SHA
+    /// Find which GitHub App provider owns a given installation
+    /// Returns Ok(Some(provider_id)) if found, Ok(None) if not found
+    pub async fn find_provider_for_installation(
+        &self,
+        installation_id_p: i32,
+    ) -> Result<Option<i32>, GithubAppServiceError> {
+        info!(
+            "Finding GitHub App provider for installation {}",
+            installation_id_p
+        );
+
+        let providers = self
+            .git_provider_manager
+            .get_github_app_providers()
+            .await
+            .map_err(|e| {
+                GithubAppServiceError::Other(format!("Failed to get GitHub App providers: {}", e))
+            })?;
+
+        if providers.is_empty() {
+            debug!("No GitHub App providers configured");
+            return Ok(None);
+        }
+
+        // Try each GitHub App to see which one owns this installation
+        for provider in providers {
+            match self.extract_github_app_data(&provider).await {
+                Ok(app_data) => {
+                    debug!(
+                        "Trying GitHub App {} (app_id: {}) for installation {}",
+                        app_data.name, app_data.app_id, installation_id_p
+                    );
+
+                    // Get client for this app
+                    match self.get_github_app_client_by_app_id(app_data.app_id).await {
+                        Ok((octocrab, _)) => {
+                            // Try to fetch the installation with this app's credentials
+                            match octocrab
+                                .apps()
+                                .installation(InstallationId(installation_id_p as u64))
+                                .await
+                            {
+                                Ok(installation) => {
+                                    // Check if this installation belongs to this app
+                                    if let Some(installation_app_id) = installation.app_id {
+                                        if app_data.app_id == installation_app_id.0 as i32 {
+                                            info!(
+                                                "Found: Installation {} belongs to GitHub App {} (provider_id: {})",
+                                                installation_id_p, app_data.name, provider.id
+                                            );
+                                            return Ok(Some(provider.id));
+                                        } else {
+                                            debug!(
+                                                "Installation {} app_id {} doesn't match provider app_id {}",
+                                                installation_id_p, installation_app_id.0, app_data.app_id
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        "Installation {} not accessible with app {}: {}",
+                                        installation_id_p, app_data.name, e
+                                    );
+                                    // This app doesn't own the installation, try next
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!(
+                                "Failed to get client for app {} (app_id: {}): {}",
+                                app_data.name, app_data.app_id, e
+                            );
+                            // Skip this provider, try next
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to extract app data for provider {}: {}",
+                        provider.id, e
+                    );
+                    // Skip this provider, try next
+                }
+            }
+        }
+
+        info!(
+            "No GitHub App provider found for installation {}",
+            installation_id_p
+        );
+        Ok(None)
+    }
+
+    pub async fn create_source(
+        &self,
+        provider_id: i32,
+        owner: String,
+        repo: String,
+        reference: String,
+    ) -> Result<crate::sources::GitHubSource, GithubAppServiceError> {
+        // Get provider and extract app data
+        let provider = self
+            .git_provider_manager
+            .get_provider(provider_id)
+            .await
+            .map_err(|e| GithubAppServiceError::Other(format!("Failed to get provider: {}", e)))?;
+
+        let app_data = self.extract_github_app_data(&provider).await?;
+
+        // Create Octocrab client using installation token
+        // We need a connection ID, which we don't have here
+        // Instead, create Octocrab client using the app's private key
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(app_data.private_key.as_bytes())
+            .map_err(|e| {
+                GithubAppServiceError::PrivateKeyCreationFailed(format!(
+                    "Failed to create encoding key: {}",
+                    e
+                ))
+            })?;
+
+        let octocrab = Octocrab::builder()
+            .app(AppId::from(app_data.app_id as u64), key)
+            .build()
+            .map_err(|e| {
+                GithubAppServiceError::GithubApiError(format!(
+                    "Failed to create Octocrab client: {}",
+                    e
+                ))
+            })?;
+
+        Ok(crate::sources::GitHubSource::new(
+            Arc::new(octocrab),
+            owner,
+            repo,
+            reference,
+        ))
     }
 }
 
@@ -1324,6 +1837,7 @@ pub struct CommitInfo {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TokenResponse {
     access_token: String,
     expires_in: i64,

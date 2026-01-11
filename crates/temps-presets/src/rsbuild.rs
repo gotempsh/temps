@@ -1,9 +1,11 @@
-use std::path::PathBuf;
+use std::path::Path;
 
-use super::{PackageManager, Preset, ProjectType};
+use super::{DockerfileWithArgs, PackageManager, Preset, ProjectType};
+use async_trait::async_trait;
 
 pub struct Rsbuild;
 
+#[async_trait]
 impl Preset for Rsbuild {
     fn slug(&self) -> String {
         "rsbuild".to_string()
@@ -18,19 +20,11 @@ impl Preset for Rsbuild {
     }
 
     fn icon_url(&self) -> String {
-        "https://example.com/vite-icon.png".to_string()
+        "/presets/rsbuild.svg".to_string()
     }
 
-    fn dockerfile(
-        &self,
-        _root_local_path: &PathBuf, local_path: &PathBuf,
-        install_command: Option<&str>,
-        build_command: Option<&str>,
-        _output_dir: Option<&str>,
-        build_vars: Option<&Vec<String>>,
-        project_slug: &str,
-    ) -> String {
-        let pkg_manager = PackageManager::detect(local_path);
+    async fn dockerfile(&self, config: super::DockerfileConfig<'_>) -> DockerfileWithArgs {
+        let pkg_manager = PackageManager::detect(config.local_path);
 
         let lockfile = match pkg_manager {
             PackageManager::Bun => "COPY package.json bun.lock* ./",
@@ -48,18 +42,16 @@ WORKDIR /app
 # Copy package files
 {}
 
-# Install dependencies with caching
-RUN --mount=type=cache,target=/app/node_modules,id=node_modules_{} \
-    {}
+# Install dependencies
+RUN {}
 "#,
             pkg_manager.base_image(),
             lockfile,
-            project_slug,
-            install_command.unwrap_or(pkg_manager.install_command())
+            config.install_command.unwrap_or(pkg_manager.install_command())
         );
 
         // Add build variables if present
-        if let Some(vars) = build_vars {
+        if let Some(vars) = config.build_vars {
             for var in vars {
                 dockerfile.push_str(&format!("ARG {}\n", var));
             }
@@ -70,9 +62,8 @@ RUN --mount=type=cache,target=/app/node_modules,id=node_modules_{} \
 # Copy the rest of the application code
 COPY . .
 
-# Build the Rsbuild application with caching
-RUN --mount=type=cache,target=/app/node_modules,sharing=locked,id=node_modules_{} \
-    {}
+# Build the Rsbuild application
+RUN {}
 
 # Stage 2: Create the production image
 FROM {} AS runner
@@ -90,8 +81,7 @@ EXPOSE 3000
 
 CMD ["serve", "-s", "dist", "-l", "3000"]
 "#,
-            project_slug,
-            build_command.unwrap_or(pkg_manager.build_command()),
+            config.build_command.unwrap_or(pkg_manager.build_command()),
             pkg_manager.base_image(),
             match pkg_manager {
                 PackageManager::Bun => "bun install -g serve",
@@ -101,12 +91,11 @@ CMD ["serve", "-s", "dist", "-l", "3000"]
             }
         ));
 
-        dockerfile
+        DockerfileWithArgs::new(dockerfile)
     }
 
-    fn dockerfile_with_build_dir(&self, _local_path: &PathBuf) -> String {
-        format!(
-            r#"
+    async fn dockerfile_with_build_dir(&self, _local_path: &Path) -> DockerfileWithArgs {
+        let content = r#"
 # Use a lightweight base image
 FROM oven/bun:1.2-alpine
 
@@ -123,25 +112,29 @@ EXPOSE 3000
 
 # Use serve to host the static files
 CMD ["serve", "-s", "dist", "-l", "3000"]
-      
-"#,
-        )
+
+"#;
+        DockerfileWithArgs::new(content.to_string())
     }
 
-    fn install_command(&self, local_path: &PathBuf) -> String {
+    fn install_command(&self, local_path: &Path) -> String {
         PackageManager::detect(local_path)
             .install_command()
             .to_string()
     }
 
-    fn build_command(&self, local_path: &PathBuf) -> String {
+    fn build_command(&self, local_path: &Path) -> String {
         PackageManager::detect(local_path)
             .build_command()
             .to_string()
     }
 
     fn dirs_to_upload(&self) -> Vec<String> {
-        vec!["dist".to_string()]
+        vec!["/app/dist".to_string()]
+    }
+
+    fn static_output_dir(&self) -> Option<String> {
+        Some("/app/dist".to_string())
     }
 }
 

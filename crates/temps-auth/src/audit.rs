@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::Serialize;
-use temps_core::{AuditOperation, AuditContext};
+use temps_core::{AuditContext, AuditOperation};
 
 // Login audit
 #[derive(Debug, Clone, Serialize)]

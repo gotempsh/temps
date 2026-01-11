@@ -10,7 +10,7 @@ use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json,
 };
 use std::sync::Arc;
@@ -22,7 +22,8 @@ use tracing::{debug, error, info};
 use super::types::{
     CreateProjectRequest, PaginatedProjectList, PaginationParams, ProjectResponse,
     ProjectStatisticsResponse, TriggerPipelinePayload, TriggerPipelineResponse,
-    UpdateAutomaticDeployRequest, UpdateGitSettingsRequest, UpdateProjectSettingsRequest,
+    UpdateAutomaticDeployRequest, UpdateDeploymentConfigRequest, UpdateGitSettingsRequest,
+    UpdateProjectSettingsRequest,
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use temps_core::problemdetails;
@@ -40,6 +41,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/projects", post(create_project))
         .route("/projects", get(get_projects))
         .route("/projects/statistics", get(get_project_statistics))
+        // Presets route
+        .route("/presets", get(list_presets))
         // Pipeline trigger route
         .route(
             "/projects/{id}/trigger-pipeline",
@@ -53,6 +56,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/projects/{project_id}/automatic-deploy",
             post(update_automatic_deploy),
+        )
+        .route(
+            "/projects/{project_id}/deployment-config",
+            patch(update_project_deployment_config),
         )
         // Merge custom domain routes
         .merge(custom_domain_routes)
@@ -70,8 +77,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         update_project_settings,
         update_git_settings,
         update_automatic_deploy,
+        update_project_deployment_config,
         trigger_project_pipeline,
         get_project_statistics,
+        list_presets,
     ),
     components(
         schemas(
@@ -82,13 +91,17 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             UpdateProjectSettingsRequest,
             UpdateGitSettingsRequest,
             UpdateAutomaticDeployRequest,
+            UpdateDeploymentConfigRequest,
             TriggerPipelinePayload,
             TriggerPipelineResponse,
             ProjectStatisticsResponse,
+            super::types::PresetResponse,
+            super::types::ListPresetsResponse,
         )
     ),
     tags(
-        (name = "Projects", description = "Project management endpoints")
+        (name = "Projects", description = "Project management endpoints"),
+        (name = "Presets", description = "Available deployment presets")
     ),
     nest(
         (path = "/projects", api = super::custom_domains::CustomDomainsApiDoc)
@@ -135,21 +148,14 @@ pub async fn create_project(
         directory: project.directory,
         main_branch: project.main_branch,
         preset: project.preset,
-        output_dir: project.output_dir,
-        build_command: project.build_command,
-        install_command: project.install_command,
+        preset_config: project.preset_config,
         environment_variables: project.environment_variables,
         automatic_deploy: project.automatic_deploy.unwrap_or(false),
-        project_type: project.project_type,
-        is_web_app: project.is_web_app.unwrap_or(true),
-        performance_metrics_enabled: project.performance_metrics_enabled,
         storage_service_ids: project.storage_service_ids,
-        use_default_wildcard: project.use_default_wildcard,
-        custom_domain: project.custom_domain,
         is_public_repo: project.is_public_repo,
         git_url: project.git_url,
         git_provider_connection_id: project.git_provider_connection_id,
-        is_on_demand: Some(false),
+        exposed_port: project.exposed_port,
     };
 
     let new_project = state
@@ -329,21 +335,14 @@ pub async fn update_project(
         directory: project.directory.clone(),
         main_branch: project.main_branch.clone(),
         preset: project.preset.clone(),
-        output_dir: project.output_dir.clone(),
-        build_command: project.build_command.clone(),
-        install_command: project.install_command.clone(),
+        preset_config: project.preset_config.clone(),
         environment_variables: project.environment_variables.clone(),
-        automatic_deploy: project.automatic_deploy.clone().unwrap_or_else(|| false),
-        project_type: project.project_type.clone(),
-        is_web_app: project.is_web_app.clone().unwrap_or_else(|| true),
-        performance_metrics_enabled: project.performance_metrics_enabled.clone(),
+        automatic_deploy: project.automatic_deploy.unwrap_or(false),
         storage_service_ids: project.storage_service_ids.clone(),
-        use_default_wildcard: None,       // Keep existing setting
-        custom_domain: None,              // Keep existing setting
-        is_public_repo: None,             // Keep existing setting
-        git_url: None,                    // Keep existing setting
-        git_provider_connection_id: None, // Keep existing setting
-        is_on_demand: None,               // Keep existing setting
+        is_public_repo: None,               // Keep existing setting
+        git_url: None,                      // Keep existing setting
+        git_provider_connection_id: None,   // Keep existing setting
+        exposed_port: project.exposed_port, // Keep existing or update if provided
     };
     let updated_project = state
         .project_service
@@ -475,6 +474,8 @@ pub async fn update_project_settings(
             settings.repo_name.clone(),
             settings.preset.clone(),
             settings.directory.clone(),
+            settings.attack_mode,
+            settings.enable_preview_environments,
         )
         .await
         .map_err(Problem::from)?;
@@ -641,6 +642,108 @@ pub async fn update_git_settings(
     Ok(Json(ProjectResponse::map_from_project(updated_project)))
 }
 
+/// Update deployment configuration for a project
+#[utoipa::path(
+    patch,
+    path = "/projects/{project_id}/deployment-config",
+    tag = "Projects",
+    request_body = UpdateDeploymentConfigRequest,
+    responses(
+        (status = 200, description = "Deployment configuration updated successfully", body = ProjectResponse),
+        (status = 400, description = "Invalid deployment configuration"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Project not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("project_id" = i32, Path, description = "Project ID")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn update_project_deployment_config(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(config): Json<UpdateDeploymentConfigRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+
+    info!("Updating deployment config for project: {}", project_id);
+
+    let updated_project = state
+        .project_service
+        .update_project_deployment_config(project_id, config.clone())
+        .await
+        .map_err(|e| {
+            error!("Error updating deployment config: {:?}", e);
+            Problem::from(e)
+        })?;
+
+    // Create audit event
+    let audit_context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.to_string()),
+        user_agent: metadata.user_agent,
+    };
+
+    let mut updated_fields = std::collections::HashMap::new();
+    if config.cpu_request.is_some() {
+        updated_fields.insert("cpu_request".to_string(), "updated".to_string());
+    }
+    if config.cpu_limit.is_some() {
+        updated_fields.insert("cpu_limit".to_string(), "updated".to_string());
+    }
+    if config.memory_request.is_some() {
+        updated_fields.insert("memory_request".to_string(), "updated".to_string());
+    }
+    if config.memory_limit.is_some() {
+        updated_fields.insert("memory_limit".to_string(), "updated".to_string());
+    }
+    if config.exposed_port.is_some() {
+        updated_fields.insert("exposed_port".to_string(), "updated".to_string());
+    }
+    if config.automatic_deploy.is_some() {
+        updated_fields.insert("automatic_deploy".to_string(), "updated".to_string());
+    }
+    if config.performance_metrics_enabled.is_some() {
+        updated_fields.insert(
+            "performance_metrics_enabled".to_string(),
+            "updated".to_string(),
+        );
+    }
+    if config.session_recording_enabled.is_some() {
+        updated_fields.insert(
+            "session_recording_enabled".to_string(),
+            "updated".to_string(),
+        );
+    }
+    if config.replicas.is_some() {
+        updated_fields.insert("replicas".to_string(), "updated".to_string());
+    }
+    if config.security.is_some() {
+        updated_fields.insert("security".to_string(), "updated".to_string());
+    }
+
+    let audit_event = super::audit::DeploymentConfigUpdatedAudit {
+        context: audit_context,
+        project_id: updated_project.id,
+        project_name: updated_project.name.clone(),
+        project_slug: updated_project.slug.clone(),
+        updated_fields,
+    };
+
+    if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
+        error!("Failed to create audit log: {:?}", e);
+        // Continue with the operation even if audit logging fails
+    }
+
+    Ok(Json(ProjectResponse::map_from_project(updated_project)))
+}
+
 /// Trigger pipeline for a specific project
 #[utoipa::path(
     post,
@@ -671,8 +774,17 @@ pub async fn trigger_project_pipeline(
     // Get the project for audit logging
     let project = state.project_service.get_project(id).await?;
 
+    // Determine which environment to use: explicit payload or project's preview template environment
+    let environment_id = if let Some(env_id) = payload.environment_id {
+        env_id
+    } else {
+        return Err(temps_core::error_builder::bad_request()
+            .detail("No environment specified and project has no preview template environment configured")
+            .build());
+    };
+
     // Get the environment for audit logging
-    let environment = temps_entities::environments::Entity::find_by_id(payload.environment_id)
+    let environment = temps_entities::environments::Entity::find_by_id(environment_id)
         .filter(temps_entities::environments::Column::ProjectId.eq(id))
         .one(state.project_service.db.as_ref())
         .await
@@ -713,11 +825,11 @@ pub async fn trigger_project_pipeline(
     }
 
     // Trigger the pipeline
-    let (project_id, environment_id, branch, tag, commit) = state
+    let (project_id, triggered_env_id, branch, tag, commit) = state
         .project_service
         .trigger_pipeline(
             id,
-            payload.environment_id,
+            environment_id,
             payload.branch,
             payload.tag,
             payload.commit,
@@ -731,7 +843,7 @@ pub async fn trigger_project_pipeline(
     let response = super::types::TriggerPipelineResponse {
         message: "Pipeline triggered successfully".to_string(),
         project_id,
-        environment_id,
+        environment_id: triggered_env_id,
         branch,
         tag,
         commit,
@@ -769,6 +881,52 @@ pub async fn get_project_statistics(
     let response = ProjectStatisticsResponse {
         total_count: statistics.total_count,
     };
+
+    Ok(Json(response))
+}
+
+/// List all available presets
+#[utoipa::path(
+    get,
+    path = "/presets",
+    tag = "Presets",
+    responses(
+        (status = 200, description = "List of available presets", body = super::types::ListPresetsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_presets(RequireAuth(_auth): RequireAuth) -> Result<impl IntoResponse, Problem> {
+    // No permission check needed - all authenticated users can list presets
+
+    // Get all presets from temps-presets crate
+    let presets: Vec<super::types::PresetResponse> = temps_presets::all_presets()
+        .into_iter()
+        .map(|preset| {
+            let slug = preset.slug();
+            let label = preset.label();
+            let description = preset.description();
+            let project_type = preset.project_type().to_string();
+            let default_port = Some(preset.default_port());
+
+            // Generate relative icon URL
+            let icon_url = format!("/presets/{}.svg", slug);
+
+            super::types::PresetResponse {
+                slug,
+                label,
+                icon_url,
+                project_type,
+                description,
+                default_port,
+            }
+        })
+        .collect();
+
+    let total = presets.len();
+
+    let response = super::types::ListPresetsResponse { presets, total };
 
     Ok(Json(response))
 }

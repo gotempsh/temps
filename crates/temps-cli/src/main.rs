@@ -6,18 +6,30 @@
 mod commands;
 
 use clap::{Parser, Subcommand};
+use commands::{
+    BackupCommand, ProxyCommand, ResetPasswordCommand, ServeCommand, ServicesCommand, SetupCommand,
+};
 use tracing_subscriber::{layer::SubscriberExt, Layer};
-use commands::{ServeCommand, ProxyCommand, ResetPasswordCommand};
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version = env!("TEMPS_VERSION"),
+    about,
+    long_about = None
+)]
 struct Cli {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info", env = "TEMPS_LOG_LEVEL", global = true)]
     log_level: String,
 
     /// Log format: compact, full
-    #[arg(long, default_value = "compact", env = "TEMPS_LOG_FORMAT", global = true)]
+    #[arg(
+        long,
+        default_value = "compact",
+        env = "TEMPS_LOG_FORMAT",
+        global = true
+    )]
     log_format: String,
 
     #[command(subcommand)]
@@ -30,8 +42,15 @@ enum Commands {
     Serve(ServeCommand),
     /// Start only the proxy server
     Proxy(ProxyCommand),
+    /// Initial setup: create admin user, configure DNS/Git providers, and domain
+    #[command(alias = "init")]
+    Setup(SetupCommand),
     /// Reset admin user password
     ResetAdminPassword(ResetPasswordCommand),
+    /// Backup management commands
+    Backup(BackupCommand),
+    /// Manage platform services (KV, Blob)
+    Services(ServicesCommand),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -49,7 +68,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         // Use our default filter with all temps crates at the specified level
         // and noisy dependencies at warn level
-        tracing_subscriber::EnvFilter::new(&format!(
+        tracing_subscriber::EnvFilter::new(format!(
             "temps_cli={level},\
              temps_deployments={level},\
              temps_deployer={level},\
@@ -84,9 +103,11 @@ fn main() -> anyhow::Result<()> {
              temps_analytics_session_replay={level},\
              temps_analytics_events={level},\
              temps_analytics_funnels={level},\
+             temps_webhooks={level},\
              pingora=warn,\
              sqlx=warn,\
              sea_orm=warn,\
+             sea_orm_migration=warn,\
              h2=warn,\
              tower=warn,\
              hyper=warn,\
@@ -112,9 +133,7 @@ fn main() -> anyhow::Result<()> {
             .boxed(),
     };
 
-    let subscriber = tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt_layer);
+    let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
     tracing::subscriber::set_global_default(subscriber)
         .expect("Failed to set global default subscriber");
 
@@ -122,7 +141,9 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Serve(serve_cmd) => serve_cmd.execute(),
         Commands::Proxy(proxy_cmd) => proxy_cmd.execute(),
+        Commands::Setup(setup_cmd) => setup_cmd.execute(),
         Commands::ResetAdminPassword(reset_cmd) => reset_cmd.execute(),
+        Commands::Backup(backup_cmd) => backup_cmd.execute(),
+        Commands::Services(services_cmd) => services_cmd.execute(),
     }
 }
-

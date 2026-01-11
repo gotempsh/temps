@@ -51,7 +51,9 @@ pub fn merge_openapi_schemas(mut base: OpenApi, schemas: Vec<OpenApi>) -> OpenAp
             base_components.responses.extend(components.responses);
 
             // Merge security schemes
-            base_components.security_schemes.extend(components.security_schemes);
+            base_components
+                .security_schemes
+                .extend(components.security_schemes);
         }
 
         // Merge tags
@@ -85,17 +87,18 @@ pub fn merge_openapi_schemas(mut base: OpenApi, schemas: Vec<OpenApi>) -> OpenAp
 mod tests {
     use super::*;
     use utoipa::openapi::{
-        OpenApiBuilder, PathItem, PathsBuilder, InfoBuilder,
-        HttpMethod, path::OperationBuilder
+        path::OperationBuilder, HttpMethod, InfoBuilder, OpenApiBuilder, PathItem, PathsBuilder,
     };
 
     #[test]
     fn test_merge_empty_schemas() {
         let base = OpenApiBuilder::new()
-            .info(InfoBuilder::new()
-                .title("Test API")
-                .version("1.0.0")
-                .build())
+            .info(
+                InfoBuilder::new()
+                    .title("Test API")
+                    .version("1.0.0")
+                    .build(),
+            )
             .paths(PathsBuilder::new().build())
             .build();
 
@@ -114,23 +117,37 @@ mod tests {
             .build();
 
         let base = OpenApiBuilder::new()
-            .info(InfoBuilder::new()
-                .title("Test API")
-                .version("1.0.0")
-                .build())
-            .paths(PathsBuilder::new()
-                .path("/api/v1/test", PathItem::new(HttpMethod::Get, test_operation))
-                .build())
+            .info(
+                InfoBuilder::new()
+                    .title("Test API")
+                    .version("1.0.0")
+                    .build(),
+            )
+            .paths(
+                PathsBuilder::new()
+                    .path(
+                        "/api/v1/test",
+                        PathItem::new(HttpMethod::Get, test_operation),
+                    )
+                    .build(),
+            )
             .build();
 
         let other = OpenApiBuilder::new()
-            .info(InfoBuilder::new()
-                .title("Other API")
-                .version("1.0.0")
-                .build())
-            .paths(PathsBuilder::new()
-                .path("/api/v1/other", PathItem::new(HttpMethod::Get, other_operation))
-                .build())
+            .info(
+                InfoBuilder::new()
+                    .title("Other API")
+                    .version("1.0.0")
+                    .build(),
+            )
+            .paths(
+                PathsBuilder::new()
+                    .path(
+                        "/api/v1/other",
+                        PathItem::new(HttpMethod::Get, other_operation),
+                    )
+                    .build(),
+            )
             .build();
 
         let result = merge_openapi_schemas(base, vec![other]);

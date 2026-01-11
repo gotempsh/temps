@@ -19,4 +19,5 @@ pub struct EnvVarWithEnvironments {
     pub created_at: UtcDateTime,
     pub updated_at: UtcDateTime,
     pub environments: Vec<EnvVarEnvironment>,
+    pub include_in_preview: bool,
 }

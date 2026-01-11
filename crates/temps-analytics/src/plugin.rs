@@ -13,11 +13,11 @@ use std::sync::Arc;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use temps_core::EncryptionService;
+use temps_core::CookieCrypto;
 use utoipa::{openapi::OpenApi, OpenApi as OpenApiTrait};
 
-use crate::{AnalyticsService, Analytics};
-use crate::handler::{AppState, AnalyticsApiDoc, configure_routes};
+use crate::handler::{configure_routes, AnalyticsApiDoc, AppState};
+use crate::{Analytics, AnalyticsService};
 
 /// Analytics Plugin for web analytics and visitor tracking
 pub struct AnalyticsPlugin;
@@ -46,9 +46,10 @@ impl TempsPlugin for AnalyticsPlugin {
         Box::pin(async move {
             // Get required dependencies from the service registry
             let db = context.require_service::<sea_orm::DatabaseConnection>();
-            let encryption_service = context.require_service::<EncryptionService>();
+            let cookie_crypto = context.require_service::<CookieCrypto>();
             // Create AnalyticsService
-            let analytics_service = Arc::new(AnalyticsService::new(db.clone(), encryption_service.clone()));
+            let analytics_service =
+                Arc::new(AnalyticsService::new(db.clone(), cookie_crypto.clone()));
 
             // Register the service with both the concrete type and trait
             context.register_service(analytics_service.clone());
@@ -65,16 +66,12 @@ impl TempsPlugin for AnalyticsPlugin {
         let analytics_service = context.require_service::<dyn Analytics>();
 
         // Create AppState
-        let app_state = Arc::new(AppState {
-            analytics_service,
-        });
+        let app_state = Arc::new(AppState { analytics_service });
 
         // Configure routes with the state
         let routes = configure_routes().with_state(app_state);
 
-        Some(PluginRoutes {
-            router: routes,
-        })
+        Some(PluginRoutes { router: routes })
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
@@ -94,7 +91,7 @@ mod tests {
 
     #[test]
     fn test_analytics_plugin_default() {
-        let analytics_plugin = AnalyticsPlugin::default();
+        let analytics_plugin = AnalyticsPlugin;
         assert_eq!(analytics_plugin.name(), "analytics");
     }
 }

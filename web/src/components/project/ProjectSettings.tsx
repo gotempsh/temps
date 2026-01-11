@@ -4,10 +4,14 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 import { CronJobDetail } from './settings/CronJobDetail'
 import { CronJobsSettings } from './settings/CronJobsSettings'
 import { DomainsSettings } from './settings/DomainsSettings'
-import { EnvironmentsSettings } from './settings/EnvironmentsSettings'
 import { EnvironmentVariablesSettings } from './settings/EnvironmentVariablesSettings'
 import { GeneralSettings } from './settings/GeneralSettings'
 import { GitSettings } from './settings/GitSettings'
+import { ProjectSecuritySettings } from './settings/ProjectSecuritySettings'
+import { WebhooksSettings } from './settings/WebhooksSettings'
+import { CreateWebhookPage } from './settings/webhooks/CreateWebhookPage'
+import { EditWebhookPage } from './settings/webhooks/EditWebhookPage'
+import { WebhookDetail } from './settings/webhooks/WebhookDetail'
 
 interface ProjectSettingsProps {
   project: ProjectResponse
@@ -25,16 +29,18 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
         />
         <Route path="domains" element={<DomainsSettings project={project} />} />
         <Route
-          path="environments/*"
-          element={<EnvironmentsSettings project={project} />}
-        />
-        <Route
           path="environment-variables"
           element={<EnvironmentVariablesSettings project={project} />}
         />
         <Route
           path="git"
           element={<GitSettings project={project} refetch={refetch} />}
+        />
+        <Route
+          path="security"
+          element={
+            <ProjectSecuritySettings project={project} refetch={refetch} />
+          }
         />
         <Route path="cron-jobs">
           <Route index element={<CronJobsSettings project={project} />} />
@@ -43,6 +49,18 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
             element={<CronJobDetail project={project} />}
           />
         </Route>
+        <Route path="webhooks">
+          <Route index element={<WebhooksSettings project={project} />} />
+          <Route path="new" element={<CreateWebhookPage project={project} />} />
+          <Route
+            path=":webhookId/edit"
+            element={<EditWebhookPage project={project} />}
+          />
+        </Route>
+        <Route
+          path="webhooks/:webhookId"
+          element={<WebhookDetail project={project} />}
+        />
         <Route path="*" element={<Navigate to="general" replace />} />
       </Routes>
     </Card>

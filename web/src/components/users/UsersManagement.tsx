@@ -21,6 +21,7 @@ import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { KbdBadge } from '@/components/ui/kbd-badge'
 import {
   Dialog,
   DialogContent,
@@ -46,7 +47,6 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import {
   Select,
   SelectContent,
@@ -54,7 +54,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Switch } from '@/components/ui/switch'
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import { Label } from '@/components/ui/label'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -126,26 +127,9 @@ export function UsersManagement({
     meta: {
       errorTitle: 'Failed to create user',
     },
-    onSuccess: async (data) => {
-      // After creating the user, assign the selected role
-      if (form.getValues('role') !== 'user') {
-        // If admin role selected, we need to assign it
-        // Note: This assumes the API allows role assignment after registration
-        try {
-          await assignRole.mutateAsync({
-            path: {
-              user_id: data.user.id,
-            },
-            body: {
-              role_type: form.getValues('role'),
-              user_id: data.user.id,
-            },
-          })
-        } catch (error) {
-          console.error('Failed to assign role:', error)
-        }
-      }
-
+    onSuccess: async () => {
+      // Roles are already assigned in the body during creation
+      // No need to assign them again here - that would create duplicates
       toast.success('User created successfully')
       setIsCreateDialogOpen(false)
       form.reset()
@@ -170,7 +154,25 @@ export function UsersManagement({
     meta: {
       errorTitle: 'Failed to assign role',
     },
-    onSuccess: () => {
+    onSuccess: (_, variables) => {
+      toast.success('Role updated successfully')
+      // Update local state to reflect the change
+      if (userToManageRoles) {
+        setUserToManageRoles((prev) => {
+          if (!prev) return null
+          return {
+            ...prev,
+            roles: [
+              {
+                id: Date.now(),
+                created_at: Date.now(),
+                updated_at: Date.now(),
+                name: variables.body.role_type,
+              },
+            ],
+          }
+        })
+      }
       queryClient.invalidateQueries({ queryKey: ['listUsers'] })
       reloadUsers()
     },
@@ -181,7 +183,19 @@ export function UsersManagement({
     meta: {
       errorTitle: 'Failed to remove role',
     },
-    onSuccess: () => {
+    onSuccess: (_, variables) => {
+      // Update local state to reflect the change
+      if (userToManageRoles) {
+        setUserToManageRoles((prev) => {
+          if (!prev) return null
+          return {
+            ...prev,
+            roles: prev.roles.filter(
+              (r) => r.name !== variables.path.role_type
+            ),
+          }
+        })
+      }
       queryClient.invalidateQueries({ queryKey: ['listUsers'] })
       reloadUsers()
     },
@@ -193,7 +207,7 @@ export function UsersManagement({
         username: data.name,
         email: data.email,
         roles: [data.role],
-        // password: data.password,
+        password: data.password,
       },
     })
   }
@@ -209,16 +223,25 @@ export function UsersManagement({
   const handleRoleChange = async (
     userId: number,
     roleType: string,
-    hasRole: boolean
+    currentRoles: string[]
   ) => {
-    if (hasRole) {
-      await removeRole.mutateAsync({
-        path: {
-          user_id: userId,
-          role_type: roleType,
-        },
-      })
-    } else {
+    // Remove all existing roles first (since only one role can be active)
+    for (const existingRole of currentRoles) {
+      if (existingRole !== roleType) {
+        await removeRole.mutateAsync({
+          path: {
+            user_id: userId,
+            role_type: existingRole,
+          },
+        })
+      }
+    }
+
+    // Check if the user already has this role
+    const hasRole = currentRoles.includes(roleType)
+
+    if (!hasRole) {
+      // Assign the new role
       await assignRole.mutateAsync({
         path: {
           user_id: userId,
@@ -230,22 +253,8 @@ export function UsersManagement({
       })
     }
 
-    if (userToManageRoles) {
-      setUserToManageRoles(
-        (prevUser: RouteUserWithRoles | null): RouteUserWithRoles | null => {
-          if (!prevUser) return null
-          return {
-            ...prevUser,
-            roles: hasRole
-              ? prevUser.roles
-              : [
-                  ...prevUser.roles,
-                  { id: 0, created_at: 0, updated_at: 0, name: roleType },
-                ],
-          }
-        }
-      )
-    }
+    // Keep the dialog open - don't close it
+    // The user list will be refreshed automatically via onSuccess callbacks
   }
 
   return (
@@ -262,6 +271,7 @@ export function UsersManagement({
             <Button>
               <UserPlus className="mr-2 h-4 w-4" />
               Add User
+              <KbdBadge keys={['N']} className="ml-2" />
             </Button>
           </DialogTrigger>
           <DialogContent className="sm:max-w-[425px]">
@@ -349,8 +359,9 @@ export function UsersManagement({
                           <SelectTrigger>
                             <SelectValue placeholder="Select a role">
                               {field.value &&
-                                availableRoles.find((r) => r.value === field.value)
-                                  ?.label}
+                                availableRoles.find(
+                                  (r) => r.value === field.value
+                                )?.label}
                             </SelectValue>
                           </SelectTrigger>
                         </FormControl>
@@ -413,54 +424,90 @@ export function UsersManagement({
       >
         <DialogContent className="sm:max-w-[425px]">
           <DialogHeader>
-            <DialogTitle>Manage User Roles</DialogTitle>
+            <DialogTitle>Manage User Role</DialogTitle>
             <p className="text-sm text-muted-foreground">
-              Update roles for{' '}
+              Select a role for{' '}
               {userToManageRoles?.user.name || userToManageRoles?.user.username}
+              . Only one role can be active at a time.
             </p>
           </DialogHeader>
           <div className="py-4">
-            <ScrollArea className="h-[300px] pr-4">
-              <div className="space-y-4">
+            {userToManageRoles && (
+              <RadioGroup
+                value={
+                  Array.from(
+                    new Map(
+                      userToManageRoles.roles.map((r) => [r.name, r])
+                    ).values()
+                  )[0]?.name || 'user'
+                }
+                onValueChange={(value) => {
+                  const currentRoles = Array.from(
+                    new Map(
+                      userToManageRoles.roles.map((r) => [r.name, r])
+                    ).values()
+                  ).map((r) => r.name)
+                  handleRoleChange(
+                    userToManageRoles.user.id,
+                    value,
+                    currentRoles
+                  )
+                }}
+                disabled={assignRole.isPending || removeRole.isPending}
+                className="space-y-3"
+              >
                 {availableRoles.map((role) => {
-                  const hasRole = userToManageRoles?.roles.some(
+                  const uniqueRoles = Array.from(
+                    new Map(
+                      userToManageRoles.roles.map((r) => [r.name, r])
+                    ).values()
+                  )
+                  const isActive = uniqueRoles.some(
                     (r) => r.name === role.value
                   )
                   return (
                     <div
                       key={role.value}
-                      className="flex items-center justify-between"
+                      className="flex items-start space-x-3 p-3 rounded-lg border bg-card hover:bg-accent/50 transition-colors cursor-pointer"
                     >
-                      <div className="space-y-0.5">
-                        <div className="text-sm font-medium">{role.label}</div>
+                      <RadioGroupItem
+                        value={role.value}
+                        id={role.value}
+                        className="mt-1"
+                      />
+                      <Label
+                        htmlFor={role.value}
+                        className="flex-1 cursor-pointer space-y-1"
+                      >
+                        <div className="flex items-center gap-2">
+                          <div className="text-sm font-medium">
+                            {role.label}
+                          </div>
+                          {isActive && (
+                            <Badge variant="secondary" className="text-xs">
+                              Active
+                            </Badge>
+                          )}
+                        </div>
                         <div className="text-sm text-muted-foreground">
                           {role.description}
                         </div>
-                      </div>
-                      <Switch
-                        checked={hasRole}
-                        disabled={assignRole.isPending || removeRole.isPending}
-                        onCheckedChange={(checked) =>
-                          userToManageRoles &&
-                          handleRoleChange(
-                            userToManageRoles.user.id,
-                            role.value,
-                            !checked
-                          )
-                        }
-                      />
+                      </Label>
                     </div>
                   )
                 })}
-              </div>
-            </ScrollArea>
+              </RadioGroup>
+            )}
           </div>
           <DialogFooter>
             <Button
               variant="secondary"
               onClick={() => setUserToManageRoles(null)}
+              disabled={assignRole.isPending || removeRole.isPending}
             >
-              Done
+              {assignRole.isPending || removeRole.isPending
+                ? 'Updating...'
+                : 'Close'}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -522,7 +569,12 @@ export function UsersManagement({
                           {user.user.name || user.user.username}
                         </h3>
                         <div className="flex flex-wrap gap-1">
-                          {user.roles.map((role) => (
+                          {/* Deduplicate roles by name to prevent showing duplicates */}
+                          {Array.from(
+                            new Map(
+                              user.roles.map((role) => [role.name, role])
+                            ).values()
+                          ).map((role) => (
                             <Badge
                               key={role.id}
                               variant="secondary"

@@ -24,17 +24,14 @@ use octocrab::params::apps::CreateInstallationAccessToken;
 use octocrab::Octocrab;
 use reqwest::Url;
 
-#[derive(Debug, Clone)]
-struct PresetInfo {
-    slug: String,
-    label: String,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProjectPresetDomain {
     pub path: String,
     pub preset: String,
     pub preset_label: String,
+    pub exposed_port: Option<u16>,
+    pub icon_url: Option<String>,
+    pub project_type: String,
 }
 
 #[derive(Debug, Clone)]
@@ -42,8 +39,7 @@ pub struct RepositoryPresetDomain {
     pub repository_id: i32,
     pub owner: String,
     pub name: String,
-    pub root_preset: Option<String>,
-    pub projects: Vec<ProjectPresetDomain>,
+    pub presets: Vec<ProjectPresetDomain>,
     pub calculated_at: UtcDateTime,
 }
 
@@ -547,6 +543,7 @@ impl GitProviderManager {
     }
 
     /// Create a new git provider configuration
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_provider(
         &self,
         name: String,
@@ -634,6 +631,7 @@ impl GitProviderManager {
     }
 
     /// Create a connection to a git provider for a user
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_connection(
         &self,
         provider_id: i32,
@@ -983,9 +981,9 @@ impl GitProviderManager {
         let repository = repositories::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?;
-        Ok(repository.ok_or_else(|| {
+        repository.ok_or_else(|| {
             GitProviderManagerError::RepositoryNotFound(format!("Repository {} not found", id))
-        })?)
+        })
     }
     pub async fn get_repository_by_owner_and_name_in_connection(
         &self,
@@ -1000,12 +998,12 @@ impl GitProviderManager {
             .one(self.db.as_ref())
             .await?;
 
-        Ok(repository.ok_or_else(|| {
+        repository.ok_or_else(|| {
             GitProviderManagerError::RepositoryNotFound(format!(
                 "Repository {}/{} not found in connection {}",
                 owner, name, connection_id
             ))
-        })?)
+        })
     }
 
     /// Get a specific connection
@@ -1259,7 +1257,7 @@ impl GitProviderManager {
                             .queue_service
                             .send(temps_core::Job::CalculateRepositoryPreset(
                                 temps_core::CalculateRepositoryPresetJob {
-                                    repository_id: repository.id.clone(),
+                                    repository_id: repository.id,
                                 },
                             ))
                             .await
@@ -1492,7 +1490,7 @@ impl GitProviderManager {
             } else {
                 // New repository - prepare for bulk insert
                 let new_repo = repositories::ActiveModel {
-                    git_provider_connection_id: Set(Some(connection_id)),
+                    git_provider_connection_id: Set(connection_id),
                     owner: Set(repo.owner.clone()),
                     name: Set(repo.name.clone()),
                     full_name: Set(repo.full_name.clone()),
@@ -1570,9 +1568,10 @@ impl GitProviderManager {
     pub async fn calculate_and_store_preset(
         &self,
         repo_id: i32,
-        connection_id: i32,
+        _connection_id: i32,
     ) -> Result<(), GitProviderManagerError> {
-        let repo = repositories::Entity::find_by_id(repo_id)
+        // Verify repository exists
+        let _ = repositories::Entity::find_by_id(repo_id)
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| {
@@ -1582,34 +1581,12 @@ impl GitProviderManager {
                 ))
             })?;
 
-        let connection = self.get_connection(connection_id).await?;
-        let provider_service = self.get_provider_service(connection.provider_id).await?;
-
-        // Decrypt access token
-        let access_token = if let Some(ref encrypted) = connection.access_token {
-            self.decrypt_string(encrypted).await?
-        } else {
-            return Err(GitProviderManagerError::InvalidConfiguration(
-                "No access token found".to_string(),
-            ));
-        };
-
-        // Calculate preset
-        let preset = self
-            .calculate_repository_preset(
-                &provider_service,
-                &access_token,
-                &repo.owner,
-                &repo.name,
-                &repo.default_branch,
+        // Calculate preset (this will automatically cache it in the database)
+        let _ = self
+            .calculate_repository_preset_live(
+                repo_id, None, // Use default branch
             )
-            .await;
-
-        // Update repository with preset
-        let mut active_model: repositories::ActiveModel = repo.into();
-        active_model.preset = Set(preset);
-        active_model.framework_last_updated_at = Set(Some(chrono::Utc::now()));
-        active_model.update(self.db.as_ref()).await?;
+            .await?;
 
         Ok(())
     }
@@ -2079,7 +2056,7 @@ impl GitProviderManager {
                             .full_name
                             .to_lowercase()
                             .contains(&search_term.to_lowercase())
-                        || repo.description.as_ref().map_or(false, |desc| {
+                        || repo.description.as_ref().is_some_and(|desc| {
                             desc.to_lowercase().contains(&search_term.to_lowercase())
                         })
                 })
@@ -2163,37 +2140,6 @@ impl GitProviderManager {
         // For now, just return the data as-is
         // In production, decrypt sensitive fields
         Ok(data.clone())
-    }
-
-    /// Calculate the preset for a repository by analyzing its files
-    async fn calculate_repository_preset(
-        &self,
-        provider_service: &Arc<dyn GitProviderService>,
-        access_token: &str,
-        owner: &str,
-        repo: &str,
-        branch: &str,
-    ) -> Option<String> {
-        use temps_presets::detect_preset_from_files;
-
-        // Try to get the repository tree to detect project type
-        match self
-            .get_repository_files(provider_service, access_token, owner, repo, branch)
-            .await
-        {
-            Ok(files) => {
-                // Use the preset detection logic
-                if let Some(preset) = detect_preset_from_files(&files) {
-                    Some(preset.slug())
-                } else {
-                    None
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to detect preset for {}/{}: {}", owner, repo, e);
-                None
-            }
-        }
     }
 
     /// Get repository files for preset detection
@@ -2325,13 +2271,16 @@ impl GitProviderManager {
         }
     }
 
-    /// Get repository preset from database
+    /// Get repository preset from database by branch
+    /// If branch is not specified, uses the repository's default branch
     pub async fn get_repository_preset(
         &self,
         connection_id: i32,
         owner: &str,
         repo: &str,
-    ) -> Result<Option<String>, GitProviderManagerError> {
+        branch: Option<String>,
+    ) -> Result<Option<serde_json::Value>, GitProviderManagerError> {
+        // Find repository
         let repository = repositories::Entity::find()
             .filter(repositories::Column::GitProviderConnectionId.eq(connection_id))
             .filter(repositories::Column::Owner.eq(owner))
@@ -2339,7 +2288,26 @@ impl GitProviderManager {
             .one(self.db.as_ref())
             .await?;
 
-        Ok(repository.and_then(|r| r.preset))
+        let repository = match repository {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        // Use provided branch or fall back to default branch
+        let target_branch = branch.unwrap_or_else(|| repository.default_branch.clone());
+
+        // Get preset cache and extract data for the specific branch
+        let preset_data = repository.preset.as_ref().and_then(|json_cache| {
+            // Deserialize Json to RepositoryPresetCache
+            let cache: repositories::RepositoryPresetCache =
+                serde_json::from_value(json_cache.clone()).ok()?;
+            cache
+                .branches
+                .get(&target_branch)
+                .map(|branch_data| json!(branch_data))
+        });
+
+        Ok(preset_data)
     }
 
     /// Calculate repository preset in real-time without storing it
@@ -2359,12 +2327,8 @@ impl GitProviderManager {
                 ))
             })?;
 
-        // Check if repository has a git provider connection
-        let connection_id = repository.git_provider_connection_id.ok_or_else(|| {
-            GitProviderManagerError::InvalidConfiguration(
-                "Repository is not associated with a git provider connection".to_string(),
-            )
-        })?;
+        // Repository always has a git provider connection (required field)
+        let connection_id = repository.git_provider_connection_id;
 
         // Get the git provider connection
         let connection = self.get_connection(connection_id).await?;
@@ -2394,139 +2358,101 @@ impl GitProviderManager {
             .await?;
 
         // Detect presets in root and subdirectories
-        let (root_preset, projects) = self.detect_presets_in_directories(&files).await;
+        let presets = self.detect_presets_in_directories(&files).await;
+
+        // Cache presets in repositories.preset as HashMap<branch, preset_data>
+        let calculated_at = chrono::Utc::now();
+
+        // Get existing preset cache or create new one
+        let mut preset_cache: repositories::RepositoryPresetCache = repository
+            .preset
+            .as_ref()
+            .and_then(|json| serde_json::from_value(json.clone()).ok())
+            .unwrap_or_else(|| repositories::RepositoryPresetCache {
+                branches: std::collections::HashMap::new(),
+            });
+
+        // Convert ProjectPresetDomain to PresetInfo
+        let preset_infos: Vec<repositories::PresetInfo> = presets
+            .iter()
+            .map(|p| repositories::PresetInfo {
+                path: p.path.clone(),
+                preset: p.preset.clone(),
+                preset_label: p.preset_label.clone(),
+                exposed_port: p.exposed_port,
+                icon_url: p.icon_url.clone(),
+                project_type: p.project_type.clone(),
+            })
+            .collect();
+
+        // Update cache for this branch
+        preset_cache.branches.insert(
+            target_branch.clone(),
+            repositories::BranchPresetData {
+                presets: preset_infos,
+                calculated_at,
+            },
+        );
+
+        // Serialize cache to Json for database storage
+        let preset_json = serde_json::to_value(&preset_cache).map_err(|e| {
+            GitProviderManagerError::InvalidConfiguration(format!(
+                "Failed to serialize preset cache: {}",
+                e
+            ))
+        })?;
+
+        // Update repository with new cache
+        let mut repo_update: repositories::ActiveModel = repository.clone().into();
+        repo_update.preset = Set(Some(preset_json));
+        repo_update.update(self.db.as_ref()).await?;
 
         Ok(RepositoryPresetDomain {
             repository_id,
             owner: repository.owner,
             name: repository.name,
-            root_preset,
-            projects,
-            calculated_at: chrono::Utc::now(),
+            presets,
+            calculated_at,
         })
     }
 
     /// Detect presets in directories with proper grouping and filtering
-    async fn detect_presets_in_directories(
-        &self,
-        files: &[String],
-    ) -> (Option<String>, Vec<ProjectPresetDomain>) {
-        use std::collections::HashMap;
+    async fn detect_presets_in_directories(&self, files: &[String]) -> Vec<ProjectPresetDomain> {
+        // Use the centralized file tree detection from temps-presets
+        let detected_presets = temps_presets::detect_presets_from_file_tree(files);
 
-        // Group files by directory
-        let mut directory_files: HashMap<String, Vec<String>> = HashMap::new();
+        // Convert to ProjectPresetDomain
+        detected_presets
+            .into_iter()
+            .map(|preset| {
+                // Parse preset slug to get metadata from entity enum
+                let preset_enum = preset.slug.parse::<temps_entities::preset::Preset>().ok();
 
-        for path in files {
-            let directory = match path.rfind('/') {
-                Some(idx) => path[..idx].to_string(),
-                None => "".to_string(), // Root directory
-            };
+                let exposed_port = preset_enum
+                    .as_ref()
+                    .and_then(|p| p.exposed_port())
+                    .or(preset.exposed_port);
 
-            directory_files
-                .entry(directory.clone())
-                .or_insert_with(Vec::new)
-                .push(path.clone());
-        }
+                let icon_url = preset_enum
+                    .as_ref()
+                    .and_then(|p| p.icon_url())
+                    .map(|s| s.to_string());
 
-        let mut root_preset = None;
-        let mut projects = Vec::new();
+                let project_type = preset_enum
+                    .as_ref()
+                    .map(|p| p.project_type().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
 
-        // Check each directory for presets
-        for (dir, files) in &directory_files {
-            // Limit to 2 levels deep
-            let depth = dir.matches('/').count();
-            if depth > 2 {
-                continue;
-            }
-
-            let preset = self.detect_preset_from_directory_files(&files);
-
-            if let Some(preset) = preset {
-                if dir.is_empty() {
-                    // Root directory preset
-                    root_preset = Some(preset.slug);
-                } else {
-                    // Subdirectory preset
-                    projects.push(ProjectPresetDomain {
-                        path: dir.clone(),
-                        preset: preset.slug,
-                        preset_label: preset.label,
-                    });
+                ProjectPresetDomain {
+                    path: preset.path,
+                    preset: preset.slug,
+                    preset_label: preset.label,
+                    exposed_port,
+                    icon_url,
+                    project_type,
                 }
-            }
-        }
-
-        // Sort projects by path for consistent output
-        projects.sort_by(|a, b| a.path.cmp(&b.path));
-
-        (root_preset, projects)
-    }
-
-    /// Detect preset from a specific directory's files
-    fn detect_preset_from_directory_files(&self, files: &[String]) -> Option<PresetInfo> {
-        // Check for Dockerfile first (highest priority)
-        if files
-            .iter()
-            .any(|path| path.ends_with("/Dockerfile") || path == "Dockerfile")
-        {
-            return Some(PresetInfo {
-                slug: "dockerfile".to_string(),
-                label: "Dockerfile".to_string(),
-            });
-        }
-
-        // Check for Docusaurus
-        if files.iter().any(|path| {
-            path.ends_with("docusaurus.config.js") || path.ends_with("docusaurus.config.ts")
-        }) {
-            return Some(PresetInfo {
-                slug: "docusaurus".to_string(),
-                label: "Docusaurus".to_string(),
-            });
-        }
-
-        // Check for Next.js
-        if files.iter().any(|path| {
-            path.ends_with("next.config.js")
-                || path.ends_with("next.config.mjs")
-                || path.ends_with("next.config.ts")
-        }) {
-            return Some(PresetInfo {
-                slug: "nextjs".to_string(),
-                label: "Next.js".to_string(),
-            });
-        }
-
-        // Check for Vite
-        if files
-            .iter()
-            .any(|path| path.ends_with("vite.config.js") || path.ends_with("vite.config.ts"))
-        {
-            return Some(PresetInfo {
-                slug: "vite".to_string(),
-                label: "Vite".to_string(),
-            });
-        }
-
-        // Check for Create React App
-        if files.iter().any(|path| path.contains("react-scripts")) {
-            return Some(PresetInfo {
-                slug: "create-react-app".to_string(),
-                label: "Create React App".to_string(),
-            });
-        }
-
-        // Check for Rsbuild
-        if files.iter().any(|path| path.ends_with("rsbuild.config.ts")) {
-            return Some(PresetInfo {
-                slug: "rsbuild".to_string(),
-                label: "Rsbuild".to_string(),
-            });
-        }
-
-        // Don't return anything for directories without framework-specific files
-        // This prevents directories like "src", "public", etc. from being detected as having presets
-        None
+            })
+            .collect()
     }
 
     /// Update access token for a connection (for when tokens expire or are rotated)
@@ -2675,15 +2601,13 @@ impl GitProviderManager {
         // Check each provider's auth config for matching app_id
         for provider in providers {
             if let Ok(auth_config) = self.decrypt_sensitive_data(&provider.auth_config).await {
-                if let Ok(auth_method) = serde_json::from_value::<AuthMethod>(auth_config) {
-                    if let AuthMethod::GitHubApp {
-                        app_id: provider_app_id,
-                        ..
-                    } = auth_method
-                    {
-                        if provider_app_id == app_id {
-                            return Ok(provider);
-                        }
+                if let Ok(AuthMethod::GitHubApp {
+                    app_id: provider_app_id,
+                    ..
+                }) = serde_json::from_value::<AuthMethod>(auth_config)
+                {
+                    if provider_app_id == app_id {
+                        return Ok(provider);
                     }
                 }
             }
@@ -3378,10 +3302,10 @@ impl GitProviderManagerTrait for GitProviderManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_entities::{git_providers, git_provider_connections};
-    use temps_core::{Job, QueueError, JobReceiver, async_trait::async_trait};
+    use sea_orm::{ActiveModelTrait, Set};
+    use temps_core::{async_trait::async_trait, Job, JobReceiver, QueueError};
     use temps_database::test_utils::TestDatabase;
-    use sea_orm::{Set, ActiveModelTrait};
+    use temps_entities::{git_provider_connections, git_providers};
 
     // Mock implementations for tests
     struct MockJobQueue;
@@ -3413,8 +3337,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_installation_deactivates_provider() {
-        use temps_entities::users;
         use chrono::Utc;
+        use temps_entities::users;
 
         // Create real test database
         let test_db = TestDatabase::with_migrations().await.unwrap();
@@ -3468,14 +3392,21 @@ mod tests {
         connection.insert(db.as_ref()).await.unwrap();
 
         let encryption_service = Arc::new(
-            temps_core::EncryptionService::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-                .unwrap()
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
         );
 
         let queue_service = Arc::new(MockJobQueue) as Arc<dyn JobQueue>;
         let config_service = create_test_config_service(db.clone());
 
-        let manager = GitProviderManager::new(db.clone(), encryption_service, queue_service, config_service);
+        let manager = GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            queue_service,
+            config_service,
+        );
 
         // Test delete_installation
         let result = manager.delete_installation(12345).await;
@@ -3493,14 +3424,21 @@ mod tests {
         let db = test_db.connection_arc();
 
         let encryption_service = Arc::new(
-            temps_core::EncryptionService::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-                .unwrap()
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
         );
 
         let queue_service = Arc::new(MockJobQueue) as Arc<dyn JobQueue>;
         let config_service = create_test_config_service(db.clone());
 
-        let manager = GitProviderManager::new(db.clone(), encryption_service, queue_service, config_service);
+        let manager = GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            queue_service,
+            config_service,
+        );
 
         // Should succeed even if installation not found (idempotent)
         let result = manager.delete_installation(99999).await;

@@ -1,6 +1,6 @@
-use trust_dns_resolver::TokioAsyncResolver;
-use trust_dns_resolver::config::*;
 use anyhow::Result;
+use hickory_resolver::config::*;
+use hickory_resolver::TokioAsyncResolver;
 
 /// Result of a DNS A record lookup
 #[derive(Debug, Clone)]
@@ -14,6 +14,12 @@ pub struct DnsLookupResult {
 /// DNS lookup service for resolving domain names
 #[derive(Clone)]
 pub struct DnsService;
+
+impl Default for DnsService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl DnsService {
     /// Create a new DNS service
@@ -47,13 +53,12 @@ impl DnsService {
         // Create a fresh resolver for each lookup (no caching)
         let (resolver, dns_servers) = self.create_resolver().await?;
 
-        let response = resolver.ipv4_lookup(domain).await
+        let response = resolver
+            .ipv4_lookup(domain)
+            .await
             .map_err(|e| anyhow::anyhow!("DNS lookup failed: {}", e))?;
 
-        let records: Vec<String> = response
-            .iter()
-            .map(|ip| ip.to_string())
-            .collect();
+        let records: Vec<String> = response.iter().map(|ip| ip.to_string()).collect();
 
         Ok(DnsLookupResult {
             records,
@@ -94,7 +99,9 @@ mod tests {
         let service = DnsService::new();
 
         // Test with a domain that doesn't exist
-        let result = service.lookup_a_records("this-domain-definitely-does-not-exist-12345.com").await;
+        let result = service
+            .lookup_a_records("this-domain-definitely-does-not-exist-12345.com")
+            .await;
         assert!(result.is_err());
     }
 

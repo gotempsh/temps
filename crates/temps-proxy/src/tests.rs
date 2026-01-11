@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use std::sync::Arc;
 
@@ -9,12 +10,16 @@ mod tests {
 
     fn create_crypto_cookie_crypto() -> Arc<temps_core::CookieCrypto> {
         let encryption_key = "default-32-byte-key-for-testing!";
-        Arc::new(temps_core::CookieCrypto::new(encryption_key).expect("Failed to create cookie crypto"))
+        Arc::new(
+            temps_core::CookieCrypto::new(encryption_key).expect("Failed to create cookie crypto"),
+        )
     }
     #[tokio::test]
     async fn test_database_setup() -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await.unwrap();
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone())
+            .await
+            .unwrap();
 
         // Test that migrations ran successfully by creating a simple record
         let (project, environment, deployment) = test_db.create_test_project().await?;
@@ -30,7 +35,9 @@ mod tests {
     #[tokio::test]
     async fn test_visitor_creation() -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await.unwrap();
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone())
+            .await
+            .unwrap();
 
         // Create test project
         let (project, _environment, _deployment) = test_db.create_test_project().await?;
@@ -75,7 +82,9 @@ mod tests {
         assert!(error.to_string().contains("Request logging failed"));
 
         let error = ProxyServiceError::ProjectContext("Context error".to_string());
-        assert!(error.to_string().contains("Project context resolution failed"));
+        assert!(error
+            .to_string()
+            .contains("Project context resolution failed"));
 
         let error = ProxyServiceError::Visitor("Visitor error".to_string());
         assert!(error.to_string().contains("Visitor management failed"));
@@ -113,11 +122,14 @@ mod tests {
     #[tokio::test]
     async fn test_project_context_creation() -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await.unwrap();
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone())
+            .await
+            .unwrap();
 
         // Create test project
         let (project, environment, deployment) = test_db.create_test_project().await?;
-        let project_context = create_test_project_context(project.clone(), environment.clone(), deployment.clone());
+        let project_context =
+            create_test_project_context(project.clone(), environment.clone(), deployment.clone());
 
         assert_eq!(project_context.project.id, project.id);
         assert_eq!(project_context.environment.id, environment.id);
@@ -130,10 +142,14 @@ mod tests {
     #[tokio::test]
     async fn test_custom_route_creation() -> Result<(), Box<dyn std::error::Error>> {
         let test_db_mock = TestDatabase::with_migrations().await.unwrap();
-        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await.unwrap();
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone())
+            .await
+            .unwrap();
 
         // Create test custom route
-        let custom_route = test_db.create_test_custom_route("custom.example.com").await?;
+        let custom_route = test_db
+            .create_test_custom_route("custom.example.com")
+            .await?;
         assert_eq!(custom_route.domain, "custom.example.com");
         assert!(custom_route.enabled);
 

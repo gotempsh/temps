@@ -6,12 +6,21 @@ import {
   getDomainOrderOptions,
   getHttpChallengeDebugOptions,
   getPublicIpOptions,
+  listProvidersOptions,
   renewDomainMutation,
+  setupDnsChallengeMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -32,6 +41,7 @@ import {
   Loader2,
   RefreshCw,
   Shield,
+  Wand2,
   XCircle,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
@@ -44,6 +54,7 @@ export function DomainDetail() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [copiedField, setCopiedField] = useState<string | null>(null)
+  const [selectedDnsProvider, setSelectedDnsProvider] = useState<string>('')
 
   const {
     data: domain,
@@ -95,6 +106,17 @@ export function DomainDetail() {
       (domain?.status === 'challenge_requested' ||
         domain?.status === 'pending' ||
         domain?.status === 'pending_http'),
+  })
+
+  // Fetch DNS providers for auto-provisioning when DNS-01 challenge is available
+  const { data: dnsProviders } = useQuery({
+    ...listProvidersOptions(),
+    enabled:
+      !!domain &&
+      domain?.verification_method === 'dns-01' &&
+      (domain?.status === 'challenge_requested' ||
+        domain?.status === 'pending_dns' ||
+        domain?.status === 'pending'),
   })
 
   const { canManageCertificates, isUsingCloudflare } = usePlatformCapabilities()
@@ -169,6 +191,7 @@ export function DomainDetail() {
       )
 
       await refetchDomain()
+      await refetchOrder()
     },
   })
 
@@ -184,6 +207,26 @@ export function DomainDetail() {
     },
   })
 
+  const setupDns = useMutation({
+    ...setupDnsChallengeMutation(),
+    meta: {
+      errorTitle: 'Failed to setup DNS records',
+    },
+    onSuccess: (data) => {
+      if (data.success) {
+        toast.success(data.message)
+      } else {
+        toast.warning(data.message)
+      }
+      // Show individual record results
+      data.results.forEach((result) => {
+        if (!result.success) {
+          toast.error(`${result.name}: ${result.message}`)
+        }
+      })
+    },
+  })
+
   const handleCopy = (text: string, field: string) => {
     navigator.clipboard.writeText(text)
     setCopiedField(field)
@@ -191,21 +234,33 @@ export function DomainDetail() {
     setTimeout(() => setCopiedField(null), 2000)
   }
 
-  const handleCreateOrder = async () => {
+  const handleCreateOrder = () => {
     if (!domain) return
-    await createOrder.mutate({
+    createOrder.mutate({
       path: {
         domain_id: domain.id,
       },
     })
   }
 
-  const handleCompleteDns = async () => {
+  const handleCompleteDns = () => {
     if (!domain) return
     // Finalize the order after DNS challenge verification
-    await finalizeOrder.mutate({
+    finalizeOrder.mutate({
       path: {
         domain_id: domain.id,
+      },
+    })
+  }
+
+  const handleSetupDnsRecords = async () => {
+    if (!domain || !selectedDnsProvider) return
+    await setupDns.mutateAsync({
+      path: {
+        domain_id: domain.id,
+      },
+      body: {
+        dns_provider_id: parseInt(selectedDnsProvider, 10),
       },
     })
   }
@@ -685,6 +740,87 @@ export function DomainDetail() {
                               </div>
                             ))}
                           </div>
+
+                          {/* DNS Auto-Provisioning Option */}
+                          {dnsProviders && dnsProviders.length > 0 && (
+                            <div className="p-4 bg-muted/50 rounded-lg border">
+                              <div className="flex items-start gap-3">
+                                <div className="p-2 bg-primary/10 rounded-lg">
+                                  <Wand2 className="h-5 w-5 text-primary" />
+                                </div>
+                                <div className="flex-1 space-y-3">
+                                  <div>
+                                    <h4 className="font-medium">
+                                      Auto-Provision DNS Records
+                                    </h4>
+                                    <p className="text-sm text-muted-foreground">
+                                      Automatically create the required TXT
+                                      records using one of your configured DNS
+                                      providers.
+                                    </p>
+                                  </div>
+                                  <div className="flex flex-col sm:flex-row gap-2">
+                                    <Select
+                                      value={selectedDnsProvider}
+                                      onValueChange={setSelectedDnsProvider}
+                                    >
+                                      <SelectTrigger className="w-full sm:w-[220px]">
+                                        <SelectValue placeholder="Select DNS provider" />
+                                      </SelectTrigger>
+                                      <SelectContent>
+                                        {dnsProviders.map((provider) => (
+                                          <SelectItem
+                                            key={provider.id}
+                                            value={provider.id.toString()}
+                                          >
+                                            {provider.name} (
+                                            {provider.provider_type})
+                                          </SelectItem>
+                                        ))}
+                                      </SelectContent>
+                                    </Select>
+                                    <Button
+                                      onClick={handleSetupDnsRecords}
+                                      disabled={
+                                        !selectedDnsProvider ||
+                                        setupDns.isPending ||
+                                        !canManageCertificates
+                                      }
+                                    >
+                                      {setupDns.isPending ? (
+                                        <>
+                                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                          Creating Records...
+                                        </>
+                                      ) : (
+                                        <>
+                                          <Wand2 className="mr-2 h-4 w-4" />
+                                          Auto-Create Records
+                                        </>
+                                      )}
+                                    </Button>
+                                  </div>
+                                  {!dnsProviders.length && (
+                                    <p className="text-xs text-muted-foreground">
+                                      <a
+                                        href="/dns-providers/add"
+                                        className="underline"
+                                      >
+                                        Add a DNS provider
+                                      </a>{' '}
+                                      to enable automatic DNS record creation.
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          )}
+
+                          <Separator className="my-2" />
+
+                          <p className="text-sm text-muted-foreground text-center">
+                            — or add the records manually —
+                          </p>
 
                           <Alert>
                             <Clock className="h-4 w-4" />

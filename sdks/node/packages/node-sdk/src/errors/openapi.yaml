@@ -1,0 +1,496 @@
+openapi: 3.1.0
+info:
+  title: Error Tracking API
+  description: |
+    Sentry-compatible error tracking API for capturing and managing application errors, exceptions, and diagnostic information.
+
+    ## Features
+    - Capture exceptions with full stack traces
+    - Track custom error messages
+    - Breadcrumb trail for debugging
+    - User context and metadata
+    - Environment and release tracking
+
+    ## Authentication
+    The API uses Sentry-compatible authentication via the X-Sentry-Auth header.
+  version: 1.0.0
+  contact:
+    name: Temps Support
+    url: https://temps.sh
+  license:
+    name: MIT
+
+servers:
+  - url: https://api.temps.sh
+    description: Production server
+  - url: http://localhost:3000
+    description: Development server
+
+security:
+  - sentryAuth: []
+
+paths:
+  /api/{projectId}/store/:
+    post:
+      tags:
+        - Error Events
+      summary: Store error event
+      description: |
+        Captures and stores an error event with stack trace, user context, and metadata.
+        Compatible with Sentry's store endpoint format.
+      operationId: storeEvent
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          description: The project identifier
+          schema:
+            type: string
+            example: "42"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorEvent'
+            examples:
+              exception:
+                summary: Exception with stack trace
+                value:
+                  event_id: "fc6d8c0c43fc4630ad850ee518f1b9d0"
+                  timestamp: 1699564800
+                  level: "error"
+                  platform: "node"
+                  sdk:
+                    name: "@temps-sdk/node-sdk"
+                    version: "1.0.0"
+                  environment: "production"
+                  release: "1.0.0"
+                  exception:
+                    values:
+                      - type: "TypeError"
+                        value: "Cannot read property 'foo' of undefined"
+                        stacktrace:
+                          frames:
+                            - filename: "/app/src/index.js"
+                              function: "processUser"
+                              lineno: 42
+                              colno: 15
+                              in_app: true
+              message:
+                summary: Custom message
+                value:
+                  event_id: "fc6d8c0c43fc4630ad850ee518f1b9d0"
+                  timestamp: 1699564800
+                  level: "info"
+                  platform: "node"
+                  message: "User successfully completed checkout"
+                  user:
+                    id: "12345"
+                    email: "user@example.com"
+                  tags:
+                    module: "checkout"
+                    version: "2.0"
+      responses:
+        '200':
+          description: Event stored successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    description: The event identifier
+                    example: "fc6d8c0c43fc4630ad850ee518f1b9d0"
+        '400':
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Authentication failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/{projectId}/envelope/:
+    post:
+      tags:
+        - Error Events
+      summary: Store error envelope
+      description: |
+        Alternative endpoint for storing error events using Sentry's envelope format.
+        Supports batching multiple events and attachments.
+      operationId: storeEnvelope
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          description: The project identifier
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/x-sentry-envelope:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Envelope processed successfully
+        '400':
+          description: Invalid envelope format
+        '401':
+          description: Authentication failed
+        '429':
+          description: Rate limit exceeded
+
+components:
+  securitySchemes:
+    sentryAuth:
+      type: apiKey
+      in: header
+      name: X-Sentry-Auth
+      description: |
+        Sentry-compatible authentication header.
+        Format: `Sentry sentry_key={PUBLIC_KEY}, sentry_version=7`
+
+  schemas:
+    ErrorEvent:
+      type: object
+      required:
+        - event_id
+        - timestamp
+        - platform
+      properties:
+        event_id:
+          type: string
+          description: Unique event identifier (32 character hex string)
+          pattern: '^[a-f0-9]{32}$'
+          example: "fc6d8c0c43fc4630ad850ee518f1b9d0"
+        timestamp:
+          type: number
+          description: Unix timestamp when the event occurred
+          example: 1699564800
+        level:
+          type: string
+          enum: [debug, info, warning, error, fatal]
+          description: Severity level of the event
+          default: error
+        logger:
+          type: string
+          description: Name of the logger
+          example: "my.logger"
+        platform:
+          type: string
+          description: Platform identifier
+          example: "node"
+        sdk:
+          $ref: '#/components/schemas/SDK'
+        release:
+          type: string
+          description: Release version of the application
+          example: "1.0.0"
+        environment:
+          type: string
+          description: Environment name
+          example: "production"
+        server_name:
+          type: string
+          description: Server hostname
+          example: "web-01"
+        message:
+          type: string
+          description: Human-readable message
+          example: "User action completed"
+        user:
+          $ref: '#/components/schemas/User'
+        request:
+          $ref: '#/components/schemas/Request'
+        contexts:
+          type: object
+          description: Additional context objects
+          additionalProperties: true
+        tags:
+          type: object
+          description: Key-value pairs for categorization
+          additionalProperties:
+            type: string
+          example:
+            module: "authentication"
+            version: "2.0"
+        extra:
+          type: object
+          description: Arbitrary extra data
+          additionalProperties: true
+        fingerprint:
+          type: array
+          description: Custom fingerprint for grouping
+          items:
+            type: string
+        exception:
+          type: object
+          properties:
+            values:
+              type: array
+              items:
+                $ref: '#/components/schemas/Exception'
+        breadcrumbs:
+          type: array
+          description: Trail of events leading to the error
+          items:
+            $ref: '#/components/schemas/Breadcrumb'
+
+    SDK:
+      type: object
+      required:
+        - name
+        - version
+      properties:
+        name:
+          type: string
+          description: SDK name
+          example: "@temps-sdk/node-sdk"
+        version:
+          type: string
+          description: SDK version
+          example: "1.0.0"
+        packages:
+          type: array
+          description: SDK packages/integrations
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              version:
+                type: string
+
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          description: User identifier
+          example: "12345"
+        username:
+          type: string
+          description: Username
+          example: "john_doe"
+        email:
+          type: string
+          format: email
+          description: User email address
+          example: "john@example.com"
+        ip_address:
+          type: string
+          description: IP address
+          example: "192.168.1.1"
+        segment:
+          type: string
+          description: User segment for analytics
+        data:
+          type: object
+          description: Additional user data
+          additionalProperties: true
+
+    Request:
+      type: object
+      properties:
+        url:
+          type: string
+          description: Request URL
+          example: "https://example.com/api/users"
+        method:
+          type: string
+          description: HTTP method
+          enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]
+          example: "POST"
+        data:
+          description: Request body data
+        query_string:
+          type: string
+          description: Query parameters
+          example: "page=1&limit=10"
+        cookies:
+          type: object
+          description: Request cookies
+          additionalProperties:
+            type: string
+        headers:
+          type: object
+          description: Request headers
+          additionalProperties:
+            type: string
+        env:
+          type: object
+          description: Environment variables
+          additionalProperties:
+            type: string
+
+    Exception:
+      type: object
+      required:
+        - type
+        - value
+      properties:
+        type:
+          type: string
+          description: Exception type
+          example: "TypeError"
+        value:
+          type: string
+          description: Exception message
+          example: "Cannot read property 'foo' of undefined"
+        module:
+          type: string
+          description: Module where exception occurred
+          example: "user.service"
+        mechanism:
+          $ref: '#/components/schemas/Mechanism'
+        stacktrace:
+          $ref: '#/components/schemas/Stacktrace'
+
+    Mechanism:
+      type: object
+      properties:
+        type:
+          type: string
+          description: Mechanism type
+          example: "generic"
+        handled:
+          type: boolean
+          description: Whether exception was handled
+          default: true
+        data:
+          type: object
+          description: Additional mechanism data
+          additionalProperties: true
+
+    Stacktrace:
+      type: object
+      properties:
+        frames:
+          type: array
+          description: Stack frames (innermost last)
+          items:
+            $ref: '#/components/schemas/StackFrame'
+
+    StackFrame:
+      type: object
+      properties:
+        filename:
+          type: string
+          description: File path
+          example: "/app/src/index.js"
+        function:
+          type: string
+          description: Function name
+          example: "processUser"
+        lineno:
+          type: integer
+          description: Line number
+          example: 42
+        colno:
+          type: integer
+          description: Column number
+          example: 15
+        abs_path:
+          type: string
+          description: Absolute file path
+          example: "/home/app/src/index.js"
+        context_line:
+          type: string
+          description: Source code of the line
+        pre_context:
+          type: array
+          description: Lines before the error
+          items:
+            type: string
+        post_context:
+          type: array
+          description: Lines after the error
+          items:
+            type: string
+        in_app:
+          type: boolean
+          description: Whether frame is from application code
+          default: true
+        vars:
+          type: object
+          description: Local variables
+          additionalProperties: true
+
+    Breadcrumb:
+      type: object
+      properties:
+        timestamp:
+          type: number
+          description: Unix timestamp
+          example: 1699564700
+        message:
+          type: string
+          description: Breadcrumb message
+          example: "User clicked checkout button"
+        category:
+          type: string
+          description: Category for grouping
+          example: "ui.click"
+        level:
+          type: string
+          enum: [debug, info, warning, error, critical]
+          description: Severity level
+          default: info
+        type:
+          type: string
+          enum: [default, http, navigation, console, user]
+          description: Breadcrumb type
+          default: default
+        data:
+          type: object
+          description: Additional data
+          additionalProperties: true
+          example:
+            buttonId: "checkout-btn"
+            userId: "12345"
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Error message
+          example: "Invalid authentication credentials"
+        code:
+          type: string
+          description: Error code
+          example: "AUTH_FAILED"
+        details:
+          type: object
+          description: Additional error details
+          additionalProperties: true
+
+tags:
+  - name: Error Events
+    description: Endpoints for capturing and managing error events
+    externalDocs:
+      description: Learn more about error tracking
+      url: https://docs.temps.sh/error-tracking

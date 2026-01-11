@@ -1,0 +1,118 @@
+name: Test Release
+
+on:
+  push:
+    tags:
+      - 'test-v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test-release:
+    name: Test Release (No Build)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create dummy artifacts
+        run: |
+          mkdir -p release
+
+          # Create dummy binaries
+          echo "fake linux binary" > release/temps-linux-amd64
+          echo "fake darwin amd64 binary" > release/temps-darwin-amd64
+          echo "fake darwin arm64 binary" > release/temps-darwin-arm64
+
+          # Generate checksums
+          sha256sum release/temps-linux-amd64 > release/temps-linux-amd64.sha256
+          sha256sum release/temps-darwin-amd64 > release/temps-darwin-amd64.sha256
+          sha256sum release/temps-darwin-arm64 > release/temps-darwin-arm64.sha256
+
+          # Combined checksums
+          cat release/temps-linux-amd64.sha256 > release/checksums.txt
+          cat release/temps-darwin-amd64.sha256 >> release/checksums.txt
+          cat release/temps-darwin-arm64.sha256 >> release/checksums.txt
+
+      - name: Copy install script
+        run: |
+          cp scripts/install.sh release/install.sh
+          chmod +x release/install.sh
+
+      - name: Generate Homebrew formula
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/test-v}"
+          SHA256_LINUX_AMD64=$(awk '{print $1}' release/temps-linux-amd64.sha256)
+          SHA256_DARWIN_AMD64=$(awk '{print $1}' release/temps-darwin-amd64.sha256)
+          SHA256_DARWIN_ARM64=$(awk '{print $1}' release/temps-darwin-arm64.sha256)
+
+          sed -e "s/{{VERSION}}/$VERSION/g" \
+              -e "s/{{SHA256_LINUX_AMD64}}/$SHA256_LINUX_AMD64/g" \
+              -e "s/{{SHA256_DARWIN_AMD64}}/$SHA256_DARWIN_AMD64/g" \
+              -e "s/{{SHA256_DARWIN_ARM64}}/$SHA256_DARWIN_ARM64/g" \
+              scripts/homebrew-formula.rb.template > release/temps.rb
+
+          echo "Generated formula:"
+          cat release/temps.rb
+
+      - name: List release files
+        run: |
+          echo "Release files:"
+          ls -lh release/
+
+      - name: Create release notes file
+        run: |
+          cat > release/release-notes.md << 'EOF'
+          ## Test Release
+
+          This is a test release with dummy binaries for testing the release workflow.
+
+          **⚠️ Do not use these binaries - they are not functional!**
+
+          To create a real release, push a tag like `v0.1.0` (without `test-` prefix).
+
+          ## Quick Install (Test Only)
+
+          ```bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/install.sh | bash
+          ```
+
+          ## Files Included
+          - temps-linux-amd64 (dummy binary)
+          - temps-darwin-amd64 (dummy binary)
+          - temps-darwin-arm64 (dummy binary)
+          - install.sh (real install script)
+          - temps.rb (Homebrew formula)
+          - checksums.txt (SHA256 checksums)
+          EOF
+
+          echo "Release notes:"
+          cat release/release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Creating release ${{ github.ref_name }}..."
+
+          gh release create ${{ github.ref_name }} \
+            --title "${{ github.ref_name }}" \
+            --notes-file release/release-notes.md \
+            --prerelease \
+            release/temps-linux-amd64 \
+            release/temps-linux-amd64.sha256 \
+            release/temps-darwin-amd64 \
+            release/temps-darwin-amd64.sha256 \
+            release/temps-darwin-arm64 \
+            release/temps-darwin-arm64.sha256 \
+            release/checksums.txt \
+            release/install.sh \
+            release/temps.rb
+
+          echo "✓ Release created successfully!"
+          echo ""
+          echo "View release at: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"

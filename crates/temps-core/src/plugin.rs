@@ -108,6 +108,17 @@ impl MiddlewareCondition {
     }
 }
 
+/// Type alias for middleware handler function
+pub type MiddlewareHandler = Arc<
+    dyn Fn(
+            Request,
+            Next,
+        )
+            -> Pin<Box<dyn Future<Output = Result<Response, axum::http::StatusCode>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Plugin middleware definition
 pub struct PluginMiddleware {
     /// Unique name for this middleware
@@ -119,15 +130,7 @@ pub struct PluginMiddleware {
     /// Condition for when to execute
     pub condition: MiddlewareCondition,
     /// The actual middleware function
-    pub handler: Arc<
-        dyn Fn(
-                Request,
-                Next,
-            )
-                -> Pin<Box<dyn Future<Output = Result<Response, axum::http::StatusCode>> + Send>>
-            + Send
-            + Sync,
-    >,
+    pub handler: MiddlewareHandler,
 }
 
 impl std::fmt::Debug for PluginMiddleware {
@@ -217,6 +220,12 @@ impl TempsMiddlewareWrapper {
 /// Collection of middleware from a plugin
 pub struct PluginMiddlewareCollection {
     pub middleware: Vec<PluginMiddleware>,
+}
+
+impl Default for PluginMiddlewareCollection {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PluginMiddlewareCollection {
@@ -362,6 +371,21 @@ pub trait TempsPlugin: Send + Sync {
         context: &'a ServiceRegistrationContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>>;
 
+    /// Initialize plugin-managed services after all plugins are registered
+    ///
+    /// This is called after all plugins have registered their services, allowing
+    /// plugins to access services from other plugins (like ExternalServiceManager)
+    /// to initialize their own services with configuration from the database.
+    ///
+    /// Use this hook when you need to load service configuration from the database
+    /// or perform other async initialization that requires access to other plugins' services.
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        _context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move { Ok(()) })
+    }
+
     /// Configure HTTP routes for this plugin
     ///
     /// Return None if this plugin doesn't provide HTTP endpoints.
@@ -400,6 +424,12 @@ impl PluginRoutes {
 /// Type-safe service registry for dependency injection
 pub struct ServiceRegistry {
     services: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+}
+
+impl Default for ServiceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ServiceRegistry {
@@ -444,6 +474,12 @@ impl ServiceRegistry {
 /// Registry for plugin-specific state (used for routing)
 pub struct PluginStateRegistry {
     states: Mutex<HashMap<String, Box<dyn Any + Send + Sync>>>,
+}
+
+impl Default for PluginStateRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PluginStateRegistry {
@@ -535,6 +571,12 @@ pub struct ServiceRegistrationContext {
     state_registry: Arc<PluginStateRegistry>,
 }
 
+impl Default for ServiceRegistrationContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServiceRegistrationContext {
     pub fn new() -> Self {
         Self {
@@ -579,6 +621,12 @@ pub struct PluginManager {
     context: ServiceRegistrationContext,
 }
 
+impl Default for PluginManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PluginManager {
     /// Create a new plugin manager
     pub fn new() -> Self {
@@ -598,8 +646,9 @@ impl PluginManager {
     pub async fn initialize_plugins(&mut self) -> Result<(), PluginError> {
         debug!("Initializing {} plugins", self.plugins.len());
 
+        // Phase 1: Register all services
         for plugin in &self.plugins {
-            debug!("Initializing plugin: {}", plugin.name());
+            debug!("Registering services for plugin: {}", plugin.name());
 
             plugin.register_services(&self.context).await.map_err(|e| {
                 PluginError::PluginRegistrationFailed {
@@ -608,7 +657,30 @@ impl PluginManager {
                 }
             })?;
 
-            debug!("Successfully initialized plugin: {}", plugin.name());
+            debug!(
+                "Successfully registered services for plugin: {}",
+                plugin.name()
+            );
+        }
+
+        // Phase 2: Initialize plugin services (after all services are registered)
+        // This allows plugins to access services from other plugins
+        let plugin_context = self.context.create_plugin_context();
+        for plugin in &self.plugins {
+            debug!("Initializing plugin services for: {}", plugin.name());
+
+            plugin
+                .initialize_plugin_services(&plugin_context)
+                .await
+                .map_err(|e| PluginError::PluginRegistrationFailed {
+                    plugin_name: plugin.name().to_string(),
+                    error: format!("Failed to initialize plugin services: {}", e),
+                })?;
+
+            debug!(
+                "Successfully initialized plugin services for: {}",
+                plugin.name()
+            );
         }
 
         Ok(())
@@ -662,26 +734,26 @@ impl PluginManager {
             .info(
                 InfoBuilder::new()
                     .title("Temps")
-                    .description(Some("A comprehensive API for managing projects, deployments, and infrastructure resources"))
+                    .description(Some(
+                        "An API for managing projects, deployments, and infrastructure resources",
+                    ))
                     .version("1.0.0")
                     .contact(Some(
                         ContactBuilder::new()
                             .name(Some("Temps Support"))
                             .url(Some("https://temps.sh"))
-                            .build()
+                            .build(),
                     ))
-                    .build()
+                    .build(),
             )
-            .servers(Some(vec![
-                ServerBuilder::new()
-                    .url("/api")
-                    .description(Some("Base path for all API endpoints"))
-                    .build()
-            ]))
+            .servers(Some(vec![ServerBuilder::new()
+                .url("/api")
+                .description(Some("Base path for all API endpoints"))
+                .build()]))
             .components(Some(
                 ComponentsBuilder::new()
                     .security_scheme("bearer_auth", self.create_bearer_auth_scheme())
-                    .build()
+                    .build(),
             ))
             .build();
 

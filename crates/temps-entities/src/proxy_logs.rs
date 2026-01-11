@@ -107,6 +107,12 @@ pub struct Model {
 
     /// Created date for partitioning (denormalized from timestamp)
     pub created_date: Date,
+
+    /// Session ID for tracking user sessions
+    pub session_id: Option<i32>,
+
+    /// Visitor ID for tracking unique visitors
+    pub visitor_id: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -135,6 +141,18 @@ pub enum Relation {
         to = "super::ip_geolocations::Column::Id"
     )]
     IpGeolocation,
+    #[sea_orm(
+        belongs_to = "super::request_sessions::Entity",
+        from = "Column::SessionId",
+        to = "super::request_sessions::Column::Id"
+    )]
+    RequestSession,
+    #[sea_orm(
+        belongs_to = "super::visitor::Entity",
+        from = "Column::VisitorId",
+        to = "super::visitor::Column::Id"
+    )]
+    Visitor,
 }
 
 impl Related<super::projects::Entity> for Entity {
@@ -158,6 +176,18 @@ impl Related<super::deployments::Entity> for Entity {
 impl Related<super::ip_geolocations::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::IpGeolocation.def()
+    }
+}
+
+impl Related<super::request_sessions::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::RequestSession.def()
+    }
+}
+
+impl Related<super::visitor::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Visitor.def()
     }
 }
 

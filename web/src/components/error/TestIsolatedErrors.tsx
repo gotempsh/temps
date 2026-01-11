@@ -50,10 +50,7 @@ export function TestIsolatedErrors() {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <Button
-            variant="destructive"
-            onClick={() => setShouldCrash(true)}
-          >
+          <Button variant="destructive" onClick={() => setShouldCrash(true)}>
             Crash This Page
           </Button>
         </CardContent>
@@ -77,7 +74,7 @@ export function TestIsolatedErrors() {
           <div>
             <h3 className="font-semibold mb-2">🔧 Architecture:</h3>
             <pre className="text-xs bg-muted p-3 rounded-md overflow-x-auto">
-{`SidebarProvider
+              {`SidebarProvider
 ├── <ErrorBoundary> (Sidebar)
 │   └── AppSidebar
 │       └── [Sidebar Content]
@@ -114,9 +111,9 @@ export function TestIsolatedErrors() {
         <CardContent className="text-sm text-muted-foreground">
           <p>
             Testing errors in Sidebar and Header requires modifying those
-            components directly to throw errors. The page crash test demonstrates
-            the isolation principle - when this page crashes, the Sidebar and
-            Header continue working normally.
+            components directly to throw errors. The page crash test
+            demonstrates the isolation principle - when this page crashes, the
+            Sidebar and Header continue working normally.
           </p>
         </CardContent>
       </Card>

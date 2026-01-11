@@ -1,28 +1,29 @@
 use crate::config::*;
 use crate::proxy::LoadBalancer;
-use crate::tls_cert_loader::CertificateLoader;
-use temps_routes::CachedPeerTable;
-use crate::services::*;
 use crate::service::lb_service::LbService;
+use crate::services::*;
+use crate::tls_cert_loader::CertificateLoader;
 use crate::traits::*;
 use anyhow::Result;
-use tracing::{debug, info};
 use pingora::server::RunArgs;
-use pingora_core::server::configuration::Opt;
-use pingora_proxy::http_proxy_service;
-use std::sync::Arc;
-use temps_database::DbConnection;
-use temps_core::plugin::{ServiceRegistrationContext, TempsPlugin};
-use pingora_core::listeners::TlsAccept;
 use pingora_core::listeners::tls::TlsSettings;
+use pingora_core::listeners::TlsAccept;
 use pingora_core::protocols::tls::TlsRef;
+use pingora_core::server::configuration::Opt;
+use pingora_openssl::pkey::PKey;
 use pingora_openssl::ssl::NameType;
 use pingora_openssl::x509::X509;
-use pingora_openssl::pkey::PKey;
+use pingora_proxy::http_proxy_service;
+use std::sync::Arc;
+use temps_config::ServerConfig;
+use temps_core::plugin::{ServiceRegistrationContext, TempsPlugin};
+use temps_database::DbConnection;
+use temps_routes::CachedPeerTable;
+use tracing::{debug, info};
 
-use std::pin::Pin;
-use std::future::Future;
 use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 
 /// Dynamic certificate callback for TLS
 struct DynamicCertLoader {
@@ -40,7 +41,8 @@ impl TlsAccept for DynamicCertLoader {
         let ssl: &mut SslRef = unsafe { std::mem::transmute(ssl_ref) };
 
         // Get SNI hostname from the SSL context and clone it to avoid borrow conflicts
-        let sni = ssl.servername(NameType::HOST_NAME)
+        let sni = ssl
+            .servername(NameType::HOST_NAME)
             .unwrap_or("default")
             .to_string();
 
@@ -63,7 +65,10 @@ impl TlsAccept for DynamicCertLoader {
                             } else {
                                 // Subsequent certificates are chain certificates
                                 if let Err(e) = ext::ssl_add_chain_cert(ssl, &cert) {
-                                    debug!("Failed to add chain certificate {} for {}: {}", i, sni, e);
+                                    debug!(
+                                        "Failed to add chain certificate {} for {}: {}",
+                                        i, sni, e
+                                    );
                                     return;
                                 }
                             }
@@ -102,16 +107,28 @@ impl TlsAccept for DynamicCertLoader {
 }
 
 /// Setup plugin system and register all necessary services for the proxy
-async fn setup_proxy_plugins(db: Arc<DbConnection>) -> Result<ServiceRegistrationContext> {
+async fn setup_proxy_plugins(
+    db: Arc<DbConnection>,
+    config: Arc<ServerConfig>,
+) -> Result<ServiceRegistrationContext> {
     // Create registration context - it will create its own registry
     let context = ServiceRegistrationContext::new();
 
     // Register core services that plugins depend on
     context.register_service(db.clone());
 
+    // Register ConfigPlugin for configuration services
+    let config_plugin = Box::new(temps_config::ConfigPlugin::new(config.clone()));
+    config_plugin
+        .register_services(&context)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to register ConfigPlugin: {}", e))?;
+
     // Register GeoPlugin for IP geolocation
     let geo_plugin = temps_geo::GeoPlugin::new();
-    geo_plugin.register_services(&context).await
+    geo_plugin
+        .register_services(&context)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to register GeoPlugin: {}", e))?;
 
     debug!("Proxy plugin system initialized");
@@ -145,6 +162,7 @@ impl pingora::server::ShutdownSignalWatch for ShutdownSignalBridge {
 }
 
 /// Setup and configure the proxy server with all services
+#[allow(clippy::too_many_arguments)]
 pub fn setup_proxy_server(
     db: Arc<DbConnection>,
     proxy_config: ProxyConfig,
@@ -152,10 +170,11 @@ pub fn setup_proxy_server(
     encryption_service: Arc<temps_core::EncryptionService>,
     route_table: Arc<CachedPeerTable>,
     shutdown_signal: Box<dyn ProxyShutdownSignal>,
+    config: Arc<ServerConfig>,
 ) -> Result<()> {
     // Setup plugin system (async operation in sync context)
     let context = tokio::runtime::Runtime::new()?
-        .block_on(setup_proxy_plugins(db.clone()))?;
+        .block_on(setup_proxy_plugins(db.clone(), config.clone()))?;
 
     // Create service implementations
     let lb_service = Arc::new(LbService::new(db.clone()));
@@ -165,19 +184,37 @@ pub fn setup_proxy_server(
         route_table.clone(),
     )) as Arc<dyn UpstreamResolver>;
 
-    // Get IP service from plugin registry
+    // Get services from plugin registry
     let ip_service = context.require_service::<temps_geo::IpAddressService>();
+    let config_service = context.require_service::<temps_config::ConfigService>();
 
-    let request_logger =
-        Arc::new(RequestLoggerImpl::new(LoggingConfig::default(), db.clone(), ip_service.clone())) as Arc<dyn RequestLogger>;
+    let request_logger = Arc::new(RequestLoggerImpl::new(
+        LoggingConfig::default(),
+        db.clone(),
+        ip_service.clone(),
+    )) as Arc<dyn RequestLogger>;
 
-    let proxy_log_service = Arc::new(crate::service::proxy_log_service::ProxyLogService::new(db.clone(), ip_service.clone()));
+    let proxy_log_service = Arc::new(crate::service::proxy_log_service::ProxyLogService::new(
+        db.clone(),
+        ip_service.clone(),
+    ));
 
-    let project_context_resolver =
-        Arc::new(ProjectContextResolverImpl::new(route_table.clone())) as Arc<dyn ProjectContextResolver>;
+    let ip_access_control_service = Arc::new(
+        crate::service::ip_access_control_service::IpAccessControlService::new(db.clone()),
+    );
 
-    let visitor_manager =
-        Arc::new(VisitorManagerImpl::new(db.clone(), crypto.clone(), ip_service.clone())) as Arc<dyn VisitorManager>;
+    let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
+        db.clone(),
+    ));
+
+    let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
+        as Arc<dyn ProjectContextResolver>;
+
+    let visitor_manager = Arc::new(VisitorManagerImpl::new(
+        db.clone(),
+        crypto.clone(),
+        ip_service.clone(),
+    )) as Arc<dyn VisitorManager>;
 
     let session_manager =
         Arc::new(SessionManagerImpl::new(db.clone(), crypto.clone())) as Arc<dyn SessionManager>;
@@ -194,15 +231,22 @@ pub fn setup_proxy_server(
         session_manager,
         crypto,
         db.clone(),
+        config_service,
+        ip_access_control_service,
+        challenge_service,
     );
 
-    // Setup Pingora server
+    // Setup Pingora server with explicit configuration
+    // Disable upgrade mode to avoid "Console API failed to start: channel closed" error
     let opt = Opt {
-        daemon: false,
-        ..Default::default()
+        upgrade: false,   // Don't try to upgrade from old process
+        daemon: false,    // Don't daemonize (systemd handles this)
+        nocapture: false, // Not running under cargo test
+        test: false,      // Not in test mode
+        conf: None,       // No config file path
     };
 
-    let mut server = pingora_core::server::Server::new(opt)?;
+    let mut server = pingora_core::server::Server::new(Some(opt))?;
     server.bootstrap();
 
     // Create HTTP proxy service
@@ -213,19 +257,27 @@ pub fn setup_proxy_server(
         debug!("Adding TLS service on {}", tls_address);
 
         // Create certificate loader for dynamic SNI resolution
-        let cert_loader = Arc::new(CertificateLoader::new(db.clone(), encryption_service.clone()));
+        let cert_loader = Arc::new(CertificateLoader::new(
+            db.clone(),
+            encryption_service.clone(),
+        ));
 
         // Create TLS callback handler
-        let tls_callbacks: Box<dyn TlsAccept + Send + Sync> = Box::new(DynamicCertLoader {
-            cert_loader,
-        });
+        let tls_callbacks: Box<dyn TlsAccept + Send + Sync> =
+            Box::new(DynamicCertLoader { cert_loader });
 
-        // Create TLS settings with dynamic certificate callback
-        let tls_settings = TlsSettings::with_callbacks(tls_callbacks)
+        // Create TLS settings with dynamic certificate callback and HTTP/2 support
+        let mut tls_settings = TlsSettings::with_callbacks(tls_callbacks)
             .map_err(|e| anyhow::anyhow!("Failed to create TLS settings: {}", e))?;
 
+        // Enable HTTP/2 via ALPN (Application-Layer Protocol Negotiation)
+        tls_settings.enable_h2();
+
         proxy_service.add_tls_with_settings(tls_address, None, tls_settings);
-        debug!("TLS listener configured on {}", tls_address);
+        debug!(
+            "TLS listener configured on {} with HTTP/2 support",
+            tls_address
+        );
     }
 
     server.add_service(proxy_service);
@@ -235,8 +287,9 @@ pub fn setup_proxy_server(
         info!("TLS server will listen on {}", tls_addr);
     }
 
-    let mut run_args = RunArgs::default();
-    run_args.shutdown_signal = Box::new(ShutdownSignalBridge::new(shutdown_signal));
+    let run_args = RunArgs {
+        shutdown_signal: Box::new(ShutdownSignalBridge::new(shutdown_signal)),
+    };
     server.run(run_args);
 
     Ok(())
@@ -248,10 +301,11 @@ pub fn create_proxy_service(
     proxy_config: ProxyConfig,
     crypto: Arc<temps_core::CookieCrypto>,
     route_table: Arc<CachedPeerTable>,
+    config: Arc<ServerConfig>,
 ) -> Result<LoadBalancer> {
     // Setup plugin system (async operation in sync context)
     let context = tokio::runtime::Runtime::new()?
-        .block_on(setup_proxy_plugins(db.clone()))?;
+        .block_on(setup_proxy_plugins(db.clone(), config.clone()))?;
 
     // Create service implementations
     let lb_service = Arc::new(LbService::new(db.clone()));
@@ -261,19 +315,37 @@ pub fn create_proxy_service(
         route_table.clone(),
     )) as Arc<dyn UpstreamResolver>;
 
-    // Get IP service from plugin registry
+    // Get services from plugin registry
     let ip_service = context.require_service::<temps_geo::IpAddressService>();
+    let config_service = context.require_service::<temps_config::ConfigService>();
 
-    let request_logger =
-        Arc::new(RequestLoggerImpl::new(LoggingConfig::default(), db.clone(), ip_service.clone())) as Arc<dyn RequestLogger>;
+    let request_logger = Arc::new(RequestLoggerImpl::new(
+        LoggingConfig::default(),
+        db.clone(),
+        ip_service.clone(),
+    )) as Arc<dyn RequestLogger>;
 
-    let proxy_log_service = Arc::new(crate::service::proxy_log_service::ProxyLogService::new(db.clone(), ip_service.clone()));
+    let proxy_log_service = Arc::new(crate::service::proxy_log_service::ProxyLogService::new(
+        db.clone(),
+        ip_service.clone(),
+    ));
 
-    let project_context_resolver =
-        Arc::new(ProjectContextResolverImpl::new(route_table.clone())) as Arc<dyn ProjectContextResolver>;
+    let ip_access_control_service = Arc::new(
+        crate::service::ip_access_control_service::IpAccessControlService::new(db.clone()),
+    );
 
-    let visitor_manager =
-        Arc::new(VisitorManagerImpl::new(db.clone(), crypto.clone(), ip_service.clone())) as Arc<dyn VisitorManager>;
+    let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
+        db.clone(),
+    ));
+
+    let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
+        as Arc<dyn ProjectContextResolver>;
+
+    let visitor_manager = Arc::new(VisitorManagerImpl::new(
+        db.clone(),
+        crypto.clone(),
+        ip_service.clone(),
+    )) as Arc<dyn VisitorManager>;
 
     let session_manager =
         Arc::new(SessionManagerImpl::new(db.clone(), crypto.clone())) as Arc<dyn SessionManager>;
@@ -288,6 +360,9 @@ pub fn create_proxy_service(
         session_manager,
         crypto,
         db,
+        config_service,
+        ip_access_control_service,
+        challenge_service,
     );
 
     Ok(lb)

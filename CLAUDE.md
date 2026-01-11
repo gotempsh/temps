@@ -13,11 +13,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Create N+1 queries - ALWAYS use JOINs for related data
 - Leave the project in non-compilable state
 - Use `#[tokio::main]` when integrating with pingora
+- **Use plain text logging** - ALWAYS use structured logging with `append_structured_log()` or helper methods (`log_info`, `log_success`, `log_warning`, `log_error`)
+- **Create markdown documentation files (*.md) unless explicitly requested** - No README files, no documentation files unless the user asks
+- **Auto-generate documentation without explicit request** - Store any auto-generated docs in `thoughts/` directory instead of root
+- **Mark tests with `#[ignore]` when they require Docker/testcontainers** - Docker tests MUST run as part of normal test suite
 
 ### ✅ ALWAYS
 - Run `cargo check --lib` after every modification
 - **New functionality must compile without warnings** - Fix all warnings before considering work complete
 - **Write tests for all new functionality AND verify they run successfully** - Tests that don't run are worthless
+- **Use structured logging with explicit log levels** - All logs must use `append_structured_log(log_id, LogLevel, message)` or helper methods
+- **Use Conventional Commits** - Format: `type(scope): description` (e.g., `feat: add user authentication`, `fix(api): handle null responses`)
+  - Types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`, `perf`, `ci`, `build`, `revert`
+  - CHANGELOG is auto-generated from commits using `git-cliff`
 - Use services for all business logic
 - Implement pagination (default: 20, max: 100) and sorting (default: created_at DESC)
 - Use typed error handling with proper propagation
@@ -25,6 +33,112 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Keep tests for a class/service in the same file, not in separate test files
 - Return dates in ISO 8601 format with `Z` suffix for UTC times
 - Use `permission_check!` macro for authorization in handlers
+
+## Commit Message Format
+
+Follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<type>[optional scope]: <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+**Types:**
+- `feat:` - New feature (→ Added in CHANGELOG)
+- `fix:` - Bug fix (→ Fixed in CHANGELOG)
+- `docs:` - Documentation only
+- `style:` - Code style (formatting, no logic change)
+- `refactor:` - Code refactoring
+- `perf:` - Performance improvement
+- `test:` - Adding tests
+- `build:` - Build system changes
+- `ci:` - CI configuration
+- `chore:` - Other changes (dependencies, tooling)
+- `revert:` - Revert previous commit
+
+**Examples:**
+```bash
+feat(auth): add JWT token refresh
+fix(api): handle null response from external service
+docs: update installation instructions
+chore(deps): update rust dependencies
+```
+
+**Generate CHANGELOG:**
+```bash
+# Install git-cliff
+cargo install git-cliff
+
+# Generate changelog for unreleased changes
+git cliff --unreleased --prepend CHANGELOG.md
+
+# Generate changelog for specific version
+git cliff --tag v1.0.0 --prepend CHANGELOG.md
+```
+
+## Development Setup
+
+### Initial Setup
+
+**One-time setup for git hooks:**
+```bash
+./scripts/setup-hooks.sh
+```
+
+This script will:
+- Detect or prompt you to choose between `prek` (Rust-based) or `pre-commit` (Python-based)
+- Install the chosen framework if not already installed
+- Configure git hooks that run automatically on commit
+
+The hooks include:
+- Conventional Commits validator
+- Changelog format validator
+- Code formatting (cargo fmt)
+- Linting (cargo clippy)
+- YAML validation
+- Trailing whitespace fixes
+
+**Add to your shell profile (~/.zshrc or ~/.bashrc):**
+```bash
+# If using pre-commit (Python-based)
+export PATH="$HOME/Library/Python/3.9/bin:$PATH"  # macOS
+export PATH="$HOME/.local/bin:$PATH"              # Linux
+
+# If using prek (Rust-based)
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+**Run hooks manually:**
+```bash
+# If using prek
+prek run --all-files
+
+# If using pre-commit
+pre-commit run --all-files
+```
+
+### Pre-commit Hooks
+
+Hooks run **automatically** on `git commit`:
+- ✅ Validates commit message format (Conventional Commits)
+- ✅ Runs `cargo fmt`
+- ✅ Runs `cargo clippy`
+- ✅ Validates CHANGELOG.md format
+- ✅ Checks YAML files
+- ✅ Fixes trailing whitespace
+
+**Manual run:**
+```bash
+pre-commit run --all-files
+```
+
+**Skip hooks (not recommended):**
+```bash
+git commit --no-verify
+```
 
 ## Build & Test Commands
 
@@ -43,6 +157,44 @@ cargo build --bin temps
 cargo build --release --bin temps
 ```
 
+### Web Build Integration
+
+The web UI is automatically built during `cargo build` via `temps-cli/build.rs` and placed in `temps-cli/dist/`.
+
+**Development (Debug) Mode - Web build SKIPPED by default:**
+```bash
+# Fast Rust development (skips web build)
+cargo build
+
+# Force web build in debug mode
+FORCE_WEB_BUILD=1 cargo build
+```
+
+**Release Mode - Web build INCLUDED automatically:**
+```bash
+# Build with web UI (automatic)
+cargo build --release
+
+# Skip web build even in release
+SKIP_WEB_BUILD=1 cargo build --release
+```
+
+**Manual web build:**
+```bash
+cd web
+bun install
+bun run build
+
+# Output to temps-cli/dist
+RSBUILD_OUTPUT_PATH=../crates/temps-cli/dist bun run build
+```
+
+**Important Notes:**
+- In debug mode, a **placeholder** `dist/` directory is created with a development HTML page
+- This prevents build failures since `include_dir!("dist")` requires the directory to exist
+- Tests and debug builds work without building the full web UI
+- The placeholder shows instructions for building the full UI when accessed
+
 ### Test Commands
 ```bash
 # Run unit tests (no external dependencies)
@@ -60,6 +212,125 @@ cargo test -p temps-deployments
 # Run ignored tests (Docker-dependent)
 cargo test -- --ignored
 ```
+
+### Docker Tests (Always Executed - NEVER Ignore)
+
+**CRITICAL RULE:** Tests requiring Docker/testcontainers MUST NOT be marked with `#[ignore]`. They must run as part of the standard test suite.
+
+Some tests in the codebase require Docker to be running and run as part of the standard `cargo test` command:
+
+**Important:** Docker tests will skip gracefully if Docker is not available. They detect Docker availability at runtime and exit early with informational output if Docker cannot be accessed.
+
+**Examples:**
+- `test_postgres_v16_to_v17_actual_upgrade()` in `temps-providers/src/externalsvc/postgres.rs` - Creates PostgreSQL 16 container, upgrades to v17, and verifies via SQL
+- `test_vulnerability_notification_with_mailpit()` in `temps-notifications/src/vulnerability_notifications.rs` - Tests email notifications using Mailpit container
+
+**Characteristics:**
+- ✅ No `#[ignore]` attribute - runs in normal test suite
+- ✅ Execute in normal `cargo test` runs
+- ✅ Skip gracefully if Docker unavailable (no test failure)
+- ✅ Create real Docker containers for end-to-end testing
+- ✅ Clean up resources in test (stops and removes containers)
+- ✅ Use error handling instead of panics for external dependencies
+
+**Running Docker tests:**
+```bash
+# Runs ALL tests including Docker tests (Docker tests will skip if Docker unavailable)
+cargo test --lib
+
+# Run specific Docker test
+cargo test --lib test_postgres_v16_to_v17_actual_upgrade -- --nocapture
+cargo test --lib test_vulnerability_notification_with_mailpit -- --nocapture
+
+# Docker tests are always part of test suite - no special flag needed
+```
+
+**Why NOT to use `#[ignore]`:**
+- Docker tests validate critical functionality (SMTP, databases, external services)
+- They should run in CI/CD pipelines automatically
+- Developers should know immediately if Docker-dependent features break
+- Graceful skipping when Docker is unavailable prevents false failures
+
+### Integration Tests with Pebble (Let's Encrypt ACME)
+
+The `temps-domains` crate includes integration tests that use [Pebble](https://github.com/letsencrypt/pebble), a small ACME test server for testing Let's Encrypt integration.
+
+**Prerequisites:**
+- Docker must be running (testcontainers will automatically start Pebble)
+- **Note**: Pebble tests are marked as `#[ignore]` by default due to TLS certificate requirements (see below)
+
+**Run ACME integration tests:**
+```bash
+# Run all temps-domains tests (excludes Pebble tests marked as ignored)
+cargo test --lib -p temps-domains
+
+# Run ignored Pebble integration tests (requires setup - see below)
+cargo test --lib -p temps-domains test_http01_with_pebble -- --ignored
+cargo test --lib -p temps-domains test_dns01_wildcard_with_pebble -- --ignored
+cargo test --lib -p temps-domains test_http01_rejected_for_wildcard_with_pebble -- --ignored
+
+# Run all tests including ignored ones
+cargo test --lib -p temps-domains -- --ignored
+
+# Run with output to see test progress
+cargo test --lib -p temps-domains -- --nocapture --ignored
+```
+
+**What these tests verify:**
+- ✅ HTTP-01 challenge flow with real ACME server (Pebble)
+- ✅ DNS-01 challenge for wildcard domains (`*.example.com`)
+- ✅ HTTP-01 rejection for wildcard domains (must use DNS-01)
+- ✅ Certificate provisioning and completion
+- ✅ ACME account creation and persistence
+- ✅ Challenge data format and validation
+- ✅ Certificate expiration detection (non-Pebble test, runs by default)
+- ✅ ACME account persistence across sessions (non-Pebble test, runs by default)
+
+**Why Pebble tests are ignored:**
+The Pebble integration tests are marked with `#[ignore]` because Pebble uses self-signed TLS certificates that the `instant-acme` library (via `rustls`) cannot validate by default. This is a common issue with Pebble testing and requires additional setup.
+
+**To run Pebble tests, you have two options:**
+
+1. **Option A: Add Pebble CA to system trust store (Recommended for development)**
+   ```bash
+   # Extract Pebble's CA certificate from the container
+   docker run --rm letsencrypt/pebble cat /test/certs/pebble.minica.pem > pebble-ca.pem
+
+   # macOS: Add to system keychain
+   sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain pebble-ca.pem
+
+   # Linux: Add to ca-certificates
+   sudo cp pebble-ca.pem /usr/local/share/ca-certificates/pebble-ca.crt
+   sudo update-ca-certificates
+
+   # Then run tests
+   cargo test --lib -p temps-domains -- --ignored
+   ```
+
+2. **Option B: Use Let's Encrypt Staging for integration testing**
+
+   For production-like integration testing without Pebble TLS issues, use Let's Encrypt's staging environment:
+   ```bash
+   LETSENCRYPT_MODE=staging cargo test --lib -p temps-domains
+   ```
+
+**How it works:**
+1. Testcontainers automatically pulls and starts the `letsencrypt/pebble` Docker image
+2. Tests configure the ACME client to point to the local Pebble instance via `ACME_DIRECTORY_URL` environment variable
+3. `PEBBLE_VA_ALWAYS_VALID=1` is used to skip actual HTTP/DNS validation challenges
+4. Real ACME protocol flows are executed against Pebble
+5. Tests complete the full challenge flow: `provision()` → `complete_challenge()`
+6. Containers are automatically cleaned up after tests
+
+**Troubleshooting:**
+- **TLS certificate error**: "no native root CA certificates found" → See "Why Pebble tests are ignored" above
+- If tests fail, ensure Docker is running: `docker ps`
+- Pebble startup takes ~3 seconds, tests wait automatically
+- Check Docker logs if Pebble fails to start: `docker logs <container_id>`
+- For full validation testing (not just ACME protocol), you would need:
+  - `pebble-challtestsrv` for DNS resolution
+  - HTTP server on port 80 for HTTP-01 challenges
+  - DNS configuration to resolve test domains
 
 
 ## Workspace Architecture
@@ -93,6 +364,103 @@ This is a **Cargo workspace** with 30+ crates organized by domain:
 - **temps-backup**: Backup and restore operations
 - **temps-config**: Configuration management
 - **temps-audit**: Audit logging
+
+## Logging
+
+### Structured Logging (JSONL Format)
+
+**CRITICAL**: All logs must use structured logging. Plain text logging via `append_to_log()` has been removed.
+
+#### Log Format
+
+All logs are stored in **JSONL (JSON Lines)** format with the following structure:
+
+```json
+{"level":"info","message":"Starting deployment","timestamp":"2025-01-25T12:34:56.789Z","line":1}
+{"level":"success","message":"Deployment complete","timestamp":"2025-01-25T12:35:12.456Z","line":2}
+```
+
+#### Log Levels
+
+- `info` - Informational messages (default)
+- `success` - Successful operations (✅)
+- `warning` - Warnings or non-critical issues (⏳, ⚠️)
+- `error` - Errors or failures (❌)
+
+#### Usage
+
+```rust
+use temps_logs::{LogLevel, LogService};
+
+// Basic usage - explicit level
+log_service
+    .append_structured_log(log_id, LogLevel::Info, "Starting deployment")
+    .await?;
+
+// Helper methods (recommended)
+log_service.log_info(log_id, "Processing...").await?;
+log_service.log_success(log_id, "Deployment complete").await?;
+log_service.log_warning(log_id, "Retrying connection...").await?;
+log_service.log_error(log_id, "Failed to connect").await?;
+```
+
+#### Automatic Level Detection
+
+When streaming logs (e.g., Docker build output), use level detection:
+
+```rust
+fn detect_log_level(message: &str) -> LogLevel {
+    if message.contains("✅") || message.contains("Complete") || message.contains("success") {
+        LogLevel::Success
+    } else if message.contains("❌") || message.contains("Failed") || message.contains("Error") {
+        LogLevel::Error
+    } else if message.contains("⏳") || message.contains("Waiting") || message.contains("warning") {
+        LogLevel::Warning
+    } else {
+        LogLevel::Info
+    }
+}
+
+// Use in callbacks
+let level = detect_log_level(&line);
+log_service.append_structured_log(log_id, level, line).await?;
+```
+
+#### Reading Logs
+
+```rust
+// Get structured logs
+let logs: Vec<LogEntry> = log_service.get_structured_logs(log_id).await?;
+
+// Search logs
+let results = log_service.search_structured_logs(log_id, "error").await?;
+
+// Filter by level
+let errors = log_service
+    .filter_structured_logs_by_level(log_id, LogLevel::Error)
+    .await?;
+```
+
+#### Migration from Plain Text Logging
+
+The `append_to_log()` method has been **removed**. All code must use structured logging:
+
+```rust
+// ❌ REMOVED - Will not compile
+log_service.append_to_log(log_id, "message\n").await?;
+
+// ✅ CORRECT - Use structured logging
+log_service.append_structured_log(log_id, LogLevel::Info, "message").await?;
+
+// ✅ BETTER - Use helper methods
+log_service.log_info(log_id, "message").await?;
+```
+
+**Why removed?**
+- Enforces consistent JSONL format across all logs
+- Prevents accidental plain text logs
+- Requires explicit log level selection
+- Enables frontend to display logs with proper icons, colors, and formatting
 
 ## Architecture
 
@@ -1210,6 +1578,139 @@ docker.remove_container(
 - Boolean fields use plain `bool` instead of `Option<bool>`
 - Network options: `CreateNetworkOptions` → `NetworkCreateRequest`
 
+## Production Docker Deployment
+
+### Multi-Stage Dockerfile
+
+The project includes a production-ready `Dockerfile` with multi-stage build:
+
+**Stages:**
+1. **Builder**: Compiles Rust binary with cargo
+2. **GeoLite2-Downloader**: Optionally downloads MaxMind database
+3. **Runtime**: Alpine-based final image with binary and database
+
+**Features:**
+- Multi-stage build keeps final image small (~100MB)
+- Non-root user execution (security best practice)
+- Health checks via HTTP endpoint
+- Optional GeoLite2 database embedding
+- Support for both embedded and mounted databases
+
+**Build Commands:**
+
+```bash
+# Without embedded database (user downloads manually)
+docker build -t temps:latest .
+
+# With embedded GeoLite2 database (requires MAXMIND_LICENSE_KEY)
+docker build -t temps:latest \
+  --build-arg MAXMIND_LICENSE_KEY=your_license_key .
+
+# Run the container
+docker run -d \
+  --name temps \
+  -p 3000:3000 \
+  -e TEMPS_DATABASE_URL="postgresql://user:password@postgres:5432/temps" \
+  -v temps_data:/app/data \
+  temps:latest
+```
+
+### Docker Compose Setup
+
+The project includes `docker-compose.yml` with complete stack:
+
+**Services:**
+- **PostgreSQL + TimescaleDB**: Database with time-series extension
+- **Redis**: Cache service
+- **Temps Application**: Main service with health checks
+
+**Features:**
+- Service dependencies with health checks
+- Volume management for data persistence
+- Network isolation
+- Pre-configured environment variables
+
+**Quick Start:**
+
+```bash
+# Start all services
+docker-compose up -d
+
+# View logs
+docker-compose logs -f temps
+
+# Stop services
+docker-compose down
+
+# Stop and remove volumes (WARNING: deletes data)
+docker-compose down -v
+```
+
+**Environment Configuration** (in docker-compose.yml):
+```yaml
+TEMPS_DATABASE_URL: postgresql://temps:password@postgres:5432/temps
+TEMPS_ADDRESS: 0.0.0.0:3000
+TEMPS_DATA_DIR: /app/data
+REDIS_URL: redis://redis:6379
+```
+
+### GeoLite2 Database Management
+
+**Philosophy:** Zero system dependencies - MaxMind database must be downloaded by user
+
+**Implementation:**
+- File: `crates/temps-cli/src/commands/serve/console.rs` - Function: `validate_geolite2_database()`
+- Validation runs at console API startup (pre-validation before plugin initialization)
+- If database missing, clear error message with setup instructions
+
+**Setup Options:**
+
+1. **Manual Download (Recommended)**
+   - Download from: https://www.maxmind.com/en/geolite2/geolite2-free-data-sources
+   - Extract: `tar xzf GeoLite2-City_*.tar.gz`
+   - Place at: `~/.temps/GeoLite2-City.mmdb`
+
+2. **Docker with Embedded Database**
+   - Use MAXMIND_LICENSE_KEY build argument
+   - Database auto-downloaded and embedded during build
+   - No runtime setup needed
+
+3. **Docker with Volume Mount**
+   - Download database locally
+   - Mount to container: `-v ./GeoLite2-City.mmdb:/app/data/GeoLite2-City.mmdb:ro`
+
+4. **Docker Compose Method**
+   - Set `MAXMIND_LICENSE_KEY` in docker-compose.yml build args
+   - Or uncomment volume mount and provide local database
+
+**Error Handling:**
+- Missing database shows friendly error with download instructions
+- No external tools required (geoipupdate)
+- Geolocation features gracefully disabled if database unavailable
+- Clear distinction between setup instructions (pre-validation) and runtime errors
+
+### Dockerfile Best Practices
+
+**What's Included:**
+- Alpine base image (small footprint)
+- Build cache mounts for faster rebuilds
+- Security: non-root user, read-only volumes where applicable
+- Health checks (HTTP endpoint check)
+- Signal handling with dumb-init
+
+**Build Cache Optimization:**
+```dockerfile
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --bin temps
+```
+
+**See Files:**
+- `Dockerfile` - Multi-stage production build
+- `.dockerignore` - Optimizes build context
+- `docker-compose.yml` - Complete stack for development/deployment
+
 ## CLI Commands
 
 ### Available Commands
@@ -1870,13 +2371,22 @@ const syncMutation = useMutation({
 
 ### React Component Best Practices
 
-#### Avoid IIFEs (Immediately Invoked Function Expressions) in JSX
+#### CRITICAL: NO IFEs (Immediately Invoked Function Expressions) in JSX
 
-**NEVER use auto-callable functions (IIFEs) in React components.** Instead, extract logic into separate components, helper functions, or use proper React patterns.
+**🚫 ABSOLUTELY FORBIDDEN: NEVER use auto-callable functions (IFEs) in React components under ANY circumstances.**
 
-**Why?**
+IFEs violate React's rules of hooks and cause the error: **"Rendered more hooks than during the previous render" (React Error #310)**
+
+Instead, ALWAYS extract logic into:
+- Separate helper functions (preferred for simple logic)
+- Separate components (preferred for complex JSX)
+- useMemo/useCallback hooks (for expensive computations)
+
+**Why IFEs are FORBIDDEN:**
+- **Violates React's rules of hooks** - Can cause variable number of hooks between renders
+- **Causes React Error #310** - "Rendered more hooks than during the previous render"
 - Reduces code readability and maintainability
-- Makes components harder to test
+- Makes components impossible to test properly
 - Hides logic that should be in reusable components or helper functions
 - Creates unnecessary complexity in JSX
 
@@ -2005,21 +2515,284 @@ function EventList({ events }) {
 }
 ```
 
-**When IIFEs are acceptable:**
-- Simple type casting that TypeScript requires (but prefer helper functions)
-- Very simple transformations that don't warrant a separate function (1-2 lines max)
+**There are NO exceptions to this rule. ALL IFEs must be replaced with helper functions or separate components.**
 
 ```tsx
-// Acceptable for simple type casting (but still prefer helper functions)
-<pre>
-  {(() => {
-    const data = event.data
-    const formatted: string = typeof data === 'object' && data !== null
-      ? JSON.stringify(data, null, 2)
-      : String(data)
-    return formatted
-  })()}
-</pre>
+// ✅ CORRECT - Even for "simple" type casting, use a helper function
+function formatEventData(data: unknown): string {
+  return typeof data === 'object' && data !== null
+    ? JSON.stringify(data, null, 2)
+    : String(data)
+}
+
+<pre>{formatEventData(event.data)}</pre>
+```
+
+#### CRITICAL: NO Hooks After Early Returns
+
+**🚫 ABSOLUTELY FORBIDDEN: NEVER call hooks after early return statements.**
+
+This violates React's Rules of Hooks and causes the error: **"Rendered more hooks than during the previous render" (React Error #310)**
+
+**React's Rules of Hooks:**
+- Hooks must be called in the **exact same order** on every render
+- Hooks must be called at the **top level** of the component
+- Hooks must **NOT** be called inside conditions, loops, or after early returns
+
+**Why this is CRITICAL:**
+- When you return early, hooks after the return are skipped in some renders but not others
+- This creates a variable number of hooks between renders
+- React relies on the order of hook calls to maintain state correctly
+- Violating this rule causes React Error #310 and component crashes
+
+**Examples:**
+
+```tsx
+// ❌ CRITICALLY BAD - Hook called after early return
+function MyComponent() {
+  const [data, setData] = useState(null)
+  const { isLoading } = useQuery({ ... })
+
+  if (isLoading) {
+    return <Spinner />  // Early return
+  }
+
+  // ❌ ERROR! This useEffect is called after the early return
+  // When isLoading=true, useEffect is skipped
+  // When isLoading=false, useEffect is called
+  // This creates variable number of hooks → React Error #310
+  useEffect(() => {
+    console.log('Data loaded')
+  }, [data])
+
+  return <div>{data}</div>
+}
+
+// ✅ CORRECT - All hooks called before early return
+function MyComponent() {
+  const [data, setData] = useState(null)
+  const { isLoading } = useQuery({ ... })
+
+  // ✅ CORRECT - useEffect called BEFORE early return
+  useEffect(() => {
+    console.log('Data loaded')
+  }, [data])
+
+  if (isLoading) {
+    return <Spinner />  // Early return is now safe
+  }
+
+  return <div>{data}</div>
+}
+```
+
+```tsx
+// ❌ CRITICALLY BAD - Multiple violations
+function UserProfile({ userId }: { userId: string }) {
+  const [user, setUser] = useState(null)
+
+  if (!userId) {
+    return <div>No user ID provided</div>
+  }
+
+  // ❌ ERROR! Hook called after conditional return
+  const { data } = useQuery({
+    queryKey: ['user', userId],
+    queryFn: () => fetchUser(userId),
+  })
+
+  // ❌ ERROR! Another hook after conditional return
+  useEffect(() => {
+    setUser(data)
+  }, [data])
+
+  return <div>{user?.name}</div>
+}
+
+// ✅ CORRECT - All hooks before any returns
+function UserProfile({ userId }: { userId: string }) {
+  const [user, setUser] = useState(null)
+
+  // ✅ CORRECT - All hooks called first
+  const { data } = useQuery({
+    queryKey: ['user', userId],
+    queryFn: () => fetchUser(userId),
+    enabled: !!userId,  // Use 'enabled' to conditionally execute query
+  })
+
+  useEffect(() => {
+    setUser(data)
+  }, [data])
+
+  // Early returns AFTER all hooks
+  if (!userId) {
+    return <div>No user ID provided</div>
+  }
+
+  return <div>{user?.name}</div>
+}
+```
+
+**Common Patterns to Avoid:**
+
+```tsx
+// ❌ BAD PATTERNS
+
+// Pattern 1: Hook after loading check
+if (isLoading) return <Spinner />
+useEffect(() => { ... }, [])  // ❌ Skipped when loading
+
+// Pattern 2: Hook after null check
+if (!data) return null
+const derived = useMemo(() => processData(data), [data])  // ❌ Skipped when no data
+
+// Pattern 3: Hook after error check
+if (error) return <Error />
+const mutation = useMutation({ ... })  // ❌ Skipped when error
+
+// Pattern 4: Hook after permission check
+if (!hasPermission) return <Unauthorized />
+const [value, setValue] = useState('')  // ❌ Skipped without permission
+```
+
+**Checklist for Every Component:**
+1. ✅ All `useState`, `useEffect`, `useMemo`, `useCallback`, `useQuery`, `useMutation` called first
+2. ✅ No early returns before all hooks
+3. ✅ No conditional hook calls
+4. ✅ No hooks inside if statements, loops, or functions
+
+**If you need conditional logic:**
+- Use conditional parameters inside hooks (e.g., `enabled` in useQuery)
+- Use conditional JSX in the return statement
+- Extract conditional logic to separate components
+
+#### CRITICAL: NO Conditional Component Mounting for Components with Hooks
+
+**🚫 NEVER conditionally mount/unmount components that contain hooks (especially dialogs, modals, forms).**
+
+**Problem:** When you conditionally render a component with `{condition && <Component />}`, the component is **mounted and unmounted** each time the condition changes. This destroys all internal hooks state (useState, useForm, useQuery, etc.) and can cause errors when the component remounts.
+
+**Solution:** Always render the component and control its visibility through props (like `open` for dialogs).
+
+**Examples:**
+
+```tsx
+// ❌ CRITICALLY BAD - Conditionally mounting dialog component
+function MyWizard() {
+  const [selectedType, setSelectedType] = useState<string | null>(null)
+  const [isDialogOpen, setIsDialogOpen] = useState(false)
+
+  return (
+    <div>
+      <Button onClick={() => {
+        setSelectedType('postgres')
+        setIsDialogOpen(true)
+      }}>
+        Create Service
+      </Button>
+
+      {/* ❌ ERROR! Dialog unmounts when selectedType changes to null */}
+      {/* All form state, hooks are destroyed on unmount */}
+      {selectedType && (
+        <CreateServiceDialog
+          open={isDialogOpen}
+          serviceType={selectedType}
+          onOpenChange={setIsDialogOpen}
+        />
+      )}
+    </div>
+  )
+}
+
+// ✅ CORRECT - Always mounted, control visibility with open prop
+function MyWizard() {
+  const [selectedType, setSelectedType] = useState<string | null>(null)
+  const [isDialogOpen, setIsDialogOpen] = useState(false)
+
+  return (
+    <div>
+      <Button onClick={() => {
+        setSelectedType('postgres')
+        setIsDialogOpen(true)
+      }}>
+        Create Service
+      </Button>
+
+      {/* ✅ CORRECT - Dialog always mounted, only open state changes */}
+      <CreateServiceDialog
+        open={isDialogOpen && !!selectedType}
+        serviceType={selectedType || 'postgres'}
+        onOpenChange={(open) => {
+          setIsDialogOpen(open)
+          if (!open) setSelectedType(null)
+        }}
+      />
+    </div>
+  )
+}
+```
+
+```tsx
+// ❌ BAD - Conditionally mounting form component
+function UserProfile() {
+  const [isEditing, setIsEditing] = useState(false)
+
+  return (
+    <div>
+      {isEditing && <EditUserForm />}  {/* ❌ Unmounts and remounts */}
+    </div>
+  )
+}
+
+// ✅ GOOD - Control visibility with props or CSS
+function UserProfile() {
+  const [isEditing, setIsEditing] = useState(false)
+
+  return (
+    <div>
+      <EditUserForm
+        open={isEditing}
+        onOpenChange={setIsEditing}
+      />
+    </div>
+  )
+}
+
+// ✅ ALSO GOOD - Use conditional rendering only if component is stateless
+function UserProfile() {
+  const [isEditing, setIsEditing] = useState(false)
+
+  return (
+    <div>
+      {isEditing ? (
+        <EditUserForm onClose={() => setIsEditing(false)} />
+      ) : (
+        <ViewUserProfile onEdit={() => setIsEditing(true)} />
+      )}
+    </div>
+  )
+}
+```
+
+**When is conditional mounting safe?**
+- ✅ Stateless presentational components (no hooks, just props → JSX)
+- ✅ Simple components that don't use forms, queries, or complex state
+- ✅ Components that are intentionally designed to reset state on remount
+
+**When you MUST avoid conditional mounting:**
+- ❌ Dialog/Modal components with forms inside
+- ❌ Components using useForm, useQuery, useMutation
+- ❌ Components with complex useState or useEffect logic
+- ❌ Any component where you want to preserve state between visibility changes
+
+**Pattern for Dialogs/Modals:**
+```tsx
+// Always use this pattern for dialogs
+<Dialog open={isOpen && someCondition} onOpenChange={setIsOpen}>
+  <DialogContent>
+    {/* Form content */}
+  </DialogContent>
+</Dialog>
 ```
 
 #### Use Mutation/Query States Instead of Manual State Variables

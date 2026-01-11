@@ -4,9 +4,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
 
+pub mod mongodb;
 pub mod postgres;
 pub mod redis;
+pub mod rustfs;
 pub mod s3;
+
+// Test utilities for backup and restore testing
+#[cfg(test)]
+pub mod test_utils;
+
+// Re-export services for easier access
+pub use mongodb::MongodbService;
+pub use postgres::PostgresService;
+pub use redis::RedisService;
+pub use rustfs::RustfsService;
+pub use s3::S3Service;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
@@ -15,37 +28,61 @@ pub struct ServiceConfig {
     pub version: Option<String>,
     pub parameters: serde_json::Value,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ServiceType {
+    Mongodb,
     Postgres,
     Redis,
     S3,
+    /// RustFS S3-compatible object storage (standalone)
+    Rustfs,
+    /// Temps KV service (Redis-backed key-value store)
+    Kv,
+    /// Temps Blob service (RustFS-backed object storage)
+    Blob,
 }
 
 impl std::fmt::Display for ServiceType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ServiceType::Mongodb => write!(f, "mongodb"),
             ServiceType::Postgres => write!(f, "postgres"),
             ServiceType::Redis => write!(f, "redis"),
             ServiceType::S3 => write!(f, "s3"),
+            ServiceType::Rustfs => write!(f, "rustfs"),
+            ServiceType::Kv => write!(f, "kv"),
+            ServiceType::Blob => write!(f, "blob"),
         }
     }
 }
 
 impl ServiceType {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
+            "mongodb" => Ok(ServiceType::Mongodb),
             "postgres" => Ok(ServiceType::Postgres),
             "redis" => Ok(ServiceType::Redis),
             "s3" => Ok(ServiceType::S3),
+            "rustfs" => Ok(ServiceType::Rustfs),
+            "kv" => Ok(ServiceType::Kv),
+            "blob" => Ok(ServiceType::Blob),
             _ => Err(anyhow::anyhow!("Invalid service type: {}", s)),
         }
     }
 
     /// Returns a Vec containing all available service types
     pub fn get_all() -> Vec<ServiceType> {
-        vec![ServiceType::Postgres, ServiceType::Redis, ServiceType::S3]
+        vec![
+            ServiceType::Mongodb,
+            ServiceType::Postgres,
+            ServiceType::Redis,
+            ServiceType::S3,
+            ServiceType::Rustfs,
+            ServiceType::Kv,
+            ServiceType::Blob,
+        ]
     }
 
     /// Returns a Vec containing string representations of all available service types
@@ -65,6 +102,9 @@ pub struct ServiceParameter {
     pub description: String,
     pub default_value: Option<String>,
     pub validation_pattern: Option<String>,
+    /// Optional list of valid choices for this parameter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choices: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,9 +119,32 @@ pub struct RuntimeEnvVar {
     pub name: String,
     pub description: String,
     pub example: String,
+    /// Whether this variable contains sensitive data (passwords, keys, tokens)
+    pub sensitive: bool,
+}
+
+/// Information about an available Docker container that can be imported
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AvailableContainer {
+    /// Container ID or name
+    pub container_id: String,
+    /// Container name
+    pub container_name: String,
+    /// Docker image name (e.g., "postgres:17-alpine")
+    pub image: String,
+    /// Extracted version from image (e.g., "17")
+    pub version: String,
+    /// Service type this container represents
+    pub service_type: ServiceType,
+    /// Whether the container is currently running
+    pub is_running: bool,
+    /// Exposed ports (e.g., [5432] for PostgreSQL, [6379] for Redis)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exposed_ports: Vec<u16>,
 }
 
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait ExternalService: Send + Sync {
     /// Initialize the service with given configuration
     /// Returns a HashMap of inferred parameters that should be stored
@@ -102,47 +165,9 @@ pub trait ExternalService: Send + Sync {
     /// Cleanup/shutdown the service
     async fn cleanup(&self) -> Result<()>;
 
-    /// Get required parameters and their validation rules
-    fn get_parameter_definitions(&self) -> Vec<ServiceParameter>;
-
-    /// Validate parameters against the service's requirements
-    fn validate_parameters(&self, parameters: &HashMap<String, String>) -> Result<()> {
-        let required_params = self.get_parameter_definitions();
-
-        // Check for required parameters
-        for param in &required_params {
-            if param.required {
-                if !parameters.contains_key(&param.name) {
-                    return Err(anyhow::anyhow!(
-                        "Missing required parameter: {}",
-                        param.name
-                    ));
-                }
-            }
-        }
-
-        // Validate each provided parameter
-        for (key, value) in parameters {
-            if let Some(param) = required_params.iter().find(|p| p.name == *key) {
-                // Check validation pattern if it exists
-                if let Some(pattern) = &param.validation_pattern {
-                    let regex = regex::Regex::new(pattern)
-                        .map_err(|_| anyhow::anyhow!("Invalid validation pattern for {}", key))?;
-
-                    if !regex.is_match(value) {
-                        return Err(anyhow::anyhow!(
-                            "Parameter {} value does not match required pattern",
-                            key
-                        ));
-                    }
-                }
-            } else {
-                return Err(anyhow::anyhow!("Unknown parameter: {}", key));
-            }
-        }
-
-        Ok(())
-    }
+    /// Get parameter schema as JSON Schema
+    /// Services must implement this to provide their configuration schema
+    fn get_parameter_schema(&self) -> Option<serde_json::Value>;
 
     /// Start the service
     async fn start(&self) -> Result<()>;
@@ -198,6 +223,11 @@ pub trait ExternalService: Send + Sync {
     }
     fn get_local_address(&self, service_config: ServiceConfig) -> Result<String>;
 
+    /// Get the effective host and port for connecting to this service
+    /// In Docker mode, returns (container_name, internal_port)
+    /// In Baremetal mode, returns (localhost, exposed_port)
+    fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)>;
+
     /// Backup the service data to an S3 location
     /// s3_source: The S3 source configuration to use for backup
     /// subpath: The subpath within the S3 bucket where the backup should be stored
@@ -224,5 +254,66 @@ pub trait ExternalService: Send + Sync {
         _service_config: ServiceConfig,
     ) -> Result<()> {
         Err(anyhow::anyhow!("Restore not implemented for this service"))
+    }
+
+    /// Upgrade the service to a new version/image with data migration
+    /// This method handles version-specific upgrade logic (e.g., pg_upgrade for PostgreSQL)
+    ///
+    /// # Arguments
+    /// * `old_config` - Configuration of the current running service
+    /// * `new_config` - Configuration with the new version/image
+    ///
+    /// # Returns
+    /// * `Ok(())` if upgrade successful
+    /// * `Err(...)` if upgrade failed or not supported
+    async fn upgrade(&self, _old_config: ServiceConfig, _new_config: ServiceConfig) -> Result<()> {
+        Err(anyhow::anyhow!("Upgrade not implemented for this service"))
+    }
+
+    /// Get the default/recommended Docker image and version for this service
+    /// Returns (image_name, version) tuple
+    fn get_default_docker_image(&self) -> (String, String) {
+        ("".to_string(), "latest".to_string())
+    }
+
+    /// Get the currently running Docker image and version for this service
+    /// Returns (image_name, version) tuple
+    async fn get_current_docker_image(&self) -> Result<(String, String)> {
+        Err(anyhow::anyhow!(
+            "Getting current docker image not implemented for this service"
+        ))
+    }
+
+    /// Get the default/recommended version for this service
+    fn get_default_version(&self) -> String {
+        "latest".to_string()
+    }
+
+    /// Get the currently running version for this service
+    async fn get_current_version(&self) -> Result<String> {
+        Err(anyhow::anyhow!(
+            "Getting current version not implemented for this service"
+        ))
+    }
+
+    /// Import an existing running Docker container as a managed service
+    /// User provides container ID and necessary credentials/configuration
+    ///
+    /// # Arguments
+    /// * `container_id` - Docker container ID or name of the running service
+    /// * `service_name` - Name to register the service as in Temps
+    /// * `credentials` - User-provided credentials (username, password, etc)
+    /// * `additional_config` - Any additional configuration needed (ports, paths, etc)
+    ///
+    /// # Returns
+    /// * Returns registered ServiceConfig with managed parameters
+    async fn import_from_container(
+        &self,
+        _container_id: String,
+        _service_name: String,
+        _credentials: HashMap<String, String>,
+        _additional_config: serde_json::Value,
+    ) -> Result<ServiceConfig> {
+        Err(anyhow::anyhow!("Import not implemented for this service"))
     }
 }

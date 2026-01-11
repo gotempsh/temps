@@ -1,17 +1,11 @@
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    response::IntoResponse,
-    routing::get,
-    http::HeaderMap,
-    Json, Router
-};
+use axum::{extract::State, http::HeaderMap, response::IntoResponse, routing::get, Json, Router};
 use tracing::{debug, info};
 use utoipa::OpenApi;
 
-use crate::types::{PlatformInfo, ServiceAccessInfo};
 use crate::services::PlatformInfoService;
+use crate::types::{PlatformInfo, ServiceAccessInfo};
 
 /// Application state containing the platform info service
 pub trait InfraAppState: Send + Sync + 'static {
@@ -40,9 +34,7 @@ pub struct PlatformInfoApiDoc;
     ),
     tag = "Platform"
 )]
-pub async fn get_platform_info<T>(
-    State(app_state): State<Arc<T>>,
-) -> impl IntoResponse
+pub async fn get_platform_info<T>(State(app_state): State<Arc<T>>) -> impl IntoResponse
 where
     T: InfraAppState,
 {
@@ -70,9 +62,7 @@ where
     ),
     tag = "Platform"
 )]
-pub async fn get_public_ip<T>(
-    State(app_state): State<Arc<T>>,
-) -> impl IntoResponse
+pub async fn get_public_ip<T>(State(app_state): State<Arc<T>>) -> impl IntoResponse
 where
     T: InfraAppState,
 {
@@ -102,28 +92,22 @@ where
     ),
     tag = "Platform"
 )]
-pub async fn get_private_ip<T>(
-    State(app_state): State<Arc<T>>,
-) -> impl IntoResponse
+pub async fn get_private_ip<T>(State(app_state): State<Arc<T>>) -> impl IntoResponse
 where
     T: InfraAppState,
 {
     info!("Getting private IP address");
 
     match app_state.platform_info_service().get_private_ip().await {
-        Ok(ip_info) => {
-            Json(serde_json::json!({
-                "primary_ip": ip_info.primary_ip,
-                "ipv4_addresses": ip_info.ipv4_addresses,
-                "ipv6_addresses": ip_info.ipv6_addresses
-            }))
-        }
-        Err(e) => {
-            Json(serde_json::json!({
-                "error": "Unable to get network interfaces",
-                "details": e.to_string()
-            }))
-        }
+        Ok(ip_info) => Json(serde_json::json!({
+            "primary_ip": ip_info.primary_ip,
+            "ipv4_addresses": ip_info.ipv4_addresses,
+            "ipv6_addresses": ip_info.ipv6_addresses
+        })),
+        Err(e) => Json(serde_json::json!({
+            "error": "Unable to get network interfaces",
+            "details": e.to_string()
+        })),
     }
 }
 
@@ -150,19 +134,28 @@ where
     debug!("Getting service access information");
 
     // Get server mode using the enhanced service
-    let server_mode = app_state.platform_info_service()
-        .get_server_mode_from_headers(&headers).await;
+    let server_mode = app_state
+        .platform_info_service()
+        .get_server_mode_from_headers(&headers)
+        .await;
 
     // Always get both public and private IPs (with automatic fallback to fetch if not cached)
-    let public_ip = app_state.platform_info_service().get_public_ip_with_fallback().await;
-    let private_ip = app_state.platform_info_service().get_private_ip_with_fallback().await;
+    let public_ip = app_state
+        .platform_info_service()
+        .get_public_ip_with_fallback()
+        .await;
+    let private_ip = app_state
+        .platform_info_service()
+        .get_private_ip_with_fallback()
+        .await;
 
     Json(ServiceAccessInfo {
         access_mode: server_mode.to_string(),
         public_ip,
         private_ip,
         can_create_domains: server_mode.can_create_domains(),
-        domain_creation_error: server_mode.domain_creation_error_message()
+        domain_creation_error: server_mode
+            .domain_creation_error_message()
             .map(|s| s.to_string()),
     })
 }

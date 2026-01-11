@@ -31,10 +31,22 @@ pub struct ServeCommand {
     /// Console/Admin address (defaults to random port on localhost)
     #[arg(long, env = "TEMPS_CONSOLE_ADDRESS")]
     pub console_address: Option<String>,
+
+    /// Screenshot provider to use: "local" (headless Chrome), "remote", or "noop" (disabled)
+    /// Use "noop" on servers without Chrome installed to skip screenshot functionality
+    #[arg(long, env = "TEMPS_SCREENSHOT_PROVIDER", value_parser = ["local", "remote", "noop", "disabled", "none"])]
+    pub screenshot_provider: Option<String>,
 }
 
 impl ServeCommand {
     pub fn execute(self) -> anyhow::Result<()> {
+        // Set screenshot provider from CLI flag (takes precedence over env var)
+        // This allows: temps serve --screenshot-provider=noop
+        if let Some(ref provider) = self.screenshot_provider {
+            std::env::set_var("TEMPS_SCREENSHOT_PROVIDER", provider);
+            debug!("Screenshot provider set to '{}' from CLI flag", provider);
+        }
+
         let serve_config = Arc::new(temps_config::ServerConfig::new(
             self.address.clone(),
             self.database_url.clone(),
@@ -78,7 +90,19 @@ impl ServeCommand {
             }
         });
 
-        // Create a channel to wait for console API to be ready
+        // Start the project change listener
+        let project_listener = temps_routes::ProjectChangeListener::new(
+            self.database_url.clone(),
+            route_table.clone(),
+        );
+        rt.spawn(async move {
+            if let Err(e) = project_listener.start_listening().await {
+                tracing::error!("Project change listener failed: {}", e);
+            }
+        });
+
+        // Create a channel to pass error information back from console API task
+        let (error_tx, mut error_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
         // Start console API server in background with error handling
@@ -96,31 +120,78 @@ impl ServeCommand {
                 encryption_service_clone,
                 route_table_clone,
                 Some(ready_tx),
-            ).await {
-                tracing::error!("Failed to start console API server: {}", e);
+            )
+            .await
+            {
+                let error_msg = format!("{}", e);
+                let error_details = format!("{:?}", e);
+
+                tracing::error!("❌ Failed to start console API server");
+                tracing::error!("Error: {}", error_msg);
+                tracing::error!("Error details: {}", error_details);
                 tracing::error!("Console API server will not be available");
+                tracing::error!(
+                    "Check the logs above for more details about what failed during initialization"
+                );
+
+                // Send error information back to main thread
+                let _ = error_tx.send(error_msg).await;
             }
         });
 
         // Wait for console API to be ready before starting proxy
         info!("Waiting for console API to be ready...");
-        if let Err(err) = rt.block_on(ready_rx) {
-            tracing::error!("Console API failed to start properly: {}", err);
-            return Err(anyhow::anyhow!("Console API failed to start: {}", err));
+        if let Err(recv_err) = rt.block_on(ready_rx) {
+            tracing::error!("❌ Console API failed to start");
+            tracing::error!("Ready signal channel error: {:?}", recv_err);
+            tracing::error!("This means the console API task exited or panicked before sending the ready signal.");
+
+            // Try to get error details from the error channel
+            let error_detail = std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().ok()?;
+                rt.block_on(async {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        error_rx.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Some(msg)) => Some(msg),
+                        _ => None,
+                    }
+                })
+            })
+            .join()
+            .ok()
+            .flatten();
+
+            if let Some(error_detail) = error_detail {
+                tracing::error!("The console API task exited with error: {}", error_detail);
+                return Err(anyhow::anyhow!(
+                    "Console API failed to start: {}",
+                    error_detail
+                ));
+            } else {
+                tracing::error!("The console API task exited without signaling readiness.");
+                tracing::error!("This usually happens when plugin initialization fails.");
+                tracing::error!("Check the error messages above (starting with '❌ Failed to start console API') for details.");
+                return Err(anyhow::anyhow!(
+                    "Console API failed to start - check logs above for the specific error"
+                ));
+            }
         }
-        info!("Console API is ready, starting proxy server...");
+        info!("✅ Console API is ready, starting proxy server...");
 
         // Start proxy server (this will block until shutdown)
         start_proxy_server(
             db,
             self.address.clone(),
             self.tls_address.clone(),
-            serve_config.console_address.clone(),
             cookie_crypto.clone(),
             encryption_service.clone(),
-            serve_config.data_dir.clone(),
             self.database_url.clone(),
             route_table,
+            serve_config.clone(),
         )
     }
 }

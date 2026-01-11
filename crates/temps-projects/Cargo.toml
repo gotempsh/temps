@@ -20,7 +20,7 @@ temps-environments = { path = "../temps-environments" }
 temps-git = { path = "../temps-git" }
 temps-queue = { path = "../temps-queue" }
 temps-providers = { path = "../temps-providers" }
-temps-presets = { path = "../temps-presets" }
+temps-presets = { path = "../temps-presets", features = ["openapi"] }
 serde = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
@@ -40,3 +40,4 @@ flate2 = { workspace = true }
 http = { workspace = true }
 futures-util = { workspace = true }
 slug = { workspace = true }
+url = { workspace = true }

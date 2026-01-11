@@ -5,6 +5,7 @@ use axum::response::IntoResponse;
 use temps_core::error_builder::ErrorBuilder;
 
 /// Helper function to check permission and return appropriate error
+#[allow(clippy::result_large_err)]
 pub fn check_permission_or_error(
     auth: &AuthContext,
     permission: Permission,
@@ -15,7 +16,7 @@ pub fn check_permission_or_error(
             .title("Insufficient Permissions")
             .detail(format!(
                 "This operation requires the {} permission",
-                permission.to_string()
+                permission
             ))
             .value("required_permission", permission.to_string())
             .value("user_role", auth.effective_role.to_string())

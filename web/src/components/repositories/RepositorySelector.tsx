@@ -46,18 +46,18 @@ export function RepositorySelector({
     if (showAsCard) {
       return (
         <Card className={className}>
-          <CardHeader>
-            <CardTitle>{title}</CardTitle>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-lg">{title}</CardTitle>
             {description && (
               <p className="text-sm text-muted-foreground">{description}</p>
             )}
           </CardHeader>
-          <CardContent>
+          <CardContent className="p-4 pt-0">
             <RepositoryList
               connectionId={connectionId}
               onRepositorySelect={handleRepositorySelect}
               showSelection={false}
-              itemsPerPage={6}
+              itemsPerPage={12}
               showHeader={true}
               compactMode={false}
             />
@@ -72,7 +72,7 @@ export function RepositorySelector({
           connectionId={connectionId}
           onRepositorySelect={handleRepositorySelect}
           showSelection={false}
-          itemsPerPage={6}
+          itemsPerPage={12}
           showHeader={true}
           compactMode={false}
         />

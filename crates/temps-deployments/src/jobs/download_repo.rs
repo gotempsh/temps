@@ -5,16 +5,21 @@
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
-use temps_core::{WorkflowTask, JobResult, WorkflowContext, WorkflowError};
+use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_git::GitProviderManagerTrait;
-use temps_logs::LogService;
+use temps_logs::{LogLevel, LogService};
 
 /// Job for downloading repository source code
 pub struct DownloadRepoJob {
     job_id: String,
     repo_owner: String,
     repo_name: String,
-    git_provider_connection_id: i32,
+    /// Git provider connection ID (optional - not needed for public repos)
+    git_provider_connection_id: Option<i32>,
+    /// Direct git URL for public repos or custom git servers
+    git_url: Option<String>,
+    /// Whether this is a public repository (no authentication needed)
+    is_public_repo: bool,
     branch_ref: Option<String>,
     tag_ref: Option<String>,
     commit_sha: Option<String>,
@@ -31,7 +36,12 @@ impl std::fmt::Debug for DownloadRepoJob {
             .field("job_id", &self.job_id)
             .field("repo_owner", &self.repo_owner)
             .field("repo_name", &self.repo_name)
-            .field("git_provider_connection_id", &self.git_provider_connection_id)
+            .field(
+                "git_provider_connection_id",
+                &self.git_provider_connection_id,
+            )
+            .field("git_url", &self.git_url)
+            .field("is_public_repo", &self.is_public_repo)
             .field("branch_ref", &self.branch_ref)
             .field("tag_ref", &self.tag_ref)
             .field("commit_sha", &self.commit_sha)
@@ -41,6 +51,7 @@ impl std::fmt::Debug for DownloadRepoJob {
 }
 
 impl DownloadRepoJob {
+    /// Create a new download job for a private repository (with git provider connection)
     pub fn new(
         job_id: String,
         repo_owner: String,
@@ -52,7 +63,34 @@ impl DownloadRepoJob {
             job_id,
             repo_owner,
             repo_name,
-            git_provider_connection_id,
+            git_provider_connection_id: Some(git_provider_connection_id),
+            git_url: None,
+            is_public_repo: false,
+            branch_ref: None,
+            tag_ref: None,
+            commit_sha: None,
+            project_directory: None,
+            git_provider_manager,
+            log_id: None,
+            log_service: None,
+        }
+    }
+
+    /// Create a new download job for a public repository (no authentication needed)
+    pub fn new_public(
+        job_id: String,
+        repo_owner: String,
+        repo_name: String,
+        git_url: String,
+        git_provider_manager: Arc<dyn GitProviderManagerTrait>,
+    ) -> Self {
+        Self {
+            job_id,
+            repo_owner,
+            repo_name,
+            git_provider_connection_id: None,
+            git_url: Some(git_url),
+            is_public_repo: true,
             branch_ref: None,
             tag_ref: None,
             commit_sha: None,
@@ -94,15 +132,41 @@ impl DownloadRepoJob {
         self
     }
 
-    /// Write log message to job-specific log file
-    async fn log(&self, message: String) -> Result<(), WorkflowError> {
+    /// Write log message to both job-specific log file and context log writer
+    async fn log(&self, context: &WorkflowContext, message: String) -> Result<(), WorkflowError> {
+        // Detect log level from message content/emojis
+        let level = Self::detect_log_level(&message);
+
+        // Write structured log to job-specific log file
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
-                .append_to_log(log_id, &format!("{}\n", message))
+                .append_structured_log(log_id, level, message.clone())
                 .await
                 .map_err(|e| WorkflowError::Other(format!("Failed to write log: {}", e)))?;
         }
+        // Also write to context log writer (for real-time streaming and test capture)
+        context.log(&message).await?;
         Ok(())
+    }
+
+    /// Detect log level from message content
+    fn detect_log_level(message: &str) -> LogLevel {
+        if message.contains("✅") || message.contains("Complete") || message.contains("success") {
+            LogLevel::Success
+        } else if message.contains("❌")
+            || message.contains("Failed")
+            || message.contains("Error")
+            || message.contains("error")
+        {
+            LogLevel::Error
+        } else if message.contains("⏳")
+            || message.contains("Waiting")
+            || message.contains("warning")
+        {
+            LogLevel::Warning
+        } else {
+            LogLevel::Info
+        }
     }
 
     /// Get the branch/ref to checkout based on priority
@@ -140,37 +204,187 @@ impl DownloadRepoJob {
 
         let temp_dir = std::path::PathBuf::from("/tmp/temps-deployments")
             .join(format!("deployment-{}", unix_epoch));
-        std::fs::create_dir_all(&temp_dir)
-            .map_err(|e| WorkflowError::IoError(e))?;
+        std::fs::create_dir_all(&temp_dir).map_err(WorkflowError::IoError)?;
         Ok(temp_dir)
     }
 
+    /// Clone a public repository using direct git clone (no authentication)
+    async fn clone_public_repository(
+        &self,
+        context: &WorkflowContext,
+        git_url: &str,
+        repo_dir: &std::path::Path,
+    ) -> Result<(), WorkflowError> {
+        self.log(
+            context,
+            format!("Cloning public repository from: {}", git_url),
+        )
+        .await?;
+
+        // Determine clone strategy based on what ref type we have
+        // commit_sha requires full clone + checkout, branches/tags can use shallow clone with --branch
+        let needs_full_clone = self.commit_sha.is_some() && self.tag_ref.is_none();
+
+        if needs_full_clone {
+            let commit_sha = self.commit_sha.as_ref().unwrap();
+            self.log(context, format!("Cloning for commit SHA: {}", commit_sha))
+                .await?;
+
+            // Clone full history to ensure we have the commit
+            let clone_output = tokio::process::Command::new("git")
+                .arg("clone")
+                .arg(git_url)
+                .arg(repo_dir)
+                .output()
+                .await
+                .map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!("Failed to run git clone: {}", e))
+                })?;
+
+            if !clone_output.status.success() {
+                let stderr = String::from_utf8_lossy(&clone_output.stderr);
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "Failed to clone public repository: {}",
+                    stderr
+                )));
+            }
+
+            // Checkout the specific commit
+            let checkout_output = tokio::process::Command::new("git")
+                .arg("checkout")
+                .arg(commit_sha)
+                .current_dir(repo_dir)
+                .output()
+                .await
+                .map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!("Failed to run git checkout: {}", e))
+                })?;
+
+            if !checkout_output.status.success() {
+                let stderr = String::from_utf8_lossy(&checkout_output.stderr);
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "Failed to checkout commit {}: {}",
+                    commit_sha, stderr
+                )));
+            }
+
+            self.log(
+                context,
+                format!("Successfully cloned and checked out commit: {}", commit_sha),
+            )
+            .await?;
+        } else {
+            // For tags and branches, use --branch with shallow clone
+            // Priority: tag_ref > branch_ref > default branch
+            let branch_arg = self
+                .tag_ref
+                .as_ref()
+                .or(self.branch_ref.as_ref())
+                .cloned()
+                .unwrap_or_else(|| "master".to_string());
+
+            self.log(context, format!("Cloning with --branch {}", branch_arg))
+                .await?;
+
+            let output = tokio::process::Command::new("git")
+                .arg("clone")
+                .arg("--depth=1")
+                .arg("--branch")
+                .arg(&branch_arg)
+                .arg(git_url)
+                .arg(repo_dir)
+                .output()
+                .await
+                .map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!("Failed to run git clone: {}", e))
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "Failed to clone public repository: {}",
+                    stderr
+                )));
+            }
+
+            self.log(
+                context,
+                format!("Successfully cloned at ref: {}", branch_arg),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     /// Download repository source code with real-time logging
-    async fn download_repository(&self, context: &WorkflowContext) -> Result<PathBuf, WorkflowError> {
-        self.log(format!("🔽 Starting repository download for {}/{}", self.repo_owner, self.repo_name)).await?;
+    async fn download_repository(
+        &self,
+        context: &WorkflowContext,
+    ) -> Result<PathBuf, WorkflowError> {
+        self.log(
+            context,
+            format!(
+                "🔽 Starting repository download for {}/{}",
+                self.repo_owner, self.repo_name
+            ),
+        )
+        .await?;
 
         let checkout_ref = self.get_checkout_ref(context);
-        self.log(format!("📌 Checking out ref: {}", checkout_ref)).await?;
+        self.log(context, format!("Checking out ref: {}", checkout_ref))
+            .await?;
 
         // Create temp directory
         let temp_dir = self.create_temp_dir(context)?;
         let repo_dir = temp_dir.join("repository");
-        std::fs::create_dir_all(&repo_dir)
-            .map_err(|e| WorkflowError::IoError(e))?;
+        std::fs::create_dir_all(&repo_dir).map_err(WorkflowError::IoError)?;
 
-        self.log(format!("📁 Created repository directory at: {}", repo_dir.display())).await?;
+        self.log(
+            context,
+            format!("Created repository directory at: {}", repo_dir.display()),
+        )
+        .await?;
+
+        // Handle public repos differently - use direct git clone
+        if self.is_public_repo {
+            if let Some(ref git_url) = self.git_url {
+                self.clone_public_repository(context, git_url, &repo_dir)
+                    .await?;
+                return Ok(repo_dir);
+            } else {
+                return Err(WorkflowError::JobExecutionFailed(
+                    "Public repository requires git_url to be set".to_string(),
+                ));
+            }
+        }
+
+        // For private repos, verify we have a connection ID
+        let connection_id = self.git_provider_connection_id.ok_or_else(|| {
+            WorkflowError::JobExecutionFailed(
+                "Private repository requires git_provider_connection_id".to_string(),
+            )
+        })?;
 
         // Try download archive first (faster)
         let archive_path = temp_dir.join("source.tar.gz");
-        match self.git_provider_manager.download_archive(
-            self.git_provider_connection_id,
-            &self.repo_owner,
-            &self.repo_name,
-            &checkout_ref,
-            &archive_path,
-        ).await {
+        match self
+            .git_provider_manager
+            .download_archive(
+                connection_id,
+                &self.repo_owner,
+                &self.repo_name,
+                &checkout_ref,
+                &archive_path,
+            )
+            .await
+        {
             Ok(()) => {
-                self.log("📦 Successfully downloaded repository archive".to_string()).await?;
+                self.log(
+                    context,
+                    "📦 Successfully downloaded repository archive".to_string(),
+                )
+                .await?;
 
                 // Extract the archive
                 let output = tokio::process::Command::new("tar")
@@ -181,47 +395,85 @@ impl DownloadRepoJob {
                     .arg(&repo_dir)
                     .output()
                     .await
-                    .map_err(|e| WorkflowError::JobExecutionFailed(format!("Failed to run tar command: {}", e)))?;
+                    .map_err(|e| {
+                        WorkflowError::JobExecutionFailed(format!(
+                            "Failed to run tar command: {}",
+                            e
+                        ))
+                    })?;
 
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(WorkflowError::JobExecutionFailed(format!("Failed to extract archive: {}", stderr)));
+                    return Err(WorkflowError::JobExecutionFailed(format!(
+                        "Failed to extract archive: {}",
+                        stderr
+                    )));
                 }
 
-                self.log("📂 Successfully extracted repository archive".to_string()).await?;
+                self.log(
+                    context,
+                    "📂 Successfully extracted repository archive".to_string(),
+                )
+                .await?;
 
                 // Clean up archive
                 if let Err(e) = std::fs::remove_file(&archive_path) {
-                    self.log(format!("Warning: Failed to clean up archive file: {}", e)).await?;
+                    self.log(
+                        context,
+                        format!("Warning: Failed to clean up archive file: {}", e),
+                    )
+                    .await?;
                 }
             }
             Err(e) => {
-                self.log(format!("📦 Archive download failed, falling back to git clone: {}", e)).await?;
+                self.log(
+                    context,
+                    format!(
+                        "📦 Archive download failed, falling back to git clone: {}",
+                        e
+                    ),
+                )
+                .await?;
 
                 // Fall back to git clone - directory must be empty for trait method
                 // Remove directory (and any contents) before cloning
-                std::fs::remove_dir_all(&repo_dir)
-                    .map_err(|e| WorkflowError::JobExecutionFailed(format!("Failed to remove directory for clone: {}", e)))?;
+                std::fs::remove_dir_all(&repo_dir).map_err(|e| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "Failed to remove directory for clone: {}",
+                        e
+                    ))
+                })?;
 
-                self.git_provider_manager.clone_repository(
-                    self.git_provider_connection_id,
-                    &self.repo_owner,
-                    &self.repo_name,
-                    &repo_dir,
-                    Some(&checkout_ref),
-                ).await
-                .map_err(|e| WorkflowError::JobExecutionFailed(format!("Failed to clone repository: {}", e)))?;
+                self.git_provider_manager
+                    .clone_repository(
+                        connection_id,
+                        &self.repo_owner,
+                        &self.repo_name,
+                        &repo_dir,
+                        Some(&checkout_ref),
+                    )
+                    .await
+                    .map_err(|e| {
+                        WorkflowError::JobExecutionFailed(format!(
+                            "Failed to clone repository: {}",
+                            e
+                        ))
+                    })?;
 
-                self.log("🔄 Successfully cloned repository".to_string()).await?;
+                self.log(context, "Successfully cloned repository".to_string())
+                    .await?;
             }
         }
 
         // Validate repository was downloaded
         if !repo_dir.exists() || std::fs::read_dir(&repo_dir)?.next().is_none() {
-            return Err(WorkflowError::JobExecutionFailed("Repository directory is empty".to_string()));
+            return Err(WorkflowError::JobExecutionFailed(
+                "Repository directory is empty".to_string(),
+            ));
         }
 
-        self.log("✅ Repository validation passed".to_string()).await?;
+        self.log(context, "Repository validation passed".to_string())
+            .await?;
 
         Ok(repo_dir)
     }
@@ -246,8 +498,16 @@ impl WorkflowTask for DownloadRepoJob {
         let repo_dir = self.download_repository(&context).await?;
 
         // Set job outputs
-        context.set_output(&self.job_id, "repo_dir", repo_dir.to_string_lossy().to_string())?;
-        context.set_output(&self.job_id, "checkout_ref", self.get_checkout_ref(&context))?;
+        context.set_output(
+            &self.job_id,
+            "repo_dir",
+            repo_dir.to_string_lossy().to_string(),
+        )?;
+        context.set_output(
+            &self.job_id,
+            "checkout_ref",
+            self.get_checkout_ref(&context),
+        )?;
         context.set_output(&self.job_id, "repo_owner", &self.repo_owner)?;
         context.set_output(&self.job_id, "repo_name", &self.repo_name)?;
 
@@ -260,16 +520,34 @@ impl WorkflowTask for DownloadRepoJob {
         Ok(JobResult::success(context))
     }
 
-    async fn validate_prerequisites(&self, _context: &WorkflowContext) -> Result<(), WorkflowError> {
+    async fn validate_prerequisites(
+        &self,
+        _context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
         // Basic validation
         if self.repo_owner.is_empty() {
-            return Err(WorkflowError::JobValidationFailed("repo_owner cannot be empty".to_string()));
+            return Err(WorkflowError::JobValidationFailed(
+                "repo_owner cannot be empty".to_string(),
+            ));
         }
         if self.repo_name.is_empty() {
-            return Err(WorkflowError::JobValidationFailed("repo_name cannot be empty".to_string()));
+            return Err(WorkflowError::JobValidationFailed(
+                "repo_name cannot be empty".to_string(),
+            ));
         }
-        if self.git_provider_connection_id == 0 {
-            return Err(WorkflowError::JobValidationFailed("git_provider_connection_id must be provided".to_string()));
+
+        // For private repos, git_provider_connection_id is required
+        // For public repos, git_url is required
+        if !self.is_public_repo && self.git_provider_connection_id.is_none() {
+            return Err(WorkflowError::JobValidationFailed(
+                "git_provider_connection_id must be provided for private repositories".to_string(),
+            ));
+        }
+
+        if self.is_public_repo && self.git_url.is_none() {
+            return Err(WorkflowError::JobValidationFailed(
+                "git_url must be provided for public repositories".to_string(),
+            ));
         }
 
         Ok(())
@@ -279,8 +557,7 @@ impl WorkflowTask for DownloadRepoJob {
         // Clean up temporary directory if it exists
         if let Some(ref work_dir) = context.work_dir {
             if work_dir.exists() {
-                std::fs::remove_dir_all(work_dir)
-                    .map_err(|e| WorkflowError::IoError(e))?;
+                std::fs::remove_dir_all(work_dir).map_err(WorkflowError::IoError)?;
             }
         }
         Ok(())
@@ -293,6 +570,8 @@ pub struct DownloadRepoBuilder {
     repo_owner: Option<String>,
     repo_name: Option<String>,
     git_provider_connection_id: Option<i32>,
+    git_url: Option<String>,
+    is_public_repo: bool,
     branch_ref: Option<String>,
     tag_ref: Option<String>,
     commit_sha: Option<String>,
@@ -308,6 +587,8 @@ impl DownloadRepoBuilder {
             repo_owner: None,
             repo_name: None,
             git_provider_connection_id: None,
+            git_url: None,
+            is_public_repo: false,
             branch_ref: None,
             tag_ref: None,
             commit_sha: None,
@@ -334,6 +615,16 @@ impl DownloadRepoBuilder {
 
     pub fn git_provider_connection_id(mut self, connection_id: i32) -> Self {
         self.git_provider_connection_id = Some(connection_id);
+        self
+    }
+
+    pub fn git_url(mut self, git_url: String) -> Self {
+        self.git_url = Some(git_url);
+        self
+    }
+
+    pub fn is_public_repo(mut self, is_public: bool) -> Self {
+        self.is_public_repo = is_public;
         self
     }
 
@@ -367,22 +658,48 @@ impl DownloadRepoBuilder {
         self
     }
 
-    pub fn build(self, git_provider_manager: Arc<dyn GitProviderManagerTrait>) -> Result<DownloadRepoJob, WorkflowError> {
+    pub fn build(
+        self,
+        git_provider_manager: Arc<dyn GitProviderManagerTrait>,
+    ) -> Result<DownloadRepoJob, WorkflowError> {
         let job_id = self.job_id.unwrap_or_else(|| "download_repo".to_string());
-        let repo_owner = self.repo_owner
-            .ok_or_else(|| WorkflowError::JobValidationFailed("repo_owner is required".to_string()))?;
-        let repo_name = self.repo_name
-            .ok_or_else(|| WorkflowError::JobValidationFailed("repo_name is required".to_string()))?;
-        let git_provider_connection_id = self.git_provider_connection_id
-            .ok_or_else(|| WorkflowError::JobValidationFailed("git_provider_connection_id is required".to_string()))?;
+        let repo_owner = self.repo_owner.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("repo_owner is required".to_string())
+        })?;
+        let repo_name = self.repo_name.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("repo_name is required".to_string())
+        })?;
 
-        let mut job = DownloadRepoJob::new(
-            job_id,
-            repo_owner,
-            repo_name,
-            git_provider_connection_id,
-            git_provider_manager,
-        );
+        // Create job based on whether it's a public or private repo
+        let mut job = if self.is_public_repo {
+            // Public repo: requires git_url
+            let git_url = self.git_url.ok_or_else(|| {
+                WorkflowError::JobValidationFailed(
+                    "git_url is required for public repositories".to_string(),
+                )
+            })?;
+            DownloadRepoJob::new_public(
+                job_id,
+                repo_owner,
+                repo_name,
+                git_url,
+                git_provider_manager,
+            )
+        } else {
+            // Private repo: requires git_provider_connection_id
+            let git_provider_connection_id = self.git_provider_connection_id.ok_or_else(|| {
+                WorkflowError::JobValidationFailed(
+                    "git_provider_connection_id is required for private repositories".to_string(),
+                )
+            })?;
+            DownloadRepoJob::new(
+                job_id,
+                repo_owner,
+                repo_name,
+                git_provider_connection_id,
+                git_provider_manager,
+            )
+        };
 
         if let Some(branch_ref) = self.branch_ref {
             job = job.with_branch_ref(branch_ref);
@@ -416,9 +733,9 @@ impl Default for DownloadRepoBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::WorkflowContext;
-    use temps_git::GitProviderManagerError;
     use std::path::Path;
+
+    use temps_git::GitProviderManagerError;
 
     /// Mock implementation of GitProviderManagerTrait for testing
     struct MockGitProviderManager;
@@ -460,7 +777,9 @@ mod tests {
             _archive_path: &Path,
         ) -> Result<(), GitProviderManagerError> {
             // Mock returns error to test fallback to clone
-            Err(GitProviderManagerError::Other("Mock: archive not implemented".to_string()))
+            Err(GitProviderManagerError::Other(
+                "Mock: archive not implemented".to_string(),
+            ))
         }
     }
 
@@ -516,5 +835,62 @@ mod tests {
 
         // Commit should have second priority
         assert_eq!(job_no_tag.get_checkout_ref(&context), "abc123");
+    }
+
+    #[test]
+    fn test_get_checkout_ref_branch_only() {
+        let git_manager: Arc<dyn GitProviderManagerTrait> = Arc::new(MockGitProviderManager);
+
+        // Test with only branch_ref set
+        let job_branch_only = DownloadRepoJob::new(
+            "test".to_string(),
+            "owner".to_string(),
+            "repo".to_string(),
+            1,
+            git_manager.clone(),
+        )
+        .with_branch_ref("feature-branch".to_string());
+
+        let context = crate::test_utils::create_test_context("test".to_string(), 1, 1, 1);
+
+        // Branch should be used when no tag or commit is set
+        assert_eq!(job_branch_only.get_checkout_ref(&context), "feature-branch");
+
+        // Test with no refs set (should fall back to "master")
+        let job_no_refs = DownloadRepoJob::new(
+            "test".to_string(),
+            "owner".to_string(),
+            "repo".to_string(),
+            1,
+            git_manager,
+        );
+
+        // Should fall back to "master" when nothing is set
+        assert_eq!(job_no_refs.get_checkout_ref(&context), "master");
+    }
+
+    #[test]
+    fn test_builder_with_tag_and_commit() {
+        let git_manager: Arc<dyn GitProviderManagerTrait> = Arc::new(MockGitProviderManager);
+
+        let job = DownloadRepoBuilder::new()
+            .job_id("test_download".to_string())
+            .repo_owner("test_owner".to_string())
+            .repo_name("test_repo".to_string())
+            .git_provider_connection_id(1)
+            .branch_ref("main".to_string())
+            .tag_ref("v2.0.0".to_string())
+            .commit_sha("def456".to_string())
+            .build(git_manager)
+            .unwrap();
+
+        assert_eq!(job.job_id(), "test_download");
+        assert_eq!(job.branch_ref, Some("main".to_string()));
+        assert_eq!(job.tag_ref, Some("v2.0.0".to_string()));
+        assert_eq!(job.commit_sha, Some("def456".to_string()));
+
+        // Verify tag has highest priority
+        let context = crate::test_utils::create_test_context("test".to_string(), 1, 1, 1);
+        assert_eq!(job.get_checkout_ref(&context), "v2.0.0");
     }
 }

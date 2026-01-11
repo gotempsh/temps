@@ -15,6 +15,8 @@ path = "src/main.rs"
 # All library crates
 temps-analytics = { path = "../temps-analytics" }
 temps-analytics-events = { path = "../temps-analytics-events" }
+temps-blob = { path = "../temps-blob" }
+temps-kv = { path = "../temps-kv" }
 temps-analytics-funnels = { path = "../temps-analytics-funnels" }
 temps-analytics-performance = { path = "../temps-analytics-performance" }
 temps-analytics-session-replay = { path = "../temps-analytics-session-replay" }
@@ -26,7 +28,9 @@ temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-deployer = { path = "../temps-deployer" }
 temps-deployments = { path = "../temps-deployments" }
+temps-dns = { path = "../temps-dns" }
 temps-domains = { path = "../temps-domains" }
+temps-email = { path = "../temps-email" }
 temps-entities = { path = "../temps-entities" }
 temps-environments = { path = "../temps-environments" }
 temps-error-tracking = { path = "../temps-error-tracking" }
@@ -47,6 +51,8 @@ temps-queue = { path = "../temps-queue" }
 temps-screenshots = { path = "../temps-screenshots" }
 temps-status-page = { path = "../temps-status-page" }
 temps-static-files = { path = "../temps-static-files" }
+temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
+temps-webhooks = { path = "../temps-webhooks" }
 tokio-util = { workspace = true }
 
 # CLI and runtime dependencies - reference from crates workspace
@@ -62,6 +68,7 @@ dirs = { version = "5.0" }
 rand = { workspace = true }
 hex = { workspace = true }
 bollard = { workspace = true }
+futures = { workspace = true }
 axum = { workspace = true }
 utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
@@ -69,4 +76,16 @@ async-trait = { workspace = true }
 sea-orm = { workspace = true }
 include_dir = "0.7"
 mime_guess = "2.0"
+aws-sdk-s3 = { workspace = true }
+url = { workspace = true }
+urlencoding = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+flate2 = "1.0"
+indicatif = "0.17"
+tar = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
 
+[build-dependencies]
+chrono = { workspace = true }

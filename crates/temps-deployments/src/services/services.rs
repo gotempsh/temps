@@ -14,6 +14,15 @@ use crate::services::types::{
     Deployment, DeploymentDomain, DeploymentEnvironment, DeploymentListResponse,
 };
 use crate::UpdateDeploymentSettingsRequest;
+use temps_core::WorkflowTask;
+
+/// Parameters for container log retrieval
+pub struct ContainerLogParams {
+    pub start_date: Option<i64>,
+    pub end_date: Option<i64>,
+    pub tail: Option<String>,
+    pub timestamps: bool,
+}
 
 #[derive(Error, Debug)]
 pub enum DeploymentError {
@@ -28,6 +37,9 @@ pub enum DeploymentError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("Invalid deployment state: {0}")]
+    InvalidDeploymentState(String),
 
     #[error("Pipeline error: {0}")]
     PipelineError(String),
@@ -85,10 +97,8 @@ impl DeploymentService {
         &self,
         project_id: i32,
         environment_id: i32,
-        start_date: Option<i64>,
-        end_date: Option<i64>,
-        tail: Option<String>,
         container_name: Option<String>,
+        params: ContainerLogParams,
     ) -> Result<impl Stream<Item = Result<String, std::io::Error>>, DeploymentError> {
         use temps_entities::{deployment_containers, projects};
         let project = projects::Entity::find_by_id(project_id)
@@ -96,7 +106,7 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
 
-        if project.project_type != temps_entities::types::ProjectType::Server {
+        if project.preset == temps_entities::preset::Preset::Static {
             return Err(DeploymentError::Other(
                 "Container logs are only available for server-type projects".to_string(),
             ));
@@ -126,19 +136,13 @@ impl DeploymentService {
             query = query.filter(deployment_containers::Column::ContainerName.eq(name));
         }
 
-        let container = query
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| {
-                if let Some(name) = container_name {
-                    DeploymentError::NotFound(format!(
-                        "Container '{}' not found for deployment",
-                        name
-                    ))
-                } else {
-                    DeploymentError::NotFound("No containers found for deployment".to_string())
-                }
-            })?;
+        let container = query.one(self.db.as_ref()).await?.ok_or_else(|| {
+            if let Some(name) = container_name {
+                DeploymentError::NotFound(format!("Container '{}' not found for deployment", name))
+            } else {
+                DeploymentError::NotFound("No containers found for deployment".to_string())
+            }
+        })?;
 
         let container_id = container.container_id;
         let stream_result = self
@@ -146,15 +150,14 @@ impl DeploymentService {
             .get_container_logs(
                 &container_id,
                 temps_logs::docker_logs::ContainerLogOptions {
-                    start_date: start_date.map(|ts| {
-                        chrono::DateTime::from_timestamp(ts, 0)
-                            .unwrap_or_else(|| chrono::Utc::now())
+                    start_date: params.start_date.map(|ts| {
+                        chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
                     }),
-                    end_date: end_date.map(|ts| {
-                        chrono::DateTime::from_timestamp(ts, 0)
-                            .unwrap_or_else(|| chrono::Utc::now())
+                    end_date: params.end_date.map(|ts| {
+                        chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
                     }),
-                    tail,
+                    tail: params.tail,
+                    timestamps: params.timestamps,
                 },
             )
             .await
@@ -162,9 +165,7 @@ impl DeploymentService {
 
         // Map ContainerError to std::io::Error to maintain API compatibility
         let mapped_stream = futures_util::stream::StreamExt::map(stream_result, |item| {
-            item.map_err(|container_err| {
-                std::io::Error::new(std::io::ErrorKind::Other, container_err.to_string())
-            })
+            item.map_err(|container_err| std::io::Error::other(container_err.to_string()))
         });
 
         Ok(mapped_stream)
@@ -176,9 +177,7 @@ impl DeploymentService {
         project_id: i32,
         environment_id: i32,
         container_id: String,
-        start_date: Option<i64>,
-        end_date: Option<i64>,
-        tail: Option<String>,
+        params: ContainerLogParams,
     ) -> Result<impl Stream<Item = Result<String, std::io::Error>>, DeploymentError> {
         use temps_entities::{deployment_containers, projects};
 
@@ -188,7 +187,7 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
 
-        if project.project_type != temps_entities::types::ProjectType::Server {
+        if project.preset == temps_entities::preset::Preset::Static {
             return Err(DeploymentError::Other(
                 "Container logs are only available for server-type projects".to_string(),
             ));
@@ -229,15 +228,14 @@ impl DeploymentService {
             .get_container_logs(
                 &container_id,
                 temps_logs::docker_logs::ContainerLogOptions {
-                    start_date: start_date.map(|ts| {
-                        chrono::DateTime::from_timestamp(ts, 0)
-                            .unwrap_or_else(|| chrono::Utc::now())
+                    start_date: params.start_date.map(|ts| {
+                        chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
                     }),
-                    end_date: end_date.map(|ts| {
-                        chrono::DateTime::from_timestamp(ts, 0)
-                            .unwrap_or_else(|| chrono::Utc::now())
+                    end_date: params.end_date.map(|ts| {
+                        chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
                     }),
-                    tail,
+                    tail: params.tail,
+                    timestamps: params.timestamps,
                 },
             )
             .await
@@ -245,9 +243,7 @@ impl DeploymentService {
 
         // Map ContainerError to std::io::Error to maintain API compatibility
         let mapped_stream = futures_util::stream::StreamExt::map(stream_result, |item| {
-            item.map_err(|container_err| {
-                std::io::Error::new(std::io::ErrorKind::Other, container_err.to_string())
-            })
+            item.map_err(|container_err| std::io::Error::other(container_err.to_string()))
         });
 
         Ok(mapped_stream)
@@ -267,7 +263,7 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
 
-        if project.project_type != temps_entities::types::ProjectType::Server {
+        if project.preset == temps_entities::preset::Preset::Static {
             return Err(DeploymentError::Other(
                 "Containers are only available for server-type projects".to_string(),
             ));
@@ -300,7 +296,11 @@ impl DeploymentService {
         // Get container info from the deployer for each container
         let mut container_infos = Vec::new();
         for db_container in db_containers {
-            match self.deployer.get_container_info(&db_container.container_id).await {
+            match self
+                .deployer
+                .get_container_info(&db_container.container_id)
+                .await
+            {
                 Ok(info) => container_infos.push(info),
                 Err(e) => {
                     warn!(
@@ -329,11 +329,16 @@ impl DeploymentService {
             .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
 
         // Update the environment with new settings
-        let mut active_environment: environments::ActiveModel = environment.into();
-        active_environment.cpu_request = Set(settings.cpu_request);
-        active_environment.cpu_limit = Set(settings.cpu_limit);
-        active_environment.memory_request = Set(settings.memory_request);
-        active_environment.memory_limit = Set(settings.memory_limit);
+        let mut active_environment: environments::ActiveModel = environment.clone().into();
+
+        // Update deployment config with new resource settings
+        let mut deployment_config = environment.deployment_config.clone().unwrap_or_default();
+        deployment_config.cpu_request = settings.cpu_request;
+        deployment_config.cpu_limit = settings.cpu_limit;
+        deployment_config.memory_request = settings.memory_request;
+        deployment_config.memory_limit = settings.memory_limit;
+
+        active_environment.deployment_config = Set(Some(deployment_config));
         active_environment.update(self.db.as_ref()).await?;
 
         Ok(())
@@ -438,6 +443,14 @@ impl DeploymentService {
 
         let deployment = deployment_with_pipeline;
 
+        // Check if this deployment is current for any environment
+        let is_current = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::CurrentDeploymentId.eq(deployment.id))
+            .one(self.db.as_ref())
+            .await?
+            .is_some();
+
         // Fetch environment with domains
         let environments_with_domains = self
             .get_environments_with_domains(&[deployment.environment_id])
@@ -447,7 +460,7 @@ impl DeploymentService {
             .cloned();
 
         Ok(self
-            .map_db_deployment_to_deployment(deployment, false, environment)
+            .map_db_deployment_to_deployment(deployment, is_current, environment)
             .await)
     }
 
@@ -547,36 +560,34 @@ impl DeploymentService {
                 project_id
             )));
         }
-        info!("Project found: {:?}", project);
+        debug!("Project found: {:?}", project);
 
-        info!(
+        debug!(
             "Before invoking pipeline service project_id: {}, environment_id: {}",
             project_id, environment_id
         );
         // Check if repo_owner and repo_name are present
-        let repo_owner = match &project.as_ref().unwrap().repo_owner {
-            Some(owner) => owner.clone(),
-            None => {
-                return Err(DeploymentError::InvalidInput(
-                    "Project repo_owner is missing".to_string(),
-                ));
-            }
-        };
-        let repo_name = match &project.as_ref().unwrap().repo_name {
-            Some(name) => name.clone(),
-            None => {
-                return Err(DeploymentError::InvalidInput(
-                    "Project repo_name is missing".to_string(),
-                ));
-            }
-        };
+        let repo_owner = project.as_ref().unwrap().repo_owner.clone();
+        let repo_name = project.as_ref().unwrap().repo_name.clone();
+
+        // Validate that they're not empty
+        if repo_owner.is_empty() {
+            return Err(DeploymentError::InvalidInput(
+                "Project repo_owner is missing".to_string(),
+            ));
+        }
+        if repo_name.is_empty() {
+            return Err(DeploymentError::InvalidInput(
+                "Project repo_name is missing".to_string(),
+            ));
+        }
         let git_push_job = temps_core::GitPushEventJob {
             owner: repo_owner,
             repo: repo_name,
             branch: branch.clone(),
             tag: tag.clone(),
             commit: commit.clone().unwrap_or_default(),
-            project_id: project_id,
+            project_id,
         };
 
         tracing::debug!(
@@ -588,11 +599,11 @@ impl DeploymentService {
             .send(temps_core::Job::GitPushEvent(git_push_job))
             .await
             .map_err(|e| {
-                tracing::error!("❌ Failed to send GitPushEvent to queue: {}", e);
+                tracing::error!("Failed to send GitPushEvent to queue: {}", e);
                 DeploymentError::QueueError(e.to_string())
             })?;
 
-        tracing::debug!("✅ GitPushEvent successfully sent to queue");
+        tracing::debug!("GitPushEvent successfully sent to queue");
         Ok(())
     }
 
@@ -606,66 +617,174 @@ impl DeploymentService {
             .filter(deployments::Column::ProjectId.eq(project_id))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| DeploymentError::Other("Target deployment not found".to_string()))?;
+            .ok_or_else(|| DeploymentError::NotFound("Target deployment not found".to_string()))?;
+
+        // Validate that the deployment is in a valid state for rollback
+        let valid_rollback_states = ["deployed", "completed"];
+        if !valid_rollback_states.contains(&target_deployment.state.as_str()) {
+            return Err(DeploymentError::InvalidDeploymentState(format!(
+                "Cannot rollback to deployment in '{}' state. Only deployed or completed deployments can be rolled back to.",
+                target_deployment.state
+            )));
+        }
+
+        // Ensure target deployment has an image to roll back to
+        let image_name = target_deployment.image_name.clone().ok_or_else(|| {
+            DeploymentError::Other(
+                "Target deployment has no image_name - cannot rollback".to_string(),
+            )
+        })?;
 
         let environment_id = target_deployment.environment_id;
 
-        info!(
-            "Initiating container-based rollback for project_id: {}, deployment_id: {}, environment_id: {}",
-            project_id, deployment_id, environment_id
-        );
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
 
-        // Find the current active deployment for this environment
         let environment = environments::Entity::find_by_id(environment_id)
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
 
-        // Stop current deployment's containers if any
-        if let Some(current_deployment_id) = environment.current_deployment_id {
-            if current_deployment_id != deployment_id {
-                let current_containers = deployment_containers::Entity::find()
-                    .filter(deployment_containers::Column::DeploymentId.eq(current_deployment_id))
-                    .filter(deployment_containers::Column::DeletedAt.is_null())
-                    .all(self.db.as_ref())
-                    .await?;
+        info!(
+            "Initiating rollback for project_id: {}, deployment_id: {}, image: {}, environment_id: {}",
+            project_id, deployment_id, image_name, environment_id
+        );
+        let preset = temps_presets::get_preset_by_slug(&project.preset.as_str())
+            .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
+        // Check if preset is static - if so, just update environment without deploying
+        if preset.project_type() == temps_presets::ProjectType::Static {
+            info!("Rollback: Static preset detected - updating environment only");
 
-                for container in current_containers {
-                    self.deployer
-                        .stop_container(&container.container_id)
-                        .await
-                        .map_err(|e| {
-                            DeploymentError::Other(format!(
-                                "Failed to stop current container: {}",
-                                e
-                            ))
-                        })?;
-                }
-            }
-        }
+            // For static deployments, just point environment to the previous deployment
+            let mut active_env: environments::ActiveModel = environment.into();
+            active_env.current_deployment_id = Set(Some(deployment_id));
+            active_env.update(self.db.as_ref()).await?;
 
-        // Launch the target deployment containers
-        let target_containers = deployment_containers::Entity::find()
-            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
-            .filter(deployment_containers::Column::DeletedAt.is_null())
-            .all(self.db.as_ref())
-            .await?;
+            info!(
+                "Rollback completed - environment {} now points to deployment {}",
+                environment_id, deployment_id
+            );
+        } else {
+            // Rollback workflow for non-static presets:
+            // 1. Deploy the image using DeployImageJob (will deploy/redeploy containers as needed)
+            // 2. Mark deployment as complete using MarkDeploymentCompleteJob (will stop previous deployments)
 
-        for container in target_containers {
-            self.deployer
-                .start_container(&container.container_id)
+            // Create log path for rollback execution
+            let rollback_log_id = format!(
+                "rollback-{}-{}",
+                deployment_id,
+                chrono::Utc::now().timestamp()
+            );
+            self.log_service
+                .create_log_path(&rollback_log_id)
                 .await
                 .map_err(|e| {
-                    DeploymentError::Other(format!("Failed to start target container: {}", e))
+                    DeploymentError::Other(format!("Failed to create log path for rollback: {}", e))
                 })?;
+
+            info!("Rollback: Deploying image: {}", image_name);
+
+            // Step 1: Execute DeployImageJob with external image
+            // CRITICAL: Use "deploy_container" as job_id so MarkDeploymentCompleteJob can find the outputs
+            let deploy_job = crate::jobs::DeployImageJobBuilder::new()
+                .job_id("deploy_container".to_string())
+                .build_job_id("external-image".to_string()) // Placeholder, will use external image instead
+                .target(crate::jobs::DeploymentTarget::Docker {
+                    registry_url: "local".to_string(),
+                    network: Some(temps_core::NETWORK_NAME.to_string()),
+                })
+                .service_name(target_deployment.slug.clone())
+                .replicas(
+                    environment
+                        .deployment_config
+                        .as_ref()
+                        .map(|c| c.replicas as u32)
+                        .or_else(|| {
+                            project
+                                .deployment_config
+                                .as_ref()
+                                .map(|c| c.replicas as u32)
+                        })
+                        .unwrap_or(1),
+                )
+                .port(
+                    environment
+                        .deployment_config
+                        .as_ref()
+                        .and_then(|c| c.exposed_port)
+                        .or_else(|| {
+                            project
+                                .deployment_config
+                                .as_ref()
+                                .and_then(|c| c.exposed_port)
+                        })
+                        .unwrap_or(3000) as u32,
+                )
+                .log_id(rollback_log_id.clone())
+                .log_service(self.log_service.clone())
+                .build(self.deployer.clone())
+                .map_err(|e| DeploymentError::Other(format!("Failed to create deploy job: {}", e)))?
+                .with_external_image_tag(image_name.clone()); // Use existing image without rebuild
+
+            // Create workflow context for execution with a mock log writer
+            let mock_log_writer = Arc::new(crate::test_utils::MockLogWriter::new(0));
+            let mut rollback_context = temps_core::WorkflowContext::new(
+                format!("rollback-{}", deployment_id),
+                deployment_id,
+                project_id,
+                environment_id,
+                mock_log_writer,
+            );
+
+            match deploy_job.execute(rollback_context.clone()).await {
+                Ok(job_result) => {
+                    info!("Rollback: Deploy job completed successfully");
+                    rollback_context = job_result.context;
+                }
+                Err(e) => {
+                    error!("Rollback: Deploy job failed: {}", e);
+                    return Err(DeploymentError::Other(format!(
+                        "Failed to deploy image during rollback: {}",
+                        e
+                    )));
+                }
+            }
+
+            // Step 2: Execute MarkDeploymentCompleteJob
+            info!("Rollback: Marking deployment {} as complete", deployment_id);
+
+            let mark_complete_job = crate::jobs::MarkDeploymentCompleteJobBuilder::new()
+                .job_id(format!("rollback-mark-complete-{}", deployment_id))
+                .deployment_id(deployment_id)
+                .db(self.db.clone())
+                .log_id(rollback_log_id)
+                .log_service(self.log_service.clone())
+                .container_deployer(self.deployer.clone())
+                .build()
+                .map_err(|e| {
+                    DeploymentError::Other(format!("Failed to create mark complete job: {}", e))
+                })?;
+
+            match mark_complete_job.execute(rollback_context).await {
+                Ok(_) => {
+                    info!("Rollback: Mark complete job executed successfully");
+                }
+                Err(e) => {
+                    error!("Rollback: Mark complete job failed: {}", e);
+                    return Err(DeploymentError::Other(format!(
+                        "Failed to mark deployment complete during rollback: {}",
+                        e
+                    )));
+                }
+            }
+
+            info!(
+                "Rollback completed - deployment {} is now active",
+                deployment_id
+            );
         }
-
-        // Update the environment to point to the target deployment
-        let mut active_env: environments::ActiveModel = environment.into();
-        active_env.current_deployment_id = Set(Some(deployment_id));
-        active_env.update(self.db.as_ref()).await?;
-
-        info!("Rollback completed successfully");
 
         Ok(self
             .map_db_deployment_to_deployment(target_deployment, true, None)
@@ -782,7 +901,7 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
 
-        // Pause all containers for this deployment
+        // Stop and remove all containers for this deployment
         let containers = deployment_containers::Entity::find()
             .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
             .filter(deployment_containers::Column::DeletedAt.is_null())
@@ -790,14 +909,29 @@ impl DeploymentService {
             .await?;
 
         for container in containers {
-            self.deployer
-                .pause_container(&container.container_id)
-                .await
-                .map_err(|e| DeploymentError::Other(format!("Failed to pause container: {}", e)))?;
+            // Stop the container first
+            if let Err(e) = self.deployer.stop_container(&container.container_id).await {
+                warn!(
+                    "Failed to stop container {} during deployment pause: {}",
+                    container.container_id, e
+                );
+            }
 
-            // Update container status
+            // Remove the container
+            if let Err(e) = self
+                .deployer
+                .remove_container(&container.container_id)
+                .await
+            {
+                warn!(
+                    "Failed to remove container {} during deployment pause: {}",
+                    container.container_id, e
+                );
+            }
+
+            // Update container status to removed
             let mut active_container: deployment_containers::ActiveModel = container.into();
-            active_container.status = Set(Some("paused".to_string()));
+            active_container.status = Set(Some("removed".to_string()));
             active_container.update(self.db.as_ref()).await?;
         }
 
@@ -806,7 +940,10 @@ impl DeploymentService {
         active_deployment.state = Set("paused".to_string());
         active_deployment.update(self.db.as_ref()).await?;
 
-        info!("Successfully paused deployment: {}", deployment_id);
+        info!(
+            "Successfully paused deployment {}: removed all containers",
+            deployment_id
+        );
         Ok(())
     }
 
@@ -884,7 +1021,7 @@ impl DeploymentService {
         for domain in custom_domains {
             domains_by_env
                 .entry(domain.environment_id)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(domain.domain);
         }
 
@@ -923,21 +1060,44 @@ impl DeploymentService {
 
         let base_domain = settings.preview_domain;
         let domain = format!("{}.{}", deployment_slug, base_domain);
-        let protocol = if let Some(ref url) = settings.external_url {
+
+        // Determine protocol and port from external_url if set, otherwise default to http
+        let (protocol, port) = if let Some(ref url) = settings.external_url {
             if let Ok(parsed_url) = url::Url::parse(url) {
-                match parsed_url.scheme() {
+                let scheme = match parsed_url.scheme() {
                     "https" => "https",
                     "http" => "http",
                     _ => "http",
-                }
+                };
+                (scheme, parsed_url.port())
             } else {
-                "http"
+                // Fallback for malformed URLs - detect protocol from prefix
+                let protocol = if url.starts_with("https://") {
+                    "https"
+                } else {
+                    "http"
+                };
+                (protocol, None)
             }
         } else {
-            "http"
+            ("http", None)
         };
 
-        Ok(format!("{}://{}", protocol, domain))
+        // Construct the URL with port if present
+        // Only include port if it's non-standard (not 443 for https, not 80 for http)
+        let url = if let Some(port) = port {
+            let is_standard_port =
+                (protocol == "https" && port == 443) || (protocol == "http" && port == 80);
+            if is_standard_port {
+                format!("{}://{}", protocol, domain)
+            } else {
+                format!("{}://{}:{}", protocol, domain, port)
+            }
+        } else {
+            format!("{}://{}", protocol, domain)
+        };
+
+        Ok(url)
     }
 
     async fn compute_environment_url(
@@ -948,26 +1108,45 @@ impl DeploymentService {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
 
         let base_domain = settings.preview_domain;
+        let domain = format!("{}-{}.{}", project_slug, environment_slug, base_domain);
 
-        // Determine protocol - use https if external_url is configured, otherwise http
-        let protocol = if let Some(ref url) = settings.external_url {
+        // Determine protocol and port from external_url if set, otherwise default to http
+        let (protocol, port) = if let Some(ref url) = settings.external_url {
             if let Ok(parsed_url) = url::Url::parse(url) {
-                match parsed_url.scheme() {
+                let scheme = match parsed_url.scheme() {
                     "https" => "https",
                     "http" => "http",
                     _ => "http",
-                }
+                };
+                (scheme, parsed_url.port())
             } else {
-                "http"
+                // Fallback for malformed URLs - detect protocol from prefix
+                let protocol = if url.starts_with("https://") {
+                    "https"
+                } else {
+                    "http"
+                };
+                (protocol, None)
             }
         } else {
-            "http"
+            ("http", None)
         };
-        // New format: <protocol>://<project_slug>-<env_slug>.<preview_domain>
-        Ok(format!(
-            "{}://{}-{}.{}",
-            protocol, project_slug, environment_slug, base_domain
-        ))
+
+        // Construct the URL with port if present
+        // Only include port if it's non-standard (not 443 for https, not 80 for http)
+        let url = if let Some(port) = port {
+            let is_standard_port =
+                (protocol == "https" && port == 443) || (protocol == "http" && port == 80);
+            if is_standard_port {
+                format!("{}://{}", protocol, domain)
+            } else {
+                format!("{}://{}:{}", protocol, domain, port)
+            }
+        } else {
+            format!("{}://{}", protocol, domain)
+        };
+
+        Ok(url)
     }
 
     async fn map_db_deployment_to_deployment(
@@ -1018,7 +1197,7 @@ impl DeploymentService {
             status: db_deployment.state,
             url: deployment_url,
             commit_hash: commit_sha,
-            commit_message: commit_message,
+            commit_message,
             branch: branch_ref,
             tag: tag_ref,
             created_at: db_deployment.created_at,
@@ -1029,6 +1208,8 @@ impl DeploymentService {
             commit_date,
             is_current,
             cancelled_reason: db_deployment.cancelled_reason.clone(),
+            deployment_config: db_deployment.deployment_config,
+            metadata: db_deployment.metadata,
         }
     }
 
@@ -1233,17 +1414,154 @@ impl DeploymentService {
         Ok(count)
     }
 
+    /// Cancel all active deployments for an environment
+    ///
+    /// Used when deleting an environment to ensure no deployments are left running
+    /// This method:
+    /// 1. Stops and removes all running containers
+    /// 2. Writes cancellation messages to job logs
+    /// 3. Updates deployment states to cancelled
+    pub async fn cancel_all_environment_deployments(
+        &self,
+        environment_id: i32,
+    ) -> Result<u64, DeploymentError> {
+        use temps_entities::{deployment_jobs, types::JobStatus};
+
+        info!(
+            "Cancelling all active deployments for environment {}",
+            environment_id
+        );
+
+        // First, stop and remove all containers for this environment
+        info!(
+            "Stopping and removing all containers for environment {}",
+            environment_id
+        );
+
+        let containers = deployment_containers::Entity::find()
+            .inner_join(deployments::Entity)
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .all(self.db.as_ref())
+            .await?;
+
+        for container in containers {
+            info!(
+                "Stopping and removing container {} for environment {}",
+                container.container_id, environment_id
+            );
+
+            // Stop the container
+            if let Err(e) = self.deployer.stop_container(&container.container_id).await {
+                warn!(
+                    "Failed to stop container {}: {} (continuing anyway)",
+                    container.container_id, e
+                );
+            }
+
+            // Remove the container
+            if let Err(e) = self
+                .deployer
+                .remove_container(&container.container_id)
+                .await
+            {
+                warn!(
+                    "Failed to remove container {}: {} (continuing anyway)",
+                    container.container_id, e
+                );
+            }
+
+            // Update container status to stopped
+            let mut active_container: deployment_containers::ActiveModel = container.into();
+            active_container.status = Set(Some("stopped".to_string()));
+            active_container.deleted_at = Set(Some(chrono::Utc::now()));
+            let _ = active_container.update(self.db.as_ref()).await;
+        }
+
+        // Find all active deployments for this environment
+        let active_deployments = deployments::Entity::find()
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployments::Column::State.is_in(vec![
+                "pending",
+                "running",
+                "deploying",
+                "ready",
+            ]))
+            .all(self.db.as_ref())
+            .await?;
+
+        let count = active_deployments.len() as u64;
+
+        if count == 0 {
+            info!(
+                "No active deployments found for environment {}",
+                environment_id
+            );
+            return Ok(0);
+        }
+
+        info!(
+            "Found {} active deployment(s) for environment {} - cancelling",
+            count, environment_id
+        );
+
+        for deployment in active_deployments {
+            // Find currently running jobs and write cancellation message to their logs
+            let running_jobs = deployment_jobs::Entity::find()
+                .filter(deployment_jobs::Column::DeploymentId.eq(deployment.id))
+                .filter(deployment_jobs::Column::Status.eq(JobStatus::Running))
+                .all(self.db.as_ref())
+                .await?;
+
+            for job in running_jobs {
+                info!(
+                    "📝 Writing cancellation message to running job: {} ({})",
+                    job.name, job.log_id
+                );
+
+                let cancel_msg = format!(
+                    "DEPLOYMENT CANCELLED DUE TO ENVIRONMENT DELETION - Job '{}' is being terminated",
+                    job.name
+                );
+                if let Err(e) = self
+                    .log_service
+                    .append_structured_log(&job.log_id, temps_logs::LogLevel::Error, &cancel_msg)
+                    .await
+                {
+                    warn!(
+                        "Failed to write cancellation message to job log {}: {}",
+                        job.log_id, e
+                    );
+                }
+            }
+
+            // Update deployment to cancelled state
+            let mut active_deployment: deployments::ActiveModel = deployment.into();
+            active_deployment.state = Set("cancelled".to_string());
+            active_deployment.cancelled_reason = Set(Some("Environment deleted".to_string()));
+            active_deployment.finished_at = Set(Some(chrono::Utc::now()));
+            active_deployment.updated_at = Set(chrono::Utc::now());
+            active_deployment.update(self.db.as_ref()).await?;
+        }
+
+        info!(
+            "Successfully cancelled {} deployment(s) and cleaned up containers for environment {}",
+            count, environment_id
+        );
+
+        Ok(count)
+    }
+
     /// Cancel a specific deployment
     pub async fn cancel_deployment(
         &self,
         project_id: i32,
         deployment_id: i32,
     ) -> Result<(), DeploymentError> {
-        
         use temps_entities::{deployment_jobs, types::JobStatus};
 
         info!(
-            "🛑 Cancelling deployment {} for project {}",
+            "Cancelling deployment {} for project {}",
             deployment_id, project_id
         );
 
@@ -1255,14 +1573,14 @@ impl DeploymentService {
             .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
 
         info!(
-            "📋 Deployment {} current state: '{}' - checking if cancellable",
+            "Deployment {} current state: '{}' - checking if cancellable",
             deployment_id, deployment.state
         );
 
         // Only allow cancelling deployments in pending or running state
         if deployment.state != "pending" && deployment.state != "running" {
             info!(
-                "⚠️  Cannot cancel deployment {} - already in '{}' state",
+                "Cannot cancel deployment {} - already in '{}' state",
                 deployment_id, deployment.state
             );
             return Err(DeploymentError::InvalidInput(format!(
@@ -1286,12 +1604,12 @@ impl DeploymentService {
 
             // Write cancellation message to the job's log
             let cancel_msg = format!(
-                "\n🛑 DEPLOYMENT CANCELLED BY USER\n🛑 Job '{}' is being terminated\n",
+                "DEPLOYMENT CANCELLED BY USER - Job '{}' is being terminated",
                 job.name
             );
             if let Err(e) = self
                 .log_service
-                .append_to_log(&job.log_id, &cancel_msg)
+                .append_structured_log(&job.log_id, temps_logs::LogLevel::Error, &cancel_msg)
                 .await
             {
                 warn!(
@@ -1310,28 +1628,396 @@ impl DeploymentService {
         active_deployment.update(self.db.as_ref()).await?;
 
         info!(
-            "✅ Successfully cancelled deployment {} for project {} - workflow will stop at next checkpoint",
+            "Successfully cancelled deployment {} for project {} - workflow will stop at next checkpoint",
             deployment_id, project_id
         );
 
         Ok(())
+    }
+
+    /// Get detailed information about a specific container
+    pub async fn get_container_detail(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+    ) -> Result<(deployment_containers::Model, DeploymentEnvironment), DeploymentError> {
+        use temps_entities::environments;
+
+        // Verify environment belongs to project
+        let environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
+
+        // Find the container
+        let container = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::ContainerId.eq(&container_id))
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Container not found".to_string()))?;
+
+        // Verify container belongs to a deployment in this environment
+        let _deployment = deployments::Entity::find_by_id(container.deployment_id)
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
+
+        let env_info = DeploymentEnvironment {
+            id: environment.id,
+            name: environment.name,
+            slug: environment.slug,
+            domains: vec![], // Could be populated if needed
+        };
+
+        Ok((container, env_info))
+    }
+
+    /// Stop a specific container
+    pub async fn stop_container(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+    ) -> Result<(), DeploymentError> {
+        let (container, _) = self
+            .get_container_detail(project_id, environment_id, container_id.clone())
+            .await?;
+
+        // Stop the container via Docker
+        self.deployer
+            .stop_container(&container.container_id)
+            .await
+            .map_err(|e| DeploymentError::Other(format!("Failed to stop container: {}", e)))?;
+
+        // Update container status in database
+        let mut active_container: deployment_containers::ActiveModel = container.into();
+        active_container.status = Set(Some("stopped".to_string()));
+        active_container.update(self.db.as_ref()).await?;
+
+        info!("Successfully stopped container: {}", container_id);
+        Ok(())
+    }
+
+    /// Start a stopped container
+    pub async fn start_container(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+    ) -> Result<(), DeploymentError> {
+        let (container, _) = self
+            .get_container_detail(project_id, environment_id, container_id.clone())
+            .await?;
+
+        // Start the container via Docker
+        self.deployer
+            .start_container(&container.container_id)
+            .await
+            .map_err(|e| DeploymentError::Other(format!("Failed to start container: {}", e)))?;
+
+        // Update container status in database
+        let mut active_container: deployment_containers::ActiveModel = container.into();
+        active_container.status = Set(Some("running".to_string()));
+        active_container.update(self.db.as_ref()).await?;
+
+        info!("Successfully started container: {}", container_id);
+        Ok(())
+    }
+
+    /// Restart a container (stop and then start)
+    pub async fn restart_container(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+    ) -> Result<(), DeploymentError> {
+        let (container, _) = self
+            .get_container_detail(project_id, environment_id, container_id.clone())
+            .await?;
+
+        // Stop the container via Docker
+        self.deployer
+            .stop_container(&container.container_id)
+            .await
+            .map_err(|e| DeploymentError::Other(format!("Failed to stop container: {}", e)))?;
+
+        // Start the container via Docker
+        self.deployer
+            .start_container(&container.container_id)
+            .await
+            .map_err(|e| DeploymentError::Other(format!("Failed to start container: {}", e)))?;
+
+        // Update container status in database
+        let mut active_container: deployment_containers::ActiveModel = container.into();
+        active_container.status = Set(Some("running".to_string()));
+        active_container.update(self.db.as_ref()).await?;
+
+        info!("Successfully restarted container: {}", container_id);
+        Ok(())
+    }
+
+    /// Get container environment variables from Docker
+    pub async fn get_container_env_variables(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+    ) -> Result<Vec<(String, String)>, DeploymentError> {
+        let (container, _) = self
+            .get_container_detail(project_id, environment_id, container_id.clone())
+            .await?;
+
+        // Get container info from Docker which includes environment variables
+        let container_info = self
+            .deployer
+            .get_container_info(&container.container_id)
+            .await
+            .map_err(|e| DeploymentError::Other(format!("Failed to get container info: {}", e)))?;
+
+        // Convert HashMap to Vec of tuples
+        let env_vars: Vec<(String, String)> = container_info.environment_vars.into_iter().collect();
+        Ok(env_vars)
+    }
+
+    /// Stop all containers in an environment
+    pub async fn stop_all_containers(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<(), DeploymentError> {
+        use temps_entities::environments;
+
+        // Verify environment exists and belongs to project
+        let _environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
+
+        // Get all active containers in this environment
+        let containers = deployment_containers::Entity::find()
+            .inner_join(deployments::Entity)
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .all(self.db.as_ref())
+            .await?;
+
+        for container in containers {
+            let _ = self.deployer.stop_container(&container.container_id).await;
+            let mut active_container: deployment_containers::ActiveModel = container.into();
+            active_container.status = Set(Some("stopped".to_string()));
+            let _ = active_container.update(self.db.as_ref()).await;
+        }
+
+        info!("Stopped containers in environment: {}", environment_id);
+        Ok(())
+    }
+
+    /// Start all containers in an environment
+    pub async fn start_all_containers(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<(), DeploymentError> {
+        use temps_entities::environments;
+
+        // Verify environment exists and belongs to project
+        let _environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
+
+        // Get all active containers in this environment
+        let containers = deployment_containers::Entity::find()
+            .inner_join(deployments::Entity)
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .all(self.db.as_ref())
+            .await?;
+
+        for container in containers {
+            let _ = self.deployer.start_container(&container.container_id).await;
+            let mut active_container: deployment_containers::ActiveModel = container.into();
+            active_container.status = Set(Some("running".to_string()));
+            let _ = active_container.update(self.db.as_ref()).await;
+        }
+
+        info!("Started containers in environment: {}", environment_id);
+        Ok(())
+    }
+
+    /// Restart all containers in an environment
+    pub async fn restart_all_containers(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<(), DeploymentError> {
+        use temps_entities::environments;
+
+        // Verify environment exists and belongs to project
+        let _environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
+
+        // Get all active containers in this environment
+        let containers = deployment_containers::Entity::find()
+            .inner_join(deployments::Entity)
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .all(self.db.as_ref())
+            .await?;
+
+        for container in containers {
+            let _ = self.deployer.stop_container(&container.container_id).await;
+            let _ = self.deployer.start_container(&container.container_id).await;
+            let mut active_container: deployment_containers::ActiveModel = container.into();
+            active_container.status = Set(Some("running".to_string()));
+            let _ = active_container.update(self.db.as_ref()).await;
+        }
+
+        info!("Restarted containers in environment: {}", environment_id);
+        Ok(())
+    }
+
+    /// Get metrics/stats for a specific container
+    pub async fn get_container_metrics(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+    ) -> Result<temps_deployer::ContainerStats, DeploymentError> {
+        let (container, _) = self
+            .get_container_detail(project_id, environment_id, container_id.clone())
+            .await?;
+
+        // Get container stats from Docker
+        let stats = self
+            .deployer
+            .get_container_stats(&container.container_id)
+            .await
+            .map_err(|e| DeploymentError::Other(format!("Failed to get container stats: {}", e)))?;
+
+        debug!("Retrieved metrics for container: {}", container_id);
+        Ok(stats)
+    }
+
+    /// Get deployment activity graph for the last N days
+    /// Returns daily counts of unique commits deployed, with intensity levels for GitHub-style contribution graph
+    /// Note: Only counts deployments that have a commit SHA, and counts each unique commit once per day
+    pub async fn get_activity_graph(
+        &self,
+        project_id: Option<i32>,
+        environment_id: Option<i32>,
+        days: i32,
+    ) -> Result<crate::handlers::types::ActivityGraphResponse, DeploymentError> {
+        use chrono::{Duration, NaiveDate, Utc};
+        use std::collections::HashMap;
+
+        let end_date = Utc::now().date_naive();
+        let start_date = end_date - Duration::days(days as i64 - 1);
+
+        // Convert NaiveDate to DateTime for comparison
+        let start_datetime = start_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let end_datetime = end_date.and_hms_opt(23, 59, 59).unwrap().and_utc();
+
+        // Build query using Sea-ORM
+        let mut query = deployments::Entity::find()
+            .filter(deployments::Column::CreatedAt.gte(start_datetime))
+            .filter(deployments::Column::CreatedAt.lte(end_datetime));
+
+        if let Some(pid) = project_id {
+            query = query.filter(deployments::Column::ProjectId.eq(pid));
+        }
+
+        if let Some(eid) = environment_id {
+            query = query.filter(deployments::Column::EnvironmentId.eq(eid));
+        }
+
+        // Fetch all deployments in the date range
+        let deployments_list = query.all(self.db.as_ref()).await?;
+
+        // Group deployments by date, counting unique commit SHAs per day
+        // We use a HashMap of HashSet to track unique commits per date
+        let mut commits_by_date: HashMap<NaiveDate, std::collections::HashSet<String>> =
+            HashMap::new();
+        for deployment in deployments_list {
+            let date = deployment.created_at.date_naive();
+
+            // Only count deployments with a commit SHA
+            if let Some(commit_sha) = deployment.commit_sha {
+                commits_by_date
+                    .entry(date)
+                    .or_insert_with(std::collections::HashSet::new)
+                    .insert(commit_sha);
+            }
+        }
+
+        // Convert unique commits to counts
+        let mut activity_map: HashMap<NaiveDate, i64> = HashMap::new();
+        for (date, commits) in commits_by_date {
+            activity_map.insert(date, commits.len() as i64);
+        }
+
+        // Generate all days in the range (including days with zero activity)
+        let mut days_vec = Vec::new();
+        let mut total_count = 0i64;
+        let mut current = start_date;
+
+        while current <= end_date {
+            let count = activity_map.get(&current).copied().unwrap_or(0);
+            total_count += count;
+
+            // Calculate intensity level for visualization
+            // 0: No activity, 1: Low (1-2), 2: Medium (3-5), 3: High (6-10), 4: Very High (11+)
+            let level = match count {
+                0 => 0,
+                1..=2 => 1,
+                3..=5 => 2,
+                6..=10 => 3,
+                _ => 4,
+            };
+
+            days_vec.push(crate::handlers::types::ActivityDay {
+                date: current.to_string(),
+                count,
+                level,
+            });
+
+            current = current.succ_opt().unwrap_or(current);
+        }
+
+        Ok(crate::handlers::types::ActivityGraphResponse {
+            days: days_vec,
+            total_count,
+            start_date: start_date.to_string(),
+            end_date: end_date.to_string(),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
+
     use chrono::Utc;
     use mockall::mock;
     use sea_orm::{ActiveModelTrait, EntityTrait, Set};
-    use temps_core::EncryptionService;
-    use std::collections::HashMap;
+
     use std::sync::Arc;
-    use temps_database::{test_utils::TestDatabase, DbConnection};
+    use temps_core::EncryptionService;
+    use temps_database::test_utils::TestDatabase;
     use temps_entities::{
-        deployments, env_vars, environments, external_service_params, external_services,
-        project_services, projects,
+        deployment_config::DeploymentConfig, deployments, env_vars, environments,
+        external_services, preset::Preset, project_services, projects,
+        upstream_config::UpstreamList,
     };
 
     // Mock for other services
@@ -1375,15 +2061,31 @@ mod tests {
             async fn resume_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
             async fn remove_container(&self, container_id: &str) -> Result<(), temps_deployer::DeployerError>;
             async fn get_container_info(&self, container_id: &str) -> Result<temps_deployer::ContainerInfo, temps_deployer::DeployerError>;
+            async fn get_container_stats(&self, container_id: &str) -> Result<temps_deployer::ContainerStats, temps_deployer::DeployerError>;
             async fn list_containers(&self) -> Result<Vec<temps_deployer::ContainerInfo>, temps_deployer::DeployerError>;
             async fn get_container_logs(&self, container_id: &str) -> Result<String, temps_deployer::DeployerError>;
             async fn stream_container_logs(&self, container_id: &str) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, temps_deployer::DeployerError>;
         }
     }
-    fn create_test_external_service_manager(db: Arc<temps_database::DbConnection>) -> Arc<temps_providers::ExternalServiceManager> {
-        let encryption_service = Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+    fn create_test_external_service_manager(
+        db: Arc<temps_database::DbConnection>,
+    ) -> Arc<temps_providers::ExternalServiceManager> {
+        let encryption_service = create_test_encryption_service();
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().ok().unwrap());
-        Arc::new(temps_providers::ExternalServiceManager::new(db, encryption_service, docker))
+        Arc::new(temps_providers::ExternalServiceManager::new(
+            db,
+            encryption_service,
+            docker,
+        ))
+    }
+
+    fn create_test_encryption_service() -> Arc<EncryptionService> {
+        Arc::new(
+            EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        )
     }
 
     async fn setup_test_data(
@@ -1396,25 +2098,18 @@ mod tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            repo_owner: Set(Some("test-owner".to_string())),
-            repo_name: Set(Some("test-repo".to_string())),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            main_branch: Set("main".to_string()),
             git_provider_connection_id: Set(Some(1)),
-            preset: Set(Some("nextjs".to_string())),
+            preset: Set(Preset::NextJs),
             directory: Set("/".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
-            automatic_deploy: Set(false),
-            custom_domain: Set(None),
             deleted_at: Set(None),
             is_deleted: Set(false),
-            project_type: Set(temps_entities::types::ProjectType::Server),
-            is_web_app: Set(true),
-            performance_metrics_enabled: Set(false),
-            use_default_wildcard: Set(true),
-            is_public_repo: Set(false),
-            git_url: Set(None),
-            is_on_demand: Set(false),
-            main_branch: Set("main".to_string()),
+            deployment_config: Set(Some(DeploymentConfig::default())),
+            last_deployment: Set(None),
             ..Default::default()
         };
         let project = project.insert(db.as_ref()).await?;
@@ -1425,13 +2120,8 @@ mod tests {
             name: Set("Test Environment".to_string()),
             slug: Set("test".to_string()),
             host: Set("test.example.com".to_string()), // Add required host field
-            upstreams: Set(serde_json::json!([])),     // Add required upstreams field (empty array)
+            upstreams: Set(UpstreamList::default()),   // Add required upstreams field (empty array)
             current_deployment_id: Set(None),
-            replicas: Set(Some(1)),
-            cpu_request: Set(Some(100)),
-            cpu_limit: Set(Some(200)),
-            memory_request: Set(Some(128)),
-            memory_limit: Set(Some(256)),
             subdomain: Set("test.example.com".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -1445,7 +2135,9 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("test-deployment-123".to_string()),
             state: Set("deployed".to_string()),
-            metadata: Set(serde_json::json!({"message": "Test deployment"})),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             image_name: Set(Some("nginx:latest".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -1500,6 +2192,7 @@ mod tests {
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn setup_test_external_services(
         db: &Arc<temps_database::DbConnection>,
         project_id: i32,
@@ -1526,27 +2219,6 @@ mod tests {
             ..Default::default()
         };
         project_service.insert(db.as_ref()).await?;
-
-        // Create service parameters
-        let service_param = external_service_params::ActiveModel {
-            service_id: Set(external_service.id),
-            key: Set("host".to_string()),
-            value: Set("redis.example.com".to_string()),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        service_param.insert(db.as_ref()).await?;
-
-        let encrypted_param = external_service_params::ActiveModel {
-            service_id: Set(external_service.id),
-            key: Set("password".to_string()),
-            value: Set("encrypted_password".to_string()),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        encrypted_param.insert(db.as_ref()).await?;
 
         Ok(())
     }
@@ -1712,19 +2384,50 @@ mod tests {
         let (_project, mut environment, target_deployment) = setup_test_data(&db).await?;
         setup_test_environment_variables(&db, target_deployment.project_id, environment.id).await?;
 
+        // Create container for target deployment (required for rollback)
+        let now = Utc::now();
+        let target_container = deployment_containers::ActiveModel {
+            deployment_id: Set(target_deployment.id),
+            container_id: Set("container-rollback-target".to_string()),
+            container_name: Set("app-rollback-target".to_string()),
+            container_port: Set(8080),
+            image_name: Set(Some("nginx:target".to_string())),
+            status: Set(Some("running".to_string())),
+            created_at: Set(now),
+            deployed_at: Set(now),
+            ..Default::default()
+        };
+        target_container.insert(db.as_ref()).await?;
+
         // Create current deployment that will be stopped
         let current_deployment = deployments::ActiveModel {
             project_id: Set(target_deployment.project_id),
             environment_id: Set(environment.id),
             slug: Set("current-deployment-456".to_string()),
             state: Set("deployed".to_string()),
-            metadata: Set(serde_json::json!({"message": "Current deployment"})),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             image_name: Set(Some("nginx:current".to_string())),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
         };
         let current_deployment = current_deployment.insert(db.as_ref()).await?;
+
+        // Create container for current deployment
+        let current_container = deployment_containers::ActiveModel {
+            deployment_id: Set(current_deployment.id),
+            container_id: Set("container-rollback-current".to_string()),
+            container_name: Set("app-rollback-current".to_string()),
+            container_port: Set(8080),
+            image_name: Set(Some("nginx:current".to_string())),
+            status: Set(Some("running".to_string())),
+            created_at: Set(now),
+            deployed_at: Set(now),
+            ..Default::default()
+        };
+        current_container.insert(db.as_ref()).await?;
 
         // Update environment to point to current deployment
         let mut active_environment: environments::ActiveModel = environment.into();
@@ -1751,6 +2454,39 @@ mod tests {
             updated_environment.current_deployment_id,
             Some(target_deployment.id)
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rollback_to_deployment_invalid_state() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Setup test data
+        let (_project, _environment, mut target_deployment) = setup_test_data(&db).await?;
+
+        // Update the deployment state to "failed" to make it invalid for rollback
+        let mut active_deployment: deployments::ActiveModel = target_deployment.into();
+        active_deployment.state = Set("failed".to_string());
+        target_deployment = active_deployment.update(db.as_ref()).await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        // Test rollback to invalid deployment state
+        let result = deployment_service
+            .rollback_to_deployment(target_deployment.project_id, target_deployment.id)
+            .await;
+
+        // Verify error is thrown
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            DeploymentError::InvalidDeploymentState(msg) => {
+                assert!(msg.contains("failed"));
+                assert!(msg.contains("deployed"));
+            }
+            e => panic!("Expected InvalidDeploymentState error, got: {:?}", e),
+        }
 
         Ok(())
     }
@@ -1794,7 +2530,9 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("deployment2-456".to_string()),
             state: Set("deployed".to_string()),
-            metadata: Set(serde_json::json!({"message": "Second deployment"})),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -1895,8 +2633,14 @@ mod tests {
         // Create workflow planner
         let dsn_service = Arc::new(temps_error_tracking::DSNService::new(db.clone()));
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let workflow_planner =
-            WorkflowPlanner::new(db.clone(), log_service.clone(), external_service_manager.clone(), config_service, dsn_service);
+        let workflow_planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service.clone(),
+            external_service_manager.clone(),
+            config_service,
+            dsn_service,
+            create_test_encryption_service(),
+        );
 
         // Create deployment jobs using workflow planner
         let created_jobs = workflow_planner
@@ -1959,7 +2703,6 @@ mod tests {
     #[tokio::test]
     async fn test_deployment_jobs_with_log_ids() -> Result<(), Box<dyn std::error::Error>> {
         use crate::services::workflow_planner::WorkflowPlanner;
-        use temps_entities::deployment_jobs;
 
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
@@ -1982,8 +2725,14 @@ mod tests {
         // Create workflow planner
         let dsn_service = Arc::new(temps_error_tracking::DSNService::new(db.clone()));
         let external_service_manager = create_test_external_service_manager(db.clone());
-        let workflow_planner =
-            WorkflowPlanner::new(db.clone(), log_service.clone(), external_service_manager.clone(), config_service, dsn_service);
+        let workflow_planner = WorkflowPlanner::new(
+            db.clone(),
+            log_service.clone(),
+            external_service_manager.clone(),
+            config_service,
+            dsn_service,
+            create_test_encryption_service(),
+        );
 
         // Create deployment jobs
         let created_jobs = workflow_planner
@@ -1999,7 +2748,7 @@ mod tests {
             assert!(log_id.starts_with(&format!("deployment-{}", deployment.id)));
             assert!(log_id.contains(&job.job_id));
 
-            println!("✅ Job '{}' has log_id: {}", job.name, log_id);
+            println!("Job '{}' has log_id: {}", job.name, log_id);
         }
 
         Ok(())
@@ -2062,7 +2811,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_environment_containers_no_deployment() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_list_environment_containers_no_deployment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
@@ -2076,7 +2826,11 @@ mod tests {
             .list_environment_containers(project.id, environment.id)
             .await?;
 
-        assert_eq!(containers.len(), 0, "Should return no containers when no active deployment");
+        assert_eq!(
+            containers.len(),
+            0,
+            "Should return no containers when no active deployment"
+        );
 
         Ok(())
     }
@@ -2119,16 +2873,22 @@ mod tests {
                 deployment.project_id,
                 environment.id,
                 "invalid-container-id".to_string(),
-                None,
-                None,
-                None,
+                ContainerLogParams {
+                    start_date: None,
+                    end_date: None,
+                    tail: None,
+                    timestamps: false,
+                },
             )
             .await;
 
         assert!(result.is_err(), "Should fail with invalid container ID");
         match result {
             Err(DeploymentError::NotFound(msg)) => {
-                assert!(msg.contains("Container"), "Error should mention container not found");
+                assert!(
+                    msg.contains("Container"),
+                    "Error should mention container not found"
+                );
             }
             _ => panic!("Expected NotFound error"),
         }
@@ -2145,7 +2905,9 @@ mod tests {
         let project = projects::ActiveModel {
             name: Set("Static Site".to_string()),
             slug: Set("static-site".to_string()),
-            project_type: Set(temps_entities::types::ProjectType::Static),
+            repo_name: Set("static-site-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            preset: Set(Preset::Static), // Static preset doesn't require a server
             main_branch: Set("main".to_string()),
             directory: Set("/".to_string()),
             created_at: Set(Utc::now()),
@@ -2160,7 +2922,7 @@ mod tests {
             name: Set("Test".to_string()),
             slug: Set("test".to_string()),
             host: Set("test.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             subdomain: Set("test.example.com".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -2178,11 +2940,676 @@ mod tests {
         assert!(result.is_err(), "Should fail for non-server projects");
         match result {
             Err(DeploymentError::Other(msg)) => {
-                assert!(msg.contains("server-type"), "Error should mention server-type projects");
+                assert!(
+                    msg.contains("server-type"),
+                    "Error should mention server-type projects"
+                );
             }
             _ => panic!("Expected Other error"),
         }
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_container_detail_success() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Setup: Create project, environment, deployment, and container
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        // Test: Get container detail
+        let (result_container, result_env) = deployment_service
+            .get_container_detail(project.id, environment.id, container.container_id.clone())
+            .await?;
+
+        // Verify container details
+        assert_eq!(result_container.id, container.id);
+        assert_eq!(result_container.container_id, "container-123");
+        assert_eq!(result_container.container_name, "test-container-1");
+        assert_eq!(result_container.status, Some("running".to_string()));
+
+        // Verify environment info
+        assert_eq!(result_env.id, environment.id);
+        assert_eq!(result_env.name, environment.name);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_container_detail_not_found() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Setup: Create project and environment (no container)
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let project = project.insert(db.as_ref()).await?;
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Production".to_string()),
+            slug: Set("prod".to_string()),
+            host: Set("prod.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("prod.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let environment = environment.insert(db.as_ref()).await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        // Test: Try to get non-existent container
+        let result = deployment_service
+            .get_container_detail(project.id, environment.id, "non-existent".to_string())
+            .await;
+
+        assert!(result.is_err(), "Should fail when container not found");
+        match result {
+            Err(DeploymentError::NotFound(msg)) => {
+                assert!(msg.contains("Container"));
+            }
+            _ => panic!("Expected NotFound error"),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stop_container_success() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Setup
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        // Test: Stop container
+        deployment_service
+            .stop_container(project.id, environment.id, container.container_id.clone())
+            .await?;
+
+        // Verify: Check that container status is updated in database
+        let updated_container = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("Container should exist");
+
+        assert_eq!(updated_container.status, Some("stopped".to_string()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_start_container_success() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Setup
+        let (project, environment, _deployment, mut container) = setup_test_deployment(&db).await?;
+
+        // Set container status to stopped
+        let mut active_container: deployment_containers::ActiveModel = container.into();
+        active_container.status = Set(Some("stopped".to_string()));
+        container = active_container.update(db.as_ref()).await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        // Test: Start container
+        deployment_service
+            .start_container(project.id, environment.id, container.container_id.clone())
+            .await?;
+
+        // Verify: Check that container status is updated to running
+        let updated_container = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("Container should exist");
+
+        assert_eq!(updated_container.status, Some("running".to_string()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_restart_container_success() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Setup
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        // Test: Restart container (stop + start)
+        deployment_service
+            .restart_container(project.id, environment.id, container.container_id.clone())
+            .await?;
+
+        // Verify: Container should be running after restart
+        let updated_container = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("Container should exist");
+
+        assert_eq!(updated_container.status, Some("running".to_string()));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_container_env_variables() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Setup
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        // Test: Get container environment variables
+        let env_vars = deployment_service
+            .get_container_env_variables(project.id, environment.id, container.container_id.clone())
+            .await?;
+
+        // The mock returns empty HashMap, so we should get empty vec
+        assert_eq!(env_vars.len(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stop_all_containers_success() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Setup
+        let (project, environment, deployment, _container) = setup_test_deployment(&db).await?;
+
+        // Create second container
+        let now = Utc::now();
+        let container2 = deployment_containers::ActiveModel {
+            deployment_id: Set(deployment.id),
+            container_id: Set("container-789".to_string()),
+            container_name: Set("test-container-3".to_string()),
+            container_port: Set(9090),
+            image_name: Set(Some("redis:latest".to_string())),
+            status: Set(Some("running".to_string())),
+            created_at: Set(now),
+            deployed_at: Set(now),
+            ..Default::default()
+        };
+        container2.insert(db.as_ref()).await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        // Test: Stop all containers
+        deployment_service
+            .stop_all_containers(project.id, environment.id)
+            .await?;
+
+        // Verify: Both containers should be stopped
+        let containers = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::DeploymentId.eq(deployment.id))
+            .all(db.as_ref())
+            .await?;
+
+        for container in containers {
+            assert_eq!(container.status, Some("stopped".to_string()));
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_start_all_containers_success() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Setup
+        let (project, environment, deployment, container1) = setup_test_deployment(&db).await?;
+
+        // Set all containers to stopped
+        let mut active_container: deployment_containers::ActiveModel = container1.into();
+        active_container.status = Set(Some("stopped".to_string()));
+        active_container.update(db.as_ref()).await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        // Test: Start all containers
+        deployment_service
+            .start_all_containers(project.id, environment.id)
+            .await?;
+
+        // Verify: All containers should be running
+        let containers = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::DeploymentId.eq(deployment.id))
+            .all(db.as_ref())
+            .await?;
+
+        for container in containers {
+            assert_eq!(container.status, Some("running".to_string()));
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_restart_all_containers_success() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Setup (this creates 1 container)
+        let (project, environment, deployment, _container) = setup_test_deployment(&db).await?;
+
+        // Create multiple additional containers (3 more, total 4)
+        let now = Utc::now();
+        for i in 1..=3 {
+            let container = deployment_containers::ActiveModel {
+                deployment_id: Set(deployment.id),
+                container_id: Set(format!("container-{}", i * 100)),
+                container_name: Set(format!("test-container-{}", i)),
+                container_port: Set(8000 + i),
+                image_name: Set(Some("nginx:latest".to_string())),
+                status: Set(Some("running".to_string())),
+                created_at: Set(now),
+                deployed_at: Set(now),
+                ..Default::default()
+            };
+            container.insert(db.as_ref()).await?;
+        }
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        // Test: Restart all containers
+        deployment_service
+            .restart_all_containers(project.id, environment.id)
+            .await?;
+
+        // Verify: All containers should still be running (1 from setup + 3 created = 4 total)
+        let containers = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::DeploymentId.eq(deployment.id))
+            .all(db.as_ref())
+            .await?;
+
+        assert_eq!(
+            containers.len(),
+            4,
+            "Should have 4 containers (1 from setup + 3 created)"
+        );
+        for container in containers {
+            assert_eq!(container.status, Some("running".to_string()));
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_container_operations_wrong_environment() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Setup: Create two environments
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let project = project.insert(db.as_ref()).await?;
+
+        let env1 = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Environment 1".to_string()),
+            slug: Set("env1".to_string()),
+            host: Set("env1.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("env1.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let env1 = env1.insert(db.as_ref()).await?;
+
+        let env2 = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Environment 2".to_string()),
+            slug: Set("env2".to_string()),
+            host: Set("env2.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("env2.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let env2 = env2.insert(db.as_ref()).await?;
+
+        // Create deployment and container in env1
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(env1.id),
+            state: Set("deployed".to_string()),
+            slug: Set("test-deployment".to_string()),
+            metadata: Set(Some(Default::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let deployment = deployment.insert(db.as_ref()).await?;
+
+        let now = Utc::now();
+        let container = deployment_containers::ActiveModel {
+            deployment_id: Set(deployment.id),
+            container_id: Set("container-123".to_string()),
+            container_name: Set("test-container".to_string()),
+            container_port: Set(8080),
+            image_name: Set(Some("nginx:latest".to_string())),
+            status: Set(Some("running".to_string())),
+            created_at: Set(now),
+            deployed_at: Set(now),
+            ..Default::default()
+        };
+        container.insert(db.as_ref()).await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        // Test: Try to operate on container from wrong environment
+        let result = deployment_service
+            .get_container_detail(project.id, env2.id, "container-123".to_string())
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Should fail when environment doesn't match"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rollback_to_multiple_deployments_with_deleted_containers(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Setup: Create project and environment
+        let project = projects::ActiveModel {
+            name: Set("Multi-Deploy Project".to_string()),
+            slug: Set("multi-deploy".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let project = project.insert(db.as_ref()).await?;
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Production".to_string()),
+            slug: Set("prod".to_string()),
+            host: Set("prod.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("prod.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let environment = environment.insert(db.as_ref()).await?;
+
+        // Create 3 deployments
+        let deployment1 = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            state: Set("deployed".to_string()),
+            slug: Set("deployment-1".to_string()),
+            image_name: Set(Some("app:v1".to_string())),
+            metadata: Set(Some(Default::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let deployment1 = deployment1.insert(db.as_ref()).await?;
+
+        let deployment2 = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            state: Set("deployed".to_string()),
+            slug: Set("deployment-2".to_string()),
+            image_name: Set(Some("app:v2".to_string())),
+            metadata: Set(Some(Default::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let deployment2 = deployment2.insert(db.as_ref()).await?;
+
+        let deployment3 = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            state: Set("deployed".to_string()),
+            slug: Set("deployment-3".to_string()),
+            image_name: Set(Some("app:v3".to_string())),
+            metadata: Set(Some(Default::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let deployment3 = deployment3.insert(db.as_ref()).await?;
+
+        // Create containers for each deployment
+        let now = Utc::now();
+
+        let container1 = deployment_containers::ActiveModel {
+            deployment_id: Set(deployment1.id),
+            container_id: Set("container-v1".to_string()),
+            container_name: Set("app-container-v1".to_string()),
+            container_port: Set(8080),
+            image_name: Set(Some("app:v1".to_string())),
+            status: Set(Some("running".to_string())),
+            created_at: Set(now),
+            deployed_at: Set(now),
+            ..Default::default()
+        };
+        container1.insert(db.as_ref()).await?;
+
+        let container2 = deployment_containers::ActiveModel {
+            deployment_id: Set(deployment2.id),
+            container_id: Set("container-v2".to_string()),
+            container_name: Set("app-container-v2".to_string()),
+            container_port: Set(8080),
+            image_name: Set(Some("app:v2".to_string())),
+            status: Set(Some("running".to_string())),
+            created_at: Set(now),
+            deployed_at: Set(now),
+            ..Default::default()
+        };
+        container2.insert(db.as_ref()).await?;
+
+        let container3 = deployment_containers::ActiveModel {
+            deployment_id: Set(deployment3.id),
+            container_id: Set("container-v3".to_string()),
+            container_name: Set("app-container-v3".to_string()),
+            container_port: Set(8080),
+            image_name: Set(Some("app:v3".to_string())),
+            status: Set(Some("running".to_string())),
+            created_at: Set(now),
+            deployed_at: Set(now),
+            ..Default::default()
+        };
+        container3.insert(db.as_ref()).await?;
+
+        // Set current deployment to deployment3
+        let mut active_environment: environments::ActiveModel = environment.into();
+        active_environment.current_deployment_id = Set(Some(deployment3.id));
+        let environment = active_environment.update(db.as_ref()).await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        // Test 1: Rollback to deployment2
+        println!("Test 1: Rolling back to deployment 2");
+        deployment_service
+            .rollback_to_deployment(project.id, deployment2.id)
+            .await?;
+
+        // Verify deployment2 is now current
+        let updated_env = environments::Entity::find_by_id(environment.id)
+            .one(db.as_ref())
+            .await?
+            .expect("Environment should exist");
+        assert_eq!(updated_env.current_deployment_id, Some(deployment2.id));
+
+        // Test 2: Rollback to deployment1 (containers redeployed)
+        println!("Test 2: Rolling back to deployment 1 (containers redeployed)");
+        deployment_service
+            .rollback_to_deployment(project.id, deployment1.id)
+            .await?;
+
+        // Verify deployment1 is now current
+        let updated_env = environments::Entity::find_by_id(environment.id)
+            .one(db.as_ref())
+            .await?
+            .expect("Environment should exist");
+        assert_eq!(updated_env.current_deployment_id, Some(deployment1.id));
+
+        // Test 3: Verify rollback chain (3 -> 2 -> 1)
+        println!("Test 3: Full rollback chain (3 -> 2 -> 1)");
+
+        deployment_service
+            .rollback_to_deployment(project.id, deployment3.id)
+            .await?;
+        let updated_env = environments::Entity::find_by_id(environment.id)
+            .one(db.as_ref())
+            .await?
+            .expect("Environment should exist");
+        assert_eq!(updated_env.current_deployment_id, Some(deployment3.id));
+
+        deployment_service
+            .rollback_to_deployment(project.id, deployment2.id)
+            .await?;
+        let updated_env = environments::Entity::find_by_id(environment.id)
+            .one(db.as_ref())
+            .await?
+            .expect("Environment should exist");
+        assert_eq!(updated_env.current_deployment_id, Some(deployment2.id));
+
+        deployment_service
+            .rollback_to_deployment(project.id, deployment1.id)
+            .await?;
+        let updated_env = environments::Entity::find_by_id(environment.id)
+            .one(db.as_ref())
+            .await?
+            .expect("Environment should exist");
+        assert_eq!(updated_env.current_deployment_id, Some(deployment1.id));
+
+        println!("All rollback tests passed!");
+        Ok(())
+    }
+
+    // Helper function to setup a test deployment with a container
+    async fn setup_test_deployment(
+        db: &Arc<temps_database::DbConnection>,
+    ) -> Result<
+        (
+            projects::Model,
+            environments::Model,
+            deployments::Model,
+            deployment_containers::Model,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let project = project.insert(db.as_ref()).await?;
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Production".to_string()),
+            slug: Set("prod".to_string()),
+            host: Set("prod.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("prod.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let environment = environment.insert(db.as_ref()).await?;
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            state: Set("deployed".to_string()),
+            slug: Set("test-deployment".to_string()),
+            metadata: Set(Some(Default::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let deployment = deployment.insert(db.as_ref()).await?;
+
+        let now = Utc::now();
+        let container = deployment_containers::ActiveModel {
+            deployment_id: Set(deployment.id),
+            container_id: Set("container-123".to_string()),
+            container_name: Set("test-container-1".to_string()),
+            container_port: Set(8080),
+            image_name: Set(Some("nginx:latest".to_string())),
+            status: Set(Some("running".to_string())),
+            created_at: Set(now),
+            deployed_at: Set(now),
+            ..Default::default()
+        };
+        let container = container.insert(db.as_ref()).await?;
+
+        Ok((project, environment, deployment, container))
+    }
+}
+
+// Implement DeploymentCanceller trait from temps-core
+#[async_trait::async_trait]
+impl temps_core::DeploymentCanceller for DeploymentService {
+    async fn cancel_all_environment_deployments(
+        &self,
+        environment_id: i32,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        self.cancel_all_environment_deployments(environment_id)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 }

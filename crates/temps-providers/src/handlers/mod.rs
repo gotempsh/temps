@@ -1,5 +1,8 @@
-pub mod handlers;
-pub mod types;
 pub mod audit;
-pub use handlers::*;
+#[allow(clippy::module_inception)]
+pub mod handlers;
+pub mod query_handlers;
+pub mod types;
 pub use audit::*;
+pub use handlers::*;
+pub use query_handlers::*;

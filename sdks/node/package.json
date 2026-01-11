@@ -1,0 +1,19 @@
+{
+  "name": "temps-sdk",
+  "type": "module",
+  "version": "0.0.1-alpha.1",
+  "workspaces": [
+    "packages/*",
+    "examples/**/*"
+  ],
+  "scripts": {
+    "build": "bun run --filter @temps-sdk/* build",
+    "test": "bun run --filter @temps-sdk/* test:run",
+    "test:coverage": "bun run --filter @temps-sdk/* test:coverage",
+    "clean": "bun run --filter @temps-sdk/* clean"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.4"
+  }
+}

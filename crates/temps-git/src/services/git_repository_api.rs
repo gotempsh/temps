@@ -1,5 +1,5 @@
+use super::git_provider::{Branch, Commit, GitProviderError, GitProviderTag};
 use async_trait::async_trait;
-use super::git_provider::{Commit, Branch, GitProviderTag, GitProviderError};
 
 /// Repository-specific Git API trait
 /// Provides operations for a specific repository without needing to pass owner/repo repeatedly

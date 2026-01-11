@@ -62,10 +62,7 @@ macro_rules! permission_check {
                 "This operation requires the {} permission",
                 $permission.to_string()
             ))
-            .value(
-                "required_permission",
-                $permission.to_string(),
-            )
+            .value("required_permission", $permission.to_string())
             .value("user_role", $auth.effective_role.to_string())
             .build());
         }

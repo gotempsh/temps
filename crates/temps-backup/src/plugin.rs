@@ -5,13 +5,13 @@ use std::sync::Arc;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
+use tracing;
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
-use tracing;
 
 use crate::{
+    handlers::{self, create_backup_app_state, BackupAppState},
     services::BackupService,
-    handlers::{self, BackupAppState, create_backup_app_state},
 };
 
 /// Backup Plugin for managing backup operations and schedules
@@ -41,8 +41,10 @@ impl TempsPlugin for BackupPlugin {
         Box::pin(async move {
             // Get required dependencies from the service registry
             let db = context.require_service::<sea_orm::DatabaseConnection>();
-            let external_service_manager = context.require_service::<temps_providers::ExternalServiceManager>();
-            let notification_service = context.require_service::<temps_notifications::NotificationService>();
+            let external_service_manager =
+                context.require_service::<temps_providers::ExternalServiceManager>();
+            let notification_service =
+                context.require_service::<temps_notifications::NotificationService>();
             let config_service = context.require_service::<temps_config::ConfigService>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
@@ -60,10 +62,7 @@ impl TempsPlugin for BackupPlugin {
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
             // Create BackupAppState for handlers
-            let backup_app_state = create_backup_app_state(
-                backup_service,
-                audit_service,
-            ).await;
+            let backup_app_state = create_backup_app_state(backup_service, audit_service).await;
             context.register_service(backup_app_state);
 
             tracing::debug!("Backup plugin services registered successfully");
@@ -100,7 +99,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_backup_plugin_default() {
-        let backup_plugin = BackupPlugin::default();
+        let backup_plugin = BackupPlugin;
         assert_eq!(backup_plugin.name(), "backup");
     }
 }

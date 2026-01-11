@@ -28,18 +28,19 @@ import { useQuery } from '@tanstack/react-query'
 import { useForm } from 'react-hook-form'
 import { useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
-import { ProvidersManagement } from './ProvidersManagement'
 import {
   backupAlertsSchema,
   domainAlertsSchema,
   notificationSettingsSchema,
   projectAlertsSchema,
   routeAlertsSchema,
+  weeklyDigestSchema,
   type BackupAlertsFormData,
   type DomainAlertsFormData,
   type NotificationSettingsFormData,
   type ProjectAlertsFormData,
   type RouteAlertsFormData,
+  type WeeklyDigestFormData,
 } from './schemas'
 
 interface AlertComponentProps<T> {
@@ -613,6 +614,251 @@ function NotificationSettings({
   )
 }
 
+function WeeklyDigest({
+  onSave,
+  defaultValues,
+}: AlertComponentProps<WeeklyDigestFormData>) {
+  const form = useForm<WeeklyDigestFormData>({
+    resolver: zodResolver(weeklyDigestSchema),
+    defaultValues: {
+      weeklyDigestEnabled: defaultValues?.weeklyDigestEnabled ?? false,
+      digestSendDay: defaultValues?.digestSendDay ?? 'monday',
+      digestSendTime: defaultValues?.digestSendTime ?? '09:00',
+      digestSections: {
+        performance: defaultValues?.digestSections?.performance ?? true,
+        deployments: defaultValues?.digestSections?.deployments ?? true,
+        errors: defaultValues?.digestSections?.errors ?? true,
+        funnels: defaultValues?.digestSections?.funnels ?? true,
+        security: defaultValues?.digestSections?.security ?? true,
+        resources: defaultValues?.digestSections?.resources ?? true,
+      },
+    },
+  })
+
+  const handleSubmit = async (data: WeeklyDigestFormData) => {
+    await onSave(data)
+    form.reset(data)
+  }
+
+  const digestEnabled = form.watch('weeklyDigestEnabled')
+
+  return (
+    <Form {...form}>
+      <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
+        <div className="space-y-4">
+          <h3 className="text-lg font-medium">Weekly Digest</h3>
+          <p className="text-sm text-muted-foreground">
+            Receive a comprehensive weekly summary of your project's activity,
+            performance, and health metrics
+          </p>
+
+          <FormField
+            control={form.control}
+            name="weeklyDigestEnabled"
+            render={({ field }) => (
+              <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
+                <div className="space-y-0.5">
+                  <FormLabel className="text-base">
+                    Enable Weekly Digest
+                  </FormLabel>
+                  <FormDescription>
+                    Get a weekly email with project insights and metrics
+                  </FormDescription>
+                </div>
+                <FormControl>
+                  <Switch
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                  />
+                </FormControl>
+              </FormItem>
+            )}
+          />
+
+          {digestEnabled && (
+            <div className="space-y-4 pl-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <FormField
+                  control={form.control}
+                  name="digestSendDay"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Send Day</FormLabel>
+                      <Select
+                        onValueChange={field.onChange}
+                        value={field.value}
+                      >
+                        <FormControl>
+                          <SelectTrigger>
+                            <SelectValue placeholder="Select day" />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          <SelectItem value="monday">Monday</SelectItem>
+                          <SelectItem value="friday">Friday</SelectItem>
+                          <SelectItem value="sunday">Sunday</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <FormDescription>
+                        Day of the week to send the digest
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={form.control}
+                  name="digestSendTime"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Send Time (24-hour format)</FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          type="time"
+                          placeholder="09:00"
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        Time of day to send the digest
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+
+              <div className="space-y-3">
+                <FormLabel className="text-base">Digest Sections</FormLabel>
+                <FormDescription>
+                  Choose which sections to include in your weekly digest
+                </FormDescription>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <FormField
+                    control={form.control}
+                    name="digestSections.performance"
+                    render={({ field }) => (
+                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                        <FormLabel className="font-normal">
+                          Performance Metrics
+                        </FormLabel>
+                        <FormControl>
+                          <Switch
+                            checked={field.value}
+                            onCheckedChange={field.onChange}
+                          />
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="digestSections.deployments"
+                    render={({ field }) => (
+                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                        <FormLabel className="font-normal">
+                          Deployment Activity
+                        </FormLabel>
+                        <FormControl>
+                          <Switch
+                            checked={field.value}
+                            onCheckedChange={field.onChange}
+                          />
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="digestSections.errors"
+                    render={({ field }) => (
+                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                        <FormLabel className="font-normal">
+                          Error Summary
+                        </FormLabel>
+                        <FormControl>
+                          <Switch
+                            checked={field.value}
+                            onCheckedChange={field.onChange}
+                          />
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="digestSections.funnels"
+                    render={({ field }) => (
+                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                        <FormLabel className="font-normal">
+                          Funnel Analytics
+                        </FormLabel>
+                        <FormControl>
+                          <Switch
+                            checked={field.value}
+                            onCheckedChange={field.onChange}
+                          />
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="digestSections.security"
+                    render={({ field }) => (
+                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                        <FormLabel className="font-normal">
+                          Security Insights
+                        </FormLabel>
+                        <FormControl>
+                          <Switch
+                            checked={field.value}
+                            onCheckedChange={field.onChange}
+                          />
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="digestSections.resources"
+                    render={({ field }) => (
+                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                        <FormLabel className="font-normal">
+                          Resource Usage
+                        </FormLabel>
+                        <FormControl>
+                          <Switch
+                            checked={field.value}
+                            onCheckedChange={field.onChange}
+                          />
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="flex justify-end">
+          <Button disabled={!form.formState.isDirty} type="submit">
+            Save Changes
+          </Button>
+        </div>
+      </form>
+    </Form>
+  )
+}
+
 export function MonitoringSettings() {
   const navigate = useNavigate()
   const { section } = useParams()
@@ -636,7 +882,7 @@ export function MonitoringSettings() {
     { id: 'backups', label: 'Backups' },
     { id: 'routes', label: 'Routes' },
     { id: 'notifications', label: 'Notifications' },
-    { id: 'providers', label: 'Providers' },
+    { id: 'digest', label: 'Weekly Digest' },
   ] as const
 
   const handleProjectSave = async (data: ProjectAlertsFormData) => {
@@ -764,6 +1010,38 @@ export function MonitoringSettings() {
     )
   }
 
+  const handleDigestSave = async (data: WeeklyDigestFormData) => {
+    if (!preferences) return
+
+    const updatedPreferences: NotificationPreferencesResponse = {
+      ...preferences,
+      weekly_digest_enabled: data.weeklyDigestEnabled,
+      digest_send_day: data.digestSendDay,
+      digest_send_time: data.digestSendTime,
+      digest_sections: {
+        performance: data.digestSections.performance,
+        deployments: data.digestSections.deployments,
+        errors: data.digestSections.errors,
+        funnels: data.digestSections.funnels,
+        security: data.digestSections.security,
+        resources: data.digestSections.resources,
+      },
+    }
+
+    await toast.promise(
+      updatePreferences({
+        body: {
+          preferences: updatedPreferences,
+        },
+      }),
+      {
+        loading: 'Saving weekly digest settings...',
+        success: 'Weekly digest settings saved successfully',
+        error: 'Failed to save weekly digest settings',
+      }
+    )
+  }
+
   const renderContent = () => {
     if (isLoading) {
       return (
@@ -825,6 +1103,23 @@ export function MonitoringSettings() {
         | 'info',
     }
 
+    const digestDefaults = {
+      weeklyDigestEnabled: preferences.weekly_digest_enabled ?? false,
+      digestSendDay: (preferences.digest_send_day ?? 'monday') as
+        | 'monday'
+        | 'friday'
+        | 'sunday',
+      digestSendTime: preferences.digest_send_time ?? '09:00',
+      digestSections: {
+        performance: preferences.digest_sections?.performance ?? true,
+        deployments: preferences.digest_sections?.deployments ?? true,
+        errors: preferences.digest_sections?.errors ?? true,
+        funnels: preferences.digest_sections?.funnels ?? true,
+        security: preferences.digest_sections?.security ?? true,
+        resources: preferences.digest_sections?.resources ?? true,
+      },
+    }
+
     switch (currentSection) {
       case 'project':
         return (
@@ -858,8 +1153,13 @@ export function MonitoringSettings() {
             defaultValues={notificationDefaults}
           />
         )
-      case 'providers':
-        return <ProvidersManagement />
+      case 'digest':
+        return (
+          <WeeklyDigest
+            onSave={handleDigestSave}
+            defaultValues={digestDefaults}
+          />
+        )
       default:
         return null
     }

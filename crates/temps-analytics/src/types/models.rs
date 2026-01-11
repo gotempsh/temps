@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use sea_orm::FromQueryResult;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use temps_core::UtcDateTime;
 
@@ -56,7 +56,6 @@ pub struct VisitorInfo {
     pub crawler_name: Option<String>,
     pub sessions_count: i64,
     pub page_views: i64,
-    pub total_time_seconds: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,9 +129,9 @@ pub struct SessionMetricsResult {
     pub session_end: UtcDateTime,
     pub total_duration_seconds: i64,
     pub page_count: i64,
-    pub page_paths: String, // JSON array of page paths
+    pub page_paths: String,      // JSON array of page paths
     pub page_timestamps: String, // JSON array of timestamps
-    pub time_on_pages: String, // JSON array of durations
+    pub time_on_pages: String,   // JSON array of durations
 }
 
 #[derive(Debug, Serialize)]
@@ -157,7 +156,7 @@ pub struct PageSessionMetrics {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub enum PageDurationInterpretation {
-    EntryPage,      // Duration when page is the entry page
-    TimeOnPage,     // Actual time spent on the page
+    EntryPage,        // Duration when page is the entry page
+    TimeOnPage,       // Actual time spent on the page
     SessionsWithPage, // Duration of sessions that viewed this page
 }

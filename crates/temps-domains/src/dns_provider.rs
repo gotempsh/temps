@@ -5,9 +5,15 @@ use cloudflare::endpoints::{dns::dns, zones::zone};
 use cloudflare::framework::{
     auth::Credentials, client::async_api::Client, client::ClientConfig, Environment,
 };
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::proto::xfer::Protocol;
+use hickory_resolver::Resolver;
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CFDnsRecord {
     pub id: String,
@@ -65,6 +71,12 @@ impl DnsProviderService for DummyDnsProvider {
 }
 
 pub struct ManualDnsProvider {}
+
+impl Default for ManualDnsProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ManualDnsProvider {
     pub fn new() -> Self {
@@ -148,20 +160,70 @@ impl DnsProviderService for CloudflareDnsProvider {
         }
     }
     async fn set_txt_record(&self, domain: &str, name: &str, value: &str) -> Result<()> {
-        // delete record if it exists
-        match self.remove_txt_record(domain, name).await {
-            Ok(_) => (),
-            Err(e) => {
-                info!("Failed to remove TXT record {}: {:?}", name, e);
+        let zone_id = self.get_zone_id(domain).await?;
+
+        // Extract the base domain (zone name)
+        let base_domain = domain
+            .split('.')
+            .rev()
+            .take(2)
+            .collect::<Vec<&str>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<&str>>()
+            .join(".");
+
+        info!(
+            "Setting TXT record for zone: {} base_domain: {} name: {} value: {}",
+            zone_id, base_domain, name, value
+        );
+
+        // Get all existing TXT records with this name (try both full name and relative name)
+        let existing_records = self.get_txt_records_by_full_name(&zone_id, name).await?;
+
+        // Check if a record with the exact same value already exists
+        for record in &existing_records {
+            if let dns::DnsContent::TXT { content } = &record.content {
+                if content == value {
+                    info!(
+                        "TXT record already exists with same value, skipping creation: {}",
+                        name
+                    );
+                    return Ok(());
+                }
             }
         }
-        let zone_id = self.get_zone_id(domain).await?;
+
+        // NOTE: Do NOT remove existing TXT records with different values!
+        // DNS-01 challenges for wildcard certificates require MULTIPLE TXT records
+        // with the same name but different values to coexist.
+        // Each authorization (wildcard + base domain) needs its own TXT record.
+        if !existing_records.is_empty() {
+            info!(
+                "Found {} existing TXT record(s) for {}. Adding new record (multiple TXT records are allowed for DNS-01 challenges).",
+                existing_records.len(),
+                name
+            );
+        }
+
+        // Calculate the relative name (without zone suffix) for creation
+        // Cloudflare accepts both, but relative names are more reliable
+        let relative_name = if name.ends_with(&format!(".{}", base_domain)) {
+            name.strip_suffix(&format!(".{}", base_domain))
+                .unwrap_or(name)
+                .to_string()
+        } else {
+            name.to_string()
+        };
+
         info!(
-            "Setting TXT record for zone: {} domain: {} name: {} value: {}",
-            zone_id, domain, name, value
+            "Creating TXT record with relative name: {} (full: {})",
+            relative_name, name
         );
+
+        // Create the new TXT record using the relative name
         let params = dns::CreateDnsRecordParams {
-            name,
+            name: &relative_name,
             content: dns::DnsContent::TXT {
                 content: value.to_string(),
             },
@@ -175,14 +237,29 @@ impl DnsProviderService for CloudflareDnsProvider {
             params,
         };
 
-        let response = self
-            .client
-            .request(&endpoint)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create TXT record: {:?}", e))?;
-
-        info!("TXT record created: {:?}", response);
-        Ok(())
+        match self.client.request(&endpoint).await {
+            Ok(response) => {
+                info!("TXT record created successfully: {:?}", response);
+                Ok(())
+            }
+            Err(e) => {
+                // If creation failed, check if the record now exists (race condition)
+                warn!("Create failed, checking if record exists: {:?}", e);
+                let check_records = self.get_txt_records_by_full_name(&zone_id, name).await?;
+                for record in &check_records {
+                    if let dns::DnsContent::TXT { content } = &record.content {
+                        if content == value {
+                            info!(
+                                "Record was created by another process, continuing: {}",
+                                name
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(anyhow::anyhow!("Failed to create TXT record: {:?}", e))
+            }
+        }
     }
 
     async fn remove_txt_record(&self, domain: &str, name: &str) -> Result<()> {
@@ -191,33 +268,26 @@ impl DnsProviderService for CloudflareDnsProvider {
             "Removing TXT record for zone: {} domain: {} name: {}",
             zone_id, domain, name
         );
-        let base_domain = domain
-            .split('.')
-            .rev()
-            .take(2)
-            .collect::<Vec<&str>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<&str>>()
-            .join(".");
-        // Remove domain from name if it exists
-        let record_name = if name.ends_with(&base_domain) {
-            name[..name.len() - base_domain.len() - 1].to_string()
-        } else {
-            name.to_string()
-        };
-        info!("Record name: {}", record_name);
 
-        let records = self.get_records(&zone_id, &record_name).await?;
+        // Use the full name to search for records
+        let records = self.get_txt_records_by_full_name(&zone_id, name).await?;
+
+        if records.is_empty() {
+            info!("No TXT records found with name: {}", name);
+            return Ok(());
+        }
+
         for record in records {
+            info!("Deleting TXT record: {} (id: {})", record.name, record.id);
             let endpoint = dns::DeleteDnsRecord {
                 zone_identifier: &zone_id,
                 identifier: &record.id,
             };
 
-            let response = self.client.request(&endpoint).await?;
-
-            info!("TXT record removed: {:?}", response);
+            match self.client.request(&endpoint).await {
+                Ok(response) => info!("TXT record removed: {:?}", response),
+                Err(e) => warn!("Failed to remove TXT record {}: {:?}", record.id, e),
+            }
         }
         Ok(())
     }
@@ -229,14 +299,30 @@ impl DnsProviderService for CloudflareDnsProvider {
             zone_id, domain, name, ip_address
         );
 
-        // Remove existing A record if it exists
-        if let Ok(existing_record) = self.get_record(&zone_id, name).await {
+        // Build the full record name for lookup
+        let full_name = if name.ends_with(&format!(".{}", domain)) {
+            name.to_string()
+        } else if name == "*" || name.starts_with("*.") {
+            // Handle wildcard records
+            format!("{}.{}", name, domain)
+        } else {
+            format!("{}.{}", name, domain)
+        };
+
+        // Remove existing A record if it exists (use proper A record lookup)
+        if let Ok(Some(existing_record)) = self.get_a_record_by_name(&zone_id, &full_name).await {
+            info!(
+                "Found existing A record for {}: id={}, removing before update",
+                full_name, existing_record.id
+            );
             let delete_endpoint = dns::DeleteDnsRecord {
                 zone_identifier: &zone_id,
                 identifier: &existing_record.id,
             };
-            self.client.request(&delete_endpoint).await?;
-            info!("Removed existing A record: {}", name);
+            match self.client.request(&delete_endpoint).await {
+                Ok(_) => info!("Removed existing A record: {}", full_name),
+                Err(e) => warn!("Failed to remove existing A record {}: {:?}", full_name, e),
+            }
         }
 
         let params = dns::CreateDnsRecordParams {
@@ -335,13 +421,12 @@ impl CloudflareDnsProvider {
             .request(&endpoint)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list zones: {:?}", e))?;
-        return response
+        response
             .result
             .first()
             .ok_or_else(|| anyhow::anyhow!("Zone not found"))
-            .map(|zone| zone.id.to_string());
+            .map(|zone| zone.id.to_string())
     }
-
 }
 
 impl CloudflareDnsProvider {
@@ -362,14 +447,19 @@ impl CloudflareDnsProvider {
         }
     }
 
-    async fn get_record(&self, zone_id: &str, name: &str) -> Result<CFDnsRecord> {
+    /// Get A record by full DNS name
+    /// Returns the first matching A record if found
+    async fn get_a_record_by_name(
+        &self,
+        zone_id: &str,
+        full_name: &str,
+    ) -> Result<Option<cloudflare::endpoints::dns::dns::DnsRecord>> {
+        info!("Searching for A record with full name: {}", full_name);
+
         let endpoint = dns::ListDnsRecords {
             zone_identifier: zone_id,
             params: dns::ListDnsRecordsParams {
-                record_type: Some(dns::DnsContent::TXT {
-                    content: "".to_string(),
-                }),
-                name: Some(name.to_string()),
+                name: Some(full_name.to_string()),
                 ..Default::default()
             },
         };
@@ -378,39 +468,68 @@ impl CloudflareDnsProvider {
             .client
             .request(&endpoint)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to list DNS records: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to list A records: {:?}", e))?;
 
-        response
-            .result
-            .first()
-            .ok_or_else(|| {
-                anyhow::anyhow!("Record not found for zone_id {} and name {}", zone_id, name)
-            })
-            .map(|cf_record| Self::map_cloudflare_record_to_custom(cf_record))
-    }
-    async fn get_records(&self, zone_id: &str, name: &str) -> Result<Vec<CFDnsRecord>> {
-        let endpoint = dns::ListDnsRecords {
-            zone_identifier: zone_id,
-            params: dns::ListDnsRecordsParams {
-                record_type: Some(dns::DnsContent::TXT {
-                    content: "".to_string(),
-                }),
-                name: Some(name.to_string()),
-                ..Default::default()
-            },
-        };
-
-        let response = self
-            .client
-            .request(&endpoint)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to list DNS records: {:?}", e))?;
-
-        Ok(response
+        // Filter for A records client-side
+        let a_record = response
             .result
             .into_iter()
-            .map(|cf_record| Self::map_cloudflare_record_to_custom(&cf_record))
-            .collect())
+            .find(|r| matches!(r.content, dns::DnsContent::A { .. }));
+
+        if let Some(ref record) = a_record {
+            info!("Found A record: id={}, name={}", record.id, record.name);
+        } else {
+            info!("No A record found for name: {}", full_name);
+        }
+
+        Ok(a_record)
+    }
+
+    /// Get TXT records by full DNS name (without stripping domain)
+    /// Returns the raw Cloudflare DnsRecord objects for more detailed inspection
+    async fn get_txt_records_by_full_name(
+        &self,
+        zone_id: &str,
+        full_name: &str,
+    ) -> Result<Vec<cloudflare::endpoints::dns::dns::DnsRecord>> {
+        info!("Searching for TXT records with full name: {}", full_name);
+
+        // Search by name only (don't filter by record_type in the API call)
+        // The record_type filter with empty content can cause issues
+        let endpoint = dns::ListDnsRecords {
+            zone_identifier: zone_id,
+            params: dns::ListDnsRecordsParams {
+                name: Some(full_name.to_string()),
+                ..Default::default()
+            },
+        };
+
+        let response = self
+            .client
+            .request(&endpoint)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list TXT records: {:?}", e))?;
+
+        // Filter for TXT records client-side
+        let txt_records: Vec<_> = response
+            .result
+            .into_iter()
+            .filter(|r| matches!(r.content, dns::DnsContent::TXT { .. }))
+            .collect();
+
+        info!(
+            "Found {} TXT record(s) for name: {}",
+            txt_records.len(),
+            full_name
+        );
+
+        for record in &txt_records {
+            if let dns::DnsContent::TXT { content } = &record.content {
+                info!("  - TXT record id={} value={}", record.id, content);
+            }
+        }
+
+        Ok(txt_records)
     }
 
     pub async fn test_api_access(&self) -> Result<bool> {
@@ -441,6 +560,273 @@ pub fn create_dns_provider_from_settings(
                 dns_provider
             );
             Box::new(ManualDnsProvider {})
+        }
+    }
+}
+
+/// DNS propagation verification using multiple public DNS servers
+/// This helps ensure TXT records are visible globally before ACME validation
+pub struct DnsPropagationChecker {
+    /// Public DNS servers to query for verification
+    /// Using diverse providers increases confidence in global propagation
+    dns_servers: Vec<DnsServerInfo>,
+}
+
+#[derive(Clone)]
+struct DnsServerInfo {
+    name: &'static str,
+    ip: Ipv4Addr,
+}
+
+/// Result of checking DNS propagation across multiple servers
+#[derive(Debug, Clone)]
+pub struct DnsPropagationResult {
+    /// Name of the DNS record being checked
+    pub record_name: String,
+    /// Expected value(s) to find
+    pub expected_values: Vec<String>,
+    /// Results from each DNS server
+    pub server_results: Vec<DnsServerResult>,
+    /// Whether propagation is considered complete (majority of servers see the record)
+    pub is_propagated: bool,
+    /// Percentage of servers that see the expected record
+    pub propagation_percentage: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct DnsServerResult {
+    /// Name of the DNS server (e.g., "Google", "Cloudflare")
+    pub server_name: String,
+    /// IP address of the DNS server
+    pub server_ip: String,
+    /// Whether the expected TXT record was found
+    pub found: bool,
+    /// Values found at the record (if any)
+    pub values_found: Vec<String>,
+    /// Error message if the query failed
+    pub error: Option<String>,
+}
+
+impl Default for DnsPropagationChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DnsPropagationChecker {
+    /// Create a new DNS propagation checker with default public DNS servers
+    pub fn new() -> Self {
+        Self {
+            dns_servers: vec![
+                DnsServerInfo {
+                    name: "Google",
+                    ip: Ipv4Addr::new(8, 8, 8, 8),
+                },
+                DnsServerInfo {
+                    name: "Google Secondary",
+                    ip: Ipv4Addr::new(8, 8, 4, 4),
+                },
+                DnsServerInfo {
+                    name: "Cloudflare",
+                    ip: Ipv4Addr::new(1, 1, 1, 1),
+                },
+                DnsServerInfo {
+                    name: "Cloudflare Secondary",
+                    ip: Ipv4Addr::new(1, 0, 0, 1),
+                },
+                DnsServerInfo {
+                    name: "Quad9",
+                    ip: Ipv4Addr::new(9, 9, 9, 9),
+                },
+                DnsServerInfo {
+                    name: "OpenDNS",
+                    ip: Ipv4Addr::new(208, 67, 222, 222),
+                },
+            ],
+        }
+    }
+
+    /// Check if TXT records have propagated to multiple DNS servers
+    /// Returns true if at least the specified percentage of servers see all expected values
+    pub async fn verify_txt_propagation(
+        &self,
+        record_name: &str,
+        expected_values: &[String],
+        min_propagation_percent: u8,
+    ) -> DnsPropagationResult {
+        info!(
+            "Verifying DNS propagation for {} with {} expected value(s) across {} servers",
+            record_name,
+            expected_values.len(),
+            self.dns_servers.len()
+        );
+
+        let mut server_results = Vec::new();
+        let mut servers_with_all_records = 0;
+
+        for server in &self.dns_servers {
+            let result = self
+                .query_txt_record(server, record_name, expected_values)
+                .await;
+
+            if result.found {
+                servers_with_all_records += 1;
+            }
+
+            debug!(
+                "DNS server {} ({}): found={}, values={:?}",
+                server.name, server.ip, result.found, result.values_found
+            );
+
+            server_results.push(result);
+        }
+
+        let propagation_percentage = if self.dns_servers.is_empty() {
+            0
+        } else {
+            ((servers_with_all_records as f32 / self.dns_servers.len() as f32) * 100.0) as u8
+        };
+
+        let is_propagated = propagation_percentage >= min_propagation_percent;
+
+        info!(
+            "DNS propagation check complete: {}/{} servers ({}%) see all records. Threshold: {}%. Propagated: {}",
+            servers_with_all_records,
+            self.dns_servers.len(),
+            propagation_percentage,
+            min_propagation_percent,
+            is_propagated
+        );
+
+        DnsPropagationResult {
+            record_name: record_name.to_string(),
+            expected_values: expected_values.to_vec(),
+            server_results,
+            is_propagated,
+            propagation_percentage,
+        }
+    }
+
+    /// Query a specific DNS server for TXT records
+    async fn query_txt_record(
+        &self,
+        server: &DnsServerInfo,
+        record_name: &str,
+        expected_values: &[String],
+    ) -> DnsServerResult {
+        // Create resolver config for this specific DNS server using hickory-resolver 0.25+ API
+        let name_server =
+            NameServerConfig::new(SocketAddr::new(IpAddr::V4(server.ip), 53), Protocol::Udp);
+
+        let mut resolver_config = ResolverConfig::new();
+        resolver_config.add_name_server(name_server);
+
+        // Configure resolver options
+        let mut resolver_opts = ResolverOpts::default();
+        resolver_opts.timeout = Duration::from_secs(5);
+        resolver_opts.attempts = 2;
+        resolver_opts.cache_size = 0; // Disable caching to get fresh results
+
+        // Build resolver using the new builder API
+        let resolver =
+            Resolver::builder_with_config(resolver_config, TokioConnectionProvider::default())
+                .with_options(resolver_opts)
+                .build();
+
+        // Query TXT records
+        match resolver.txt_lookup(record_name).await {
+            Ok(lookup) => {
+                let values_found: Vec<String> = lookup
+                    .iter()
+                    .flat_map(|txt| {
+                        txt.iter()
+                            .map(|data| String::from_utf8_lossy(data).to_string())
+                    })
+                    .collect();
+
+                // Check if all expected values are present
+                let all_found = expected_values
+                    .iter()
+                    .all(|expected| values_found.iter().any(|found| found == expected));
+
+                DnsServerResult {
+                    server_name: server.name.to_string(),
+                    server_ip: server.ip.to_string(),
+                    found: all_found,
+                    values_found,
+                    error: None,
+                }
+            }
+            Err(e) => {
+                // NXDOMAIN or no records is not necessarily an error - just means not propagated yet
+                let error_str = e.to_string();
+                let is_not_found = error_str.contains("no records found")
+                    || error_str.contains("NXDomain")
+                    || error_str.contains("NoRecordsFound");
+
+                DnsServerResult {
+                    server_name: server.name.to_string(),
+                    server_ip: server.ip.to_string(),
+                    found: false,
+                    values_found: vec![],
+                    error: if is_not_found {
+                        None // Not found is expected during propagation
+                    } else {
+                        Some(error_str)
+                    },
+                }
+            }
+        }
+    }
+
+    /// Wait for DNS propagation with polling
+    /// Returns the final propagation result, or None if timeout is reached
+    pub async fn wait_for_propagation(
+        &self,
+        record_name: &str,
+        expected_values: &[String],
+        min_propagation_percent: u8,
+        max_wait_seconds: u32,
+        poll_interval_seconds: u32,
+    ) -> Option<DnsPropagationResult> {
+        let start = std::time::Instant::now();
+        let max_duration = Duration::from_secs(max_wait_seconds as u64);
+        let poll_interval = Duration::from_secs(poll_interval_seconds as u64);
+
+        info!(
+            "Waiting up to {}s for DNS propagation of {} (polling every {}s)",
+            max_wait_seconds, record_name, poll_interval_seconds
+        );
+
+        loop {
+            let result = self
+                .verify_txt_propagation(record_name, expected_values, min_propagation_percent)
+                .await;
+
+            if result.is_propagated {
+                info!(
+                    "DNS propagation complete for {} after {:?}",
+                    record_name,
+                    start.elapsed()
+                );
+                return Some(result);
+            }
+
+            if start.elapsed() >= max_duration {
+                warn!(
+                    "DNS propagation timeout for {} after {:?}. Only {}% of servers see the record.",
+                    record_name,
+                    start.elapsed(),
+                    result.propagation_percentage
+                );
+                return Some(result); // Return partial result
+            }
+
+            info!(
+                "DNS not fully propagated yet ({}%). Waiting {}s before next check...",
+                result.propagation_percentage, poll_interval_seconds
+            );
+            tokio::time::sleep(poll_interval).await;
         }
     }
 }

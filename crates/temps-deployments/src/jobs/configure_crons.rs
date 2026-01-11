@@ -3,14 +3,14 @@
 //! Configures cron jobs from .temps.yaml configuration file after deployment
 
 use async_trait::async_trait;
-use std::path::PathBuf;
-use std::sync::Arc;
+use sea_orm::EntityTrait;
 use std::fs;
-use temps_core::{WorkflowTask, JobResult, WorkflowContext, WorkflowError, TempsConfig};
-use temps_logs::LogService;
+use std::path::Path;
+use std::sync::Arc;
+use temps_core::{JobResult, TempsConfig, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
 use temps_entities::projects;
-use sea_orm::EntityTrait;
+use temps_logs::{LogLevel, LogService};
 use tracing::warn;
 
 use crate::jobs::RepositoryOutput;
@@ -123,64 +123,101 @@ impl ConfigureCronsJob {
 
     /// Write log message to job-specific log file
     async fn log(&self, message: String) -> Result<(), WorkflowError> {
+        // Detect log level from message content/emojis
+        let level = Self::detect_log_level(&message);
+
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
-                .append_to_log(log_id, &format!("{}\n", message))
+                .append_structured_log(log_id, level, message.clone())
                 .await
                 .map_err(|e| WorkflowError::Other(format!("Failed to write log: {}", e)))?;
         }
         Ok(())
     }
 
+    /// Detect log level from message content
+    fn detect_log_level(message: &str) -> LogLevel {
+        if message.contains("✅") || message.contains("Complete") || message.contains("success") {
+            LogLevel::Success
+        } else if message.contains("❌")
+            || message.contains("Failed")
+            || message.contains("Error")
+            || message.contains("error")
+        {
+            LogLevel::Error
+        } else {
+            LogLevel::Info
+        }
+    }
+
     /// Load and parse .temps.yaml configuration
-    async fn load_temps_config(&self, repo_dir: &PathBuf, project: &projects::Model) -> Result<Option<TempsConfig>, WorkflowError> {
+    async fn load_temps_config(
+        &self,
+        repo_dir: &Path,
+        project: &projects::Model,
+    ) -> Result<Option<TempsConfig>, WorkflowError> {
         let project_dir = repo_dir.join(&project.directory);
         let config_path = project_dir.join(".temps.yaml");
 
         if !config_path.exists() {
-            self.log(format!("ℹ️  No .temps.yaml found at {:?}, skipping cron configuration", config_path)).await?;
+            self.log(format!(
+                "No .temps.yaml found at {:?}, skipping cron configuration",
+                config_path
+            ))
+            .await?;
             return Ok(None);
         }
 
-        self.log(format!("📄 Found .temps.yaml at {:?}", config_path)).await?;
+        self.log(format!("Found .temps.yaml at {:?}", config_path))
+            .await?;
 
-        let config_contents = fs::read_to_string(&config_path)
-            .map_err(|e| WorkflowError::IoError(e))?;
+        let config_contents = fs::read_to_string(&config_path).map_err(WorkflowError::IoError)?;
 
-        let config = TempsConfig::from_yaml(&config_contents)
-            .map_err(|e| WorkflowError::JobExecutionFailed(format!("Failed to parse .temps.yaml: {}", e)))?;
+        let config = TempsConfig::from_yaml(&config_contents).map_err(|e| {
+            WorkflowError::JobExecutionFailed(format!("Failed to parse .temps.yaml: {}", e))
+        })?;
 
         Ok(Some(config))
     }
 
     /// Configure cron jobs based on repository configuration
     async fn configure_crons(&self, repo_output: &RepositoryOutput) -> Result<(), WorkflowError> {
-        self.log("⏰ Starting cron configuration".to_string()).await?;
+        self.log("Starting cron configuration".to_string()).await?;
 
         // Load project to get directory
         let project = projects::Entity::find_by_id(self.project_id)
             .one(self.db.as_ref())
             .await
             .map_err(|e| WorkflowError::Other(format!("Failed to load project: {}", e)))?
-            .ok_or_else(|| WorkflowError::Other(format!("Project {} not found", self.project_id)))?;
+            .ok_or_else(|| {
+                WorkflowError::Other(format!("Project {} not found", self.project_id))
+            })?;
 
         // Load .temps.yaml configuration
-        let config = match self.load_temps_config(&repo_output.repo_dir, &project).await? {
+        let config = match self
+            .load_temps_config(&repo_output.repo_dir, &project)
+            .await?
+        {
             Some(config) => config,
             None => {
-                self.log("✅ No cron configuration needed".to_string()).await?;
+                self.log("No cron configuration needed".to_string()).await?;
                 return Ok(());
             }
         };
 
         // Check if config has cron jobs
         if !config.has_crons() {
-            self.log("ℹ️  No cron jobs defined in .temps.yaml".to_string()).await?;
+            self.log("No cron jobs defined in .temps.yaml".to_string())
+                .await?;
             return Ok(());
         }
 
         let cron_jobs = config.cron_jobs();
-        self.log(format!("📋 Found {} cron job(s) to configure", cron_jobs.len())).await?;
+        self.log(format!(
+            "Found {} cron job(s) to configure",
+            cron_jobs.len()
+        ))
+        .await?;
 
         // Convert to service layer format
         let cron_configs: Vec<CronConfig> = cron_jobs
@@ -195,9 +232,12 @@ impl ConfigureCronsJob {
         self.cron_service
             .configure_crons(self.project_id, self.environment_id, cron_configs)
             .await
-            .map_err(|e| WorkflowError::JobExecutionFailed(format!("Failed to configure cron jobs: {}", e)))?;
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!("Failed to configure cron jobs: {}", e))
+            })?;
 
-        self.log("✅ Cron configuration completed successfully".to_string()).await?;
+        self.log("Cron configuration completed successfully".to_string())
+            .await?;
 
         Ok(())
     }
@@ -311,14 +351,18 @@ impl ConfigureCronsJobBuilder {
         cron_service: Arc<dyn CronConfigService>,
     ) -> Result<ConfigureCronsJob, WorkflowError> {
         let job_id = self.job_id.unwrap_or_else(|| "configure_crons".to_string());
-        let download_job_id = self.download_job_id
-            .ok_or_else(|| WorkflowError::JobValidationFailed("download_job_id is required".to_string()))?;
-        let deploy_container_job_id = self.deploy_container_job_id
-            .ok_or_else(|| WorkflowError::JobValidationFailed("deploy_container_job_id is required".to_string()))?;
-        let project_id = self.project_id
-            .ok_or_else(|| WorkflowError::JobValidationFailed("project_id is required".to_string()))?;
-        let environment_id = self.environment_id
-            .ok_or_else(|| WorkflowError::JobValidationFailed("environment_id is required".to_string()))?;
+        let download_job_id = self.download_job_id.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("download_job_id is required".to_string())
+        })?;
+        let deploy_container_job_id = self.deploy_container_job_id.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("deploy_container_job_id is required".to_string())
+        })?;
+        let project_id = self.project_id.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("project_id is required".to_string())
+        })?;
+        let environment_id = self.environment_id.ok_or_else(|| {
+            WorkflowError::JobValidationFailed("environment_id is required".to_string())
+        })?;
 
         let mut job = ConfigureCronsJob::new(
             job_id,
@@ -350,7 +394,6 @@ impl Default for ConfigureCronsJobBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::WorkflowContext;
     use std::sync::Arc;
 
     // Mock CronConfigService for testing
@@ -519,12 +562,10 @@ cron:
     #[test]
     fn test_noop_cron_service() {
         let service = NoOpCronConfigService;
-        let configs = vec![
-            CronConfig {
-                path: "/test".to_string(),
-                schedule: "* * * * *".to_string(),
-            },
-        ];
+        let configs = vec![CronConfig {
+            path: "/test".to_string(),
+            schedule: "* * * * *".to_string(),
+        }];
 
         // Should succeed without doing anything
         let result = tokio_test::block_on(service.configure_crons(1, 1, configs));
@@ -557,12 +598,10 @@ cron:
     #[tokio::test]
     async fn test_mock_cron_service_failure() {
         let service = MockCronConfigService::with_failure();
-        let configs = vec![
-            CronConfig {
-                path: "/api/cron/task".to_string(),
-                schedule: "0 0 * * *".to_string(),
-            },
-        ];
+        let configs = vec![CronConfig {
+            path: "/api/cron/task".to_string(),
+            schedule: "0 0 * * *".to_string(),
+        }];
 
         let result = service.configure_crons(1, 1, configs).await;
         assert!(result.is_err());

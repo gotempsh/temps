@@ -4,9 +4,9 @@ use temps_core::{DBDateTime, UtcDateTime};
 use thiserror::Error;
 
 use crate::types::{
-    AggregationLevel, EventCount, EventTimeline, EventTypeBreakdown, PropertyBreakdownItem,
-    PropertyBreakdownResponse, PropertyTimelineItem, PropertyTimelineResponse, SessionEvent,
-    SessionEventsResponse, UniqueCountsResponse,
+    AggregationLevel, AnalyticsSessionEventsResponse, EventCount, EventTimeline,
+    EventTypeBreakdown, PropertyBreakdownItem, PropertyBreakdownResponse, PropertyTimelineItem,
+    PropertyTimelineResponse, SessionEvent, UniqueCountsResponse,
 };
 
 #[derive(Debug, Error)]
@@ -31,6 +31,7 @@ impl AnalyticsEventsService {
     }
 
     /// Get custom event counts with filtering and aggregation level
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_events_count(
         &self,
         start_date: UtcDateTime,
@@ -48,11 +49,8 @@ impl AnalyticsEventsService {
             "timestamp <= $3".to_string(),
             "event_name IS NOT NULL".to_string(),
         ];
-        let mut values: Vec<sea_orm::Value> = vec![
-            project_id.into(),
-            start_date.into(),
-            end_date.into(),
-        ];
+        let mut values: Vec<sea_orm::Value> =
+            vec![project_id.into(), start_date.into(), end_date.into()];
         let mut param_index = 4;
 
         // Default to true - only return custom events by default
@@ -111,10 +109,7 @@ impl AnalyticsEventsService {
             ORDER BY ec.count DESC
             LIMIT ${}
             "#,
-            count_expr,
-            where_clause,
-            null_check,
-            param_index
+            count_expr, where_clause, null_check, param_index
         );
 
         // Add LIMIT as parameter
@@ -151,16 +146,11 @@ impl AnalyticsEventsService {
         session_id: String,
         project_id: i32,
         environment_id: Option<i32>,
-    ) -> Result<Option<SessionEventsResponse>, EventsError> {
+    ) -> Result<Option<AnalyticsSessionEventsResponse>, EventsError> {
         // Build WHERE conditions with parameterized queries
-        let mut where_conditions = vec![
-            "session_id = $1".to_string(),
-            "project_id = $2".to_string(),
-        ];
-        let mut values: Vec<sea_orm::Value> = vec![
-            session_id.clone().into(),
-            project_id.into(),
-        ];
+        let mut where_conditions =
+            vec!["session_id = $1".to_string(), "project_id = $2".to_string()];
+        let mut values: Vec<sea_orm::Value> = vec![session_id.clone().into(), project_id.into()];
         let param_index = 3;
 
         if let Some(env_id) = environment_id {
@@ -224,7 +214,7 @@ impl AnalyticsEventsService {
 
         let total_events = events.len();
 
-        Ok(Some(SessionEventsResponse {
+        Ok(Some(AnalyticsSessionEventsResponse {
             session_id,
             events,
             total_events,
@@ -291,11 +281,8 @@ impl AnalyticsEventsService {
             "timestamp >= $2".to_string(),
             "timestamp <= $3".to_string(),
         ];
-        let mut values: Vec<sea_orm::Value> = vec![
-            project_id.into(),
-            start_date.into(),
-            end_date.into(),
-        ];
+        let mut values: Vec<sea_orm::Value> =
+            vec![project_id.into(), start_date.into(), end_date.into()];
         let param_index = 4;
 
         if let Some(env_id) = environment_id {
@@ -339,9 +326,7 @@ impl AnalyticsEventsService {
             CROSS JOIN total t
             ORDER BY tc.count DESC
             "#,
-            count_expr,
-            where_clause,
-            null_check
+            count_expr, where_clause, null_check
         );
 
         #[derive(FromQueryResult)]
@@ -370,6 +355,7 @@ impl AnalyticsEventsService {
     }
 
     /// Get events over time (timeline)
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_events_timeline(
         &self,
         start_date: UtcDateTime,
@@ -386,11 +372,8 @@ impl AnalyticsEventsService {
             "timestamp >= $2".to_string(),
             "timestamp <= $3".to_string(),
         ];
-        let mut values: Vec<sea_orm::Value> = vec![
-            project_id.into(),
-            start_date.into(),
-            end_date.into(),
-        ];
+        let mut values: Vec<sea_orm::Value> =
+            vec![project_id.into(), start_date.into(), end_date.into()];
         let mut param_index = 4;
 
         if let Some(env_id) = environment_id {
@@ -400,7 +383,10 @@ impl AnalyticsEventsService {
         }
 
         if let Some(event) = event_name {
-            where_conditions.push(format!("COALESCE(event_name, event_type) = ${}", param_index));
+            where_conditions.push(format!(
+                "COALESCE(event_name, event_type) = ${}",
+                param_index
+            ));
             values.push(event.into());
         }
 
@@ -449,10 +435,7 @@ impl AnalyticsEventsService {
             ) sub
             ORDER BY bucket ASC
             "#,
-            bucket,
-            count_expr,
-            where_clause,
-            null_check
+            bucket, count_expr, where_clause, null_check
         );
 
         #[derive(FromQueryResult)]
@@ -480,6 +463,7 @@ impl AnalyticsEventsService {
 
     /// Get property breakdown by grouping events by a specific column
     /// Example: Get channel distribution, device_type breakdown, browser stats, etc.
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_property_breakdown(
         &self,
         start_date: UtcDateTime,
@@ -507,7 +491,7 @@ impl AnalyticsEventsService {
         let (from_clause, select_column) = if is_geo_column {
             (
                 "events e LEFT JOIN ip_geolocations ig ON e.ip_geolocation_id = ig.id",
-                format!("COALESCE(ig.{}, 'Unknown')", group_by_str)
+                format!("COALESCE(ig.{}, 'Unknown')", group_by_str),
             )
         } else {
             ("events e", format!("e.{}", group_by_str))
@@ -527,7 +511,10 @@ impl AnalyticsEventsService {
             param_idx += 1;
         }
         if event_name.is_some() {
-            conditions.push(format!("COALESCE(e.event_name, e.event_type) = ${}", param_idx));
+            conditions.push(format!(
+                "COALESCE(e.event_name, e.event_type) = ${}",
+                param_idx
+            ));
         }
 
         let sql_query = format!(
@@ -573,11 +560,8 @@ impl AnalyticsEventsService {
             total_count: i64,
         }
 
-        let mut params: Vec<sea_orm::Value> = vec![
-            project_id.into(),
-            start_date.into(),
-            end_date.into(),
-        ];
+        let mut params: Vec<sea_orm::Value> =
+            vec![project_id.into(), start_date.into(), end_date.into()];
         if let Some(env_id) = environment_id {
             params.push(env_id.into());
         }
@@ -614,6 +598,7 @@ impl AnalyticsEventsService {
 
     /// Get property timeline: group by column over time using TimescaleDB time_bucket
     /// Example: Channel distribution by hour, device types by day, etc.
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_property_timeline(
         &self,
         start_date: UtcDateTime,
@@ -654,7 +639,7 @@ impl AnalyticsEventsService {
         let (from_clause, select_column) = if is_geo_column {
             (
                 "events e LEFT JOIN ip_geolocations ig ON e.ip_geolocation_id = ig.id",
-                format!("COALESCE(ig.{}, 'Unknown')", group_by_str)
+                format!("COALESCE(ig.{}, 'Unknown')", group_by_str),
             )
         } else {
             ("events e", format!("e.{}", group_by_str))
@@ -674,7 +659,10 @@ impl AnalyticsEventsService {
             param_idx += 1;
         }
         if event_name.is_some() {
-            conditions.push(format!("COALESCE(e.event_name, e.event_type) = ${}", param_idx));
+            conditions.push(format!(
+                "COALESCE(e.event_name, e.event_type) = ${}",
+                param_idx
+            ));
         }
 
         let sql_query = format!(
@@ -704,11 +692,8 @@ impl AnalyticsEventsService {
             count: i64,
         }
 
-        let mut params: Vec<sea_orm::Value> = vec![
-            project_id.into(),
-            start_date.into(),
-            end_date.into(),
-        ];
+        let mut params: Vec<sea_orm::Value> =
+            vec![project_id.into(), start_date.into(), end_date.into()];
         if let Some(env_id) = environment_id {
             params.push(env_id.into());
         }
@@ -798,11 +783,8 @@ WHERE project_id = $1
             "timestamp <= $3".to_string(),
             "event_type = 'page_view'".to_string(),
         ];
-        let mut values: Vec<sea_orm::Value> = vec![
-            project_id.into(),
-            start_date.into(),
-            end_date.into(),
-        ];
+        let mut values: Vec<sea_orm::Value> =
+            vec![project_id.into(), start_date.into(), end_date.into()];
         let param_index = 4;
 
         if let Some(env_id) = environment_id {
@@ -811,13 +793,14 @@ WHERE project_id = $1
         }
 
         // Determine aggregation based on level
-        let (count_expr, null_check) = match aggregation_level {
-            AggregationLevel::Events => ("COUNT(*)", ""),
+        // Use FILTER clause instead of WHERE to allow time_bucket_gapfill to work correctly
+        let count_expr = match aggregation_level {
+            AggregationLevel::Events => "COUNT(*)".to_string(),
             AggregationLevel::Sessions => {
-                ("COUNT(DISTINCT session_id)", " AND session_id IS NOT NULL")
+                "COUNT(DISTINCT session_id) FILTER (WHERE session_id IS NOT NULL)".to_string()
             }
             AggregationLevel::Visitors => {
-                ("COUNT(DISTINCT visitor_id)", " AND visitor_id IS NOT NULL")
+                "COUNT(DISTINCT visitor_id) FILTER (WHERE visitor_id IS NOT NULL)".to_string()
             }
         };
 
@@ -832,7 +815,7 @@ WHERE project_id = $1
                     time_bucket_gapfill('1 hour', timestamp, ${}::timestamptz, ${}::timestamptz) as bucket,
                     COALESCE({}, 0) as count
                 FROM events
-                WHERE {}{}
+                WHERE {}
                 GROUP BY bucket
             ) sub
             ORDER BY bucket ASC
@@ -840,8 +823,7 @@ WHERE project_id = $1
             param_index,
             param_index + 1,
             count_expr,
-            where_clause,
-            null_check
+            where_clause
         );
 
         // Add start_date and end_date again for time_bucket_gapfill parameters
@@ -885,8 +867,12 @@ WHERE project_id = $1
     ) -> Result<UniqueCountsResponse, EventsError> {
         // Determine what to count based on metric
         let count_expr = match metric.as_str() {
-            "sessions" => "COUNT(DISTINCT session_id) FILTER (WHERE session_id IS NOT NULL)::bigint",
-            "visitors" => "COUNT(DISTINCT visitor_id) FILTER (WHERE visitor_id IS NOT NULL)::bigint",
+            "sessions" => {
+                "COUNT(DISTINCT session_id) FILTER (WHERE session_id IS NOT NULL)::bigint"
+            }
+            "visitors" => {
+                "COUNT(DISTINCT visitor_id) FILTER (WHERE visitor_id IS NOT NULL)::bigint"
+            }
             "page_views" | "paths" => "COUNT(*) FILTER (WHERE event_type = 'page_view')::bigint",
             _ => {
                 return Err(EventsError::Validation(format!(
@@ -939,6 +925,7 @@ WHERE project_id = $1
 
     /// Get aggregated metrics by time bucket using TimescaleDB time_bucket_gapfill
     /// Returns counts for visitors/sessions/events grouped by customizable time buckets
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_aggregated_buckets(
         &self,
         start_date: UtcDateTime,
@@ -966,11 +953,8 @@ WHERE project_id = $1
             "timestamp >= $2::timestamp".to_string(),
             "timestamp <= $3::timestamp".to_string(),
         ];
-        let mut values: Vec<sea_orm::Value> = vec![
-            project_id.into(),
-            start_date.into(),
-            end_date.into(),
-        ];
+        let mut values: Vec<sea_orm::Value> =
+            vec![project_id.into(), start_date.into(), end_date.into()];
         let mut param_index = 4;
 
         if let Some(env_id) = environment_id {
@@ -1039,6 +1023,7 @@ WHERE project_id = $1
     }
 
     /// Record an analytics event with enriched data
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_event(
         &self,
         project_id: i32,
@@ -1083,54 +1068,57 @@ WHERE project_id = $1
             .unwrap_or(&format!("http://{}{}", hostname, request_path))
             .to_string();
 
-        // Extract UTM parameters from event_data
-        let utm_source = event_data
-            .get("utm_source")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let utm_medium = event_data
-            .get("utm_medium")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let utm_campaign = event_data
-            .get("utm_campaign")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let utm_term = event_data
-            .get("utm_term")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let utm_content = event_data
-            .get("utm_content")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        // Parse UTM parameters from query string (request_query)
+        let utm_params = temps_analytics::parse_utm_params(request_query);
 
         // Extract referrer hostname if referrer is present
-        let referrer_hostname = referrer.as_ref().and_then(|r| {
-            url::Url::parse(r)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h.to_string()))
-        });
+        let referrer_hostname = referrer
+            .as_ref()
+            .and_then(|r| temps_analytics::extract_referrer_hostname(r));
+
+        // Compute channel attribution
+        let current_hostname = event_data.get("hostname").and_then(|v| v.as_str());
+        let channel = temps_analytics::get_channel(
+            &utm_params,
+            referrer_hostname.as_deref(),
+            current_hostname,
+        );
+
+        // Get UTM values from parsed params
+        let utm_source = utm_params.utm_source;
+        let utm_medium = utm_params.utm_medium;
+        let utm_campaign = utm_params.utm_campaign;
+        let utm_term = utm_params.utm_term;
+        let utm_content = utm_params.utm_content;
         // Get visitor from visitor_id from visitors table
         // Convert visitor_id (String) to Option<i32> by looking up the visitor in the database
         let visitor_id_i32 = if let Some(ref visitor_id) = visitor_id {
-            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+            use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter};
             use temps_entities::visitor;
 
-            visitor::Entity::find()
+            let visitor_record = visitor::Entity::find()
                 .filter(visitor::Column::VisitorId.eq(visitor_id.clone()))
                 .one(self.db.as_ref())
                 .await
-                .map_err(|e| EventsError::Database(e))?
-                .map(|v| v.id)
+                .map_err(EventsError::Database)?;
+
+            // If visitor exists and doesn't have activity flag set, update it
+            if let Some(ref v) = visitor_record {
+                if !v.has_activity {
+                    let mut active_visitor: visitor::ActiveModel = v.clone().into();
+                    active_visitor.has_activity = sea_orm::ActiveValue::Set(true);
+                    let _ = active_visitor.update(self.db.as_ref()).await;
+                }
+            }
+
+            visitor_record.map(|v| v.id)
         } else {
             None
         };
 
         // Parse user agent for browser/OS info
-        let parsed_ua = crate::services::user_agent::ParsedUserAgent::from_user_agent(
-            user_agent.as_deref()
-        );
+        let parsed_ua =
+            crate::services::user_agent::ParsedUserAgent::from_user_agent(user_agent.as_deref());
         let browser = parsed_ua.browser;
         let browser_version = parsed_ua.browser_version;
         let operating_system = parsed_ua.operating_system;
@@ -1166,6 +1154,7 @@ WHERE project_id = $1
             operating_system: Set(operating_system),
             operating_system_version: Set(operating_system_version),
             device_type: Set(device_type),
+            channel: Set(Some(channel.to_string())),
             utm_source: Set(utm_source),
             utm_medium: Set(utm_medium),
             utm_campaign: Set(utm_campaign),
@@ -1197,11 +1186,13 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use sea_orm::{Database, DatabaseConnection, DbErr};
     use std::sync::Arc;
+    use temps_entities::upstream_config::UpstreamList;
 
     async fn setup_test_db() -> Result<DatabaseConnection, DbErr> {
         Database::connect("sqlite::memory:").await
     }
 
+    #[allow(dead_code)]
     async fn create_test_events(_db: &DatabaseConnection) {
         // This test would require the events table schema
         // For now, this is a template for future tests
@@ -1223,12 +1214,11 @@ mod tests {
         // - Visitors aggregation: 2 unique visitors
 
         let service = AnalyticsEventsService::new(Arc::new(db));
-        let start =
-            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
         let end = Utc.with_ymd_and_hms(2024, 12, 31, 23, 59, 59).unwrap();
 
         // Test Events aggregation
-        let events_result = service
+        let _events_result = service
             .get_events_count(
                 start,
                 end,
@@ -1241,7 +1231,7 @@ mod tests {
             .await;
 
         // Test Sessions aggregation
-        let sessions_result = service
+        let _sessions_result = service
             .get_events_count(
                 start,
                 end,
@@ -1254,7 +1244,7 @@ mod tests {
             .await;
 
         // Test Visitors aggregation
-        let visitors_result = service
+        let _visitors_result = service
             .get_events_count(
                 start,
                 end,
@@ -1281,20 +1271,19 @@ mod tests {
         // - button_click: 6 events from 3 sessions from 2 visitors
 
         let service = AnalyticsEventsService::new(Arc::new(db));
-        let start =
-            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
         let end = Utc.with_ymd_and_hms(2024, 12, 31, 23, 59, 59).unwrap();
 
         // Test with different aggregation levels
-        let events_breakdown = service
+        let _events_breakdown = service
             .get_event_type_breakdown(start, end, 1, None, AggregationLevel::Events)
             .await;
 
-        let sessions_breakdown = service
+        let _sessions_breakdown = service
             .get_event_type_breakdown(start, end, 1, None, AggregationLevel::Sessions)
             .await;
 
-        let visitors_breakdown = service
+        let _visitors_breakdown = service
             .get_event_type_breakdown(start, end, 1, None, AggregationLevel::Visitors)
             .await;
 
@@ -1321,7 +1310,7 @@ mod tests {
         let end = Utc.with_ymd_and_hms(2024, 1, 2, 23, 59, 59).unwrap();
 
         // Test Events aggregation - should show raw event counts per day
-        let events_timeline = service
+        let _events_timeline = service
             .get_events_timeline(
                 start,
                 end,
@@ -1334,7 +1323,7 @@ mod tests {
             .await;
 
         // Test Sessions aggregation - should show unique sessions per day
-        let sessions_timeline = service
+        let _sessions_timeline = service
             .get_events_timeline(
                 start,
                 end,
@@ -1347,7 +1336,7 @@ mod tests {
             .await;
 
         // Test Visitors aggregation - should show unique visitors per day
-        let visitors_timeline = service
+        let _visitors_timeline = service
             .get_events_timeline(
                 start,
                 end,
@@ -1367,23 +1356,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_ip_geolocation_integration() {
-        use temps_geo::{GeoIpService, IpAddressService};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
         use temps_entities::ip_geolocations;
-        use sea_orm::{EntityTrait, QueryFilter, ColumnTrait};
+        use temps_geo::{GeoIpService, IpAddressService};
 
         // Setup PostgreSQL test container
-        use testcontainers::{core::{ContainerPort, WaitFor}, runners::AsyncRunner, GenericImage, ImageExt};
+        use testcontainers::{
+            core::{ContainerPort, WaitFor},
+            runners::AsyncRunner,
+            GenericImage, ImageExt,
+        };
 
         // Use TimescaleDB with pgvector support
-        let postgres_image = GenericImage::new("timescale/timescaledb-ha", "pg16")
+        let postgres_image = GenericImage::new("timescale/timescaledb", "latest-pg17")
             .with_exposed_port(ContainerPort::Tcp(5432))
-            .with_wait_for(WaitFor::message_on_stderr("database system is ready to accept connections"))
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
             .with_env_var("POSTGRES_PASSWORD", "postgres")
             .with_env_var("POSTGRES_USER", "postgres")
             .with_env_var("POSTGRES_DB", "postgres");
 
-        let node = postgres_image.start().await.expect("Failed to start PostgreSQL container");
-        let port = node.get_host_port_ipv4(5432).await.expect("Failed to get port");
+        let node = postgres_image
+            .start()
+            .await
+            .expect("Failed to start PostgreSQL container");
+        let port = node
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("Failed to get port");
 
         let database_url = format!(
             "postgresql://postgres:postgres@localhost:{}/postgres?sslmode=disable",
@@ -1406,15 +1407,10 @@ mod tests {
             .expect("Failed to run migrations");
 
         // Create mock GeoIP service
-        let geoip_service = Arc::new(GeoIpService::Mock(
-            temps_geo::MockGeoIpService::new()
-        ));
+        let geoip_service = Arc::new(GeoIpService::Mock(temps_geo::MockGeoIpService::new()));
 
         // Create IpAddressService
-        let ip_service = Arc::new(IpAddressService::new(
-            db.clone(),
-            geoip_service.clone()
-        ));
+        let ip_service = Arc::new(IpAddressService::new(db.clone(), geoip_service.clone()));
 
         // Test 1: Lookup localhost IP (should get random mock city)
         let ip_info = ip_service
@@ -1422,7 +1418,8 @@ mod tests {
             .await
             .expect("Failed to lookup IP");
 
-        println!("Resolved 127.0.0.1 to: {} / {} / {}",
+        println!(
+            "Resolved 127.0.0.1 to: {} / {} / {}",
             ip_info.country.as_ref().unwrap(),
             ip_info.region.as_ref().unwrap(),
             ip_info.city.as_ref().unwrap()
@@ -1457,16 +1454,21 @@ mod tests {
         println!("✅ IP geolocation integration test passed!");
         println!("   - IP lookup works correctly with mock GeoIP service");
         println!("   - IP data is cached in database (same ID on repeated lookups)");
-        println!("   - Geolocation: {} / {} / {}",
+        println!(
+            "   - Geolocation: {} / {} / {}",
             ip_info.country.as_ref().unwrap(),
             ip_info.region.as_ref().unwrap(),
             ip_info.city.as_ref().unwrap()
         );
-        println!("   - Coordinates: lat={:.4}, lng={:.4}",
+        println!(
+            "   - Coordinates: lat={:.4}, lng={:.4}",
             ip_info.latitude.unwrap(),
             ip_info.longitude.unwrap()
         );
-        println!("   - IP geolocation ID {} ready to be linked to events", ip_info.id);
+        println!(
+            "   - IP geolocation ID {} ready to be linked to events",
+            ip_info.id
+        );
     }
 
     // ========== SQL Injection Prevention Tests ==========
@@ -1511,11 +1513,7 @@ mod tests {
         let malicious_session_id = "' OR '1'='1"; // Classic SQL injection attempt
 
         let result = service
-            .get_session_events(
-                malicious_session_id.to_string(),
-                1,
-                None,
-            )
+            .get_session_events(malicious_session_id.to_string(), 1, None)
             .await;
 
         // Should safely handle the malicious input as a literal string
@@ -1611,13 +1609,7 @@ mod tests {
 
         // Test with various parameter combinations
         let result = service
-            .get_hourly_visits(
-                start,
-                end,
-                1,
-                Some(1),
-                AggregationLevel::Visitors,
-            )
+            .get_hourly_visits(start, end, 1, Some(1), AggregationLevel::Visitors)
             .await;
 
         // May fail on SQLite (no time_bucket_gapfill) but shouldn't cause SQL injection
@@ -1666,11 +1658,7 @@ mod tests {
 
         for session_id in special_session_ids {
             let result = service
-                .get_session_events(
-                    session_id.to_string(),
-                    1,
-                    None,
-                )
+                .get_session_events(session_id.to_string(), 1, None)
                 .await;
 
             // Should handle all special characters safely without SQL injection
@@ -1699,7 +1687,7 @@ mod tests {
                 start,
                 end,
                 1,
-                Some(10), // environment_id
+                Some(10),                         // environment_id
                 Some("button_click".to_string()), // event_name
                 Some("hour".to_string()),
                 AggregationLevel::Sessions,
@@ -1715,7 +1703,7 @@ mod tests {
                 start,
                 end,
                 1,
-                Some(5), // environment_id
+                Some(5),   // environment_id
                 Some(100), // deployment_id
                 AggregationLevel::Visitors,
                 "1 day".to_string(),
@@ -1737,13 +1725,7 @@ mod tests {
         let end = Utc.with_ymd_and_hms(2025, 12, 31, 23, 59, 59).unwrap();
 
         let result = service
-            .get_hourly_visits(
-                start,
-                end,
-                1,
-                None,
-                AggregationLevel::Events,
-            )
+            .get_hourly_visits(start, end, 1, None, AggregationLevel::Events)
             .await;
 
         // Should handle large date ranges safely (SQLite will fail on time_bucket_gapfill)
@@ -1767,20 +1749,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_hourly_visits_gap_filling() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
         use temps_entities::{deployments, environments, events, projects, visitor};
-        use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
-        use testcontainers::{core::{ContainerPort, WaitFor}, runners::AsyncRunner, GenericImage, ImageExt};
+        use testcontainers::{
+            core::{ContainerPort, WaitFor},
+            runners::AsyncRunner,
+            GenericImage, ImageExt,
+        };
 
         // Setup PostgreSQL test container with TimescaleDB
-        let postgres_image = GenericImage::new("timescale/timescaledb-ha", "pg16")
+        let postgres_image = GenericImage::new("timescale/timescaledb", "latest-pg17")
             .with_exposed_port(ContainerPort::Tcp(5432))
-            .with_wait_for(WaitFor::message_on_stderr("database system is ready to accept connections"))
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
             .with_env_var("POSTGRES_PASSWORD", "postgres")
             .with_env_var("POSTGRES_USER", "postgres")
             .with_env_var("POSTGRES_DB", "postgres");
 
-        let node = postgres_image.start().await.expect("Failed to start PostgreSQL container");
-        let port = node.get_host_port_ipv4(5432).await.expect("Failed to get port");
+        let node = postgres_image
+            .start()
+            .await
+            .expect("Failed to start PostgreSQL container");
+        let port = node
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("Failed to get port");
 
         let database_url = format!(
             "postgresql://postgres:postgres@localhost:{}/postgres?sslmode=disable",
@@ -1806,17 +1800,14 @@ mod tests {
         let _project = projects::ActiveModel {
             id: Set(1),
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-project".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             directory: Set("/".to_string()),
             main_branch: Set("main".to_string()),
             slug: Set("test-project".to_string()),
             is_deleted: Set(false),
-            automatic_deploy: Set(false),
-            project_type: Set(temps_entities::types::ProjectType::Static),
-            is_web_app: Set(false),
-            performance_metrics_enabled: Set(false),
-            use_default_wildcard: Set(false),
             is_public_repo: Set(false),
-            is_on_demand: Set(false),
+            preset: Set(temps_entities::preset::Preset::Static),
             ..Default::default()
         }
         .insert(db.as_ref())
@@ -1829,9 +1820,8 @@ mod tests {
             slug: Set("production".to_string()),
             subdomain: Set("test".to_string()),
             host: Set("test.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             project_id: Set(1),
-            use_default_wildcard: Set(false),
             ..Default::default()
         }
         .insert(db.as_ref())
@@ -1844,7 +1834,9 @@ mod tests {
             environment_id: Set(1),
             slug: Set("test-deployment".to_string()),
             state: Set("ready".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             ..Default::default()
         }
         .insert(db.as_ref())
@@ -1976,13 +1968,23 @@ mod tests {
 
         // Verify gap filling
         // Should have 5 hours: 10:00, 11:00, 12:00, 13:00, 14:00
-        assert_eq!(results.len(), 5, "Expected 5 hourly buckets (with gaps filled)");
+        assert_eq!(
+            results.len(),
+            5,
+            "Expected 5 hourly buckets (with gaps filled)"
+        );
 
         // Verify counts
         assert_eq!(results[0].count, 2, "Hour 10:00 should have 2 visitors");
-        assert_eq!(results[1].count, 0, "Hour 11:00 should have 0 visitors (gap filled)");
+        assert_eq!(
+            results[1].count, 0,
+            "Hour 11:00 should have 0 visitors (gap filled)"
+        );
         assert_eq!(results[2].count, 1, "Hour 12:00 should have 1 visitor");
-        assert_eq!(results[3].count, 0, "Hour 13:00 should have 0 visitors (gap filled)");
+        assert_eq!(
+            results[3].count, 0,
+            "Hour 13:00 should have 0 visitors (gap filled)"
+        );
         assert_eq!(results[4].count, 1, "Hour 14:00 should have 1 visitor");
 
         println!("\n✅ Gap filling test passed!");

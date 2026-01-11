@@ -12,13 +12,13 @@ use std::sync::Arc;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
+use tracing;
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
-use tracing;
 
 use crate::{
-    services::{PlatformInfoService, DnsService},
-    routes::{configure_routes, InfraAppState, PlatformInfoApiDoc, DnsAppState, DnsApiDoc},
+    routes::{configure_routes, DnsApiDoc, DnsAppState, InfraAppState, PlatformInfoApiDoc},
+    services::{DnsService, PlatformInfoService},
 };
 
 /// State container for infrastructure plugin that implements InfraAppState and DnsAppState
@@ -29,7 +29,10 @@ pub struct InfraState {
 }
 
 impl InfraState {
-    pub fn new(platform_info_service: Arc<PlatformInfoService>, dns_service: Arc<DnsService>) -> Self {
+    pub fn new(
+        platform_info_service: Arc<PlatformInfoService>,
+        dns_service: Arc<DnsService>,
+    ) -> Self {
         Self {
             platform_info_service,
             dns_service,
@@ -75,7 +78,7 @@ impl TempsPlugin for InfraPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             // Create Docker connection for platform detection
-           let docker = context.require_service::<bollard::Docker>();
+            let docker = context.require_service::<bollard::Docker>();
             // Create PlatformInfoService
             let platform_info_service = Arc::new(PlatformInfoService::new(docker.clone()));
             context.register_service(platform_info_service.clone());
@@ -138,7 +141,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_infra_plugin_default() {
-        let infra_plugin = InfraPlugin::default();
+        let infra_plugin = InfraPlugin;
         assert_eq!(infra_plugin.name(), "infra");
     }
 }

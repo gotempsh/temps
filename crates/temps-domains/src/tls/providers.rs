@@ -61,6 +61,11 @@ impl LetsEncryptProvider {
     }
 
     fn get_acme_url(&self) -> String {
+        // Allow custom ACME directory URL for testing (e.g., Pebble)
+        if let Ok(custom_url) = std::env::var("ACME_DIRECTORY_URL") {
+            return custom_url;
+        }
+
         if self.environment == "production" {
             instant_acme::LetsEncrypt::Production.url().to_string()
         } else {
@@ -133,8 +138,7 @@ impl LetsEncryptProvider {
     ) -> Result<Certificate, ProviderError> {
         // Generate CSR
         // For wildcard domains, include both wildcard and base domain
-        let names = if domain.starts_with("*.") {
-            let base_domain = &domain[2..];
+        let names = if let Some(base_domain) = domain.strip_prefix("*.") {
             vec![domain.to_string(), base_domain.to_string()]
         } else {
             vec![domain.to_string()]
@@ -240,11 +244,7 @@ impl LetsEncryptProvider {
         }
 
         // Extract base domain for DNS record name
-        let dns_record_domain = if domain.starts_with("*.") {
-            &domain[2..] // Remove "*." prefix for DNS record
-        } else {
-            domain
-        };
+        let dns_record_domain = domain.strip_prefix("*.").unwrap_or(domain);
 
         // For wildcard domains with base domain, we'll have multiple authorizations
         // Collect ALL DNS TXT records that need to be added
@@ -268,7 +268,7 @@ impl LetsEncryptProvider {
             let mut hasher = Sha256::new();
             hasher.update(key_auth.as_str().as_bytes());
             let hash = hasher.finalize();
-            let txt_value = URL_SAFE_NO_PAD.encode(&hash);
+            let txt_value = URL_SAFE_NO_PAD.encode(hash);
 
             // Add DNS TXT record with its validation URL
             dns_txt_records.push(DnsTxtRecord {
@@ -304,11 +304,17 @@ impl LetsEncryptProvider {
     }
 
     async fn wait_for_order_ready(&self, order: &mut Order) -> Result<(), ProviderError> {
-        const MAX_ATTEMPTS: u8 = 5;
-        const RETRY_DELAY_SECS: u64 = 1;
+        const MAX_ATTEMPTS: u8 = 6;
+        const BASE_DELAY_SECS: u64 = 1;
+        const MAX_DELAY_SECS: u64 = 30;
 
         for attempt in 1..=MAX_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
+            // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (capped)
+            let delay_secs = std::cmp::min(
+                BASE_DELAY_SECS * 2u64.pow((attempt - 1) as u32),
+                MAX_DELAY_SECS,
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
             let state = order.refresh().await?;
 
             match state.status {
@@ -323,9 +329,13 @@ impl LetsEncryptProvider {
                 }
                 _ => {
                     if attempt < MAX_ATTEMPTS {
+                        let next_delay = std::cmp::min(
+                            BASE_DELAY_SECS * 2u64.pow(attempt as u32),
+                            MAX_DELAY_SECS,
+                        );
                         info!(
                             "Order not ready yet (attempt {}/{}), retrying in {}s",
-                            attempt, MAX_ATTEMPTS, RETRY_DELAY_SECS
+                            attempt, MAX_ATTEMPTS, next_delay
                         );
                     } else {
                         let error_msg =
@@ -367,8 +377,8 @@ impl CertificateProvider for LetsEncryptProvider {
 
         // For wildcard domains, also request the base domain in the same certificate
         // e.g., if domain is "*.example.com", request both "*.example.com" and "example.com"
-        let identifiers = if domain.starts_with("*.") {
-            let base_domain = &domain[2..]; // Remove "*." prefix
+        let identifiers = if let Some(base_domain) = domain.strip_prefix("*.") {
+            // Remove "*." prefix
             info!(
                 "Requesting wildcard certificate for {} - including base domain {}",
                 domain, base_domain

@@ -1,5 +1,5 @@
-use sea_orm::entity::prelude::*;
 use async_trait::async_trait;
+use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
@@ -16,22 +16,16 @@ pub struct Model {
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
     pub slug: Option<String>,
+    /// Encrypted JSON configuration for the service
+    pub config: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "super::external_service_params::Entity")]
-    Params,
     #[sea_orm(has_many = "super::external_service_backups::Entity")]
     Backups,
     #[sea_orm(has_many = "super::project_services::Entity")]
     ProjectServices,
-}
-
-impl Related<super::external_service_params::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::Params.def()
-    }
 }
 
 impl Related<super::external_service_backups::Entity> for Entity {
@@ -53,7 +47,7 @@ impl ActiveModelBehavior for ActiveModel {
         C: ConnectionTrait,
     {
         let now = chrono::Utc::now();
-        
+
         if insert {
             if self.created_at.is_not_set() {
                 self.created_at = Set(now);
@@ -64,7 +58,7 @@ impl ActiveModelBehavior for ActiveModel {
         } else {
             self.updated_at = Set(now);
         }
-        
+
         Ok(self)
     }
 }

@@ -26,7 +26,7 @@ pub struct SessionEvent {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct SessionEventsResponse {
+pub struct AnalyticsSessionEventsResponse {
     pub session_id: String,
     pub events: Vec<SessionEvent>,
     pub total_events: usize,

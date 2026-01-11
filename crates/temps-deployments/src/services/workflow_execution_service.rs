@@ -6,10 +6,10 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use std::collections::HashMap;
 use std::sync::Arc;
 use temps_core::{
-    WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor,
+    Job, JobQueue, WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor,
 };
 use temps_database::DbConnection;
-use temps_deployer::{ContainerDeployer, ImageBuilder};
+use temps_deployer::{static_deployer::StaticDeployer, ContainerDeployer, ImageBuilder};
 use temps_entities::{deployment_jobs, deployments, environments, projects};
 use temps_git::GitProviderManagerTrait;
 use temps_logs::LogService;
@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::jobs::{
     BuildImageJobBuilder, ConfigureCronsJobBuilder, CronConfigService, DeployImageJobBuilder,
-    DeploymentTarget, DownloadRepoBuilder,
+    DeployStaticJob, DeploymentTarget, DownloadRepoBuilder,
 };
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
@@ -25,36 +25,48 @@ use temps_screenshots::ScreenshotService;
 /// Service for executing deployment workflows
 pub struct WorkflowExecutionService {
     db: Arc<DbConnection>,
+    queue: Arc<dyn JobQueue>,
     git_provider: Arc<dyn GitProviderManagerTrait>,
     image_builder: Arc<dyn ImageBuilder>,
     container_deployer: Arc<dyn ContainerDeployer>,
+    static_deployer: Arc<dyn StaticDeployer>,
     log_service: Arc<LogService>,
     cron_service: Arc<dyn CronConfigService>,
     config_service: Arc<temps_config::ConfigService>,
-    screenshot_service: Option<Arc<ScreenshotService>>,
+    screenshot_service: Arc<ScreenshotService>,
 }
 
 impl WorkflowExecutionService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<DbConnection>,
+        queue: Arc<dyn JobQueue>,
         git_provider: Arc<dyn GitProviderManagerTrait>,
         image_builder: Arc<dyn ImageBuilder>,
         container_deployer: Arc<dyn ContainerDeployer>,
+        static_deployer: Arc<dyn StaticDeployer>,
         log_service: Arc<LogService>,
         cron_service: Arc<dyn CronConfigService>,
         config_service: Arc<temps_config::ConfigService>,
-        screenshot_service: Option<Arc<ScreenshotService>>,
+        screenshot_service: Arc<ScreenshotService>,
     ) -> Self {
         Self {
             db,
+            queue,
             git_provider,
             image_builder,
             container_deployer,
+            static_deployer,
             log_service,
             cron_service,
             config_service,
             screenshot_service,
         }
+    }
+
+    /// Get the container deployer (for cancelling deployments)
+    pub fn container_deployer(&self) -> Arc<dyn ContainerDeployer> {
+        self.container_deployer.clone()
     }
 
     /// Execute the workflow for a deployment using its job records
@@ -63,7 +75,7 @@ impl WorkflowExecutionService {
         deployment_id: i32,
     ) -> Result<(), WorkflowExecutionError> {
         info!(
-            "🔄 Starting workflow execution for deployment {}",
+            "Starting workflow execution for deployment {}",
             deployment_id
         );
 
@@ -80,7 +92,7 @@ impl WorkflowExecutionService {
         }
 
         debug!(
-            "📋 Found {} jobs for deployment {}",
+            "Found {} jobs for deployment {}",
             db_jobs.len(),
             deployment_id
         );
@@ -101,12 +113,8 @@ impl WorkflowExecutionService {
             .with_max_parallel_jobs(3); // Allow parallel execution of configure_crons and take_screenshot
 
         // Add project metadata as workflow variables
-        if let Some(ref repo_owner) = project.repo_owner {
-            workflow_builder = workflow_builder.with_var("repo_owner", repo_owner)?;
-        }
-        if let Some(ref repo_name) = project.repo_name {
-            workflow_builder = workflow_builder.with_var("repo_name", repo_name)?;
-        }
+        workflow_builder = workflow_builder.with_var("repo_owner", &project.repo_owner)?;
+        workflow_builder = workflow_builder.with_var("repo_name", &project.repo_name)?;
 
         // Convert database job records to actual job instances
         // Create log paths for each job
@@ -133,11 +141,13 @@ impl WorkflowExecutionService {
 
             // Parse dependencies from database record
             let dependencies: Vec<String> = if let Some(ref deps_json) = db_job.dependencies {
-                serde_json::from_value(deps_json.clone())
-                    .unwrap_or_else(|e| {
-                        warn!("Failed to parse dependencies for job {}: {}", db_job.job_id, e);
-                        vec![]
-                    })
+                serde_json::from_value(deps_json.clone()).unwrap_or_else(|e| {
+                    warn!(
+                        "Failed to parse dependencies for job {}: {}",
+                        db_job.job_id, e
+                    );
+                    vec![]
+                })
             } else {
                 vec![]
             };
@@ -147,7 +157,7 @@ impl WorkflowExecutionService {
 
         let workflow = workflow_builder.build()?;
 
-        info!("✅ Built workflow with {} jobs", workflow.jobs.len());
+        info!("Built workflow with {} jobs", workflow.jobs.len());
 
         // Create job tracker for updating deployment_jobs table
         let job_tracker = Arc::new(DeploymentJobTracker::new(self.db.clone(), deployment_id));
@@ -167,7 +177,7 @@ impl WorkflowExecutionService {
         {
             Ok(_context) => {
                 info!(
-                    "🎉 Workflow execution completed successfully for deployment {}",
+                    "Workflow execution completed successfully for deployment {}",
                     deployment_id
                 );
 
@@ -177,9 +187,7 @@ impl WorkflowExecutionService {
 
                 // NOW teardown previous deployment for zero-downtime deployment
                 // This happens AFTER the new deployment is fully running
-                info!(
-                    "🔍 Checking for previous deployments to teardown after successful deployment"
-                );
+                info!("Checking for previous deployments to teardown after successful deployment");
                 match self
                     .teardown_previous_deployment(
                         deployment.project_id,
@@ -190,15 +198,15 @@ impl WorkflowExecutionService {
                 {
                     Ok(Some(stopped_container_id)) => {
                         info!(
-                            "✅ Successfully tore down previous deployment: {}",
+                            "Successfully tore down previous deployment: {}",
                             stopped_container_id
                         );
                     }
                     Ok(None) => {
-                        debug!("ℹ️  No previous deployment found to teardown");
+                        debug!("No previous deployment found to teardown");
                     }
                     Err(e) => {
-                        warn!("⚠️  Failed to teardown previous deployment: {}", e);
+                        warn!("Failed to teardown previous deployment: {}", e);
                         // Don't fail the deployment if teardown fails - the new deployment is already running
                     }
                 }
@@ -208,11 +216,12 @@ impl WorkflowExecutionService {
             Err(e) => {
                 // Check if this is a cancellation error
                 let error_message = format!("{}", e);
-                let is_cancellation = error_message.contains("cancelled") || error_message.contains("Cancelled");
+                let is_cancellation =
+                    error_message.contains("cancelled") || error_message.contains("Cancelled");
 
                 if is_cancellation {
                     info!(
-                        "🛑 Workflow execution cancelled for deployment {}: {}",
+                        "Workflow execution cancelled for deployment {}: {}",
                         deployment_id, e
                     );
 
@@ -230,12 +239,12 @@ impl WorkflowExecutionService {
                     }
 
                     info!(
-                        "✅ Deployment {} cancellation completed - workflow stopped gracefully",
+                        "Deployment {} cancellation completed - workflow stopped gracefully",
                         deployment_id
                     );
                 } else {
                     error!(
-                        "❌ Workflow execution failed for deployment {}: {}",
+                        "Workflow execution failed for deployment {}: {}",
                         deployment_id, e
                     );
 
@@ -326,14 +335,36 @@ impl WorkflowExecutionService {
                         WorkflowExecutionError::InvalidJobConfig("repo_name missing".to_string())
                     })?;
 
+                // Check if this is a public repo
+                let is_public_repo = config
+                    .get("is_public_repo")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                // Get git_url for public repos
+                let git_url = config
+                    .get("git_url")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                // Get connection_id for private repos (optional for public repos)
                 let connection_id = config
                     .get("git_provider_connection_id")
                     .and_then(|v| v.as_i64())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "git_provider_connection_id missing".to_string(),
-                        )
-                    })? as i32;
+                    .map(|v| v as i32);
+
+                // Validate: public repos need git_url, private repos need connection_id
+                if is_public_repo && git_url.is_none() {
+                    return Err(WorkflowExecutionError::InvalidJobConfig(
+                        "git_url is required for public repositories".to_string(),
+                    ));
+                }
+                if !is_public_repo && connection_id.is_none() {
+                    return Err(WorkflowExecutionError::InvalidJobConfig(
+                        "git_provider_connection_id is required for private repositories"
+                            .to_string(),
+                    ));
+                }
 
                 // Get branch_ref from job config (set by workflow planner based on deployment)
                 // Fallback to project.main_branch if not specified
@@ -343,24 +374,46 @@ impl WorkflowExecutionService {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| deployment.branch_ref.clone().unwrap_or("main".to_string()));
 
-                let _commit_sha = config
+                // Get tag_ref from job config (for tag-based deployments)
+                let tag_ref = config
+                    .get("tag_ref")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                // Get commit_sha from job config (for specific commit deployments)
+                let commit_sha = config
                     .get("commit_sha")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
-                let builder = DownloadRepoBuilder::new()
+                let mut builder = DownloadRepoBuilder::new()
                     .job_id(db_job.job_id.clone())
                     .repo_owner(repo_owner.to_string())
                     .repo_name(repo_name.to_string())
-                    .git_provider_connection_id(connection_id)
+                    .is_public_repo(is_public_repo)
                     .branch_ref(branch_ref)
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone());
 
-                // // Add commit_sha if present
-                // if let Some(commit) = commit_sha {
-                //     builder = builder.commit_sha(commit);
-                // }
+                // Add git_url for public repos
+                if let Some(url) = git_url {
+                    builder = builder.git_url(url);
+                }
+
+                // Add connection_id for private repos
+                if let Some(id) = connection_id {
+                    builder = builder.git_provider_connection_id(id);
+                }
+
+                // Add tag_ref if present (highest priority in checkout)
+                if let Some(tag) = tag_ref {
+                    builder = builder.tag_ref(tag);
+                }
+
+                // Add commit_sha if present (second priority in checkout)
+                if let Some(commit) = commit_sha {
+                    builder = builder.commit_sha(commit);
+                }
 
                 let job = builder.build(self.git_provider.clone())?;
 
@@ -407,10 +460,10 @@ impl WorkflowExecutionService {
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone());
 
-                // Pass preset if project has one
-                if let Some(ref preset) = project.preset {
-                    builder = builder.preset(preset.clone());
-                }
+                // Pass preset (always available since it's required)
+                // Convert preset enum to string for builder
+                let preset_str = format!("{:?}", project.preset).to_lowercase();
+                builder = builder.preset(preset_str);
 
                 // Add build args if present
                 if let Some(build_args_value) = config.get("build_args") {
@@ -420,6 +473,15 @@ impl WorkflowExecutionService {
                             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                             .collect();
                         builder = builder.build_args(build_args);
+                    }
+                }
+
+                // Add build context if present (for monorepo subdirectories)
+                if let Some(build_context_value) = config.get("build_context") {
+                    if let Some(build_context_str) = build_context_value.as_str() {
+                        if !build_context_str.is_empty() && build_context_str != "." {
+                            builder = builder.build_context(build_context_str.to_string());
+                        }
                     }
                 }
 
@@ -435,10 +497,17 @@ impl WorkflowExecutionService {
 
                 let port = config.get("port").and_then(|v| v.as_i64()).unwrap_or(3000) as u16;
 
-                // Get replicas from environment, fallback to config, then default to 1
+                // Get replicas with priority: environment > project > job config > default (1)
                 let replicas = environment
-                    .replicas
-                    .map(|r| r as u32)
+                    .deployment_config
+                    .as_ref()
+                    .map(|c| c.replicas as u32)
+                    .or_else(|| {
+                        project
+                            .deployment_config
+                            .as_ref()
+                            .map(|c| c.replicas as u32)
+                    })
                     .or_else(|| {
                         config
                             .get("replicas")
@@ -447,7 +516,12 @@ impl WorkflowExecutionService {
                     })
                     .unwrap_or(1);
 
-                debug!("🔢 Deploying with {} replicas from environment", replicas);
+                debug!(
+                    "🔢 Deploying with {} replicas (env: {:?}, project: {:?})",
+                    replicas,
+                    environment.deployment_config.as_ref().map(|c| c.replicas),
+                    project.deployment_config.as_ref().map(|c| c.replicas)
+                );
 
                 // Get environment variables from job config (gathered during planning phase)
                 let env_variables = config
@@ -455,8 +529,9 @@ impl WorkflowExecutionService {
                     .and_then(|v| serde_json::from_value::<HashMap<String, String>>(v.clone()).ok())
                     .unwrap_or_default();
                 debug!(
-                    "🌍 Using {} environment variables for deployment (from job config)",
-                    env_variables.len()
+                    "🌍 Using {} environment variables for deployment (from job config): {}",
+                    env_variables.len(),
+                    env_variables.keys().cloned().collect::<Vec<_>>().join(", ")
                 );
 
                 // Get dependencies to find the build job
@@ -484,7 +559,7 @@ impl WorkflowExecutionService {
                     .build_job_id(build_job_id)
                     .target(DeploymentTarget::Docker {
                         registry_url: "local".to_string(),
-                        network: Some("temps-network".to_string()),
+                        network: Some(temps_core::NETWORK_NAME.to_string()),
                     })
                     .service_name(deployment.slug.clone())
                     .namespace("default".to_string())
@@ -558,18 +633,16 @@ impl WorkflowExecutionService {
                     .db(self.db.clone())
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone())
+                    .container_deployer(self.container_deployer.clone())
+                    .queue(self.queue.clone())
                     .build()?;
 
                 Ok(Arc::new(job))
             }
 
             "TakeScreenshotJob" => {
-                // Check if screenshot service is available
-                let screenshot_service = self.screenshot_service.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::JobCreationFailed(
-                        "Screenshot service is not available".to_string()
-                    )
-                })?;
+                // Screenshot service is always available now
+                let screenshot_service = &self.screenshot_service;
 
                 let config = db_job.job_config.as_ref().ok_or_else(|| {
                     WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
@@ -597,10 +670,151 @@ impl WorkflowExecutionService {
                 Ok(Arc::new(job))
             }
 
+            "ScanVulnerabilitiesJob" => {
+                let config = db_job.job_config.as_ref().ok_or_else(|| {
+                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
+                })?;
+
+                let deployment_id = config
+                    .get("deployment_id")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "deployment_id is required".to_string(),
+                        )
+                    })? as i32;
+
+                let project_id = config
+                    .get("project_id")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "project_id is required".to_string(),
+                        )
+                    })? as i32;
+
+                let environment_id = config
+                    .get("environment_id")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "environment_id is required".to_string(),
+                        )
+                    })? as i32;
+
+                let branch = config
+                    .get("branch")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig("branch is required".to_string())
+                    })?
+                    .to_string();
+
+                let commit_hash = config
+                    .get("commit_hash")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "commit_hash is required".to_string(),
+                        )
+                    })?
+                    .to_string();
+
+                let download_job_id = config
+                    .get("download_job_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "download_job_id is required".to_string(),
+                        )
+                    })?
+                    .to_string();
+
+                let build_job_id = config
+                    .get("build_job_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "build_job_id is required".to_string(),
+                        )
+                    })?
+                    .to_string();
+
+                let job = crate::jobs::ScanVulnerabilitiesJob::new(
+                    db_job.job_id.clone(),
+                    deployment_id,
+                    project_id,
+                    environment_id,
+                    branch,
+                    commit_hash,
+                    download_job_id,
+                    build_job_id,
+                    self.db.clone(),
+                )
+                .with_log_id(db_job.log_id.clone())
+                .with_log_service(self.log_service.clone());
+
+                Ok(Arc::new(job))
+            }
+
+            "DeployStaticJob" => {
+                let config = db_job.job_config.as_ref().ok_or_else(|| {
+                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
+                })?;
+
+                // Get dependencies to find the build job (DeployStaticJob depends on BuildImageJob)
+                let dependencies: Vec<String> = db_job
+                    .dependencies
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+
+                let build_job_id = dependencies
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "build_image".to_string());
+
+                // Get static output directory from config (path inside container after build)
+                // This is typically "/app/dist" or "/app/build" depending on the framework
+                let static_output_dir = config
+                    .get("static_output_dir")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/app/dist")
+                    .to_string();
+
+                debug!(
+                    "📦 DeployStaticJob will extract files from container path: {}",
+                    static_output_dir
+                );
+
+                // Fetch deployment to get slugs
+                let deployment = deployments::Entity::find_by_id(db_job.deployment_id)
+                    .one(self.db.as_ref())
+                    .await?
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::DeploymentNotFound(db_job.deployment_id)
+                    })?;
+
+                let job = DeployStaticJob::new(
+                    db_job.job_id.clone(),
+                    build_job_id,
+                    static_output_dir,
+                    project.slug.clone(),
+                    environment.slug.clone(),
+                    deployment.slug.clone(),
+                    self.static_deployer.clone(),
+                    self.image_builder.clone(),
+                )
+                .with_log_id(db_job.log_id.clone())
+                .with_log_service(self.log_service.clone());
+
+                Ok(Arc::new(job))
+            }
+
             // Unsupported job types - log warning but don't fail the entire workflow
-            "HealthCheckJob" | "DeployBasicJob" | "BuildStaticJob" | "DeployStaticJob" => {
+            "HealthCheckJob" | "DeployBasicJob" | "BuildStaticJob" => {
                 warn!(
-                    "⚠️  Skipping unsupported job type: {} (not yet implemented)",
+                    "Skipping unsupported job type: {} (not yet implemented)",
                     db_job.job_type
                 );
                 // Return a no-op job that succeeds immediately
@@ -610,7 +824,7 @@ impl WorkflowExecutionService {
             }
 
             _ => {
-                warn!("⚠️  Unknown job type: {}", db_job.job_type);
+                warn!("Unknown job type: {}", db_job.job_type);
                 Err(WorkflowExecutionError::UnsupportedJobType(
                     db_job.job_type.clone(),
                 ))
@@ -650,8 +864,8 @@ impl WorkflowExecutionService {
         };
         active_deployment.state = Set(state_str.to_string());
 
-        if let Some(reason) = cancelled_reason {
-            active_deployment.cancelled_reason = Set(Some(reason));
+        if let Some(ref reason) = cancelled_reason {
+            active_deployment.cancelled_reason = Set(Some(reason.clone()));
         }
 
         // Set timestamps based on status
@@ -668,7 +882,81 @@ impl WorkflowExecutionService {
         }
 
         active_deployment.updated_at = Set(chrono::Utc::now());
-        active_deployment.update(self.db.as_ref()).await?;
+        let updated_deployment = active_deployment.update(self.db.as_ref()).await?;
+
+        // Fire deployment lifecycle events to queue
+        // Get environment for environment_name
+        let environment = environments::Entity::find_by_id(updated_deployment.environment_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                WorkflowExecutionError::Validation(format!(
+                    "Environment {} not found for deployment {}",
+                    updated_deployment.environment_id, deployment_id
+                ))
+            })?;
+
+        match status {
+            temps_entities::types::PipelineStatus::Completed => {
+                // Get deployment URL from environment
+                let url = if !environment.host.is_empty() {
+                    Some(format!("https://{}", environment.host))
+                } else {
+                    None
+                };
+
+                let event = Job::DeploymentSucceeded(temps_core::DeploymentSucceededJob {
+                    deployment_id: updated_deployment.id,
+                    project_id: updated_deployment.project_id,
+                    environment_id: updated_deployment.environment_id,
+                    environment_name: environment.name.clone(),
+                    commit_sha: updated_deployment.commit_sha.clone(),
+                    url,
+                });
+                if let Err(e) = self.queue.send(event).await {
+                    error!("Failed to send DeploymentSucceeded event: {}", e);
+                } else {
+                    debug!(
+                        "Sent DeploymentSucceeded event for deployment {}",
+                        deployment_id
+                    );
+                }
+            }
+            temps_entities::types::PipelineStatus::Failed => {
+                let event = Job::DeploymentFailed(temps_core::DeploymentFailedJob {
+                    deployment_id: updated_deployment.id,
+                    project_id: updated_deployment.project_id,
+                    environment_id: updated_deployment.environment_id,
+                    environment_name: environment.name.clone(),
+                    error_message: cancelled_reason.clone().map(|s| s.to_string()),
+                });
+                if let Err(e) = self.queue.send(event).await {
+                    error!("Failed to send DeploymentFailed event: {}", e);
+                } else {
+                    debug!(
+                        "Sent DeploymentFailed event for deployment {}",
+                        deployment_id
+                    );
+                }
+            }
+            temps_entities::types::PipelineStatus::Cancelled => {
+                let event = Job::DeploymentCancelled(temps_core::DeploymentCancelledJob {
+                    deployment_id: updated_deployment.id,
+                    project_id: updated_deployment.project_id,
+                    environment_id: updated_deployment.environment_id,
+                    environment_name: environment.name,
+                });
+                if let Err(e) = self.queue.send(event).await {
+                    error!("Failed to send DeploymentCancelled event: {}", e);
+                } else {
+                    debug!(
+                        "Sent DeploymentCancelled event for deployment {}",
+                        deployment_id
+                    );
+                }
+            }
+            _ => {}
+        }
 
         Ok(())
     }
@@ -742,7 +1030,7 @@ impl WorkflowExecutionService {
             deployment_container.insert(self.db.as_ref()).await?;
 
             info!(
-                "✅ Created deployment_container record for container {}",
+                "Created deployment_container record for container {}",
                 container_id
             );
         }
@@ -752,10 +1040,7 @@ impl WorkflowExecutionService {
 
         active_deployment.update(self.db.as_ref()).await?;
 
-        info!(
-            "✅ Updated deployment {} with workflow outputs",
-            deployment_id
-        );
+        info!("Updated deployment {} with workflow outputs", deployment_id);
         Ok(())
     }
 
@@ -791,7 +1076,7 @@ impl WorkflowExecutionService {
         active_environment.update(self.db.as_ref()).await?;
 
         info!(
-            "✅ Updated environment {} to point to deployment {}",
+            "Updated environment {} to point to deployment {}",
             deployment.environment_id, deployment_id
         );
         Ok(())
@@ -828,7 +1113,7 @@ impl WorkflowExecutionService {
 
             if !containers.is_empty() {
                 info!(
-                    "🔄 Tearing down previous deployment {} ({} containers)",
+                    "Tearing down previous deployment {} ({} containers)",
                     deployment.id,
                     containers.len()
                 );
@@ -841,10 +1126,10 @@ impl WorkflowExecutionService {
                     // Stop and remove the container
                     match self.container_deployer.stop_container(&container_id).await {
                         Ok(_) => {
-                            info!("✅ Stopped container {}", container_id);
+                            info!("Stopped container {}", container_id);
                         }
                         Err(e) => {
-                            warn!("⚠️  Failed to stop container {}: {}", container_id, e);
+                            warn!("Failed to stop container {}: {}", container_id, e);
                         }
                     }
 
@@ -854,10 +1139,10 @@ impl WorkflowExecutionService {
                         .await
                     {
                         Ok(_) => {
-                            info!("✅ Removed container {}", container_id);
+                            info!("Removed container {}", container_id);
                         }
                         Err(e) => {
-                            warn!("⚠️  Failed to remove container {}: {}", container_id, e);
+                            warn!("Failed to remove container {}: {}", container_id, e);
                         }
                     }
 
@@ -928,7 +1213,7 @@ impl WorkflowCancellationProvider for DatabaseCancellationProvider {
                 let is_cancelled = deployment.state == "cancelled";
                 if is_cancelled {
                     info!(
-                        "🛑 Cancellation detected for deployment {} (workflow: {}) - stopping workflow execution",
+                        "Cancellation detected for deployment {} (workflow: {}) - stopping workflow execution",
                         self.deployment_id, workflow_run_id
                     );
                 }
@@ -936,14 +1221,14 @@ impl WorkflowCancellationProvider for DatabaseCancellationProvider {
             }
             Ok(None) => {
                 warn!(
-                    "⚠️  Deployment {} not found during cancellation check",
+                    "Deployment {} not found during cancellation check",
                     self.deployment_id
                 );
                 Ok(false)
             }
             Err(e) => {
                 error!(
-                    "❌ Error checking cancellation status for deployment {}: {}",
+                    "Error checking cancellation status for deployment {}: {}",
                     self.deployment_id, e
                 );
                 // Don't cancel on error to avoid false positives
@@ -984,6 +1269,9 @@ pub enum WorkflowExecutionError {
 
     #[error("Job creation failed: {0}")]
     JobCreationFailed(String),
+
+    #[error("Validation error: {0}")]
+    Validation(String),
 }
 
 impl From<anyhow::Error> for WorkflowExecutionError {
@@ -998,9 +1286,9 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use sea_orm::{ActiveModelTrait, Set};
-    use std::sync::Mutex;
+
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::types::{JobStatus, ProjectType};
+    use temps_entities::{preset::Preset, types::JobStatus, upstream_config::UpstreamList};
 
     // Mock services for testing
     struct MockGitProvider;
@@ -1110,6 +1398,65 @@ mod tests {
         should_fail: bool,
     }
 
+    struct MockStaticDeployer;
+
+    #[async_trait]
+    impl temps_deployer::static_deployer::StaticDeployer for MockStaticDeployer {
+        async fn deploy(
+            &self,
+            _request: temps_deployer::static_deployer::StaticDeployRequest,
+        ) -> Result<
+            temps_deployer::static_deployer::StaticDeployResult,
+            temps_deployer::static_deployer::StaticDeployError,
+        > {
+            Ok(temps_deployer::static_deployer::StaticDeployResult {
+                storage_path: "/tmp/test-deployment".to_string(),
+                file_count: 10,
+                total_size_bytes: 1024,
+                deployed_at: Utc::now(),
+            })
+        }
+
+        async fn get_deployment(
+            &self,
+            _project_slug: &str,
+            _environment_slug: &str,
+            _deployment_slug: &str,
+        ) -> Result<
+            temps_deployer::static_deployer::StaticDeploymentInfo,
+            temps_deployer::static_deployer::StaticDeployError,
+        > {
+            Ok(temps_deployer::static_deployer::StaticDeploymentInfo {
+                deployment_slug: "test-deployment".to_string(),
+                storage_path: std::path::PathBuf::from("/tmp/test-deployment"),
+                deployed_at: Utc::now(),
+                file_count: 10,
+                total_size_bytes: 1024,
+            })
+        }
+
+        async fn list_files(
+            &self,
+            _project_slug: &str,
+            _environment_slug: &str,
+            _deployment_slug: &str,
+        ) -> Result<
+            Vec<temps_deployer::static_deployer::FileInfo>,
+            temps_deployer::static_deployer::StaticDeployError,
+        > {
+            Ok(vec![])
+        }
+
+        async fn remove(
+            &self,
+            _project_slug: &str,
+            _environment_slug: &str,
+            _deployment_slug: &str,
+        ) -> Result<(), temps_deployer::static_deployer::StaticDeployError> {
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl ContainerDeployer for MockContainerDeployer {
         async fn deploy_container(
@@ -1180,6 +1527,23 @@ mod tests {
             })
         }
 
+        async fn get_container_stats(
+            &self,
+            container_id: &str,
+        ) -> Result<temps_deployer::ContainerStats, temps_deployer::DeployerError> {
+            Ok(temps_deployer::ContainerStats {
+                container_id: container_id.to_string(),
+                container_name: "mock-container".to_string(),
+                cpu_percent: 10.5,
+                memory_bytes: 134217728,
+                memory_limit_bytes: Some(1073741824),
+                memory_percent: Some(12.5),
+                network_rx_bytes: 1024000,
+                network_tx_bytes: 512000,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+
         async fn list_containers(
             &self,
         ) -> Result<Vec<temps_deployer::ContainerInfo>, temps_deployer::DeployerError> {
@@ -1215,12 +1579,11 @@ mod tests {
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
             slug: Set("test-project".to_string()),
-            repo_owner: Set(Some("test-owner".to_string())),
-            repo_name: Set(Some("test-repo".to_string())),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
             git_provider_connection_id: Set(Some(1)),
-            preset: Set(Some("nextjs".to_string())),
+            preset: Set(Preset::NextJs),
             directory: Set("/".to_string()),
-            project_type: Set(ProjectType::Server),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -1234,7 +1597,7 @@ mod tests {
             name: Set("Production".to_string()),
             slug: Set("production".to_string()),
             host: Set("test.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             subdomain: Set("test.example.com".to_string()),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -1248,7 +1611,9 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("test-deployment".to_string()),
             state: Set("pending".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
@@ -1277,27 +1642,31 @@ mod tests {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
         let git_provider = Arc::new(MockGitProvider);
         let image_builder = Arc::new(MockImageBuilder { should_fail: false });
         let container_deployer = Arc::new(MockContainerDeployer { should_fail: false });
+        let static_deployer = Arc::new(MockStaticDeployer);
         let log_service = Arc::new(LogService::new(std::env::temp_dir()));
         let cron_service =
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
-        let screenshot_service = None;
-        let service = WorkflowExecutionService::new(
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
+        let _service = WorkflowExecutionService::new(
             db.clone(),
+            queue,
             git_provider,
             image_builder,
             container_deployer,
+            static_deployer,
             log_service,
             cron_service,
             config_service,
             screenshot_service,
         );
 
-        // Service should be created successfully
-        assert!(true);
+        // Service should be created successfully - compilation itself is the test
 
         Ok(())
     }
@@ -1307,21 +1676,26 @@ mod tests {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
-        let (project, environment, deployment) = create_test_data(&db).await?;
+        let (_project, _environment, deployment) = create_test_data(&db).await?;
 
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
         let git_provider = Arc::new(MockGitProvider);
         let image_builder = Arc::new(MockImageBuilder { should_fail: false });
         let container_deployer = Arc::new(MockContainerDeployer { should_fail: false });
+        let static_deployer = Arc::new(MockStaticDeployer);
         let log_service = Arc::new(LogService::new(std::env::temp_dir()));
         let cron_service =
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
-        let screenshot_service = None;
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
         let service = WorkflowExecutionService::new(
             db.clone(),
+            queue,
             git_provider,
             image_builder,
             container_deployer,
+            static_deployer,
             log_service,
             cron_service,
             config_service,
@@ -1348,7 +1722,7 @@ mod tests {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
-        let (project, environment, deployment) = create_test_data(&db).await?;
+        let (_project, _environment, deployment) = create_test_data(&db).await?;
 
         // Create jobs for the deployment
         let download_job = deployment_jobs::ActiveModel {
@@ -1405,19 +1779,24 @@ mod tests {
         };
         deploy_job.insert(db.as_ref()).await?;
 
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
         let git_provider = Arc::new(MockGitProvider);
         let image_builder = Arc::new(MockImageBuilder { should_fail: false });
         let container_deployer = Arc::new(MockContainerDeployer { should_fail: false });
+        let static_deployer = Arc::new(MockStaticDeployer);
         let log_service = Arc::new(LogService::new(std::env::temp_dir()));
         let cron_service =
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
-        let screenshot_service = None;
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
         let service = WorkflowExecutionService::new(
             db.clone(),
+            queue,
             git_provider,
             image_builder,
             container_deployer,
+            static_deployer,
             log_service,
             cron_service,
             config_service,

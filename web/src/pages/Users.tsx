@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { listUsersOptions } from '@/api/client/@tanstack/react-query.gen'
 import { UsersManagement } from '@/components/users/UsersManagement'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useEffect, useState } from 'react'
 import { UserEditDialog } from '@/components/users/UserEditDialog'
@@ -29,6 +30,12 @@ export function Users() {
   useEffect(() => {
     setBreadcrumbs([{ label: 'Users' }])
   }, [setBreadcrumbs])
+
+  // Keyboard shortcut: N to create new user
+  useKeyboardShortcut({
+    key: 'n',
+    callback: () => setSelectedUser({ id: 0, name: '', email: '' }),
+  })
 
   usePageTitle('Users')
 

@@ -124,19 +124,27 @@ pub struct BrowserStats {
 pub struct VisitorInfo {
     pub id: i32,
     pub visitor_id: String,
+    pub project_id: i32,
+    pub environment_id: i32,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
     pub first_seen: UtcDateTime,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
     pub last_seen: UtcDateTime,
     pub user_agent: Option<String>,
-    pub location: Option<String>,
+    pub ip_address_id: Option<i32>,
     pub is_crawler: bool,
     pub crawler_name: Option<String>,
-    pub sessions_count: i64,
-    pub page_views: i64,
-    pub total_time_seconds: i64,
-    pub unique_pages: i64,
-    pub browser: Option<String>,
+    pub custom_data: Option<serde_json::Value>,
+    // IP and Geolocation fields
+    pub ip_address: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub country: Option<String>,
+    pub country_code: Option<String>,
+    pub timezone: Option<String>,
+    pub is_eu: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -150,23 +158,27 @@ pub struct VisitorsResponse {
 pub struct VisitorDetails {
     pub id: i32,
     pub visitor_id: String,
+    pub project_id: i32,
+    pub environment_id: i32,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
     pub first_seen: UtcDateTime,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
     pub last_seen: UtcDateTime,
     pub user_agent: Option<String>,
-    pub location: Option<String>,
-    pub country: Option<String>,
-    pub city: Option<String>,
+    pub ip_address_id: Option<i32>,
     pub is_crawler: bool,
     pub crawler_name: Option<String>,
-    pub total_sessions: i64,
-    pub total_page_views: i64,
-    pub total_events: i64,
-    pub total_time_seconds: i64,
-    pub bounce_rate: f64,
-    pub engagement_rate: f64,
-    pub custom_data: Option<serde_json::Value>, // User-provided custom data
+    pub custom_data: Option<serde_json::Value>,
+    // IP and Geolocation fields
+    pub ip_address: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub country: Option<String>,
+    pub country_code: Option<String>,
+    pub timezone: Option<String>,
+    pub is_eu: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -189,7 +201,6 @@ pub struct VisitorStats {
     pub total_sessions: i64,
     pub total_page_views: i64,
     pub total_events: i64,
-    pub total_time_seconds: i64,
     pub average_session_duration: f64,
     pub bounce_rate: f64,
     pub engagement_rate: f64,
@@ -314,7 +325,6 @@ pub struct HasAnalyticsEventsResponse {
 pub struct PageSessionStats {
     pub page_path: String,
     pub total_sessions: i64,
-    pub total_time_seconds: f64,
     pub avg_time_seconds: f64,
     pub min_time_seconds: f64,
     pub max_time_seconds: f64,
@@ -441,4 +451,105 @@ pub struct ProjectStatsBreakdown {
     pub total_page_views: i64,
     pub bounce_rate: f64,
     pub engagement_rate: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LiveVisitorInfo {
+    pub id: i32,
+    pub visitor_id: String,
+    pub project_id: i32,
+    pub environment_id: i32,
+    #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
+    pub first_seen: UtcDateTime,
+    #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
+    pub last_seen: UtcDateTime,
+    pub user_agent: Option<String>,
+    pub ip_address_id: Option<i32>,
+    pub is_crawler: bool,
+    pub crawler_name: Option<String>,
+    pub custom_data: Option<serde_json::Value>,
+    // IP and Geolocation fields
+    pub ip_address: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub country: Option<String>,
+    pub country_code: Option<String>,
+    pub timezone: Option<String>,
+    pub is_eu: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LiveVisitorsListResponse {
+    pub total_count: i64,
+    pub visitors: Vec<LiveVisitorInfo>,
+    pub window_minutes: i32,
+}
+
+/// Time bucket data point for page activity graph
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+pub struct PageActivityBucket {
+    /// Timestamp for this bucket (ISO 8601)
+    #[schema(value_type = String)]
+    pub timestamp: UtcDateTime,
+    /// Number of unique visitors in this bucket
+    pub visitors: i64,
+    /// Number of page views in this bucket
+    pub page_views: i64,
+    /// Average time on page in seconds
+    pub avg_time_seconds: f64,
+}
+
+/// Geographic distribution of visitors for a page
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+pub struct PageCountryStats {
+    /// Country name
+    pub country: String,
+    /// ISO country code (2-letter)
+    pub country_code: Option<String>,
+    /// Number of unique visitors from this country
+    pub visitors: i64,
+    /// Number of page views from this country
+    pub page_views: i64,
+    /// Percentage of total visitors
+    pub percentage: f64,
+}
+
+/// Referrer source for the page
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+pub struct PageReferrerStats {
+    /// Referrer URL or domain
+    pub referrer: String,
+    /// Number of visits from this referrer
+    pub visits: i64,
+    /// Percentage of total visits
+    pub percentage: f64,
+}
+
+/// Detailed analytics response for a specific page path
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PagePathDetailResponse {
+    /// The page path being analyzed
+    pub page_path: String,
+    /// Total unique visitors to this page in the date range
+    pub unique_visitors: i64,
+    /// Total page views in the date range
+    pub total_page_views: i64,
+    /// Average time on page in seconds
+    pub avg_time_on_page: f64,
+    /// Bounce rate percentage (0-100)
+    pub bounce_rate: f64,
+    /// Entry rate - percentage of sessions that started on this page
+    pub entry_rate: f64,
+    /// Exit rate - percentage of sessions that ended on this page
+    pub exit_rate: f64,
+    /// Time series data for activity graph
+    pub activity_over_time: Vec<PageActivityBucket>,
+    /// Geographic distribution of visitors
+    pub countries: Vec<PageCountryStats>,
+    /// Top referrers to this page
+    pub referrers: Vec<PageReferrerStats>,
+    /// Bucket interval used for time series ('hour', 'day', etc.)
+    pub bucket_interval: String,
 }

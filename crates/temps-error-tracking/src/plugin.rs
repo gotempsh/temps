@@ -8,9 +8,9 @@ use temps_core::plugin::{
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
-use crate::services::ErrorTrackingService;
-use crate::sentry::{DSNService, SentryIngestionService};
 use crate::providers::sentry::SentryProvider;
+use crate::sentry::{DSNService, SentryIngestionService};
+use crate::services::ErrorTrackingService;
 
 /// Error Tracking Plugin for capturing and managing application errors
 pub struct ErrorTrackingPlugin;
@@ -56,7 +56,9 @@ impl TempsPlugin for ErrorTrackingPlugin {
             let sentry_provider = Arc::new(SentryProvider::new(dsn_service.clone()));
             context.register_service(sentry_provider);
 
-            tracing::debug!("Error tracking plugin services registered successfully (including Sentry)");
+            tracing::debug!(
+                "Error tracking plugin services registered successfully (including Sentry)"
+            );
             Ok(())
         })
     }
@@ -73,8 +75,8 @@ impl TempsPlugin for ErrorTrackingPlugin {
             error_tracking_service: error_tracking_service.clone(),
             audit_service: audit_service.clone(),
         });
-        let error_tracking_routes = crate::handlers::handler::configure_routes()
-            .with_state(error_tracking_state);
+        let error_tracking_routes =
+            crate::handlers::handler::configure_routes().with_state(error_tracking_state);
 
         // Configure Sentry ingestion routes
         let sentry_state = Arc::new(crate::sentry::handlers::AppState {
@@ -82,8 +84,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
             error_tracking_service: error_tracking_service.clone(),
             audit_service: audit_service.clone(),
         });
-        let sentry_routes = crate::sentry::handlers::configure_routes()
-            .with_state(sentry_state);
+        let sentry_routes = crate::sentry::handlers::configure_routes().with_state(sentry_state);
 
         // Configure DSN management routes
         let dsn_state = Arc::new(crate::sentry::dsn_handlers::DSNAppState {
@@ -91,17 +92,12 @@ impl TempsPlugin for ErrorTrackingPlugin {
             audit_service: audit_service.clone(),
             config_service: config_service.clone(),
         });
-        let dsn_routes = crate::sentry::dsn_handlers::configure_dsn_routes()
-            .with_state(dsn_state);
+        let dsn_routes = crate::sentry::dsn_handlers::configure_dsn_routes().with_state(dsn_state);
 
         // Merge all routes together
-        let routes = error_tracking_routes
-            .merge(sentry_routes)
-            .merge(dsn_routes);
+        let routes = error_tracking_routes.merge(sentry_routes).merge(dsn_routes);
 
-        Some(PluginRoutes {
-            router: routes,
-        })
+        Some(PluginRoutes { router: routes })
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
@@ -142,7 +138,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_error_tracking_plugin_default() {
-        let plugin = ErrorTrackingPlugin::default();
+        let plugin = ErrorTrackingPlugin;
         assert_eq!(plugin.name(), "error-tracking");
     }
 }

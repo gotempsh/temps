@@ -59,6 +59,11 @@ impl TempsPlugin for DeploymentsPlugin {
             ));
             context.register_service(deployment_service.clone());
 
+            // Also register as DeploymentCanceller trait for temps-environments
+            let deployment_canceller =
+                deployment_service.clone() as Arc<dyn temps_core::DeploymentCanceller>;
+            context.register_service(deployment_canceller);
+
             // Cancel any running deployments from previous server instance
             let cancel_service = deployment_service.clone();
             tokio::spawn(async move {
@@ -87,15 +92,35 @@ impl TempsPlugin for DeploymentsPlugin {
                 tracing::debug!("Starting cron scheduler");
                 scheduler_service.start_cron_scheduler().await;
             });
-            // Get screenshot service if available (optional)
-            let screenshot_service = context.get_service::<temps_screenshots::ScreenshotService>();
+
+            // Start Docker cleanup scheduler in background (nightly cleanup at 2 AM UTC)
+            let docker_cleanup = Arc::new(crate::services::DockerCleanupService::new(Arc::new(
+                crate::services::DefaultDockerClient,
+            )));
+            tokio::spawn({
+                let cleanup_service = docker_cleanup.clone();
+                async move {
+                    tracing::debug!("Starting Docker cleanup scheduler");
+                    cleanup_service.start_cleanup_scheduler().await;
+                }
+            });
+
+            // Get screenshot service (required)
+            let screenshot_service =
+                context.require_service::<temps_screenshots::ScreenshotService>();
+
+            // Get static deployer (required)
+            let static_deployer =
+                context.require_service::<dyn temps_deployer::static_deployer::StaticDeployer>();
 
             // Create WorkflowExecutionService
             let workflow_execution_service = Arc::new(WorkflowExecutionService::new(
                 db.clone(),
+                queue_service.clone(),
                 git_provider,
                 image_builder,
                 deployer,
+                static_deployer,
                 log_service.clone(),
                 cron_service,
                 config_service.clone(),
@@ -109,6 +134,9 @@ impl TempsPlugin for DeploymentsPlugin {
             // Get DSN service for automatic Sentry DSN generation (required)
             let dsn_service = context.require_service::<temps_error_tracking::DSNService>();
 
+            // Get encryption service for deployment token encryption
+            let encryption_service = context.require_service::<temps_core::EncryptionService>();
+
             // Create JobProcessor with workflow execution capability
             let job_receiver = queue_service.subscribe();
             let workflow_planner = Arc::new(WorkflowPlanner::new(
@@ -117,11 +145,13 @@ impl TempsPlugin for DeploymentsPlugin {
                 external_service_manager.clone(),
                 config_service.clone(),
                 dsn_service,
+                encryption_service,
             ));
 
             let mut job_processor = JobProcessorService::with_external_service_manager(
                 db,
                 job_receiver,
+                queue_service.clone(),
                 workflow_execution_service,
                 workflow_planner,
                 git_provider_manager,
@@ -152,16 +182,25 @@ impl TempsPlugin for DeploymentsPlugin {
             .get_service::<crate::services::DatabaseCronConfigService>()
             .expect("DatabaseCronConfigService must be registered before configuring routes");
 
+        // Create external deployment manager for handling external images and operations
+        let external_deployment_manager =
+            Arc::new(crate::services::ExternalDeploymentManager::new());
+
         let app_state = Arc::new(handlers::types::AppState {
             deployment_service,
             log_service,
             cron_service,
+            external_deployment_manager,
         });
 
         let deployments_routes = handlers::deployments::configure_routes();
         let cron_routes = handlers::crons::configure_routes();
+        let external_images_routes = handlers::external_images::configure_routes();
 
-        let routes = deployments_routes.merge(cron_routes).with_state(app_state);
+        let routes = deployments_routes
+            .merge(cron_routes)
+            .merge(external_images_routes)
+            .with_state(app_state);
 
         Some(PluginRoutes { router: routes })
     }
@@ -170,10 +209,12 @@ impl TempsPlugin for DeploymentsPlugin {
         let deployments_schema =
             <handlers::deployments::DeploymentsApiDoc as UtoimaOpenApi>::openapi();
         let cron_schema = <handlers::crons::CronApiDoc as UtoimaOpenApi>::openapi();
+        let external_images_schema =
+            <handlers::external_images::ExternalImagesApiDoc as UtoimaOpenApi>::openapi();
 
         Some(temps_core::openapi::merge_openapi_schemas(
             deployments_schema,
-            vec![cron_schema],
+            vec![cron_schema, external_images_schema],
         ))
     }
 }
@@ -190,7 +231,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_deployments_plugin_default() {
-        let deployments_plugin = DeploymentsPlugin::default();
+        let deployments_plugin = DeploymentsPlugin;
         assert_eq!(deployments_plugin.name(), "deployments");
     }
 

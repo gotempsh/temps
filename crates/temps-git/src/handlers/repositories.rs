@@ -101,7 +101,7 @@ pub async fn get_repository_branches(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get git provider connection")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build()
         })?;
 
@@ -116,11 +116,8 @@ pub async fn get_repository_branches(
         .await?;
 
     // Create cache key
-    let cache_key = crate::services::cache::BranchCacheKey::new(
-        connection_id,
-        owner.clone(),
-        repo.clone(),
-    );
+    let cache_key =
+        crate::services::cache::BranchCacheKey::new(connection_id, owner.clone(), repo.clone());
 
     // Try cache first (unless fresh=true)
     if !params.fresh {
@@ -200,13 +197,8 @@ pub async fn get_repository_tags(
         .get_repository_by_owner_and_name_in_connection(&owner, &repo, params.connection_id)
         .await?;
 
-    // We already filtered by connection_id, so we know it exists
-    let connection_id = repository.git_provider_connection_id.ok_or(
-        ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("No git provider connection configured")
-            .detail("This repository does not have a git provider connection configured")
-            .build(),
-    )?;
+    // Repository always has a connection_id (required field)
+    let connection_id = repository.git_provider_connection_id;
 
     // Get the connection and provider
     let connection = state
@@ -216,7 +208,7 @@ pub async fn get_repository_tags(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get git provider connection")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build()
         })?;
 
@@ -227,7 +219,7 @@ pub async fn get_repository_tags(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get git provider service")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build()
         })?;
 
@@ -238,16 +230,13 @@ pub async fn get_repository_tags(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get access token")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build()
         })?;
 
     // Create cache key
-    let cache_key = crate::services::cache::TagCacheKey::new(
-        connection_id,
-        owner.clone(),
-        repo.clone(),
-    );
+    let cache_key =
+        crate::services::cache::TagCacheKey::new(connection_id, owner.clone(), repo.clone());
 
     // Try cache first (unless fresh=true)
     if !params.fresh {
@@ -270,16 +259,12 @@ pub async fn get_repository_tags(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to fetch tags")
-                .detail(&format!("Error fetching tags from git provider: {}", e))
+                .detail(format!("Error fetching tags from git provider: {}", e))
                 .build()
         })?;
 
     // Cache the result
-    state
-        .cache_manager
-        .tags
-        .set(cache_key, tags.clone())
-        .await;
+    state.cache_manager.tags.set(cache_key, tags.clone()).await;
 
     let tag_infos: Vec<TagInfo> = tags
         .into_iter()
@@ -327,12 +312,7 @@ pub async fn get_branches_by_repository_id(
         .await?;
 
     // Check if repository has a git provider connection
-    let connection_id = repository.git_provider_connection_id.ok_or_else(|| {
-        ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("No git provider configured")
-            .detail("This repository does not have a git provider connection configured")
-            .build()
-    })?;
+    let connection_id = repository.git_provider_connection_id;
 
     // Get the connection and provider
     let connection = state
@@ -342,7 +322,7 @@ pub async fn get_branches_by_repository_id(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get git provider connection")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build()
         })?;
 
@@ -353,7 +333,7 @@ pub async fn get_branches_by_repository_id(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get git provider service")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build()
         })?;
 
@@ -364,7 +344,7 @@ pub async fn get_branches_by_repository_id(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get access token")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build()
         })?;
 
@@ -399,7 +379,7 @@ pub async fn get_branches_by_repository_id(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to fetch branches")
-                .detail(&format!("Error fetching branches from git provider: {}", e))
+                .detail(format!("Error fetching branches from git provider: {}", e))
                 .build()
         })?;
 
@@ -459,12 +439,7 @@ pub async fn get_tags_by_repository_id(
         .await?;
 
     // Check if repository has a git provider connection
-    let connection_id = repository.git_provider_connection_id.ok_or_else(|| {
-        ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("No git provider configured")
-            .detail("This repository does not have a git provider connection configured")
-            .build()
-    })?;
+    let connection_id = repository.git_provider_connection_id;
 
     // Get the connection and provider
     let connection = state
@@ -474,7 +449,7 @@ pub async fn get_tags_by_repository_id(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get git provider connection")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build()
         })?;
 
@@ -485,7 +460,7 @@ pub async fn get_tags_by_repository_id(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get git provider service")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build()
         })?;
 
@@ -496,7 +471,7 @@ pub async fn get_tags_by_repository_id(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get access token")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build()
         })?;
 
@@ -528,16 +503,12 @@ pub async fn get_tags_by_repository_id(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to fetch tags")
-                .detail(&format!("Error fetching tags from git provider: {}", e))
+                .detail(format!("Error fetching tags from git provider: {}", e))
                 .build()
         })?;
 
     // Cache the result
-    state
-        .cache_manager
-        .tags
-        .set(cache_key, tags.clone())
-        .await;
+    state.cache_manager.tags.set(cache_key, tags.clone()).await;
 
     let tag_infos: Vec<TagInfo> = tags
         .into_iter()
@@ -584,12 +555,7 @@ pub async fn check_commit_exists(
         .await?;
 
     // Check if repository has a git provider connection
-    let connection_id = repository.git_provider_connection_id.ok_or_else(|| {
-        ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("No git provider configured")
-            .detail("This repository does not have a git provider connection configured")
-            .build()
-    })?;
+    let connection_id = repository.git_provider_connection_id;
 
     // Get the connection and provider
     let connection = state
@@ -599,7 +565,7 @@ pub async fn check_commit_exists(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get git provider connection")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build()
         })?;
 
@@ -610,7 +576,7 @@ pub async fn check_commit_exists(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get git provider service")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build()
         })?;
 
@@ -621,7 +587,7 @@ pub async fn check_commit_exists(
         .map_err(|e| {
             ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Failed to get access token")
-                .detail(&format!("Error: {}", e))
+                .detail(format!("Error: {}", e))
                 .build()
         })?;
 

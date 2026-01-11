@@ -1,7 +1,7 @@
+use sea_orm::DbErr;
 use serde::Serialize;
 use std::collections::HashMap;
 use thiserror::Error;
-use sea_orm::DbErr;
 
 #[derive(Error, Debug)]
 pub enum AnalyticsError {

@@ -61,9 +61,7 @@ impl From<sea_orm::DbErr> for RepositoryError {
             sea_orm::DbErr::RecordNotInserted => {
                 RepositoryError::DuplicateEntry("Record not inserted".to_string())
             }
-            sea_orm::DbErr::ConnectionAcquire(err) => {
-                RepositoryError::Connection(err.to_string())
-            }
+            sea_orm::DbErr::ConnectionAcquire(err) => RepositoryError::Connection(err.to_string()),
             _ => RepositoryError::Database(err.to_string()),
         }
     }

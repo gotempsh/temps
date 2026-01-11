@@ -2,11 +2,11 @@
 //!
 //! Represents individual jobs within a deployment workflow (like GitHub Actions jobs)
 
-use sea_orm::entity::prelude::*;
+use super::types::JobStatus;
 use async_trait::async_trait;
+use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
-use super::types::JobStatus;
 use temps_core::DBDateTime;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
@@ -15,9 +15,9 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub deployment_id: i32, // The workflow run (deployment)
-    pub job_id: String, // User-defined job identifier (e.g., "download_repo", "build_image")
+    pub job_id: String,     // User-defined job identifier (e.g., "download_repo", "build_image")
     pub job_type: String, // Job type (e.g., "DownloadRepoJob", "BuildImageJob", "DeployContainerJob")
-    pub name: String, // Human-readable job name
+    pub name: String,     // Human-readable job name
     pub description: Option<String>,
     pub status: JobStatus,
     pub created_at: DBDateTime,
@@ -26,9 +26,9 @@ pub struct Model {
     pub finished_at: Option<DBDateTime>,
     pub log_id: String, // Log identifier for temps-logs service
     pub error_message: Option<String>,
-    pub job_config: Option<Json>, // Job-specific configuration
-    pub outputs: Option<Json>, // Job outputs as key-value pairs
-    pub dependencies: Option<Json>, // List of job IDs this job depends on
+    pub job_config: Option<Json>,     // Job-specific configuration
+    pub outputs: Option<Json>,        // Job outputs as key-value pairs
+    pub dependencies: Option<Json>,   // List of job IDs this job depends on
     pub execution_order: Option<i32>, // Calculated execution order
 }
 

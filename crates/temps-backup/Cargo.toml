@@ -38,6 +38,7 @@ axum = { workspace = true }
 bollard = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 sea-orm = { workspace = true, features = ["mock"] }

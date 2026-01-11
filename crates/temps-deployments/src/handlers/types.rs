@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
-use crate::DeploymentService;
 use crate::services::database_cron_service::DatabaseCronConfigService;
+use crate::services::ExternalDeploymentManager;
+use crate::DeploymentService;
 
 pub struct AppState {
     pub deployment_service: Arc<DeploymentService>,
     pub log_service: Arc<temps_logs::LogService>,
     pub cron_service: Arc<DatabaseCronConfigService>,
+    pub external_deployment_manager: Arc<ExternalDeploymentManager>,
 }
 
 use crate::services::types::Deployment;
@@ -98,7 +100,7 @@ pub struct DeploymentResponse {
     pub id: i32,
     pub project_id: i32,
     pub environment_id: i32,
-    pub environment: DeploymentEnvironmentResponse, // Add this field
+    pub environment: DeploymentEnvironmentResponse,
     pub status: String,
     pub url: String,
     pub commit_hash: Option<String>,
@@ -113,6 +115,10 @@ pub struct DeploymentResponse {
     pub commit_date: Option<i64>,
     pub is_current: bool,
     pub cancelled_reason: Option<String>,
+    /// Deployment configuration snapshot (CPU, memory, replicas, environment variables, etc.)
+    pub deployment_config: Option<temps_entities::deployment_config::DeploymentConfigSnapshot>,
+    /// Deployment metadata (build info, git event, etc.)
+    pub metadata: Option<temps_entities::prelude::DeploymentMetadata>,
 }
 
 // Add new struct for environment info in response
@@ -150,10 +156,11 @@ impl DeploymentResponse {
             commit_date: deployment.commit_date.map(|d| d.timestamp_millis()),
             is_current: deployment.is_current,
             cancelled_reason: deployment.cancelled_reason,
+            deployment_config: deployment.deployment_config,
+            metadata: deployment.metadata,
         }
     }
 }
-
 
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CustomDomainRequest {
@@ -258,11 +265,14 @@ impl From<temps_entities::environments::Model> for EnvironmentResponse {
             current_deployment_id: env.current_deployment_id,
             created_at: env.created_at.timestamp_millis(),
             updated_at: env.updated_at.timestamp_millis(),
-            cpu_request: env.cpu_request,
-            cpu_limit: env.cpu_limit,
-            memory_request: env.memory_request,
-            memory_limit: env.memory_limit,
-            replicas: env.replicas,
+            cpu_request: env.deployment_config.as_ref().and_then(|c| c.cpu_request),
+            cpu_limit: env.deployment_config.as_ref().and_then(|c| c.cpu_limit),
+            memory_request: env
+                .deployment_config
+                .as_ref()
+                .and_then(|c| c.memory_request),
+            memory_limit: env.deployment_config.as_ref().and_then(|c| c.memory_limit),
+            replicas: env.deployment_config.as_ref().map(|c| c.replicas),
             branch: env.branch,
         }
     }
@@ -347,6 +357,13 @@ pub struct ContainerLogsQuery {
     pub tail: Option<String>,
     /// Optional container name to get logs from (if deployment has multiple containers)
     pub container_name: Option<String>,
+    /// Include timestamps in log output (default: false)
+    #[serde(default = "default_timestamps")]
+    pub timestamps: bool,
+}
+
+fn default_timestamps() -> bool {
+    false
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -547,4 +564,132 @@ impl From<temps_deployer::ContainerInfo> for ContainerInfoResponse {
 pub struct ContainerListResponse {
     pub containers: Vec<ContainerInfoResponse>,
     pub total: usize,
+}
+
+/// Detailed container information with environment variables and metrics
+#[derive(Serialize, ToSchema)]
+pub struct ContainerDetailResponse {
+    pub id: i32,
+    pub container_id: String,
+    pub container_name: String,
+    pub image_name: String,
+    pub status: String,
+    pub deployment_id: i32,
+    #[schema(example = "2025-10-12T12:15:47.609192Z")]
+    pub created_at: String,
+    #[schema(example = "2025-10-12T12:15:47.609192Z")]
+    pub deployed_at: String,
+    #[schema(nullable = true, example = "2025-10-12T12:16:47.609192Z")]
+    pub ready_at: Option<String>,
+    /// Port inside the container
+    pub container_port: i32,
+    /// Port on the host machine
+    #[schema(nullable = true)]
+    pub host_port: Option<i32>,
+    /// Environment variables (sensitive values masked)
+    pub environment_variables: Vec<EnvVarResponse>,
+    /// Resource limits
+    #[schema(nullable = true)]
+    pub resource_limits: Option<ResourceLimitsResponse>,
+}
+
+/// Environment variable with masked sensitive values
+#[derive(Serialize, ToSchema)]
+pub struct EnvVarResponse {
+    pub key: String,
+    pub value: String,
+    /// Whether this is a sensitive/masked value
+    pub is_masked: bool,
+}
+
+/// Container resource limits
+#[derive(Serialize, ToSchema)]
+pub struct ResourceLimitsResponse {
+    #[schema(nullable = true)]
+    pub cpu_request: Option<i32>,
+    #[schema(nullable = true)]
+    pub cpu_limit: Option<i32>,
+    #[schema(nullable = true)]
+    pub memory_request: Option<i32>,
+    #[schema(nullable = true)]
+    pub memory_limit: Option<i32>,
+}
+
+/// Container resource metrics (CPU, memory usage)
+#[derive(Serialize, ToSchema)]
+pub struct ContainerMetricsResponse {
+    pub container_id: String,
+    pub container_name: String,
+    /// CPU usage percentage (0-100)
+    pub cpu_percent: f64,
+    /// Memory usage in bytes
+    pub memory_bytes: u64,
+    /// Memory limit in bytes (if set)
+    #[schema(nullable = true)]
+    pub memory_limit_bytes: Option<u64>,
+    /// Memory usage percentage (0-100) if limit is set
+    #[schema(nullable = true)]
+    pub memory_percent: Option<f64>,
+    /// Network bytes received
+    pub network_rx_bytes: u64,
+    /// Network bytes transmitted
+    pub network_tx_bytes: u64,
+    /// Timestamp of metrics collection
+    #[schema(example = "2025-10-12T12:15:47.609192Z")]
+    pub timestamp: String,
+}
+
+/// Response indicating success of container state change
+#[derive(Serialize, ToSchema)]
+pub struct ContainerActionResponse {
+    pub container_id: String,
+    pub container_name: String,
+    pub action: String,
+    pub status: String,
+    pub message: String,
+}
+
+/// Query parameters for activity graph endpoint
+#[derive(Deserialize, ToSchema)]
+pub struct ActivityGraphQuery {
+    /// Optional project ID to filter activity
+    pub project_id: Option<i32>,
+    /// Optional environment ID to filter activity
+    pub environment_id: Option<i32>,
+    /// Number of days to include (default: 365 for last year)
+    #[serde(default = "default_days")]
+    pub days: i32,
+}
+
+fn default_days() -> i32 {
+    365
+}
+
+/// Response for activity graph showing daily deployment activity
+#[derive(Serialize, ToSchema)]
+pub struct ActivityGraphResponse {
+    /// Array of daily activity counts
+    pub days: Vec<ActivityDay>,
+    /// Total count of activities across all days
+    pub total_count: i64,
+    /// Date range start (YYYY-MM-DD)
+    #[schema(example = "2024-01-01")]
+    pub start_date: String,
+    /// Date range end (YYYY-MM-DD)
+    #[schema(example = "2024-12-31")]
+    pub end_date: String,
+}
+
+/// Daily activity count for a single day
+#[derive(Serialize, ToSchema)]
+pub struct ActivityDay {
+    /// Date in YYYY-MM-DD format
+    #[schema(example = "2024-06-15")]
+    pub date: String,
+    /// Number of deployments on this day
+    pub count: i64,
+    /// Intensity level (0-4) for visualization
+    /// 0: No activity, 1: Low (1-2), 2: Medium (3-5), 3: High (6-10), 4: Very High (11+)
+    #[schema(example = 2)]
+    pub level: i32,
 }

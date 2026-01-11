@@ -140,4 +140,3 @@ impl StatusPageService {
         "operational".to_string()
     }
 }
-

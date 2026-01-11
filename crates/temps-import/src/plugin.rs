@@ -40,7 +40,8 @@ impl TempsPlugin for ImportPlugin {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
             let git_provider_manager = context.require_service::<temps_git::GitProviderManager>();
             let project_service = context.require_service::<temps_projects::ProjectService>();
-            let deployment_service = context.require_service::<temps_deployments::DeploymentService>();
+            let deployment_service =
+                context.require_service::<temps_deployments::DeploymentService>();
 
             // Create import orchestrator with all required services
             let mut orchestrator = ImportOrchestrator::new(

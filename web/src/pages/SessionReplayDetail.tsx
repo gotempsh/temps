@@ -8,6 +8,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ScrollArea } from '@/components/ui/scroll-area'
+import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery } from '@tanstack/react-query'
@@ -280,6 +281,75 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
     return `${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
   }
 
+  // Loading skeleton
+  if (isLoading) {
+    return (
+      <div className="container max-w-full py-6">
+        {/* Header skeleton */}
+        <div className="mb-4 flex items-center justify-between">
+          <Skeleton className="h-9 w-32" />
+          <div className="flex items-center gap-3">
+            <Skeleton className="h-12 w-28" />
+            <Skeleton className="h-12 w-24" />
+            <Skeleton className="h-12 w-32" />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          {/* Player skeleton */}
+          <div className="lg:col-span-2">
+            <Card>
+              <CardContent className="p-0">
+                <Skeleton className="h-[500px] w-full rounded-t-lg" />
+                <div className="p-4 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <Skeleton className="h-10 w-10 rounded-full" />
+                    <Skeleton className="h-10 flex-1" />
+                  </div>
+                  <Skeleton className="h-2 w-full" />
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* Events timeline skeleton */}
+          <div className="lg:col-span-1 h-[calc(100vh-200px)]">
+            <Card className="h-full">
+              <CardHeader className="pb-3">
+                <div className="flex items-center justify-between">
+                  <Skeleton className="h-5 w-16" />
+                  <Skeleton className="h-5 w-32" />
+                </div>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {/* User info skeleton */}
+                <div className="flex items-center gap-2 pb-3 border-b">
+                  <Skeleton className="h-8 w-8 rounded-full" />
+                  <div className="flex-1 space-y-1">
+                    <Skeleton className="h-4 w-24" />
+                    <Skeleton className="h-3 w-16" />
+                  </div>
+                  <Skeleton className="h-4 w-4" />
+                </div>
+                {/* Event items skeleton */}
+                {Array.from({ length: 8 }).map((_, i) => (
+                  <div key={i} className="flex items-start gap-3">
+                    <Skeleton className="h-4 w-12" />
+                    <Skeleton className="h-4 w-4" />
+                    <div className="flex-1 space-y-1">
+                      <Skeleton className="h-4 w-32" />
+                      <Skeleton className="h-3 w-full" />
+                    </div>
+                  </div>
+                ))}
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   // Calculate session stats
   const duration = sessionData?.session?.duration || 0
   const formatDuration = (ms: number) => {
@@ -294,6 +364,34 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
     } else {
       return `${seconds}s`
     }
+  }
+
+  // Helper function to format event data preview
+  const formatEventDataPreview = (eventData: any): string => {
+    // Check for meta event with href
+    if (isMetaEventData(eventData)) {
+      if (eventData.href) return eventData.href
+    }
+
+    // Check for incremental snapshot with source
+    if (isIncrementalSnapshotData(eventData)) {
+      if (eventData.source !== undefined) {
+        return INCREMENTAL_TYPES[
+          eventData.source as keyof typeof INCREMENTAL_TYPES
+        ]
+      }
+    }
+
+    // Fallback to JSON stringify
+    const str = JSON.stringify(eventData)
+    return str.length > 50 ? str.slice(0, 50) + '...' : str
+  }
+
+  // Helper function to format full event data
+  const formatEventData = (data: unknown): string => {
+    return typeof data === 'object' && data !== null
+      ? JSON.stringify(data, null, 2)
+      : String(data)
   }
 
   return (
@@ -430,30 +528,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
                               </div>
                               {firstEventData && (
                                 <div className="text-xs text-muted-foreground mt-1 font-mono truncate">
-                                  {(() => {
-                                    // Check for meta event with href
-                                    if (isMetaEventData(firstEventData)) {
-                                      if (firstEventData.href)
-                                        return firstEventData.href
-                                    }
-
-                                    // Check for incremental snapshot with source
-                                    if (
-                                      isIncrementalSnapshotData(firstEventData)
-                                    ) {
-                                      if (firstEventData.source !== undefined) {
-                                        return INCREMENTAL_TYPES[
-                                          firstEventData.source as keyof typeof INCREMENTAL_TYPES
-                                        ]
-                                      }
-                                    }
-
-                                    // Fallback to JSON stringify
-                                    const str = JSON.stringify(firstEventData)
-                                    return str.length > 50
-                                      ? str.slice(0, 50) + '...'
-                                      : str
-                                  })()}
+                                  {formatEventDataPreview(firstEventData)}
                                 </div>
                               )}
                             </div>
@@ -462,14 +537,7 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
                           {isSelected && firstEventData && (
                             <div className="mt-3 ml-[60px] p-2 bg-muted/30 rounded-md">
                               <pre className="text-xs overflow-x-auto">
-                                {(() => {
-                                  const data = firstEventData
-                                  const formattedData: string =
-                                    typeof data === 'object' && data !== null
-                                      ? JSON.stringify(data, null, 2)
-                                      : String(data)
-                                  return formattedData
-                                })()}
+                                {formatEventData(firstEventData)}
                               </pre>
                             </div>
                           )}

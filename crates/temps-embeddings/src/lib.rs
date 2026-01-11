@@ -21,4 +21,6 @@
 pub mod tokenizer;
 
 // Re-export main types
-pub use tokenizer::{Tokenizer, TokenizerError, TokenizerResult, HashTokenizer, SimpleTokenizer, CharTokenizer};
+pub use tokenizer::{
+    CharTokenizer, HashTokenizer, SimpleTokenizer, Tokenizer, TokenizerError, TokenizerResult,
+};

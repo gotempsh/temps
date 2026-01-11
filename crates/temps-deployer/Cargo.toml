@@ -28,11 +28,9 @@ thiserror = { workspace = true }
 sysinfo = { workspace = true }
 num_cpus = "1.16"
 temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
 utoipa = { workspace = true }
 flate2 = { workspace = true }
-
-# Nixpacks integration
-nixpacks = "1.40.0"
 
 [dev-dependencies]
 tempfile = { workspace = true }

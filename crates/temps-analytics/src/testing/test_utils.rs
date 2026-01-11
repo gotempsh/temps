@@ -1,9 +1,11 @@
 use sea_orm::{Database, DatabaseConnection};
 #[cfg(test)]
 use std::sync::Arc;
-use temps_core::EncryptionService;
+use temps_entities::upstream_config::UpstreamList;
 use temps_migrations::{Migrator, MigratorTrait};
-use testcontainers::{core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
+use testcontainers::{
+    core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
+};
 use uuid::Uuid;
 
 /// Test database setup with unique container per test
@@ -24,7 +26,7 @@ impl TestDatabase {
             Uuid::new_v4().to_string().replace('-', "")
         );
 
-        let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg17")
+        let postgres_container = GenericImage::new("timescale/timescaledb", "latest-pg17")
             .with_exposed_port(ContainerPort::Tcp(5432))
             .with_env_var("POSTGRES_DB", "test_db")
             .with_env_var("POSTGRES_USER", "test_user")
@@ -99,32 +101,15 @@ impl AnalyticsTestUtils {
             main_branch: Set("main".to_string()),
             slug: Set("test_project".to_string()),
             is_deleted: Set(false),
-            automatic_deploy: Set(false),
-            project_type: Set(temps_entities::types::ProjectType::Server), // or another valid variant
-            is_web_app: Set(true),
-            performance_metrics_enabled: Set(true),
-            use_default_wildcard: Set(false),
             is_public_repo: Set(false),
-            is_on_demand: Set(false),
             created_at: Set(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
             updated_at: Set(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
             // Fill Option fields with None or Some as appropriate
-            repo_name: Set(None),
-            repo_owner: Set(None),
-            preset: Set(None),
+            repo_name: Set("test_project".to_string()),
+            repo_owner: Set("test_project".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
             deleted_at: Set(None),
-            cpu_request: Set(None),
-            cpu_limit: Set(None),
-            memory_request: Set(None),
-            memory_limit: Set(None),
-            build_command: Set(None),
-            install_command: Set(None),
-            output_dir: Set(None),
             last_deployment: Set(None),
-            custom_domain: Set(None),
-            git_url: Set(None),
-            git_provider_connection_id: Set(None),
-            // Add any new fields here as needed
             ..Default::default()
         };
         let test_project = test_project.insert(db).await?; // Ignore if exists
@@ -136,25 +121,18 @@ impl AnalyticsTestUtils {
             subdomain: Set("https://test-environment.example.com".to_string()),
             last_deployment: Set(None),
             host: Set("test-environment.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])), // Assuming upstreams is a JSON array
+            upstreams: Set(UpstreamList::default()),
             created_at: Set(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
             updated_at: Set(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
             project_id: Set(test_project.id),
             current_deployment_id: Set(None),
-            cpu_request: Set(None),
-            cpu_limit: Set(None),
-            memory_request: Set(None),
-            memory_limit: Set(None),
             branch: Set(Some("main".to_string())),
-            replicas: Set(Some(1)),
-            deleted_at: Set(None),
-            use_default_wildcard: Set(false),
-            custom_domain: Set(None),
             ..Default::default()
         };
         let test_environment = test_environment.insert(db).await?; // Ignore if exists
 
         // Insert test deployment
+        use temps_entities::deployments::DeploymentMetadata;
         let test_deployment = deployments::ActiveModel {
             environment_id: Set(test_environment.id),
             project_id: Set(test_project.id),
@@ -162,7 +140,10 @@ impl AnalyticsTestUtils {
             slug: Set("https://deployment.example.com".to_string()),
             created_at: Set(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
             updated_at: Set(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(Some(DeploymentMetadata {
+                builder: Some("test".to_string()),
+                ..Default::default()
+            })),
             deploying_at: Set(None),
             ready_at: Set(None),
             static_dir_location: Set(None),
@@ -279,14 +260,15 @@ impl AnalyticsTestUtils {
 #[macro_export]
 macro_rules! create_test_analytics_service {
     ($test_name:expr) => {{
-        let test_db = crate::testing::test_utils::TestDatabase::new($test_name)
+        let test_db = $crate::testing::test_utils::TestDatabase::new($test_name)
             .await
             .unwrap();
-        crate::testing::test_utils::AnalyticsTestUtils::insert_test_data(&test_db.db)
+        $crate::testing::test_utils::AnalyticsTestUtils::insert_test_data(&test_db.db)
             .await
             .unwrap();
-        let encryption_service = Arc::new(EncryptionService::new_from_password("test_password"));
-        let service = crate::AnalyticsService::new(test_db.db.clone(), encryption_service);
+        let cookie_crypto =
+            Arc::new(temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap());
+        let service = $crate::AnalyticsService::new(test_db.db.clone(), cookie_crypto);
         (service, test_db.db.clone(), test_db) // Return the TestDatabase to keep container alive
     }};
 }
@@ -295,7 +277,7 @@ macro_rules! create_test_analytics_service {
 #[macro_export]
 macro_rules! cleanup_test_analytics {
     ($db:expr) => {{
-        crate::testing::test_utils::AnalyticsTestUtils::cleanup_test_data(&$db)
+        $crate::testing::test_utils::AnalyticsTestUtils::cleanup_test_data(&$db)
             .await
             .unwrap();
     }};

@@ -3,15 +3,20 @@ import {
   getErrorDashboardStatsOptions,
   getLastDeploymentOptions,
   getUniqueCountsOptions,
+  hasAnalyticsEventsOptions,
+  hasErrorGroupsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 // getProjectVisitorStatsOptions, getTodayErrorsCountOptions
 import { LastDeployment } from '@/components/deployments/LastDeployment'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
 import {
+  AlertCircle,
   Bug,
   DollarSign,
   Minus,
@@ -22,6 +27,7 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { MetricCard } from '../dashboard/MetricCard'
+import { DeploymentActivityGraph } from './DeploymentActivityGraph'
 
 interface ProjectOverviewProps {
   project: ProjectResponse
@@ -99,6 +105,21 @@ export function ProjectOverview({
   const isLoadingErrors = false
   const errorError = false
 
+  // Check if analytics and error tracking are configured
+  const { data: hasAnalyticsData, isLoading: isCheckingAnalytics } = useQuery({
+    ...hasAnalyticsEventsOptions({
+      path: { project_id: project.id },
+    }),
+    enabled: !!project.id,
+  })
+
+  const { data: hasErrorsData, isLoading: isCheckingErrors } = useQuery({
+    ...hasErrorGroupsOptions({
+      path: { project_id: project.id },
+    }),
+    enabled: !!project.id,
+  })
+
   // Query for fresh deployment data with polling when needed
   const { data: freshLastDeployment, refetch: refetchDeployment } = useQuery({
     ...getLastDeploymentOptions({
@@ -109,15 +130,20 @@ export function ProjectOverview({
     enabled: !!project.id,
     refetchInterval: (query) => {
       const data = query.state.data
+      // Keep polling while deployment is in progress
       if (
         !data ||
-        data.status === 'failed' ||
         data.status === 'pending' ||
+        data.status === 'running' ||
         data.status === 'building'
       ) {
         return 2500 // 2.5 seconds
       }
-      return false // Stop polling when deployment is successful
+      // Also poll if deployment is completed but screenshot is not yet available
+      if (data.status === 'completed' && !data.screenshot_location) {
+        return 3000 // 3 seconds while waiting for screenshot
+      }
+      return false // Stop polling when deployment has screenshot or failed
     },
   })
 
@@ -135,14 +161,60 @@ export function ProjectOverview({
   const [now] = useState(() => Date.now())
   const [oneDayAgo] = useState(() => now - 24 * 60 * 60 * 1000)
 
+  // Determine what's not configured
+  const missingAnalytics = !isCheckingAnalytics && !hasAnalyticsData?.has_events
+  const missingErrorTracking =
+    !isCheckingErrors && !hasErrorsData?.has_error_groups
+
   return (
     <>
+      {/* Configuration Alert */}
+      {(missingAnalytics || missingErrorTracking) && (
+        <Alert variant="default" className="mb-6 border-amber-500/50 bg-amber-50/50 dark:bg-amber-950/20">
+          <AlertCircle className="h-4 w-4 text-amber-600 dark:text-amber-500" />
+          <AlertTitle className="text-amber-900 dark:text-amber-100">
+            Complete Your Setup
+          </AlertTitle>
+          <AlertDescription className="text-amber-800 dark:text-amber-200">
+            <p className="mb-3">
+              To get the most out of your project, please complete the following:
+            </p>
+            <div className="flex flex-col sm:flex-row gap-2">
+              {missingAnalytics && (
+                <Button
+                  asChild
+                  variant="outline"
+                  size="sm"
+                  className="border-amber-600 hover:bg-amber-100 dark:hover:bg-amber-900/30"
+                >
+                  <Link to={`/projects/${project.slug}/analytics/setup`}>
+                    Set up Analytics
+                  </Link>
+                </Button>
+              )}
+              {missingErrorTracking && (
+                <Button
+                  asChild
+                  variant="outline"
+                  size="sm"
+                  className="border-amber-600 hover:bg-amber-100 dark:hover:bg-amber-900/30"
+                >
+                  <Link to={`/projects/${project.slug}/errors`}>
+                    Set up Error Tracking
+                  </Link>
+                </Button>
+              )}
+            </div>
+          </AlertDescription>
+        </Alert>
+      )}
+
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
         {isLoadingVisitors ? (
           <Skeleton className="h-24" />
         ) : visitorError ? (
           <MetricCard
-            title="Visitors last 24 hours"
+            title="Visitors last 24 hours (Unique)"
             icon={<Users />}
             value="Error"
             change=""
@@ -203,9 +275,12 @@ export function ProjectOverview({
         {currentDeployment && (
           <LastDeployment
             deployment={currentDeployment}
-            projectName={project.name}
+            projectName={project.slug}
           />
         )}
+      </div>
+      <div className="mt-6">
+        <DeploymentActivityGraph projectId={project.id} />
       </div>
     </>
   )

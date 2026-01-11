@@ -122,7 +122,7 @@ impl TempsConfig {
 
     /// Check if configuration has any cron jobs defined
     pub fn has_crons(&self) -> bool {
-        self.cron.as_ref().map_or(false, |c| !c.is_empty())
+        self.cron.as_ref().is_some_and(|c| !c.is_empty())
     }
 
     /// Get cron jobs, or empty vec if none defined
@@ -187,11 +187,17 @@ health:
         let build = config.build.as_ref().unwrap();
         assert_eq!(build.dockerfile.as_deref(), Some("docker/Dockerfile"));
         assert_eq!(build.context.as_deref(), Some("."));
-        assert_eq!(build.args.as_ref().unwrap().get("NODE_ENV"), Some(&"production".to_string()));
+        assert_eq!(
+            build.args.as_ref().unwrap().get("NODE_ENV"),
+            Some(&"production".to_string())
+        );
 
         // Verify env vars
         let env = config.env.as_ref().unwrap();
-        assert_eq!(env.get("DATABASE_URL"), Some(&"postgres://localhost/db".to_string()));
+        assert_eq!(
+            env.get("DATABASE_URL"),
+            Some(&"postgres://localhost/db".to_string())
+        );
 
         // Verify health check
         let health = config.health.as_ref().unwrap();

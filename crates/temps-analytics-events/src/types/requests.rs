@@ -4,19 +4,15 @@ use utoipa::ToSchema;
 
 #[derive(Debug, Deserialize, ToSchema, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AggregationLevel {
     /// Raw event counts - total number of events fired
+    #[default]
     Events,
     /// Unique sessions - count distinct sessions that fired the event
     Sessions,
     /// Unique visitors - count distinct visitors who fired the event
     Visitors,
-}
-
-impl Default for AggregationLevel {
-    fn default() -> Self {
-        AggregationLevel::Events
-    }
 }
 
 impl AggregationLevel {

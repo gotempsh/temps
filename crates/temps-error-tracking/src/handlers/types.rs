@@ -1,6 +1,5 @@
-use std::sync::Arc;
 use crate::services::ErrorTrackingService;
-
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AppState {

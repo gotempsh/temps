@@ -8,11 +8,7 @@
 
 use std::sync::Arc;
 
-use bollard::{
-    container::LogOutput,
-    query_parameters::LogsOptions,
-    Docker,
-};
+use bollard::{query_parameters::LogsOptions, Docker};
 use futures::{StreamExt, TryStreamExt};
 use temps_core::UtcDateTime;
 
@@ -36,6 +32,7 @@ pub struct ContainerLogOptions {
     pub start_date: Option<UtcDateTime>,
     pub end_date: Option<UtcDateTime>,
     pub tail: Option<String>, // "all" or number of lines
+    pub timestamps: bool,     // Include timestamps in log output
 }
 impl DockerLogService {
     pub fn new(docker: Arc<Docker>) -> Self {
@@ -48,28 +45,34 @@ impl DockerLogService {
         options: ContainerLogOptions,
     ) -> Result<impl futures::Stream<Item = Result<String, DockerLogError>>, DockerLogError> {
         // Validate container exists first by attempting to inspect it
-        self.docker.inspect_container(container_id, None::<bollard::query_parameters::InspectContainerOptions>).await?;
+        self.docker
+            .inspect_container(
+                container_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await?;
 
         let tail = options.tail.unwrap_or_else(|| "all".to_string());
         let log_options = Some(LogsOptions {
             follow: true,
             stdout: true,
             stderr: true,
-            timestamps: true,
+            timestamps: options.timestamps,
             tail,
-            since: options.start_date.map(|dt| dt.timestamp() as i32).unwrap_or(0),
-            until: options.end_date.map(|dt| dt.timestamp() as i32).unwrap_or(0),
-            ..Default::default()
+            since: options
+                .start_date
+                .map(|dt| dt.timestamp() as i32)
+                .unwrap_or(0),
+            until: options
+                .end_date
+                .map(|dt| dt.timestamp() as i32)
+                .unwrap_or(0),
         });
 
-        let logs = self.docker.logs(&container_id, log_options);
+        let logs = self.docker.logs(container_id, log_options);
 
         let stream = logs.map(|result| match result {
-            Ok(log_output) => match log_output {
-                LogOutput::StdOut { message } => Ok(String::from_utf8_lossy(&message).to_string()),
-                LogOutput::StdErr { message } => Ok(String::from_utf8_lossy(&message).to_string()),
-                _ => Ok("".to_string()),
-            },
+            Ok(log_output) => Ok(String::from_utf8_lossy(&log_output.into_bytes()).to_string()),
             Err(e) => Err(DockerLogError::DockerError(e)),
         });
 
@@ -136,6 +139,7 @@ impl DockerLogService {
             start_date: None,
             end_date: None,
             tail: lines.map(|l| l.to_string()),
+            timestamps: true,
         };
         let logs = self.get_logs_with_timestamps(container_id, lines).await?;
         tokio::fs::write(file_path, logs).await?;
@@ -251,6 +255,7 @@ mod tests {
                 start_date: None,
                 end_date: None,
                 tail: Some("10".to_string()),
+                timestamps: true,
             };
             let result = docker_service
                 .get_container_logs("non-existent-container-12345", options)

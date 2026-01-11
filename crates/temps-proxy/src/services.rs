@@ -14,8 +14,18 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 const ROUTE_PREFIX_TEMPS: &str = "/api/_temps";
-const VISITOR_ID_COOKIE_NAME: &str = "_temps_visitor_id";
-const SESSION_ID_COOKIE_NAME: &str = "_temps_sid";
+const VISITOR_ID_COOKIE: &str = "_temps_visitor_id";
+const SESSION_ID_COOKIE: &str = "_temps_sid";
+
+/// Generate project-scoped cookie name for visitor
+fn get_visitor_cookie_name(_project_id: Option<i32>) -> String {
+    VISITOR_ID_COOKIE.to_string()
+}
+
+/// Generate project-scoped cookie name for session
+fn get_session_cookie_name(_project_id: Option<i32>) -> String {
+    SESSION_ID_COOKIE.to_string()
+}
 
 /// Implementation of UpstreamResolver trait
 pub struct UpstreamResolverImpl {
@@ -40,8 +50,16 @@ impl UpstreamResolverImpl {
 
 #[async_trait]
 impl UpstreamResolver for UpstreamResolverImpl {
-    async fn resolve_peer(&self, host: &str, path: &str) -> PingoraResult<Box<HttpPeer>> {
-        debug!("Resolving peer for host: {}, path: {}", host, path);
+    async fn resolve_peer(
+        &self,
+        host: &str,
+        path: &str,
+        sni_hostname: Option<&str>,
+    ) -> PingoraResult<Box<HttpPeer>> {
+        debug!(
+            "Resolving peer for host: {}, path: {}, sni: {:?}",
+            host, path, sni_hostname
+        );
 
         // Check if it's a temps API route first
         if path.starts_with(ROUTE_PREFIX_TEMPS) {
@@ -57,18 +75,47 @@ impl UpstreamResolver for UpstreamResolverImpl {
             return Ok(peer);
         }
 
-        // Use O(1) route table lookup
-        if let Some(route_info) = self.route_table.get_route(host) {
+        // 1. First try TLS/SNI-based routing
+        // Note: In pingora-core 0.6.0, SNI is not available in SslDigest
+        // We use the Host header which typically matches the SNI for TLS connections
+        // If SNI was provided (from future pingora versions), use it; otherwise use host
+        let sni_or_host = sni_hostname.unwrap_or(host);
+        if let Some(route_info) = self.route_table.get_route_by_sni(sni_or_host) {
+            let backend_addr = route_info.get_backend_addr();
+            debug!(
+                "Found TLS route via SNI/Host {} -> {}",
+                sni_or_host, backend_addr
+            );
+            let peer = Box::new(HttpPeer::new(backend_addr, false, "".to_string()));
+            return Ok(peer);
+        }
+
+        // 2. Try HTTP Host-based routing (HTTP routes)
+        if let Some(route_info) = self.route_table.get_route_by_host(host) {
             let project_id = route_info.project.as_ref().map(|p| p.id);
             let env_id = route_info.environment.as_ref().map(|e| e.id);
             let backend_addr = route_info.get_backend_addr(); // Get next backend using round-robin
             debug!(
-                "Found route in table for {} -> {} (project_id: {:?}, env_id: {:?})",
+                "Found HTTP route for {} -> {} (project_id: {:?}, env_id: {:?})",
                 host, backend_addr, project_id, env_id
             );
 
             // Note: Redirects are now handled in proxy.rs request_filter before peer resolution
             // If we reach here, no redirect is configured and we route to backend normally
+
+            let peer = Box::new(HttpPeer::new(backend_addr, false, "".to_string()));
+            return Ok(peer);
+        }
+
+        // 3. Legacy: Check the old get_route method for backwards compatibility
+        if let Some(route_info) = self.route_table.get_route(host) {
+            let project_id = route_info.project.as_ref().map(|p| p.id);
+            let env_id = route_info.environment.as_ref().map(|e| e.id);
+            let backend_addr = route_info.get_backend_addr();
+            debug!(
+                "Found legacy route for {} -> {} (project_id: {:?}, env_id: {:?})",
+                host, backend_addr, project_id, env_id
+            );
 
             let peer = Box::new(HttpPeer::new(backend_addr, false, "".to_string()));
             return Ok(peer);
@@ -124,7 +171,7 @@ impl RequestLogger for RequestLoggerImpl {
         data: RequestLogData,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use sea_orm::{ActiveModelTrait, Set};
-        use temps_entities::request_logs;
+        use temps_entities::proxy_logs;
 
         // Skip logging if no project context
         let Some(ref context) = data.project_context else {
@@ -134,26 +181,8 @@ impl RequestLogger for RequestLoggerImpl {
 
         let elapsed_time = (data.finished_at - data.started_at).num_milliseconds() as i32;
 
-        // Determine if it's a static file based on path extension
-        let is_static_file = data.path.contains(".")
-            && (data.path.ends_with(".js")
-                || data.path.ends_with(".css")
-                || data.path.ends_with(".png")
-                || data.path.ends_with(".jpg")
-                || data.path.ends_with(".svg")
-                || data.path.ends_with(".ico")
-                || data.path.ends_with(".woff")
-                || data.path.ends_with(".woff2")
-                || data.path.ends_with(".ttf")
-                || data.path.ends_with(".eot"));
-
-        // Determine if it's an entry page (new session or no referrer)
-        let is_entry_page = data
-            .session
-            .as_ref()
-            .map(|s| s.is_new_session)
-            .unwrap_or(false)
-            || data.referrer.is_none();
+        // Note: is_static_file and is_entry_page are not used in proxy_logs
+        // These were part of request_logs but proxy_logs doesn't track these fields
 
         // Parse user agent with woothee
         let parser = woothee::parser::Parser::new();
@@ -205,45 +234,63 @@ impl RequestLogger for RequestLoggerImpl {
         let visitor_id = data.visitor.as_ref().map(|v| v.visitor_id_i32);
         let session_id = data.session.as_ref().map(|s| s.session_id_i32);
 
-        let log_entry = request_logs::ActiveModel {
-            project_id: Set(context.project.id),
-            environment_id: Set(context.environment.id),
-            deployment_id: Set(context.deployment.id),
-            date: Set(data.started_at.format("%Y-%m-%d").to_string()),
-            host: Set(data.host),
+        // Determine routing status
+        let routing_status = if context.deployment.id > 0 {
+            "routed"
+        } else {
+            "no_deployment"
+        }
+        .to_string();
+
+        // Convert status_code to i16
+        let status_code_i16 = data.status_code as i16;
+
+        // Headers are already JSON values
+        let response_headers_json = data.response_headers;
+        let request_headers_json = data.request_headers;
+
+        // Determine device type from is_mobile
+        let device_type = if is_mobile {
+            Some("mobile".to_string())
+        } else {
+            Some("desktop".to_string())
+        };
+
+        let log_entry = proxy_logs::ActiveModel {
+            timestamp: Set(data.started_at),
             method: Set(data.method),
-            request_path: Set(data.path),
-            message: Set(format!("{} request", data.status_code)),
-            status_code: Set(data.status_code),
-            branch: Set(None), // Branch info is in pipelines, not deployments
-            commit: Set(None), // Commit info is in pipelines, not deployments
-            request_id: Set(data.request_id),
-            level: Set(if data.status_code >= 500 {
-                "ERROR"
-            } else if data.status_code >= 400 {
-                "WARN"
-            } else {
-                "INFO"
-            }
-            .to_string()),
-            user_agent: Set(data.user_agent),
-            started_at: Set(data.started_at.to_rfc3339()),
-            finished_at: Set(data.finished_at.to_rfc3339()),
-            elapsed_time: Set(Some(elapsed_time)),
-            is_static_file: Set(Some(is_static_file)),
+            path: Set(data.path),
+            query_string: Set(None), // TODO: Extract query string from path if needed
+            host: Set(data.host),
+            status_code: Set(status_code_i16),
+            response_time_ms: Set(Some(elapsed_time)),
+            request_source: Set("proxy".to_string()),
+            is_system_request: Set(false),
+            routing_status: Set(routing_status),
+            project_id: Set(Some(context.project.id)),
+            environment_id: Set(Some(context.environment.id)),
+            deployment_id: Set(Some(context.deployment.id)),
+            container_id: Set(None),  // TODO: Add container info if available
+            upstream_host: Set(None), // TODO: Add upstream host if available
+            error_message: Set(None),
+            client_ip: Set(data.ip_address),
+            user_agent: Set(Some(data.user_agent)),
             referrer: Set(data.referrer),
-            ip_address: Set(data.ip_address),
-            session_id: Set(data.session.as_ref().map(|s| s.session_id_i32)),
-            headers: Set(Some(data.response_headers.to_string())),
-            request_headers: Set(Some(data.request_headers.to_string())),
-            ip_address_id: Set(ip_address_id),
+            request_id: Set(data.request_id),
+            ip_geolocation_id: Set(ip_address_id),
             browser: Set(browser),
             browser_version: Set(browser_version),
             operating_system: Set(operating_system),
-            is_mobile: Set(is_mobile),
-            is_entry_page: Set(is_entry_page),
-            is_crawler: Set(is_crawler),
-            crawler_name: Set(crawler_name),
+            device_type: Set(device_type),
+            is_bot: Set(Some(is_crawler)),
+            bot_name: Set(crawler_name),
+            request_size_bytes: Set(None),  // TODO: Add if available
+            response_size_bytes: Set(None), // TODO: Add if available
+            cache_status: Set(None),
+            request_headers: Set(Some(request_headers_json)),
+            response_headers: Set(Some(response_headers_json)),
+            created_date: Set(data.started_at.date_naive()),
+            session_id: Set(data.session.as_ref().map(|s| s.session_id_i32)),
             visitor_id: Set(data.visitor.as_ref().map(|v| v.visitor_id_i32)),
             ..Default::default()
         };
@@ -340,11 +387,9 @@ impl ProjectContextResolver for ProjectContextResolverImpl {
     }
 
     async fn is_static_deployment(&self, host: &str) -> bool {
-        // Use cached project model from route table for O(1) lookup
+        // Use route_info.is_static() to check if backend is static directory
         if let Some(route_info) = self.route_table.get_route(host) {
-            if let Some(project) = route_info.project {
-                return project.project_type == temps_entities::types::ProjectType::Static;
-            }
+            return route_info.is_static();
         }
         false
     }
@@ -357,9 +402,10 @@ impl ProjectContextResolver for ProjectContextResolverImpl {
         Some((redirect_to, status_code))
     }
 
-    async fn get_static_path(&self, _host: &str) -> Option<String> {
-        // Implementation would return static file path
-        None
+    async fn get_static_path(&self, host: &str) -> Option<String> {
+        // Use route_info.static_dir() to get static directory path
+        let route_info = self.route_table.get_route(host)?;
+        route_info.static_dir().map(|s| s.to_string())
     }
 }
 
@@ -473,16 +519,31 @@ impl VisitorManager for VisitorManagerImpl {
         &self,
         visitor: &Visitor,
         is_https: bool,
+        context: Option<&ProjectContext>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let encrypted_visitor_id = self.crypto.encrypt(&visitor.visitor_id)?;
-        let cookie = Cookie::build((VISITOR_ID_COOKIE_NAME, encrypted_visitor_id))
+        let project_id = context.map(|c| c.project.id);
+        let cookie_name = get_visitor_cookie_name(project_id);
+        let mut cookie_builder = Cookie::build((cookie_name, encrypted_visitor_id))
             .path("/")
             .max_age(cookie::time::Duration::days(
                 self.config.visitor_max_age_days,
             ))
             .http_only(self.config.http_only)
-            .secure(is_https && self.config.secure)
-            .build();
+            .secure(is_https && self.config.secure);
+
+        // Add SameSite attribute if configured
+        if let Some(ref same_site_value) = self.config.same_site {
+            let same_site = match same_site_value.to_lowercase().as_str() {
+                "strict" => cookie::SameSite::Strict,
+                "lax" => cookie::SameSite::Lax,
+                "none" => cookie::SameSite::None,
+                _ => cookie::SameSite::Lax, // Default to Lax
+            };
+            cookie_builder = cookie_builder.same_site(same_site);
+        }
+
+        let cookie = cookie_builder.build();
         Ok(cookie.to_string())
     }
 
@@ -548,6 +609,8 @@ impl SessionManager for SessionManagerImpl {
         visitor: &Visitor,
         _context: Option<&ProjectContext>,
         referrer: Option<&str>,
+        query_string: Option<&str>,
+        current_hostname: Option<&str>,
     ) -> Result<Session, Box<dyn std::error::Error + Send + Sync>> {
         let now = chrono::Utc::now();
 
@@ -611,6 +674,23 @@ impl SessionManager for SessionManagerImpl {
             debug!("No session cookie provided in request");
         }
 
+        // Parse UTM parameters from query string
+        let utm = query_string
+            .map(temps_analytics::parse_utm_params)
+            .unwrap_or_default();
+
+        // Extract referrer hostname
+        let referrer_hostname = referrer.and_then(temps_analytics::extract_referrer_hostname);
+
+        // Compute marketing channel
+        let channel =
+            temps_analytics::get_channel(&utm, referrer_hostname.as_deref(), current_hostname);
+
+        debug!(
+            "UTM params: source={:?}, medium={:?}, campaign={:?}, channel={}",
+            utm.utm_source, utm.utm_medium, utm.utm_campaign, channel
+        );
+
         // Create new session
         let new_session_id = Uuid::new_v4().to_string();
 
@@ -623,14 +703,23 @@ impl SessionManager for SessionManagerImpl {
             referrer: Set(referrer.map(|r| r.to_string())),
             data: Set("{}".to_string()), // Empty JSON object
             visitor_id: Set(Some(visitor.visitor_id_i32)),
+            // UTM tracking fields
+            utm_source: Set(utm.utm_source),
+            utm_medium: Set(utm.utm_medium),
+            utm_campaign: Set(utm.utm_campaign),
+            utm_content: Set(utm.utm_content),
+            utm_term: Set(utm.utm_term),
+            // Channel attribution
+            channel: Set(Some(channel.to_string())),
+            referrer_hostname: Set(referrer_hostname),
             ..Default::default()
         };
 
         let session = session.insert(self.db.as_ref()).await?;
 
         debug!(
-            "Created new session {} for visitor {}",
-            session.session_id, visitor.visitor_id
+            "Created new session {} for visitor {} (channel: {})",
+            session.session_id, visitor.visitor_id, channel
         );
 
         Ok(Session {
@@ -645,16 +734,31 @@ impl SessionManager for SessionManagerImpl {
         &self,
         session: &Session,
         is_https: bool,
+        context: Option<&ProjectContext>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let encrypted_session_id = self.crypto.encrypt(&session.session_id)?;
-        let cookie = Cookie::build((SESSION_ID_COOKIE_NAME, encrypted_session_id))
+        let project_id = context.map(|c| c.project.id);
+        let cookie_name = get_session_cookie_name(project_id);
+        let mut cookie_builder = Cookie::build((cookie_name, encrypted_session_id))
             .path("/")
             .max_age(cookie::time::Duration::minutes(
                 self.config.session_max_age_minutes,
             ))
             .http_only(self.config.http_only)
-            .secure(is_https && self.config.secure)
-            .build();
+            .secure(is_https && self.config.secure);
+
+        // Add SameSite attribute if configured
+        if let Some(ref same_site_value) = self.config.same_site {
+            let same_site = match same_site_value.to_lowercase().as_str() {
+                "strict" => cookie::SameSite::Strict,
+                "lax" => cookie::SameSite::Lax,
+                "none" => cookie::SameSite::None,
+                _ => cookie::SameSite::Lax, // Default to Lax
+            };
+            cookie_builder = cookie_builder.same_site(same_site);
+        }
+
+        let cookie = cookie_builder.build();
         Ok(cookie.to_string())
     }
 
@@ -683,13 +787,17 @@ impl SessionManager for SessionManagerImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CrawlerDetector;
+
     use temps_database::test_utils::TestDatabase;
-    use temps_entities::{deployments, environments, projects, request_logs, visitor};
+    use temps_entities::{
+        deployments, environments, preset::Preset, projects, proxy_logs,
+        upstream_config::UpstreamList, visitor,
+    };
 
     fn create_mock_ip_service(db: Arc<DatabaseConnection>) -> Arc<temps_geo::IpAddressService> {
-        let geoip_service =
-            Arc::new(temps_geo::GeoIpService::Mock(temps_geo::MockGeoIpService::new()));
+        let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
+            temps_geo::MockGeoIpService::new(),
+        ));
         Arc::new(temps_geo::IpAddressService::new(db, geoip_service))
     }
 
@@ -739,15 +847,15 @@ mod tests {
     }
 
     async fn create_test_project_context(db: &Arc<DatabaseConnection>) -> ProjectContext {
-        use temps_entities::types::ProjectType;
-
         // Create test project
         let project = projects::ActiveModel {
             name: Set("Test Project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
             slug: Set("test-project".to_string()),
             directory: Set("/".to_string()),
             main_branch: Set("main".to_string()),
-            project_type: Set(ProjectType::Static),
+            preset: Set(Preset::Nixpacks),
             ..Default::default()
         };
         let project = project.insert(db.as_ref()).await.unwrap();
@@ -758,7 +866,7 @@ mod tests {
             slug: Set("prod".to_string()),
             subdomain: Set("test".to_string()),
             host: Set("test.example.com".to_string()),
-            upstreams: Set(serde_json::json!([])),
+            upstreams: Set(UpstreamList::default()),
             project_id: Set(project.id),
             ..Default::default()
         };
@@ -769,7 +877,9 @@ mod tests {
             project_id: Set(project.id),
             environment_id: Set(environment.id),
             slug: Set("test-deployment".to_string()),
-            metadata: Set(serde_json::json!({})),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             state: Set("completed".to_string()),
             ..Default::default()
         };
@@ -786,8 +896,11 @@ mod tests {
     async fn test_request_logger_user_agent_parsing() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let ip_service = create_mock_ip_service(test_db.connection_arc().clone());
-        let logger =
-            RequestLoggerImpl::new(LoggingConfig::default(), test_db.connection_arc().clone(), ip_service);
+        let logger = RequestLoggerImpl::new(
+            LoggingConfig::default(),
+            test_db.connection_arc().clone(),
+            ip_service,
+        );
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -814,8 +927,8 @@ mod tests {
         logger.log_request(log_data).await.unwrap();
 
         // Verify log was created with parsed user agent data
-        let logs = request_logs::Entity::find()
-            .filter(request_logs::Column::RequestId.eq("test-req-1"))
+        let logs = proxy_logs::Entity::find()
+            .filter(proxy_logs::Column::RequestId.eq("test-req-1"))
             .one(test_db.connection_arc().as_ref())
             .await
             .unwrap()
@@ -824,15 +937,18 @@ mod tests {
         assert_eq!(logs.browser, Some("Chrome".to_string()));
         assert!(logs.browser_version.is_some());
         assert_eq!(logs.operating_system, Some("Windows 10".to_string()));
-        assert_eq!(logs.is_mobile, false);
+        assert_ne!(logs.device_type, Some("mobile".to_string()));
     }
 
     #[tokio::test]
     async fn test_request_logger_mobile_detection() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let ip_service = create_mock_ip_service(test_db.connection_arc().clone());
-        let logger =
-            RequestLoggerImpl::new(LoggingConfig::default(), test_db.connection_arc().clone(), ip_service);
+        let logger = RequestLoggerImpl::new(
+            LoggingConfig::default(),
+            test_db.connection_arc().clone(),
+            ip_service,
+        );
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -859,14 +975,14 @@ mod tests {
         logger.log_request(log_data).await.unwrap();
 
         // Verify mobile detection
-        let logs = request_logs::Entity::find()
-            .filter(request_logs::Column::RequestId.eq("test-req-mobile"))
+        let logs = proxy_logs::Entity::find()
+            .filter(proxy_logs::Column::RequestId.eq("test-req-mobile"))
             .one(test_db.connection_arc().as_ref())
             .await
             .unwrap()
             .expect("Log should be created");
 
-        assert_eq!(logs.is_mobile, true);
+        assert_eq!(logs.device_type, Some("mobile".to_string()));
         assert_eq!(logs.operating_system, Some("iPhone".to_string()));
     }
 
@@ -874,8 +990,11 @@ mod tests {
     async fn test_request_logger_crawler_detection() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let ip_service = create_mock_ip_service(test_db.connection_arc().clone());
-        let logger =
-            RequestLoggerImpl::new(LoggingConfig::default(), test_db.connection_arc().clone(), ip_service);
+        let logger = RequestLoggerImpl::new(
+            LoggingConfig::default(),
+            test_db.connection_arc().clone(),
+            ip_service,
+        );
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -902,16 +1021,16 @@ mod tests {
         logger.log_request(log_data).await.unwrap();
 
         // Verify crawler detection
-        let logs = request_logs::Entity::find()
-            .filter(request_logs::Column::RequestId.eq("test-req-bot"))
+        let logs = proxy_logs::Entity::find()
+            .filter(proxy_logs::Column::RequestId.eq("test-req-bot"))
             .one(test_db.connection_arc().as_ref())
             .await
             .unwrap()
             .expect("Log should be created");
 
-        assert_eq!(logs.is_crawler, true);
-        assert!(logs.crawler_name.is_some());
-        assert!(logs.crawler_name.unwrap().contains("Google"));
+        assert_eq!(logs.is_bot, Some(true));
+        assert!(logs.bot_name.is_some());
+        assert!(logs.bot_name.unwrap().contains("Google"));
     }
 
     #[tokio::test]
@@ -949,22 +1068,22 @@ mod tests {
         logger.log_request(log_data).await.unwrap();
 
         // Verify IP geolocation was created
-        let logs = request_logs::Entity::find()
-            .filter(request_logs::Column::RequestId.eq("test-req-ip"))
+        let logs = proxy_logs::Entity::find()
+            .filter(proxy_logs::Column::RequestId.eq("test-req-ip"))
             .one(test_db.connection_arc().as_ref())
             .await
             .unwrap()
             .expect("Log should be created");
 
         assert!(
-            logs.ip_address_id.is_some(),
+            logs.ip_geolocation_id.is_some(),
             "IP address should be geolocated"
         );
-        assert_eq!(logs.ip_address, Some(test_ip.to_string()));
+        assert_eq!(logs.client_ip, Some(test_ip.to_string()));
 
         // Verify the IP address record was created with geolocation data
         let ip_record =
-            temps_entities::ip_geolocations::Entity::find_by_id(logs.ip_address_id.unwrap())
+            temps_entities::ip_geolocations::Entity::find_by_id(logs.ip_geolocation_id.unwrap())
                 .one(test_db.connection_arc().as_ref())
                 .await
                 .unwrap()
@@ -979,8 +1098,11 @@ mod tests {
     async fn test_request_logger_with_visitor_and_session() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let ip_service = create_mock_ip_service(test_db.connection_arc().clone());
-        let logger =
-            RequestLoggerImpl::new(LoggingConfig::default(), test_db.connection_arc().clone(), ip_service);
+        let logger = RequestLoggerImpl::new(
+            LoggingConfig::default(),
+            test_db.connection_arc().clone(),
+            ip_service,
+        );
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -990,14 +1112,16 @@ mod tests {
             "test-visitor-123",
             context.project.id,
             context.environment.id,
-        ).await;
+        )
+        .await;
 
         // Create session record in database
         let session_id_i32 = create_test_session(
             &test_db.connection_arc(),
             "test-session-456",
             visitor_id_i32,
-        ).await;
+        )
+        .await;
 
         // Create test visitor
         let visitor_data = Visitor {
@@ -1036,8 +1160,8 @@ mod tests {
         logger.log_request(log_data).await.unwrap();
 
         // Verify visitor and session IDs are stored
-        let logs = request_logs::Entity::find()
-            .filter(request_logs::Column::RequestId.eq("test-req-with-visitor"))
+        let logs = proxy_logs::Entity::find()
+            .filter(proxy_logs::Column::RequestId.eq("test-req-with-visitor"))
             .one(test_db.connection_arc().as_ref())
             .await
             .unwrap()
@@ -1045,7 +1169,7 @@ mod tests {
 
         assert_eq!(logs.visitor_id, Some(visitor_id_i32));
         assert_eq!(logs.session_id, Some(session_id_i32));
-        assert_eq!(logs.is_entry_page, true); // New session = entry page
+        // Note: proxy_logs doesn't track is_entry_page like request_logs did
         assert_eq!(logs.referrer, Some("https://google.com".to_string()));
     }
 
@@ -1058,7 +1182,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let session_manager = SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
+        let session_manager =
+            SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -1068,7 +1193,8 @@ mod tests {
             "test-visitor-1",
             context.project.id,
             context.environment.id,
-        ).await;
+        )
+        .await;
 
         let visitor = Visitor {
             visitor_id: "test-visitor-1".to_string(),
@@ -1079,7 +1205,7 @@ mod tests {
 
         // First request - should create new session
         let session1 = session_manager
-            .get_or_create_session(None, &visitor, Some(&context), None)
+            .get_or_create_session(None, &visitor, Some(&context), None, None, None)
             .await
             .unwrap();
 
@@ -1087,7 +1213,7 @@ mod tests {
 
         // Generate encrypted cookie
         let cookie = session_manager
-            .generate_session_cookie(&session1, false)
+            .generate_session_cookie(&session1, false, None)
             .await
             .unwrap();
 
@@ -1104,7 +1230,14 @@ mod tests {
 
         // Second request with same cookie - should reuse session
         let session2 = session_manager
-            .get_or_create_session(Some(&encrypted_session_id), &visitor, Some(&context), None)
+            .get_or_create_session(
+                Some(&encrypted_session_id),
+                &visitor,
+                Some(&context),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1116,7 +1249,14 @@ mod tests {
 
         // Third request - should still reuse
         let session3 = session_manager
-            .get_or_create_session(Some(&encrypted_session_id), &visitor, Some(&context), None)
+            .get_or_create_session(
+                Some(&encrypted_session_id),
+                &visitor,
+                Some(&context),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1136,7 +1276,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let session_manager = SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
+        let session_manager =
+            SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -1146,7 +1287,8 @@ mod tests {
             "test-visitor-2",
             context.project.id,
             context.environment.id,
-        ).await;
+        )
+        .await;
 
         let visitor = Visitor {
             visitor_id: "test-visitor-2".to_string(),
@@ -1157,13 +1299,13 @@ mod tests {
 
         // Create initial session
         let session1 = session_manager
-            .get_or_create_session(None, &visitor, Some(&context), None)
+            .get_or_create_session(None, &visitor, Some(&context), None, None, None)
             .await
             .unwrap();
 
         // Generate cookie
         let cookie = session_manager
-            .generate_session_cookie(&session1, false)
+            .generate_session_cookie(&session1, false, None)
             .await
             .unwrap();
 
@@ -1188,11 +1330,21 @@ mod tests {
 
         let mut active_session: request_sessions::ActiveModel = db_session.into();
         active_session.last_accessed_at = Set(chrono::Utc::now() - chrono::Duration::minutes(31));
-        active_session.update(test_db.connection_arc().as_ref()).await.unwrap();
+        active_session
+            .update(test_db.connection_arc().as_ref())
+            .await
+            .unwrap();
 
         // Try to reuse with expired session - should create new one
         let session2 = session_manager
-            .get_or_create_session(Some(&encrypted_session_id), &visitor, Some(&context), None)
+            .get_or_create_session(
+                Some(&encrypted_session_id),
+                &visitor,
+                Some(&context),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1215,7 +1367,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let session_manager = SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
+        let session_manager =
+            SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -1225,7 +1378,8 @@ mod tests {
             "test-visitor-3",
             context.project.id,
             context.environment.id,
-        ).await;
+        )
+        .await;
 
         let visitor = Visitor {
             visitor_id: "test-visitor-3".to_string(),
@@ -1240,6 +1394,8 @@ mod tests {
                 Some("invalid-encrypted-data"),
                 &visitor,
                 Some(&context),
+                None,
+                None,
                 None,
             )
             .await
@@ -1260,7 +1416,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let session_manager = SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
+        let session_manager =
+            SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -1270,7 +1427,8 @@ mod tests {
             "test-visitor-4",
             context.project.id,
             context.environment.id,
-        ).await;
+        )
+        .await;
 
         let visitor = Visitor {
             visitor_id: "test-visitor-4".to_string(),
@@ -1281,13 +1439,13 @@ mod tests {
 
         // Create session
         let session = session_manager
-            .get_or_create_session(None, &visitor, Some(&context), None)
+            .get_or_create_session(None, &visitor, Some(&context), None, None, None)
             .await
             .unwrap();
 
         // Generate cookie
         let cookie = session_manager
-            .generate_session_cookie(&session, false)
+            .generate_session_cookie(&session, false, None)
             .await
             .unwrap();
 
@@ -1325,7 +1483,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let session_manager = SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
+        let session_manager =
+            SessionManagerImpl::new(test_db.connection_arc().clone(), crypto.clone());
 
         let context = create_test_project_context(&test_db.connection_arc()).await;
 
@@ -1335,7 +1494,8 @@ mod tests {
             "test-visitor-5",
             context.project.id,
             context.environment.id,
-        ).await;
+        )
+        .await;
 
         let visitor = Visitor {
             visitor_id: "test-visitor-5".to_string(),
@@ -1346,7 +1506,7 @@ mod tests {
 
         // Create initial session
         let session1 = session_manager
-            .get_or_create_session(None, &visitor, Some(&context), None)
+            .get_or_create_session(None, &visitor, Some(&context), None, None, None)
             .await
             .unwrap();
 
@@ -1365,7 +1525,7 @@ mod tests {
 
         // Generate cookie
         let cookie = session_manager
-            .generate_session_cookie(&session1, false)
+            .generate_session_cookie(&session1, false, None)
             .await
             .unwrap();
 
@@ -1381,7 +1541,14 @@ mod tests {
 
         // Reuse session
         session_manager
-            .get_or_create_session(Some(&encrypted_session_id), &visitor, Some(&context), None)
+            .get_or_create_session(
+                Some(&encrypted_session_id),
+                &visitor,
+                Some(&context),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 

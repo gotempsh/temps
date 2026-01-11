@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use temps_core::DateTime;
 use std::sync::Arc;
+use temps_core::DateTime;
 use utoipa::ToSchema;
 
 use crate::services::{FunnelService, SmartFilter};

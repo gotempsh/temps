@@ -10,7 +10,7 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::routes::status_page::{create_router, StatusPageApiDoc, StatusPageAppState};
-use crate::services::{HealthCheckService, StatusPageService, MonitorService};
+use crate::services::{HealthCheckService, MonitorService, StatusPageService};
 
 /// Status Page Plugin for monitoring and incident management
 pub struct StatusPagePlugin;
@@ -140,7 +140,8 @@ impl TempsPlugin for StatusPagePlugin {
             let queue_service = context.require_service::<dyn JobQueue>();
 
             // Register status page service
-            let status_page_service = Arc::new(StatusPageService::new(db.clone(), config_service.clone()));
+            let status_page_service =
+                Arc::new(StatusPageService::new(db.clone(), config_service.clone()));
             context.register_service(status_page_service.clone());
 
             // Create monitor service with job queue support for realtime event emission
@@ -151,14 +152,17 @@ impl TempsPlugin for StatusPagePlugin {
             ));
 
             // Create health check service with mandatory ConfigService
-            let health_check_service = Arc::new(HealthCheckService::new(db.clone(), config_service));
+            let health_check_service =
+                Arc::new(HealthCheckService::new(db.clone(), config_service));
             context.register_service(health_check_service.clone());
 
             // Start the health check scheduler with job receiver for realtime monitor creation
             let scheduler_service = health_check_service.clone();
             let scheduler_job_receiver = queue_service.subscribe();
             tokio::spawn(async move {
-                scheduler_service.start_scheduler(scheduler_job_receiver).await;
+                scheduler_service
+                    .start_scheduler(scheduler_job_receiver)
+                    .await;
             });
 
             // Start job listener for project/environment lifecycle events
@@ -214,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_page_plugin_default() {
-        let plugin = StatusPagePlugin::default();
+        let plugin = StatusPagePlugin;
         assert_eq!(plugin.name(), "status-page");
     }
 }
