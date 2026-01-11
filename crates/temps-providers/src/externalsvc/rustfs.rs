@@ -578,37 +578,45 @@ impl RustfsService {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to start RustFS container: {}", e))?;
 
-        // Wait for container to be healthy
-        self.wait_for_container_health(docker, &container.id)
-            .await?;
+        // Spawn health check as background task (non-blocking)
+        let container_id = container.id.clone();
+        let container_name_clone = container_name.clone();
+        let docker_clone = docker.clone();
+        tokio::spawn(async move {
+            let mut delay = Duration::from_millis(100);
+            let mut total_wait = Duration::from_secs(0);
+            let max_wait = Duration::from_secs(60);
 
-        info!("RustFS container {} created and started", container.id);
-        Ok(())
-    }
-
-    async fn wait_for_container_health(&self, docker: &Docker, container_id: &str) -> Result<()> {
-        let mut delay = Duration::from_millis(100);
-        let mut total_wait = Duration::from_secs(0);
-        let max_wait = Duration::from_secs(60);
-
-        while total_wait < max_wait {
-            let info = docker
-                .inspect_container(container_id, None::<InspectContainerOptions>)
-                .await?;
-            if let Some(state) = info.state {
-                if state.status == Some(bollard::models::ContainerStateStatusEnum::RUNNING)
-                    && state.health.as_ref().and_then(|h| h.status.as_ref())
-                        == Some(&bollard::models::HealthStatusEnum::HEALTHY)
+            while total_wait < max_wait {
+                if let Ok(info) = docker_clone
+                    .inspect_container(&container_id, None::<InspectContainerOptions>)
+                    .await
                 {
-                    return Ok(());
+                    if let Some(state) = info.state {
+                        if state.status == Some(bollard::models::ContainerStateStatusEnum::RUNNING)
+                            && state.health.as_ref().and_then(|h| h.status.as_ref())
+                                == Some(&bollard::models::HealthStatusEnum::HEALTHY)
+                        {
+                            info!("RustFS container {} is healthy", container_name_clone);
+                            return;
+                        }
+                    }
                 }
+                sleep(delay).await;
+                total_wait += delay;
+                delay = delay.mul_f32(1.5);
             }
-            sleep(delay).await;
-            total_wait += delay;
-            delay = delay.mul_f32(1.5);
-        }
+            error!(
+                "RustFS container {} health check timed out after 60s",
+                container_name_clone
+            );
+        });
 
-        Err(anyhow::anyhow!("RustFS container health check timed out"))
+        info!(
+            "RustFS container {} created and started (health check running in background)",
+            container.id
+        );
+        Ok(())
     }
 
     async fn create_s3_client(&self, config: &RustfsConfig) -> Result<Client> {

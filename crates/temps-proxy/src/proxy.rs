@@ -683,6 +683,15 @@ impl LoadBalancer {
             .unwrap_or_else(|| session.req_header().uri.scheme_str() == Some("https"))
     }
 
+    /// Check if the connection is a TLS connection by checking for SSL digest
+    fn is_tls_connection(&self, session: &PingoraSession) -> bool {
+        session
+            .downstream_session
+            .digest()
+            .and_then(|d| d.ssl_digest.as_ref())
+            .is_some()
+    }
+
     async fn handle_acme_http_challenge(&self, host: &str, path: &str) -> Result<Option<String>> {
         const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 
@@ -1859,6 +1868,45 @@ impl ProxyHttp for LoadBalancer {
             );
 
             ctx.routing_status = "acme_challenge".to_string();
+            return Ok(true);
+        }
+
+        // HTTP to HTTPS redirect for non-TLS connections
+        // This MUST come after ACME challenge handling to allow Let's Encrypt HTTP-01 validation
+        if !self.is_tls_connection(session) {
+            // Build the HTTPS redirect URL preserving path and query string
+            let redirect_url = if let Some(query) = &ctx.query_string {
+                format!(
+                    "https://{}{}{}",
+                    ctx.host,
+                    ctx.path,
+                    if query.is_empty() {
+                        String::new()
+                    } else {
+                        format!("?{}", query)
+                    }
+                )
+            } else {
+                format!("https://{}{}", ctx.host, ctx.path)
+            };
+
+            debug!(
+                request_id = %ctx.request_id,
+                host = %ctx.host,
+                path = %ctx.path,
+                redirect_url = %redirect_url,
+                "Redirecting HTTP to HTTPS"
+            );
+
+            // Use 301 Permanent Redirect for HTTP→HTTPS
+            let mut resp = ResponseHeader::build(301, None)?;
+            resp.insert_header("Location", &redirect_url)?;
+            resp.insert_header("Content-Length", "0")?;
+            resp.insert_header("X-Request-ID", &ctx.request_id)?;
+
+            ctx.routing_status = "http_to_https_redirect".to_string();
+
+            session.write_response_header(Box::new(resp), true).await?;
             return Ok(true);
         }
 
