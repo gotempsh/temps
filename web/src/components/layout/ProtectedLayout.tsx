@@ -3,13 +3,14 @@ import { Login } from '@/pages/Login'
 import { AlertCircle, RefreshCw, ServerCrash } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { DemoBanner } from './DemoBanner'
 
 export const ProtectedLayout = ({
   children,
 }: {
   children: React.ReactNode
 }) => {
-  const { user, isLoading, error, refetch } = useAuth()
+  const { user, isLoading, error, refetch, isDemoMode } = useAuth()
 
   if (isLoading) {
     return (
@@ -119,5 +120,10 @@ export const ProtectedLayout = ({
     return <Login />
   }
 
-  return <>{children}</>
+  return (
+    <>
+      {isDemoMode && <DemoBanner showExitButton />}
+      {children}
+    </>
+  )
 }

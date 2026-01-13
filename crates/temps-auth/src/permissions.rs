@@ -198,6 +198,12 @@ pub enum Permission {
     KvRead,
     KvWrite,
     KvDelete,
+
+    // Status Page permissions
+    StatusPageRead,
+    StatusPageWrite,
+    StatusPageCreate,
+    StatusPageDelete,
 }
 
 impl fmt::Display for Permission {
@@ -324,6 +330,10 @@ impl fmt::Display for Permission {
             Permission::KvRead => "kv:read",
             Permission::KvWrite => "kv:write",
             Permission::KvDelete => "kv:delete",
+            Permission::StatusPageRead => "status_page:read",
+            Permission::StatusPageWrite => "status_page:write",
+            Permission::StatusPageCreate => "status_page:create",
+            Permission::StatusPageDelete => "status_page:delete",
         };
         write!(f, "{}", name)
     }
@@ -454,6 +464,10 @@ impl Permission {
             "kv:read" => Some(Permission::KvRead),
             "kv:write" => Some(Permission::KvWrite),
             "kv:delete" => Some(Permission::KvDelete),
+            "status_page:read" => Some(Permission::StatusPageRead),
+            "status_page:write" => Some(Permission::StatusPageWrite),
+            "status_page:create" => Some(Permission::StatusPageCreate),
+            "status_page:delete" => Some(Permission::StatusPageDelete),
             _ => None,
         }
     }
@@ -581,6 +595,10 @@ impl Permission {
             Permission::KvRead,
             Permission::KvWrite,
             Permission::KvDelete,
+            Permission::StatusPageRead,
+            Permission::StatusPageWrite,
+            Permission::StatusPageCreate,
+            Permission::StatusPageDelete,
         ]
     }
 }
@@ -592,6 +610,7 @@ pub enum Role {
     Reader,
     Mcp,
     ApiReader,
+    Demo,   // For demo mode with limited read-only access
     Custom, // For API keys with custom permissions
 }
 
@@ -603,6 +622,7 @@ impl fmt::Display for Role {
             Role::Reader => "reader",
             Role::Mcp => "mcp",
             Role::ApiReader => "api_reader",
+            Role::Demo => "demo",
             Role::Custom => "custom",
         };
         write!(f, "{}", name)
@@ -618,6 +638,7 @@ impl Role {
             "reader" => Some(Role::Reader),
             "mcp" => Some(Role::Mcp),
             "api_reader" => Some(Role::ApiReader),
+            "demo" => Some(Role::Demo),
             "custom" => Some(Role::Custom),
             _ => None,
         }
@@ -630,6 +651,7 @@ impl Role {
             Role::Reader,
             Role::Mcp,
             Role::ApiReader,
+            Role::Demo,
             Role::Custom,
         ]
     }
@@ -759,6 +781,10 @@ impl Role {
                 Permission::KvRead,
                 Permission::KvWrite,
                 Permission::KvDelete,
+                Permission::StatusPageRead,
+                Permission::StatusPageWrite,
+                Permission::StatusPageCreate,
+                Permission::StatusPageDelete,
             ],
             Role::User => &[
                 Permission::ProjectsRead,
@@ -849,6 +875,9 @@ impl Role {
                 Permission::BlobWrite,
                 Permission::KvRead,
                 Permission::KvWrite,
+                Permission::StatusPageRead,
+                Permission::StatusPageWrite,
+                Permission::StatusPageCreate,
             ],
             Role::Reader => &[
                 Permission::ProjectsRead,
@@ -885,6 +914,7 @@ impl Role {
                 Permission::VulnerabilityScansRead,
                 Permission::BlobRead,
                 Permission::KvRead,
+                Permission::StatusPageRead,
             ],
             Role::Mcp => &[
                 Permission::ProjectsRead,
@@ -902,6 +932,11 @@ impl Role {
                 Permission::ProjectsRead,
                 Permission::DeploymentsRead,
                 Permission::AnalyticsRead,
+            ],
+            Role::Demo => &[
+                Permission::ProjectsRead,
+                Permission::AnalyticsRead,
+                Permission::StatusPageRead,
             ],
             Role::Custom => &[], // Custom role has no default permissions
         }

@@ -6422,6 +6422,10 @@ export type UserResponse = {
     id: number;
     mfa_enabled: boolean;
     name: string;
+    /**
+     * User's role (e.g., "admin", "user", "demo")
+     */
+    role: string;
     username: string;
 };
 

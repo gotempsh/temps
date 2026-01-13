@@ -1693,6 +1693,28 @@ impl ProxyHttp for LoadBalancer {
             ctx.ip_address = Some(client_ip.to_string());
         }
 
+        // Detect demo subdomain (demo.<preview_domain>) and add demo mode header
+        // This allows the auth middleware to auto-authenticate as demo user
+        if ctx.host.starts_with("demo.") {
+            // Get preview_domain from settings to verify this is a demo subdomain
+            if let Ok(settings) = self.config_service.get_settings().await {
+                let preview_domain = settings.preview_domain.trim_start_matches("*.");
+                let expected_demo_host = format!("demo.{}", preview_domain);
+
+                if ctx.host == expected_demo_host
+                    || ctx.host.starts_with(&format!("demo.{}:", preview_domain))
+                {
+                    debug!(
+                        "Demo subdomain detected: {} (matches demo.{}), adding X-Temps-Demo-Mode header",
+                        ctx.host, preview_domain
+                    );
+                    session
+                        .req_header_mut()
+                        .insert_header("X-Temps-Demo-Mode", "true")?;
+                }
+            }
+        }
+
         // Resolve project context early to set routing status for all requests
         let project_context = self
             .project_context_resolver

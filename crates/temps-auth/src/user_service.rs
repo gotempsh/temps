@@ -825,4 +825,64 @@ impl UserService {
         // If verification succeeds, disable MFA
         self.disable_mfa(user_id).await
     }
+
+    /// Find or create the demo user (demo@temps.sh)
+    ///
+    /// This is used by the subdomain-based demo mode to auto-authenticate
+    /// requests to demo.<preview_domain> without requiring login.
+    pub async fn find_or_create_demo_user(
+        &self,
+    ) -> Result<temps_entities::users::Model, UserServiceError> {
+        const DEMO_EMAIL: &str = "demo@temps.sh";
+        const DEMO_NAME: &str = "Demo User";
+
+        // Try to find existing demo user
+        let existing_user = temps_entities::users::Entity::find()
+            .filter(temps_entities::users::Column::Email.eq(DEMO_EMAIL))
+            .one(self.db.as_ref())
+            .await?;
+
+        if let Some(user) = existing_user {
+            debug!("Found existing demo user with id: {}", user.id);
+            return Ok(user);
+        }
+
+        // Create new demo user
+        info!("Creating demo user: {}", DEMO_EMAIL);
+        let now = Utc::now();
+
+        let new_user = temps_entities::users::ActiveModel {
+            name: Set(DEMO_NAME.to_string()),
+            email: Set(DEMO_EMAIL.to_string()),
+            email_verified: Set(true), // Demo user doesn't need verification
+            mfa_enabled: Set(false),
+            deleted_at: Set(None),
+            ..Default::default()
+        };
+
+        let user = new_user.insert(self.db.as_ref()).await?;
+
+        // Assign Demo role
+        let demo_role = temps_entities::roles::Entity::find()
+            .filter(temps_entities::roles::Column::Name.eq("demo"))
+            .one(self.db.as_ref())
+            .await?;
+
+        if let Some(role) = demo_role {
+            let user_role = temps_entities::user_roles::ActiveModel {
+                user_id: Set(user.id),
+                role_id: Set(role.id),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            };
+            let _ = user_role.insert(self.db.as_ref()).await;
+            info!("Assigned Demo role to user {}", user.id);
+        } else {
+            warn!("Demo role not found in database, user will have default permissions");
+        }
+
+        info!("Created demo user with id: {}", user.id);
+        Ok(user)
+    }
 }

@@ -1,4 +1,5 @@
 import { ProjectResponse } from '@/api/client'
+import { useAuth } from '@/contexts/AuthContext'
 import { cn } from '@/lib/utils'
 import {
   Activity,
@@ -216,6 +217,7 @@ export function MobileSidebarProvider({
 export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
   const location = useLocation()
   const navigate = useNavigate()
+  const { isDemoMode } = useAuth()
   const [expandedItems, setExpandedItems] = useState<string[]>([
     'analytics',
     'settings',
@@ -223,7 +225,7 @@ export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
 
   // Build nav items including environments
   const settingsIndex = baseNavItems.length - 1
-  const navItems: NavItem[] = [
+  const allNavItems: NavItem[] = [
     ...baseNavItems.slice(0, settingsIndex),
     {
       title: 'Environments',
@@ -232,6 +234,13 @@ export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
     },
     baseNavItems[settingsIndex],
   ]
+
+  // In demo mode, only show Analytics and Monitors
+  // Hide: Project, Deployments, Security, Runtime Logs, HTTP Requests, Domains, Storage, Services, Environment Variables, Git, Settings, Environments, Error Tracking
+  const demoAllowedTitles = ['Analytics', 'Monitors']
+  const navItems = isDemoMode
+    ? allNavItems.filter((item) => demoAllowedTitles.includes(item.title))
+    : allNavItems
 
   // Auto-expand parent items when navigating to their sub-items
   useEffect(() => {

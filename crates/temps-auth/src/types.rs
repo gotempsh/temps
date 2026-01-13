@@ -9,6 +9,8 @@ pub struct UserResponse {
     pub email: Option<String>,
     pub avatar_url: String,
     pub mfa_enabled: bool,
+    /// User's role (e.g., "admin", "user", "demo")
+    pub role: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

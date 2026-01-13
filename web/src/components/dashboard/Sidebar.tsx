@@ -29,7 +29,6 @@ import {
   LogOut,
   Mail,
   MoreHorizontal,
-  Network,
   ScrollText,
   Server,
   Settings,
@@ -60,35 +59,57 @@ import {
   DropdownMenuTrigger,
 } from '../ui/dropdown-menu'
 
+// Main navigation items - all items
+const navMainAll = [
+  {
+    title: 'Dashboard',
+    url: '/dashboard',
+    icon: SquareTerminal,
+    isActive: true,
+  },
+  {
+    title: 'Projects',
+    url: '/projects',
+    icon: Folder,
+  },
+  {
+    title: 'Storage',
+    url: '/storage',
+    icon: Database,
+  },
+  {
+    title: 'Domains',
+    url: '/domains',
+    icon: Globe,
+  },
+  {
+    title: 'Monitoring',
+    url: '/monitoring',
+    icon: Activity,
+  },
+]
+
+// Main navigation items available in demo mode (restricted)
+const navMainDemo = [
+  {
+    title: 'Dashboard',
+    url: '/dashboard',
+    icon: SquareTerminal,
+    isActive: true,
+  },
+  {
+    title: 'Projects',
+    url: '/projects',
+    icon: Folder,
+  },
+  {
+    title: 'Monitoring',
+    url: '/monitoring',
+    icon: Activity,
+  },
+]
+
 const data = {
-  navMain: [
-    {
-      title: 'Dashboard',
-      url: '/dashboard',
-      icon: SquareTerminal,
-      isActive: true,
-    },
-    {
-      title: 'Projects',
-      url: '/projects',
-      icon: Folder,
-    },
-    {
-      title: 'Storage',
-      url: '/storage',
-      icon: Database,
-    },
-    {
-      title: 'Domains',
-      url: '/domains',
-      icon: Globe,
-    },
-    {
-      title: 'Monitoring',
-      url: '/monitoring',
-      icon: Activity,
-    },
-  ],
   navSettings: [
     {
       title: 'Settings',
@@ -320,7 +341,11 @@ function NavSettings({
 export default function AppSidebar() {
   const { projects } = useProjects()
   const { setIsMinimal, isMinimal, isMobile } = useSidebar()
+  const { isDemoMode } = useAuth()
   const location = useLocation()
+
+  // Use restricted navigation in demo mode (accessed via demo.<preview_domain> subdomain)
+  const navMainItems = isDemoMode ? navMainDemo : navMainAll
 
   // Auto-collapse sidebar when on project detail pages
   useEffect(() => {
@@ -369,9 +394,10 @@ export default function AppSidebar() {
           </SidebarMenu>
         </SidebarHeader>
         <SidebarContent>
-          <NavMain items={data.navMain} />
+          <NavMain items={navMainItems} />
           <NavProjects projects={projects} />
-          <NavSettings items={data.navSettings} />
+          {/* Hide settings section in demo mode */}
+          {!isDemoMode && <NavSettings items={data.navSettings} />}
           <SidebarGroup />
         </SidebarContent>
         <SidebarFooter>

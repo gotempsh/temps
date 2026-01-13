@@ -98,6 +98,7 @@ impl RoleInfo {
             Role::Reader => "Read-only access to resources",
             Role::Mcp => "Access for MCP service operations",
             Role::ApiReader => "Read-only API access",
+            Role::Demo => "Demo mode with limited read-only access",
             Role::Custom => "Custom role with specific permissions",
         }
         .to_string();

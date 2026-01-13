@@ -68,6 +68,7 @@ pub async fn get_current_user(RequireAuth(auth): RequireAuth) -> impl IntoRespon
             urlencoding::encode(&user.name)
         ),
         mfa_enabled: user.mfa_enabled,
+        role: auth.effective_role.to_string(),
     };
     Json(user_response).into_response()
 }

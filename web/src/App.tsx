@@ -186,6 +186,8 @@ const AppContent = () => {
                 <Route path="/mfa-verify" element={<MfaVerify />} />
 
                 {/* Protected routes */}
+                {/* Note: Demo mode is handled via subdomain (demo.<preview_domain>) */}
+                {/* The proxy adds X-Temps-Demo-Mode header for demo subdomain requests */}
                 <Route
                   path="/*"
                   element={

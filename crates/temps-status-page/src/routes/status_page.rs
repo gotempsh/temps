@@ -8,6 +8,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
+use temps_auth::{permission_guard, RequireAuth};
 use temps_core::error_builder::{bad_request, internal_server_error, not_found};
 use temps_core::problemdetails::Problem;
 use temps_core::DateTime;
@@ -114,11 +115,15 @@ pub struct BucketedQuery {
     ),
     responses(
         (status = 200, description = "Successfully retrieved status overview", body = StatusPageOverview),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "Internal server error"),
     ),
-    tag = "Status Page"
+    tag = "Status Page",
+    security(("bearer_auth" = []))
 )]
 pub async fn get_status_overview<T>(
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Path(project_id): Path<i32>,
     Query(query): Query<MonitorListQuery>,
@@ -126,6 +131,7 @@ pub async fn get_status_overview<T>(
 where
     T: StatusPageAppState,
 {
+    permission_guard!(auth, StatusPageRead);
     app_state
         .status_page_service()
         .get_status_overview(project_id, query.environment_id)
@@ -145,11 +151,15 @@ where
     responses(
         (status = 201, description = "Monitor created successfully", body = MonitorResponse),
         (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "Internal server error"),
     ),
-    tag = "Status Page"
+    tag = "Status Page",
+    security(("bearer_auth" = []))
 )]
 pub async fn create_monitor<T>(
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Path(project_id): Path<i32>,
     Json(request): Json<CreateMonitorRequest>,
@@ -157,6 +167,7 @@ pub async fn create_monitor<T>(
 where
     T: StatusPageAppState,
 {
+    permission_guard!(auth, StatusPageCreate);
     app_state
         .status_page_service()
         .monitor_service()
@@ -176,11 +187,15 @@ where
     ),
     responses(
         (status = 200, description = "Successfully retrieved monitors", body = Vec<MonitorResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "Internal server error"),
     ),
-    tag = "Status Page"
+    tag = "Status Page",
+    security(("bearer_auth" = []))
 )]
 pub async fn list_monitors<T>(
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Path(project_id): Path<i32>,
     Query(query): Query<MonitorListQuery>,
@@ -188,6 +203,7 @@ pub async fn list_monitors<T>(
 where
     T: StatusPageAppState,
 {
+    permission_guard!(auth, StatusPageRead);
     app_state
         .status_page_service()
         .monitor_service()
@@ -206,18 +222,23 @@ where
     ),
     responses(
         (status = 200, description = "Successfully retrieved monitor", body = MonitorResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Monitor not found"),
         (status = 500, description = "Internal server error"),
     ),
-    tag = "Status Page"
+    tag = "Status Page",
+    security(("bearer_auth" = []))
 )]
 pub async fn get_monitor<T>(
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Path(monitor_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem>
 where
     T: StatusPageAppState,
 {
+    permission_guard!(auth, StatusPageRead);
     app_state
         .status_page_service()
         .monitor_service()
@@ -236,18 +257,23 @@ where
     ),
     responses(
         (status = 204, description = "Monitor deleted successfully"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Monitor not found"),
         (status = 500, description = "Internal server error"),
     ),
-    tag = "Status Page"
+    tag = "Status Page",
+    security(("bearer_auth" = []))
 )]
 pub async fn delete_monitor<T>(
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Path(monitor_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem>
 where
     T: StatusPageAppState,
 {
+    permission_guard!(auth, StatusPageDelete);
     app_state
         .status_page_service()
         .monitor_service()
@@ -269,12 +295,16 @@ where
     responses(
         (status = 200, description = "Successfully retrieved current status", body = CurrentStatusResponse),
         (status = 400, description = "Invalid time parameters"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Monitor not found"),
         (status = 500, description = "Internal server error"),
     ),
-    tag = "Status Page"
+    tag = "Status Page",
+    security(("bearer_auth" = []))
 )]
 pub async fn get_current_monitor_status<T>(
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Path(monitor_id): Path<i32>,
     Query(query): Query<CurrentStatusQuery>,
@@ -282,6 +312,7 @@ pub async fn get_current_monitor_status<T>(
 where
     T: StatusPageAppState,
 {
+    permission_guard!(auth, StatusPageRead);
     // Use custom timeframe method if any non-default values specified
     app_state
         .status_page_service()
@@ -309,12 +340,16 @@ where
     responses(
         (status = 200, description = "Successfully retrieved uptime history", body = UptimeHistoryResponse),
         (status = 400, description = "Invalid time parameters"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Monitor not found"),
         (status = 500, description = "Internal server error"),
     ),
-    tag = "Status Page"
+    tag = "Status Page",
+    security(("bearer_auth" = []))
 )]
 pub async fn get_uptime_history<T>(
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Path(monitor_id): Path<i32>,
     Query(query): Query<UptimeQuery>,
@@ -322,6 +357,7 @@ pub async fn get_uptime_history<T>(
 where
     T: StatusPageAppState,
 {
+    permission_guard!(auth, StatusPageRead);
     app_state
         .status_page_service()
         .monitor_service()
@@ -344,12 +380,16 @@ where
     responses(
         (status = 200, description = "Successfully retrieved bucketed status data", body = StatusBucketedResponse),
         (status = 400, description = "Invalid parameters"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Monitor not found"),
         (status = 500, description = "Internal server error"),
     ),
-    tag = "Status Page"
+    tag = "Status Page",
+    security(("bearer_auth" = []))
 )]
 pub async fn get_bucketed_status<T>(
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Path(monitor_id): Path<i32>,
     Query(query): Query<BucketedQuery>,
@@ -357,6 +397,7 @@ pub async fn get_bucketed_status<T>(
 where
     T: StatusPageAppState,
 {
+    permission_guard!(auth, StatusPageRead);
     let interval = query.interval.as_deref().unwrap_or("hourly");
     app_state
         .status_page_service()
@@ -383,11 +424,15 @@ where
     responses(
         (status = 201, description = "Incident created successfully", body = IncidentResponse),
         (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "Internal server error"),
     ),
-    tag = "Status Page"
+    tag = "Status Page",
+    security(("bearer_auth" = []))
 )]
 pub async fn create_incident<T>(
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Path(project_id): Path<i32>,
     Json(request): Json<CreateIncidentRequest>,
@@ -395,6 +440,7 @@ pub async fn create_incident<T>(
 where
     T: StatusPageAppState,
 {
+    permission_guard!(auth, StatusPageCreate);
     app_state
         .status_page_service()
         .incident_service()
@@ -417,11 +463,15 @@ where
     ),
     responses(
         (status = 200, description = "Successfully retrieved incidents"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "Internal server error"),
     ),
-    tag = "Status Page"
+    tag = "Status Page",
+    security(("bearer_auth" = []))
 )]
 pub async fn list_incidents<T>(
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Path(project_id): Path<i32>,
     Query(query): Query<IncidentListQuery>,
@@ -429,6 +479,7 @@ pub async fn list_incidents<T>(
 where
     T: StatusPageAppState,
 {
+    permission_guard!(auth, StatusPageRead);
     let (incidents, total) = app_state
         .status_page_service()
         .incident_service()
@@ -457,18 +508,23 @@ where
     ),
     responses(
         (status = 200, description = "Successfully retrieved incident", body = IncidentResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Incident not found"),
         (status = 500, description = "Internal server error"),
     ),
-    tag = "Status Page"
+    tag = "Status Page",
+    security(("bearer_auth" = []))
 )]
 pub async fn get_incident<T>(
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Path(incident_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem>
 where
     T: StatusPageAppState,
 {
+    permission_guard!(auth, StatusPageRead);
     app_state
         .status_page_service()
         .incident_service()
@@ -489,12 +545,16 @@ where
     responses(
         (status = 200, description = "Incident status updated successfully", body = IncidentResponse),
         (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Incident not found"),
         (status = 500, description = "Internal server error"),
     ),
-    tag = "Status Page"
+    tag = "Status Page",
+    security(("bearer_auth" = []))
 )]
 pub async fn update_incident_status<T>(
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Path(incident_id): Path<i32>,
     Json(request): Json<UpdateIncidentStatusRequest>,
@@ -502,6 +562,7 @@ pub async fn update_incident_status<T>(
 where
     T: StatusPageAppState,
 {
+    permission_guard!(auth, StatusPageWrite);
     app_state
         .status_page_service()
         .incident_service()
@@ -520,18 +581,23 @@ where
     ),
     responses(
         (status = 200, description = "Successfully retrieved incident updates", body = Vec<IncidentUpdateResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Incident not found"),
         (status = 500, description = "Internal server error"),
     ),
-    tag = "Status Page"
+    tag = "Status Page",
+    security(("bearer_auth" = []))
 )]
 pub async fn get_incident_updates<T>(
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Path(incident_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem>
 where
     T: StatusPageAppState,
 {
+    permission_guard!(auth, StatusPageRead);
     app_state
         .status_page_service()
         .incident_service()
@@ -555,11 +621,15 @@ where
     responses(
         (status = 200, description = "Successfully retrieved bucketed incident data", body = IncidentBucketedResponse),
         (status = 400, description = "Invalid parameters"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "Internal server error"),
     ),
-    tag = "Status Page"
+    tag = "Status Page",
+    security(("bearer_auth" = []))
 )]
 pub async fn get_bucketed_incidents<T>(
+    RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Path(project_id): Path<i32>,
     Query(query): Query<IncidentListQuery>,
@@ -568,6 +638,7 @@ pub async fn get_bucketed_incidents<T>(
 where
     T: StatusPageAppState,
 {
+    permission_guard!(auth, StatusPageRead);
     let interval = bucket_query.interval.as_deref().unwrap_or("hourly");
 
     app_state

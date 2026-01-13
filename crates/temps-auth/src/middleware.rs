@@ -108,6 +108,27 @@ pub async fn extract_auth_from_request(
     let api_key_service = &auth_state.api_key_service;
     let deployment_token_service = &auth_state.deployment_token_service;
 
+    // 0. Check for demo mode header (set by proxy for demo.<preview_domain> subdomain)
+    // This auto-authenticates requests as the demo user without requiring login
+    if let Some(demo_mode_header) = req.headers().get("x-temps-demo-mode") {
+        if demo_mode_header.to_str().ok() == Some("true") {
+            // Find or create demo user and return demo auth context
+            match user_service.find_or_create_demo_user().await {
+                Ok(demo_user) => {
+                    tracing::debug!(
+                        "Demo mode: auto-authenticated as demo user (id={})",
+                        demo_user.id
+                    );
+                    return Ok(AuthContext::new_session(demo_user, Role::Demo));
+                }
+                Err(e) => {
+                    tracing::warn!("Demo mode: failed to find/create demo user: {:?}", e);
+                    // Fall through to try other auth methods
+                }
+            }
+        }
+    }
+
     // 1. Check for Authorization header (API Key, Deployment Token, or CLI Token)
     if let Some(auth_header) = req.headers().get("authorization") {
         if let Ok(auth_str) = auth_header.to_str() {

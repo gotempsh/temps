@@ -12,6 +12,8 @@ interface AuthContextType {
   error: Error | null
   logout: () => Promise<void>
   refetch: () => void
+  /** True when logged in as demo user with limited access (via demo.<domain> subdomain) */
+  isDemoMode: boolean
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
@@ -50,9 +52,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       errorTitle: 'Failed to logout',
     },
     onSuccess: () => {
-      location.reload()
+      window.location.reload()
     },
   })
+
+  // Check if user is in demo mode based on their role
+  // Demo mode is triggered by accessing demo.<preview_domain> subdomain
+  // The proxy injects X-Temps-Demo-Mode header and the backend auto-authenticates as demo user
+  const isDemoMode = user?.role === 'demo'
+
   const value = {
     user: user || null,
     isLoading: userLoading,
@@ -61,6 +69,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       await logout({})
     },
     refetch: refetchUser,
+    isDemoMode,
   }
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
