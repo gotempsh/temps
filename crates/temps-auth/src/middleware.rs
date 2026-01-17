@@ -8,12 +8,15 @@ use axum::{
     middleware::Next,
 };
 use cookie::Cookie;
+use sea_orm::EntityTrait;
 use std::sync::Arc;
-use temps_core::{CookieCrypto, RequestMetadata};
+use temps_core::{AppSettings, CookieCrypto, RequestMetadata};
 
 // Cookie names from proxy
 const SESSION_ID_COOKIE_NAME: &str = "_temps_sid";
 const VISITOR_ID_COOKIE_NAME: &str = "_temps_visitor_id";
+// Cookie for demo mode user selection (stores encrypted user_id)
+const DEMO_USER_COOKIE_NAME: &str = "_temps_demo_uid";
 
 pub async fn auth_middleware(
     State(app_state): State<Arc<AuthState>>,
@@ -108,24 +111,44 @@ pub async fn extract_auth_from_request(
     let api_key_service = &auth_state.api_key_service;
     let deployment_token_service = &auth_state.deployment_token_service;
 
-    // 0. Check for demo mode header (set by proxy for demo.<preview_domain> subdomain)
-    // This auto-authenticates requests as the demo user without requiring login
-    if let Some(demo_mode_header) = req.headers().get("x-temps-demo-mode") {
-        if demo_mode_header.to_str().ok() == Some("true") {
-            // Find or create demo user and return demo auth context
-            match user_service.find_or_create_demo_user().await {
-                Ok(demo_user) => {
-                    tracing::debug!(
-                        "Demo mode: auto-authenticated as demo user (id={})",
-                        demo_user.id
-                    );
-                    return Ok(AuthContext::new_session(demo_user, Role::Demo));
-                }
-                Err(e) => {
-                    tracing::warn!("Demo mode: failed to find/create demo user: {:?}", e);
-                    // Fall through to try other auth methods
-                }
-            }
+    // 0. Check for demo mode via X-Temps-Demo-Mode header (set by proxy) or host matching demo.<preview_domain>
+    // This auto-authenticates requests without requiring login
+    let demo_mode_header = req
+        .headers()
+        .get("x-temps-demo-mode")
+        .and_then(|h| h.to_str().ok())
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    let host = req
+        .headers()
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    let host_without_port = host.split(':').next().unwrap_or(host);
+
+    // Debug: Log all headers to see what the auth middleware receives
+    tracing::info!(
+        "Auth middleware check: host={}, host_without_port={}, demo_mode_header={}, path={}",
+        host,
+        host_without_port,
+        demo_mode_header,
+        req.uri().path()
+    );
+
+    // Check demo mode either via header from proxy or via host subdomain
+    if demo_mode_header || host_without_port.starts_with("demo.") {
+        // Get preview_domain from database settings for host validation (if checking by host)
+        if let Some(demo_context) = check_demo_mode(
+            req,
+            auth_state,
+            host_without_port,
+            user_service,
+            demo_mode_header,
+        )
+        .await
+        {
+            return Ok(demo_context);
         }
     }
 
@@ -290,6 +313,127 @@ async fn determine_user_role(
     // For now, return User as default
     // In the future, you might want to check the user_roles table
     Ok(Role::User)
+}
+
+/// Check if the request is in demo mode and return the appropriate auth context
+/// Demo mode is detected by the X-Temps-Demo-Mode header (set by proxy) or matching the host against demo.<preview_domain>
+async fn check_demo_mode(
+    req: &Request,
+    auth_state: &Arc<AuthState>,
+    host_without_port: &str,
+    user_service: &UserService,
+    demo_mode_header: bool,
+) -> Option<AuthContext> {
+    // If demo mode header is set by proxy, skip host validation (proxy already validated)
+    if demo_mode_header {
+        tracing::info!(
+            "Demo mode detected via X-Temps-Demo-Mode header (host: {})",
+            host_without_port
+        );
+    } else {
+        // Validate host against preview_domain
+        let settings_record = temps_entities::settings::Entity::find_by_id(1)
+            .one(auth_state.db.as_ref())
+            .await
+            .ok()
+            .flatten();
+
+        let preview_domain = settings_record
+            .map(|r| AppSettings::from_json(r.data).preview_domain)
+            .unwrap_or_else(|| "localho.st".to_string());
+
+        let preview_domain = preview_domain.trim_start_matches("*.");
+        let expected_demo_host = format!("demo.{}", preview_domain);
+
+        tracing::debug!(
+            "Demo check: host_without_port={}, expected_demo_host={}, preview_domain={}",
+            host_without_port,
+            expected_demo_host,
+            preview_domain
+        );
+
+        if host_without_port != expected_demo_host {
+            return None;
+        }
+
+        tracing::info!(
+            "Demo mode detected: host {} matches demo.{}",
+            host_without_port,
+            preview_domain
+        );
+    }
+
+    // Check if there's a demo user cookie specifying which user to impersonate
+    let selected_user_id =
+        extract_demo_user_cookie(req.headers(), auth_state.cookie_crypto.as_ref());
+
+    if let Some(user_id) = selected_user_id {
+        // User has selected a specific user to view as in demo mode
+        match user_service.get_user_by_id(user_id).await {
+            Ok(user) => {
+                // Determine the role of the selected user
+                let role = determine_user_role(&user, user_service)
+                    .await
+                    .unwrap_or(Role::User);
+                tracing::info!(
+                    "Demo mode: authenticated as selected user (id={}, email={}, role={:?})",
+                    user.id,
+                    user.email,
+                    role
+                );
+                return Some(AuthContext::new_demo_session(user, role));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Demo mode: failed to load selected user {}: {:?}, falling back to demo user",
+                    user_id,
+                    e
+                );
+            }
+        }
+    }
+
+    // Default: Find or create demo user
+    match user_service.find_or_create_demo_user().await {
+        Ok(demo_user) => {
+            tracing::info!(
+                "Demo mode: auto-authenticated as demo user (id={}, email={})",
+                demo_user.id,
+                demo_user.email
+            );
+            Some(AuthContext::new_demo_session(demo_user, Role::Demo))
+        }
+        Err(e) => {
+            tracing::error!("Demo mode: failed to find/create demo user: {:?}", e);
+            None
+        }
+    }
+}
+
+/// Extract the demo user ID from the demo user cookie
+fn extract_demo_user_cookie(headers: &HeaderMap, crypto: &CookieCrypto) -> Option<i32> {
+    for cookie_header in headers.get_all("cookie") {
+        if let Ok(cookie_str) = cookie_header.to_str() {
+            for cookie in Cookie::split_parse(cookie_str).filter_map(Result::ok) {
+                if cookie.name() == DEMO_USER_COOKIE_NAME {
+                    // Decrypt the cookie value
+                    match crypto.decrypt(cookie.value()) {
+                        Ok(decrypted) => {
+                            // Parse the user_id
+                            if let Ok(user_id) = decrypted.parse::<i32>() {
+                                return Some(user_id);
+                            }
+                        }
+                        Err(_) => {
+                            // If decryption fails, no valid demo user selection
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug)]

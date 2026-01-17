@@ -17,6 +17,11 @@ pub enum AuthSource {
     Session {
         user: users::Model,
     },
+    /// Demo mode session - auto-authenticated when accessing demo.<preview_domain>
+    /// The user can switch between any available users in the system
+    DemoSession {
+        user: users::Model,
+    },
     CliToken {
         user: users::Model,
     },
@@ -42,6 +47,9 @@ pub enum AuthSource {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub enum AuthSourceSchema {
     Session {
+        user: UserSchema,
+    },
+    DemoSession {
         user: UserSchema,
     },
     CliToken {
@@ -89,6 +97,18 @@ impl AuthContext {
         Self {
             user: Some(user.clone()),
             source: AuthSource::Session { user },
+            effective_role: role,
+            custom_permissions: None,
+            deployment_token_permissions: None,
+        }
+    }
+
+    /// Create auth context for demo mode session
+    /// Demo mode allows switching between users via the demo user cookie
+    pub fn new_demo_session(user: users::Model, role: Role) -> Self {
+        Self {
+            user: Some(user.clone()),
+            source: AuthSource::DemoSession { user },
             effective_role: role,
             custom_permissions: None,
             deployment_token_permissions: None,
@@ -221,6 +241,11 @@ impl AuthContext {
 
     pub fn is_session(&self) -> bool {
         matches!(self.source, AuthSource::Session { .. })
+    }
+
+    /// Check if this is a demo mode session
+    pub fn is_demo_mode(&self) -> bool {
+        matches!(self.source, AuthSource::DemoSession { .. })
     }
 
     pub fn is_cli_token(&self) -> bool {

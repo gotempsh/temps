@@ -101,6 +101,56 @@ impl AuthMiddleware {
     ) -> Result<Response, StatusCode> {
         let mut user = None;
 
+        // 0. Check for demo mode via X-Temps-Demo-Mode header (set by proxy) or host matching demo.*
+        // This auto-authenticates requests without requiring login
+        let demo_mode_header = req
+            .headers()
+            .get("x-temps-demo-mode")
+            .and_then(|h| h.to_str().ok())
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        let host = req
+            .headers()
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        let host_without_port = host.split(':').next().unwrap_or(host);
+
+        // Log for debugging
+        tracing::info!(
+            "Auth middleware: host={}, host_without_port={}, demo_mode_header={}, path={}",
+            host,
+            host_without_port,
+            demo_mode_header,
+            req.uri().path()
+        );
+
+        // Check demo mode either via header from proxy or via host subdomain
+        if demo_mode_header || host_without_port.starts_with("demo.") {
+            // Extract demo user cookie before async call to avoid Send issues
+            let demo_user_id = self.extract_demo_user_cookie(req.headers());
+
+            if let Some((demo_user, demo_auth)) = self
+                .check_demo_mode(host_without_port, demo_mode_header, demo_user_id)
+                .await
+            {
+                tracing::info!(
+                    "Demo mode: authenticated as user {} (id={})",
+                    demo_user.email,
+                    demo_user.id
+                );
+
+                // Build metadata and insert extensions
+                let metadata = self.build_request_metadata(&req);
+                req.extensions_mut().insert(metadata);
+                req.extensions_mut().insert(demo_user);
+                req.extensions_mut().insert(demo_auth);
+
+                return Ok(next.run(req).await);
+            }
+        }
+
         // Extract auth context - simplified to avoid Send issues
         let auth_context = if let Some(auth_header) = req.headers().get("authorization") {
             if let Ok(auth_str) = auth_header.to_str() {
@@ -325,6 +375,202 @@ impl AuthMiddleware {
             mfa_recovery_codes: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+        }
+    }
+
+    /// Check if the request is in demo mode and return the appropriate user and auth context
+    async fn check_demo_mode(
+        &self,
+        host_without_port: &str,
+        demo_mode_header: bool,
+        selected_user_id: Option<i32>,
+    ) -> Option<(temps_entities::users::Model, crate::context::AuthContext)> {
+        use sea_orm::EntityTrait;
+
+        // First, check if demo mode is enabled in settings
+        let settings_record = temps_entities::settings::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten();
+
+        let settings = settings_record
+            .map(|r| temps_core::AppSettings::from_json(r.data))
+            .unwrap_or_default();
+
+        // Demo mode must be explicitly enabled
+        if !settings.demo_mode.enabled {
+            tracing::debug!(
+                "Demo mode is disabled in settings, rejecting demo request for host: {}",
+                host_without_port
+            );
+            return None;
+        }
+
+        // Check if demo mode header is set by proxy (proxy already validated the host)
+        if demo_mode_header {
+            tracing::info!(
+                "Demo mode detected via X-Temps-Demo-Mode header (host: {})",
+                host_without_port
+            );
+        } else {
+            // Validate host against configured demo domain or default pattern
+            let expected_demo_host = if let Some(ref custom_domain) = settings.demo_mode.domain {
+                custom_domain.clone()
+            } else {
+                let preview_domain = settings.preview_domain.trim_start_matches("*.");
+                format!("demo.{}", preview_domain)
+            };
+
+            tracing::debug!(
+                "Demo check: host_without_port={}, expected_demo_host={}",
+                host_without_port,
+                expected_demo_host
+            );
+
+            if host_without_port != expected_demo_host {
+                return None;
+            }
+
+            tracing::info!(
+                "Demo mode detected: host {} matches expected demo host {}",
+                host_without_port,
+                expected_demo_host
+            );
+        }
+
+        if let Some(user_id) = selected_user_id {
+            // User has selected a specific user to view as in demo mode
+            match self.user_service.get_user_by_id(user_id).await {
+                Ok(user) => {
+                    // Determine the role of the selected user
+                    let role = if self.user_service.is_admin(user.id).await.unwrap_or(false) {
+                        crate::permissions::Role::Admin
+                    } else {
+                        crate::permissions::Role::User
+                    };
+                    tracing::info!(
+                        "Demo mode: authenticated as selected user (id={}, email={}, role={:?})",
+                        user.id,
+                        user.email,
+                        role
+                    );
+                    return Some((
+                        user.clone(),
+                        crate::context::AuthContext::new_demo_session(user, role),
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Demo mode: failed to load selected user {}: {:?}, falling back to demo user",
+                        user_id,
+                        e
+                    );
+                }
+            }
+        }
+
+        // Default: Find or create demo user
+        match self.user_service.find_or_create_demo_user().await {
+            Ok(demo_user) => {
+                tracing::info!(
+                    "Demo mode: auto-authenticated as demo user (id={}, email={})",
+                    demo_user.id,
+                    demo_user.email
+                );
+                Some((
+                    demo_user.clone(),
+                    crate::context::AuthContext::new_demo_session(
+                        demo_user,
+                        crate::permissions::Role::Demo,
+                    ),
+                ))
+            }
+            Err(e) => {
+                tracing::error!("Demo mode: failed to find/create demo user: {:?}", e);
+                None
+            }
+        }
+    }
+
+    /// Extract the demo user ID from the demo user cookie
+    fn extract_demo_user_cookie(&self, headers: &axum::http::HeaderMap) -> Option<i32> {
+        use cookie::Cookie;
+
+        const DEMO_USER_COOKIE_NAME: &str = "_temps_demo_uid";
+
+        for cookie_header in headers.get_all("cookie") {
+            if let Ok(cookie_str) = cookie_header.to_str() {
+                for cookie in Cookie::split_parse(cookie_str).filter_map(Result::ok) {
+                    if cookie.name() == DEMO_USER_COOKIE_NAME {
+                        // Decrypt the cookie value
+                        match self.cookie_crypto.decrypt(cookie.value()) {
+                            Ok(decrypted) => {
+                                // Parse the user_id
+                                if let Ok(user_id) = decrypted.parse::<i32>() {
+                                    return Some(user_id);
+                                }
+                            }
+                            Err(_) => {
+                                // If decryption fails, no valid demo user selection
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Build RequestMetadata from request headers
+    fn build_request_metadata(&self, req: &Request) -> temps_core::RequestMetadata {
+        let visitor_id_cookie =
+            crate::middleware::extract_visitor_id_cookie(req, &self.cookie_crypto);
+        let session_id_cookie =
+            crate::middleware::extract_session_id_cookie(req, &self.cookie_crypto);
+
+        let host = req
+            .headers()
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("localhost")
+            .to_string();
+
+        let scheme = if req
+            .headers()
+            .get("x-forwarded-proto")
+            .and_then(|h| h.to_str().ok())
+            == Some("https")
+        {
+            "https"
+        } else {
+            "http"
+        };
+        let is_secure = scheme == "https";
+        let base_url = format!("{}://{}", scheme, host);
+
+        temps_core::RequestMetadata {
+            ip_address: req
+                .headers()
+                .get("x-forwarded-for")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .unwrap_or("unknown")
+                .to_string(),
+            user_agent: req
+                .headers()
+                .get("user-agent")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("unknown")
+                .to_string(),
+            headers: req.headers().clone(),
+            visitor_id_cookie,
+            session_id_cookie,
+            base_url,
+            scheme: scheme.to_string(),
+            host,
+            is_secure,
         }
     }
 }

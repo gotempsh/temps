@@ -36,6 +36,21 @@ pub struct ServeCommand {
     /// Use "noop" on servers without Chrome installed to skip screenshot functionality
     #[arg(long, env = "TEMPS_SCREENSHOT_PROVIDER", value_parser = ["local", "remote", "noop", "disabled", "none"])]
     pub screenshot_provider: Option<String>,
+
+    /// Enable demo mode for unauthenticated access at demo.<preview_domain>
+    /// WARNING: This allows anyone to access the application without authentication
+    #[arg(long, env = "TEMPS_DEMO_MODE")]
+    pub demo_mode: bool,
+
+    /// Custom domain for demo mode (overrides default demo.<preview_domain>)
+    /// Only used when --demo-mode is enabled
+    #[arg(long, env = "TEMPS_DEMO_DOMAIN")]
+    pub demo_domain: Option<String>,
+
+    /// Additional template YAML files to load (can be specified multiple times)
+    /// Templates are merged with the bundled defaults; validation errors will prevent startup
+    #[arg(long = "templates", env = "TEMPS_ADDITIONAL_TEMPLATES")]
+    pub additional_templates: Vec<PathBuf>,
 }
 
 impl ServeCommand {
@@ -63,6 +78,32 @@ impl ServeCommand {
         // Create tokio runtime for database connection since we need async for this
         let rt = tokio::runtime::Runtime::new()?;
         let db = rt.block_on(temps_database::establish_connection(&self.database_url))?;
+
+        // Update demo mode settings from CLI flags
+        if self.demo_mode {
+            info!("⚠️  Demo mode ENABLED - unauthenticated access allowed");
+            let db_for_settings = db.clone();
+            let demo_domain = self.demo_domain.clone();
+            let serve_config_for_demo = serve_config.clone();
+            rt.block_on(async move {
+                let config_service =
+                    temps_config::ConfigService::new(serve_config_for_demo, db_for_settings);
+                if let Err(e) = config_service
+                    .update_setting_field(|settings| {
+                        settings.demo_mode.enabled = true;
+                        settings.demo_mode.domain = demo_domain;
+                    })
+                    .await
+                {
+                    tracing::error!("Failed to update demo mode settings: {}", e);
+                }
+            });
+            if let Some(ref domain) = self.demo_domain {
+                info!("Demo mode domain: {}", domain);
+            } else {
+                info!("Demo mode using default domain: demo.<preview_domain>");
+            }
+        }
 
         info!(
             "Starting Temps server on {} and {}",
@@ -112,6 +153,7 @@ impl ServeCommand {
         let encryption_service_clone = encryption_service.clone();
         let route_table_clone = route_table.clone();
 
+        let additional_templates = self.additional_templates.clone();
         rt.spawn(async move {
             if let Err(e) = start_console_api(
                 db_clone,
@@ -120,6 +162,7 @@ impl ServeCommand {
                 encryption_service_clone,
                 route_table_clone,
                 Some(ready_tx),
+                additional_templates,
             )
             .await
             {

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use temps_core::templates::TemplateService;
 use temps_core::UtcDateTime;
 use temps_entities::deployment_config::DeploymentConfig;
 use utoipa::ToSchema;
@@ -17,6 +18,7 @@ pub struct AppState {
     pub project_service: Arc<ProjectService>,
     pub custom_domain_service: Arc<CustomDomainService>,
     pub audit_service: Arc<dyn AuditLogger>,
+    pub template_service: Arc<TemplateService>,
 }
 
 // Domain-related types

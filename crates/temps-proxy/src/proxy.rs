@@ -1693,25 +1693,48 @@ impl ProxyHttp for LoadBalancer {
             ctx.ip_address = Some(client_ip.to_string());
         }
 
-        // Detect demo subdomain (demo.<preview_domain>) and add demo mode header
+        // Detect demo subdomain and add demo mode header
         // This allows the auth middleware to auto-authenticate as demo user
+        // Demo mode must be explicitly enabled in settings
         if ctx.host.starts_with("demo.") {
-            // Get preview_domain from settings to verify this is a demo subdomain
+            // Get settings to check if demo mode is enabled and verify host
             if let Ok(settings) = self.config_service.get_settings().await {
-                let preview_domain = settings.preview_domain.trim_start_matches("*.");
-                let expected_demo_host = format!("demo.{}", preview_domain);
+                // Demo mode must be explicitly enabled
+                if settings.demo_mode.enabled {
+                    // Determine expected demo host from custom domain or default pattern
+                    let expected_demo_host =
+                        if let Some(ref custom_domain) = settings.demo_mode.domain {
+                            custom_domain.clone()
+                        } else {
+                            let preview_domain = settings.preview_domain.trim_start_matches("*.");
+                            format!("demo.{}", preview_domain)
+                        };
 
-                if ctx.host == expected_demo_host
-                    || ctx.host.starts_with(&format!("demo.{}:", preview_domain))
-                {
+                    // Strip port from host for comparison (handles both http and https)
+                    let host_without_port = ctx.host.split(':').next().unwrap_or(&ctx.host);
+
                     debug!(
-                        "Demo subdomain detected: {} (matches demo.{}), adding X-Temps-Demo-Mode header",
-                        ctx.host, preview_domain
+                        "Demo check: host={}, host_without_port={}, expected_demo_host={}, demo_mode_enabled={}",
+                        ctx.host, host_without_port, expected_demo_host, settings.demo_mode.enabled
                     );
-                    session
-                        .req_header_mut()
-                        .insert_header("X-Temps-Demo-Mode", "true")?;
+
+                    if host_without_port == expected_demo_host {
+                        info!(
+                            "Demo subdomain detected: {} (matches {}), adding X-Temps-Demo-Mode header",
+                            ctx.host, expected_demo_host
+                        );
+                        session
+                            .req_header_mut()
+                            .insert_header("X-Temps-Demo-Mode", "true")?;
+                    }
+                } else {
+                    debug!(
+                        "Demo mode disabled in settings, not adding demo header for host: {}",
+                        ctx.host
+                    );
                 }
+            } else {
+                warn!("Failed to get settings for demo subdomain check");
             }
         }
 

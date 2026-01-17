@@ -86,6 +86,7 @@ indicatif = "0.17"
 tar = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
+x509-parser = "0.16"
 
 [build-dependencies]
 chrono = { workspace = true }

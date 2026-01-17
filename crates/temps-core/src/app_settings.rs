@@ -13,6 +13,9 @@ pub struct AppSettings {
     // Access control
     pub allow_readonly_external_access: bool,
 
+    // Demo mode settings
+    pub demo_mode: DemoModeSettings,
+
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
 
@@ -106,6 +109,18 @@ pub struct DiskSpaceAlertSettings {
     pub monitor_path: Option<String>,
 }
 
+/// Demo mode settings for allowing unauthenticated access to demo subdomain
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct DemoModeSettings {
+    /// Whether demo mode is enabled (disabled by default for security)
+    pub enabled: bool,
+    /// Optional custom domain for demo mode (defaults to demo.<preview_domain>)
+    /// If set, this overrides the default demo.preview_domain pattern
+    #[schema(example = "demo.example.com")]
+    pub domain: Option<String>,
+}
+
 const DEFAULT_LOCAL_DOMAIN: &str = "localho.st";
 impl Default for AppSettings {
     fn default() -> Self {
@@ -113,6 +128,7 @@ impl Default for AppSettings {
             external_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
             allow_readonly_external_access: false,
+            demo_mode: DemoModeSettings::default(),
             screenshots: ScreenshotSettings::default(),
             letsencrypt: LetsEncryptSettings::default(),
             dns_provider: DnsProviderSettings::default(),
@@ -202,6 +218,15 @@ impl Default for DiskSpaceAlertSettings {
             threshold_percent: 80,       // Alert at 80% usage
             check_interval_seconds: 300, // Check every 5 minutes
             monitor_path: None,          // Use data directory by default
+        }
+    }
+}
+
+impl Default for DemoModeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false, // Disabled by default for security
+            domain: None,   // Uses demo.<preview_domain> by default
         }
     }
 }

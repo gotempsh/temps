@@ -174,7 +174,19 @@ impl UserService {
         // Try to insert, ignore if it already exists
         let _ = user_role.insert(self.db.as_ref()).await;
 
-        info!("Initialized default roles");
+        // Create demo role if it doesn't exist
+        // This is used for demo mode access via demo.<preview_domain> subdomain
+        let demo_role = temps_entities::roles::ActiveModel {
+            name: Set("demo".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+
+        // Try to insert, ignore if it already exists
+        let _ = demo_role.insert(self.db.as_ref()).await;
+
+        info!("Initialized default roles (admin, user, demo)");
         Ok(())
     }
 

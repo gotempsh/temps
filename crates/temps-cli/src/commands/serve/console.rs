@@ -27,6 +27,7 @@ use temps_blob::BlobPlugin;
 use temps_config::ConfigPlugin;
 use temps_config::ServerConfig;
 use temps_core::plugin::PluginManager;
+use temps_core::templates::TemplateService;
 use temps_core::{CookieCrypto, EncryptionService};
 use temps_database::DbConnection;
 use temps_deployer::plugin::DeployerPlugin;
@@ -446,6 +447,7 @@ pub async fn start_console_api(
     encryption_service: Arc<EncryptionService>,
     route_table: Arc<temps_proxy::CachedPeerTable>,
     ready_signal: Option<tokio::sync::oneshot::Sender<()>>,
+    additional_templates: Vec<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     // PRE-VALIDATE all plugin dependencies BEFORE initializing plugin manager
     // This ensures clear error messages if any critical resources are missing
@@ -523,6 +525,29 @@ pub async fn start_console_api(
     // This is used by analytics-events and other plugins that need to resolve hosts
     // Note: Route table listener is started in serve/mod.rs to avoid duplicate listeners
     service_context.register_service(route_table.clone());
+
+    // Register TemplateService - provides project templates from YAML configuration
+    // Bundled templates are loaded automatically; external file in data_dir can override them
+    let templates_override_path = config.data_dir.join("templates.yaml");
+    let template_service = Arc::new(TemplateService::new(Some(templates_override_path)));
+
+    // Load additional template files if specified
+    for additional_path in &additional_templates {
+        info!("Loading additional templates from {:?}", additional_path);
+        if let Err(e) = template_service.load_additional(additional_path).await {
+            return Err(anyhow::anyhow!(
+                "❌ Failed to load additional templates from {:?}\n\n\
+                Error: {}\n\n\
+                Please check the file exists and contains valid YAML with valid services.\n\
+                Valid services are: {}",
+                additional_path,
+                e,
+                temps_core::templates::VALID_SERVICES.join(", ")
+            ));
+        }
+    }
+
+    service_context.register_service(template_service);
 
     // Register plugins in dependency order:
     // 1. ConfigPlugin - provides configuration services
@@ -632,7 +657,7 @@ pub async fn start_console_api(
     let environments_plugin = Box::new(EnvironmentsPlugin::new());
     plugin_manager.register_plugin(environments_plugin);
 
-    // 6. ProjectsPlugin - provides project management (depends on providers, config, queue)
+    // 6. ProjectsPlugin - provides project management (depends on providers, config, queue, templates)
     debug!("Registering ProjectsPlugin");
     let projects_plugin = Box::new(ProjectsPlugin::new());
     plugin_manager.register_plugin(projects_plugin);

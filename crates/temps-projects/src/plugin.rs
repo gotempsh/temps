@@ -5,6 +5,7 @@ use std::sync::Arc;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
+use temps_core::templates::TemplateService;
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
@@ -70,10 +71,12 @@ impl TempsPlugin for ProjectsPlugin {
         let project_service = context.require_service::<ProjectService>();
         let custom_domain_service = context.require_service::<CustomDomainService>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+        let template_service = context.require_service::<TemplateService>();
         let app_state = Arc::new(crate::handlers::AppState {
             project_service,
             custom_domain_service,
             audit_service,
+            template_service,
         });
         let routes = crate::handlers::configure_routes().with_state(app_state);
         Some(PluginRoutes { router: routes })

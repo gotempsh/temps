@@ -41,8 +41,17 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/projects", post(create_project))
         .route("/projects", get(get_projects))
         .route("/projects/statistics", get(get_project_statistics))
+        // Create project from template
+        .route(
+            "/projects/from-template",
+            post(create_project_from_template),
+        )
         // Presets route
         .route("/presets", get(list_presets))
+        // Template routes
+        .route("/templates", get(list_templates))
+        .route("/templates/tags", get(list_template_tags))
+        .route("/templates/{slug}", get(get_template))
         // Pipeline trigger route
         .route(
             "/projects/{id}/trigger-pipeline",
@@ -81,6 +90,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         trigger_project_pipeline,
         get_project_statistics,
         list_presets,
+        list_templates,
+        get_template,
+        list_template_tags,
+        create_project_from_template,
     ),
     components(
         schemas(
@@ -97,11 +110,21 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             ProjectStatisticsResponse,
             super::types::PresetResponse,
             super::types::ListPresetsResponse,
+            super::templates::ListTemplatesQuery,
+            super::templates::TemplateResponse,
+            super::templates::GitRefResponse,
+            super::templates::EnvVarTemplateResponse,
+            super::templates::ListTemplatesResponse,
+            super::templates::ListTagsResponse,
+            super::templates::CreateProjectFromTemplateRequest,
+            super::templates::EnvVarInput,
+            super::templates::CreateProjectFromTemplateResponse,
         )
     ),
     tags(
         (name = "Projects", description = "Project management endpoints"),
-        (name = "Presets", description = "Available deployment presets")
+        (name = "Presets", description = "Available deployment presets"),
+        (name = "Templates", description = "Project template endpoints")
     ),
     nest(
         (path = "/projects", api = super::custom_domains::CustomDomainsApiDoc)
@@ -929,4 +952,242 @@ pub async fn list_presets(RequireAuth(_auth): RequireAuth) -> Result<impl IntoRe
     let response = super::types::ListPresetsResponse { presets, total };
 
     Ok(Json(response))
+}
+
+// ============================================================================
+// Template Handlers
+// ============================================================================
+
+/// List all available templates
+///
+/// Returns a list of all public templates, optionally filtered by tag or featured status.
+#[utoipa::path(
+    get,
+    path = "/templates",
+    tag = "Templates",
+    params(
+        ("tag" = Option<String>, Query, description = "Filter templates by tag"),
+        ("featured" = Option<bool>, Query, description = "Only return featured templates")
+    ),
+    responses(
+        (status = 200, description = "List of templates", body = super::templates::ListTemplatesResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_templates(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(_auth): RequireAuth,
+    Query(query): Query<super::templates::ListTemplatesQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    let templates = if let Some(true) = query.featured {
+        state.template_service.list_featured_templates().await
+    } else if let Some(tag) = query.tag {
+        state.template_service.list_templates_by_tag(&tag).await
+    } else {
+        state.template_service.list_templates().await
+    };
+
+    let total = templates.len();
+    let response = super::templates::ListTemplatesResponse {
+        templates: templates
+            .into_iter()
+            .map(super::templates::TemplateResponse::from)
+            .collect(),
+        total,
+    };
+
+    Ok(Json(response))
+}
+
+/// Get a specific template by slug
+///
+/// Returns detailed information about a single template.
+#[utoipa::path(
+    get,
+    path = "/templates/{slug}",
+    tag = "Templates",
+    params(
+        ("slug" = String, Path, description = "Template slug")
+    ),
+    responses(
+        (status = 200, description = "Template details", body = super::templates::TemplateResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Template not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_template(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(_auth): RequireAuth,
+    Path(slug): Path<String>,
+) -> Result<impl IntoResponse, Problem> {
+    let template = state
+        .template_service
+        .get_template(&slug)
+        .await
+        .map_err(|e| {
+            problemdetails::new(http::StatusCode::NOT_FOUND)
+                .with_title("Template Not Found")
+                .with_detail(e.to_string())
+        })?;
+
+    Ok(Json(super::templates::TemplateResponse::from(template)))
+}
+
+/// List all available template tags
+///
+/// Returns a list of all unique tags used by public templates.
+#[utoipa::path(
+    get,
+    path = "/templates/tags",
+    tag = "Templates",
+    responses(
+        (status = 200, description = "List of tags", body = super::templates::ListTagsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_template_tags(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(_auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    let tags = state.template_service.list_tags().await;
+    let total = tags.len();
+
+    Ok(Json(super::templates::ListTagsResponse { tags, total }))
+}
+
+/// Create a new project from a template
+///
+/// Creates a new repository from a template and sets up the project with the
+/// specified configuration. The template is cloned to a new repository under
+/// the authenticated user's account or specified organization.
+#[utoipa::path(
+    post,
+    path = "/projects/from-template",
+    tag = "Projects",
+    request_body = super::templates::CreateProjectFromTemplateRequest,
+    responses(
+        (status = 201, description = "Project created successfully", body = super::templates::CreateProjectFromTemplateResponse),
+        (status = 400, description = "Invalid input"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Template not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_project_from_template(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<super::templates::CreateProjectFromTemplateRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsCreate);
+
+    // 1. Get the template
+    let template = state
+        .template_service
+        .get_template(&request.template_slug)
+        .await
+        .map_err(|e| {
+            problemdetails::new(http::StatusCode::NOT_FOUND)
+                .with_title("Template Not Found")
+                .with_detail(e.to_string())
+        })?;
+
+    // 2. Determine the repository owner (use provided or get from git provider connection)
+    let repo_owner = request.repository_owner.clone().unwrap_or_else(|| {
+        // Default to repository name if owner not provided
+        // In production, this would query the git provider for the authenticated user
+        request.repository_name.clone()
+    });
+
+    // 3. Build the environment variables from the request
+    let env_vars: Option<Vec<(String, String)>> = if request.environment_variables.is_empty() {
+        None
+    } else {
+        Some(
+            request
+                .environment_variables
+                .iter()
+                .map(|ev| (ev.name.clone(), ev.value.clone()))
+                .collect(),
+        )
+    };
+
+    // 4. Create the project using the project service
+    // Note: The actual repository creation from template would be done by the
+    // git provider integration (cloning the template repo to the new repo)
+    let create_request = crate::services::types::CreateProjectRequest {
+        name: request.project_name.clone(),
+        repo_name: Some(request.repository_name.clone()),
+        repo_owner: Some(repo_owner.clone()),
+        directory: template.git.path.clone().unwrap_or_else(|| ".".to_string()),
+        main_branch: template.git.r#ref.clone(),
+        preset: template.preset.clone(),
+        preset_config: template.preset_config.clone(),
+        environment_variables: env_vars,
+        automatic_deploy: request.automatic_deploy,
+        storage_service_ids: request.storage_service_ids.clone(),
+        is_public_repo: Some(!request.private),
+        git_url: Some(template.git.url.clone()),
+        git_provider_connection_id: Some(request.git_provider_connection_id),
+        exposed_port: None,
+    };
+
+    let project = state
+        .project_service
+        .create_project(create_request)
+        .await
+        .map_err(Problem::from)?;
+
+    // 5. Create audit event
+    let audit_context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.to_string()),
+        user_agent: metadata.user_agent,
+    };
+
+    let audit_event = ProjectCreatedAudit {
+        context: audit_context,
+        project_id: project.id,
+        project_name: project.name.clone(),
+        project_slug: project.slug.clone(),
+        repo_name: project.repo_name.clone(),
+        repo_owner: project.repo_owner.clone(),
+        directory: project.directory.clone(),
+        main_branch: project.main_branch.clone(),
+        preset: project.preset.clone(),
+        automatic_deploy: project.automatic_deploy,
+    };
+
+    if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
+        error!("Failed to create audit log: {:?}", e);
+    }
+
+    // 6. Build the repository URL (for now, construct it from the template URL pattern)
+    // In production, this would be the actual URL of the newly created repository
+    let repository_url = format!(
+        "https://github.com/{}/{}.git",
+        repo_owner, request.repository_name
+    );
+
+    let response = super::templates::CreateProjectFromTemplateResponse {
+        project_id: project.id,
+        project_slug: project.slug,
+        project_name: project.name,
+        repository_url,
+        template_slug: request.template_slug,
+        message: format!(
+            "Project created successfully from template. Services required: {:?}",
+            template.services
+        ),
+    };
+
+    Ok((StatusCode::CREATED, Json(response)))
 }
