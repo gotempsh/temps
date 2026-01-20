@@ -828,11 +828,15 @@ async fn list_domains(
 }
 
 /// Renew domain certificate
+///
+/// For HTTP-01 domains: Automatically renews the certificate
+/// For DNS-01 domains (wildcards): Creates a new ACME order and returns challenge data
 #[utoipa::path(
     post,
     path = "/domains/{domain}/renew",
     responses(
         (status = 200, description = "Certificate renewal initiated", body = ProvisionResponse),
+        (status = 202, description = "DNS challenge created - manual action required", body = DomainChallengeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Domain not found"),
         (status = 500, description = "Internal server error")
@@ -874,7 +878,68 @@ async fn renew_domain(
         auth.user_id()
     );
 
-    // Use the TlsService renew_certificate method
+    // Get the domain to check verification method
+    let domain_model = app_state
+        .domain_service
+        .get_domain(&domain)
+        .await
+        .map_err(|e| {
+            error!("Failed to get domain {}: {}", domain, e);
+            e
+        })?
+        .ok_or_else(|| {
+            ErrorBuilder::new(StatusCode::NOT_FOUND)
+                .title("Domain not found")
+                .detail(format!("Domain {} not found", domain))
+                .build()
+        })?;
+
+    // For DNS-01 domains (wildcards), use request_challenge to create a new order
+    if domain_model.verification_method == "dns-01" {
+        info!(
+            "DNS-01 domain {} - creating new ACME order for renewal",
+            domain
+        );
+
+        // Request challenge from Let's Encrypt (creates new ACME order)
+        let challenge_data = app_state
+            .domain_service
+            .request_challenge(&domain, user_email)
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to create renewal order for domain {}: {}",
+                    domain, e
+                );
+                e
+            })?;
+
+        // Convert to response
+        let txt_records = challenge_data
+            .txt_records
+            .into_iter()
+            .map(|record| TxtRecord {
+                name: record.name,
+                value: record.value,
+            })
+            .collect();
+
+        let challenge_response = DomainChallengeResponse {
+            domain: challenge_data.domain,
+            txt_records,
+            status: challenge_data.status,
+        };
+
+        info!(
+            "Renewal order created for DNS-01 domain: {}. User must update DNS TXT records and finalize.",
+            domain
+        );
+
+        // Return 202 Accepted with challenge data
+        return Ok((StatusCode::ACCEPTED, Json(challenge_response)).into_response());
+    }
+
+    // For HTTP-01 domains, use automatic renewal
     match app_state
         .tls_service
         .renew_certificate(&domain, user_email)
@@ -887,7 +952,8 @@ async fn renew_domain(
                 Json(ProvisionResponse::Complete(DomainResponse::from(
                     certificate,
                 ))),
-            ))
+            )
+                .into_response())
         }
         Err(e) => {
             error!("Failed to renew certificate for {}: {}", domain, e);
@@ -898,7 +964,8 @@ async fn renew_domain(
                     code: "RENEWAL_FAILED".to_string(),
                     details: Some("Certificate renewal failed".to_string()),
                 })),
-            ))
+            )
+                .into_response())
         }
     }
 }

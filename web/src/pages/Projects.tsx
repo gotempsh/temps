@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useAuth } from '@/contexts/AuthContext'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
@@ -18,6 +19,7 @@ const ITEMS_PER_PAGE = 8
 
 export function Projects() {
   const { setBreadcrumbs } = useBreadcrumbs()
+  const { isDemoMode } = useAuth()
   const navigate = useNavigate()
   const [page, setPage] = useState(1)
 
@@ -87,28 +89,30 @@ export function Projects() {
             Manage your projects and their settings
           </p>
         </div>
-        <div className="flex gap-2">
-          <Button asChild variant="outline">
-            <Link
-              to="/projects/import-wizard"
-              className="flex items-center gap-2"
-            >
-              <Upload className="h-4 w-4" />
-              Import Project
-            </Link>
-          </Button>
-          <Button asChild>
-            <Link to="/projects/new" className="flex items-center gap-2">
-              <Plus className="h-4 w-4" />
-              New Project
-              <KbdBadge keys="N" />
-            </Link>
-          </Button>
-        </div>
+        {!isDemoMode && (
+          <div className="flex gap-2">
+            <Button asChild variant="outline">
+              <Link
+                to="/projects/import-wizard"
+                className="flex items-center gap-2"
+              >
+                <Upload className="h-4 w-4" />
+                Import Project
+              </Link>
+            </Button>
+            <Button asChild>
+              <Link to="/projects/new" className="flex items-center gap-2">
+                <Plus className="h-4 w-4" />
+                New Project
+                <KbdBadge keys="N" />
+              </Link>
+            </Button>
+          </div>
+        )}
       </div>
 
       {/* Projects Grid */}
-      <div className="grid gap-6 md:grid-cols-2">
+      <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
         {isLoading || gitProvidersLoading ? (
           <>
             {Array.from({ length: ITEMS_PER_PAGE }).map((_, i) => (
@@ -116,9 +120,20 @@ export function Projects() {
             ))}
           </>
         ) : projectsData?.projects.length === 0 ? (
-          // Check if there are no git providers configured
+          isDemoMode ? (
+            // Demo mode: simple empty state without action buttons
+            <div className="col-span-full flex flex-col items-center justify-center rounded-lg border border-dashed p-8 text-center animate-in fade-in-50">
+              <div className="flex h-20 w-20 items-center justify-center rounded-full bg-muted">
+                <FolderPlus className="h-10 w-10 text-muted-foreground" />
+              </div>
+              <h2 className="mt-6 text-xl font-semibold">No projects</h2>
+              <p className="mt-2 text-center text-sm text-muted-foreground">
+                No projects are available in demo mode.
+              </p>
+            </div>
+          ) : // Check if there are no git providers configured
           !gitProviders || gitProviders.length === 0 ? (
-            <div className="col-span-2 flex flex-col items-center justify-center rounded-lg border border-dashed p-8 text-center animate-in fade-in-50">
+            <div className="col-span-full flex flex-col items-center justify-center rounded-lg border border-dashed p-8 text-center animate-in fade-in-50">
               <div className="flex h-20 w-20 items-center justify-center rounded-full bg-muted">
                 <GitBranch className="h-10 w-10 text-muted-foreground" />
               </div>
@@ -147,7 +162,7 @@ export function Projects() {
               </div>
             </div>
           ) : (
-            <div className="col-span-2 flex flex-col items-center justify-center rounded-lg border border-dashed p-8 text-center animate-in fade-in-50">
+            <div className="col-span-full flex flex-col items-center justify-center rounded-lg border border-dashed p-8 text-center animate-in fade-in-50">
               <div className="flex h-20 w-20 items-center justify-center rounded-full bg-muted">
                 <FolderPlus className="h-10 w-10 text-muted-foreground" />
               </div>

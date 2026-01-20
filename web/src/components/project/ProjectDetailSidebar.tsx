@@ -235,12 +235,21 @@ export function ProjectDetailSidebar({ project }: ProjectDetailSidebarProps) {
     baseNavItems[settingsIndex],
   ]
 
-  // In demo mode, only show Analytics and Monitors
-  // Hide: Project, Deployments, Security, Runtime Logs, HTTP Requests, Domains, Storage, Services, Environment Variables, Git, Settings, Environments, Error Tracking
-  const demoAllowedTitles = ['Analytics', 'Monitors']
-  const navItems = isDemoMode
-    ? allNavItems.filter((item) => demoAllowedTitles.includes(item.title))
-    : allNavItems
+  // In demo mode, only show Analytics and Monitors as flat items (no sub-items)
+  // This creates a simplified view for the demo
+  const demoNavItems: NavItem[] = [
+    {
+      title: 'Analytics',
+      url: 'analytics',
+      icon: BarChart3,
+    },
+    {
+      title: 'Monitors',
+      url: 'monitors',
+      icon: Activity,
+    },
+  ]
+  const navItems = isDemoMode ? demoNavItems : allNavItems
 
   // Auto-expand parent items when navigating to their sub-items
   useEffect(() => {

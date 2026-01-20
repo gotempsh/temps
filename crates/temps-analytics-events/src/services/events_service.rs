@@ -488,6 +488,8 @@ impl AnalyticsEventsService {
 
         // Check if we need to join with ip_geolocations
         let is_geo_column = matches!(group_by_str, "country" | "region" | "city");
+        let is_referrer_column = group_by_str == "referrer_hostname";
+
         let (from_clause, select_column) = if is_geo_column {
             (
                 "events e LEFT JOIN ip_geolocations ig ON e.ip_geolocation_id = ig.id",
@@ -500,6 +502,16 @@ impl AnalyticsEventsService {
         let mut conditions = vec!["e.project_id = $1".to_string()];
         conditions.push("e.timestamp >= $2".to_string());
         conditions.push("e.timestamp <= $3".to_string());
+
+        // For referrer_hostname, filter out self-referrals (project's own domains)
+        if is_referrer_column {
+            conditions.push(
+                r#"(e.referrer_hostname IS NULL OR e.referrer_hostname NOT IN (
+                    SELECT domain FROM project_custom_domains WHERE project_id = $1
+                ))"#
+                .to_string(),
+            );
+        }
 
         let mut param_idx = 4;
         if environment_id.is_some() {

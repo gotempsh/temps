@@ -1,5 +1,6 @@
 import { ThemeToggle } from '@/components/theme/ThemeToggle'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useAuth } from '@/contexts/AuthContext'
 import { FolderPlus, GitBranch, Globe, Key, Plus } from 'lucide-react'
 import React from 'react'
 import { Link, useNavigate } from 'react-router-dom'
@@ -25,6 +26,7 @@ import { SidebarTrigger } from '../ui/sidebar'
 
 export function Header() {
   const { breadcrumbs } = useBreadcrumbs()
+  const { isDemoMode } = useAuth()
   const navigate = useNavigate()
 
   const handleCreateProject = () => {
@@ -69,34 +71,36 @@ export function Header() {
           </Breadcrumb>
         </div>
         <div className="ml-auto flex items-center space-x-2">
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="icon">
-                <Plus className="h-4 w-4" />
-                <span className="sr-only">Create new</span>
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-[200px]">
-              <DropdownMenuLabel>Quick Actions</DropdownMenuLabel>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={handleCreateProject}>
-                <FolderPlus className="mr-2 h-4 w-4" />
-                Create Project
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={handleProvisionDomain}>
-                <Globe className="mr-2 h-4 w-4" />
-                Provision Domain
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={handleCreateApiKey}>
-                <Key className="mr-2 h-4 w-4" />
-                Create API Key
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={handleAddGitProvider}>
-                <GitBranch className="mr-2 h-4 w-4" />
-                Add Git Provider
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          {!isDemoMode && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="icon">
+                  <Plus className="h-4 w-4" />
+                  <span className="sr-only">Create new</span>
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-[200px]">
+                <DropdownMenuLabel>Quick Actions</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={handleCreateProject}>
+                  <FolderPlus className="mr-2 h-4 w-4" />
+                  Create Project
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={handleProvisionDomain}>
+                  <Globe className="mr-2 h-4 w-4" />
+                  Provision Domain
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={handleCreateApiKey}>
+                  <Key className="mr-2 h-4 w-4" />
+                  Create API Key
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={handleAddGitProvider}>
+                  <GitBranch className="mr-2 h-4 w-4" />
+                  Add Git Provider
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
           {/* <NotificationsDropdown /> */}
           <ThemeToggle />
         </div>

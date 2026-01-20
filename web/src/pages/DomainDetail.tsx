@@ -200,8 +200,24 @@ export function DomainDetail() {
     meta: {
       errorTitle: 'Failed to renew certificate',
     },
-    onSuccess: () => {
-      toast.success('Certificate renewed successfully')
+    onSuccess: (data) => {
+      // Check if the response is a challenge (DNS-01 renewal)
+      // The API returns 202 with challenge data for DNS-01 domains
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const response = data as any
+      if (response?.txt_records && response.txt_records.length > 0) {
+        // DNS-01 challenge was created - user needs to update DNS and finalize
+        toast.success(
+          'Renewal order created. Update DNS TXT records and click "Verify & Complete" to finalize.',
+          { duration: 6000 }
+        )
+      } else if (response?.Complete) {
+        // HTTP-01 certificate was renewed successfully
+        toast.success('Certificate renewed successfully')
+      } else {
+        // Generic success
+        toast.success('Certificate renewal initiated')
+      }
       refetchDomain()
       refetchOrder()
     },
@@ -281,20 +297,24 @@ export function DomainDetail() {
     )
   }
 
-  const handleRenewDomain = () => {
+  const handleRenewDomain = async () => {
     if (!domain) return
-    toast.promise(
-      renewDomain.mutateAsync({
+    const loadingToast = toast.loading(
+      domain.verification_method === 'dns-01'
+        ? 'Creating renewal order...'
+        : 'Renewing certificate...'
+    )
+    try {
+      await renewDomain.mutateAsync({
         path: {
           domain: domain.domain,
         },
-      }),
-      {
-        loading: 'Renewing certificate...',
-        success: 'Certificate renewed successfully',
-        error: 'Failed to renew certificate',
-      }
-    )
+      })
+    } catch {
+      // Error is handled by the mutation's meta.errorTitle
+    } finally {
+      toast.dismiss(loadingToast)
+    }
   }
 
   const isExpiringSoon = (expirationTime?: number | null) => {

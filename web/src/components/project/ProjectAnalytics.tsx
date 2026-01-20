@@ -76,6 +76,7 @@ import { DateRange } from 'react-day-picker'
 import { Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 
 import { Badge } from '@/components/ui/badge'
+import { useAuth } from '@/contexts/AuthContext'
 import { Line, LineChart, XAxis, YAxis } from 'recharts'
 
 const chartConfig2 = {
@@ -302,6 +303,7 @@ interface AnalyticsFiltersProps {
   onEnvironmentChange: (environment: number | undefined) => void
   onRefresh: () => void
   isRefreshing: boolean
+  isDemoMode?: boolean
 }
 
 function AnalyticsFilters({
@@ -314,6 +316,7 @@ function AnalyticsFilters({
   onEnvironmentChange,
   onRefresh,
   isRefreshing,
+  isDemoMode = false,
 }: AnalyticsFiltersProps) {
   const { data: environments } = useQuery({
     ...getEnvironmentsOptions({
@@ -321,27 +324,34 @@ function AnalyticsFilters({
         project_id: project.id,
       },
     }),
+    enabled: !isDemoMode,
   })
 
   return (
     <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-      <Select
-        value={selectedEnvironment?.toString()}
-        onValueChange={(value) =>
-          onEnvironmentChange(value ? parseInt(value) : undefined)
-        }
-      >
-        <SelectTrigger className="w-[200px]">
-          <SelectValue placeholder="All environments" />
-        </SelectTrigger>
-        <SelectContent>
-          {environments?.map((env) => (
-            <SelectItem key={env.id} value={env.id.toString()}>
-              {env.name}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
+      {isDemoMode ? (
+        <div className="flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground bg-muted rounded-md w-fit">
+          <span className="font-medium">Production</span>
+        </div>
+      ) : (
+        <Select
+          value={selectedEnvironment?.toString()}
+          onValueChange={(value) =>
+            onEnvironmentChange(value ? parseInt(value) : undefined)
+          }
+        >
+          <SelectTrigger className="w-[200px]">
+            <SelectValue placeholder="All environments" />
+          </SelectTrigger>
+          <SelectContent>
+            {environments?.map((env) => (
+              <SelectItem key={env.id} value={env.id.toString()}>
+                {env.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      )}
 
       <div className="flex items-center sm:justify-end gap-2">
         <div className="flex items-center gap-2">
@@ -693,6 +703,7 @@ interface ProjectAnalyticsOverviewProps {
 }
 function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   const navigate = useNavigate()
+  const { isDemoMode } = useAuth()
   const [dateFilter, setDateFilter] = React.useState<AnalyticsDateFilter>({
     quickFilter: '24hours',
     dateRange: undefined,
@@ -772,12 +783,12 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
     return !hasAnalyticsEventsQuery.data.has_events
   }, [hasAnalyticsEventsQuery.data, hasAnalyticsEventsQuery.isLoading])
 
-  // Auto-navigate to setup if no data detected
+  // Auto-navigate to setup if no data detected (skip in demo mode)
   React.useEffect(() => {
-    if (hasNoData && !showSetupOverride) {
+    if (hasNoData && !showSetupOverride && !isDemoMode) {
       navigate(`/projects/${project.slug}/analytics/setup`)
     }
-  }, [hasNoData, showSetupOverride, project.slug, navigate])
+  }, [hasNoData, showSetupOverride, isDemoMode, project.slug, navigate])
 
   const handleRefresh = React.useCallback(async () => {
     setIsRefreshing(true)
@@ -811,8 +822,8 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   return (
     <>
       <div className="space-y-6">
-        {/* Show banner if there's no data */}
-        {hasNoData && (
+        {/* Show banner if there's no data (skip in demo mode) */}
+        {hasNoData && !isDemoMode && (
           <Card className="border-yellow-200 bg-yellow-50 dark:border-yellow-800 dark:bg-yellow-950/50">
             <CardHeader className="pb-3">
               <div className="flex items-center justify-between">
@@ -855,6 +866,7 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
             onEnvironmentChange={setSelectedEnvironment}
             onRefresh={handleRefresh}
             isRefreshing={isRefreshing}
+            isDemoMode={isDemoMode}
           />
 
           {/* Analytics Metrics */}
