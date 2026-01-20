@@ -35,7 +35,8 @@ pub struct GitRef {
     /// Git repository URL (e.g., "https://github.com/owner/repo.git" or "https://gitlab.com/owner/repo.git")
     pub url: String,
     /// Path within the repository (for monorepos)
-    #[serde(default)]
+    /// Also accepts "subfolder" as an alias in YAML/JSON
+    #[serde(default, alias = "subfolder")]
     pub path: Option<String>,
     /// Git reference (branch, tag, or commit)
     #[serde(default = "default_ref")]

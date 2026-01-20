@@ -1342,4 +1342,393 @@ impl GitProviderService for GitHubProvider {
             reference.to_string(),
         )))
     }
+
+    async fn create_repository(
+        &self,
+        access_token: &str,
+        name: &str,
+        owner: Option<&str>,
+        description: Option<&str>,
+        private: bool,
+    ) -> Result<Repository, GitProviderError> {
+        let client = self.get_client();
+        let headers = self.get_headers(access_token);
+
+        // If owner is specified, create in organization; otherwise create in user account
+        let url = if let Some(org) = owner {
+            format!("{}/orgs/{}/repos", self.api_url, org)
+        } else {
+            format!("{}/user/repos", self.api_url)
+        };
+
+        #[derive(Serialize)]
+        struct CreateRepoRequest {
+            name: String,
+            description: Option<String>,
+            private: bool,
+            auto_init: bool, // Initialize with README to have a default branch
+        }
+
+        let request = CreateRepoRequest {
+            name: name.to_string(),
+            description: description.map(|s| s.to_string()),
+            private,
+            auto_init: true, // Initialize with README so we have a default branch
+        };
+
+        info!("Creating repository {} (private: {})", name, private);
+
+        let response = client
+            .post(&url)
+            .headers(headers)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                GitProviderError::ApiError(format!("Failed to create repository: {}", e))
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            error!("Failed to create repository: {} - {}", status, error_text);
+            return Err(GitProviderError::ApiError(format!(
+                "Failed to create repository: {} - {}",
+                status, error_text
+            )));
+        }
+
+        let github_repo: GitHubRepo = response
+            .json()
+            .await
+            .map_err(|e| GitProviderError::ApiError(format!("Failed to parse response: {}", e)))?;
+
+        info!("Successfully created repository: {}", github_repo.full_name);
+
+        Ok(Repository {
+            id: github_repo.id.to_string(),
+            name: github_repo.name,
+            full_name: github_repo.full_name,
+            owner: github_repo.owner.login,
+            description: github_repo.description,
+            private: github_repo.private,
+            default_branch: github_repo.default_branch,
+            clone_url: github_repo.clone_url,
+            ssh_url: github_repo.ssh_url,
+            web_url: github_repo.html_url,
+            language: github_repo.language,
+            size: github_repo.size,
+            stars: github_repo.stargazers_count,
+            forks: github_repo.forks_count,
+            created_at: DateTime::parse_from_rfc3339(&github_repo.created_at)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            updated_at: DateTime::parse_from_rfc3339(&github_repo.updated_at)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            pushed_at: github_repo.pushed_at.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            }),
+        })
+    }
+
+    async fn push_files_to_repository(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        files: Vec<(String, Vec<u8>)>,
+        commit_message: &str,
+    ) -> Result<Commit, GitProviderError> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let client = self.get_client();
+        let headers = self.get_headers(access_token);
+
+        info!(
+            "Pushing {} files to {}/{} on branch {}",
+            files.len(),
+            owner,
+            repo,
+            branch
+        );
+
+        // 1. Get the current commit SHA for the branch (reference)
+        let ref_url = format!(
+            "{}/repos/{}/{}/git/ref/heads/{}",
+            self.api_url, owner, repo, branch
+        );
+
+        let ref_response = client
+            .get(&ref_url)
+            .headers(headers.clone())
+            .send()
+            .await
+            .map_err(|e| GitProviderError::ApiError(format!("Failed to get branch ref: {}", e)))?;
+
+        if !ref_response.status().is_success() {
+            let status = ref_response.status();
+            let error_text = ref_response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(GitProviderError::ApiError(format!(
+                "Failed to get branch reference: {} - {}",
+                status, error_text
+            )));
+        }
+
+        #[derive(Deserialize)]
+        struct GitRef {
+            object: GitRefObject,
+        }
+
+        #[derive(Deserialize)]
+        struct GitRefObject {
+            sha: String,
+        }
+
+        let git_ref: GitRef = ref_response
+            .json()
+            .await
+            .map_err(|e| GitProviderError::ApiError(format!("Failed to parse ref: {}", e)))?;
+
+        let base_commit_sha = git_ref.object.sha;
+        debug!("Base commit SHA: {}", base_commit_sha);
+
+        // 2. Get the tree SHA from the base commit
+        let commit_url = format!(
+            "{}/repos/{}/{}/git/commits/{}",
+            self.api_url, owner, repo, base_commit_sha
+        );
+
+        let commit_response = client
+            .get(&commit_url)
+            .headers(headers.clone())
+            .send()
+            .await
+            .map_err(|e| GitProviderError::ApiError(format!("Failed to get commit: {}", e)))?;
+
+        #[derive(Deserialize)]
+        struct GitCommitResponse {
+            tree: GitTree,
+        }
+
+        #[derive(Deserialize)]
+        struct GitTree {
+            sha: String,
+        }
+
+        let commit_data: GitCommitResponse = commit_response
+            .json()
+            .await
+            .map_err(|e| GitProviderError::ApiError(format!("Failed to parse commit: {}", e)))?;
+
+        let base_tree_sha = commit_data.tree.sha;
+        debug!("Base tree SHA: {}", base_tree_sha);
+
+        // 3. Create blobs for each file
+        let mut tree_entries = Vec::new();
+
+        for (path, content) in files {
+            let blob_url = format!("{}/repos/{}/{}/git/blobs", self.api_url, owner, repo);
+
+            #[derive(Serialize)]
+            struct CreateBlobRequest {
+                content: String,
+                encoding: String,
+            }
+
+            let blob_request = CreateBlobRequest {
+                content: STANDARD.encode(&content),
+                encoding: "base64".to_string(),
+            };
+
+            let blob_response = client
+                .post(&blob_url)
+                .headers(headers.clone())
+                .json(&blob_request)
+                .send()
+                .await
+                .map_err(|e| {
+                    GitProviderError::ApiError(format!("Failed to create blob for {}: {}", path, e))
+                })?;
+
+            if !blob_response.status().is_success() {
+                let status = blob_response.status();
+                let error_text = blob_response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unknown error".to_string());
+                return Err(GitProviderError::ApiError(format!(
+                    "Failed to create blob for {}: {} - {}",
+                    path, status, error_text
+                )));
+            }
+
+            #[derive(Deserialize)]
+            struct BlobResponse {
+                sha: String,
+            }
+
+            let blob: BlobResponse = blob_response
+                .json()
+                .await
+                .map_err(|e| GitProviderError::ApiError(format!("Failed to parse blob: {}", e)))?;
+
+            tree_entries.push(serde_json::json!({
+                "path": path,
+                "mode": "100644", // Regular file
+                "type": "blob",
+                "sha": blob.sha
+            }));
+
+            debug!("Created blob for {}: {}", path, blob.sha);
+        }
+
+        // 4. Create a new tree with all the files
+        let tree_url = format!("{}/repos/{}/{}/git/trees", self.api_url, owner, repo);
+
+        let tree_request = serde_json::json!({
+            "base_tree": base_tree_sha,
+            "tree": tree_entries
+        });
+
+        let tree_response = client
+            .post(&tree_url)
+            .headers(headers.clone())
+            .json(&tree_request)
+            .send()
+            .await
+            .map_err(|e| GitProviderError::ApiError(format!("Failed to create tree: {}", e)))?;
+
+        if !tree_response.status().is_success() {
+            let status = tree_response.status();
+            let error_text = tree_response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(GitProviderError::ApiError(format!(
+                "Failed to create tree: {} - {}",
+                status, error_text
+            )));
+        }
+
+        #[derive(Deserialize)]
+        struct TreeResponse {
+            sha: String,
+        }
+
+        let tree: TreeResponse = tree_response
+            .json()
+            .await
+            .map_err(|e| GitProviderError::ApiError(format!("Failed to parse tree: {}", e)))?;
+
+        debug!("Created new tree: {}", tree.sha);
+
+        // 5. Create a new commit
+        let new_commit_url = format!("{}/repos/{}/{}/git/commits", self.api_url, owner, repo);
+
+        let commit_request = serde_json::json!({
+            "message": commit_message,
+            "tree": tree.sha,
+            "parents": [base_commit_sha]
+        });
+
+        let new_commit_response = client
+            .post(&new_commit_url)
+            .headers(headers.clone())
+            .json(&commit_request)
+            .send()
+            .await
+            .map_err(|e| GitProviderError::ApiError(format!("Failed to create commit: {}", e)))?;
+
+        if !new_commit_response.status().is_success() {
+            let status = new_commit_response.status();
+            let error_text = new_commit_response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(GitProviderError::ApiError(format!(
+                "Failed to create commit: {} - {}",
+                status, error_text
+            )));
+        }
+
+        #[derive(Deserialize)]
+        struct NewCommitResponse {
+            sha: String,
+            message: String,
+            author: CommitAuthor,
+        }
+
+        #[derive(Deserialize)]
+        struct CommitAuthor {
+            name: String,
+            email: String,
+            date: String,
+        }
+
+        let new_commit: NewCommitResponse = new_commit_response
+            .json()
+            .await
+            .map_err(|e| GitProviderError::ApiError(format!("Failed to parse commit: {}", e)))?;
+
+        debug!("Created new commit: {}", new_commit.sha);
+
+        // 6. Update the branch reference to point to the new commit
+        let update_ref_url = format!(
+            "{}/repos/{}/{}/git/refs/heads/{}",
+            self.api_url, owner, repo, branch
+        );
+
+        let update_ref_request = serde_json::json!({
+            "sha": new_commit.sha,
+            "force": false
+        });
+
+        let update_ref_response = client
+            .patch(&update_ref_url)
+            .headers(headers)
+            .json(&update_ref_request)
+            .send()
+            .await
+            .map_err(|e| GitProviderError::ApiError(format!("Failed to update ref: {}", e)))?;
+
+        if !update_ref_response.status().is_success() {
+            let status = update_ref_response.status();
+            let error_text = update_ref_response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(GitProviderError::ApiError(format!(
+                "Failed to update branch reference: {} - {}",
+                status, error_text
+            )));
+        }
+
+        info!(
+            "Successfully pushed {} files to {}/{} with commit {}",
+            tree_entries.len(),
+            owner,
+            repo,
+            new_commit.sha
+        );
+
+        Ok(Commit {
+            sha: new_commit.sha,
+            message: new_commit.message,
+            author: new_commit.author.name,
+            author_email: new_commit.author.email,
+            date: DateTime::parse_from_rfc3339(&new_commit.author.date)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now()),
+        })
+    }
 }

@@ -1181,4 +1181,272 @@ impl GitProviderService for GitLabProvider {
             access_token.to_string(),
         )))
     }
+
+    async fn create_repository(
+        &self,
+        access_token: &str,
+        name: &str,
+        owner: Option<&str>,
+        description: Option<&str>,
+        private: bool,
+    ) -> Result<Repository, GitProviderError> {
+        let client = self.get_client();
+        let headers = self.get_headers(access_token);
+
+        // GitLab API endpoint for creating projects
+        let url = format!("{}/api/v4/projects", self.base_url);
+
+        #[derive(Serialize)]
+        struct CreateProjectRequest {
+            name: String,
+            path: String,
+            description: Option<String>,
+            visibility: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            namespace_id: Option<String>,
+            initialize_with_readme: bool,
+        }
+
+        // Get namespace ID if owner is specified
+        let namespace_id = if let Some(namespace) = owner {
+            // Try to find the namespace/group ID
+            let namespace_url = format!("{}/api/v4/namespaces?search={}", self.base_url, namespace);
+            let namespace_response = client
+                .get(&namespace_url)
+                .headers(headers.clone())
+                .send()
+                .await
+                .map_err(|e| {
+                    GitProviderError::ApiError(format!("Failed to find namespace: {}", e))
+                })?;
+
+            if namespace_response.status().is_success() {
+                #[derive(Deserialize)]
+                struct Namespace {
+                    id: i64,
+                    path: String,
+                }
+                let namespaces: Vec<Namespace> = namespace_response.json().await.map_err(|e| {
+                    GitProviderError::ApiError(format!("Failed to parse namespaces: {}", e))
+                })?;
+
+                namespaces
+                    .into_iter()
+                    .find(|n| n.path == namespace)
+                    .map(|n| n.id.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let visibility = if private { "private" } else { "public" };
+
+        let request = CreateProjectRequest {
+            name: name.to_string(),
+            path: name.to_string(),
+            description: description.map(|s| s.to_string()),
+            visibility: visibility.to_string(),
+            namespace_id,
+            initialize_with_readme: true, // Initialize with README to have a default branch
+        };
+
+        info!(
+            "Creating GitLab repository {} (visibility: {})",
+            name, visibility
+        );
+
+        let response = client
+            .post(&url)
+            .headers(headers)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                GitProviderError::ApiError(format!("Failed to create repository: {}", e))
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            error!(
+                "Failed to create GitLab repository: {} - {}",
+                status, error_text
+            );
+            return Err(GitProviderError::ApiError(format!(
+                "Failed to create repository: {} - {}",
+                status, error_text
+            )));
+        }
+
+        #[derive(Deserialize)]
+        struct GitLabProject {
+            id: i64,
+            name: String,
+            path_with_namespace: String,
+            description: Option<String>,
+            visibility: String,
+            default_branch: Option<String>,
+            http_url_to_repo: String,
+            ssh_url_to_repo: String,
+            web_url: String,
+            star_count: i32,
+            forks_count: i32,
+            created_at: String,
+            last_activity_at: String,
+        }
+
+        let project: GitLabProject = response
+            .json()
+            .await
+            .map_err(|e| GitProviderError::ApiError(format!("Failed to parse response: {}", e)))?;
+
+        let parts: Vec<&str> = project.path_with_namespace.split('/').collect();
+        let owner = parts.first().map(|s| s.to_string()).unwrap_or_default();
+
+        info!(
+            "Successfully created GitLab repository: {}",
+            project.path_with_namespace
+        );
+
+        Ok(Repository {
+            id: project.id.to_string(),
+            name: project.name,
+            full_name: project.path_with_namespace,
+            owner,
+            description: project.description,
+            private: project.visibility != "public",
+            default_branch: project.default_branch.unwrap_or_else(|| "main".to_string()),
+            clone_url: project.http_url_to_repo,
+            ssh_url: project.ssh_url_to_repo,
+            web_url: project.web_url,
+            language: None,
+            size: 0,
+            stars: project.star_count,
+            forks: project.forks_count,
+            created_at: chrono::DateTime::parse_from_rfc3339(&project.created_at)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            updated_at: chrono::DateTime::parse_from_rfc3339(&project.last_activity_at)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            pushed_at: None,
+        })
+    }
+
+    async fn push_files_to_repository(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        files: Vec<(String, Vec<u8>)>,
+        commit_message: &str,
+    ) -> Result<Commit, GitProviderError> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let client = self.get_client();
+        let headers = self.get_headers(access_token);
+
+        info!(
+            "Pushing {} files to {}/{} on branch {}",
+            files.len(),
+            owner,
+            repo,
+            branch
+        );
+
+        // URL encode the project path
+        let project_path = format!("{}/{}", owner, repo);
+        let encoded_path = urlencoding::encode(&project_path);
+
+        // GitLab API endpoint for commits (allows multi-file commits)
+        let url = format!(
+            "{}/api/v4/projects/{}/repository/commits",
+            self.base_url, encoded_path
+        );
+
+        // Build actions for each file
+        let actions: Vec<serde_json::Value> = files
+            .into_iter()
+            .map(|(path, content)| {
+                // Try to decode as UTF-8 first; if not possible, use base64
+                match String::from_utf8(content.clone()) {
+                    Ok(text_content) => {
+                        serde_json::json!({
+                            "action": "create",
+                            "file_path": path,
+                            "content": text_content
+                        })
+                    }
+                    Err(_) => {
+                        serde_json::json!({
+                            "action": "create",
+                            "file_path": path,
+                            "content": STANDARD.encode(&content),
+                            "encoding": "base64"
+                        })
+                    }
+                }
+            })
+            .collect();
+
+        let commit_request = serde_json::json!({
+            "branch": branch,
+            "commit_message": commit_message,
+            "actions": actions
+        });
+
+        let response = client
+            .post(&url)
+            .headers(headers)
+            .json(&commit_request)
+            .send()
+            .await
+            .map_err(|e| GitProviderError::ApiError(format!("Failed to create commit: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(GitProviderError::ApiError(format!(
+                "Failed to push files: {} - {}",
+                status, error_text
+            )));
+        }
+
+        #[derive(Deserialize)]
+        struct CommitResponse {
+            id: String,
+            message: String,
+            author_name: String,
+            author_email: String,
+            created_at: String,
+        }
+
+        let commit_response: CommitResponse = response.json().await.map_err(|e| {
+            GitProviderError::ApiError(format!("Failed to parse commit response: {}", e))
+        })?;
+
+        info!(
+            "Successfully pushed files to {}/{} with commit {}",
+            owner, repo, commit_response.id
+        );
+
+        Ok(Commit {
+            sha: commit_response.id,
+            message: commit_response.message,
+            author: commit_response.author_name,
+            author_email: commit_response.author_email,
+            date: chrono::DateTime::parse_from_rfc3339(&commit_response.created_at)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now()),
+        })
+    }
 }

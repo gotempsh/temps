@@ -23,8 +23,9 @@ import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { ProjectConfigurator } from '@/components/project/ProjectConfigurator'
 import { RepositoryList } from '@/components/repositories/RepositoryList'
-import type { RepositoryResponse } from '@/api/client/types.gen'
-import { GitBranch, ChevronLeft, Link as LinkIcon, Loader2, Gitlab } from 'lucide-react'
+import { TemplateList, TemplateConfigurator } from '@/components/templates'
+import type { RepositoryResponse, TemplateResponse } from '@/api/client/types.gen'
+import { GitBranch, ChevronLeft, Link as LinkIcon, Loader2, Gitlab, LayoutTemplate } from 'lucide-react'
 import Github from '@/icons/Github'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
@@ -101,6 +102,7 @@ export function GitImportClone({
   >()
   const [selectedRepository, setSelectedRepository] =
     useState<RepositoryResponse | null>(null)
+  const [selectedTemplate, setSelectedTemplate] = useState<TemplateResponse | null>(null)
   const [gitUrl, setGitUrl] = useState('')
   const [useGitUrl, setUseGitUrl] = useState(false)
   const [parsedPublicRepo, setParsedPublicRepo] = useState<ParsedGitUrl | null>(null)
@@ -220,6 +222,30 @@ export function GitImportClone({
       // Inline mode: show configurator
       setSelectedRepository(repo)
     }
+  }
+
+  // Show TemplateConfigurator when a template is selected
+  if (selectedTemplate) {
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center gap-4">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setSelectedTemplate(null)}
+          >
+            <ChevronLeft className="h-4 w-4 mr-2" />
+            Back to Templates
+          </Button>
+        </div>
+
+        <TemplateConfigurator
+          template={selectedTemplate}
+          onCancel={() => setSelectedTemplate(null)}
+          onSuccess={onProjectCreated}
+        />
+      </div>
+    )
   }
 
   // Show ProjectConfigurator when:
@@ -373,18 +399,30 @@ export function GitImportClone({
       <CardHeader className="flex items-center gap-2 pb-3">
         <GitBranch className="h-5 w-5 text-foreground" />
         <CardTitle className="text-xl font-bold">
-          Import Git Repository
+          Create New Project
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
-        <Tabs defaultValue="browse" className="w-full">
-          <TabsList className="grid w-full grid-cols-2">
+        <Tabs defaultValue="templates" className="w-full">
+          <TabsList className="grid w-full grid-cols-3">
+            <TabsTrigger value="templates">
+              <LayoutTemplate className="h-4 w-4 mr-2" />
+              Templates
+            </TabsTrigger>
             <TabsTrigger value="browse">Browse Repositories</TabsTrigger>
             <TabsTrigger value="git-url">
               <LinkIcon className="h-4 w-4 mr-2" />
-              Use Git URL
+              Git URL
             </TabsTrigger>
           </TabsList>
+
+          <TabsContent value="templates" className="space-y-4 mt-4">
+            <TemplateList
+              onTemplateSelect={setSelectedTemplate}
+              selectedTemplate={selectedTemplate}
+              showFeaturedFirst={true}
+            />
+          </TabsContent>
 
           <TabsContent value="browse" className="space-y-3 mt-4">
             <div className="flex flex-col gap-2">

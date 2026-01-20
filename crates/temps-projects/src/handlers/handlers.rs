@@ -1100,12 +1100,40 @@ pub async fn create_project_from_template(
                 .with_detail(e.to_string())
         })?;
 
-    // 2. Determine the repository owner (use provided or get from git provider connection)
-    let repo_owner = request.repository_owner.clone().unwrap_or_else(|| {
-        // Default to repository name if owner not provided
-        // In production, this would query the git provider for the authenticated user
-        request.repository_name.clone()
-    });
+    // 2. Create the repository on the git provider and push template code
+    info!(
+        "Creating repository {} from template {}",
+        request.repository_name, request.template_slug
+    );
+
+    let new_repo = state
+        .project_service
+        .git_provider_manager
+        .create_repository_and_push_template(
+            request.git_provider_connection_id,
+            &request.repository_name,
+            request.repository_owner.as_deref(),
+            Some(&format!("Created from template: {}", template.name)),
+            request.private,
+            &template.git.url,
+            &template.git.r#ref,
+            template.git.path.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to create repository from template: {:?}", e);
+            problemdetails::new(http::StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Repository Creation Failed")
+                .with_detail(format!(
+                    "Failed to create repository and push template code: {}",
+                    e
+                ))
+        })?;
+
+    info!(
+        "Successfully created repository {} from template",
+        new_repo.full_name
+    );
 
     // 3. Build the environment variables from the request
     let env_vars: Option<Vec<(String, String)>> = if request.environment_variables.is_empty() {
@@ -1121,21 +1149,20 @@ pub async fn create_project_from_template(
     };
 
     // 4. Create the project using the project service
-    // Note: The actual repository creation from template would be done by the
-    // git provider integration (cloning the template repo to the new repo)
+    // Now that the repository is created, we point to the new repository URL
     let create_request = crate::services::types::CreateProjectRequest {
         name: request.project_name.clone(),
-        repo_name: Some(request.repository_name.clone()),
-        repo_owner: Some(repo_owner.clone()),
-        directory: template.git.path.clone().unwrap_or_else(|| ".".to_string()),
-        main_branch: template.git.r#ref.clone(),
+        repo_name: Some(new_repo.name.clone()),
+        repo_owner: Some(new_repo.owner.clone()),
+        directory: ".".to_string(), // The template subfolder has been flattened into the root
+        main_branch: new_repo.default_branch.clone(),
         preset: template.preset.clone(),
         preset_config: template.preset_config.clone(),
         environment_variables: env_vars,
         automatic_deploy: request.automatic_deploy,
         storage_service_ids: request.storage_service_ids.clone(),
-        is_public_repo: Some(!request.private),
-        git_url: Some(template.git.url.clone()),
+        is_public_repo: Some(!new_repo.private),
+        git_url: Some(new_repo.clone_url.clone()),
         git_provider_connection_id: Some(request.git_provider_connection_id),
         exposed_port: None,
     };
@@ -1170,22 +1197,16 @@ pub async fn create_project_from_template(
         error!("Failed to create audit log: {:?}", e);
     }
 
-    // 6. Build the repository URL (for now, construct it from the template URL pattern)
-    // In production, this would be the actual URL of the newly created repository
-    let repository_url = format!(
-        "https://github.com/{}/{}.git",
-        repo_owner, request.repository_name
-    );
-
+    // 6. Return the response with the actual repository URL
     let response = super::templates::CreateProjectFromTemplateResponse {
         project_id: project.id,
         project_slug: project.slug,
         project_name: project.name,
-        repository_url,
+        repository_url: new_repo.clone_url,
         template_slug: request.template_slug,
         message: format!(
-            "Project created successfully from template. Services required: {:?}",
-            template.services
+            "Project created successfully from template '{}'. Repository created and initialized with template code. Services required: {:?}",
+            template.name, template.services
         ),
     };
 

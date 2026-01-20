@@ -550,6 +550,53 @@ pub trait GitProviderService: Send + Sync {
         repo: &str,
         reference: &str,
     ) -> Result<Box<dyn temps_presets::source::ProjectSource>, GitProviderError>;
+
+    /// Create a new repository on the git provider
+    ///
+    /// # Arguments
+    /// * `access_token` - Access token for authentication
+    /// * `name` - Name of the repository to create
+    /// * `owner` - Owner/organization for the repository (optional, defaults to authenticated user)
+    /// * `description` - Optional description for the repository
+    /// * `private` - Whether the repository should be private
+    ///
+    /// # Returns
+    /// * `Ok(Repository)` - The created repository
+    /// * `Err(GitProviderError)` - If creation fails
+    async fn create_repository(
+        &self,
+        access_token: &str,
+        name: &str,
+        owner: Option<&str>,
+        description: Option<&str>,
+        private: bool,
+    ) -> Result<Repository, GitProviderError>;
+
+    /// Push files to a repository
+    ///
+    /// This method creates a commit with the provided files and pushes it to the repository.
+    /// It's used for initializing repositories with template content.
+    ///
+    /// # Arguments
+    /// * `access_token` - Access token for authentication
+    /// * `owner` - Repository owner
+    /// * `repo` - Repository name
+    /// * `branch` - Branch to push to (will be created if it doesn't exist)
+    /// * `files` - List of files to commit (path, content pairs)
+    /// * `commit_message` - Commit message
+    ///
+    /// # Returns
+    /// * `Ok(Commit)` - The created commit
+    /// * `Err(GitProviderError)` - If push fails
+    async fn push_files_to_repository(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        files: Vec<(String, Vec<u8>)>,
+        commit_message: &str,
+    ) -> Result<Commit, GitProviderError>;
 }
 
 /// Factory for creating provider instances

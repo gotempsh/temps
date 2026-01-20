@@ -83,6 +83,15 @@ impl TlsService {
         domain: &str,
         email: &str,
     ) -> Result<Certificate, TlsError> {
+        // Wildcard domains require DNS-01 challenge
+        if domain.starts_with("*.") {
+            info!(
+                "Provisioning wildcard certificate for domain: {} using DNS-01 challenge with email: {}",
+                domain, email
+            );
+            return self.initiate_dns_challenge(domain, email).await;
+        }
+
         info!(
             "Provisioning certificate for domain: {} using HTTP-01 challenge with email: {}",
             domain, email
@@ -126,6 +135,62 @@ impl TlsService {
                 Err(TlsError::ManualActionRequired(format!(
                     "HTTP-01 challenge initiated for {}. The challenge token is available at /.well-known/acme-challenge/{}",
                     domain, challenge_data.token
+                )))
+            }
+            ProvisioningResult::Certificate(cert) => {
+                let saved_cert = self.repository.save_certificate(cert).await?;
+                info!("Certificate immediately available for {}", domain);
+                Ok(saved_cert)
+            }
+        }
+    }
+
+    async fn initiate_dns_challenge(
+        &self,
+        domain: &str,
+        email: &str,
+    ) -> Result<Certificate, TlsError> {
+        info!(
+            "Initiating DNS-01 challenge for {} with email: {}",
+            domain, email
+        );
+
+        match self
+            .cert_provider
+            .provision(domain, ChallengeType::Dns01, email)
+            .await?
+        {
+            ProvisioningResult::Challenge(challenge_data) => {
+                // For DNS-01, user needs to add TXT records manually
+                let txt_records_info = challenge_data
+                    .dns_txt_records
+                    .iter()
+                    .map(|r| format!("{} = {}", r.name, r.value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                info!(
+                    "DNS-01 challenge initiated for domain: {}. Add TXT record(s): {}",
+                    domain, txt_records_info
+                );
+
+                // Save the challenge data to the database for later completion
+                // We store it as an HTTP challenge record for simplicity, but it's a DNS challenge
+                let dns_challenge = HttpChallengeData {
+                    domain: domain.to_string(),
+                    token: challenge_data.token.clone(),
+                    key_authorization: challenge_data.key_authorization.clone(),
+                    validation_url: challenge_data.validation_url.clone(),
+                    order_url: challenge_data.order_url.clone(),
+                    created_at: Utc::now(),
+                };
+
+                self.repository.save_http_challenge(dns_challenge).await?;
+
+                // Return an error indicating manual action is required
+                Err(TlsError::ManualActionRequired(format!(
+                    "DNS-01 challenge initiated for {}. Add TXT record(s): {}",
+                    domain, txt_records_info
                 )))
             }
             ProvisioningResult::Certificate(cert) => {
@@ -543,11 +608,18 @@ impl TlsService {
 
         let days_remaining = cert.days_until_expiry();
 
+        let cert_type = if cert.is_wildcard {
+            "wildcard certificate"
+        } else {
+            "certificate"
+        };
+
         let notification = NotificationData {
             id: uuid::Uuid::new_v4().to_string(),
             title: format!("Action Required: Renew Certificate for {}", cert.domain),
             message: format!(
-                "Your wildcard certificate for {} will expire in {} days.\n\nSince this is a DNS-01 certificate, you need to manually renew it:\n1. Go to Temps Dashboard → Domains → {}\n2. Click 'Renew Certificate'\n3. Add the provided DNS TXT record\n4. Click 'Finalize Renewal'\n\nYour current certificate remains active during renewal.",
+                "Your {} for {} will expire in {} days.\n\nSince this is a DNS-01 certificate, you need to manually renew it:\n1. Go to Temps Dashboard → Domains → {}\n2. Click 'Renew Certificate'\n3. Add the provided DNS TXT record\n4. Click 'Finalize Renewal'\n\nYour current certificate remains active during renewal.",
+                cert_type,
                 cert.domain,
                 days_remaining,
                 cert.domain

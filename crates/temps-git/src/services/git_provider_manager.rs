@@ -333,14 +333,18 @@ impl GitProviderManager {
             GitProviderManagerError::InvalidConfiguration(format!("Invalid auth config: {}", e))
         })?;
 
+        // Check if this connection uses GitHub App installation token or PAT/OAuth
+        // A connection is a GitHub App installation if:
+        // 1. The provider is configured as GitHubApp AND
+        // 2. The connection has an installation_id
+        // Otherwise, treat it as PAT/OAuth (just return the stored token)
+        let is_github_app_installation = matches!(auth_method, AuthMethod::GitHubApp { .. })
+            && connection.installation_id.is_some();
+
         match auth_method {
-            // GitHub App: Always generate fresh installation token
-            AuthMethod::GitHubApp { .. } => {
-                let installation_id = connection.installation_id.as_ref().ok_or_else(|| {
-                    GitProviderManagerError::InvalidConfiguration(
-                        "GitHub App connection missing installation_id".to_string(),
-                    )
-                })?;
+            // GitHub App: Generate fresh installation token only if connection has installation_id
+            AuthMethod::GitHubApp { .. } if is_github_app_installation => {
+                let installation_id = connection.installation_id.as_ref().unwrap(); // Safe: checked above
 
                 debug!(
                     "Generating fresh installation token for GitHub App connection {}",
@@ -364,6 +368,22 @@ impl GitProviderManager {
                 active_connection.update(self.db.as_ref()).await?;
 
                 Ok(new_access_token)
+            }
+
+            // GitHub App provider but connection without installation_id (PAT connection)
+            // Just return the stored token like a PAT
+            AuthMethod::GitHubApp { .. } => {
+                debug!(
+                    "Connection {} uses GitHub App provider but has no installation_id, treating as PAT",
+                    connection_id
+                );
+                let access_token = connection.access_token.as_ref().ok_or_else(|| {
+                    GitProviderManagerError::InvalidConfiguration(
+                        "No access token found".to_string(),
+                    )
+                })?;
+
+                self.decrypt_string(access_token).await
             }
 
             // PAT: Just return the stored token (no refresh)
@@ -2465,7 +2485,177 @@ impl GitProviderManager {
     ) -> Result<(), GitProviderManagerError> {
         let connection = self.get_connection(connection_id).await?;
 
-        // Validate the new access token before saving
+        // When updating a connection token, we're providing a PAT, so validate it as a PAT
+        // using the /user endpoint, not the /installation/repositories endpoint
+        // This allows users to update a GitHub App installation connection to use a PAT
+        let provider = self.get_provider(connection.provider_id).await?;
+
+        // Validate the new access token as a PAT (using /user endpoint)
+        let client = reqwest::Client::new();
+        let api_url = provider
+            .api_url
+            .as_deref()
+            .unwrap_or("https://api.github.com");
+        let validation_endpoint = if provider.provider_type == "github" {
+            format!("{}/user", api_url)
+        } else if provider.provider_type == "gitlab" {
+            format!("{}/user", api_url)
+        } else {
+            // For other providers, use the provider service's validate_token
+            let provider_service = self.get_provider_service(connection.provider_id).await?;
+            match provider_service.validate_token(&new_access_token).await {
+                Ok(true) => {
+                    tracing::info!(
+                        "New access token validated successfully for connection {}",
+                        connection_id
+                    );
+                    // Continue to save the token
+                    return self
+                        .save_updated_connection_token(
+                            connection,
+                            new_access_token,
+                            new_refresh_token,
+                            connection_id,
+                            false, // Don't clear installation_id for non-GitHub/GitLab providers
+                        )
+                        .await;
+                }
+                Ok(false) => {
+                    return Err(GitProviderManagerError::InvalidConfiguration(
+                        "The provided access token is invalid or has insufficient permissions"
+                            .to_string(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(GitProviderManagerError::InvalidConfiguration(format!(
+                        "Failed to validate the provided access token: {}",
+                        e
+                    )));
+                }
+            }
+        };
+
+        let response = client
+            .get(&validation_endpoint)
+            .header("Authorization", format!("Bearer {}", new_access_token))
+            .header("User-Agent", "Temps-Git-Provider")
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| {
+                GitProviderManagerError::InvalidConfiguration(format!(
+                    "Failed to validate token: {}",
+                    e
+                ))
+            })?;
+
+        match response.status() {
+            status if status.is_success() => {
+                tracing::info!(
+                    "New access token validated successfully for connection {}",
+                    connection_id
+                );
+            }
+            status if status.as_u16() == 401 => {
+                tracing::warn!(
+                    "New access token validation failed for connection {} - token appears invalid (401)",
+                    connection_id
+                );
+                return Err(GitProviderManagerError::InvalidConfiguration(
+                    "The provided access token is invalid or has insufficient permissions"
+                        .to_string(),
+                ));
+            }
+            status => {
+                let error_text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unknown error".to_string());
+                tracing::warn!(
+                    "Error validating new access token for connection {}: {} - {}",
+                    connection_id,
+                    status,
+                    error_text
+                );
+                return Err(GitProviderManagerError::InvalidConfiguration(format!(
+                    "Failed to validate the provided access token: {} - {}",
+                    status, error_text
+                )));
+            }
+        }
+
+        // If the connection had an installation_id and we're now using a PAT, clear it
+        let clear_installation_id = connection.installation_id.is_some();
+        if clear_installation_id {
+            tracing::info!(
+                "Connection {} is being updated from GitHub App installation to PAT, clearing installation_id",
+                connection_id
+            );
+        }
+
+        self.save_updated_connection_token(
+            connection,
+            new_access_token,
+            new_refresh_token,
+            connection_id,
+            clear_installation_id,
+        )
+        .await
+    }
+
+    /// Helper method to save updated connection token
+    async fn save_updated_connection_token(
+        &self,
+        connection: git_provider_connections::Model,
+        new_access_token: String,
+        new_refresh_token: Option<String>,
+        connection_id: i32,
+        clear_installation_id: bool,
+    ) -> Result<(), GitProviderManagerError> {
+        // Encrypt the new tokens
+        let encrypted_access = self.encrypt_string(&new_access_token).await?;
+        let encrypted_refresh = if let Some(token) = new_refresh_token {
+            Some(self.encrypt_string(&token).await?)
+        } else {
+            None
+        };
+
+        let mut active_model: git_provider_connections::ActiveModel = connection.into();
+        active_model.access_token = Set(Some(encrypted_access));
+        if encrypted_refresh.is_some() {
+            active_model.refresh_token = Set(encrypted_refresh);
+        }
+        active_model.token_expires_at = Set(None); // Reset expiration since we have a new token
+        active_model.updated_at = Set(chrono::Utc::now());
+        active_model.is_active = Set(true); // Reactivate if it was deactivated due to expired token
+        active_model.is_expired = Set(false); // Reset expired flag since we have a validated token
+
+        // Clear installation_id if switching from GitHub App to PAT
+        if clear_installation_id {
+            active_model.installation_id = Set(None);
+        }
+
+        active_model.update(self.db.as_ref()).await?;
+
+        tracing::info!(
+            "Successfully updated and validated access token for connection {}",
+            connection_id
+        );
+        Ok(())
+    }
+
+    /// Validate and update connection token - legacy method for compatibility
+    /// Prefer update_connection_token which validates as PAT
+    #[allow(dead_code)]
+    pub async fn update_connection_token_with_provider_validation(
+        &self,
+        connection_id: i32,
+        new_access_token: String,
+        new_refresh_token: Option<String>,
+    ) -> Result<(), GitProviderManagerError> {
+        let connection = self.get_connection(connection_id).await?;
+
+        // Validate the new access token before saving using provider's method
         let provider_service = self.get_provider_service(connection.provider_id).await?;
         match provider_service.validate_token(&new_access_token).await {
             Ok(true) => {
@@ -3128,6 +3318,512 @@ impl GitProviderManager {
 
         Ok(())
     }
+
+    /// Push files to a repository using native git operations (git2 library)
+    ///
+    /// This is much more efficient than uploading blobs one by one via the API.
+    /// It clones the repo locally, writes files, commits, and pushes in a single operation.
+    ///
+    /// # Arguments
+    /// * `clone_url` - The repository clone URL
+    /// * `access_token` - Access token for authentication
+    /// * `branch` - The branch to push to
+    /// * `files` - List of (path, content) tuples to push
+    /// * `commit_message` - The commit message
+    /// * `author_name` - Name for the commit author
+    /// * `author_email` - Email for the commit author
+    fn push_files_with_git(
+        clone_url: &str,
+        access_token: &str,
+        branch: &str,
+        files: Vec<(String, Vec<u8>)>,
+        commit_message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<String, GitProviderManagerError> {
+        use git2::{Cred, PushOptions, RemoteCallbacks, Repository, Signature};
+        use std::fs;
+
+        // Create a temp directory for the clone
+        let temp_dir = tempfile::tempdir().map_err(|e| {
+            GitProviderManagerError::InvalidConfiguration(format!(
+                "Failed to create temp dir: {}",
+                e
+            ))
+        })?;
+
+        let repo_path = temp_dir.path();
+
+        // Inject token into the clone URL for HTTPS authentication
+        // Transform https://github.com/owner/repo.git -> https://x-access-token:TOKEN@github.com/owner/repo.git
+        let authenticated_url = if clone_url.starts_with("https://") {
+            let url_without_scheme = clone_url.strip_prefix("https://").unwrap();
+            format!(
+                "https://x-access-token:{}@{}",
+                access_token, url_without_scheme
+            )
+        } else {
+            clone_url.to_string()
+        };
+
+        info!("Cloning repository to local temp directory for push operation");
+
+        // Clone the repository
+        let repo = Repository::clone(&authenticated_url, repo_path).map_err(|e| {
+            GitProviderManagerError::InvalidConfiguration(format!(
+                "Failed to clone repository: {}",
+                e
+            ))
+        })?;
+
+        // Checkout the correct branch if it's not the default
+        let head_ref = repo.head().map_err(|e| {
+            GitProviderManagerError::InvalidConfiguration(format!(
+                "Failed to get HEAD reference: {}",
+                e
+            ))
+        })?;
+
+        let current_branch = head_ref.shorthand().unwrap_or("main");
+
+        if current_branch != branch {
+            // Try to checkout the specified branch
+            let branch_ref = format!("refs/remotes/origin/{}", branch);
+            if let Ok(reference) = repo.find_reference(&branch_ref) {
+                let commit = reference.peel_to_commit().map_err(|e| {
+                    GitProviderManagerError::InvalidConfiguration(format!(
+                        "Failed to peel to commit: {}",
+                        e
+                    ))
+                })?;
+
+                repo.branch(branch, &commit, false).map_err(|e| {
+                    GitProviderManagerError::InvalidConfiguration(format!(
+                        "Failed to create local branch: {}",
+                        e
+                    ))
+                })?;
+
+                let obj = repo
+                    .revparse_single(&format!("refs/heads/{}", branch))
+                    .map_err(|e| {
+                        GitProviderManagerError::InvalidConfiguration(format!(
+                            "Failed to find branch: {}",
+                            e
+                        ))
+                    })?;
+
+                repo.checkout_tree(&obj, None).map_err(|e| {
+                    GitProviderManagerError::InvalidConfiguration(format!(
+                        "Failed to checkout tree: {}",
+                        e
+                    ))
+                })?;
+
+                repo.set_head(&format!("refs/heads/{}", branch))
+                    .map_err(|e| {
+                        GitProviderManagerError::InvalidConfiguration(format!(
+                            "Failed to set HEAD: {}",
+                            e
+                        ))
+                    })?;
+            }
+        }
+
+        info!("Writing {} files to local repository", files.len());
+
+        // Write all files to the repository
+        for (file_path, content) in &files {
+            let full_path = repo_path.join(file_path);
+
+            // Create parent directories if needed
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    GitProviderManagerError::InvalidConfiguration(format!(
+                        "Failed to create directory for {}: {}",
+                        file_path, e
+                    ))
+                })?;
+            }
+
+            // Write the file
+            fs::write(&full_path, content).map_err(|e| {
+                GitProviderManagerError::InvalidConfiguration(format!(
+                    "Failed to write file {}: {}",
+                    file_path, e
+                ))
+            })?;
+
+            debug!("Wrote file: {}", file_path);
+        }
+
+        // Stage all files
+        let mut index = repo.index().map_err(|e| {
+            GitProviderManagerError::InvalidConfiguration(format!("Failed to get index: {}", e))
+        })?;
+
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .map_err(|e| {
+                GitProviderManagerError::InvalidConfiguration(format!(
+                    "Failed to add files to index: {}",
+                    e
+                ))
+            })?;
+
+        index.write().map_err(|e| {
+            GitProviderManagerError::InvalidConfiguration(format!("Failed to write index: {}", e))
+        })?;
+
+        let tree_oid = index.write_tree().map_err(|e| {
+            GitProviderManagerError::InvalidConfiguration(format!("Failed to write tree: {}", e))
+        })?;
+
+        let tree = repo.find_tree(tree_oid).map_err(|e| {
+            GitProviderManagerError::InvalidConfiguration(format!("Failed to find tree: {}", e))
+        })?;
+
+        // Create the commit
+        let signature = Signature::now(author_name, author_email).map_err(|e| {
+            GitProviderManagerError::InvalidConfiguration(format!(
+                "Failed to create signature: {}",
+                e
+            ))
+        })?;
+
+        let parent_commit = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+
+        let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
+
+        let commit_oid = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                commit_message,
+                &tree,
+                &parents,
+            )
+            .map_err(|e| {
+                GitProviderManagerError::InvalidConfiguration(format!(
+                    "Failed to create commit: {}",
+                    e
+                ))
+            })?;
+
+        let commit_sha = commit_oid.to_string();
+        info!("Created local commit: {}", commit_sha);
+
+        // Push to remote
+        let mut remote = repo.find_remote("origin").map_err(|e| {
+            GitProviderManagerError::InvalidConfiguration(format!("Failed to find remote: {}", e))
+        })?;
+
+        let mut callbacks = RemoteCallbacks::new();
+        callbacks.credentials(|_url, _username_from_url, _allowed_types| {
+            Cred::userpass_plaintext("x-access-token", access_token)
+        });
+
+        let mut push_options = PushOptions::new();
+        push_options.remote_callbacks(callbacks);
+
+        let refspec = format!("refs/heads/{}:refs/heads/{}", branch, branch);
+        info!("Pushing to remote with refspec: {}", refspec);
+
+        remote
+            .push(&[&refspec], Some(&mut push_options))
+            .map_err(|e| {
+                GitProviderManagerError::InvalidConfiguration(format!(
+                    "Failed to push to remote: {}",
+                    e
+                ))
+            })?;
+
+        info!(
+            "Successfully pushed {} files with commit {}",
+            files.len(),
+            commit_sha
+        );
+
+        Ok(commit_sha)
+    }
+
+    /// Create a repository on the git provider and push template files
+    ///
+    /// This method:
+    /// 1. Creates a new repository on the git provider
+    /// 2. Downloads the template repository archive
+    /// 3. Extracts the files (optionally from a subfolder)
+    /// 4. Pushes the template files to the new repository using native git operations
+    ///
+    /// # Arguments
+    /// * `connection_id` - The git provider connection ID
+    /// * `repo_name` - Name for the new repository
+    /// * `repo_owner` - Optional owner/organization (defaults to authenticated user)
+    /// * `description` - Optional description for the repository
+    /// * `private` - Whether the repository should be private
+    /// * `template_url` - URL of the template repository
+    /// * `template_ref` - Branch/tag/commit reference in the template repository
+    /// * `template_subfolder` - Optional subfolder within the template repository
+    ///
+    /// # Returns
+    /// * `Ok(Repository)` - The created repository with the pushed template code
+    /// * `Err(GitProviderManagerError)` - If any step fails
+    pub async fn create_repository_and_push_template(
+        &self,
+        connection_id: i32,
+        repo_name: &str,
+        repo_owner: Option<&str>,
+        description: Option<&str>,
+        private: bool,
+        template_url: &str,
+        template_ref: &str,
+        template_subfolder: Option<&str>,
+    ) -> Result<super::git_provider::Repository, GitProviderManagerError> {
+        info!(
+            "Creating repository {} from template {} (ref: {}, subfolder: {:?})",
+            repo_name, template_url, template_ref, template_subfolder
+        );
+
+        // Get the connection and provider
+        let connection = self.get_connection(connection_id).await?;
+        let provider_service = self.get_provider_service(connection.provider_id).await?;
+        let access_token = self
+            .validate_and_refresh_connection_token(connection_id)
+            .await?;
+
+        // Step 1: Create the new repository
+        info!("Step 1: Creating repository {} on git provider", repo_name);
+        let new_repo = provider_service
+            .create_repository(&access_token, repo_name, repo_owner, description, private)
+            .await?;
+
+        info!(
+            "Created repository: {} (clone_url: {})",
+            new_repo.full_name, new_repo.clone_url
+        );
+
+        // Step 2: Download the template archive
+        let temp_dir = tempfile::tempdir().map_err(|e| {
+            GitProviderManagerError::InvalidConfiguration(format!(
+                "Failed to create temp dir: {}",
+                e
+            ))
+        })?;
+        let archive_path = temp_dir.path().join("template.tar.gz");
+
+        // Parse template URL to get owner/repo
+        let (template_owner, template_repo) = parse_git_url(template_url).ok_or_else(|| {
+            GitProviderManagerError::InvalidConfiguration(format!(
+                "Invalid template URL: {}",
+                template_url
+            ))
+        })?;
+
+        info!(
+            "Step 2: Downloading template archive from {}/{} (ref: {})",
+            template_owner, template_repo, template_ref
+        );
+
+        // Use the provider service to download the archive
+        provider_service
+            .download_archive(
+                &access_token,
+                &template_owner,
+                &template_repo,
+                template_ref,
+                &archive_path,
+            )
+            .await?;
+
+        // Step 3: Extract the archive and read files
+        info!("Step 3: Extracting template archive");
+        let files = extract_template_files(&archive_path, template_subfolder).map_err(|e| {
+            GitProviderManagerError::InvalidConfiguration(format!(
+                "Failed to extract template: {}",
+                e
+            ))
+        })?;
+
+        if files.is_empty() {
+            error!("No files found in template archive");
+            return Err(GitProviderManagerError::InvalidConfiguration(
+                "Template archive contains no files".to_string(),
+            ));
+        }
+
+        info!("Extracted {} files from template", files.len());
+
+        // Step 4: Push template files to the new repository using native git
+        info!("Step 4: Pushing template files to new repository using native git");
+        let commit_message = format!("Initial commit from template: {}", template_url);
+
+        // Get author info from connection or use defaults
+        let author_name = if connection.account_name.is_empty() {
+            "Temps Bot"
+        } else {
+            &connection.account_name
+        };
+        let author_email = "bot@temps.sh";
+
+        // Use native git operations instead of API-based blob uploads
+        // This is much faster: single clone + commit + push vs N individual API calls
+        match Self::push_files_with_git(
+            &new_repo.clone_url,
+            &access_token,
+            &new_repo.default_branch,
+            files,
+            &commit_message,
+            author_name,
+            author_email,
+        ) {
+            Ok(commit_sha) => {
+                info!(
+                    "Successfully pushed template files with commit: {}",
+                    commit_sha
+                );
+            }
+            Err(e) => {
+                error!("Failed to push template files: {}", e);
+                // Note: Repository was already created, so we return partial success
+                // The user can still push files manually
+                return Err(e);
+            }
+        }
+
+        info!(
+            "Successfully created repository {} from template",
+            new_repo.full_name
+        );
+
+        Ok(new_repo)
+    }
+}
+
+/// Parse a git URL to extract owner and repository name
+fn parse_git_url(url: &str) -> Option<(String, String)> {
+    // Handle HTTPS URLs: https://github.com/owner/repo.git
+    // Handle SSH URLs: git@github.com:owner/repo.git
+    let url = url.trim_end_matches(".git");
+
+    if url.contains("://") {
+        // HTTPS URL
+        let parts: Vec<&str> = url.split('/').collect();
+        if parts.len() >= 2 {
+            let repo = parts.last()?;
+            let owner = parts.get(parts.len() - 2)?;
+            return Some((owner.to_string(), repo.to_string()));
+        }
+    } else if url.contains('@') && url.contains(':') {
+        // SSH URL: git@github.com:owner/repo
+        let after_colon = url.split(':').nth(1)?;
+        let parts: Vec<&str> = after_colon.split('/').collect();
+        if parts.len() >= 2 {
+            let owner = parts[0];
+            let repo = parts[1];
+            return Some((owner.to_string(), repo.to_string()));
+        }
+    }
+
+    None
+}
+
+/// Extract files from a template archive
+fn extract_template_files(
+    archive_path: &std::path::Path,
+    subfolder: Option<&str>,
+) -> Result<Vec<(String, Vec<u8>)>, std::io::Error> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    use tar::Archive;
+
+    let file = std::fs::File::open(archive_path)?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = Archive::new(decoder);
+
+    let mut files = Vec::new();
+    let entries = archive.entries()?;
+
+    // Determine the prefix to strip (archive usually has a root folder like "repo-main/")
+    let mut prefix_to_strip: Option<String> = None;
+
+    for entry in entries {
+        let mut entry = entry?;
+        let path = entry.path()?.to_path_buf();
+        let path_str = path.to_string_lossy().to_string();
+
+        // Skip pax_global_header files (tar archive artifacts)
+        if path_str == "pax_global_header" || path_str.ends_with("/pax_global_header") {
+            continue;
+        }
+
+        // Skip directories but detect the root prefix
+        if entry.header().entry_type().is_dir() {
+            // Detect the root folder prefix from the first directory entry
+            if prefix_to_strip.is_none() {
+                let root = path_str
+                    .trim_end_matches('/')
+                    .split('/')
+                    .next()
+                    .unwrap_or("");
+                if !root.is_empty() {
+                    prefix_to_strip = Some(format!("{}/", root));
+                }
+            }
+            continue;
+        }
+
+        // For files, also try to detect the prefix if not already detected
+        if prefix_to_strip.is_none() && path_str.contains('/') {
+            let root = path_str.split('/').next().unwrap_or("");
+            if !root.is_empty() {
+                prefix_to_strip = Some(format!("{}/", root));
+            }
+        }
+
+        // Get the relative path after stripping the archive root folder
+        let relative_path = if let Some(ref prefix) = prefix_to_strip {
+            if path_str.starts_with(prefix) {
+                path_str[prefix.len()..].to_string()
+            } else {
+                path_str.clone()
+            }
+        } else {
+            path_str.clone()
+        };
+
+        // Skip any remaining pax files after path processing
+        if relative_path == "pax_global_header" || relative_path.contains("pax_global_header") {
+            continue;
+        }
+
+        // If a subfolder is specified, only include files from that subfolder
+        if let Some(subfolder) = subfolder {
+            let subfolder_prefix = if subfolder.ends_with('/') {
+                subfolder.to_string()
+            } else {
+                format!("{}/", subfolder)
+            };
+
+            if !relative_path.starts_with(&subfolder_prefix) {
+                continue;
+            }
+
+            // Strip the subfolder prefix to get the final path
+            let final_path = relative_path[subfolder_prefix.len()..].to_string();
+            if !final_path.is_empty() {
+                let mut content = Vec::new();
+                entry.read_to_end(&mut content)?;
+                files.push((final_path, content));
+            }
+        } else if !relative_path.is_empty() {
+            let mut content = Vec::new();
+            entry.read_to_end(&mut content)?;
+            files.push((relative_path, content));
+        }
+    }
+
+    Ok(files)
 }
 
 // Implement the trait for GitProviderManager
@@ -3443,5 +4139,258 @@ mod tests {
         // Should succeed even if installation not found (idempotent)
         let result = manager.delete_installation(99999).await;
         assert!(result.is_ok(), "delete_installation should be idempotent");
+    }
+
+    #[test]
+    fn test_parse_git_url_https_with_git_extension() {
+        let url = "https://github.com/owner/repo.git";
+        let result = parse_git_url(url);
+        assert!(result.is_some());
+        let (owner, repo) = result.unwrap();
+        assert_eq!(owner, "owner");
+        assert_eq!(repo, "repo");
+    }
+
+    #[test]
+    fn test_parse_git_url_https_without_git_extension() {
+        let url = "https://github.com/owner/repo";
+        let result = parse_git_url(url);
+        assert!(result.is_some());
+        let (owner, repo) = result.unwrap();
+        assert_eq!(owner, "owner");
+        assert_eq!(repo, "repo");
+    }
+
+    #[test]
+    fn test_parse_git_url_ssh_format() {
+        let url = "git@github.com:owner/repo.git";
+        let result = parse_git_url(url);
+        assert!(result.is_some());
+        let (owner, repo) = result.unwrap();
+        assert_eq!(owner, "owner");
+        assert_eq!(repo, "repo");
+    }
+
+    #[test]
+    fn test_parse_git_url_ssh_without_git_extension() {
+        let url = "git@gitlab.com:myorg/myrepo";
+        let result = parse_git_url(url);
+        assert!(result.is_some());
+        let (owner, repo) = result.unwrap();
+        assert_eq!(owner, "myorg");
+        assert_eq!(repo, "myrepo");
+    }
+
+    #[test]
+    fn test_parse_git_url_gitlab_https() {
+        let url = "https://gitlab.com/group/project.git";
+        let result = parse_git_url(url);
+        assert!(result.is_some());
+        let (owner, repo) = result.unwrap();
+        assert_eq!(owner, "group");
+        assert_eq!(repo, "project");
+    }
+
+    #[test]
+    fn test_parse_git_url_with_nested_groups() {
+        // For nested groups, we want the last two components
+        let url = "https://gitlab.com/group/subgroup/project.git";
+        let result = parse_git_url(url);
+        assert!(result.is_some());
+        let (owner, repo) = result.unwrap();
+        assert_eq!(owner, "subgroup");
+        assert_eq!(repo, "project");
+    }
+
+    #[test]
+    fn test_parse_git_url_invalid_url() {
+        let url = "not-a-valid-url";
+        let result = parse_git_url(url);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_template_files_creates_files_from_archive() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        // Create a temporary directory and archive
+        let temp_dir = tempfile::tempdir().unwrap();
+        let archive_path = temp_dir.path().join("test.tar.gz");
+
+        // Create a tar.gz archive with test files
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let encoder = GzEncoder::new(file, Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+
+            // Add root directory entry first (like git archive does)
+            let mut dir_header = tar::Header::new_gnu();
+            dir_header.set_path("repo-main/").unwrap();
+            dir_header.set_size(0);
+            dir_header.set_mode(0o755);
+            dir_header.set_entry_type(tar::EntryType::Directory);
+            dir_header.set_cksum();
+            builder.append(&dir_header, &[] as &[u8]).unwrap();
+
+            // Add a file inside a root folder (mimicking git archive format)
+            let content = b"Hello, World!";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("repo-main/test.txt").unwrap();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            builder.append(&header, &content[..]).unwrap();
+
+            // Add src directory
+            let mut src_dir_header = tar::Header::new_gnu();
+            src_dir_header.set_path("repo-main/src/").unwrap();
+            src_dir_header.set_size(0);
+            src_dir_header.set_mode(0o755);
+            src_dir_header.set_entry_type(tar::EntryType::Directory);
+            src_dir_header.set_cksum();
+            builder.append(&src_dir_header, &[] as &[u8]).unwrap();
+
+            // Add another file
+            let content2 = b"console.log('test');";
+            let mut header2 = tar::Header::new_gnu();
+            header2.set_path("repo-main/src/index.js").unwrap();
+            header2.set_size(content2.len() as u64);
+            header2.set_mode(0o644);
+            header2.set_entry_type(tar::EntryType::Regular);
+            header2.set_cksum();
+            builder.append(&header2, &content2[..]).unwrap();
+
+            builder.finish().unwrap();
+        }
+
+        // Extract the files
+        let files = extract_template_files(&archive_path, None).unwrap();
+
+        assert_eq!(files.len(), 2);
+
+        // Check that the root folder prefix was stripped
+        let file_names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(file_names.contains(&"test.txt"));
+        assert!(file_names.contains(&"src/index.js"));
+
+        // Verify content
+        let test_file = files.iter().find(|(name, _)| name == "test.txt").unwrap();
+        assert_eq!(test_file.1, b"Hello, World!");
+    }
+
+    #[test]
+    fn test_extract_template_files_with_subfolder() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let archive_path = temp_dir.path().join("test.tar.gz");
+
+        // Create archive with multiple folders
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let encoder = GzEncoder::new(file, Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+
+            // Add root directory entry first
+            let mut root_dir = tar::Header::new_gnu();
+            root_dir.set_path("repo-main/").unwrap();
+            root_dir.set_size(0);
+            root_dir.set_mode(0o755);
+            root_dir.set_entry_type(tar::EntryType::Directory);
+            root_dir.set_cksum();
+            builder.append(&root_dir, &[] as &[u8]).unwrap();
+
+            // Add files in different subfolders
+            let content1 = b"Root file";
+            let mut header1 = tar::Header::new_gnu();
+            header1.set_path("repo-main/README.md").unwrap();
+            header1.set_size(content1.len() as u64);
+            header1.set_mode(0o644);
+            header1.set_entry_type(tar::EntryType::Regular);
+            header1.set_cksum();
+            builder.append(&header1, &content1[..]).unwrap();
+
+            // Add templates directory
+            let mut templates_dir = tar::Header::new_gnu();
+            templates_dir.set_path("repo-main/templates/").unwrap();
+            templates_dir.set_size(0);
+            templates_dir.set_mode(0o755);
+            templates_dir.set_entry_type(tar::EntryType::Directory);
+            templates_dir.set_cksum();
+            builder.append(&templates_dir, &[] as &[u8]).unwrap();
+
+            // Add template1 directory
+            let mut template1_dir = tar::Header::new_gnu();
+            template1_dir
+                .set_path("repo-main/templates/template1/")
+                .unwrap();
+            template1_dir.set_size(0);
+            template1_dir.set_mode(0o755);
+            template1_dir.set_entry_type(tar::EntryType::Directory);
+            template1_dir.set_cksum();
+            builder.append(&template1_dir, &[] as &[u8]).unwrap();
+
+            let content2 = b"Template 1 content";
+            let mut header2 = tar::Header::new_gnu();
+            header2
+                .set_path("repo-main/templates/template1/index.js")
+                .unwrap();
+            header2.set_size(content2.len() as u64);
+            header2.set_mode(0o644);
+            header2.set_entry_type(tar::EntryType::Regular);
+            header2.set_cksum();
+            builder.append(&header2, &content2[..]).unwrap();
+
+            let content3 = b"Template 1 config";
+            let mut header3 = tar::Header::new_gnu();
+            header3
+                .set_path("repo-main/templates/template1/config.json")
+                .unwrap();
+            header3.set_size(content3.len() as u64);
+            header3.set_mode(0o644);
+            header3.set_entry_type(tar::EntryType::Regular);
+            header3.set_cksum();
+            builder.append(&header3, &content3[..]).unwrap();
+
+            // Add template2 directory
+            let mut template2_dir = tar::Header::new_gnu();
+            template2_dir
+                .set_path("repo-main/templates/template2/")
+                .unwrap();
+            template2_dir.set_size(0);
+            template2_dir.set_mode(0o755);
+            template2_dir.set_entry_type(tar::EntryType::Directory);
+            template2_dir.set_cksum();
+            builder.append(&template2_dir, &[] as &[u8]).unwrap();
+
+            let content4 = b"Template 2 content";
+            let mut header4 = tar::Header::new_gnu();
+            header4
+                .set_path("repo-main/templates/template2/main.py")
+                .unwrap();
+            header4.set_size(content4.len() as u64);
+            header4.set_mode(0o644);
+            header4.set_entry_type(tar::EntryType::Regular);
+            header4.set_cksum();
+            builder.append(&header4, &content4[..]).unwrap();
+
+            builder.finish().unwrap();
+        }
+
+        // Extract only files from templates/template1 subfolder
+        let files = extract_template_files(&archive_path, Some("templates/template1")).unwrap();
+
+        assert_eq!(files.len(), 2);
+
+        let file_names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(file_names.contains(&"index.js"));
+        assert!(file_names.contains(&"config.json"));
+
+        // Verify the other template's files were not included
+        assert!(!file_names.contains(&"main.py"));
+        assert!(!file_names.contains(&"README.md"));
     }
 }
