@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use instant_acme::{
-    Account, AccountCredentials, ChallengeType as AcmeChallengeType, Identifier, NewAccount,
-    NewOrder, Order, OrderStatus,
+    Account, AccountCredentials, AuthorizationStatus, ChallengeType as AcmeChallengeType,
+    Identifier, NewAccount, NewOrder, Order, OrderStatus,
 };
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde_json;
@@ -207,6 +207,26 @@ impl LetsEncryptProvider {
             ProviderError::ValidationFailed("No authorizations found".to_string())
         })?;
 
+        // Check authorization status
+        match authz.status {
+            AuthorizationStatus::Valid => {
+                // This shouldn't happen since we check all_valid before calling this,
+                // but handle it gracefully
+                return Err(ProviderError::ValidationFailed(
+                    "Authorization is already valid, no challenge needed".to_string(),
+                ));
+            }
+            AuthorizationStatus::Pending => {
+                // Need to complete challenge
+            }
+            _ => {
+                return Err(ProviderError::ValidationFailed(format!(
+                    "Authorization has unexpected status: {:?}",
+                    authz.status
+                )));
+            }
+        }
+
         let challenge = authz
             .challenges
             .iter()
@@ -254,12 +274,37 @@ impl LetsEncryptProvider {
         let mut first_key_auth = String::new();
 
         for authz in &authorizations {
+            // Skip authorizations that are already valid (cached from previous validation)
+            // ACME servers cache successful validations for ~30 days, so we may encounter
+            // authorizations that don't need new challenges
+            match authz.status {
+                AuthorizationStatus::Valid => {
+                    debug!(
+                        "Authorization for {:?} is already valid, skipping challenge",
+                        authz.identifier
+                    );
+                    continue;
+                }
+                AuthorizationStatus::Pending => {
+                    // Need to complete challenge
+                }
+                _ => {
+                    return Err(ProviderError::ValidationFailed(format!(
+                        "Authorization for {:?} has unexpected status: {:?}",
+                        authz.identifier, authz.status
+                    )));
+                }
+            }
+
             let challenge = authz
                 .challenges
                 .iter()
                 .find(|c| c.r#type == AcmeChallengeType::Dns01)
                 .ok_or_else(|| {
-                    ProviderError::UnsupportedChallenge("No DNS-01 challenge found".to_string())
+                    ProviderError::UnsupportedChallenge(format!(
+                        "No DNS-01 challenge found for {:?}",
+                        authz.identifier
+                    ))
                 })?;
 
             let key_auth = order.key_authorization(challenge);
@@ -409,6 +454,22 @@ impl CertificateProvider for LetsEncryptProvider {
         }
 
         let authorizations = order.authorizations().await?;
+
+        // Check if all authorizations are already valid (cached from previous validation)
+        // This can happen when Let's Encrypt has cached the authorization (~30 days)
+        let all_valid = authorizations
+            .iter()
+            .all(|authz| authz.status == AuthorizationStatus::Valid);
+        if all_valid && !authorizations.is_empty() {
+            info!(
+                "All {} authorizations are already valid (cached), generating certificate directly",
+                authorizations.len()
+            );
+            let cert = self
+                .generate_certificate_from_order(domain, &mut order)
+                .await?;
+            return Ok(ProvisioningResult::Certificate(cert));
+        }
 
         match challenge {
             ChallengeType::Http01 => {

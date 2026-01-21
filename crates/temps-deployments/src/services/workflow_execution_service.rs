@@ -152,7 +152,16 @@ impl WorkflowExecutionService {
                 vec![]
             };
 
-            workflow_builder = workflow_builder.with_job_and_dependencies(job, dependencies);
+            // Parse _required_for_completion from job config (defaults to true for backwards compatibility)
+            let required_for_completion = db_job
+                .job_config
+                .as_ref()
+                .and_then(|config| config.get("_required_for_completion"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
+            workflow_builder =
+                workflow_builder.with_job_config(job, dependencies, required_for_completion);
         }
 
         let workflow = workflow_builder.build()?;
@@ -1082,9 +1091,12 @@ impl WorkflowExecutionService {
         Ok(())
     }
 
-    /// Teardown (stop and remove) the previous deployment in an environment
-    /// Returns the container_id of the stopped deployment, if any
+    /// Teardown (stop and remove) ALL previous deployments in an environment
+    /// Returns the container_id of the first stopped container, if any
     /// Excludes the current deployment_id to avoid stopping the newly deployed container
+    ///
+    /// This cleans up ALL old containers for this project/environment, not just the most recent one.
+    /// This prevents orphaned containers from accumulating when deployments fail or cleanup is missed.
     async fn teardown_previous_deployment(
         &self,
         project_id: i32,
@@ -1093,74 +1105,84 @@ impl WorkflowExecutionService {
     ) -> Result<Option<String>, WorkflowExecutionError> {
         use temps_entities::deployment_containers;
 
-        // Find the most recent completed deployment in this environment (excluding the current one)
-        let previous_deployment = deployments::Entity::find()
+        // Find ALL previous deployments in this environment (excluding the current one)
+        // that have active (non-deleted) containers
+        let previous_deployments = deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::State.eq("completed"))
             .filter(deployments::Column::Id.ne(current_deployment_id)) // Exclude current deployment
-            .order_by_desc(deployments::Column::Id)
-            .one(self.db.as_ref())
+            .all(self.db.as_ref())
             .await?;
 
-        if let Some(deployment) = previous_deployment {
-            // Get all containers for this deployment
+        let mut first_stopped_container_id: Option<String> = None;
+        let mut total_containers_cleaned = 0;
+
+        for deployment in previous_deployments {
+            // Get all non-deleted containers for this deployment
             let containers = deployment_containers::Entity::find()
                 .filter(deployment_containers::Column::DeploymentId.eq(deployment.id))
                 .filter(deployment_containers::Column::DeletedAt.is_null())
                 .all(self.db.as_ref())
                 .await?;
 
-            if !containers.is_empty() {
-                info!(
-                    "Tearing down previous deployment {} ({} containers)",
-                    deployment.id,
-                    containers.len()
-                );
+            if containers.is_empty() {
+                continue;
+            }
 
-                let mut stopped_container_ids = Vec::new();
+            info!(
+                "Tearing down deployment {} ({} containers)",
+                deployment.id,
+                containers.len()
+            );
 
-                for container in containers {
-                    let container_id = container.container_id.clone();
+            for container in containers {
+                let container_id = container.container_id.clone();
 
-                    // Stop and remove the container
-                    match self.container_deployer.stop_container(&container_id).await {
-                        Ok(_) => {
-                            info!("Stopped container {}", container_id);
-                        }
-                        Err(e) => {
-                            warn!("Failed to stop container {}: {}", container_id, e);
-                        }
+                // Stop and remove the container
+                match self.container_deployer.stop_container(&container_id).await {
+                    Ok(_) => {
+                        info!("Stopped container {}", container_id);
                     }
-
-                    match self
-                        .container_deployer
-                        .remove_container(&container_id)
-                        .await
-                    {
-                        Ok(_) => {
-                            info!("Removed container {}", container_id);
-                        }
-                        Err(e) => {
-                            warn!("Failed to remove container {}: {}", container_id, e);
-                        }
+                    Err(e) => {
+                        warn!("Failed to stop container {}: {}", container_id, e);
                     }
-
-                    // Mark container as deleted
-                    use sea_orm::{ActiveModelTrait, Set};
-                    let mut active_container: deployment_containers::ActiveModel = container.into();
-                    active_container.deleted_at = Set(Some(chrono::Utc::now()));
-                    active_container.status = Set(Some("deleted".to_string()));
-                    active_container.update(self.db.as_ref()).await?;
-
-                    stopped_container_ids.push(container_id);
                 }
 
-                return Ok(stopped_container_ids.into_iter().next());
+                match self
+                    .container_deployer
+                    .remove_container(&container_id)
+                    .await
+                {
+                    Ok(_) => {
+                        info!("Removed container {}", container_id);
+                    }
+                    Err(e) => {
+                        warn!("Failed to remove container {}: {}", container_id, e);
+                    }
+                }
+
+                // Mark container as deleted
+                use sea_orm::{ActiveModelTrait, Set};
+                let mut active_container: deployment_containers::ActiveModel = container.into();
+                active_container.deleted_at = Set(Some(chrono::Utc::now()));
+                active_container.status = Set(Some("deleted".to_string()));
+                active_container.update(self.db.as_ref()).await?;
+
+                if first_stopped_container_id.is_none() {
+                    first_stopped_container_id = Some(container_id);
+                }
+                total_containers_cleaned += 1;
             }
         }
 
-        Ok(None)
+        if total_containers_cleaned > 0 {
+            info!(
+                "Cleaned up {} containers from previous deployments",
+                total_containers_cleaned
+            );
+        }
+
+        Ok(first_stopped_container_id)
     }
 }
 

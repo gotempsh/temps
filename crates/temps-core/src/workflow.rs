@@ -568,6 +568,23 @@ impl WorkflowBuilder {
         self
     }
 
+    /// Add a job with custom dependencies and required flag
+    /// Use this for post-deployment jobs that shouldn't fail the entire deployment
+    pub fn with_job_config(
+        mut self,
+        job: Arc<dyn WorkflowTask>,
+        dependencies: Vec<String>,
+        required: bool,
+    ) -> Self {
+        self.jobs.push(JobConfig {
+            job,
+            required,
+            condition: None,
+            dependencies_override: Some(dependencies),
+        });
+        self
+    }
+
     /// Add multiple jobs
     pub fn with_jobs(mut self, jobs: Vec<Arc<dyn WorkflowTask>>) -> Self {
         for job in jobs {
