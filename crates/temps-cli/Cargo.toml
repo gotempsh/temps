@@ -87,6 +87,10 @@ tar = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 x509-parser = "0.16"
+glob = "0.3"
+uuid = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
 
 [build-dependencies]
 chrono = { workspace = true }

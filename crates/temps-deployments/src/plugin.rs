@@ -166,6 +166,15 @@ impl TempsPlugin for DeploymentsPlugin {
             });
 
             tracing::debug!("Deployment job processor started successfully");
+
+            // Get the db connection for RemoteDeploymentService
+            let db_for_remote = context.require_service::<sea_orm::DatabaseConnection>();
+
+            // Create RemoteDeploymentService
+            let remote_deployment_service =
+                Arc::new(crate::services::RemoteDeploymentService::new(db_for_remote));
+            context.register_service(remote_deployment_service);
+
             tracing::debug!("Deployments plugin services registered successfully");
             Ok(())
         })
@@ -186,20 +195,28 @@ impl TempsPlugin for DeploymentsPlugin {
         let external_deployment_manager =
             Arc::new(crate::services::ExternalDeploymentManager::new());
 
+        // Get RemoteDeploymentService for handling remote deployments
+        let remote_deployment_service = context
+            .get_service::<crate::services::RemoteDeploymentService>()
+            .expect("RemoteDeploymentService must be registered before configuring routes");
+
         let app_state = Arc::new(handlers::types::AppState {
             deployment_service,
             log_service,
             cron_service,
             external_deployment_manager,
+            remote_deployment_service,
         });
 
         let deployments_routes = handlers::deployments::configure_routes();
         let cron_routes = handlers::crons::configure_routes();
         let external_images_routes = handlers::external_images::configure_routes();
+        let remote_deployments_routes = handlers::remote_deployments::configure_routes();
 
         let routes = deployments_routes
             .merge(cron_routes)
             .merge(external_images_routes)
+            .merge(remote_deployments_routes)
             .with_state(app_state);
 
         Some(PluginRoutes { router: routes })
@@ -211,10 +228,16 @@ impl TempsPlugin for DeploymentsPlugin {
         let cron_schema = <handlers::crons::CronApiDoc as UtoimaOpenApi>::openapi();
         let external_images_schema =
             <handlers::external_images::ExternalImagesApiDoc as UtoimaOpenApi>::openapi();
+        let remote_deployments_schema =
+            <handlers::remote_deployments::RemoteDeploymentsApiDoc as UtoimaOpenApi>::openapi();
 
         Some(temps_core::openapi::merge_openapi_schemas(
             deployments_schema,
-            vec![cron_schema, external_images_schema],
+            vec![
+                cron_schema,
+                external_images_schema,
+                remote_deployments_schema,
+            ],
         ))
     }
 }

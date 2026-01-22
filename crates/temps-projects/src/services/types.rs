@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use temps_core::UtcDateTime;
+use temps_entities::source_type::SourceType;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,6 +62,8 @@ pub struct Project {
     pub deployment_config: Option<temps_entities::prelude::DeploymentConfig>,
     pub attack_mode: bool,
     pub enable_preview_environments: bool,
+    /// Source type for deployments (git, docker_image, or static_files)
+    pub source_type: SourceType,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +83,9 @@ pub struct CreateProjectRequest {
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
     pub exposed_port: Option<i32>,
+    /// Source type for deployments (git, docker_image, or static_files)
+    #[serde(default)]
+    pub source_type: SourceType,
 }
 
 #[derive(Deserialize)]

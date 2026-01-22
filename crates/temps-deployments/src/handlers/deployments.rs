@@ -1560,11 +1560,15 @@ mod tests {
             ),
         );
 
+        let remote_deployment_service =
+            Arc::new(crate::services::RemoteDeploymentService::new(db.clone()));
+
         let app_state = Arc::new(AppState {
             deployment_service,
             log_service,
             cron_service,
             external_deployment_manager: Arc::new(crate::services::ExternalDeploymentManager::new()),
+            remote_deployment_service,
         });
 
         // Create test data in database
@@ -1828,11 +1832,15 @@ mod tests {
             ),
         );
 
+        let remote_deployment_service =
+            Arc::new(crate::services::RemoteDeploymentService::new(db.clone()));
+
         let app_state = Arc::new(AppState {
             deployment_service,
             log_service: log_service.clone(),
             cron_service,
             external_deployment_manager: Arc::new(crate::services::ExternalDeploymentManager::new()),
+            remote_deployment_service,
         });
 
         // Create test data
@@ -2095,11 +2103,15 @@ mod tests {
             ),
         );
 
+        let remote_deployment_service =
+            Arc::new(crate::services::RemoteDeploymentService::new(db.clone()));
+
         let app_state = Arc::new(AppState {
             deployment_service,
             log_service: log_service.clone(),
             cron_service,
             external_deployment_manager: Arc::new(crate::services::ExternalDeploymentManager::new()),
+            remote_deployment_service,
         });
 
         // Create test data
@@ -2369,11 +2381,15 @@ mod tests {
             ),
         );
 
+        let remote_deployment_service =
+            Arc::new(crate::services::RemoteDeploymentService::new(db.clone()));
+
         Arc::new(AppState {
             deployment_service,
             log_service,
             cron_service,
             external_deployment_manager: Arc::new(crate::services::ExternalDeploymentManager::new()),
+            remote_deployment_service,
         })
     }
 

@@ -21,6 +21,7 @@ mod m20251209_000001_add_environments_route_trigger;
 mod m20251210_000001_add_vulnerability_class_fields;
 mod m20260103_000001_add_visitor_has_activity;
 mod m20260103_000002_add_utm_fields_to_sessions;
+mod m20260121_000001_add_remote_builds_support;
 
 pub struct Migrator;
 
@@ -49,6 +50,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20251210_000001_add_vulnerability_class_fields::Migration),
             Box::new(m20260103_000001_add_visitor_has_activity::Migration),
             Box::new(m20260103_000002_add_utm_fields_to_sessions::Migration),
+            Box::new(m20260121_000001_add_remote_builds_support::Migration),
         ]
     }
 }

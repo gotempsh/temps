@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use temps_core::templates::TemplateService;
 use temps_core::UtcDateTime;
 use temps_entities::deployment_config::DeploymentConfig;
+use temps_entities::source_type::SourceType;
 use utoipa::ToSchema;
 
 use crate::services::custom_domains::CustomDomainService;
@@ -183,6 +184,16 @@ pub struct CreateProjectRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 8080)]
     pub exposed_port: Option<i32>,
+    /// Source type for deployments
+    ///
+    /// Determines how the project is deployed:
+    /// - **git** (default): Traditional Git-based deployments - source code is pulled, built, and deployed
+    /// - **docker_image**: Deploy pre-built Docker images from external registries (DockerHub, GHCR, etc.)
+    /// - **static_files**: Deploy pre-built static files uploaded as tar.gz or zip bundles
+    ///
+    /// For `docker_image` and `static_files` source types, `repo_name` and `repo_owner` are optional.
+    #[serde(default)]
+    pub source_type: SourceType,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -250,6 +261,8 @@ pub struct ProjectResponse {
     pub attack_mode: bool,
     /// Enable automatic preview environment creation for each branch
     pub enable_preview_environments: bool,
+    /// Source type for deployments (git, docker_image, or static_files)
+    pub source_type: SourceType,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -276,6 +289,7 @@ impl ProjectResponse {
             git_provider_connection_id: project.git_provider_connection_id,
             attack_mode: project.attack_mode,
             enable_preview_environments: project.enable_preview_environments,
+            source_type: project.source_type,
             deployment_config: DeploymentConfig {
                 cpu_request: project
                     .deployment_config

@@ -180,8 +180,8 @@ impl ProjectService {
 
         let project = projects::ActiveModel {
             name: Set(request.name),
-            repo_name: Set(request.repo_name.unwrap_or_else(|| "unknown".to_string())),
-            repo_owner: Set(request.repo_owner.unwrap_or_else(|| "unknown".to_string())),
+            repo_name: Set(request.repo_name.unwrap_or_default()),
+            repo_owner: Set(request.repo_owner.unwrap_or_default()),
             directory: Set(normalized_directory),
             main_branch: Set(request.main_branch),
             preset: Set(preset), // Now required, not Option
@@ -195,6 +195,7 @@ impl ProjectService {
             git_provider_connection_id: Set(request.git_provider_connection_id),
             deleted_at: Set(None),
             last_deployment: Set(None),
+            source_type: Set(request.source_type),
             ..Default::default()
         };
 
@@ -281,10 +282,14 @@ impl ProjectService {
                 project_found_db.id
             );
         }
-        // Queue initial deployment/pipeline job if project has repository information
-        if !project_found_db.repo_owner.is_empty() && !project_found_db.repo_name.is_empty() {
+        // Queue initial deployment/pipeline job only for Git-based projects with repository information
+        // For docker_image and static_files source types, deployments are triggered via API
+        if project_found_db.source_type.requires_git_info()
+            && !project_found_db.repo_owner.is_empty()
+            && !project_found_db.repo_name.is_empty()
+        {
             info!(
-                "Queueing initial deployment job for project: {}",
+                "Queueing initial deployment job for Git project: {}",
                 project_found_db.id
             );
 
@@ -307,6 +312,11 @@ impl ProjectService {
                     );
                 }
             }
+        } else {
+            info!(
+                "Skipping initial deployment for project {} (source_type: {})",
+                project_found_db.id, project_found_db.source_type
+            );
         }
 
         Ok(Self::map_db_project_to_project(project_found_db))
@@ -1254,12 +1264,24 @@ impl ProjectService {
         // Convert preset enum to string for backwards compatibility
         let preset_str = format!("{:?}", db_project.preset).to_lowercase();
 
+        // Handle repo_name and repo_owner - return None for empty strings (Git-less projects)
+        let repo_name = if db_project.repo_name.is_empty() {
+            None
+        } else {
+            Some(db_project.repo_name)
+        };
+        let repo_owner = if db_project.repo_owner.is_empty() {
+            None
+        } else {
+            Some(db_project.repo_owner)
+        };
+
         Project {
             id: db_project.id,
             slug: db_project.slug,
             name: db_project.name,
-            repo_name: Some(db_project.repo_name),
-            repo_owner: Some(db_project.repo_owner),
+            repo_name,
+            repo_owner,
             directory: db_project.directory,
             main_branch: db_project.main_branch,
             preset: Some(preset_str),
@@ -1292,6 +1314,7 @@ impl ProjectService {
             deployment_config: deployment_config.clone(),
             attack_mode: db_project.attack_mode,
             enable_preview_environments: db_project.enable_preview_environments,
+            source_type: db_project.source_type,
         }
     }
 
@@ -1733,6 +1756,7 @@ mod tests {
             exposed_port: None,
             is_public_repo: None,
             storage_service_ids: vec![],
+            source_type: temps_entities::source_type::SourceType::Git,
         };
 
         let result = project_service
@@ -1856,6 +1880,7 @@ mod tests {
             git_url: None,
             git_provider_connection_id: None,
             exposed_port: None,
+            source_type: temps_entities::source_type::SourceType::Git,
         };
 
         project_service

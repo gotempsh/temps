@@ -31,3 +31,6 @@ pub use docker_cleanup_service::*;
 
 pub mod deployment_token_service;
 pub use deployment_token_service::*;
+
+pub mod remote_deployment_service;
+pub use remote_deployment_service::*;

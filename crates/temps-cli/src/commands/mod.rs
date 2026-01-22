@@ -1,4 +1,6 @@
 pub mod backup;
+pub mod build;
+pub mod deploy;
 pub mod domain;
 pub mod proxy;
 pub mod reset_password;
@@ -7,6 +9,8 @@ pub mod services;
 pub mod setup;
 
 pub use backup::BackupCommand;
+pub use build::BuildCommand;
+pub use deploy::DeployCommand;
 pub use domain::DomainCommand;
 pub use proxy::ProxyCommand;
 pub use reset_password::ResetPasswordCommand;

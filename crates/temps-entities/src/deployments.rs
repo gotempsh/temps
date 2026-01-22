@@ -65,6 +65,26 @@ pub struct DeploymentMetadata {
     /// Custom labels/tags for the deployment
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+
+    // =========================================================================
+    // Remote deployment fields (for Git-less deployments)
+    // =========================================================================
+    /// External Docker image reference (for docker_image source type)
+    /// e.g., "ghcr.io/org/app:v1.0" or "docker.io/myapp:sha-abc123"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_image_ref: Option<String>,
+
+    /// External image ID (reference to external_images table)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_image_id: Option<i32>,
+
+    /// Static bundle ID (reference to static_bundles table, for static_files source type)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub static_bundle_id: Option<i32>,
+
+    /// Static bundle path in blob storage (for static_files source type)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub static_bundle_path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]

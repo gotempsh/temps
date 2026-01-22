@@ -6,6 +6,7 @@ use temps_core::DBDateTime;
 
 use super::deployment_config::DeploymentConfig;
 use super::preset::{Preset, PresetConfig};
+use super::source_type::SourceType;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "projects")]
@@ -41,6 +42,10 @@ pub struct Model {
     pub attack_mode: bool,
     /// Enable automatic preview environment creation for each branch
     pub enable_preview_environments: bool,
+    /// Source type - determines how deployments are triggered and executed
+    /// Defaults to 'git' for backward compatibility
+    #[sea_orm(default_value = "git")]
+    pub source_type: SourceType,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

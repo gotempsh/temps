@@ -563,6 +563,7 @@ impl WorkloadImporter for DockerImporter {
             git_url: None,
             git_provider_connection_id: context.git_provider_connection_id,
             exposed_port: None,
+            source_type: temps_entities::source_type::SourceType::Git,
         };
 
         let project = project_service

@@ -7,8 +7,8 @@ mod commands;
 
 use clap::{Parser, Subcommand};
 use commands::{
-    BackupCommand, DomainCommand, ProxyCommand, ResetPasswordCommand, ServeCommand,
-    ServicesCommand, SetupCommand,
+    BackupCommand, BuildCommand, DeployCommand, DomainCommand, ProxyCommand, ResetPasswordCommand,
+    ServeCommand, ServicesCommand, SetupCommand,
 };
 use tracing_subscriber::{layer::SubscriberExt, Layer};
 
@@ -54,6 +54,10 @@ enum Commands {
     Services(ServicesCommand),
     /// Domain and certificate management
     Domain(DomainCommand),
+    /// Build a Docker image locally
+    Build(BuildCommand),
+    /// Deploy pre-built images or static files to environments
+    Deploy(DeployCommand),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -149,5 +153,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Backup(backup_cmd) => backup_cmd.execute(),
         Commands::Services(services_cmd) => services_cmd.execute(),
         Commands::Domain(domain_cmd) => domain_cmd.execute(),
+        Commands::Build(build_cmd) => build_cmd.execute(),
+        Commands::Deploy(deploy_cmd) => deploy_cmd.execute(),
     }
 }

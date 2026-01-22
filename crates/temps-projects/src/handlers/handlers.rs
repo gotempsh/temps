@@ -28,6 +28,7 @@ use super::types::{
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
+use temps_entities::source_type::SourceType;
 
 pub fn configure_routes() -> Router<Arc<AppState>> {
     let custom_domain_routes = super::custom_domains::configure_routes();
@@ -155,12 +156,16 @@ pub async fn create_project(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsCreate);
 
-    // If git provider is specified, repo_name and repo_owner should also be provided
-    if project.repo_name.is_none() || project.repo_owner.is_none() {
+    // Only require repo_name and repo_owner for Git source type
+    // For docker_image and static_files, Git info is optional
+    if project.source_type.requires_git_info()
+        && (project.repo_name.is_none() || project.repo_owner.is_none())
+    {
         return Err(problemdetails::new(http::StatusCode::BAD_REQUEST)
             .with_title("Missing Repository Information")
             .with_detail(
-                "When using a git provider, both repo_name and repo_owner must be specified",
+                "For Git-based projects, both repo_name and repo_owner must be specified. \
+                Use source_type 'docker_image' or 'static_files' for Git-less deployments.",
             ));
     }
 
@@ -179,6 +184,7 @@ pub async fn create_project(
         git_url: project.git_url,
         git_provider_connection_id: project.git_provider_connection_id,
         exposed_port: project.exposed_port,
+        source_type: project.source_type,
     };
 
     let new_project = state
@@ -366,6 +372,7 @@ pub async fn update_project(
         git_url: None,                      // Keep existing setting
         git_provider_connection_id: None,   // Keep existing setting
         exposed_port: project.exposed_port, // Keep existing or update if provided
+        source_type: project.source_type,   // Preserve source type
     };
     let updated_project = state
         .project_service
@@ -1165,6 +1172,7 @@ pub async fn create_project_from_template(
         git_url: Some(new_repo.clone_url.clone()),
         git_provider_connection_id: Some(request.git_provider_connection_id),
         exposed_port: None,
+        source_type: SourceType::Git, // Templates are always Git-based
     };
 
     let project = state

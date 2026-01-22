@@ -9,6 +9,7 @@ homepage.workspace = true
 
 [dependencies]
 temps-auth = { path = "../temps-auth" }
+temps-blob = { path = "../temps-blob" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
@@ -24,6 +25,7 @@ temps-screenshots = { path = "../temps-screenshots" }
 temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 serde = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 serde_yaml = { workspace = true }
@@ -47,6 +49,8 @@ tar = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
 cron = "0.12"
+flate2 = { workspace = true }
+zip = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
