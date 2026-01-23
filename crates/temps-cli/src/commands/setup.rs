@@ -1462,6 +1462,7 @@ impl SetupCommand {
                 &password,
                 &self.wildcard_domain,
                 self.non_interactive,
+                self.admin_password.is_some(),
                 &self.output_format,
             );
         }
@@ -1587,6 +1588,7 @@ impl SetupCommand {
                 &password,
                 &self.wildcard_domain,
                 self.non_interactive,
+                self.admin_password.is_some(),
                 &self.output_format,
             );
         }
@@ -1663,26 +1665,34 @@ impl SetupCommand {
                         detected_ip.bright_cyan()
                     ));
 
-                    // Always ask for confirmation - IP is critical for DNS setup
-                    println!();
-                    if !ask_confirmation(&format!(
-                        "   Is {} the correct public IP for this server? (y/n):",
-                        detected_ip.bright_cyan()
-                    ))? {
-                        println!();
-                        print!("   {} ", "Enter the correct IP address:".bright_white());
-                        io::stdout().flush()?;
-                        let mut custom_ip = String::new();
-                        io::stdin().read_line(&mut custom_ip)?;
-                        let custom_ip = custom_ip.trim().to_string();
-
-                        // Validate the IP
-                        if custom_ip.parse::<std::net::IpAddr>().is_err() {
-                            return Err(anyhow::anyhow!("❌ Invalid IP address: {}", custom_ip));
-                        }
-                        custom_ip
-                    } else {
+                    // In non-interactive mode, use the detected IP without confirmation
+                    if self.non_interactive {
                         detected_ip
+                    } else {
+                        // Ask for confirmation - IP is critical for DNS setup
+                        println!();
+                        if !ask_confirmation(&format!(
+                            "   Is {} the correct public IP for this server? (y/n):",
+                            detected_ip.bright_cyan()
+                        ))? {
+                            println!();
+                            print!("   {} ", "Enter the correct IP address:".bright_white());
+                            io::stdout().flush()?;
+                            let mut custom_ip = String::new();
+                            io::stdin().read_line(&mut custom_ip)?;
+                            let custom_ip = custom_ip.trim().to_string();
+
+                            // Validate the IP
+                            if custom_ip.parse::<std::net::IpAddr>().is_err() {
+                                return Err(anyhow::anyhow!(
+                                    "❌ Invalid IP address: {}",
+                                    custom_ip
+                                ));
+                            }
+                            custom_ip
+                        } else {
+                            detected_ip
+                        }
                     }
                 }
                 Err(e) => {
@@ -1792,6 +1802,7 @@ impl SetupCommand {
                 &password,
                 &self.wildcard_domain,
                 self.non_interactive,
+                self.admin_password.is_some(),
                 &self.output_format,
             );
         }
@@ -1832,6 +1843,7 @@ impl SetupCommand {
                 &password,
                 &self.wildcard_domain,
                 self.non_interactive,
+                self.admin_password.is_some(),
                 &self.output_format,
             );
         }
@@ -2275,6 +2287,7 @@ impl SetupCommand {
             &password,
             &self.wildcard_domain,
             self.non_interactive,
+            self.admin_password.is_some(),
             &self.output_format,
         )
     }
@@ -2295,6 +2308,7 @@ fn finish_setup(
     password: &str,
     wildcard_domain: &str,
     non_interactive: bool,
+    password_was_provided: bool,
     output_format: &OutputFormat,
 ) -> anyhow::Result<()> {
     // JSON output for automation
@@ -2339,7 +2353,11 @@ fn finish_setup(
         wildcard_domain.bright_cyan()
     );
 
-    if !password.is_empty() {
+    // Only show password and prompt if password was auto-generated (not user-provided)
+    // and we're not in non-interactive mode
+    let show_password_prompt = !password.is_empty() && !password_was_provided;
+
+    if show_password_prompt {
         println!(
             "{} {}",
             "Admin Email:".bright_white().bold(),
@@ -2377,6 +2395,13 @@ fn finish_setup(
                 println!();
             }
         }
+    } else if !password.is_empty() {
+        // Password was provided by user, just show email
+        println!(
+            "{} {}",
+            "Admin Email:".bright_white().bold(),
+            user.email.bright_cyan()
+        );
     }
 
     println!();
