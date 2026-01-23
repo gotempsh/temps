@@ -85,6 +85,16 @@ pub struct DeploymentMetadata {
     /// Static bundle path in blob storage (for static_files source type)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub static_bundle_path: Option<String>,
+
+    /// Static bundle content type (for proper extraction: application/gzip or application/zip)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub static_bundle_content_type: Option<String>,
+
+    /// Source type for THIS specific deployment (for Manual/flexible projects)
+    /// This allows Manual projects to have deployments via different methods
+    /// (docker_image, static_files, or git) while keeping per-deployment tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_source_type: Option<crate::source_type::SourceType>,
 }
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]

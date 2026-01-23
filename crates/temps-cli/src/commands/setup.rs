@@ -17,7 +17,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use temps_auth::UserService;
-use temps_core::EncryptionService;
+use temps_core::{AppSettings, EncryptionService};
 use temps_dns::providers::credentials::{
     AzureCredentials, CloudflareCredentials, DigitalOceanCredentials, GcpCredentials,
     ProviderCredentials, Route53Credentials,
@@ -29,9 +29,11 @@ use temps_domains::tls::providers::LetsEncryptProvider;
 use temps_domains::tls::repository::DefaultCertificateRepository;
 use temps_domains::DomainService;
 use temps_entities::{
-    dns_providers, domains, git_provider_connections, git_providers, roles, user_roles, users,
+    dns_providers, domains, git_provider_connections, git_providers, roles, settings, user_roles,
+    users,
 };
 use tracing::{debug, warn};
+use x509_parser::prelude::*;
 
 /// Supported DNS providers
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -92,13 +94,14 @@ pub struct SetupCommand {
     #[arg(long)]
     pub wildcard_domain: String,
 
-    /// DNS provider type (required for wildcard domain certificate provisioning)
+    /// DNS provider type (required for certificate provisioning via Let's Encrypt)
+    /// Optional when using --wildcard-domain-cert with --skip-dns-records
     #[arg(long, value_enum)]
-    pub dns_provider: DnsProviderType,
+    pub dns_provider: Option<DnsProviderType>,
 
     /// Cloudflare API token (required for Cloudflare DNS provider)
     #[arg(long, env = "CLOUDFLARE_API_TOKEN")]
-    pub cloudflare_token: String,
+    pub cloudflare_token: Option<String>,
 
     /// AWS Access Key ID (for Route53 DNS provider)
     #[arg(long, env = "AWS_ACCESS_KEY_ID")]
@@ -148,9 +151,15 @@ pub struct SetupCommand {
     #[arg(long, env = "GCP_PROJECT_ID")]
     pub gcp_project_id: Option<String>,
 
-    /// GitHub Personal Access Token (required for Git provider integration)
+    /// GitHub Personal Access Token (optional, for Git provider integration)
+    /// Skip with --skip-git to set up Temps without GitHub integration
     #[arg(long, env = "GITHUB_TOKEN")]
-    pub github_token: String,
+    pub github_token: Option<String>,
+
+    /// Skip Git provider setup (allows running Temps without GitHub)
+    /// Useful for testing or when only using Docker image/static file deployments
+    #[arg(long, default_value = "false")]
+    pub skip_git: bool,
 
     /// Skip interactive prompts and use defaults
     #[arg(long, default_value = "false")]
@@ -187,6 +196,21 @@ pub struct SetupCommand {
     /// Output format: text (human-readable) or json (machine-readable)
     #[arg(long, value_enum, default_value = "text")]
     pub output_format: OutputFormat,
+
+    /// Path to external wildcard certificate file (PEM format)
+    /// When provided, skips Let's Encrypt provisioning and uses this certificate
+    #[arg(long)]
+    pub wildcard_domain_cert: Option<PathBuf>,
+
+    /// Path to external wildcard certificate private key file (PEM format)
+    /// Required when --wildcard-domain-cert is provided
+    #[arg(long)]
+    pub wildcard_domain_key: Option<PathBuf>,
+
+    /// External URL base for the application (e.g., "https://app.example.com")
+    /// Used when running behind a reverse proxy or load balancer
+    #[arg(long, env = "TEMPS_EXTERNAL_URL")]
+    pub external_url: Option<String>,
 }
 
 fn generate_secure_password() -> String {
@@ -723,6 +747,248 @@ fn check_geolite2_database(data_dir: &PathBuf) {
     println!();
 }
 
+/// Validate certificate PEM format and extract expiration time
+fn validate_and_parse_certificate(
+    cert_pem: &str,
+    expected_domain: &str,
+) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    use chrono::Utc;
+
+    // Parse PEM certificate
+    let (_, pem) = parse_x509_pem(cert_pem.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Failed to parse certificate PEM: {:?}", e))?;
+
+    // Parse X509 certificate
+    let (_, cert) = X509Certificate::from_der(&pem.contents)
+        .map_err(|e| anyhow::anyhow!("Failed to parse X509 certificate: {:?}", e))?;
+
+    // Get expiration time
+    let not_after = cert.validity().not_after;
+    let expiration_timestamp = not_after.timestamp();
+    let expiration_time = chrono::DateTime::from_timestamp(expiration_timestamp, 0)
+        .ok_or_else(|| anyhow::anyhow!("Invalid certificate expiration timestamp"))?;
+
+    // Check if certificate is expired
+    if expiration_time < Utc::now() {
+        return Err(anyhow::anyhow!(
+            "Certificate is already expired (expired on {})",
+            expiration_time.format("%Y-%m-%d %H:%M:%S UTC")
+        ));
+    }
+
+    // Check certificate domains (CN and SANs)
+    let mut cert_domains: Vec<String> = Vec::new();
+
+    // Get Common Name
+    if let Some(cn) = cert.subject().iter_common_name().next() {
+        if let Ok(cn_str) = cn.as_str() {
+            cert_domains.push(cn_str.to_string());
+        }
+    }
+
+    // Get Subject Alternative Names
+    if let Ok(Some(san_ext)) = cert.subject_alternative_name() {
+        for name in &san_ext.value.general_names {
+            if let GeneralName::DNSName(dns) = name {
+                cert_domains.push(dns.to_string());
+            }
+        }
+    }
+
+    // Check if expected domain matches certificate
+    let domain_matches = cert_domains.iter().any(|cert_domain| {
+        if cert_domain == expected_domain {
+            return true;
+        }
+        // Check wildcard matching
+        if cert_domain.starts_with("*.") {
+            let cert_suffix = &cert_domain[2..];
+            if expected_domain.starts_with("*.") {
+                let expected_suffix = &expected_domain[2..];
+                return cert_suffix == expected_suffix;
+            }
+            // Check if expected is a subdomain of wildcard
+            if let Some(expected_suffix) = expected_domain
+                .strip_prefix(|c: char| c != '.')
+                .and_then(|s| s.strip_prefix('.'))
+            {
+                return cert_suffix == expected_suffix;
+            }
+        }
+        false
+    });
+
+    if !domain_matches {
+        println!(
+            "   {} Certificate domains: {:?}",
+            "⚠".bright_yellow(),
+            cert_domains
+        );
+        println!(
+            "   {} Expected domain '{}' does not match certificate. Proceeding anyway...",
+            "⚠".bright_yellow(),
+            expected_domain
+        );
+    } else {
+        print_substep(&format!(
+            "{} Certificate domain validated",
+            "✓".bright_green()
+        ));
+    }
+
+    print_substep(&format!(
+        "{} Certificate expires: {}",
+        "✓".bright_green(),
+        expiration_time.format("%Y-%m-%d %H:%M:%S UTC")
+    ));
+
+    Ok(expiration_time)
+}
+
+/// Validate private key PEM format
+fn validate_private_key(key_pem: &str) -> anyhow::Result<()> {
+    // Basic PEM format validation
+    if !key_pem.contains("-----BEGIN") || !key_pem.contains("-----END") {
+        return Err(anyhow::anyhow!(
+            "Invalid private key format. Expected PEM format with BEGIN/END markers."
+        ));
+    }
+
+    // Check for common private key types
+    let valid_types = [
+        "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----",
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+    ];
+
+    let has_valid_type = valid_types.iter().any(|t| key_pem.contains(t));
+    if !has_valid_type {
+        return Err(anyhow::anyhow!(
+            "Unsupported private key type. Expected RSA, EC, or PKCS#8 private key in PEM format."
+        ));
+    }
+
+    print_substep(&format!(
+        "{} Private key format validated",
+        "✓".bright_green()
+    ));
+    Ok(())
+}
+
+/// Import external certificate into the database
+async fn import_external_certificate(
+    db: &sea_orm::DatabaseConnection,
+    encryption_service: &EncryptionService,
+    domain: &str,
+    certificate_pem: &str,
+    private_key_pem: &str,
+    expiration_time: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<domains::Model> {
+    use chrono::Utc;
+
+    let is_wildcard = domain.starts_with("*.");
+
+    // Encrypt the private key
+    let encrypted_private_key = encryption_service
+        .encrypt_string(private_key_pem)
+        .map_err(|e| anyhow::anyhow!("Failed to encrypt private key: {}", e))?;
+
+    // Check if domain already exists
+    let existing = domains::Entity::find()
+        .filter(domains::Column::Domain.eq(domain))
+        .one(db)
+        .await?;
+
+    if let Some(existing_domain) = existing {
+        // Update existing domain
+        let mut domain_update: domains::ActiveModel = existing_domain.into();
+        domain_update.certificate = Set(Some(certificate_pem.to_string()));
+        domain_update.private_key = Set(Some(encrypted_private_key));
+        domain_update.expiration_time = Set(Some(expiration_time));
+        domain_update.status = Set("active".to_string());
+        domain_update.last_renewed = Set(Some(Utc::now()));
+        domain_update.last_error = Set(None);
+        domain_update.last_error_type = Set(None);
+        domain_update.verification_method = Set("manual".to_string());
+        domain_update.updated_at = Set(Utc::now());
+
+        let updated = domain_update.update(db).await?;
+        Ok(updated)
+    } else {
+        // Create new domain
+        let new_domain = domains::ActiveModel {
+            domain: Set(domain.to_string()),
+            certificate: Set(Some(certificate_pem.to_string())),
+            private_key: Set(Some(encrypted_private_key)),
+            expiration_time: Set(Some(expiration_time)),
+            status: Set("active".to_string()),
+            is_wildcard: Set(is_wildcard),
+            verification_method: Set("manual".to_string()),
+            last_renewed: Set(Some(Utc::now())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+
+        let created = new_domain.insert(db).await?;
+        Ok(created)
+    }
+}
+
+/// Update application settings with preview domain and external URL
+async fn update_app_settings(
+    db: &sea_orm::DatabaseConnection,
+    preview_domain: &str,
+    external_url: Option<&str>,
+) -> anyhow::Result<()> {
+    use chrono::Utc;
+
+    // Get existing settings or create default
+    let existing = settings::Entity::find_by_id(1).one(db).await?;
+
+    let mut app_settings = existing
+        .as_ref()
+        .map(|r| AppSettings::from_json(r.data.clone()))
+        .unwrap_or_default();
+
+    // Update preview_domain
+    app_settings.preview_domain = preview_domain.to_string();
+
+    // Update external_url if provided
+    if let Some(url) = external_url {
+        app_settings.external_url = Some(url.to_string());
+    }
+
+    let now = Utc::now();
+    let settings_json = app_settings.to_json();
+
+    if let Some(existing_model) = existing {
+        // Update existing settings
+        let mut active_model: settings::ActiveModel = existing_model.into();
+        active_model.data = Set(settings_json);
+        active_model.updated_at = Set(now);
+        active_model.update(db).await?;
+    } else {
+        // Create new settings
+        let new_settings = settings::ActiveModel {
+            id: Set(1),
+            data: Set(settings_json),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        new_settings.insert(db).await?;
+    }
+
+    Ok(())
+}
+
+/// Extract preview domain (base domain) from wildcard domain
+/// e.g., "*.davidviejo.kfs.es" -> "davidviejo.kfs.es"
+fn extract_preview_domain(wildcard_domain: &str) -> String {
+    wildcard_domain.trim_start_matches("*.").to_string()
+}
+
 impl SetupCommand {
     pub fn execute(self) -> anyhow::Result<()> {
         print_header();
@@ -835,119 +1101,176 @@ impl SetupCommand {
             }
         };
 
-        // DNS Provider setup (required)
-        print_section("DNS Provider Setup");
+        // DNS Provider setup (optional when using external certs with --skip-dns-records)
+        // Check if DNS provider is needed
+        let needs_dns_provider =
+            !self.skip_dns_records || (self.wildcard_domain_cert.is_none() && !self.skip_ssl);
 
-        let credentials = match &self.dns_provider {
-            DnsProviderType::Cloudflare => {
-                println!("   Verifying Cloudflare API token...");
-                rt.block_on(verify_cloudflare_token(&self.cloudflare_token))?;
-                print_success("Cloudflare token verified");
+        let dns_credentials: Option<ProviderCredentials> = if needs_dns_provider {
+            // DNS provider is required
+            let dns_provider = self.dns_provider.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--dns-provider is required for DNS record management or Let's Encrypt certificate provisioning.\n\
+                    Use --skip-dns-records with --wildcard-domain-cert/--wildcard-domain-key to skip DNS provider setup."
+                )
+            })?;
 
-                ProviderCredentials::Cloudflare(CloudflareCredentials {
-                    api_token: self.cloudflare_token.clone(),
-                    account_id: None,
-                })
-            }
-            DnsProviderType::Route53 => {
-                let access_key = self.aws_access_key_id.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("--aws-access-key-id is required for Route53 DNS provider")
-                })?;
-                let secret_key = self.aws_secret_access_key.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("--aws-secret-access-key is required for Route53 DNS provider")
-                })?;
+            print_section("DNS Provider Setup");
 
-                ProviderCredentials::Route53(Route53Credentials {
-                    access_key_id: access_key.clone(),
-                    secret_access_key: secret_key.clone(),
-                    session_token: None,
-                    region: Some(self.aws_region.clone()),
-                })
-            }
-            DnsProviderType::DigitalOcean => {
-                let token = self.digitalocean_token.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--digitalocean-token is required for DigitalOcean DNS provider"
-                    )
-                })?;
+            let credentials = match dns_provider {
+                DnsProviderType::Cloudflare => {
+                    let token = self.cloudflare_token.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--cloudflare-token is required for Cloudflare DNS provider"
+                        )
+                    })?;
+                    println!("   Verifying Cloudflare API token...");
+                    rt.block_on(verify_cloudflare_token(token))?;
+                    print_success("Cloudflare token verified");
 
-                ProviderCredentials::DigitalOcean(DigitalOceanCredentials {
-                    api_token: token.clone(),
-                })
-            }
-            DnsProviderType::Azure => {
-                let tenant_id = self.azure_tenant_id.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("--azure-tenant-id is required for Azure DNS provider")
-                })?;
-                let client_id = self.azure_client_id.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("--azure-client-id is required for Azure DNS provider")
-                })?;
-                let client_secret = self.azure_client_secret.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("--azure-client-secret is required for Azure DNS provider")
-                })?;
-                let subscription_id = self.azure_subscription_id.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("--azure-subscription-id is required for Azure DNS provider")
-                })?;
-                let resource_group = self.azure_resource_group.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("--azure-resource-group is required for Azure DNS provider")
-                })?;
+                    ProviderCredentials::Cloudflare(CloudflareCredentials {
+                        api_token: token.clone(),
+                        account_id: None,
+                    })
+                }
+                DnsProviderType::Route53 => {
+                    let access_key = self.aws_access_key_id.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("--aws-access-key-id is required for Route53 DNS provider")
+                    })?;
+                    let secret_key = self.aws_secret_access_key.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--aws-secret-access-key is required for Route53 DNS provider"
+                        )
+                    })?;
 
-                ProviderCredentials::Azure(AzureCredentials {
-                    tenant_id: tenant_id.clone(),
-                    client_id: client_id.clone(),
-                    client_secret: client_secret.clone(),
-                    subscription_id: subscription_id.clone(),
-                    resource_group: resource_group.clone(),
-                })
-            }
-            DnsProviderType::Gcp => {
-                let email = self.gcp_service_account_email.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("--gcp-service-account-email is required for GCP DNS provider")
-                })?;
-                let private_key = self.gcp_private_key.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("--gcp-private-key is required for GCP DNS provider")
-                })?;
-                let project_id = self.gcp_project_id.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("--gcp-project-id is required for GCP DNS provider")
-                })?;
+                    ProviderCredentials::Route53(Route53Credentials {
+                        access_key_id: access_key.clone(),
+                        secret_access_key: secret_key.clone(),
+                        session_token: None,
+                        region: Some(self.aws_region.clone()),
+                    })
+                }
+                DnsProviderType::DigitalOcean => {
+                    let token = self.digitalocean_token.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--digitalocean-token is required for DigitalOcean DNS provider"
+                        )
+                    })?;
 
-                ProviderCredentials::Gcp(GcpCredentials {
-                    service_account_email: email.clone(),
-                    private_key: private_key.clone(),
-                    project_id: project_id.clone(),
-                })
-            }
+                    ProviderCredentials::DigitalOcean(DigitalOceanCredentials {
+                        api_token: token.clone(),
+                    })
+                }
+                DnsProviderType::Azure => {
+                    let tenant_id = self.azure_tenant_id.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("--azure-tenant-id is required for Azure DNS provider")
+                    })?;
+                    let client_id = self.azure_client_id.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("--azure-client-id is required for Azure DNS provider")
+                    })?;
+                    let client_secret = self.azure_client_secret.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("--azure-client-secret is required for Azure DNS provider")
+                    })?;
+                    let subscription_id = self.azure_subscription_id.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--azure-subscription-id is required for Azure DNS provider"
+                        )
+                    })?;
+                    let resource_group = self.azure_resource_group.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("--azure-resource-group is required for Azure DNS provider")
+                    })?;
+
+                    ProviderCredentials::Azure(AzureCredentials {
+                        tenant_id: tenant_id.clone(),
+                        client_id: client_id.clone(),
+                        client_secret: client_secret.clone(),
+                        subscription_id: subscription_id.clone(),
+                        resource_group: resource_group.clone(),
+                    })
+                }
+                DnsProviderType::Gcp => {
+                    let email = self.gcp_service_account_email.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--gcp-service-account-email is required for GCP DNS provider"
+                        )
+                    })?;
+                    let private_key = self.gcp_private_key.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("--gcp-private-key is required for GCP DNS provider")
+                    })?;
+                    let project_id = self.gcp_project_id.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("--gcp-project-id is required for GCP DNS provider")
+                    })?;
+
+                    ProviderCredentials::Gcp(GcpCredentials {
+                        service_account_email: email.clone(),
+                        private_key: private_key.clone(),
+                        project_id: project_id.clone(),
+                    })
+                }
+            };
+
+            let _dns_provider = rt.block_on(create_dns_provider(
+                db.as_ref(),
+                &encryption_service,
+                dns_provider,
+                credentials.clone(),
+            ))?;
+            print_success(&format!("{} DNS provider configured", dns_provider));
+
+            Some(credentials)
+        } else {
+            print_section("DNS Provider Setup");
+            print_info(
+                "Skipped",
+                "DNS provider not required (using external certificate with --skip-dns-records)",
+            );
+            None
         };
 
-        let _dns_provider = rt.block_on(create_dns_provider(
-            db.as_ref(),
-            &encryption_service,
-            &self.dns_provider,
-            credentials.clone(),
-        ))?;
-        print_success(&format!("{} DNS provider configured", self.dns_provider));
+        // Extract Cloudflare token for DNS A record operations (if available)
+        let cloudflare_token_for_dns: Option<String> =
+            dns_credentials.as_ref().and_then(|creds| match creds {
+                ProviderCredentials::Cloudflare(cf) => Some(cf.api_token.clone()),
+                _ => None,
+            });
 
-        // GitHub Provider setup (required)
-        print_section("Git Provider Setup");
+        // GitHub Provider setup (optional)
+        if self.skip_git {
+            print_section("Git Provider Setup");
+            print_info("Skipped", "Git provider setup skipped (--skip-git flag)");
+            println!(
+                "   {} You can deploy using Docker images or static files without Git integration",
+                "💡".bright_yellow()
+            );
+        } else if let Some(ref github_token) = self.github_token {
+            print_section("Git Provider Setup");
 
-        println!("   Verifying GitHub token...");
-        let github_user = rt.block_on(verify_github_token(&self.github_token))?;
-        print_success(&format!(
-            "GitHub token verified (user: {})",
-            github_user.username
-        ));
+            println!("   Verifying GitHub token...");
+            let github_user = rt.block_on(verify_github_token(github_token))?;
+            print_success(&format!(
+                "GitHub token verified (user: {})",
+                github_user.username
+            ));
 
-        let git_result = rt.block_on(create_git_provider(
-            db.as_ref(),
-            &encryption_service,
-            &self.github_token,
-            &github_user.username,
-        ))?;
-        print_success("GitHub provider configured");
-        print_success(&format!(
-            "GitHub connection created for '{}'",
-            git_result.connection.account_name
-        ));
+            let git_result = rt.block_on(create_git_provider(
+                db.as_ref(),
+                &encryption_service,
+                github_token,
+                &github_user.username,
+            ))?;
+            print_success("GitHub provider configured");
+            print_success(&format!(
+                "GitHub connection created for '{}'",
+                git_result.connection.account_name
+            ));
+        } else {
+            print_section("Git Provider Setup");
+            print_info("Skipped", "No GitHub token provided");
+            println!(
+                "   {} You can add a Git provider later or deploy using Docker images/static files",
+                "💡".bright_yellow()
+            );
+        }
 
         // Wildcard Domain setup (required)
         print_section("Wildcard Domain Setup");
@@ -957,6 +1280,190 @@ impl SetupCommand {
             return Err(anyhow::anyhow!(
                 "Domain must be a wildcard domain (e.g., *.app.example.com)"
             ));
+        }
+
+        // Validate external certificate arguments are provided together
+        if self.wildcard_domain_cert.is_some() != self.wildcard_domain_key.is_some() {
+            return Err(anyhow::anyhow!(
+                "Both --wildcard-domain-cert and --wildcard-domain-key must be provided together"
+            ));
+        }
+
+        // Check if external certificate is provided
+        if let (Some(cert_path), Some(key_path)) =
+            (&self.wildcard_domain_cert, &self.wildcard_domain_key)
+        {
+            print_section("External Certificate Import");
+            println!(
+                "   {} Importing external certificate for: {}",
+                "🔐".bright_yellow(),
+                self.wildcard_domain.bright_cyan().bold()
+            );
+            println!();
+
+            // Read certificate file
+            print_substep(&format!(
+                "Reading certificate from: {}",
+                cert_path.display()
+            ));
+            let certificate_pem = fs::read_to_string(cert_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to read certificate file '{}': {}",
+                    cert_path.display(),
+                    e
+                )
+            })?;
+
+            // Read private key file
+            print_substep(&format!("Reading private key from: {}", key_path.display()));
+            let private_key_pem = fs::read_to_string(key_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to read private key file '{}': {}",
+                    key_path.display(),
+                    e
+                )
+            })?;
+
+            // Validate certificate format and extract expiration
+            let expiration_time =
+                validate_and_parse_certificate(&certificate_pem, &self.wildcard_domain)?;
+
+            // Validate private key format
+            validate_private_key(&private_key_pem)?;
+
+            // Import certificate into database
+            print_substep("Importing certificate into database...");
+            rt.block_on(import_external_certificate(
+                db.as_ref(),
+                &encryption_service,
+                &self.wildcard_domain,
+                &certificate_pem,
+                &private_key_pem,
+                expiration_time,
+            ))?;
+            print_substep(&format!(
+                "{} Certificate imported successfully",
+                "✓".bright_green()
+            ));
+            println!();
+
+            // Handle DNS records if not skipped
+            if !self.skip_dns_records {
+                let server_ip = if let Some(ip) = &self.server_ip {
+                    ip.clone()
+                } else if self.non_interactive {
+                    return Err(anyhow::anyhow!(
+                        "Server IP is required for DNS A records. Use --server-ip or --skip-dns-records"
+                    ));
+                } else {
+                    match rt.block_on(detect_public_ip()) {
+                        Ok(ip) => ip,
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "Failed to detect IP: {}. Use --server-ip or --skip-dns-records",
+                                e
+                            ));
+                        }
+                    }
+                };
+
+                // Extract base domain from wildcard
+                let base_domain = self
+                    .wildcard_domain
+                    .trim_start_matches("*.")
+                    .split('.')
+                    .rev()
+                    .take(2)
+                    .collect::<Vec<&str>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<&str>>()
+                    .join(".");
+
+                let subdomain_prefix = {
+                    let without_wildcard = self.wildcard_domain.trim_start_matches("*.");
+                    let parts: Vec<&str> = without_wildcard.split('.').collect();
+                    if parts.len() > 2 {
+                        parts[..parts.len() - 2].join(".")
+                    } else {
+                        String::new()
+                    }
+                };
+
+                let cf_provider = CloudflareDnsProvider::new(cloudflare_token_for_dns.clone().ok_or_else(|| {
+                    anyhow::anyhow!("DNS A record creation requires Cloudflare provider. Use --skip-dns-records to skip.")
+                })?);
+
+                print_section("DNS A Record Setup");
+                let wildcard_record_name = if subdomain_prefix.is_empty() {
+                    "*".to_string()
+                } else {
+                    format!("*.{}", subdomain_prefix)
+                };
+                print_substep(&format!(
+                    "Creating A record: {} → {}",
+                    format!("{}.{}", wildcard_record_name, base_domain).bright_cyan(),
+                    server_ip.bright_yellow()
+                ));
+                if let Err(e) = rt.block_on(cf_provider.set_a_record(
+                    &base_domain,
+                    &wildcard_record_name,
+                    &server_ip,
+                )) {
+                    warn!("Failed to create wildcard A record: {}", e);
+                } else {
+                    print_substep(&format!("{} Wildcard A record created", "✓".bright_green()));
+                }
+
+                if !subdomain_prefix.is_empty() {
+                    print_substep(&format!(
+                        "Creating A record: {} → {}",
+                        format!("{}.{}", subdomain_prefix, base_domain).bright_cyan(),
+                        server_ip.bright_yellow()
+                    ));
+                    if let Err(e) = rt.block_on(cf_provider.set_a_record(
+                        &base_domain,
+                        &subdomain_prefix,
+                        &server_ip,
+                    )) {
+                        warn!("Failed to create subdomain A record: {}", e);
+                    } else {
+                        print_substep(&format!(
+                            "{} Subdomain A record created",
+                            "✓".bright_green()
+                        ));
+                    }
+                }
+                println!();
+            } else {
+                print_success("DNS A record creation skipped (--skip-dns-records)");
+                println!();
+            }
+
+            // Update application settings with preview domain and external URL
+            print_section("Application Settings");
+            let preview_domain = extract_preview_domain(&self.wildcard_domain);
+            rt.block_on(update_app_settings(
+                db.as_ref(),
+                &preview_domain,
+                self.external_url.as_deref(),
+            ))?;
+            print_success(&format!(
+                "Preview domain set to: {}",
+                preview_domain.bright_cyan()
+            ));
+            if let Some(ref url) = self.external_url {
+                print_success(&format!("External URL set to: {}", url.bright_cyan()));
+            }
+            println!();
+
+            return finish_setup(
+                &user,
+                &password,
+                &self.wildcard_domain,
+                self.non_interactive,
+                &self.output_format,
+            );
         }
 
         // Check if SSL provisioning is skipped
@@ -1008,7 +1515,9 @@ impl SetupCommand {
                     }
                 };
 
-                let cf_provider = CloudflareDnsProvider::new(self.cloudflare_token.clone());
+                let cf_provider = CloudflareDnsProvider::new(cloudflare_token_for_dns.clone().ok_or_else(|| {
+                    anyhow::anyhow!("DNS A record creation requires Cloudflare provider. Use --skip-dns-records to skip.")
+                })?);
 
                 print_section("DNS A Record Setup");
                 let wildcard_record_name = if subdomain_prefix.is_empty() {
@@ -1056,6 +1565,23 @@ impl SetupCommand {
                 println!();
             }
 
+            // Update application settings with preview domain and external URL
+            print_section("Application Settings");
+            let preview_domain = extract_preview_domain(&self.wildcard_domain);
+            rt.block_on(update_app_settings(
+                db.as_ref(),
+                &preview_domain,
+                self.external_url.as_deref(),
+            ))?;
+            print_success(&format!(
+                "Preview domain set to: {}",
+                preview_domain.bright_cyan()
+            ));
+            if let Some(ref url) = self.external_url {
+                print_success(&format!("External URL set to: {}", url.bright_cyan()));
+            }
+            println!();
+
             return finish_setup(
                 &user,
                 &password,
@@ -1079,7 +1605,9 @@ impl SetupCommand {
 
         // Step 1: Verify Cloudflare zone and detect server IP
         print_step(1, 8, "Verifying Cloudflare zone and detecting server IP");
-        let cf_provider = CloudflareDnsProvider::new(self.cloudflare_token.clone());
+        let cf_provider = CloudflareDnsProvider::new(cloudflare_token_for_dns.clone().ok_or_else(|| {
+                    anyhow::anyhow!("DNS A record creation requires Cloudflare provider. Use --skip-dns-records to skip.")
+                })?);
 
         // Extract base domain from wildcard (e.g., "*.app.example.com" -> "example.com")
         let base_domain = self
@@ -1241,6 +1769,24 @@ impl SetupCommand {
                 self.wildcard_domain.bright_cyan()
             );
             println!();
+
+            // Update application settings with preview domain and external URL
+            print_section("Application Settings");
+            let preview_domain = extract_preview_domain(&self.wildcard_domain);
+            rt.block_on(update_app_settings(
+                db.as_ref(),
+                &preview_domain,
+                self.external_url.as_deref(),
+            ))?;
+            print_success(&format!(
+                "Preview domain set to: {}",
+                preview_domain.bright_cyan()
+            ));
+            if let Some(ref url) = self.external_url {
+                print_success(&format!("External URL set to: {}", url.bright_cyan()));
+            }
+            println!();
+
             return finish_setup(
                 &user,
                 &password,
@@ -1263,6 +1809,24 @@ impl SetupCommand {
                 "🎉".bright_green()
             );
             println!();
+
+            // Update application settings with preview domain and external URL
+            print_section("Application Settings");
+            let preview_domain = extract_preview_domain(&self.wildcard_domain);
+            rt.block_on(update_app_settings(
+                db.as_ref(),
+                &preview_domain,
+                self.external_url.as_deref(),
+            ))?;
+            print_success(&format!(
+                "Preview domain set to: {}",
+                preview_domain.bright_cyan()
+            ));
+            if let Some(ref url) = self.external_url {
+                print_success(&format!("External URL set to: {}", url.bright_cyan()));
+            }
+            println!();
+
             return finish_setup(
                 &user,
                 &password,
@@ -1688,6 +2252,23 @@ impl SetupCommand {
             );
             println!();
         }
+
+        // Update application settings with preview domain and external URL
+        print_section("Application Settings");
+        let preview_domain = extract_preview_domain(&self.wildcard_domain);
+        rt.block_on(update_app_settings(
+            db.as_ref(),
+            &preview_domain,
+            self.external_url.as_deref(),
+        ))?;
+        print_success(&format!(
+            "Preview domain set to: {}",
+            preview_domain.bright_cyan()
+        ));
+        if let Some(ref url) = self.external_url {
+            print_success(&format!("External URL set to: {}", url.bright_cyan()));
+        }
+        println!();
 
         finish_setup(
             &user,

@@ -223,7 +223,7 @@ export const credentials = {
 
   async getApiKey(): Promise<string | undefined> {
     // Check environment variable first (for CI/CD)
-    const envToken = process.env.TEMPS_API_TOKEN || process.env.TEMPS_API_KEY
+    const envToken = process.env.TEMPS_TOKEN || process.env.TEMPS_API_TOKEN || process.env.TEMPS_API_KEY
     if (envToken) {
       return envToken
     }

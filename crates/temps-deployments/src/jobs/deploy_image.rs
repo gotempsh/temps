@@ -1136,6 +1136,7 @@ pub struct DeployImageJobBuilder {
     config: DeploymentJobConfig,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
+    external_image_tag: Option<String>,
 }
 
 impl DeployImageJobBuilder {
@@ -1147,6 +1148,7 @@ impl DeployImageJobBuilder {
             config: DeploymentJobConfig::default(),
             log_id: None,
             log_service: None,
+            external_image_tag: None,
         }
     }
 
@@ -1211,6 +1213,12 @@ impl DeployImageJobBuilder {
         self
     }
 
+    /// Set external image tag (for pre-built images, bypasses build job dependency)
+    pub fn external_image_tag(mut self, image_tag: String) -> Self {
+        self.external_image_tag = Some(image_tag);
+        self
+    }
+
     pub fn build(
         self,
         container_deployer: Arc<dyn ContainerDeployer>,
@@ -1231,6 +1239,9 @@ impl DeployImageJobBuilder {
         }
         if let Some(log_service) = self.log_service {
             job = job.with_log_service(log_service);
+        }
+        if let Some(external_image_tag) = self.external_image_tag {
+            job = job.with_external_image_tag(external_image_tag);
         }
 
         Ok(job)

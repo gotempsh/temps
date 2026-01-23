@@ -13,6 +13,7 @@ use utoipa::ToSchema;
 /// - `Git`: Source code from a Git repository (traditional flow)
 /// - `DockerImage`: Pre-built Docker image from external registry
 /// - `StaticFiles`: Pre-built static files uploaded as a bundle
+/// - `Manual`: Flexible type that accepts any deployment method
 #[derive(
     Debug,
     Clone,
@@ -45,6 +46,12 @@ pub enum SourceType {
     /// Pre-built static files are uploaded as a tar.gz or zip bundle
     #[sea_orm(string_value = "static_files")]
     StaticFiles,
+
+    /// Manual/Flexible deployments
+    /// Accepts any deployment method: Docker images, static files, or Git-based
+    /// Allows switching between deployment methods without recreating the project
+    #[sea_orm(string_value = "manual")]
+    Manual,
 }
 
 impl std::fmt::Display for SourceType {
@@ -53,6 +60,7 @@ impl std::fmt::Display for SourceType {
             SourceType::Git => write!(f, "git"),
             SourceType::DockerImage => write!(f, "docker_image"),
             SourceType::StaticFiles => write!(f, "static_files"),
+            SourceType::Manual => write!(f, "manual"),
         }
     }
 }
@@ -65,17 +73,41 @@ impl SourceType {
 
     /// Returns true if this source type can have cron jobs configured
     pub fn supports_crons(&self) -> bool {
-        matches!(self, SourceType::Git | SourceType::DockerImage)
+        matches!(
+            self,
+            SourceType::Git | SourceType::DockerImage | SourceType::Manual
+        )
     }
 
     /// Returns true if this source type supports Docker image deployments
     pub fn is_container_based(&self) -> bool {
-        matches!(self, SourceType::Git | SourceType::DockerImage)
+        matches!(
+            self,
+            SourceType::Git | SourceType::DockerImage | SourceType::Manual
+        )
     }
 
     /// Returns true if this source type is for static file serving
     pub fn is_static(&self) -> bool {
         matches!(self, SourceType::StaticFiles)
+    }
+
+    /// Returns true if this source type is flexible (accepts any deployment method)
+    ///
+    /// Manual projects can deploy via Docker images, static files, or Git-based methods.
+    pub fn is_flexible(&self) -> bool {
+        matches!(self, SourceType::Manual)
+    }
+
+    /// Returns true if this project source type allows the given deployment method
+    ///
+    /// - `Manual` projects accept any deployment method (Docker, static, Git)
+    /// - Other project types only accept their specific deployment method
+    pub fn allows_deployment_method(&self, method: &SourceType) -> bool {
+        match self {
+            SourceType::Manual => true, // Accepts everything
+            other => other == method,
+        }
     }
 }
 
@@ -93,6 +125,7 @@ mod tests {
         assert_eq!(SourceType::Git.to_string(), "git");
         assert_eq!(SourceType::DockerImage.to_string(), "docker_image");
         assert_eq!(SourceType::StaticFiles.to_string(), "static_files");
+        assert_eq!(SourceType::Manual.to_string(), "manual");
     }
 
     #[test]
@@ -100,6 +133,7 @@ mod tests {
         assert!(SourceType::Git.requires_git_info());
         assert!(!SourceType::DockerImage.requires_git_info());
         assert!(!SourceType::StaticFiles.requires_git_info());
+        assert!(!SourceType::Manual.requires_git_info());
     }
 
     #[test]
@@ -107,6 +141,7 @@ mod tests {
         assert!(SourceType::Git.is_container_based());
         assert!(SourceType::DockerImage.is_container_based());
         assert!(!SourceType::StaticFiles.is_container_based());
+        assert!(SourceType::Manual.is_container_based());
     }
 
     #[test]
@@ -114,6 +149,39 @@ mod tests {
         assert!(!SourceType::Git.is_static());
         assert!(!SourceType::DockerImage.is_static());
         assert!(SourceType::StaticFiles.is_static());
+        assert!(!SourceType::Manual.is_static());
+    }
+
+    #[test]
+    fn test_is_flexible() {
+        assert!(!SourceType::Git.is_flexible());
+        assert!(!SourceType::DockerImage.is_flexible());
+        assert!(!SourceType::StaticFiles.is_flexible());
+        assert!(SourceType::Manual.is_flexible());
+    }
+
+    #[test]
+    fn test_allows_deployment_method() {
+        // Manual accepts everything
+        assert!(SourceType::Manual.allows_deployment_method(&SourceType::Git));
+        assert!(SourceType::Manual.allows_deployment_method(&SourceType::DockerImage));
+        assert!(SourceType::Manual.allows_deployment_method(&SourceType::StaticFiles));
+        assert!(SourceType::Manual.allows_deployment_method(&SourceType::Manual));
+
+        // Git only accepts Git
+        assert!(SourceType::Git.allows_deployment_method(&SourceType::Git));
+        assert!(!SourceType::Git.allows_deployment_method(&SourceType::DockerImage));
+        assert!(!SourceType::Git.allows_deployment_method(&SourceType::StaticFiles));
+
+        // DockerImage only accepts DockerImage
+        assert!(SourceType::DockerImage.allows_deployment_method(&SourceType::DockerImage));
+        assert!(!SourceType::DockerImage.allows_deployment_method(&SourceType::Git));
+        assert!(!SourceType::DockerImage.allows_deployment_method(&SourceType::StaticFiles));
+
+        // StaticFiles only accepts StaticFiles
+        assert!(SourceType::StaticFiles.allows_deployment_method(&SourceType::StaticFiles));
+        assert!(!SourceType::StaticFiles.allows_deployment_method(&SourceType::Git));
+        assert!(!SourceType::StaticFiles.allows_deployment_method(&SourceType::DockerImage));
     }
 
     #[test]
@@ -126,6 +194,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&SourceType::StaticFiles).unwrap(),
             "\"static_files\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SourceType::Manual).unwrap(),
+            "\"manual\""
         );
     }
 
@@ -142,6 +214,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<SourceType>("\"static_files\"").unwrap(),
             SourceType::StaticFiles
+        );
+        assert_eq!(
+            serde_json::from_str::<SourceType>("\"manual\"").unwrap(),
+            SourceType::Manual
         );
     }
 }

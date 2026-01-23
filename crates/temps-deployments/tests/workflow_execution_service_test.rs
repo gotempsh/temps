@@ -401,9 +401,15 @@ async fn test_workflow_execution_service_with_real_jobs() {
             .unwrap(),
     );
 
+    // Create Docker client for test
+    let docker = Arc::new(
+        bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
+    );
+
     // Create WorkflowExecutionService
     let workflow_execution_service = Arc::new(WorkflowExecutionService::new(
         db.clone(),
+        queue.clone(),
         git_provider,
         image_builder,
         container_deployer,
@@ -412,6 +418,8 @@ async fn test_workflow_execution_service_with_real_jobs() {
         cron_config_service,
         config_service.clone(),
         screenshot_service.clone(),
+        None, // blob_service
+        docker,
     ));
 
     // Execute the workflow

@@ -113,6 +113,12 @@ impl TempsPlugin for DeploymentsPlugin {
             let static_deployer =
                 context.require_service::<dyn temps_deployer::static_deployer::StaticDeployer>();
 
+            // Create Docker client for external image pulls
+            let docker = Arc::new(
+                bollard::Docker::connect_with_local_defaults()
+                    .expect("Failed to connect to Docker"),
+            );
+
             // Create WorkflowExecutionService
             let workflow_execution_service = Arc::new(WorkflowExecutionService::new(
                 db.clone(),
@@ -125,6 +131,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 cron_service,
                 config_service.clone(),
                 screenshot_service,
+                docker,
             ));
 
             // Get ExternalServiceManager for accessing external service env vars
@@ -148,11 +155,15 @@ impl TempsPlugin for DeploymentsPlugin {
                 encryption_service,
             ));
 
+            // Clone workflow_execution_service before passing to job processor
+            // (the job processor takes ownership, but we need to register it too)
+            let workflow_execution_service_for_processor = workflow_execution_service.clone();
+
             let mut job_processor = JobProcessorService::with_external_service_manager(
                 db,
                 job_receiver,
                 queue_service.clone(),
-                workflow_execution_service,
+                workflow_execution_service_for_processor,
                 workflow_planner,
                 git_provider_manager,
             );
@@ -174,6 +185,9 @@ impl TempsPlugin for DeploymentsPlugin {
             let remote_deployment_service =
                 Arc::new(crate::services::RemoteDeploymentService::new(db_for_remote));
             context.register_service(remote_deployment_service);
+
+            // Register WorkflowExecutionService for use in remote deployments
+            context.register_service(workflow_execution_service);
 
             tracing::debug!("Deployments plugin services registered successfully");
             Ok(())
@@ -200,12 +214,61 @@ impl TempsPlugin for DeploymentsPlugin {
             .get_service::<crate::services::RemoteDeploymentService>()
             .expect("RemoteDeploymentService must be registered before configuring routes");
 
+        // Get services needed for remote deployment triggering
+        let db = context
+            .get_service::<sea_orm::DatabaseConnection>()
+            .expect("DatabaseConnection must be registered before configuring routes");
+        let queue_service = context
+            .get_service::<dyn temps_core::JobQueue>()
+            .expect("JobQueue must be registered before configuring routes");
+        let config_service = context
+            .get_service::<temps_config::ConfigService>()
+            .expect("ConfigService must be registered before configuring routes");
+        let external_service_manager = context
+            .get_service::<temps_providers::ExternalServiceManager>()
+            .expect("ExternalServiceManager must be registered before configuring routes");
+        let dsn_service = context
+            .get_service::<temps_error_tracking::DSNService>()
+            .expect("DSNService must be registered before configuring routes");
+        let encryption_service = context
+            .get_service::<temps_core::EncryptionService>()
+            .expect("EncryptionService must be registered before configuring routes");
+
+        // Create WorkflowPlanner for remote deployments
+        let workflow_planner = Arc::new(WorkflowPlanner::new(
+            db.clone(),
+            log_service.clone(),
+            external_service_manager,
+            config_service.clone(),
+            dsn_service,
+            encryption_service,
+        ));
+
+        // Get WorkflowExecutionService
+        let workflow_executor = context
+            .get_service::<WorkflowExecutionService>()
+            .expect("WorkflowExecutionService must be registered before configuring routes");
+
+        // Get BlobService for static bundle uploads
+        let blob_service = context
+            .get_service::<temps_blob::BlobService>()
+            .expect("BlobService must be registered before configuring routes");
+
+        // Get data directory for local file storage
+        let data_dir = config_service.data_dir();
+
         let app_state = Arc::new(handlers::types::AppState {
             deployment_service,
             log_service,
             cron_service,
             external_deployment_manager,
             remote_deployment_service,
+            db,
+            workflow_planner,
+            workflow_executor,
+            queue_service,
+            blob_service,
+            data_dir,
         });
 
         let deployments_routes = handlers::deployments::configure_routes();

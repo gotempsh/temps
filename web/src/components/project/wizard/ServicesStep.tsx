@@ -1,4 +1,4 @@
-import { memo } from 'react'
+import { memo, useCallback } from 'react'
 import { useFormContext } from 'react-hook-form'
 import { FormField, FormItem, FormMessage } from '@/components/ui/form'
 import {
@@ -19,6 +19,8 @@ import {
 import { Plus, ChevronDown } from 'lucide-react'
 import { format } from 'date-fns'
 import { ServiceTypeRoute } from '@/api/client/types.gen'
+import { cn } from '@/lib/utils'
+import { toast } from 'sonner'
 
 const SERVICE_TYPES = [
   {
@@ -42,6 +44,7 @@ const SERVICE_TYPES = [
 interface ServicesStepProps {
   existingServices?: any[]
   newlyCreatedServiceIds: number[]
+  newlyCreatedServiceTypes: ServiceTypeRoute[]
   onServiceToggle: (serviceId: number) => void
   onCreateService: (serviceType: ServiceTypeRoute) => void
 }
@@ -49,10 +52,63 @@ interface ServicesStepProps {
 export const ServicesStep = memo(function ServicesStep({
   existingServices,
   newlyCreatedServiceIds,
+  newlyCreatedServiceTypes,
   onServiceToggle,
   onCreateService,
 }: ServicesStepProps) {
   const form = useFormContext()
+
+  // Get the service types that are already selected (either existing or newly created)
+  const getSelectedServiceTypes = useCallback((): Set<string> => {
+    const currentServices = form.getValues('storageServices') || []
+    const selectedTypes = new Set<string>()
+
+    // Add types from selected existing services
+    currentServices.forEach((serviceId: number) => {
+      const service = existingServices?.find((s: any) => s.id === serviceId)
+      if (service) {
+        selectedTypes.add(service.service_type)
+      }
+    })
+
+    // Add types from newly created services
+    newlyCreatedServiceTypes.forEach((serviceType) => {
+      selectedTypes.add(serviceType)
+    })
+
+    return selectedTypes
+  }, [form, existingServices, newlyCreatedServiceTypes])
+
+  // Handle service toggle with type collision check
+  const handleServiceToggleWithValidation = useCallback(
+    (serviceId: number) => {
+      const currentServices = form.getValues('storageServices') || []
+      const isSelected = currentServices.includes(serviceId)
+
+      // If trying to select (not deselect), check for type collision
+      if (!isSelected) {
+        const serviceToAdd = existingServices?.find(
+          (s: any) => s.id === serviceId
+        )
+        if (serviceToAdd) {
+          const selectedTypes = getSelectedServiceTypes()
+          if (selectedTypes.has(serviceToAdd.service_type)) {
+            toast.error(
+              `A ${serviceToAdd.service_type} service is already selected`,
+              {
+                description:
+                  'Only one service of each type can be linked to a project to avoid environment variable conflicts.',
+              }
+            )
+            return
+          }
+        }
+      }
+
+      onServiceToggle(serviceId)
+    },
+    [form, existingServices, getSelectedServiceTypes, onServiceToggle]
+  )
 
   return (
     <div className="space-y-6">
@@ -74,7 +130,9 @@ export const ServicesStep = memo(function ServicesStep({
                         className={`cursor-pointer transition-colors hover:bg-muted/50 ${
                           isSelected ? 'ring-2 ring-primary' : ''
                         }`}
-                        onClick={() => onServiceToggle(service.id)}
+                        onClick={() =>
+                          handleServiceToggleWithValidation(service.id)
+                        }
                       >
                         <CardHeader className="pb-2">
                           <div className="flex items-center justify-between">
@@ -118,21 +176,47 @@ export const ServicesStep = memo(function ServicesStep({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-[240px]">
-              {SERVICE_TYPES.map((type) => (
-                <DropdownMenuItem
-                  key={type.id}
-                  onClick={() => onCreateService(type.id)}
-                  className="flex items-start gap-3 py-3"
-                >
-                  <ServiceLogo service={type.id} />
-                  <div className="flex flex-col">
-                    <span className="font-medium">{type.name}</span>
-                    <span className="text-xs text-muted-foreground">
-                      {type.description}
-                    </span>
-                  </div>
-                </DropdownMenuItem>
-              ))}
+              {SERVICE_TYPES.map((type) => {
+                const selectedTypes = getSelectedServiceTypes()
+                const isTypeAlreadySelected = selectedTypes.has(type.id)
+                return (
+                  <DropdownMenuItem
+                    key={type.id}
+                    onClick={() => {
+                      if (isTypeAlreadySelected) {
+                        toast.error(
+                          `A ${type.name} service is already selected`,
+                          {
+                            description:
+                              'Only one service of each type can be linked to a project.',
+                          }
+                        )
+                        return
+                      }
+                      onCreateService(type.id)
+                    }}
+                    className={cn(
+                      'flex items-start gap-3 py-3',
+                      isTypeAlreadySelected && 'opacity-50 cursor-not-allowed'
+                    )}
+                  >
+                    <ServiceLogo service={type.id} />
+                    <div className="flex flex-col">
+                      <span className="font-medium">
+                        {type.name}
+                        {isTypeAlreadySelected && (
+                          <span className="text-xs text-muted-foreground ml-2">
+                            (already selected)
+                          </span>
+                        )}
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        {type.description}
+                      </span>
+                    </div>
+                  </DropdownMenuItem>
+                )
+              })}
             </DropdownMenuContent>
           </DropdownMenu>
         </div>

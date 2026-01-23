@@ -1,6 +1,6 @@
 //! Deploy Static Bundle Job
 //!
-//! Deploys pre-uploaded static files from blob storage.
+//! Deploys pre-uploaded static files from local storage.
 //! This job is used for remote deployments where static files are built externally
 //! and uploaded as a tar.gz or zip bundle.
 
@@ -8,12 +8,11 @@ use async_trait::async_trait;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read};
+use std::path::PathBuf;
 use std::sync::Arc;
-use temps_blob::BlobService;
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_deployer::static_deployer::{StaticDeployRequest, StaticDeployer};
 use temps_logs::{LogLevel, LogService};
-use tokio_util::io::StreamReader;
 use tracing::{debug, error, info};
 use zip::ZipArchive;
 
@@ -64,13 +63,13 @@ impl DeployStaticBundleOutput {
     }
 }
 
-/// Job that deploys a static bundle from blob storage
+/// Job that deploys a static bundle from local storage
 pub struct DeployStaticBundleJob {
     /// Unique job identifier
     job_id: String,
-    /// Project ID for blob storage namespace
+    /// Project ID (for logging/tracking purposes)
     project_id: i32,
-    /// Path to the bundle in blob storage (relative to project namespace)
+    /// Path to the bundle in local storage (relative to data_dir)
     bundle_path: String,
     /// Content type of the bundle (application/gzip or application/zip)
     content_type: String,
@@ -82,8 +81,8 @@ pub struct DeployStaticBundleJob {
     environment_slug: String,
     /// Deployment slug for organizing files
     deployment_slug: String,
-    /// Blob service for retrieving the bundle
-    blob_service: Arc<BlobService>,
+    /// Data directory for reading the bundle
+    data_dir: PathBuf,
     /// Static deployer for deploying files
     static_deployer: Arc<dyn StaticDeployer>,
     /// Log service for streaming logs
@@ -118,7 +117,7 @@ impl DeployStaticBundleJob {
         project_slug: String,
         environment_slug: String,
         deployment_slug: String,
-        blob_service: Arc<BlobService>,
+        data_dir: PathBuf,
         static_deployer: Arc<dyn StaticDeployer>,
     ) -> Self {
         Self {
@@ -130,7 +129,7 @@ impl DeployStaticBundleJob {
             project_slug,
             environment_slug,
             deployment_slug,
-            blob_service,
+            data_dir,
             static_deployer,
             log_service: None,
             log_id: None,
@@ -154,21 +153,25 @@ impl DeployStaticBundleJob {
         }
     }
 
-    /// Detect content type from the bundle path if not provided
+    /// Detect content type - prioritize file extension over provided content_type
+    /// to avoid mismatches (e.g., tar.gz file with wrong content-type header)
     fn detect_content_type(&self) -> &str {
+        // ALWAYS check file extension first - it's more reliable than content_type header
+        // which can be wrong due to multipart form handling or client misconfiguration
+        if self.bundle_path.ends_with(".tar.gz") || self.bundle_path.ends_with(".tgz") {
+            return "application/gzip";
+        }
+        if self.bundle_path.ends_with(".zip") {
+            return "application/zip";
+        }
+
+        // Fall back to provided content type if extension is unknown
         if !self.content_type.is_empty() {
             return &self.content_type;
         }
 
-        // Detect from file extension
-        if self.bundle_path.ends_with(".tar.gz") || self.bundle_path.ends_with(".tgz") {
-            "application/gzip"
-        } else if self.bundle_path.ends_with(".zip") {
-            "application/zip"
-        } else {
-            // Default to gzip
-            "application/gzip"
-        }
+        // Default to gzip
+        "application/gzip"
     }
 
     /// Extract tar.gz bundle to the target directory
@@ -307,32 +310,18 @@ impl DeployStaticBundleJob {
         Ok(file_count)
     }
 
-    /// Download the bundle data from blob storage
+    /// Read the bundle data from local storage
     async fn download_bundle(&self) -> Result<Vec<u8>, WorkflowError> {
-        use futures::StreamExt;
-        use tokio::io::AsyncReadExt;
+        let local_path = self.data_dir.join(&self.bundle_path);
 
-        let (stream, _content_type, _size) = self
-            .blob_service
-            .download(self.project_id, &self.bundle_path)
-            .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!(
-                    "Failed to download bundle from blob storage: {}",
-                    e
-                ))
-            })?;
+        debug!("Reading bundle from local storage: {:?}", local_path);
 
-        // Collect the stream into bytes
-        let stream = stream
-            .map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
-        let mut reader = StreamReader::new(stream);
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data).await.map_err(|e| {
-            WorkflowError::JobExecutionFailed(format!("Failed to read bundle data: {}", e))
-        })?;
-
-        Ok(data)
+        tokio::fs::read(&local_path).await.map_err(|e| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Failed to read bundle from local storage at {:?}: {}",
+                local_path, e
+            ))
+        })
     }
 }
 
@@ -371,15 +360,15 @@ impl WorkflowTask for DeployStaticBundleJob {
             .await;
         }
 
-        // Download bundle from blob storage
-        self.log(LogLevel::Info, "⏳ Downloading bundle from storage...")
+        // Read bundle from local storage
+        self.log(LogLevel::Info, "⏳ Reading bundle from local storage...")
             .await;
 
         let bundle_data = self.download_bundle().await?;
 
         self.log(
             LogLevel::Success,
-            &format!("✅ Downloaded {} bytes", bundle_data.len()),
+            &format!("✅ Read {} bytes from local storage", bundle_data.len()),
         )
         .await;
 
@@ -397,11 +386,12 @@ impl WorkflowTask for DeployStaticBundleJob {
         .await;
 
         // Extract based on content type
+        // Note: Must check for exact "application/zip" since "application/gzip" also contains "zip"
         let content_type = self.detect_content_type();
-        let file_count = if content_type.contains("zip") {
+        let file_count = if content_type == "application/zip" {
             self.extract_zip(&bundle_data, &temp_dir)?
         } else {
-            // Default to tar.gz
+            // Default to tar.gz (application/gzip, application/x-gzip, etc.)
             self.extract_tar_gz(&bundle_data, &temp_dir)?
         };
 
@@ -716,16 +706,39 @@ mod tests {
     }
 
     #[test]
-    fn test_explicit_content_type_takes_precedence() {
+    fn test_file_extension_takes_precedence_over_content_type() {
+        // File extension should override explicit content type to prevent mismatches
+        // This is the new behavior - extension is more reliable than content_type header
         let path = "bundle.tar.gz";
-        let explicit_content_type = "application/zip";
+        let explicit_content_type = "application/zip"; // Wrong content type
 
-        let detected = if !explicit_content_type.is_empty() {
-            explicit_content_type
-        } else if path.ends_with(".tar.gz") || path.ends_with(".tgz") {
+        // New logic: check extension first
+        let detected = if path.ends_with(".tar.gz") || path.ends_with(".tgz") {
             "application/gzip"
         } else if path.ends_with(".zip") {
             "application/zip"
+        } else if !explicit_content_type.is_empty() {
+            explicit_content_type
+        } else {
+            "application/gzip"
+        };
+
+        // Extension wins - should be gzip even though content_type says zip
+        assert_eq!(detected, "application/gzip");
+    }
+
+    #[test]
+    fn test_content_type_used_when_extension_unknown() {
+        // When extension doesn't match known formats, use content_type
+        let path = "bundle.dat"; // Unknown extension
+        let explicit_content_type = "application/zip";
+
+        let detected = if path.ends_with(".tar.gz") || path.ends_with(".tgz") {
+            "application/gzip"
+        } else if path.ends_with(".zip") {
+            "application/zip"
+        } else if !explicit_content_type.is_empty() {
+            explicit_content_type
         } else {
             "application/gzip"
         };

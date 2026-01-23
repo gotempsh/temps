@@ -1,3 +1,4 @@
+pub mod api_key;
 pub mod backup;
 pub mod build;
 pub mod deploy;
@@ -8,6 +9,7 @@ pub mod serve;
 pub mod services;
 pub mod setup;
 
+pub use api_key::ApiKeyCommand;
 pub use backup::BackupCommand;
 pub use build::BuildCommand;
 pub use deploy::DeployCommand;

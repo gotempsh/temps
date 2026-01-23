@@ -2,8 +2,11 @@ use std::sync::Arc;
 
 use crate::services::database_cron_service::DatabaseCronConfigService;
 use crate::services::remote_deployment_service::RemoteDeploymentService;
+use crate::services::workflow_planner::WorkflowPlanner;
 use crate::services::ExternalDeploymentManager;
+use crate::services::WorkflowExecutionService;
 use crate::DeploymentService;
+use sea_orm::DatabaseConnection;
 
 pub struct AppState {
     pub deployment_service: Arc<DeploymentService>,
@@ -11,6 +14,15 @@ pub struct AppState {
     pub cron_service: Arc<DatabaseCronConfigService>,
     pub external_deployment_manager: Arc<ExternalDeploymentManager>,
     pub remote_deployment_service: Arc<RemoteDeploymentService>,
+    // Services for remote deployments
+    pub db: Arc<DatabaseConnection>,
+    pub workflow_planner: Arc<WorkflowPlanner>,
+    pub workflow_executor: Arc<WorkflowExecutionService>,
+    pub queue_service: Arc<dyn temps_core::JobQueue>,
+    // Blob service for static bundle uploads (optional, falls back to local storage)
+    pub blob_service: Arc<temps_blob::BlobService>,
+    /// Data directory for local file storage (static bundles, etc.)
+    pub data_dir: std::path::PathBuf,
 }
 
 use crate::services::types::Deployment;

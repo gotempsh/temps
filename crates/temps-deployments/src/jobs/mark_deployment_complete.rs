@@ -150,10 +150,20 @@ impl MarkDeploymentCompleteJob {
             active_deployment.image_name = Set(Some(image_tag));
         }
 
-        // Extract static_dir_location from deploy_static job output
-        if let Ok(Some(static_dir)) =
-            context.get_output::<String>("deploy_static", "static_dir_location")
-        {
+        // Extract static_dir_location from deploy_static or deploy_static_bundle job output
+        let static_dir = context
+            .get_output::<String>("deploy_static", "static_dir_location")
+            .ok()
+            .flatten()
+            .or_else(|| {
+                // Also check deploy_static_bundle for remote static deployments
+                context
+                    .get_output::<String>("deploy_static_bundle", "static_dir_location")
+                    .ok()
+                    .flatten()
+            });
+
+        if let Some(static_dir) = static_dir {
             debug!("Setting deployment static_dir_location to: {}", static_dir);
             self.log(format!("📁 Static files location: {}", static_dir))
                 .await?;

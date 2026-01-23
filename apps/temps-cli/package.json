@@ -24,7 +24,9 @@
   },
   "devDependencies": {
     "@hey-api/openapi-ts": "^0.88.0",
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "@types/react": "^19.2.9",
+    "react-devtools-core": "^7.0.1"
   },
   "peerDependencies": {
     "typescript": "^5"
@@ -37,6 +39,9 @@
     "cli-table3": "^0.6.5",
     "commander": "^14.0.2",
     "conf": "^15.0.2",
-    "ora": "^9.0.0"
+    "ink": "^6.6.0",
+    "ink-spinner": "^5.0.0",
+    "ora": "^9.0.0",
+    "react": "^19.2.3"
   }
 }

@@ -1,5 +1,7 @@
 import type { Command } from 'commander'
 import { deploy } from './deploy.js'
+import { deployStatic } from './deploy-static.js'
+import { deployImage } from './deploy-image.js'
 import { list } from './list.js'
 import { logs } from './logs.js'
 import { rollback } from './rollback.js'
@@ -7,17 +9,53 @@ import { status } from './status.js'
 import { cancelDeploymentAction, pauseDeploymentAction, resumeDeploymentAction, teardownDeploymentAction } from './actions.js'
 
 export function registerDeployCommands(program: Command): void {
-  // Main deploy command
+  // Main deploy command - git-based deployment
   program
-    .command('deploy')
-    .description('Deploy a project')
+    .command('deploy [project]')
+    .description('Deploy a project from git')
     .option('-p, --project <project>', 'Project slug or ID')
     .option('-e, --environment <env>', 'Target environment name')
     .option('--environment-id <id>', 'Target environment ID')
     .option('-b, --branch <branch>', 'Git branch to deploy')
     .option('--no-wait', 'Do not wait for deployment to complete')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
-    .action(deploy)
+    .action((projectArg, options) => {
+      // If project is passed as argument, use it
+      if (projectArg && !options.project) {
+        options.project = projectArg
+      }
+      return deploy(options)
+    })
+
+  // Static deployment - separate command
+  program
+    .command('deploy:static')
+    .alias('deploy-static')
+    .description('Deploy static files (tar.gz, zip, or directory)')
+    .requiredOption('--path <path>', 'Path to static files archive or directory')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('-e, --environment <env>', 'Target environment name', 'production')
+    .option('--environment-id <id>', 'Target environment ID')
+    .option('--no-wait', 'Do not wait for deployment to complete')
+    .option('-y, --yes', 'Skip confirmation prompts (for automation)')
+    .option('--metadata <json>', 'Additional metadata (JSON format)')
+    .option('--timeout <seconds>', 'Timeout in seconds for --wait', '300')
+    .action(deployStatic)
+
+  // Docker image deployment - separate command
+  program
+    .command('deploy:image')
+    .alias('deploy-image')
+    .description('Deploy a pre-built Docker image')
+    .requiredOption('--image <image>', 'Docker image reference (e.g., ghcr.io/org/app:v1.0)')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('-e, --environment <env>', 'Target environment name', 'production')
+    .option('--environment-id <id>', 'Target environment ID')
+    .option('--no-wait', 'Do not wait for deployment to complete')
+    .option('-y, --yes', 'Skip confirmation prompts (for automation)')
+    .option('--metadata <json>', 'Additional metadata (JSON format)')
+    .option('--timeout <seconds>', 'Timeout in seconds for --wait', '300')
+    .action(deployImage)
 
   // Deployments subcommand
   const deployments = program

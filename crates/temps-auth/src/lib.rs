@@ -36,7 +36,7 @@ pub use apikey_plugin::ApiKeyPlugin;
 pub use plugin::AuthPlugin;
 
 // Export services
-pub use apikey_service::ApiKeyService;
+pub use apikey_service::{ApiKeyService, CreateApiKeyRequest, CreateApiKeyResponse};
 pub use auth_service::AuthService;
 pub use deployment_token_service::{
     DeploymentTokenValidationError, DeploymentTokenValidationService, ValidatedDeploymentToken,

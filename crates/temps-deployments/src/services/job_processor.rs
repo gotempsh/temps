@@ -184,7 +184,7 @@ impl JobProcessorService {
         })
     }
 
-    async fn update_deployment_status(
+    pub async fn update_deployment_status(
         db: &DbConnection,
         deployment_id: i32,
         status: PipelineStatus,
@@ -192,7 +192,7 @@ impl JobProcessorService {
         Self::update_deployment_status_with_message(db, deployment_id, status, None).await
     }
 
-    async fn update_deployment_status_with_message(
+    pub async fn update_deployment_status_with_message(
         db: &DbConnection,
         deployment_id: i32,
         status: PipelineStatus,

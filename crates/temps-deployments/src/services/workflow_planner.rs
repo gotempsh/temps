@@ -447,12 +447,71 @@ impl WorkflowPlanner {
         3000
     }
 
+    /// Determine the effective deployment source type for this deployment
+    ///
+    /// For flexible (Manual) projects, this determines the actual deployment method based on:
+    /// 1. Explicit `deployment_source_type` in metadata (set by remote deployment handlers)
+    /// 2. Presence of `external_image_ref` in metadata -> DockerImage
+    /// 3. Presence of `static_bundle_path` in metadata -> StaticFiles
+    /// 4. Has git info (repo_owner, repo_name) -> Git
+    /// 5. Fallback to Manual (will fail at job planning time)
+    ///
+    /// For non-flexible projects, always returns the project's source type.
+    fn determine_deployment_source_type(
+        &self,
+        project: &projects::Model,
+        deployment: &deployments::Model,
+    ) -> temps_entities::source_type::SourceType {
+        use temps_entities::source_type::SourceType;
+
+        // Non-flexible projects: always use project source type
+        if !project.source_type.is_flexible() {
+            return project.source_type;
+        }
+
+        // Manual/Flexible projects: check deployment metadata
+        if let Some(metadata) = &deployment.metadata {
+            // 1. Explicit deployment_source_type (set by remote deployment handlers)
+            if let Some(dtype) = &metadata.deployment_source_type {
+                debug!(
+                    "Using explicit deployment_source_type from metadata: {:?}",
+                    dtype
+                );
+                return *dtype;
+            }
+
+            // 2. Infer from external image reference
+            if metadata.external_image_ref.is_some() {
+                debug!("Inferred DockerImage deployment from external_image_ref in metadata");
+                return SourceType::DockerImage;
+            }
+
+            // 3. Infer from static bundle path
+            if metadata.static_bundle_path.is_some() {
+                debug!("Inferred StaticFiles deployment from static_bundle_path in metadata");
+                return SourceType::StaticFiles;
+            }
+        }
+
+        // 4. Check if project has git info (fallback to Git deployment)
+        if !project.repo_owner.is_empty() && !project.repo_name.is_empty() {
+            debug!("Using Git deployment for Manual project with git info");
+            return SourceType::Git;
+        }
+
+        // 5. No deployment method could be determined
+        // Keep as Manual - will cause a meaningful error in plan_jobs_for_project
+        debug!("Could not determine deployment method for Manual project");
+        SourceType::Manual
+    }
+
     /// Plan jobs based on project configuration and source type
     ///
     /// Job workflows by source type:
     /// - Git: DownloadRepoJob -> BuildImageJob -> DeployImageJob (or DeployStaticJob)
     /// - DockerImage: PullExternalImageJob -> DeployImageJob
     /// - StaticFiles: DeployStaticBundleJob
+    /// - Manual: Determined at runtime based on deployment metadata
     async fn plan_jobs_for_project(
         &self,
         project: &projects::Model,
@@ -461,9 +520,13 @@ impl WorkflowPlanner {
     ) -> anyhow::Result<Vec<JobDefinition>> {
         use temps_entities::source_type::SourceType;
 
+        // Determine the effective source type for this deployment
+        // For Manual projects, this inspects the deployment metadata
+        let effective_source_type = self.determine_deployment_source_type(project, deployment);
+
         debug!(
-            "Planning jobs for project: {} (source_type: {:?})",
-            project.name, project.source_type
+            "Planning jobs for project: {} (project_source_type: {:?}, effective_source_type: {:?})",
+            project.name, project.source_type, effective_source_type
         );
 
         // Gather environment variables for the deployment
@@ -475,8 +538,8 @@ impl WorkflowPlanner {
             env_vars.len()
         );
 
-        // Route to appropriate job planning based on source type
-        match project.source_type {
+        // Route to appropriate job planning based on effective source type
+        match effective_source_type {
             SourceType::DockerImage => {
                 self.plan_docker_image_deployment(project, environment, deployment, env_vars)
                     .await
@@ -488,6 +551,23 @@ impl WorkflowPlanner {
             SourceType::Git => {
                 self.plan_git_deployment(project, environment, deployment, env_vars)
                     .await
+            }
+            SourceType::Manual => {
+                // Manual projects without explicit deployment method
+                // This happens when someone tries to deploy a Manual project without specifying
+                // how to deploy (no image, no bundle, no git info)
+                Err(anyhow::anyhow!(
+                    "Cannot determine deployment method for Manual project '{}'. \
+                    Please deploy using one of the following methods:\n\
+                    - Docker image: POST /projects/{}/environments/{}/deploy/image\n\
+                    - Static files: POST /projects/{}/environments/{}/deploy/static\n\
+                    - Configure git repository in project settings for git-based deployments",
+                    project.name,
+                    project.id,
+                    deployment.environment_id,
+                    project.id,
+                    deployment.environment_id
+                ))
             }
         }
     }
@@ -951,6 +1031,13 @@ impl WorkflowPlanner {
             project.name, static_bundle_path
         );
 
+        // Get content type from deployment metadata (for proper extraction)
+        let content_type = deployment
+            .metadata
+            .as_ref()
+            .and_then(|m| m.static_bundle_content_type.clone())
+            .unwrap_or_default();
+
         // Job 1: Deploy static bundle (extract and deploy to filesystem)
         jobs.push(JobDefinition {
             job_id: "deploy_static_bundle".to_string(),
@@ -963,6 +1050,7 @@ impl WorkflowPlanner {
             dependencies: vec![],
             job_config: Some(serde_json::json!({
                 "bundle_path": static_bundle_path,
+                "content_type": content_type,
                 "static_bundle_id": deployment.metadata.as_ref().and_then(|m| m.static_bundle_id),
                 "project_slug": project.slug,
                 "environment_slug": environment.slug,

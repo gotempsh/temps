@@ -30,6 +30,11 @@ impl LogService {
         }
     }
 
+    /// Returns the base path where logs and other data files are stored
+    pub fn base_path(&self) -> &PathBuf {
+        &self.log_base_path
+    }
+
     pub fn get_log_path(&self, log_id: &str) -> PathBuf {
         // If log_id already contains .log extension or path separators, treat it as a full path
         if log_id.contains('/') || log_id.ends_with(".log") {

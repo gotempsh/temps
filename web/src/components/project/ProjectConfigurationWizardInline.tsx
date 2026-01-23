@@ -280,11 +280,11 @@ function RepoConfigStep({
 }
 
 // Services Step Component
-// Services Step Component
 interface ServicesStepProps {
   form: UseFormReturn<FormValues>
   existingServices?: any[]
   newlyCreatedServiceIds: number[]
+  newlyCreatedServiceTypes: ServiceTypeRoute[]
   onCreateService: (type: ServiceTypeRoute) => void
 }
 // Memoized ServiceCard to prevent unnecessary re-renders
@@ -327,13 +327,53 @@ function ServicesStep({
   form,
   existingServices,
   newlyCreatedServiceIds,
+  newlyCreatedServiceTypes,
   onCreateService,
 }: ServicesStepProps) {
+  // Get the service types that are already selected (either existing or newly created)
+  const getSelectedServiceTypes = useCallback((): Set<string> => {
+    const currentServices = form.getValues('storageServices') || []
+    const selectedTypes = new Set<string>()
+
+    // Add types from selected existing services
+    currentServices.forEach((serviceId: number) => {
+      const service = existingServices?.find((s: any) => s.id === serviceId)
+      if (service) {
+        selectedTypes.add(service.service_type)
+      }
+    })
+
+    // Add types from newly created services
+    newlyCreatedServiceTypes.forEach((serviceType) => {
+      selectedTypes.add(serviceType)
+    })
+
+    return selectedTypes
+  }, [form, existingServices, newlyCreatedServiceTypes])
+
   // Stable callback for service selection to prevent infinite re-renders
   const handleServiceToggle = useCallback(
     (serviceId: number) => {
       const currentServices = form.getValues('storageServices') || []
       const isSelected = currentServices.includes(serviceId)
+
+      // If trying to select (not deselect), check for type collision
+      if (!isSelected) {
+        const serviceToAdd = existingServices?.find(
+          (s: any) => s.id === serviceId
+        )
+        if (serviceToAdd) {
+          const selectedTypes = getSelectedServiceTypes()
+          if (selectedTypes.has(serviceToAdd.service_type)) {
+            toast.error(`A ${serviceToAdd.service_type} service is already selected`, {
+              description:
+                'Only one service of each type can be linked to a project to avoid environment variable conflicts.',
+            })
+            return
+          }
+        }
+      }
+
       const newValues = isSelected
         ? currentServices.filter((id: number) => id !== serviceId)
         : [...currentServices, serviceId]
@@ -344,7 +384,7 @@ function ServicesStep({
         shouldTouch: false,
       })
     },
-    [form]
+    [form, existingServices, getSelectedServiceTypes]
   )
 
   return (
@@ -365,21 +405,44 @@ function ServicesStep({
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-[240px]">
-            {SERVICE_TYPES.map((type) => (
-              <DropdownMenuItem
-                key={type.id}
-                onClick={() => onCreateService(type.id)}
-                className="flex items-start gap-3 py-3"
-              >
-                <ServiceLogo service={type.id} />
-                <div className="flex flex-col">
-                  <span className="font-medium">{type.name}</span>
-                  <span className="text-xs text-muted-foreground">
-                    {type.description}
-                  </span>
-                </div>
-              </DropdownMenuItem>
-            ))}
+            {SERVICE_TYPES.map((type) => {
+              const selectedTypes = getSelectedServiceTypes()
+              const isTypeAlreadySelected = selectedTypes.has(type.id)
+              return (
+                <DropdownMenuItem
+                  key={type.id}
+                  onClick={() => {
+                    if (isTypeAlreadySelected) {
+                      toast.error(`A ${type.name} service is already selected`, {
+                        description:
+                          'Only one service of each type can be linked to a project.',
+                      })
+                      return
+                    }
+                    onCreateService(type.id)
+                  }}
+                  className={cn(
+                    'flex items-start gap-3 py-3',
+                    isTypeAlreadySelected && 'opacity-50 cursor-not-allowed'
+                  )}
+                >
+                  <ServiceLogo service={type.id} />
+                  <div className="flex flex-col">
+                    <span className="font-medium">
+                      {type.name}
+                      {isTypeAlreadySelected && (
+                        <span className="text-xs text-muted-foreground ml-2">
+                          (already selected)
+                        </span>
+                      )}
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      {type.description}
+                    </span>
+                  </div>
+                </DropdownMenuItem>
+              )
+            })}
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
@@ -774,6 +837,9 @@ export function ProjectConfigurationWizardInline({
   const [newlyCreatedServiceIds, setNewlyCreatedServiceIds] = useState<
     number[]
   >([])
+  const [newlyCreatedServiceTypes, setNewlyCreatedServiceTypes] = useState<
+    ServiceTypeRoute[]
+  >([])
 
   const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
@@ -874,12 +940,19 @@ export function ProjectConfigurationWizardInline({
   const watchedEnvVars = form.watch('environmentVariables') || []
 
   // Create service dialog success handler
-  const handleServiceCreated = useCallback((service: any) => {
-    setIsCreateServiceDialogOpen(false)
-    setSelectedServiceType(null)
-    setNewlyCreatedServiceIds((prev) => [...prev, service.id])
-    toast.success(`Service "${service.name}" created successfully!`)
-  }, [])
+  const handleServiceCreated = useCallback(
+    (service: any) => {
+      setIsCreateServiceDialogOpen(false)
+      setNewlyCreatedServiceIds((prev) => [...prev, service.id])
+      // Track the service type from the selected type (more reliable than service response)
+      if (selectedServiceType) {
+        setNewlyCreatedServiceTypes((prev) => [...prev, selectedServiceType])
+      }
+      setSelectedServiceType(null)
+      toast.success(`Service "${service.name}" created successfully!`)
+    },
+    [selectedServiceType]
+  )
 
   // Queries
   const { data: existingServices } = useQuery({
@@ -963,6 +1036,7 @@ export function ProjectConfigurationWizardInline({
                   form={form}
                   existingServices={existingServices}
                   newlyCreatedServiceIds={newlyCreatedServiceIds}
+                  newlyCreatedServiceTypes={newlyCreatedServiceTypes}
                   onCreateService={handleCreateService}
                 />
               ) : currentStep === 'env-vars' ? (

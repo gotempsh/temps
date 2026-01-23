@@ -17,7 +17,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::jobs::{
     BuildImageJobBuilder, ConfigureCronsJobBuilder, CronConfigService, DeployImageJobBuilder,
-    DeployStaticJob, DeploymentTarget, DownloadRepoBuilder,
+    DeployStaticBundleJob, DeployStaticJob, DeploymentTarget, DownloadRepoBuilder,
+    PullExternalImageJob,
 };
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
@@ -34,6 +35,7 @@ pub struct WorkflowExecutionService {
     cron_service: Arc<dyn CronConfigService>,
     config_service: Arc<temps_config::ConfigService>,
     screenshot_service: Arc<ScreenshotService>,
+    docker: Arc<bollard::Docker>,
 }
 
 impl WorkflowExecutionService {
@@ -49,6 +51,7 @@ impl WorkflowExecutionService {
         cron_service: Arc<dyn CronConfigService>,
         config_service: Arc<temps_config::ConfigService>,
         screenshot_service: Arc<ScreenshotService>,
+        docker: Arc<bollard::Docker>,
     ) -> Self {
         Self {
             db,
@@ -61,6 +64,7 @@ impl WorkflowExecutionService {
             cron_service,
             config_service,
             screenshot_service,
+            docker,
         }
     }
 
@@ -563,7 +567,22 @@ impl WorkflowExecutionService {
                         WorkflowExecutionError::DeploymentNotFound(db_job.deployment_id)
                     })?;
 
-                let job = DeployImageJobBuilder::new()
+                // Check if this is an external image deployment (from remote deployment)
+                let use_external_image = config
+                    .get("use_external_image")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let external_image_tag = if use_external_image {
+                    config
+                        .get("image_name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                };
+
+                let mut builder = DeployImageJobBuilder::new()
                     .job_id(db_job.job_id.clone())
                     .build_job_id(build_job_id)
                     .target(DeploymentTarget::Docker {
@@ -576,8 +595,15 @@ impl WorkflowExecutionService {
                     .replicas(replicas)
                     .environment_variables(env_variables)
                     .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone())
-                    .build(self.container_deployer.clone())?;
+                    .log_service(self.log_service.clone());
+
+                // If using external image, set the image tag directly (bypasses build job lookup)
+                if let Some(image_tag) = external_image_tag {
+                    debug!("🐳 Using external image tag for deployment: {}", image_tag);
+                    builder = builder.external_image_tag(image_tag);
+                }
+
+                let job = builder.build(self.container_deployer.clone())?;
 
                 Ok(Arc::new(job))
             }
@@ -816,6 +842,83 @@ impl WorkflowExecutionService {
                 )
                 .with_log_id(db_job.log_id.clone())
                 .with_log_service(self.log_service.clone());
+
+                Ok(Arc::new(job))
+            }
+
+            "PullExternalImageJob" => {
+                let config = db_job.job_config.as_ref().ok_or_else(|| {
+                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
+                })?;
+
+                let image_ref = config
+                    .get("image_ref")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "image_ref is required".to_string(),
+                        )
+                    })?
+                    .to_string();
+
+                let external_image_id = config
+                    .get("external_image_id")
+                    .and_then(|v| v.as_i64())
+                    .map(|id| id as i32);
+
+                let job = PullExternalImageJob::new(
+                    db_job.job_id.clone(),
+                    image_ref,
+                    external_image_id,
+                    self.docker.clone(),
+                )
+                .with_log_service(self.log_service.clone(), db_job.log_id.clone());
+
+                Ok(Arc::new(job))
+            }
+
+            "DeployStaticBundleJob" => {
+                let config = db_job.job_config.as_ref().ok_or_else(|| {
+                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
+                })?;
+
+                let bundle_path = config
+                    .get("bundle_path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "bundle_path is required".to_string(),
+                        )
+                    })?
+                    .to_string();
+
+                let content_type = config
+                    .get("content_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("application/gzip")
+                    .to_string();
+
+                let static_bundle_id = config
+                    .get("static_bundle_id")
+                    .and_then(|v| v.as_i64())
+                    .map(|id| id as i32);
+
+                // Get data directory from config service for local storage
+                let data_dir = self.config_service.data_dir();
+
+                let job = DeployStaticBundleJob::new(
+                    db_job.job_id.clone(),
+                    project.id,
+                    bundle_path,
+                    content_type,
+                    static_bundle_id,
+                    project.slug.clone(),
+                    environment.slug.clone(),
+                    deployment.slug.clone(),
+                    data_dir,
+                    self.static_deployer.clone(),
+                )
+                .with_log_service(self.log_service.clone(), db_job.log_id.clone());
 
                 Ok(Arc::new(job))
             }
@@ -1675,6 +1778,10 @@ mod tests {
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
+        );
         let _service = WorkflowExecutionService::new(
             db.clone(),
             queue,
@@ -1686,6 +1793,7 @@ mod tests {
             cron_service,
             config_service,
             screenshot_service,
+            docker,
         );
 
         // Service should be created successfully - compilation itself is the test
@@ -1711,6 +1819,10 @@ mod tests {
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
+        );
         let service = WorkflowExecutionService::new(
             db.clone(),
             queue,
@@ -1722,6 +1834,7 @@ mod tests {
             cron_service,
             config_service,
             screenshot_service,
+            docker,
         );
 
         // Should fail with NoJobsFound error
@@ -1812,6 +1925,10 @@ mod tests {
             Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
         let config_service = create_mock_config_service(db.clone());
         let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
+        );
         let service = WorkflowExecutionService::new(
             db.clone(),
             queue,
@@ -1823,6 +1940,7 @@ mod tests {
             cron_service,
             config_service,
             screenshot_service,
+            docker,
         );
 
         // Execute workflow - this will use mock services so should succeed

@@ -5,7 +5,7 @@
 //! and only the pre-built image reference is provided.
 
 use async_trait::async_trait;
-use bollard::image::CreateImageOptions;
+use bollard::query_parameters::CreateImageOptionsBuilder;
 use bollard::Docker;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -185,10 +185,9 @@ impl WorkflowTask for PullExternalImageJob {
         }
 
         // Pull the image using Docker daemon
-        let create_image_options = CreateImageOptions {
-            from_image: self.image_ref.clone(),
-            ..Default::default()
-        };
+        let create_image_options = CreateImageOptionsBuilder::new()
+            .from_image(&self.image_ref)
+            .build();
 
         // Use None for authentication - relies on Docker daemon's credentials (~/.docker/config.json)
         let mut stream = self
