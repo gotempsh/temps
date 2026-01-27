@@ -10,6 +10,7 @@ use argon2::password_hash::{rand_core::OsRng, SaltString};
 use argon2::{Argon2, PasswordHasher};
 use clap::Args;
 use colored::Colorize;
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
 use rustls::crypto::CryptoProvider;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
@@ -211,6 +212,11 @@ pub struct SetupCommand {
     /// Used when running behind a reverse proxy or load balancer
     #[arg(long, env = "TEMPS_EXTERNAL_URL")]
     pub external_url: Option<String>,
+
+    /// Skip downloading GeoLite2-City.mmdb database from GitHub
+    /// By default, the database is downloaded automatically if not present
+    #[arg(long, default_value = "false")]
+    pub skip_geolite2_download: bool,
 }
 
 fn generate_secure_password() -> String {
@@ -680,20 +686,151 @@ fn ask_confirmation(prompt: &str) -> anyhow::Result<bool> {
     Ok(response == "y" || response == "yes")
 }
 
-/// Check if GeoLite2-City.mmdb exists and warn if missing
-/// This database is required to run the application but not for setup
-fn check_geolite2_database(data_dir: &PathBuf) {
+/// URL for downloading GeoLite2-City.mmdb from GitHub
+const GEOLITE2_DOWNLOAD_URL: &str =
+    "https://raw.githubusercontent.com/gotempsh/temps/refs/heads/main/crates/temps-cli/GeoLite2-City.mmdb";
+
+/// Download GeoLite2-City.mmdb from GitHub with progress bar
+async fn download_geolite2_database(data_dir: &PathBuf) -> anyhow::Result<()> {
+    use futures::StreamExt;
+
+    let geo_db_path = data_dir.join("GeoLite2-City.mmdb");
+
+    println!();
+    println!(
+        "   {} {}",
+        "📥".bright_cyan(),
+        "Downloading GeoLite2-City.mmdb...".bright_white()
+    );
+    println!(
+        "   {} {}",
+        "🔗".bright_blue(),
+        GEOLITE2_DOWNLOAD_URL.bright_cyan()
+    );
+    println!();
+
+    // Create HTTP client
+    let client = reqwest::Client::new();
+    let response = client
+        .get(GEOLITE2_DOWNLOAD_URL)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to start download: {}", e))?;
+
+    // Check response status
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "Failed to download GeoLite2 database: HTTP {}",
+            response.status()
+        ));
+    }
+
+    // Get content length for progress bar
+    let total_size = response.content_length().unwrap_or(0);
+
+    // Create progress bar with beautiful styling
+    let pb = if total_size > 0 {
+        let pb = ProgressBar::new(total_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("   {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) {msg}")
+                .unwrap()
+                .progress_chars("█▓▒░  "),
+        );
+        pb.set_message("downloading...");
+        pb
+    } else {
+        // Unknown size - use spinner
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("   {spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec}) {msg}")
+                .unwrap(),
+        );
+        pb.set_message("downloading...");
+        pb
+    };
+
+    // Create temporary file for download
+    let temp_path = geo_db_path.with_extension("mmdb.tmp");
+    let mut file = fs::File::create(&temp_path)
+        .map_err(|e| anyhow::anyhow!("Failed to create temporary file: {}", e))?;
+
+    // Stream the download with progress updates
+    let mut stream = response.bytes_stream();
+    let mut downloaded: u64 = 0;
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.map_err(|e| anyhow::anyhow!("Download error: {}", e))?;
+
+        use std::io::Write;
+        file.write_all(&chunk)
+            .map_err(|e| anyhow::anyhow!("Failed to write to file: {}", e))?;
+
+        downloaded += chunk.len() as u64;
+        pb.set_position(downloaded);
+    }
+
+    // Finish progress bar
+    pb.finish_with_message("complete!");
+
+    // Rename temp file to final destination
+    fs::rename(&temp_path, &geo_db_path)
+        .map_err(|e| anyhow::anyhow!("Failed to finalize download: {}", e))?;
+
+    println!();
+    println!(
+        "   {} {} {}",
+        "✅".bright_green(),
+        "Downloaded to:".bright_white(),
+        geo_db_path.display().to_string().bright_cyan()
+    );
+
+    // Verify file size is reasonable (> 1MB, typical size is ~60MB)
+    let metadata = fs::metadata(&geo_db_path)?;
+    let size_mb = metadata.len() as f64 / 1024.0 / 1024.0;
+    println!(
+        "   {} {} {:.1} MB",
+        "📊".bright_blue(),
+        "File size:".bright_white(),
+        size_mb
+    );
+
+    if metadata.len() < 1_000_000 {
+        warn!(
+            "Downloaded file seems too small ({} bytes), may be corrupted",
+            metadata.len()
+        );
+        println!(
+            "   {} {}",
+            "⚠️ ".bright_yellow(),
+            "Warning: File seems small, may be corrupted".bright_yellow()
+        );
+    }
+
+    println!();
+
+    Ok(())
+}
+
+/// Check if GeoLite2-City.mmdb exists
+/// Returns true if database exists, false if it needs to be downloaded
+fn check_geolite2_database(data_dir: &PathBuf) -> bool {
     let geo_db_path = data_dir.join("GeoLite2-City.mmdb");
     let current_dir_path = PathBuf::from("./GeoLite2-City.mmdb");
 
     // Check both locations
     if geo_db_path.exists() || current_dir_path.exists() {
         print_success("GeoLite2 database found");
-        return;
+        return true;
     }
 
-    // Database not found - show warning with download instructions
-    print_warning("GeoLite2 database not found");
+    false
+}
+
+/// Show warning when GeoLite2 database is missing and download was skipped
+fn show_geolite2_missing_warning(data_dir: &PathBuf) {
+    print_warning("GeoLite2 database not found (download skipped)");
     println!();
     println!(
         "{}",
@@ -710,9 +847,16 @@ fn check_geolite2_database(data_dir: &PathBuf) {
     );
     println!();
     println!(
+        "   {} {} {}",
+        "💡".bright_yellow(),
+        "Quick fix:".bright_white().bold(),
+        "Run setup without --skip-geolite2-download".bright_cyan()
+    );
+    println!();
+    println!(
         "   {} {}",
         "📥".bright_cyan(),
-        "Download instructions:".bright_white().bold()
+        "Or download manually:".bright_white().bold()
     );
     println!(
         "   {}",
@@ -1013,11 +1157,35 @@ impl SetupCommand {
 
         print_success("Encryption key configured");
 
-        // Check for GeoLite2 database (warning only - not required for setup)
-        check_geolite2_database(&data_dir);
+        // Check for GeoLite2 database
+        let geolite2_exists = check_geolite2_database(&data_dir);
 
         // Create tokio runtime for async operations
         let rt = tokio::runtime::Runtime::new()?;
+
+        // Download GeoLite2 database if not present (unless skipped)
+        if !geolite2_exists {
+            if self.skip_geolite2_download {
+                // User explicitly skipped download - show warning
+                show_geolite2_missing_warning(&data_dir);
+            } else {
+                // Download by default
+                print_section("GeoLite2 Database Download");
+                match rt.block_on(download_geolite2_database(&data_dir)) {
+                    Ok(()) => {
+                        print_success("GeoLite2 database downloaded successfully");
+                    }
+                    Err(e) => {
+                        print_error(&format!("Failed to download GeoLite2 database: {}", e));
+                        println!(
+                            "   {} You can manually download the database later.",
+                            "ℹ️ ".bright_blue()
+                        );
+                        println!();
+                    }
+                }
+            }
+        }
 
         // Establish database connection (this also runs migrations)
         print_section("Database Setup");

@@ -7,7 +7,7 @@ import {
   getLastDeployment,
 } from '../../api/sdk.gen.js'
 import type { EnvironmentResponse, DeploymentResponse } from '../../api/types.gen.js'
-import { promptSelect, promptText, promptConfirm } from '../../ui/prompts.js'
+import { promptSelect, promptText } from '../../ui/prompts.js'
 import { startSpinner, succeedSpinner, failSpinner, updateSpinner } from '../../ui/spinner.js'
 import { success, info, warning, newline, icons, colors, header, keyValue, box } from '../../ui/output.js'
 
@@ -133,18 +133,6 @@ export async function deploy(options: DeployOptions): Promise<void> {
     `${icons.rocket} Deployment Preview`
   )
   newline()
-
-  if (!options.yes) {
-    const confirmed = await promptConfirm({
-      message: 'Start deployment?',
-      default: true,
-    })
-
-    if (!confirmed) {
-      info('Deployment cancelled')
-      return
-    }
-  }
 
   // Start deployment
   startSpinner('Starting deployment...')

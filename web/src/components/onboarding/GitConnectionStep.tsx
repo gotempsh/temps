@@ -31,6 +31,7 @@ import { formatDistanceToNow } from 'date-fns'
 interface GitConnectionStepProps {
   onSuccess: () => void
   onBack?: () => void
+  onSkip?: () => void
 }
 
 function getProviderIcon(providerType: string) {
@@ -123,7 +124,7 @@ function ConnectionCard({
   )
 }
 
-export function GitConnectionStep({ onSuccess, onBack }: GitConnectionStepProps) {
+export function GitConnectionStep({ onSuccess, onBack, onSkip }: GitConnectionStepProps) {
   const [selectedConnection, setSelectedConnection] = useState<number | null>(
     null
   )
@@ -149,14 +150,34 @@ export function GitConnectionStep({ onSuccess, onBack }: GitConnectionStepProps)
     }
   }
 
-  // If no connections exist, go directly to add new flow
+  // If no connections exist, show option to connect or skip
   if (!connectionsLoading && connections.length === 0) {
     return (
-      <GitProviderFlow
-        onSuccess={onSuccess}
-        onCancel={onBack}
-        mode="onboarding"
-      />
+      <div className="space-y-6">
+        <div className="text-center space-y-2">
+          <h2 className="text-xl sm:text-2xl font-bold">
+            Connect Git Provider (Optional)
+          </h2>
+          <p className="text-sm sm:text-base text-muted-foreground">
+            Connect your Git provider to deploy from private repositories, or skip to use public repos and templates
+          </p>
+        </div>
+
+        <GitProviderFlow
+          onSuccess={onSuccess}
+          onCancel={onBack}
+          mode="onboarding"
+        />
+
+        {onSkip && (
+          <div className="flex items-center justify-center pt-4 border-t">
+            <Button variant="ghost" onClick={onSkip} className="text-muted-foreground">
+              Skip for now - I&apos;ll use templates or public repos
+              <ArrowRight className="h-4 w-4 ml-2" />
+            </Button>
+          </div>
+        )}
+      </div>
     )
   }
 
@@ -244,14 +265,21 @@ export function GitConnectionStep({ onSuccess, onBack }: GitConnectionStepProps)
               </Button>
             )}
             <div className="flex-1" />
-            <Button
-              onClick={handleContinue}
-              disabled={!selectedConnection}
-              className="gap-2"
-            >
-              Continue
-              <ArrowRight className="h-4 w-4" />
-            </Button>
+            <div className="flex items-center gap-2">
+              {onSkip && (
+                <Button variant="ghost" onClick={onSkip} className="text-muted-foreground">
+                  Skip
+                </Button>
+              )}
+              <Button
+                onClick={handleContinue}
+                disabled={!selectedConnection}
+                className="gap-2"
+              >
+                Continue
+                <ArrowRight className="h-4 w-4" />
+              </Button>
+            </div>
           </div>
         </>
       )}

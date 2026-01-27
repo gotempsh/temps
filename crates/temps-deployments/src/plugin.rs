@@ -249,6 +249,11 @@ impl TempsPlugin for DeploymentsPlugin {
             .get_service::<WorkflowExecutionService>()
             .expect("WorkflowExecutionService must be registered before configuring routes");
 
+        // Get ImageBuilder for uploading Docker image tarballs
+        let image_builder = context
+            .get_service::<dyn temps_deployer::ImageBuilder>()
+            .expect("ImageBuilder must be registered before configuring routes");
+
         // Get BlobService for static bundle uploads
         let blob_service = context
             .get_service::<temps_blob::BlobService>()
@@ -269,6 +274,7 @@ impl TempsPlugin for DeploymentsPlugin {
             queue_service,
             blob_service,
             data_dir,
+            image_builder,
         });
 
         let deployments_routes = handlers::deployments::configure_routes();

@@ -112,6 +112,8 @@ export function ImprovedOnboardingDashboard() {
   const hasProjects = (projectsData?.projects?.length || 0) > 0
   const hasExternalUrl = !!settings?.external_url
   const hasPreviewDomain = !!settings?.preview_domain
+  // Check if access URLs are already configured (for auto-skip)
+  const hasAccessUrls = hasExternalUrl && hasPreviewDomain
   const hasDomain = (domains?.domains?.length || 0) > 0
   // Check if there's an active/provisioned domain (not just pending)
   const hasActiveDomain =
@@ -198,17 +200,23 @@ export function ImprovedOnboardingDashboard() {
             stepsToMark.push('domain-challenge')
 
             // Check where to go next based on what's configured
-            if (hasExternalUrl) {
+            if (hasAccessUrls) {
+              // Both external_url and preview_domain are set
+              stepsToMark.push('external-url', 'screenshot-setup')
+              // Skip to git-provider or project step
+              if (hasConnections) {
+                stepsToMark.push('git-provider')
+                nextStep = 'project'
+              } else {
+                nextStep = 'git-provider'
+              }
+            } else if (hasExternalUrl) {
+              // Only external_url is set
               stepsToMark.push('external-url')
-            }
-            // Note: screenshot-setup is optional, so we skip marking it
-
-            // If git connections exist, go to project step
-            if (hasConnections) {
-              stepsToMark.push('git-provider')
-              nextStep = 'project'
+              nextStep = 'screenshot-setup'
             } else {
-              nextStep = 'git-provider'
+              // Neither is set - go to external-url step
+              nextStep = 'external-url'
             }
           }
         }
@@ -227,6 +235,7 @@ export function ImprovedOnboardingDashboard() {
     hasActiveDomain,
     hasConnections,
     hasExternalUrl,
+    hasAccessUrls,
     savedState.currentStep,
     completedSteps.length,
   ])
@@ -314,6 +323,18 @@ export function ImprovedOnboardingDashboard() {
     }
   }, [currentStep, hasConnections, completedSteps])
 
+  // Auto-skip external-url step if access URLs are already configured
+  useEffect(() => {
+    if (currentStep === 'external-url' && hasAccessUrls) {
+      queueMicrotask(() => {
+        setCompletedSteps((prev) => [
+          ...Array.from(new Set<OnboardingStep>([...prev, 'external-url'])),
+        ])
+        setCurrentStep('screenshot-setup')
+      })
+    }
+  }, [currentStep, hasAccessUrls])
+
   // Save state to localStorage whenever it changes
   useEffect(() => {
     const state: OnboardingState = {
@@ -347,9 +368,9 @@ export function ImprovedOnboardingDashboard() {
   }
 
   // Check if all steps are complete
+  // Note: Git connections are optional - projects can be created from templates, public repos, or manual deployments
   const allStepsComplete =
     hasActiveDomain &&
-    hasConnections &&
     hasProjects &&
     hasExternalUrl &&
     hasPreviewDomain
@@ -531,6 +552,10 @@ export function ImprovedOnboardingDashboard() {
                 completeStep('git-provider', 'project')
               }}
               onBack={() => setCurrentStep('screenshot-setup')}
+              onSkip={() => {
+                // Skip git provider step - users can create projects from templates, public repos, or manual deployments
+                completeStep('git-provider', 'project')
+              }}
             />
           )}
 

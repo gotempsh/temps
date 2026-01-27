@@ -24,7 +24,7 @@ use temps_entities::source_type::SourceType;
 use temps_entities::types::PipelineStatus;
 use temps_entities::{deployments, environments, projects};
 use tracing::{debug, error, info};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::services::{ExternalImageInfo, RegisterExternalImageRequest, StaticBundleInfo};
 
@@ -32,6 +32,7 @@ use crate::services::{ExternalImageInfo, RegisterExternalImageRequest, StaticBun
 #[openapi(
     paths(
         deploy_from_image,
+        deploy_from_image_upload,
         deploy_from_static,
         upload_static_bundle,
         register_external_image,
@@ -44,6 +45,7 @@ use crate::services::{ExternalImageInfo, RegisterExternalImageRequest, StaticBun
     ),
     components(schemas(
         DeployFromImageRequest,
+        DeployFromImageUploadQuery,
         DeployFromStaticRequest,
         DeploymentResponse,
         ExternalImageResponse,
@@ -101,6 +103,15 @@ pub struct RegisterImageRequest {
 pub struct PaginationQuery {
     pub page: Option<u64>,
     pub page_size: Option<u64>,
+}
+
+/// Query parameters for deploying from an uploaded image tarball
+#[derive(Debug, Clone, Deserialize, ToSchema, IntoParams)]
+pub struct DeployFromImageUploadQuery {
+    /// Tag to apply to the imported image (e.g., "myapp:v1.0")
+    /// If not provided, a unique tag will be generated
+    #[schema(example = "myapp:v1.0")]
+    pub tag: Option<String>,
 }
 
 // Response Types
@@ -742,6 +753,386 @@ pub async fn deploy_from_static(
     ))
 }
 
+/// Deploy from an uploaded Docker image tarball
+///
+/// Uploads a Docker image tarball (from `docker save`) and deploys it directly.
+/// The image is imported using `docker load` and then deployed to the specified environment.
+/// This is useful when you want to deploy an image without pushing to a registry first.
+///
+/// The uploaded file should be a tarball created by `docker save myimage:tag > image.tar`
+/// or `docker save myimage:tag | gzip > image.tar.gz` (gzip compressed tarballs are also supported).
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/environments/{environment_id}/deploy/image-upload",
+    params(DeployFromImageUploadQuery),
+    responses(
+        (status = 202, description = "Image imported and deployment started", body = DeploymentResponse),
+        (status = 400, description = "Invalid request or unsupported format"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Project or environment not found"),
+        (status = 413, description = "Image tarball too large"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn deploy_from_image_upload(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id)): Path<(i32, i32)>,
+    Query(query): Query<DeployFromImageUploadQuery>,
+    mut multipart: Multipart,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, DeploymentsCreate);
+
+    info!(
+        "Deploying from uploaded image tarball to project {} environment {}",
+        project_id, environment_id
+    );
+
+    // 1. Verify project exists and has DockerImage source type
+    let project = projects::Entity::find_by_id(project_id)
+        .one(state.db.as_ref())
+        .await
+        .map_err(|e| {
+            error!("Database error: {}", e);
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Error")
+                .with_detail(e.to_string())
+        })?
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Project Not Found")
+                .with_detail(format!("Project {} not found", project_id))
+        })?;
+
+    // Verify project source type allows Docker image deployments
+    if !project
+        .source_type
+        .allows_deployment_method(&SourceType::DockerImage)
+    {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Project Type")
+            .with_detail(format!(
+                "Project with source type {:?} does not allow Docker image deployments",
+                project.source_type
+            )));
+    }
+
+    // 2. Verify environment exists and belongs to project
+    let environment = environments::Entity::find_by_id(environment_id)
+        .one(state.db.as_ref())
+        .await
+        .map_err(|e| {
+            error!("Database error: {}", e);
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Error")
+                .with_detail(e.to_string())
+        })?
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Environment Not Found")
+                .with_detail(format!("Environment {} not found", environment_id))
+        })?;
+
+    if environment.project_id != project_id {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Environment")
+            .with_detail("Environment does not belong to this project"));
+    }
+
+    // 3. Read the uploaded image tarball from multipart
+    let mut file_data: Option<bytes::Bytes> = None;
+    let mut original_filename: Option<String> = None;
+
+    // Maximum file size: 2GB for Docker images
+    const MAX_FILE_SIZE: usize = 2 * 1024 * 1024 * 1024;
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        error!("Multipart error: {}", e);
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Multipart Error")
+            .with_detail(e.to_string())
+    })? {
+        let name = field.name().unwrap_or_default().to_string();
+
+        if name == "file" || name == "image" {
+            original_filename = field.file_name().map(String::from);
+
+            let data = field.bytes().await.map_err(|e| {
+                error!("Failed to read file data: {}", e);
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("File Read Error")
+                    .with_detail(e.to_string())
+            })?;
+
+            if data.len() > MAX_FILE_SIZE {
+                return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Image Tarball Too Large")
+                    .with_detail(format!(
+                        "Image tarball size {} exceeds maximum of {} bytes",
+                        data.len(),
+                        MAX_FILE_SIZE
+                    )));
+            }
+
+            file_data = Some(data);
+        }
+    }
+
+    let file_data = file_data.ok_or_else(|| {
+        problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Missing File")
+            .with_detail("No image tarball file was uploaded. Use field name 'file' or 'image'")
+    })?;
+
+    info!(
+        "Received image tarball: {} bytes, filename: {:?}",
+        file_data.len(),
+        original_filename
+    );
+
+    // 4. Write tarball to temporary file
+    let temp_dir = std::env::temp_dir();
+    let temp_filename = format!(
+        "temps-image-{}-{}.tar",
+        project_id,
+        Utc::now().timestamp_millis()
+    );
+    let temp_path = temp_dir.join(&temp_filename);
+
+    tokio::fs::write(&temp_path, &file_data)
+        .await
+        .map_err(|e| {
+            error!("Failed to write temporary file: {}", e);
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("File Write Error")
+                .with_detail(e.to_string())
+        })?;
+
+    // 5. Generate image tag if not provided
+    let image_tag = query.tag.unwrap_or_else(|| {
+        format!(
+            "temps-{}-{}:upload-{}",
+            project.slug,
+            environment.slug,
+            Utc::now().timestamp()
+        )
+    });
+
+    // 6. Import the image using docker load
+    info!("Importing image from tarball with tag: {}", image_tag);
+    let import_result = state
+        .image_builder
+        .import_image(temp_path.clone(), &image_tag)
+        .await;
+
+    // Clean up temp file
+    if let Err(e) = tokio::fs::remove_file(&temp_path).await {
+        debug!("Failed to remove temporary file: {}", e);
+    }
+
+    let imported_image_id = import_result.map_err(|e| {
+        error!("Failed to import image: {}", e);
+        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Image Import Failed")
+            .with_detail(format!("Failed to import Docker image: {}", e))
+    })?;
+
+    info!(
+        "Successfully imported image with ID: {}, tag: {}",
+        imported_image_id, image_tag
+    );
+
+    // 7. Generate deployment slug
+    let deployment_number = deployments::Entity::find()
+        .filter(deployments::Column::ProjectId.eq(project_id))
+        .count(state.db.as_ref())
+        .await
+        .unwrap_or(0)
+        + 1;
+
+    let env_slug = format!("{}-{}", environment.slug, deployment_number);
+
+    // 8. Get deployment config from environment
+    let deployment_config_snapshot = environment.deployment_config.as_ref().map(|config| {
+        temps_entities::deployment_config::DeploymentConfigSnapshot::from_config(
+            config,
+            std::collections::HashMap::new(),
+        )
+    });
+
+    // 9. Build deployment metadata
+    let deployment_metadata = DeploymentMetadata {
+        external_image_ref: Some(image_tag.clone()),
+        external_image_id: None,
+        deployment_source_type: Some(SourceType::DockerImage),
+        ..Default::default()
+    };
+
+    // 10. Create deployment record
+    let now = Utc::now();
+    let new_deployment = deployments::ActiveModel {
+        project_id: Set(project_id),
+        environment_id: Set(environment_id),
+        slug: Set(env_slug),
+        state: Set("pending".to_string()),
+        metadata: Set(Some(deployment_metadata)),
+        context_vars: Set(Some(serde_json::json!({
+            "trigger": "image_upload",
+            "source": "api",
+            "image_tag": image_tag,
+            "imported_image_id": imported_image_id,
+        }))),
+        image_name: Set(Some(image_tag.clone())),
+        deployment_config: Set(deployment_config_snapshot),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+
+    let deployment = new_deployment
+        .insert(state.db.as_ref())
+        .await
+        .map_err(|e| {
+            error!("Failed to create deployment: {}", e);
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Deployment Creation Failed")
+                .with_detail(e.to_string())
+        })?;
+
+    info!(
+        "Created deployment {} for image upload deployment",
+        deployment.id
+    );
+
+    // 11. Fire DeploymentCreated event
+    let deployment_created_event = Job::DeploymentCreated(DeploymentCreatedJob {
+        deployment_id: deployment.id,
+        project_id: project.id,
+        environment_id: environment.id,
+        environment_name: environment.name.clone(),
+        branch: None,
+        commit_sha: None,
+    });
+    if let Err(e) = state.queue_service.send(deployment_created_event).await {
+        error!("Failed to send DeploymentCreated event: {}", e);
+    }
+
+    // Update project's last_deployment timestamp
+    let mut active_project: projects::ActiveModel = project.into();
+    active_project.last_deployment = Set(Some(Utc::now()));
+    if let Err(e) = active_project.update(state.db.as_ref()).await {
+        error!(
+            "Failed to update last_deployment for project {}: {}",
+            project_id, e
+        );
+    } else {
+        debug!(
+            "Updated last_deployment timestamp for project {}",
+            project_id
+        );
+    }
+
+    // 12. Create jobs using WorkflowPlanner
+    let create_jobs_result = state
+        .workflow_planner
+        .create_deployment_jobs(deployment.id)
+        .await;
+
+    match create_jobs_result {
+        Ok(created_jobs) => {
+            info!(
+                "Created {} jobs for deployment {}",
+                created_jobs.len(),
+                deployment.id
+            );
+
+            // Update deployment status to Running
+            if let Err(e) =
+                crate::services::job_processor::JobProcessorService::update_deployment_status(
+                    &state.db,
+                    deployment.id,
+                    PipelineStatus::Running,
+                )
+                .await
+            {
+                error!("Failed to update deployment status: {}", e);
+            }
+
+            // Execute the workflow in background
+            let workflow_executor = state.workflow_executor.clone();
+            let deployment_id = deployment.id;
+            let db = state.db.clone();
+            tokio::spawn(async move {
+                match workflow_executor
+                    .execute_deployment_workflow(deployment_id)
+                    .await
+                {
+                    Ok(_) => {
+                        info!(
+                            "Workflow execution completed for deployment {}",
+                            deployment_id
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            "Workflow execution failed for deployment {}: {}",
+                            deployment_id, e
+                        );
+                        // Update deployment status to Failed
+                        if let Err(e) =
+                            crate::services::job_processor::JobProcessorService::update_deployment_status(
+                                &db,
+                                deployment_id,
+                                PipelineStatus::Failed,
+                            )
+                            .await
+                        {
+                            error!("Failed to update deployment status: {}", e);
+                        }
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            error!(
+                "Failed to create jobs for deployment {}: {}",
+                deployment.id, e
+            );
+            // Update deployment status to Failed
+            if let Err(e) =
+                crate::services::job_processor::JobProcessorService::update_deployment_status(
+                    &state.db,
+                    deployment.id,
+                    PipelineStatus::Failed,
+                )
+                .await
+            {
+                error!("Failed to update deployment status: {}", e);
+            }
+
+            return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Job Creation Failed")
+                .with_detail(e.to_string()));
+        }
+    }
+
+    // 13. Return deployment info
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(DeploymentResponse {
+            id: deployment.id,
+            project_id: deployment.project_id,
+            environment_id: deployment.environment_id,
+            slug: deployment.slug,
+            state: deployment.state,
+            source_type: "docker_image_upload".to_string(),
+            created_at: deployment.created_at,
+        }),
+    ))
+}
+
 /// Upload a static bundle for later deployment
 ///
 /// Uploads a tar.gz or zip file containing static assets. The bundle can be
@@ -1367,6 +1758,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/projects/{project_id}/environments/{environment_id}/deploy/static",
             post(deploy_from_static),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/deploy/image-upload",
+            post(deploy_from_image_upload),
         )
         // Upload endpoints
         .route(

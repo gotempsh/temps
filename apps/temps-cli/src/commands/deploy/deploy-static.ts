@@ -3,7 +3,7 @@ import { setupClient, client } from '../../lib/api-client.js'
 import { watchDeployment } from '../../lib/deployment-watcher.jsx'
 import { getProjectBySlug, getProject, getEnvironments } from '../../api/sdk.gen.js'
 import type { EnvironmentResponse } from '../../api/types.gen.js'
-import { promptSelect, promptConfirm } from '../../ui/prompts.js'
+import { promptSelect } from '../../ui/prompts.js'
 import {
   startSpinner,
   succeedSpinner,
@@ -220,19 +220,6 @@ export async function deployStatic(options: DeployStaticOptions): Promise<void> 
     `${icons.package} Static Deployment`
   )
   newline()
-
-  // Confirm deployment (skip if --yes flag)
-  if (!options.yes) {
-    const confirmed = await promptConfirm({
-      message: 'Start deployment?',
-      default: true,
-    })
-
-    if (!confirmed) {
-      info('Deployment cancelled')
-      return
-    }
-  }
 
   // Prepare the file for upload
   startSpinner('Preparing static bundle...')

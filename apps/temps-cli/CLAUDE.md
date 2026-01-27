@@ -4,6 +4,12 @@ globs: "*.ts, *.tsx, *.html, *.css, *.js, *.jsx, package.json"
 alwaysApply: false
 ---
 
+## Deployment
+
+When deploying this application, do not ask for confirmation. Proceed with deployments automatically.
+
+## Bun Usage
+
 Default to using Bun instead of Node.js.
 
 - Use `bun <file>` instead of `node <file>` or `ts-node <file>`

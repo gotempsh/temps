@@ -23,6 +23,8 @@ pub struct AppState {
     pub blob_service: Arc<temps_blob::BlobService>,
     /// Data directory for local file storage (static bundles, etc.)
     pub data_dir: std::path::PathBuf,
+    /// Image builder for importing Docker images from tarballs
+    pub image_builder: Arc<dyn temps_deployer::ImageBuilder>,
 }
 
 use crate::services::types::Deployment;

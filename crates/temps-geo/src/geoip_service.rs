@@ -144,7 +144,13 @@ impl GeoIpService {
 
         let db_path = std::env::current_dir()?.join("GeoLite2-City.mmdb");
         debug!("Loading MaxMind database from: {:?}", db_path);
-        let reader = maxminddb::Reader::open_readfile(db_path)?;
+        let reader = maxminddb::Reader::open_readfile(&db_path).map_err(|e| {
+            GeoIpError::Other(format!(
+                "Failed to open MaxMind database at '{}': {}",
+                db_path.display(),
+                e
+            ))
+        })?;
         Ok(Self::MaxMind(MaxMindGeoIpService { reader }))
     }
 

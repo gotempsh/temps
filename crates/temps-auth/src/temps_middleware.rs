@@ -118,7 +118,7 @@ impl AuthMiddleware {
         let host_without_port = host.split(':').next().unwrap_or(host);
 
         // Log for debugging
-        tracing::info!(
+        tracing::debug!(
             "Auth middleware: host={}, host_without_port={}, demo_mode_header={}, path={}",
             host,
             host_without_port,
@@ -135,7 +135,7 @@ impl AuthMiddleware {
                 .check_demo_mode(host_without_port, demo_mode_header, demo_user_id)
                 .await
             {
-                tracing::info!(
+                tracing::debug!(
                     "Demo mode: authenticated as user {} (id={})",
                     demo_user.email,
                     demo_user.id
@@ -409,7 +409,7 @@ impl AuthMiddleware {
 
         // Check if demo mode header is set by proxy (proxy already validated the host)
         if demo_mode_header {
-            tracing::info!(
+            tracing::debug!(
                 "Demo mode detected via X-Temps-Demo-Mode header (host: {})",
                 host_without_port
             );
@@ -432,7 +432,7 @@ impl AuthMiddleware {
                 return None;
             }
 
-            tracing::info!(
+            tracing::debug!(
                 "Demo mode detected: host {} matches expected demo host {}",
                 host_without_port,
                 expected_demo_host
@@ -449,7 +449,7 @@ impl AuthMiddleware {
                     } else {
                         crate::permissions::Role::User
                     };
-                    tracing::info!(
+                    tracing::debug!(
                         "Demo mode: authenticated as selected user (id={}, email={}, role={:?})",
                         user.id,
                         user.email,
@@ -473,7 +473,7 @@ impl AuthMiddleware {
         // Default: Find or create demo user
         match self.user_service.find_or_create_demo_user().await {
             Ok(demo_user) => {
-                tracing::info!(
+                tracing::debug!(
                     "Demo mode: auto-authenticated as demo user (id={}, email={})",
                     demo_user.id,
                     demo_user.email

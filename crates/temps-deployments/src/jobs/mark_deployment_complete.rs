@@ -13,7 +13,7 @@ use temps_core::{
     Job, JobQueue, JobResult, UtcDateTime, WorkflowContext, WorkflowError, WorkflowTask,
 };
 use temps_database::DbConnection;
-use temps_entities::{deployment_containers, deployments, environments};
+use temps_entities::{deployment_containers, deployments, environments, projects};
 use temps_logs::{LogLevel, LogService};
 use tracing::{debug, info};
 
@@ -331,6 +331,35 @@ impl MarkDeploymentCompleteJob {
             environment_id, self.deployment_id
         ))
         .await?;
+
+        // Update project's last_deployment timestamp
+        let project = projects::Entity::find_by_id(deployment.project_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!("Failed to find project: {}", e))
+            })?
+            .ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Project {} not found",
+                    deployment.project_id
+                ))
+            })?;
+
+        let mut active_project: projects::ActiveModel = project.into();
+        active_project.last_deployment = Set(Some(now));
+
+        active_project.update(self.db.as_ref()).await.map_err(|e| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Failed to update project last_deployment: {}",
+                e
+            ))
+        })?;
+
+        info!(
+            "Project {} last_deployment updated to {}",
+            deployment.project_id, now
+        );
 
         self.log("Deployment is now LIVE and ready for traffic!".to_string())
             .await?;
