@@ -41,14 +41,36 @@ import { toast } from 'sonner'
 import { CopyButton } from '../ui/copy-button'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 
+/**
+ * Compute the resource path (database/bucket name) for a project linked to a service.
+ * Mirrors the backend naming conventions in temps-providers/src/externalsvc/.
+ */
+function getProjectResourcePath(
+  serviceType: string,
+  projectSlug: string,
+  environment = 'production'
+): string {
+  if (serviceType === 's3' || serviceType === 'rustfs' || serviceType === 'minio') {
+    // S3/RustFS: {slug}-{env} with underscores replaced by hyphens
+    return `${projectSlug}-${environment}`.replace(/_/g, '-').toLowerCase()
+  }
+  // Postgres/MongoDB/Redis: {slug}_{env} normalized (lowercase, non-alphanumeric -> _)
+  const raw = `${projectSlug}_${environment}`.toLowerCase()
+  const normalized = raw.replace(/[^a-z0-9]/g, '_')
+  // Prefix with db_ if starting with a digit
+  return /^\d/.test(normalized) ? `db_${normalized}` : normalized
+}
+
 function ServiceCard({
   service,
   isLinked,
   onToggle,
+  projectSlug,
 }: {
   service: ExternalServiceInfo
   isLinked: boolean
   onToggle: () => Promise<void>
+  projectSlug: string
 }) {
   const [isEnvPreviewOpen, setIsEnvPreviewOpen] = useState(false)
   const [showEnvPreview, setShowEnvPreview] = useState(false)
@@ -127,7 +149,9 @@ function ServiceCard({
             <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2">
               {isLinked ? (
                 <>
-                  <Link to={`/storage/${service.id}/browse`}>
+                  <Link
+                    to={`/storage/${service.id}/browse?path=${encodeURIComponent(getProjectResourcePath(service.service_type, projectSlug))}`}
+                  >
                     <Button variant="outline" size="sm" className="gap-2">
                       <Database className="h-4 w-4" />
                       Browse Data
@@ -405,6 +429,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
                 false
               }
               onToggle={() => handleServiceToggle(service.id)}
+              projectSlug={project.slug}
             />
           ))}
         </div>
