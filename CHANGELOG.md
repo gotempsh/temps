@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Deleted legacy `web/src/pages/CreateService.tsx` and `CreateServiceRefactored.tsx` (superseded by current service creation flow)
 
 ### Fixed
+- Install script command in documentation now uses `bash` instead of `sh`, fixing failures on Ubuntu 24 where `/bin/sh` is `dash` (#15)
 - Build failures when web UI is skipped in debug mode
 - CPU percentage calculation in container stats now uses delta between `cpu_stats` and `precpu_stats` instead of absolute values
 - `avg_response_time` cast to `float8` in proxy log time bucket stats for correct type handling
