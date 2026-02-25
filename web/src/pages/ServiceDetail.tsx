@@ -332,6 +332,7 @@ export function ServiceDetail() {
                       ? 'Creating...'
                       : 'Start'}
                 </DropdownMenuItem>
+                <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onClick={() => setIsDeleteDialogOpen(true)}
                   className="text-destructive focus:text-destructive"
