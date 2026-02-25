@@ -960,6 +960,7 @@ impl ExternalService for S3Service {
         &self,
         // we are not using the s3 client for this backup, we are using the mc container to backup the data
         _s3_client: &aws_sdk_s3::Client,
+        _s3_credentials: &super::S3Credentials,
         backup: temps_entities::backups::Model,
         s3_source: &temps_entities::s3_sources::Model,
         _subpath: &str,
@@ -1197,6 +1198,7 @@ impl ExternalService for S3Service {
         &self,
         // we are not using the s3 client for this restore, we are using the mc container to restore the backup
         _s3_client: &aws_sdk_s3::Client,
+        _s3_credentials: &super::S3Credentials,
         backup_location: &str,
         s3_source: &temps_entities::s3_sources::Model,
         service_config: ServiceConfig,
@@ -2123,9 +2125,11 @@ mod tests {
         // mirroring may not work in the test environment without additional setup
         println!("⚠️  S3 backup uses mc container - full integration may require additional Docker networking setup");
 
+        let s3_creds = minio.s3_credentials();
         match s3_service
             .backup_to_s3(
                 &minio.s3_client,
+                &s3_creds,
                 backup,
                 &backup_s3_source,
                 "backups/s3",

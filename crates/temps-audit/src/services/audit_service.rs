@@ -1,4 +1,3 @@
-use anyhow::Context;
 use chrono::Utc;
 use sea_orm::{prelude::*, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
 use serde::Serialize;
@@ -128,7 +127,7 @@ impl AuditService {
             .offset(offset as u64)
             .all(self.db.as_ref())
             .await
-            .context("Failed to load filtered audit logs")?;
+            .map_err(|e| anyhow::anyhow!("Failed to load filtered audit logs: {}", e))?;
 
         // Fetch related user and IP geolocation data for each log
         let mut audit_details = Vec::new();
@@ -161,7 +160,7 @@ impl AuditService {
         let log = temps_entities::audit_logs::Entity::find_by_id(log_id)
             .one(self.db.as_ref())
             .await
-            .context("Failed to get audit log by ID")?;
+            .map_err(|e| anyhow::anyhow!("Failed to get audit log by ID {}: {}", log_id, e))?;
 
         if let Some(log) = log {
             // Fetch related user

@@ -30,6 +30,7 @@ import {
   ArrowRight,
   ChevronDown,
   ChevronRight,
+  Database,
   Eye,
   EyeOff,
   Loader2,
@@ -126,14 +127,18 @@ function ServiceCard({
             <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2">
               {isLinked ? (
                 <>
-                  {isEnvPreviewOpen && (
-                    <Link to={`/storage/${service.id}`}>
-                      <Button variant="outline" size="sm" className="gap-2">
-                        View Details
-                        <ArrowRight className="h-4 w-4" />
-                      </Button>
-                    </Link>
-                  )}
+                  <Link to={`/storage/${service.id}/browse`}>
+                    <Button variant="outline" size="sm" className="gap-2">
+                      <Database className="h-4 w-4" />
+                      Browse Data
+                    </Button>
+                  </Link>
+                  <Link to={`/storage/${service.id}`}>
+                    <Button variant="outline" size="sm" className="gap-2">
+                      View Details
+                      <ArrowRight className="h-4 w-4" />
+                    </Button>
+                  </Link>
                   <Button variant="destructive" size="sm" onClick={onToggle}>
                     Unlink
                   </Button>

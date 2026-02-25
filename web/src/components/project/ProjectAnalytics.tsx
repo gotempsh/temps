@@ -38,6 +38,7 @@ import {
   ChartTooltipContent,
 } from '@/components/ui/chart'
 import { CodeBlock } from '@/components/ui/code-block'
+import { CopyButton } from '@/components/ui/copy-button'
 import {
   Popover,
   PopoverContent,
@@ -1845,6 +1846,111 @@ export default function App() {
   const selectedFrameworkData =
     frameworks.find((f) => f.id === selectedFramework) || frameworks[0]
 
+  // Generate AI prompt for coding agents based on the selected framework
+  const getAnalyticsAiPrompt = () => {
+    const fw = selectedFrameworkData
+    return `Add Temps analytics to my ${fw.name}${fw.description ? ` (${fw.description})` : ''} application.
+
+## Installation
+
+\`\`\`bash
+${getInstallCommand(fw.packageName || '@temps-sdk/react-analytics')}
+\`\`\`
+
+## Setup
+
+Wrap the app with the TempsAnalyticsProvider. Here is the framework-specific setup:
+
+\`\`\`tsx
+${fw.setupCode}
+\`\`\`
+${fw.envExample ? `\n## Environment Variables\n\n\`\`\`bash\n${fw.envExample}\n\`\`\`` : ''}
+${fw.apiRouteCode ? `\n## API Route (for proxying analytics events)\n\n\`\`\`typescript\n${fw.apiRouteCode}\n\`\`\`` : ''}
+
+## Provider Configuration
+
+The TempsAnalyticsProvider accepts these options:
+
+\`\`\`tsx
+<TempsAnalyticsProvider
+  basePath="/api/_temps"
+  autoTrack={{
+    pageviews: true,       // Auto-track page views
+    pageLeave: true,       // Track time on page
+    speedAnalytics: true,  // Track Web Vitals (LCP, FCP, CLS, TTFB, INP)
+    engagement: true,      // Track engagement
+    engagementInterval: 30000,
+  }}
+  debug={process.env.NODE_ENV === 'development'}
+>
+  {children}
+</TempsAnalyticsProvider>
+\`\`\`
+
+## Available Hooks
+
+| Hook | Purpose |
+|------|---------|
+| \`useTrackEvent\` | Track custom events |
+| \`useAnalytics\` | Access analytics context, identify users |
+| \`useScrollVisibility\` | Track element visibility on scroll |
+| \`usePageLeave\` | Track page leave and time on page |
+| \`useEngagementTracking\` | Heartbeat engagement monitoring |
+| \`useSpeedAnalytics\` | Web Vitals (LCP, FCP, CLS, TTFB, INP) |
+| \`useTrackPageview\` | Manual page view tracking |
+
+## Track Custom Events
+
+\`\`\`tsx
+'use client';
+import { useTrackEvent } from '@temps-sdk/react-analytics';
+
+function MyComponent() {
+  const trackEvent = useTrackEvent();
+
+  const handleClick = () => {
+    trackEvent('button_click', {
+      button_id: 'subscribe',
+      plan: 'premium'
+    });
+  };
+
+  return <button onClick={handleClick}>Subscribe</button>;
+}
+\`\`\`
+
+## Identify Users
+
+\`\`\`tsx
+'use client';
+import { useAnalytics } from '@temps-sdk/react-analytics';
+import { useEffect } from 'react';
+
+function UserProfile({ user }) {
+  const { identify } = useAnalytics();
+
+  useEffect(() => {
+    if (user) {
+      identify(user.id, {
+        email: user.email,
+        name: user.name,
+        plan: user.subscription?.plan
+      });
+    }
+  }, [user, identify]);
+
+  return <div>Profile</div>;
+}
+\`\`\`
+
+## Verification
+
+After implementation:
+1. Check browser DevTools Network tab for \`/api/_temps\` requests
+2. Verify events appear in the Temps dashboard
+3. Confirm Web Vitals are being captured`
+  }
+
   // Group frameworks by category
   const frameworksByCategory = frameworks.reduce(
     (acc, framework) => {
@@ -1860,17 +1966,25 @@ export default function App() {
       {/* Header */}
       <Card>
         <CardHeader>
-          <div className="flex items-start gap-3">
-            <div className="rounded-lg bg-primary/10 p-2">
-              <Code2 className="h-5 w-5 text-primary" />
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start gap-3">
+              <div className="rounded-lg bg-primary/10 p-2">
+                <Code2 className="h-5 w-5 text-primary" />
+              </div>
+              <div className="space-y-1">
+                <CardTitle>Analytics Setup Instructions</CardTitle>
+                <CardDescription>
+                  Choose your framework and follow the instructions to integrate
+                  analytics
+                </CardDescription>
+              </div>
             </div>
-            <div className="space-y-1">
-              <CardTitle>Analytics Setup Instructions</CardTitle>
-              <CardDescription>
-                Choose your framework and follow the instructions to integrate
-                analytics
-              </CardDescription>
-            </div>
+            <CopyButton
+              value={getAnalyticsAiPrompt()}
+              className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium"
+            >
+              Copy AI Prompt
+            </CopyButton>
           </div>
         </CardHeader>
       </Card>

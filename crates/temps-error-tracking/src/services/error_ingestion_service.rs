@@ -129,54 +129,52 @@ impl ErrorIngestionService {
     /// Replaces dynamic values (IDs, UUIDs, numbers, paths, URLs) with placeholders
     fn normalize_error_message(&self, message: &str) -> String {
         use regex::Regex;
+        use std::sync::LazyLock;
+
+        static UUID_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap()
+        });
+        static HEX_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"\b(0x)?[0-9a-f]{8,}\b").unwrap());
+        static URL_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"https?://[\w./\-?=&%]+").unwrap());
+        static EMAIL_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"\b[\w._%+-]+@[\w.-]+\.[a-z]{2,}\b").unwrap());
+        static UNIX_PATH_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"/[\w/.]+\.[\w]+").unwrap());
+        static WIN_PATH_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"[a-z]:\\[\w\\]+\.[\w]+").unwrap());
+        static IP_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").unwrap());
+        static TABLE_REF_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"\b(\w+)_\d+\b").unwrap());
+        static NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{4,}\b").unwrap());
+        static QUOTED_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r#"["']([^"']{10,})["']"#).unwrap());
 
         let mut normalized = message.to_lowercase();
 
         // Replace UUIDs (e.g., 550e8400-e29b-41d4-a716-446655440000) - FIRST
-        let uuid_regex =
-            Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap();
-        normalized = uuid_regex.replace_all(&normalized, "<uuid>").to_string();
-
+        normalized = UUID_RE.replace_all(&normalized, "<uuid>").to_string();
         // Replace hex IDs (e.g., 0x1a2b3c4d, deadbeef) - SECOND
-        let hex_regex = Regex::new(r"\b(0x)?[0-9a-f]{8,}\b").unwrap();
-        normalized = hex_regex.replace_all(&normalized, "<hex_id>").to_string();
-
-        // Replace URLs (http/https) - BEFORE paths (paths might match URL components)
-        let url_regex = Regex::new(r"https?://[\w./\-?=&%]+").unwrap();
-        normalized = url_regex.replace_all(&normalized, "<url>").to_string();
-
+        normalized = HEX_RE.replace_all(&normalized, "<hex_id>").to_string();
+        // Replace URLs (http/https) - BEFORE paths
+        normalized = URL_RE.replace_all(&normalized, "<url>").to_string();
         // Replace email addresses - BEFORE paths
-        let email_regex = Regex::new(r"\b[\w._%+-]+@[\w.-]+\.[a-z]{2,}\b").unwrap();
-        normalized = email_regex.replace_all(&normalized, "<email>").to_string();
-
+        normalized = EMAIL_RE.replace_all(&normalized, "<email>").to_string();
         // Replace file paths (Unix and Windows style) - AFTER URLs/emails
-        let unix_path_regex = Regex::new(r"/[\w/.]+\.[\w]+").unwrap();
-        normalized = unix_path_regex
-            .replace_all(&normalized, "<path>")
-            .to_string();
-
-        let windows_path_regex = Regex::new(r"[a-z]:\\[\w\\]+\.[\w]+").unwrap();
-        normalized = windows_path_regex
-            .replace_all(&normalized, "<path>")
-            .to_string();
-
+        normalized = UNIX_PATH_RE.replace_all(&normalized, "<path>").to_string();
+        normalized = WIN_PATH_RE.replace_all(&normalized, "<path>").to_string();
         // Replace IP addresses (v4) - BEFORE table refs and numbers
-        let ip_regex = Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").unwrap();
-        normalized = ip_regex.replace_all(&normalized, "<ip>").to_string();
-
-        // Replace database table references (table_123, users_456) - BEFORE general numbers
-        let table_ref_regex = Regex::new(r"\b(\w+)_\d+\b").unwrap();
-        normalized = table_ref_regex
+        normalized = IP_RE.replace_all(&normalized, "<ip>").to_string();
+        // Replace database table references (table_123, users_456)
+        normalized = TABLE_REF_RE
             .replace_all(&normalized, "${1}_<id>")
             .to_string();
-
-        // Replace numeric IDs and timestamps (standalone numbers of 4+ digits) - LAST number operation
-        let number_regex = Regex::new(r"\b\d{4,}\b").unwrap();
-        normalized = number_regex.replace_all(&normalized, "<num>").to_string();
-
+        // Replace numeric IDs and timestamps (standalone numbers of 4+ digits)
+        normalized = NUMBER_RE.replace_all(&normalized, "<num>").to_string();
         // Replace quoted strings (often dynamic user input) - FINAL
-        let quoted_string_regex = Regex::new(r#"["']([^"']{10,})["']"#).unwrap();
-        normalized = quoted_string_regex
+        normalized = QUOTED_RE
             .replace_all(&normalized, r#""<string>""#)
             .to_string();
 

@@ -8,12 +8,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_core::{
+    JobResult, WorkflowCancellationProvider, WorkflowContext, WorkflowError, WorkflowTask,
+};
 use temps_deployer::{
     ContainerDeployer, ContainerLogConfig, ContainerStatus as DeployerContainerStatus,
     DeployRequest, PortMapping, Protocol, ResourceLimits, RestartPolicy,
 };
 use temps_logs::{LogLevel, LogService};
+use tokio::time::{sleep, Duration};
 
 /// Typed output from BuildImageJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1134,6 +1137,67 @@ impl WorkflowTask for DeployImageJob {
         }
 
         Ok(JobResult::success(context))
+    }
+
+    async fn execute_with_cancellation(
+        &self,
+        context: WorkflowContext,
+        cancellation_provider: &dyn WorkflowCancellationProvider,
+    ) -> Result<JobResult, WorkflowError> {
+        let workflow_run_id = context.workflow_run_id.clone();
+
+        // Check if already cancelled before starting
+        if cancellation_provider.is_cancelled(&workflow_run_id).await? {
+            self.log(
+                &context,
+                "Deploy cancelled before starting - deployment was cancelled by user".to_string(),
+            )
+            .await
+            .ok();
+            return Err(WorkflowError::BuildCancelled);
+        }
+
+        // Create cancellation check future that polls every 2 seconds
+        let cancellation_check = async {
+            loop {
+                sleep(Duration::from_secs(2)).await;
+
+                match cancellation_provider.is_cancelled(&workflow_run_id).await {
+                    Ok(true) => {
+                        // Cancellation detected
+                        return;
+                    }
+                    Ok(false) => {
+                        // Continue checking
+                    }
+                    Err(_) => {
+                        // Error checking cancellation - stop polling
+                        break;
+                    }
+                }
+            }
+        };
+
+        // Race between deploy execution and cancellation detection
+        let deploy_future = self.execute(context.clone());
+
+        tokio::select! {
+            result = deploy_future => {
+                // Deploy completed (success or failure)
+                result
+            }
+            _ = cancellation_check => {
+                // Cancellation detected during deploy
+                self.log(
+                    &context,
+                    "Deploy cancelled by user - stopping container deployment".to_string(),
+                )
+                .await
+                .ok();
+
+                Err(WorkflowError::BuildCancelled)
+            }
+        }
     }
 
     async fn validate_prerequisites(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {

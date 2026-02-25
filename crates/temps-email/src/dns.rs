@@ -205,8 +205,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires network access
     async fn test_verify_known_txt_record() {
+        if std::env::var("TEMPS_NETWORK_TESTS").is_err() {
+            println!("Network tests disabled; set TEMPS_NETWORK_TESTS=1 to enable");
+            return;
+        }
         let verifier = DnsVerifier::new();
         // Test with a known TXT record (Google's SPF)
         let status = verifier
@@ -216,8 +219,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires network access
     async fn test_verify_known_mx_record() {
+        if std::env::var("TEMPS_NETWORK_TESTS").is_err() {
+            println!("Network tests disabled; set TEMPS_NETWORK_TESTS=1 to enable");
+            return;
+        }
         let verifier = DnsVerifier::new();
         // Test with a known MX record
         let status = verifier

@@ -88,11 +88,12 @@ impl TempsPlugin for NotificationsPlugin {
             context.register_service(notification_state);
 
             // Start the weekly digest scheduler
-            let scheduler = DigestScheduler::new(
+            let mut scheduler = DigestScheduler::new(
                 digest_service.clone(),
                 notification_preferences_service.clone(),
             );
-            context.register_service(scheduler);
+            scheduler.start();
+            context.register_service(Arc::new(scheduler));
 
             debug!("Notifications plugin services registered successfully");
             Ok(())

@@ -297,8 +297,9 @@ impl MarkDeploymentCompleteJob {
         ))
         .await?;
 
-        // Update environment's current_deployment_id
+        // Update environment's current_deployment_id (only if environment is not soft-deleted)
         let environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await
             .map_err(|e| {
@@ -306,7 +307,7 @@ impl MarkDeploymentCompleteJob {
             })?
             .ok_or_else(|| {
                 WorkflowError::JobExecutionFailed(format!(
-                    "Environment {} not found",
+                    "Environment {} not found or was deleted",
                     environment_id
                 ))
             })?;

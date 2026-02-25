@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Default Redis Docker image
-pub const DEFAULT_REDIS_IMAGE: &str = "redis:8-alpine";
+pub const DEFAULT_REDIS_IMAGE: &str = "gotempsh/redis-walg:8-bookworm";
 /// Default container name
 pub const DEFAULT_CONTAINER_NAME: &str = "temps-kv-redis";
 /// Default volume name
@@ -27,7 +27,7 @@ fn default_persistence() -> bool {
 
 // Helper functions for schemars examples
 fn example_docker_image() -> &'static str {
-    "redis:7.2-alpine"
+    "gotempsh/redis-walg:8-bookworm"
 }
 
 fn example_port() -> &'static str {
@@ -46,7 +46,7 @@ fn example_max_memory() -> &'static str {
     description = "Configuration for Temps KV service (Redis-backed)"
 )]
 pub struct KvInputConfig {
-    /// Docker image to use (e.g., "redis:8-alpine", "redis:7.2-alpine")
+    /// Docker image to use (e.g., "gotempsh/redis-walg:8-bookworm", "redis:7.2-alpine")
     #[serde(default = "default_docker_image")]
     #[schemars(example = "example_docker_image", default = "default_docker_image")]
     pub docker_image: String,
@@ -142,7 +142,7 @@ impl KvConfig {
         self.docker_image.split(':').nth(1).unwrap_or("latest")
     }
 
-    /// Get the version from the image tag (e.g., "7" from "redis:8-alpine")
+    /// Get the version from the image tag (e.g., "8" from "gotempsh/redis-walg:8-bookworm")
     pub fn version(&self) -> String {
         let tag = self.image_tag();
         // Extract numeric version: "7-alpine" -> "7", "7.2.4-alpine" -> "7.2.4"
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn test_kv_config_default() {
         let config = KvConfig::default();
-        assert_eq!(config.docker_image, "redis:8-alpine");
+        assert_eq!(config.docker_image, "gotempsh/redis-walg:8-bookworm");
         assert_eq!(config.port, 0);
         assert_eq!(config.max_memory, "256mb");
         assert!(config.persistence);
@@ -185,7 +185,7 @@ mod tests {
         let input = KvInputConfig::default();
         let config: KvConfig = input.into();
 
-        assert_eq!(config.docker_image, "redis:8-alpine");
+        assert_eq!(config.docker_image, "gotempsh/redis-walg:8-bookworm");
         assert_eq!(config.port, 0);
         assert!(config.persistence);
     }
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn test_version_extraction() {
         let tests = vec![
-            ("redis:8-alpine", "8"),
+            ("gotempsh/redis-walg:8-bookworm", "8"),
             ("redis:7.2-alpine", "7.2"),
             ("redis:7.2.4", "7.2.4"),
             ("redis:latest", "latest"),

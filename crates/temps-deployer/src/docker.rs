@@ -76,18 +76,34 @@ impl DockerRuntime {
         use bytes::Bytes;
         use http_body_util::Full;
 
-        let mut tar_buffer = Vec::new();
-        {
-            let mut tar_builder = tar::Builder::new(&mut tar_buffer);
+        // Write the tar archive to a temporary file to avoid holding the entire
+        // build context in memory.  The temp file is cleaned up when `_tmp` drops.
+        let tmp = tempfile::NamedTempFile::new().map_err(BuilderError::IoError)?;
+        let tmp_path = tmp.path().to_path_buf();
+
+        // Tar creation is synchronous and CPU-bound — run it on a blocking thread.
+        let ctx = context_path.clone();
+        let out_path = tmp_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::create(&out_path).map_err(BuilderError::IoError)?;
+            let mut tar_builder = tar::Builder::new(file);
             tar_builder
-                .append_dir_all(".", context_path)
+                .append_dir_all(".", ctx)
                 .map_err(BuilderError::IoError)?;
             tar_builder.finish().map_err(BuilderError::IoError)?;
-        }
+            Ok::<(), BuilderError>(())
+        })
+        .await
+        .map_err(|e| BuilderError::Other(format!("Tar task panicked: {}", e)))??;
 
-        // Create body from tar buffer as expected by Bollard
-        // Return Full<Bytes> which will be converted to Either::Left automatically
-        Ok(Full::new(Bytes::from(tar_buffer)))
+        // Read the completed tar file back into memory for Bollard.
+        // This is still an allocation, but happens after the tar builder is dropped,
+        // so peak memory is (tar file on disk) instead of (directory walk + tar buffer).
+        let tar_data = tokio::fs::read(&tmp_path)
+            .await
+            .map_err(BuilderError::IoError)?;
+
+        Ok(Full::new(Bytes::from(tar_data)))
     }
 
     fn get_resource_limits() -> (usize, u64) {
@@ -925,9 +941,17 @@ impl ContainerDeployer for DockerRuntime {
 
     async fn stop_container(&self, container_id: &str) -> Result<(), DeployerError> {
         self.docker
-            .stop_container(container_id, None::<StopContainerOptions>)
+            .stop_container(
+                container_id,
+                Some(StopContainerOptions {
+                    t: Some(10),
+                    signal: None,
+                }),
+            )
             .await
-            .map_err(|e| DeployerError::Other(format!("Failed to stop container: {}", e)))?;
+            .map_err(|e| {
+                DeployerError::Other(format!("Failed to stop container {}: {}", container_id, e))
+            })?;
         Ok(())
     }
 
@@ -1160,6 +1184,7 @@ impl ContainerDeployer for DockerRuntime {
                 Some(LogsOptions {
                     stdout: true,
                     stderr: true,
+                    tail: "10000".to_string(),
                     ..Default::default()
                 }),
             )

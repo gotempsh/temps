@@ -6,6 +6,11 @@
 //! This system bridges the existing Preset enum (stored in database) with a modern provider architecture.
 
 use crate::providers::app::App;
+use crate::providers::{
+    AngularPresetProvider, AstroPresetProvider, DockerfilePresetProvider, DocusaurusPresetProvider,
+    DocusaurusV1PresetProvider, NestJsPresetProvider, NextJsPresetProvider, NixpacksPresetProvider,
+    RsbuildPresetProvider, VitePresetProvider,
+};
 use anyhow::Result;
 use std::collections::HashMap;
 use temps_entities::preset::Preset;
@@ -92,16 +97,27 @@ pub struct PresetProviderRegistry {
 impl PresetProviderRegistry {
     /// Create a new registry with all providers
     pub fn new() -> Self {
-
-
-        // Register all providers
-        // registry.register(Box::new(providers::NextJsProvider));
-        // TODO: Register other providers as they are implemented
-
-        Self {
+        let mut registry = Self {
             providers: Vec::new(),
             by_slug: HashMap::new(),
-        }
+        };
+
+        // Register all providers. Dockerfile and Nixpacks are registered first
+        // as they take highest precedence during detection.
+        registry.register(Box::new(DockerfilePresetProvider));
+        registry.register(Box::new(NixpacksPresetProvider));
+
+        // Node.js / TypeScript frameworks
+        registry.register(Box::new(NextJsPresetProvider));
+        registry.register(Box::new(VitePresetProvider));
+        registry.register(Box::new(RsbuildPresetProvider));
+        registry.register(Box::new(DocusaurusPresetProvider));
+        registry.register(Box::new(DocusaurusV1PresetProvider));
+        registry.register(Box::new(NestJsPresetProvider));
+        registry.register(Box::new(AngularPresetProvider));
+        registry.register(Box::new(AstroPresetProvider));
+
+        registry
     }
 
     /// Register a provider
@@ -127,7 +143,10 @@ impl PresetProviderRegistry {
                 };
 
                 // Update best match if this has higher confidence
-                if best_match.as_ref().is_none_or(|m| confidence > m.confidence) {
+                if best_match
+                    .as_ref()
+                    .is_none_or(|m| confidence > m.confidence)
+                {
                     best_match = Some(detection);
                 }
             }
@@ -237,7 +256,10 @@ mod tests {
         registry.register(Box::new(MockProvider));
 
         let mut files = HashMap::new();
-        files.insert("next.config.js".to_string(), "module.exports = {}".to_string());
+        files.insert(
+            "next.config.js".to_string(),
+            "module.exports = {}".to_string(),
+        );
         let app = App::from_tree(PathBuf::from("/test"), files);
 
         let detection = registry.detect(&app);

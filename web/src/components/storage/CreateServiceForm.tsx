@@ -15,14 +15,59 @@ import {
 import { Input } from '@/components/ui/input'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
+import { AlertTriangle } from 'lucide-react'
 import { customAlphabet } from 'nanoid'
 import { useEffect, useMemo } from 'react'
-import { useForm } from 'react-hook-form'
+import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import * as z from 'zod'
 
+/** Service types that support WAL-G streaming backups */
+const WALG_SERVICE_TYPES = ['postgres', 'redis', 'mongodb']
+
 // Create a custom nanoid with lowercase alphanumeric characters
 const generateId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 4)
+
+/**
+ * Shows a warning when the user selects a Docker image without WAL-G support
+ * for a database service type that supports streaming backups.
+ */
+function BackupWarning({
+  control,
+  serviceType,
+}: {
+  control: any
+  serviceType: string
+}) {
+  const dockerImage = useWatch({
+    control,
+    name: 'parameters.docker_image',
+  })
+
+  if (!WALG_SERVICE_TYPES.includes(serviceType)) return null
+
+  // Default images (gotempsh/*) include WAL-G — no warning needed
+  const image = (dockerImage as string) || ''
+  if (!image || image.includes('gotempsh/')) return null
+
+  return (
+    <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 flex gap-2">
+      <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400 mt-0.5 flex-shrink-0" />
+      <div className="space-y-1">
+        <p className="text-sm font-medium text-amber-800 dark:text-amber-200">
+          Atomic backups only
+        </p>
+        <p className="text-xs text-amber-700 dark:text-amber-300">
+          This image does not include WAL-G. Backups will buffer the entire
+          database in memory before uploading to S3. For large databases
+          this can cause out-of-memory failures and service interruptions.
+          Use the default image or a <code className="font-mono">gotempsh/</code> image
+          for streaming backups with constant memory usage.
+        </p>
+      </div>
+    </div>
+  )
+}
 
 interface CreateServiceFormProps {
   serviceType: ServiceTypeRoute
@@ -318,6 +363,8 @@ export function CreateServiceForm({
               />
             )
           })}
+
+        <BackupWarning control={form.control} serviceType={serviceType} />
 
         <div className="flex justify-end space-x-2">
           <Button

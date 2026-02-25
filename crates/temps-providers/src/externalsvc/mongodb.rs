@@ -55,7 +55,7 @@ pub struct MongodbInputConfig {
     #[schemars(with = "Option<String>", example = "example_password")]
     pub password: Option<String>,
 
-    /// Docker image to use for MongoDB (e.g., mongo:8.0, mongo:7.0)
+    /// Docker image to use for MongoDB (e.g., gotempsh/mongodb-walg:8.0, gotempsh/mongodb-walg:7.0)
     #[serde(default = "default_docker_image")]
     #[schemars(example = "example_docker_image", default = "default_docker_image")]
     pub docker_image: String,
@@ -83,11 +83,11 @@ fn example_password() -> &'static str {
 }
 
 fn default_docker_image() -> String {
-    "mongo:8.0".to_string()
+    "gotempsh/mongodb-walg:8.0".to_string()
 }
 
 fn example_docker_image() -> &'static str {
-    "mongo:8.0"
+    "gotempsh/mongodb-walg:8.0"
 }
 
 /// Internal runtime configuration for MongoDB service
@@ -462,6 +462,387 @@ impl MongodbService {
                 ))
             }
         }
+    }
+}
+
+impl MongodbService {
+    /// Restore from a WAL-G backup stored in S3.
+    ///
+    /// WAL-G restore runs `wal-g backup-fetch LATEST` which downloads the backup from S3
+    /// and pipes it to `mongorestore --archive` via WALG_STREAM_RESTORE_COMMAND.
+    async fn restore_from_walg(
+        &self,
+        s3_credentials: &super::S3Credentials,
+        walg_s3_prefix: &str,
+        service_config: ServiceConfig,
+    ) -> Result<()> {
+        let config = self.get_mongodb_config(service_config)?;
+        let container_name = self.get_container_name();
+
+        info!(
+            "Restoring MongoDB from WAL-G backup (prefix: {}) in container '{}'",
+            walg_s3_prefix, container_name
+        );
+
+        // Build the MongoDB URI for WAL-G and mongorestore
+        let mongodb_uri = format!(
+            "mongodb://{}:{}@localhost:{}/?authSource=admin",
+            urlencoding::encode(&config.username),
+            urlencoding::encode(&config.password),
+            MONGODB_INTERNAL_PORT
+        );
+
+        let stream_create_cmd = format!("mongodump --archive --uri=\"{}\"", mongodb_uri);
+        let stream_restore_cmd = format!("mongorestore --archive --drop --uri=\"{}\"", mongodb_uri);
+
+        let mut walg_env: Vec<String> = vec![
+            format!("WALG_S3_PREFIX={}", walg_s3_prefix),
+            format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
+            format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
+            format!("AWS_REGION={}", s3_credentials.region),
+            format!("WALG_STREAM_CREATE_COMMAND={}", stream_create_cmd),
+            format!("WALG_STREAM_RESTORE_COMMAND={}", stream_restore_cmd),
+            format!("MONGODB_URI={}", mongodb_uri),
+        ];
+
+        // Resolve S3 endpoint for use inside the Docker container.
+        if let Some(resolved_endpoint) = s3_credentials
+            .resolve_endpoint_for_container(&self.docker, &container_name)
+            .await
+        {
+            walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
+        }
+        if s3_credentials.force_path_style {
+            walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
+        }
+
+        let walg_env_refs: Vec<&str> = walg_env.iter().map(|s| s.as_str()).collect();
+
+        // Run wal-g backup-fetch LATEST inside the container
+        // WAL-G downloads from S3 and pipes to mongorestore via WALG_STREAM_RESTORE_COMMAND
+        let restore_cmd = vec!["sh", "-c", "wal-g backup-fetch LATEST 2>&1"];
+
+        info!(
+            "Running wal-g backup-fetch LATEST in container '{}'",
+            container_name
+        );
+
+        let exec = self
+            .docker
+            .create_exec(
+                &container_name,
+                CreateExecOptions {
+                    cmd: Some(restore_cmd),
+                    attach_stdout: Some(false),
+                    attach_stderr: Some(false),
+                    env: Some(walg_env_refs),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        use bollard::exec::StartExecOptions;
+        self.docker
+            .start_exec(
+                &exec.id,
+                Some(StartExecOptions {
+                    detach: true,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        // Poll for completion
+        loop {
+            let inspect = self.docker.inspect_exec(&exec.id).await?;
+            if let Some(running) = inspect.running {
+                if !running {
+                    if let Some(exit_code) = inspect.exit_code {
+                        if exit_code != 0 {
+                            return Err(anyhow::anyhow!(
+                                "WAL-G backup-fetch failed with exit code {} in container '{}'",
+                                exit_code,
+                                container_name
+                            ));
+                        }
+                    }
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+
+        info!("MongoDB WAL-G restore completed successfully");
+        Ok(())
+    }
+
+    /// Restore from a legacy backup (pre-WAL-G .gz files created by mongodump).
+    /// Falls back to the old approach: download from S3, copy into container, run mongorestore.
+    async fn restore_from_legacy(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        backup_location: &str,
+        s3_source: &temps_entities::s3_sources::Model,
+        service_config: ServiceConfig,
+    ) -> Result<()> {
+        let config = self.get_mongodb_config(service_config)?;
+        let container_name = self.get_container_name();
+
+        info!(
+            "Restoring MongoDB from legacy backup format: {}",
+            backup_location
+        );
+
+        // Download backup from S3
+        let response = s3_client
+            .get_object()
+            .bucket(&s3_source.bucket_name)
+            .key(backup_location)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to download MongoDB backup from S3: {}", e))?;
+
+        let backup_data = response
+            .body
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read backup data: {}", e))?
+            .into_bytes();
+
+        info!("Downloaded backup, size: {} bytes", backup_data.len());
+
+        // Create a temporary file for the backup
+        let temp_file = tempfile::NamedTempFile::new()?;
+        let temp_path = temp_file.path().to_str().unwrap();
+        std::fs::write(temp_path, &backup_data)?;
+
+        // Copy backup file to container
+        let tar_data = {
+            let mut ar = tar::Builder::new(Vec::new());
+            ar.append_path_with_name(temp_path, "backup.gz")?;
+            ar.finish()?;
+            ar.into_inner()?
+        };
+
+        self.docker
+            .upload_to_container(
+                &container_name,
+                Some(bollard::query_parameters::UploadToContainerOptions {
+                    path: "/tmp".to_string(),
+                    ..Default::default()
+                }),
+                body_full(tar_data.into()),
+            )
+            .await?;
+
+        // Execute mongorestore inside the container
+        let exec_config = CreateExecOptions {
+            cmd: Some(vec![
+                "mongorestore",
+                "--archive=/tmp/backup.gz",
+                "--gzip",
+                "-u",
+                &config.username,
+                "-p",
+                &config.password,
+                "--authenticationDatabase",
+                "admin",
+                "--drop",
+            ]),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            ..Default::default()
+        };
+
+        let exec = self
+            .docker
+            .create_exec(&container_name, exec_config)
+            .await?;
+
+        let output = self.docker.start_exec(&exec.id, None).await?;
+
+        if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
+            while let Some(result) = output.next().await {
+                match result {
+                    Ok(log_output) => match log_output {
+                        bollard::container::LogOutput::StdOut { message } => {
+                            let stdout_str = String::from_utf8_lossy(&message);
+                            info!("mongorestore stdout: {}", stdout_str);
+                        }
+                        bollard::container::LogOutput::StdErr { message } => {
+                            let stderr_str = String::from_utf8_lossy(&message);
+                            info!("mongorestore stderr: {}", stderr_str);
+                        }
+                        _ => {}
+                    },
+                    Err(e) => {
+                        error!("Error reading exec output: {}", e);
+                        return Err(anyhow::anyhow!("Failed to read mongorestore output: {}", e));
+                    }
+                }
+            }
+        }
+
+        // Clean up temporary file in container
+        let cleanup_exec = self
+            .docker
+            .create_exec(
+                &container_name,
+                CreateExecOptions {
+                    cmd: Some(vec!["rm", "/tmp/backup.gz"]),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        self.docker.start_exec(&cleanup_exec.id, None).await?;
+
+        info!("MongoDB legacy restore completed successfully");
+        Ok(())
+    }
+
+    /// Check if the WAL-G binary is available inside a container.
+    async fn container_has_walg(&self, container_name: &str) -> bool {
+        use bollard::exec::{CreateExecOptions, StartExecOptions};
+
+        let exec = match self
+            .docker
+            .create_exec(
+                container_name,
+                CreateExecOptions {
+                    cmd: Some(vec!["which", "wal-g"]),
+                    attach_stdout: Some(false),
+                    attach_stderr: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+
+        if self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(StartExecOptions {
+                    detach: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .is_err()
+        {
+            return false;
+        }
+
+        loop {
+            match self.docker.inspect_exec(&exec.id).await {
+                Ok(inspect) => {
+                    if inspect.running == Some(false) {
+                        return inspect.exit_code == Some(0);
+                    }
+                }
+                Err(_) => return false,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Legacy MongoDB backup using mongodump via Bollard exec.
+    /// Fallback for containers without WAL-G (e.g., `mongo:8.0`).
+    async fn backup_to_s3_legacy(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        s3_source: &temps_entities::s3_sources::Model,
+        subpath: &str,
+        service_config: ServiceConfig,
+    ) -> Result<String> {
+        use bollard::exec::CreateExecOptions;
+
+        let config = self.get_mongodb_config(service_config)?;
+        let container_name = self.get_container_name();
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let backup_file = format!("mongodb_backup_{}.gz", timestamp);
+        let backup_path = format!("{}/{}", subpath, backup_file);
+
+        info!(
+            "Starting MongoDB legacy backup for database: {}",
+            config.database
+        );
+
+        let exec_config = CreateExecOptions {
+            cmd: Some(vec![
+                "mongodump",
+                "--archive",
+                "--gzip",
+                "-u",
+                &config.username,
+                "-p",
+                &config.password,
+                "--authenticationDatabase",
+                "admin",
+                "--db",
+                &config.database,
+            ]),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            ..Default::default()
+        };
+
+        let exec = self
+            .docker
+            .create_exec(&container_name, exec_config)
+            .await?;
+
+        let output = self.docker.start_exec(&exec.id, None).await?;
+
+        let mut backup_data = Vec::new();
+        if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
+            use futures::stream::StreamExt;
+            while let Some(result) = output.next().await {
+                match result {
+                    Ok(log_output) => match log_output {
+                        bollard::container::LogOutput::StdOut { message } => {
+                            backup_data.extend_from_slice(&message);
+                        }
+                        bollard::container::LogOutput::StdErr { message } => {
+                            let stderr_str = String::from_utf8_lossy(&message);
+                            info!("mongodump stderr: {}", stderr_str);
+                        }
+                        _ => {}
+                    },
+                    Err(e) => {
+                        error!("Error reading exec output: {}", e);
+                        return Err(anyhow::anyhow!("Failed to read mongodump output: {}", e));
+                    }
+                }
+            }
+        }
+
+        if backup_data.is_empty() {
+            return Err(anyhow::anyhow!("Backup data is empty"));
+        }
+
+        let temp_file = tempfile::NamedTempFile::new()?;
+        let temp_path = temp_file.path().to_str().unwrap();
+        std::fs::write(temp_path, &backup_data)?;
+
+        info!("MongoDB legacy backup size: {} bytes", backup_data.len());
+
+        let body = aws_sdk_s3::primitives::ByteStream::from_path(temp_path).await?;
+        s3_client
+            .put_object()
+            .bucket(&s3_source.bucket_name)
+            .key(&backup_path)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to upload MongoDB backup to S3: {}", e))?;
+
+        info!("MongoDB legacy backup uploaded to S3: {}", backup_path);
+        Ok(backup_path)
     }
 }
 
@@ -884,233 +1265,231 @@ impl ExternalService for MongodbService {
         Ok(format!("localhost:{}", port))
     }
 
+    /// Backup MongoDB data to S3.
+    ///
+    /// Detects whether the container has WAL-G installed:
+    /// - **WAL-G available**: Uses `wal-g backup-push` with mongodump stream. Zero data
+    ///   flows through the Temps process.
+    /// - **WAL-G not available** (legacy images like `mongo:8.0`): Falls back to
+    ///   mongodump via Bollard exec, buffering output and uploading to S3.
     async fn backup_to_s3(
         &self,
         s3_client: &aws_sdk_s3::Client,
-        _backup: temps_entities::backups::Model,
+        s3_credentials: &super::S3Credentials,
+        backup: temps_entities::backups::Model,
         s3_source: &temps_entities::s3_sources::Model,
         subpath: &str,
-        _subpath_root: &str,
-        _pool: &temps_database::DbConnection,
-        _external_service: &temps_entities::external_services::Model,
+        subpath_root: &str,
+        pool: &temps_database::DbConnection,
+        external_service: &temps_entities::external_services::Model,
         service_config: ServiceConfig,
     ) -> Result<String> {
-        // Parse config from the provided service_config parameter (don't rely on in-memory config)
-        let config = self.get_mongodb_config(service_config)?;
-
-        let container_name = self.get_container_name();
-        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        let backup_file = format!("mongodb_backup_{}.gz", timestamp);
-        let backup_path = format!("{}/{}", subpath, backup_file);
-
-        info!("Starting MongoDB backup for database: {}", config.database);
-
-        // Create a temporary file for the backup
-        let temp_file = tempfile::NamedTempFile::new()?;
-        let temp_path = temp_file.path().to_str().unwrap();
-
-        // Execute mongodump inside the container
-        let exec_config = CreateExecOptions {
-            cmd: Some(vec![
-                "mongodump",
-                "--archive",
-                "--gzip",
-                "-u",
-                &config.username,
-                "-p",
-                &config.password,
-                "--authenticationDatabase",
-                "admin",
-                "--db",
-                &config.database,
-            ]),
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            ..Default::default()
-        };
-
-        let exec = self
-            .docker
-            .create_exec(&container_name, exec_config)
-            .await?;
-
-        let output = self.docker.start_exec(&exec.id, None).await?;
-
-        let mut backup_data = Vec::new();
-        if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
-            while let Some(result) = output.next().await {
-                match result {
-                    Ok(log_output) => match log_output {
-                        bollard::container::LogOutput::StdOut { message } => {
-                            backup_data.extend_from_slice(&message);
-                        }
-                        bollard::container::LogOutput::StdErr { message } => {
-                            let stderr_str = String::from_utf8_lossy(&message);
-                            info!("mongodump stderr: {}", stderr_str);
-                        }
-                        _ => {}
-                    },
-                    Err(e) => {
-                        error!("Error reading exec output: {}", e);
-                        return Err(anyhow::anyhow!("Failed to read mongodump output: {}", e));
-                    }
-                }
-            }
-        }
-
-        if backup_data.is_empty() {
-            return Err(anyhow::anyhow!("Backup data is empty"));
-        }
-
-        // Write backup data to temp file
-        std::fs::write(temp_path, &backup_data)?;
-
-        info!("MongoDB backup size: {} bytes", backup_data.len());
-
-        // Upload to S3
-        let body = aws_sdk_s3::primitives::ByteStream::from_path(temp_path).await?;
-        s3_client
-            .put_object()
-            .bucket(&s3_source.bucket_name)
-            .key(&backup_path)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to upload MongoDB backup to S3: {}", e))?;
-
-        info!("MongoDB backup uploaded to S3: {}", backup_path);
-
-        // TODO: Implement backup record creation with new schema
-        // The backup entity schema has changed and needs to be updated
-
-        Ok(backup_path)
-    }
-
-    async fn restore_from_s3(
-        &self,
-        s3_client: &aws_sdk_s3::Client,
-        backup_location: &str,
-        s3_source: &temps_entities::s3_sources::Model,
-        service_config: ServiceConfig,
-    ) -> Result<()> {
-        // Parse config from the provided service_config parameter (don't rely on in-memory config)
-        let config = self.get_mongodb_config(service_config)?;
+        use chrono::Utc;
+        use sea_orm::*;
 
         let container_name = self.get_container_name();
 
-        info!("Starting MongoDB restore from: {}", backup_location);
-
-        // Download backup from S3
-        let response = s3_client
-            .get_object()
-            .bucket(&s3_source.bucket_name)
-            .key(backup_location)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to download MongoDB backup from S3: {}", e))?;
-
-        let backup_data = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read backup data: {}", e))?
-            .into_bytes();
-
-        info!("Downloaded backup, size: {} bytes", backup_data.len());
-
-        // Create a temporary file for the backup
-        let temp_file = tempfile::NamedTempFile::new()?;
-        let temp_path = temp_file.path().to_str().unwrap();
-        std::fs::write(temp_path, &backup_data)?;
-
-        // Copy backup file to container
-        let tar_data = {
-            let mut ar = tar::Builder::new(Vec::new());
-            ar.append_path_with_name(temp_path, "backup.gz")?;
-            ar.finish()?;
-            ar.into_inner()?
-        };
-
-        self.docker
-            .upload_to_container(
-                &container_name,
-                Some(bollard::query_parameters::UploadToContainerOptions {
-                    path: "/tmp".to_string(),
-                    ..Default::default()
-                }),
-                body_full(tar_data.into()),
-            )
-            .await?;
-
-        // Execute mongorestore inside the container
-        let exec_config = CreateExecOptions {
-            cmd: Some(vec![
-                "mongorestore",
-                "--archive=/tmp/backup.gz",
-                "--gzip",
-                "-u",
-                &config.username,
-                "-p",
-                &config.password,
-                "--authenticationDatabase",
-                "admin",
-                "--drop",
-            ]),
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            ..Default::default()
-        };
-
-        let exec = self
-            .docker
-            .create_exec(&container_name, exec_config)
-            .await?;
-
-        let output = self.docker.start_exec(&exec.id, None).await?;
-
-        if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
-            while let Some(result) = output.next().await {
-                match result {
-                    Ok(log_output) => match log_output {
-                        bollard::container::LogOutput::StdOut { message } => {
-                            let stdout_str = String::from_utf8_lossy(&message);
-                            info!("mongorestore stdout: {}", stdout_str);
-                        }
-                        bollard::container::LogOutput::StdErr { message } => {
-                            let stderr_str = String::from_utf8_lossy(&message);
-                            info!("mongorestore stderr: {}", stderr_str);
-                        }
-                        _ => {}
-                    },
-                    Err(e) => {
-                        error!("Error reading exec output: {}", e);
-                        return Err(anyhow::anyhow!("Failed to read mongorestore output: {}", e));
-                    }
-                }
-            }
+        if !self.container_has_walg(&container_name).await {
+            info!(
+                "WAL-G not found in container '{}', falling back to legacy mongodump backup",
+                container_name
+            );
+            return self
+                .backup_to_s3_legacy(s3_client, s3_source, subpath, service_config)
+                .await;
         }
 
-        // Clean up temporary file in container
-        let cleanup_exec = self
+        info!("Starting MongoDB backup to S3 via WAL-G");
+
+        let config = self.get_mongodb_config(service_config)?;
+
+        let metadata = serde_json::json!({
+            "service_type": "mongodb",
+            "service_name": self.name,
+            "backup_tool": "wal-g",
+        });
+
+        // Create a backup record
+        let backup_record = temps_entities::external_service_backups::Entity::insert(
+            temps_entities::external_service_backups::ActiveModel {
+                service_id: Set(external_service.id),
+                backup_id: Set(backup.id),
+                backup_type: Set("full".to_string()),
+                state: Set("running".to_string()),
+                started_at: Set(Utc::now()),
+                s3_location: Set("".to_string()),
+                metadata: Set(metadata),
+                compression_type: Set("lz4".to_string()), // WAL-G uses LZ4 by default
+                created_by: Set(0),
+                ..Default::default()
+            },
+        )
+        .exec_with_returning(pool)
+        .await?;
+
+        // Build the WAL-G S3 prefix using the STABLE subpath_root (no date component).
+        // All WAL-G backups must share the same prefix for retention management to work.
+        let walg_s3_prefix = format!(
+            "s3://{}/{}/walg",
+            s3_credentials.bucket_name,
+            subpath_root.trim_matches('/')
+        );
+
+        // Build the MongoDB URI for WAL-G and mongodump
+        let mongodb_uri = format!(
+            "mongodb://{}:{}@localhost:{}/?authSource=admin",
+            urlencoding::encode(&config.username),
+            urlencoding::encode(&config.password),
+            MONGODB_INTERNAL_PORT
+        );
+
+        // Build WAL-G environment variables for docker exec.
+        // WALG_STREAM_CREATE_COMMAND tells WAL-G how to create the backup stream.
+        let stream_create_cmd = format!("mongodump --archive --uri=\"{}\"", mongodb_uri);
+        let stream_restore_cmd = format!("mongorestore --archive --drop --uri=\"{}\"", mongodb_uri);
+
+        let mut walg_env: Vec<String> = vec![
+            format!("WALG_S3_PREFIX={}", walg_s3_prefix),
+            format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
+            format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
+            format!("AWS_REGION={}", s3_credentials.region),
+            format!("WALG_STREAM_CREATE_COMMAND={}", stream_create_cmd),
+            format!("WALG_STREAM_RESTORE_COMMAND={}", stream_restore_cmd),
+            format!("MONGODB_URI={}", mongodb_uri),
+        ];
+
+        // Resolve S3 endpoint for use inside the Docker container.
+        if let Some(resolved_endpoint) = s3_credentials
+            .resolve_endpoint_for_container(&self.docker, &container_name)
+            .await
+        {
+            walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
+        }
+        if s3_credentials.force_path_style {
+            walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
+        }
+
+        // Run wal-g backup-push inside the running MongoDB container
+        let walg_cmd = vec!["sh", "-c", "wal-g backup-push 2>&1"];
+        let walg_env_refs: Vec<&str> = walg_env.iter().map(|s| s.as_str()).collect();
+
+        info!(
+            "Running wal-g backup-push in container '{}' (S3 prefix: {})",
+            container_name, walg_s3_prefix
+        );
+
+        let exec = self
             .docker
             .create_exec(
                 &container_name,
                 CreateExecOptions {
-                    cmd: Some(vec!["rm", "/tmp/backup.gz"]),
+                    cmd: Some(walg_cmd),
+                    attach_stdout: Some(false),
+                    attach_stderr: Some(false),
+                    env: Some(walg_env_refs),
                     ..Default::default()
                 },
             )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create wal-g exec in container {}: {}",
+                    container_name,
+                    e
+                )
+            })?;
+
+        // Start WAL-G in detached mode — no data flows through the Temps process
+        use bollard::exec::StartExecOptions;
+        self.docker
+            .start_exec(
+                &exec.id,
+                Some(StartExecOptions {
+                    detach: true,
+                    ..Default::default()
+                }),
+            )
             .await?;
 
-        self.docker.start_exec(&cleanup_exec.id, None).await?;
+        // Poll for completion
+        loop {
+            let inspect = self.docker.inspect_exec(&exec.id).await?;
+            if let Some(running) = inspect.running {
+                if !running {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
 
-        info!("MongoDB restore completed successfully");
-        Ok(())
+        // Check WAL-G exit code
+        let exec_inspect = self.docker.inspect_exec(&exec.id).await?;
+        if let Some(exit_code) = exec_inspect.exit_code {
+            if exit_code != 0 {
+                let error_msg = format!(
+                    "wal-g backup-push failed with exit code {} in container '{}'",
+                    exit_code, container_name
+                );
+                error!("{}", error_msg);
+                let mut backup_update: temps_entities::external_service_backups::ActiveModel =
+                    backup_record.clone().into();
+                backup_update.state = Set("failed".to_string());
+                backup_update.error_message = Set(Some(error_msg.clone()));
+                backup_update.finished_at = Set(Some(Utc::now()));
+                let _ = backup_update.update(pool).await;
+                return Err(anyhow::anyhow!("{}", error_msg));
+            }
+        }
+
+        // The backup location is the WAL-G S3 prefix
+        let backup_location = walg_s3_prefix.clone();
+
+        // Update backup record with success
+        let mut backup_update: temps_entities::external_service_backups::ActiveModel =
+            backup_record.clone().into();
+        backup_update.state = Set("completed".to_string());
+        backup_update.finished_at = Set(Some(Utc::now()));
+        backup_update.s3_location = Set(backup_location.clone());
+        backup_update.update(pool).await?;
+
+        info!(
+            "MongoDB WAL-G backup completed successfully (prefix: {})",
+            walg_s3_prefix
+        );
+        Ok(backup_location)
+    }
+
+    /// Restore MongoDB data from S3 using WAL-G or legacy format
+    ///
+    /// For WAL-G backups (s3:// prefix): Runs `wal-g backup-fetch LATEST` inside the container.
+    /// WAL-G downloads the backup from S3 and pipes it to mongorestore via WALG_STREAM_RESTORE_COMMAND.
+    ///
+    /// For legacy backups (.gz files): Falls back to the old approach — downloads from S3,
+    /// copies into the container, and runs mongorestore.
+    async fn restore_from_s3(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        s3_credentials: &super::S3Credentials,
+        backup_location: &str,
+        s3_source: &temps_entities::s3_sources::Model,
+        service_config: ServiceConfig,
+    ) -> Result<()> {
+        info!("Starting MongoDB restore from S3: {}", backup_location);
+
+        if backup_location.starts_with("s3://") {
+            // WAL-G backup: use wal-g backup-fetch
+            self.restore_from_walg(s3_credentials, backup_location, service_config)
+                .await
+        } else {
+            // Legacy backup: fall back to old mongorestore approach
+            self.restore_from_legacy(s3_client, backup_location, s3_source, service_config)
+                .await
+        }
     }
 
     fn get_default_docker_image(&self) -> (String, String) {
         // Return (image_name, version)
-        ("mongo".to_string(), "8.0".to_string())
+        ("gotempsh/mongodb-walg".to_string(), "8.0".to_string())
     }
 
     async fn get_current_docker_image(&self) -> Result<(String, String)> {
@@ -1286,7 +1665,10 @@ mod tests {
     fn test_default_values() {
         assert_eq!(default_host(), "localhost");
         assert_eq!(default_username(), "root");
-        assert_eq!(default_docker_image(), "mongo:8.0".to_string());
+        assert_eq!(
+            default_docker_image(),
+            "gotempsh/mongodb-walg:8.0".to_string()
+        );
     }
 
     #[test]
@@ -1455,8 +1837,8 @@ mod tests {
     fn test_default_docker_image() {
         assert_eq!(
             default_docker_image(),
-            "mongo:8.0".to_string(),
-            "Default docker_image should be mongo:8.0"
+            "gotempsh/mongodb-walg:8.0".to_string(),
+            "Default docker_image should be gotempsh/mongodb-walg:8.0"
         );
     }
 
@@ -1476,7 +1858,7 @@ mod tests {
                 "database": "testdb",
                 "username": "testuser",
                 "password": "testpass123",
-                "docker_image": "mongo:8.0"
+                "docker_image": "gotempsh/mongodb-walg:8.0"
             }),
         };
 
@@ -1486,7 +1868,7 @@ mod tests {
                 .parameters
                 .get("docker_image")
                 .and_then(|v| v.as_str()),
-            Some("mongo:8.0")
+            Some("gotempsh/mongodb-walg:8.0")
         );
     }
 
@@ -1503,7 +1885,7 @@ mod tests {
                 "database": "testdb",
                 "username": "testuser",
                 "password": "testpass123",
-                "docker_image": "mongo:7.0"
+                "docker_image": "gotempsh/mongodb-walg:7.0"
             }),
         };
 
@@ -1517,7 +1899,7 @@ mod tests {
                 "database": "testdb",
                 "username": "testuser",
                 "password": "testpass123",
-                "docker_image": "mongo:8.0"
+                "docker_image": "gotempsh/mongodb-walg:8.0"
             }),
         };
 
@@ -1534,12 +1916,12 @@ mod tests {
             .unwrap_or("unknown");
 
         assert_eq!(
-            old_image, "mongo:7.0",
-            "Old docker_image should be mongo:7.0"
+            old_image, "gotempsh/mongodb-walg:7.0",
+            "Old docker_image should be gotempsh/mongodb-walg:7.0"
         );
         assert_eq!(
-            new_image, "mongo:8.0",
-            "New docker_image should be mongo:8.0"
+            new_image, "gotempsh/mongodb-walg:8.0",
+            "New docker_image should be gotempsh/mongodb-walg:8.0"
         );
     }
 
@@ -1555,7 +1937,7 @@ mod tests {
                 "username": "mongouser",
                 "password": "mongopass",
                 "database": "admin",
-                "docker_image": "mongo:7.0",
+                "docker_image": "gotempsh/mongodb-walg:7.0",
                 "container_id": "def456ghi789",
             }),
         };
@@ -1569,10 +1951,10 @@ mod tests {
     #[test]
     fn test_import_mongodb_version_extraction() {
         let test_cases = vec![
-            ("mongo:7.0", "7.0"),
+            ("gotempsh/mongodb-walg:7.0", "7.0"),
             ("mongo:latest", "latest"),
             ("mongo:6.0-ubuntu", "6.0-ubuntu"),
-            ("mongo:8.0-alpine", "8.0-alpine"),
+            ("gotempsh/mongodb-walg:8.0", "8.0"),
         ];
 
         for (image, expected_version) in test_cases {
@@ -1704,7 +2086,7 @@ mod tests {
             database: database.to_string(),
             username: username.to_string(),
             password: password.to_string(),
-            docker_image: "mongo:8.0".to_string(),
+            docker_image: "gotempsh/mongodb-walg:8.0".to_string(),
         };
 
         *service.config.write().await = Some(mongodb_config.clone());
@@ -1760,9 +2142,11 @@ mod tests {
             parameters: serde_json::to_value(&mongodb_config).expect("Failed to serialize config"),
         };
 
+        let s3_creds = minio.s3_credentials();
         let backup_path = service
             .backup_to_s3(
                 &minio.s3_client,
+                &s3_creds,
                 backup_record,
                 &minio.s3_source,
                 "backups/test",
@@ -1776,17 +2160,31 @@ mod tests {
 
         println!("✓ Backup created at: {}", backup_path);
 
-        // Verify backup exists in S3
-        let backup_exists = minio
+        // Verify backup exists in S3 by listing objects under the WAL-G prefix.
+        // WAL-G stores backups under the prefix (e.g., backups/test/walg/basebackups_005/...),
+        // not at the exact prefix path, so we use list_objects instead of head_object.
+        let walg_prefix = backup_path
+            .strip_prefix(&format!("s3://{}/", minio.bucket_name))
+            .unwrap_or(&backup_path);
+        let list_result = minio
             .s3_client
-            .head_object()
+            .list_objects_v2()
             .bucket(&minio.bucket_name)
-            .key(&backup_path)
+            .prefix(walg_prefix)
+            .max_keys(5)
             .send()
             .await
-            .is_ok();
-        assert!(backup_exists, "Backup file should exist in S3");
-        println!("✓ Backup verified in S3");
+            .expect("Failed to list S3 objects");
+        let object_count = list_result.contents().len();
+        assert!(
+            object_count > 0,
+            "Backup files should exist in S3 under prefix '{}'",
+            walg_prefix
+        );
+        println!(
+            "✓ Backup verified in S3 ({} objects under prefix '{}')",
+            object_count, walg_prefix
+        );
 
         // Step 6: Drop the database to simulate data loss
         println!("Step 6: Dropping database to simulate data loss...");
@@ -1811,6 +2209,7 @@ mod tests {
         service
             .restore_from_s3(
                 &minio.s3_client,
+                &s3_creds,
                 &backup_path,
                 &minio.s3_source,
                 service_config,

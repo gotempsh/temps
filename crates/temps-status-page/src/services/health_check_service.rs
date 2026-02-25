@@ -419,8 +419,9 @@ impl HealthCheckService {
     pub async fn initialize_monitors(&self) -> Result<(), StatusPageError> {
         debug!("Initializing monitors for all existing environments");
 
-        // Get all environments with their projects
+        // Get all active (non-deleted) environments with their projects
         let environments_with_projects = environments::Entity::find()
+            .filter(environments::Column::DeletedAt.is_null())
             .inner_join(projects::Entity)
             .all(self.db.as_ref())
             .await?;

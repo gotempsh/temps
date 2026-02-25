@@ -6,7 +6,7 @@ use serde::Serialize;
 use slug::slugify;
 use std::sync::Arc;
 use temps_core::problemdetails::Problem;
-use temps_core::{EnvironmentCreatedJob, Job, JobQueue};
+use temps_core::{EnvironmentCreatedJob, EnvironmentDeletedJob, Job, JobQueue};
 use temps_entities::{environment_domains, environments, projects};
 use thiserror::Error;
 use tracing::{info, warn};
@@ -24,6 +24,15 @@ pub enum EnvironmentError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error(
+        "Branch '{branch}' is already used by environment '{env_name}' in project {project_id}"
+    )]
+    BranchAlreadyInUse {
+        branch: String,
+        env_name: String,
+        project_id: i32,
+    },
 
     #[error("Other error: {0}")]
     Other(String),
@@ -59,6 +68,10 @@ impl From<EnvironmentError> for Problem {
                     .detail(reason)
                     .build()
             }
+            EnvironmentError::BranchAlreadyInUse { .. } => temps_core::error_builder::bad_request()
+                .title("Branch Already In Use")
+                .detail(error.to_string())
+                .build(),
             EnvironmentError::Other(msg) => temps_core::error_builder::internal_server_error()
                 .detail(msg)
                 .build(),
@@ -132,19 +145,39 @@ impl EnvironmentService {
         memory_limit: Option<i32>,
         branch: String,
     ) -> anyhow::Result<environments::Model> {
-        // Start a transaction
-        let txn = self.db.begin().await?;
-
         // Get the project slug
         let project = projects::Entity::find_by_id(project_id)
-            .one(&txn)
+            .one(self.db.as_ref())
             .await?
             .ok_or_else(|| anyhow::anyhow!("Project not found"))?;
+
+        // Check if a soft-deleted environment with this branch exists — restore it
+        if let Some(deleted_env) = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::Branch.eq(&branch))
+            .filter(environments::Column::DeletedAt.is_not_null())
+            .one(self.db.as_ref())
+            .await?
+        {
+            info!(
+                "Restoring soft-deleted environment {} for branch '{}' in project {}",
+                deleted_env.id, branch, project_id
+            );
+            let mut active_env: environments::ActiveModel = deleted_env.into();
+            active_env.deleted_at = Set(None);
+            active_env.updated_at = Set(chrono::Utc::now());
+            active_env.current_deployment_id = Set(None);
+            let restored = active_env.update(self.db.as_ref()).await?;
+            return Ok(restored);
+        }
 
         let env_slug = slugify(&name);
 
         // Create main_url using project_slug-env_slug format
         let main_url = format!("{}-{}", project.slug, env_slug);
+
+        // Start a transaction for insert + domain creation
+        let txn = self.db.begin().await?;
 
         // Create the new environment
         let new_environment = environments::ActiveModel {
@@ -218,6 +251,7 @@ impl EnvironmentService {
     ) -> Result<Vec<environments::Model>, EnvironmentError> {
         let envs = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project_id_p))
+            .filter(environments::Column::DeletedAt.is_null())
             .order_by_asc(environments::Column::CreatedAt)
             .all(self.db.as_ref())
             .await?;
@@ -243,10 +277,10 @@ impl EnvironmentService {
         project_id_p: i32,
         env_id: i32,
     ) -> Result<environments::Model, EnvironmentError> {
-        // If not found by ID or if parsing failed, try by slug
         let environment = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project_id_p))
             .filter(environments::Column::Id.eq(env_id))
+            .filter(environments::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?;
 
@@ -262,6 +296,7 @@ impl EnvironmentService {
     ) -> Result<environments::Model, EnvironmentError> {
         let default_environment = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project_id_p))
+            .filter(environments::Column::DeletedAt.is_null())
             .order_by_asc(environments::Column::CreatedAt)
             .one(self.db.as_ref())
             .await?;
@@ -269,7 +304,7 @@ impl EnvironmentService {
         match default_environment {
             Some(env) => Ok(env),
             None => Err(EnvironmentError::NotFound(format!(
-                "Environment {} not found",
+                "No environment found for project {}",
                 project_id_p
             ))),
         }
@@ -295,10 +330,11 @@ impl EnvironmentService {
             });
         }
 
-        // For non-main branches, continue with preview environment logic
+        // For non-main branches, find active environment for this branch
         let existing_env = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::Branch.eq(branch))
+            .filter(environments::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await
             .map_err(|e| EnvironmentError::Other(e.to_string()))?;
@@ -309,6 +345,29 @@ impl EnvironmentService {
                 branch, env.id
             );
             return Ok(env);
+        }
+
+        // Check for a soft-deleted environment with this branch and restore it
+        if let Some(deleted_env) = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::Branch.eq(branch))
+            .filter(environments::Column::DeletedAt.is_not_null())
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| EnvironmentError::Other(e.to_string()))?
+        {
+            info!(
+                "Restoring soft-deleted environment {} for branch '{}'",
+                deleted_env.id, branch
+            );
+            let mut active_env: environments::ActiveModel = deleted_env.into();
+            active_env.deleted_at = Set(None);
+            active_env.updated_at = Set(chrono::Utc::now());
+            let restored = active_env
+                .update(self.db.as_ref())
+                .await
+                .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+            return Ok(restored);
         }
 
         let env_name = "preview";
@@ -344,10 +403,11 @@ impl EnvironmentService {
                 EnvironmentError::NotFound(format!("Project {} not found", project_id))
             })?;
 
-        // Check if environment with same name already exists
+        // Check if an active environment with same name already exists
         let existing_env = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::Name.eq(&name))
+            .filter(environments::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await
             .map_err(|e| EnvironmentError::Other(e.to_string()))?;
@@ -356,6 +416,58 @@ impl EnvironmentService {
             return Err(EnvironmentError::Other(
                 "Environment with this name already exists".to_string(),
             ));
+        }
+
+        // Check if another active environment in the same project already tracks this branch
+        // (applies to both restore and fresh creation paths)
+        let branch_conflict = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::Branch.eq(&branch))
+            .filter(environments::Column::DeletedAt.is_null())
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| EnvironmentError::DatabaseError {
+                reason: format!("Failed to check branch uniqueness: {}", e),
+            })?;
+
+        if let Some(conflict) = branch_conflict {
+            return Err(EnvironmentError::BranchAlreadyInUse {
+                branch,
+                env_name: conflict.name,
+                project_id,
+            });
+        }
+
+        // Check if a soft-deleted environment with this name exists — restore it
+        if let Some(deleted_env) = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::Name.eq(&name))
+            .filter(environments::Column::DeletedAt.is_not_null())
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| EnvironmentError::Other(e.to_string()))?
+        {
+            info!(
+                "Restoring soft-deleted environment {} ('{}') in project {}",
+                deleted_env.id, name, project_id
+            );
+            let mut active_env: environments::ActiveModel = deleted_env.into();
+            active_env.deleted_at = Set(None);
+            active_env.branch = Set(Some(branch));
+            active_env.updated_at = Set(chrono::Utc::now());
+            active_env.current_deployment_id = Set(None);
+            if let Some(r) = replicas {
+                active_env.deployment_config =
+                    Set(Some(temps_entities::deployment_config::DeploymentConfig {
+                        replicas: r,
+                        ..Default::default()
+                    }));
+            }
+            let restored = active_env
+                .update(self.db.as_ref())
+                .await
+                .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+            return Ok(restored);
         }
 
         // Generate the environment identifier
@@ -469,6 +581,29 @@ impl EnvironmentService {
             EnvironmentError::InvalidInput(format!("Invalid deployment config: {}", e))
         })?;
 
+        // If the branch is being changed, verify no other environment in the same project
+        // already tracks it. We exclude the environment being updated from the check.
+        if let Some(ref new_branch) = settings.branch {
+            let branch_conflict = environments::Entity::find()
+                .filter(environments::Column::ProjectId.eq(project_id_param))
+                .filter(environments::Column::Branch.eq(new_branch.as_str()))
+                .filter(environments::Column::Id.ne(env_id))
+                .filter(environments::Column::DeletedAt.is_null())
+                .one(self.db.as_ref())
+                .await
+                .map_err(|e| EnvironmentError::DatabaseError {
+                    reason: format!("Failed to check branch uniqueness: {}", e),
+                })?;
+
+            if let Some(conflict) = branch_conflict {
+                return Err(EnvironmentError::BranchAlreadyInUse {
+                    branch: new_branch.clone(),
+                    env_name: conflict.name,
+                    project_id: project_id_param,
+                });
+            }
+        }
+
         active_model.deployment_config = Set(Some(deployment_config));
         active_model.branch = Set(settings.branch);
         active_model.updated_at = Set(chrono::Utc::now());
@@ -576,22 +711,25 @@ impl EnvironmentService {
         )))
     }
 
-    /// Delete an environment permanently
+    /// Soft-delete an environment by setting its `deleted_at` timestamp.
+    ///
+    /// The environment row is preserved for historical data (deployments, analytics)
+    /// and can be restored if a new environment with the same name/branch is created.
     ///
     /// Prevents deletion of:
     /// - Production environments (name = "Production" case-insensitive)
     ///
     /// Note: Active deployments should be cancelled before calling this method
-    /// Warning: This permanently deletes the environment and related data
     pub async fn delete_environment(
         &self,
         project_id: i32,
         env_id: i32,
     ) -> Result<(), EnvironmentError> {
-        // Get the environment
+        // Get the environment (only non-deleted ones)
         let environment = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::Id.eq(env_id))
+            .filter(environments::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| {
@@ -605,14 +743,31 @@ impl EnvironmentService {
             ));
         }
 
-        // Delete the environment permanently
-        environments::Entity::delete_by_id(env_id)
-            .exec(self.db.as_ref())
-            .await?;
+        // Emit EnvironmentDeleted job so subscribers can clean up
+        if let Some(queue_service) = &self.queue_service {
+            let env_deleted_job = Job::EnvironmentDeleted(EnvironmentDeletedJob {
+                environment_id: env_id,
+                environment_name: environment.name.clone(),
+                project_id,
+            });
+
+            if let Err(e) = queue_service.send(env_deleted_job).await {
+                warn!(
+                    "Failed to emit EnvironmentDeleted job for environment {}: {}",
+                    env_id, e
+                );
+            }
+        }
+
+        // Soft-delete: set deleted_at and clear current_deployment_id
+        let mut active_env: environments::ActiveModel = environment.into();
+        active_env.deleted_at = Set(Some(chrono::Utc::now()));
+        active_env.current_deployment_id = Set(None);
+        active_env.update(self.db.as_ref()).await?;
 
         info!(
-            "Permanently deleted environment {} (slug: {}) in project {}",
-            env_id, environment.slug, project_id
+            "Soft-deleted environment {} in project {}",
+            env_id, project_id
         );
 
         Ok(())
@@ -622,6 +777,22 @@ impl EnvironmentService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+    fn make_service(db: sea_orm::DatabaseConnection) -> EnvironmentService {
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+        ));
+        EnvironmentService::new(Arc::new(db), config_service)
+    }
 
     #[test]
     fn test_environment_error_display() {
@@ -633,6 +804,30 @@ mod tests {
 
         let error = EnvironmentError::Other("some error".to_string());
         assert_eq!(error.to_string(), "Other error: some error");
+    }
+
+    #[test]
+    fn test_branch_already_in_use_error_display() {
+        let error = EnvironmentError::BranchAlreadyInUse {
+            branch: "main".to_string(),
+            env_name: "production".to_string(),
+            project_id: 42,
+        };
+        assert_eq!(
+            error.to_string(),
+            "Branch 'main' is already used by environment 'production' in project 42"
+        );
+    }
+
+    #[test]
+    fn test_branch_already_in_use_maps_to_bad_request() {
+        let error = EnvironmentError::BranchAlreadyInUse {
+            branch: "main".to_string(),
+            env_name: "production".to_string(),
+            project_id: 1,
+        };
+        let problem = Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -657,5 +852,232 @@ mod tests {
             EnvironmentError::NotFound(_) => {}
             _ => panic!("Expected NotFound error"),
         }
+    }
+
+    /// create_new_environment rejects a branch already tracked by another environment
+    /// in the same project.
+    #[tokio::test]
+    async fn test_create_environment_rejects_duplicate_branch() {
+        let existing_env = environments::Model {
+            id: 1,
+            name: "production".to_string(),
+            slug: "production".to_string(),
+            subdomain: "my-project-production".to_string(),
+            branch: Some("main".to_string()),
+            project_id: 10,
+            host: "".to_string(),
+            upstreams: temps_entities::upstream_config::UpstreamList::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_deployment: None,
+            current_deployment_id: None,
+            deleted_at: None,
+            deployment_config: None,
+            is_preview: false,
+        };
+
+        let project = temps_entities::projects::Model {
+            id: 10,
+            name: "My Project".to_string(),
+            slug: "my-project".to_string(),
+            repo_name: "repo".to_string(),
+            repo_owner: "owner".to_string(),
+            directory: ".".to_string(),
+            main_branch: "main".to_string(),
+            preset: temps_entities::preset::Preset::NextJs,
+            preset_config: None,
+            deployment_config: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            is_deleted: false,
+            deleted_at: None,
+            last_deployment: None,
+            is_public_repo: true,
+            git_url: None,
+            git_provider_connection_id: None,
+            attack_mode: false,
+            enable_preview_environments: false,
+            source_type: temps_entities::source_type::SourceType::Git,
+        };
+
+        // Query sequence:
+        //   1. find project by id            → returns project
+        //   2. find env by project_id+name   → returns empty (no name conflict)
+        //   3. find env by project_id+branch → returns existing_env (branch conflict)
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![project]])
+            .append_query_results(vec![Vec::<environments::Model>::new()])
+            .append_query_results(vec![vec![existing_env]])
+            .into_connection();
+
+        let svc = make_service(db);
+        let result = svc
+            .create_new_environment(10, "staging".to_string(), "main".to_string(), None)
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                EnvironmentError::BranchAlreadyInUse {
+                    branch,
+                    env_name,
+                    project_id: 10,
+                } if branch == "main" && env_name == "production"
+            ),
+            "Expected BranchAlreadyInUse error"
+        );
+    }
+
+    /// update_environment_settings rejects a branch already tracked by a different
+    /// environment in the same project.
+    #[tokio::test]
+    async fn test_update_settings_rejects_duplicate_branch() {
+        let current_env = environments::Model {
+            id: 2,
+            name: "staging".to_string(),
+            slug: "staging".to_string(),
+            subdomain: "my-project-staging".to_string(),
+            branch: Some("develop".to_string()),
+            project_id: 10,
+            host: "".to_string(),
+            upstreams: temps_entities::upstream_config::UpstreamList::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_deployment: None,
+            current_deployment_id: None,
+            deleted_at: None,
+            deployment_config: None,
+            is_preview: false,
+        };
+
+        let conflicting_env = environments::Model {
+            id: 1,
+            name: "production".to_string(),
+            slug: "production".to_string(),
+            subdomain: "my-project-production".to_string(),
+            branch: Some("main".to_string()),
+            project_id: 10,
+            host: "".to_string(),
+            upstreams: temps_entities::upstream_config::UpstreamList::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_deployment: None,
+            current_deployment_id: None,
+            deleted_at: None,
+            deployment_config: None,
+            is_preview: false,
+        };
+
+        // Query sequence:
+        //   1. get_environment (find by project_id + env_id)            → returns current_env
+        //   2. find env by project_id + branch (excluding env_id=2)     → returns conflicting_env
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![current_env]])
+            .append_query_results(vec![vec![conflicting_env]])
+            .into_connection();
+
+        let svc = make_service(db);
+        let result = svc
+            .update_environment_settings(
+                10,
+                2,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    branch: Some("main".to_string()),
+                    cpu_request: None,
+                    cpu_limit: None,
+                    memory_request: None,
+                    memory_limit: None,
+                    replicas: None,
+                    exposed_port: None,
+                    automatic_deploy: None,
+                    performance_metrics_enabled: None,
+                    session_recording_enabled: None,
+                    security: None,
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                EnvironmentError::BranchAlreadyInUse {
+                    branch,
+                    env_name,
+                    project_id: 10,
+                } if branch == "main" && env_name == "production"
+            ),
+            "Expected BranchAlreadyInUse error"
+        );
+    }
+
+    /// update_environment_settings allows updating other settings while keeping
+    /// the same branch (self-reference must not trigger the conflict check).
+    #[tokio::test]
+    async fn test_update_settings_allows_same_branch_on_same_env() {
+        let current_env = environments::Model {
+            id: 1,
+            name: "production".to_string(),
+            slug: "production".to_string(),
+            subdomain: "my-project-production".to_string(),
+            branch: Some("main".to_string()),
+            project_id: 10,
+            host: "".to_string(),
+            upstreams: temps_entities::upstream_config::UpstreamList::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_deployment: None,
+            current_deployment_id: None,
+            deleted_at: None,
+            deployment_config: None,
+            is_preview: false,
+        };
+
+        // Query sequence:
+        //   1. get_environment                  → returns current_env
+        //   2. branch conflict check (id != 1)  → returns empty (no other env uses "main")
+        //   3. update                            → returns updated env
+        let updated_env = environments::Model {
+            branch: Some("main".to_string()),
+            ..current_env.clone()
+        };
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![current_env]])
+            .append_query_results(vec![Vec::<environments::Model>::new()])
+            .append_query_results(vec![vec![updated_env]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+
+        let svc = make_service(db);
+        let result = svc
+            .update_environment_settings(
+                10,
+                1,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    branch: Some("main".to_string()),
+                    cpu_request: None,
+                    cpu_limit: None,
+                    memory_request: None,
+                    memory_limit: None,
+                    replicas: None,
+                    exposed_port: None,
+                    automatic_deploy: None,
+                    performance_metrics_enabled: None,
+                    session_recording_enabled: None,
+                    security: None,
+                },
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Should allow keeping the same branch: {:?}",
+            result.err()
+        );
     }
 }

@@ -338,6 +338,30 @@ async fn find_or_create_environment_for_branch(
             return Ok(existing_preview);
         }
 
+        // Check if a soft-deleted preview environment exists for this branch — restore it
+        if let Some(deleted_preview) = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .filter(environments::Column::Branch.eq(branch_name))
+            .filter(environments::Column::DeletedAt.is_not_null())
+            .one(db.as_ref())
+            .await
+            .map_err(|e| format!("Database error finding deleted preview environment: {}", e))?
+        {
+            info!(
+                "Restoring soft-deleted preview environment {} for branch '{}'",
+                deleted_preview.id, branch_name
+            );
+            let mut active_env: environments::ActiveModel = deleted_preview.into();
+            active_env.deleted_at = Set(None);
+            active_env.updated_at = Set(chrono::Utc::now());
+            active_env.current_deployment_id = Set(None);
+            let restored = active_env
+                .update(db.as_ref())
+                .await
+                .map_err(|e| format!("Failed to restore preview environment: {}", e))?;
+            return Ok(restored);
+        }
+
         // Create new preview environment for this branch
         return create_preview_environment(db, project, branch_name, &slugified_branch).await;
     }

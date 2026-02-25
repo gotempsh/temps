@@ -1,6 +1,7 @@
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
+    QueryOrder, QuerySelect, Set,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -136,20 +137,55 @@ impl SourceMapService {
         Ok(SourceMapInfo::from(model))
     }
 
-    /// List all source maps for a project release
+    /// List all source maps for a project release.
+    /// Only fetches metadata columns — excludes the large `source_map_data` blob.
     pub async fn list_for_release(
         &self,
         project_id: i32,
         release: &str,
     ) -> Result<Vec<SourceMapInfo>, SourceMapError> {
+        #[derive(FromQueryResult)]
+        struct SourceMapMetadata {
+            id: i32,
+            project_id: i32,
+            release: String,
+            file_path: String,
+            dist: Option<String>,
+            size_bytes: i64,
+            checksum: Option<String>,
+            created_at: chrono::DateTime<Utc>,
+        }
+
         let maps = source_maps::Entity::find()
             .filter(source_maps::Column::ProjectId.eq(project_id))
             .filter(source_maps::Column::Release.eq(release))
             .order_by_asc(source_maps::Column::FilePath)
+            .select_only()
+            .column(source_maps::Column::Id)
+            .column(source_maps::Column::ProjectId)
+            .column(source_maps::Column::Release)
+            .column(source_maps::Column::FilePath)
+            .column(source_maps::Column::Dist)
+            .column(source_maps::Column::SizeBytes)
+            .column(source_maps::Column::Checksum)
+            .column(source_maps::Column::CreatedAt)
+            .into_model::<SourceMapMetadata>()
             .all(self.db.as_ref())
             .await?;
 
-        Ok(maps.into_iter().map(SourceMapInfo::from).collect())
+        Ok(maps
+            .into_iter()
+            .map(|m| SourceMapInfo {
+                id: m.id,
+                project_id: m.project_id,
+                release: m.release,
+                file_path: m.file_path,
+                dist: m.dist,
+                size_bytes: m.size_bytes,
+                checksum: m.checksum,
+                created_at: m.created_at,
+            })
+            .collect())
     }
 
     /// List all releases that have source maps for a project

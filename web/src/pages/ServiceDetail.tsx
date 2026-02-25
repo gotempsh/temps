@@ -264,6 +264,42 @@ export function ServiceDetail() {
           </div>
 
           <div className="flex items-center gap-2 self-start sm:self-auto">
+            <Link to={`/storage/${id}/browse`}>
+              <Button variant="outline" size="sm" className="gap-2">
+                <Database className="h-4 w-4" />
+                Browse Data
+              </Button>
+            </Link>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setIsBackupDialogOpen(true)}
+              className="gap-2"
+            >
+              <HardDrive className="h-4 w-4" />
+              Backup
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setIsEditDialogOpen(true)}
+              className="gap-2"
+            >
+              <Pencil className="h-4 w-4" />
+              Edit
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setIsUpgradeDialogOpen(true)}
+              className="gap-2"
+            >
+              <ArrowUpCircle className="h-4 w-4" />
+              Upgrade
+            </Button>
+
+            <div className="w-px h-6 bg-border" />
+
             <Button
               variant={
                 service.service.status === 'running' ? 'destructive' : 'default'
@@ -284,39 +320,6 @@ export function ServiceDetail() {
                 : service.service.status === 'creating'
                   ? 'Creating...'
                   : 'Start'}
-            </Button>
-            <Link to={`/storage/${id}/browse`}>
-              <Button variant="outline" size="sm" className="gap-2">
-                <Database className="h-4 w-4" />
-                Browse Data
-              </Button>
-            </Link>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setIsEditDialogOpen(true)}
-              className="gap-2"
-            >
-              <Pencil className="h-4 w-4" />
-              Edit
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setIsUpgradeDialogOpen(true)}
-              className="gap-2"
-            >
-              <ArrowUpCircle className="h-4 w-4" />
-              Upgrade
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setIsBackupDialogOpen(true)}
-              className="gap-2"
-            >
-              <HardDrive className="h-4 w-4" />
-              Backup
             </Button>
             <Button
               variant="ghost"

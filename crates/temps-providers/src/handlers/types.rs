@@ -259,7 +259,7 @@ pub struct CreateExternalServiceRequest {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpdateExternalServiceRequest {
     pub parameters: HashMap<String, serde_json::Value>,
-    /// Docker image to use for the service (e.g., "postgres:18-alpine", "timescale/timescaledb-ha:pg18")
+    /// Docker image to use for the service (e.g., "gotempsh/postgres-walg:18-bookworm", "timescale/timescaledb-ha:pg18")
     /// When provided, the service will be recreated with the new image while preserving data
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_image: Option<String>,
@@ -267,9 +267,9 @@ pub struct UpdateExternalServiceRequest {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpgradeExternalServiceRequest {
-    /// Docker image to upgrade to (e.g., "postgres:18-alpine")
+    /// Docker image to upgrade to (e.g., "gotempsh/postgres-walg:18-bookworm")
     /// This will trigger pg_upgrade for PostgreSQL or equivalent upgrade procedures for other services
-    #[schema(example = "postgres:18-alpine")]
+    #[schema(example = "gotempsh/postgres-walg:18-bookworm")]
     pub docker_image: String,
 }
 
@@ -287,8 +287,8 @@ pub struct AvailableContainerInfo {
     /// Container display name
     #[schema(example = "my-postgres")]
     pub container_name: String,
-    /// Docker image name (e.g., "postgres:18-alpine")
-    #[schema(example = "postgres:18-alpine")]
+    /// Docker image name (e.g., "gotempsh/postgres-walg:18-bookworm")
+    #[schema(example = "gotempsh/postgres-walg:18-bookworm")]
     pub image: String,
     /// Extracted version from image
     #[schema(example = "18")]

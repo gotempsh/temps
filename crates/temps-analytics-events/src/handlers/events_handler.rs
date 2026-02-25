@@ -1,9 +1,9 @@
 use crate::services::AnalyticsEventsService;
 use crate::types::{
     ActiveVisitorsQuery, ActiveVisitorsResponse, AggregatedBucketsResponse, AggregationLevel,
-    AnalyticsSessionEventsResponse, EventCount, EventMetricsPayload, EventTimeline,
-    EventTimelineQuery, EventTypeBreakdown, EventTypeBreakdownQuery, EventsCountQuery,
-    HasEventsQuery, HasEventsResponse, HourlyVisitsQuery, PropertyBreakdownQuery,
+    AnalyticsSessionEventsResponse, ConsoleEventPayload, EventCount, EventMetricsPayload,
+    EventTimeline, EventTimelineQuery, EventTypeBreakdown, EventTypeBreakdownQuery,
+    EventsCountQuery, HasEventsQuery, HasEventsResponse, HourlyVisitsQuery, PropertyBreakdownQuery,
     PropertyBreakdownResponse, PropertyColumn, PropertyTimelineQuery, PropertyTimelineResponse,
     SessionEventsQuery, UniqueCountsQuery, UniqueCountsResponse,
 };
@@ -26,6 +26,7 @@ pub struct AppState {
     pub events_service: Arc<AnalyticsEventsService>,
     pub route_table: Arc<CachedPeerTable>,
     pub ip_address_service: Arc<temps_geo::IpAddressService>,
+    pub cookie_crypto: Arc<temps_core::CookieCrypto>,
 }
 
 /// Get event counts with filtering
@@ -719,6 +720,122 @@ pub async fn record_event_metrics(
     }
 }
 
+/// Record an analytics event via the console API with explicit project ID.
+///
+/// The app backend forwards the user's encrypted Temps cookies, so visitor/session
+/// identity is resolved automatically by middleware. No geolocation or user-agent
+/// enrichment is performed — this is a lightweight server-side ingestion path.
+#[utoipa::path(
+    tag = "Events",
+    post,
+    path = "/projects/{project_id}/events/ingest",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+    ),
+    request_body = ConsoleEventPayload,
+    responses(
+        (status = 200, description = "Event recorded successfully"),
+        (status = 400, description = "Bad request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn record_console_event(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
+    Json(payload): Json<ConsoleEventPayload>,
+) -> Result<impl IntoResponse, Problem> {
+    use tracing::{info, warn};
+
+    permission_guard!(auth, AnalyticsWrite);
+
+    info!(
+        "Recording console event: {} for project {} path: {}",
+        payload.event_name, project_id, payload.request_path
+    );
+
+    // Decrypt the encrypted cookie values if provided.
+    // Generate fallback UUIDs when cookies are absent or decryption fails,
+    // because the events hypertable enforces NOT NULL on session_id.
+    let visitor_id = payload.visitor_id.as_deref().and_then(|encrypted| {
+        match state.cookie_crypto.decrypt(encrypted) {
+            Ok(decrypted) => Some(decrypted),
+            Err(e) => {
+                warn!(
+                    "Failed to decrypt visitor_id cookie for project {}: {}",
+                    project_id, e
+                );
+                None
+            }
+        }
+    });
+
+    let session_id = payload
+        .session_id
+        .as_deref()
+        .and_then(|encrypted| match state.cookie_crypto.decrypt(encrypted) {
+            Ok(decrypted) => Some(decrypted),
+            Err(e) => {
+                warn!(
+                    "Failed to decrypt session_id cookie for project {}: {}",
+                    project_id, e
+                );
+                None
+            }
+        })
+        .or_else(|| Some(temps_core::uuid::Uuid::new_v4().to_string()));
+
+    state
+        .events_service
+        .record_event(
+            project_id,
+            Some(payload.environment_id),
+            Some(payload.deployment_id),
+            session_id,
+            visitor_id,
+            &payload.event_name,
+            payload.event_data,
+            &payload.request_path,
+            &payload.request_query,
+            None, // screen_width
+            None, // screen_height
+            None, // viewport_width
+            None, // viewport_height
+            None, // language
+            None, // page_title
+            None, // ip_geolocation_id
+            None, // user_agent
+            None, // referrer
+            None, // ttfb
+            None, // lcp
+            None, // fid
+            None, // fcp
+            None, // cls
+            None, // inp
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to record console event: {:?}", e);
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Failed to record event")
+                .detail(format!(
+                    "Error recording event for project {}: {}",
+                    project_id, e
+                ))
+                .build()
+        })?;
+
+    info!(
+        "Console event recorded: {} for project {} env={}",
+        payload.event_name, project_id, payload.environment_id
+    );
+
+    Ok(StatusCode::OK)
+}
+
 /// Get aggregated metrics by time bucket
 #[utoipa::path(
     get,
@@ -887,6 +1004,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/projects/{project_id}/has-events",
             get(has_analytics_events),
         )
+        .route(
+            "/projects/{project_id}/events/ingest",
+            post(record_console_event),
+        )
         .route("/sessions/{session_id}/events", get(get_session_events))
         .route("/_temps/event", post(record_event_metrics))
 }
@@ -904,6 +1025,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         get_active_visitors,
         get_hourly_visits,
         record_event_metrics,
+        record_console_event,
         get_session_events,
         has_analytics_events,
         get_dashboard_projects_analytics,
@@ -931,6 +1053,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             ActiveVisitorsQuery,
             HourlyVisitsQuery,
             EventMetricsPayload,
+            ConsoleEventPayload,
             AnalyticsSessionEventsResponse,
             SessionEventsQuery,
             HasEventsResponse,
@@ -946,3 +1069,624 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     )
 )]
 pub struct EventsApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::middleware;
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+    use temps_database::test_utils::TestDatabase;
+    use temps_entities::projects;
+    use tower::ServiceExt;
+
+    fn create_test_auth_context() -> temps_auth::AuthContext {
+        let user = temps_entities::users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: Some("hashed".to_string()),
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+    }
+
+    async fn setup_test_app(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> (axum::Router, Arc<AppState>, Arc<temps_core::CookieCrypto>) {
+        let events_service = Arc::new(crate::services::AnalyticsEventsService::new(db.clone()));
+        let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
+        let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
+            temps_geo::MockGeoIpService::new(),
+        ));
+        let ip_address_service =
+            Arc::new(temps_geo::IpAddressService::new(db.clone(), geoip_service));
+        let cookie_crypto =
+            Arc::new(temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap());
+
+        let app_state = Arc::new(AppState {
+            events_service,
+            route_table,
+            ip_address_service,
+            cookie_crypto: cookie_crypto.clone(),
+        });
+
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                let auth_context = create_test_auth_context();
+                req.extensions_mut().insert(auth_context);
+                next.run(req).await
+            },
+        );
+
+        let app = configure_routes()
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+
+        (app, app_state, cookie_crypto)
+    }
+
+    async fn insert_test_environment(
+        db: &sea_orm::DatabaseConnection,
+        project_id: i32,
+    ) -> temps_entities::environments::Model {
+        use temps_entities::{environments, upstream_config::UpstreamList};
+        environments::ActiveModel {
+            project_id: Set(project_id),
+            name: Set("production".to_string()),
+            branch: Set(Some("main".to_string())),
+            slug: Set("production".to_string()),
+            subdomain: Set("prod".to_string()),
+            host: Set(String::new()),
+            upstreams: Set(UpstreamList::new()),
+            is_preview: Set(false),
+            current_deployment_id: Set(None),
+            deleted_at: Set(None),
+            deployment_config: Set(None),
+            last_deployment: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("Failed to insert test environment")
+    }
+
+    async fn insert_test_deployment(
+        db: &sea_orm::DatabaseConnection,
+        project_id: i32,
+        environment_id: i32,
+    ) -> temps_entities::deployments::Model {
+        use temps_entities::deployments;
+        deployments::ActiveModel {
+            project_id: Set(project_id),
+            environment_id: Set(environment_id),
+            slug: Set(format!("test-deploy-{}", uuid::Uuid::new_v4())),
+            state: Set("ready".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            deploying_at: Set(None),
+            ready_at: Set(Some(chrono::Utc::now())),
+            started_at: Set(Some(chrono::Utc::now())),
+            finished_at: Set(Some(chrono::Utc::now())),
+            context_vars: Set(None),
+            branch_ref: Set(Some("main".to_string())),
+            tag_ref: Set(None),
+            commit_sha: Set(None),
+            commit_message: Set(None),
+            commit_author: Set(None),
+            commit_json: Set(None),
+            cancelled_reason: Set(None),
+            static_dir_location: Set(None),
+            screenshot_location: Set(None),
+            image_name: Set(None),
+            deployment_config: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("Failed to insert test deployment")
+    }
+
+    async fn insert_test_project(db: &sea_orm::DatabaseConnection) -> projects::Model {
+        projects::ActiveModel {
+            name: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            preset_config: Set(None),
+            deployment_config: Set(None),
+            slug: Set("test-project".to_string()),
+            is_deleted: Set(false),
+            deleted_at: Set(None),
+            last_deployment: Set(None),
+            is_public_repo: Set(false),
+            git_url: Set(None),
+            git_provider_connection_id: Set(None),
+            attack_mode: Set(false),
+            enable_preview_environments: Set(false),
+            source_type: Set(temps_entities::source_type::SourceType::Git),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("Failed to insert test project")
+    }
+
+    #[tokio::test]
+    async fn test_console_event_ingest_success() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let environment = insert_test_environment(db.as_ref(), project.id).await;
+        let deployment = insert_test_deployment(db.as_ref(), project.id, environment.id).await;
+        let (app, _state, _crypto) = setup_test_app(db.clone()).await;
+
+        let payload = serde_json::json!({
+            "event_name": "purchase",
+            "event_data": { "plan": "pro", "amount": 49.99 },
+            "environment_id": environment.id,
+            "deployment_id": deployment.id,
+            "request_path": "/checkout",
+            "request_query": ""
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{}/events/ingest", project.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "Expected 200, got {}. Body: {}",
+            status,
+            String::from_utf8_lossy(&body)
+        );
+
+        // Verify the event was stored in the database
+        let events: Vec<temps_entities::events::Model> = temps_entities::events::Entity::find()
+            .filter(temps_entities::events::Column::ProjectId.eq(project.id))
+            .all(db.as_ref())
+            .await
+            .expect("Failed to query events");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_name.as_deref(), Some("purchase"));
+        assert_eq!(events[0].pathname, "/checkout");
+        assert_eq!(events[0].project_id, project.id);
+        assert_eq!(events[0].environment_id, Some(environment.id));
+        assert!(events[0].visitor_id.is_none());
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn test_console_event_with_encrypted_visitor_id() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        use temps_entities::visitor;
+        let environment = insert_test_environment(db.as_ref(), project.id).await;
+        let deployment = insert_test_deployment(db.as_ref(), project.id, environment.id).await;
+        let (app, _state, cookie_crypto) = setup_test_app(db.clone()).await;
+
+        // Create a visitor in the DB first
+        let visitor_uuid = uuid::Uuid::new_v4().to_string();
+        let _visitor = visitor::ActiveModel {
+            visitor_id: Set(visitor_uuid.clone()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(chrono::Utc::now()),
+            last_seen: Set(chrono::Utc::now()),
+            has_activity: Set(false),
+            is_crawler: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test visitor");
+
+        // Encrypt the visitor_id like the browser cookie would have
+        let encrypted_visitor_id = cookie_crypto.encrypt(&visitor_uuid).unwrap();
+        let session_uuid = uuid::Uuid::new_v4().to_string();
+        let encrypted_session_id = cookie_crypto.encrypt(&session_uuid).unwrap();
+
+        let payload = serde_json::json!({
+            "event_name": "add_to_cart",
+            "event_data": { "item": "widget" },
+            "visitor_id": encrypted_visitor_id,
+            "session_id": encrypted_session_id,
+            "environment_id": environment.id,
+            "deployment_id": deployment.id,
+            "request_path": "/products/widget"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{}/events/ingest", project.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify the event was stored with the correct visitor
+        let events: Vec<temps_entities::events::Model> = temps_entities::events::Entity::find()
+            .filter(temps_entities::events::Column::ProjectId.eq(project.id))
+            .all(db.as_ref())
+            .await
+            .expect("Failed to query events");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_name.as_deref(), Some("add_to_cart"));
+        assert_eq!(events[0].pathname, "/products/widget");
+        // Visitor should be resolved from the encrypted cookie
+        assert!(events[0].visitor_id.is_some());
+        // Session should be decrypted and stored
+        assert_eq!(events[0].session_id.as_deref(), Some(session_uuid.as_str()));
+
+        // Verify visitor's has_activity was updated
+        let updated_visitor: temps_entities::visitor::Model = visitor::Entity::find()
+            .filter(visitor::Column::VisitorId.eq(&visitor_uuid))
+            .one(db.as_ref())
+            .await
+            .expect("Failed to query visitor")
+            .expect("Visitor not found");
+        assert!(updated_visitor.has_activity);
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn test_console_event_with_invalid_encrypted_cookies_still_succeeds() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let environment = insert_test_environment(db.as_ref(), project.id).await;
+        let deployment = insert_test_deployment(db.as_ref(), project.id, environment.id).await;
+        let (app, _state, _crypto) = setup_test_app(db.clone()).await;
+
+        // Send garbage encrypted values — should warn but not fail
+        let payload = serde_json::json!({
+            "event_name": "page_view",
+            "environment_id": environment.id,
+            "deployment_id": deployment.id,
+            "visitor_id": "not_a_valid_encrypted_value",
+            "session_id": "also_garbage"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{}/events/ingest", project.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Should succeed — invalid cookies are treated as absent
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let events: Vec<temps_entities::events::Model> = temps_entities::events::Entity::find()
+            .filter(temps_entities::events::Column::ProjectId.eq(project.id))
+            .all(db.as_ref())
+            .await
+            .expect("Failed to query events");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_name.as_deref(), Some("page_view"));
+        assert!(events[0].visitor_id.is_none());
+        // session_id gets a generated UUID fallback when cookie decryption fails
+        assert!(events[0].session_id.is_some());
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn test_console_event_with_environment_id() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let environment = insert_test_environment(db.as_ref(), project.id).await;
+        let deployment = insert_test_deployment(db.as_ref(), project.id, environment.id).await;
+        let (app, _state, _crypto) = setup_test_app(db.clone()).await;
+
+        let payload = serde_json::json!({
+            "event_name": "deploy_complete",
+            "event_data": { "version": "1.2.3" },
+            "environment_id": environment.id,
+            "deployment_id": deployment.id,
+            "request_path": "/deploy"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{}/events/ingest", project.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let events: Vec<temps_entities::events::Model> = temps_entities::events::Entity::find()
+            .filter(temps_entities::events::Column::ProjectId.eq(project.id))
+            .all(db.as_ref())
+            .await
+            .expect("Failed to query events");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].environment_id, Some(environment.id));
+        assert_eq!(events[0].event_name.as_deref(), Some("deploy_complete"));
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn test_console_event_without_auth_returns_401() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+
+        let events_service = Arc::new(crate::services::AnalyticsEventsService::new(db.clone()));
+        let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
+        let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
+            temps_geo::MockGeoIpService::new(),
+        ));
+        let ip_address_service =
+            Arc::new(temps_geo::IpAddressService::new(db.clone(), geoip_service));
+        let cookie_crypto =
+            Arc::new(temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap());
+        let app_state = Arc::new(AppState {
+            events_service,
+            route_table,
+            ip_address_service,
+            cookie_crypto,
+        });
+
+        // No auth middleware — should return 401
+        let app = configure_routes().with_state(app_state);
+
+        let payload = serde_json::json!({
+            "event_name": "should_fail"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{}/events/ingest", project.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn test_console_event_minimal_payload() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let environment = insert_test_environment(db.as_ref(), project.id).await;
+        let deployment = insert_test_deployment(db.as_ref(), project.id, environment.id).await;
+        let (app, _state, _crypto) = setup_test_app(db.clone()).await;
+
+        // Minimum payload — event_name + environment_id + deployment_id
+        let payload = serde_json::json!({
+            "event_name": "heartbeat",
+            "environment_id": environment.id,
+            "deployment_id": deployment.id
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{}/events/ingest", project.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let events: Vec<temps_entities::events::Model> = temps_entities::events::Entity::find()
+            .filter(temps_entities::events::Column::ProjectId.eq(project.id))
+            .all(db.as_ref())
+            .await
+            .expect("Failed to query events");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_name.as_deref(), Some("heartbeat"));
+        // Defaults
+        assert_eq!(events[0].pathname, "/");
+        assert!(events[0].screen_width.is_none());
+        assert!(events[0].user_agent.is_none());
+        assert!(events[0].ip_geolocation_id.is_none());
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn test_console_events_appear_in_query_results() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let environment = insert_test_environment(db.as_ref(), project.id).await;
+        let deployment = insert_test_deployment(db.as_ref(), project.id, environment.id).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+
+        // Ingest 3 events
+        for event_name in &["signup", "purchase", "purchase"] {
+            let payload = serde_json::json!({
+                "event_name": event_name,
+                "event_data": {},
+                "environment_id": environment.id,
+                "deployment_id": deployment.id,
+                "request_path": "/api/track"
+            });
+
+            let app_clone = configure_routes()
+                .layer(middleware::from_fn(
+                    |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                        req.extensions_mut().insert(create_test_auth_context());
+                        next.run(req).await
+                    },
+                ))
+                .with_state(state.clone());
+
+            let response = app_clone
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/projects/{}/events/ingest", project.id))
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        // Verify via has-events endpoint
+        let app_query = configure_routes()
+            .layer(middleware::from_fn(
+                |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                    req.extensions_mut().insert(create_test_auth_context());
+                    next.run(req).await
+                },
+            ))
+            .with_state(state.clone());
+
+        let response = app_query
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/projects/{}/has-events", project.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let has_events: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(has_events["has_events"], true);
+
+        // Verify all 3 events are in the database
+        let events: Vec<temps_entities::events::Model> = temps_entities::events::Entity::find()
+            .filter(temps_entities::events::Column::ProjectId.eq(project.id))
+            .all(db.as_ref())
+            .await
+            .expect("Failed to query events");
+
+        assert_eq!(events.len(), 3);
+
+        let event_names: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e.event_name.as_deref())
+            .collect();
+        assert_eq!(event_names.iter().filter(|n| **n == "signup").count(), 1);
+        assert_eq!(event_names.iter().filter(|n| **n == "purchase").count(), 2);
+
+        test_db.cleanup().await;
+    }
+}

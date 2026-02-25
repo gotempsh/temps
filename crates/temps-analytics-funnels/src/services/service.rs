@@ -55,7 +55,13 @@ impl FunnelMetricsCacheKey {
     }
 }
 
-/// Generic TTL-based cache
+/// Maximum number of entries in the metrics cache.
+/// This prevents unbounded memory growth from many unique funnel/filter combinations.
+const DEFAULT_MAX_CACHE_ENTRIES: usize = 1000;
+
+/// Generic TTL-based cache with bounded capacity.
+/// When the cache exceeds `max_capacity`, expired entries are evicted first,
+/// then oldest entries are removed to make room.
 pub struct MetricsCache<K, V>
 where
     K: Eq + Hash + Clone,
@@ -63,6 +69,7 @@ where
 {
     cache: Arc<RwLock<HashMap<K, CacheEntry<V>>>>,
     default_ttl_minutes: i64,
+    max_capacity: usize,
 }
 
 impl<K, V> MetricsCache<K, V>
@@ -74,6 +81,7 @@ where
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             default_ttl_minutes,
+            max_capacity: DEFAULT_MAX_CACHE_ENTRIES,
         }
     }
 
@@ -89,6 +97,27 @@ where
 
     pub async fn set(&self, key: K, value: V) {
         let mut cache = self.cache.write().await;
+
+        // Evict expired entries if at capacity
+        if cache.len() >= self.max_capacity {
+            cache.retain(|_, entry| !entry.is_expired());
+        }
+
+        // If still at capacity after expiry cleanup, remove oldest entries
+        if cache.len() >= self.max_capacity {
+            let to_remove = cache.len() - self.max_capacity + 1;
+            // Find the entries with the earliest expiration times
+            let mut entries_by_expiry: Vec<(K, chrono::DateTime<Utc>)> = cache
+                .iter()
+                .map(|(k, entry)| (k.clone(), entry.expires_at))
+                .collect();
+            entries_by_expiry.sort_by_key(|(_, expires_at)| *expires_at);
+
+            for (k, _) in entries_by_expiry.into_iter().take(to_remove) {
+                cache.remove(&k);
+            }
+        }
+
         cache.insert(key, CacheEntry::new(value, self.default_ttl_minutes));
     }
 
@@ -2647,5 +2676,218 @@ mod tests {
 
         // Overall conversion
         assert!((metrics.overall_conversion_rate - 66.67).abs() < 0.01);
+    }
+
+    // ========================================================================
+    // MetricsCache unit tests (no DB required)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_cache_basic_get_set() {
+        let cache: MetricsCache<String, String> = MetricsCache::new(5);
+
+        // Miss on empty cache
+        assert!(cache.get(&"key1".to_string()).await.is_none());
+
+        // Set and hit
+        cache.set("key1".to_string(), "value1".to_string()).await;
+        assert_eq!(
+            cache.get(&"key1".to_string()).await,
+            Some("value1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_expired_entries_not_returned() {
+        // TTL of 0 minutes — entries expire immediately
+        let cache: MetricsCache<String, String> = MetricsCache::new(0);
+
+        cache.set("key1".to_string(), "value1".to_string()).await;
+
+        // Should miss because TTL is 0 (already expired)
+        assert!(
+            cache.get(&"key1".to_string()).await.is_none(),
+            "Expired entry should not be returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_invalidate() {
+        let cache: MetricsCache<String, String> = MetricsCache::new(60);
+
+        cache.set("key1".to_string(), "value1".to_string()).await;
+        assert!(cache.get(&"key1".to_string()).await.is_some());
+
+        cache.invalidate(&"key1".to_string()).await;
+        assert!(cache.get(&"key1".to_string()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cache_cleanup_expired() {
+        // TTL of 0 minutes
+        let cache: MetricsCache<String, String> = MetricsCache::new(0);
+
+        cache.set("key1".to_string(), "value1".to_string()).await;
+        cache.set("key2".to_string(), "value2".to_string()).await;
+
+        // Both entries are expired (TTL=0), cleanup should remove them
+        cache.cleanup_expired().await;
+
+        let inner = cache.cache.read().await;
+        assert_eq!(inner.len(), 0, "All expired entries should be cleaned up");
+    }
+
+    #[tokio::test]
+    async fn test_cache_bounded_capacity_evicts_expired_first() {
+        // Create cache with very small max_capacity for testing
+        let cache: MetricsCache<i32, String> = MetricsCache {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            default_ttl_minutes: 60,
+            max_capacity: 3,
+        };
+
+        // Fill to capacity
+        cache.set(1, "a".to_string()).await;
+        cache.set(2, "b".to_string()).await;
+        cache.set(3, "c".to_string()).await;
+
+        {
+            let inner = cache.cache.read().await;
+            assert_eq!(inner.len(), 3, "Cache should be at capacity");
+        }
+
+        // Manually expire entry 1
+        {
+            let mut inner = cache.cache.write().await;
+            if let Some(entry) = inner.get_mut(&1) {
+                entry.expires_at = Utc::now() - Duration::minutes(1);
+            }
+        }
+
+        // Adding a new entry should evict the expired entry first
+        cache.set(4, "d".to_string()).await;
+
+        {
+            let inner = cache.cache.read().await;
+            assert_eq!(inner.len(), 3, "Should still be at capacity (3)");
+            assert!(
+                !inner.contains_key(&1),
+                "Expired entry 1 should have been evicted"
+            );
+            assert!(inner.contains_key(&4), "New entry 4 should be present");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_bounded_capacity_evicts_oldest_when_no_expired() {
+        let cache: MetricsCache<i32, String> = MetricsCache {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            default_ttl_minutes: 60,
+            max_capacity: 3,
+        };
+
+        // Fill to capacity with entries that expire at different times
+        cache.set(1, "a".to_string()).await;
+
+        // Give entry 2 a later expiration by inserting after a tiny delay
+        // (or by manipulating the cache directly)
+        cache.set(2, "b".to_string()).await;
+        cache.set(3, "c".to_string()).await;
+
+        // Make entry 1 expire soonest (oldest expiration)
+        {
+            let mut inner = cache.cache.write().await;
+            if let Some(entry) = inner.get_mut(&1) {
+                entry.expires_at = Utc::now() + Duration::minutes(1); // soonest
+            }
+            if let Some(entry) = inner.get_mut(&2) {
+                entry.expires_at = Utc::now() + Duration::minutes(30);
+            }
+            if let Some(entry) = inner.get_mut(&3) {
+                entry.expires_at = Utc::now() + Duration::minutes(60);
+            }
+        }
+
+        // No expired entries, so adding a 4th should evict the one with earliest expiration (key=1)
+        cache.set(4, "d".to_string()).await;
+
+        {
+            let inner = cache.cache.read().await;
+            assert_eq!(inner.len(), 3, "Should still be at capacity");
+            assert!(
+                !inner.contains_key(&1),
+                "Oldest-by-expiration entry (key=1) should be evicted"
+            );
+            assert!(inner.contains_key(&2), "Entry 2 should remain");
+            assert!(inner.contains_key(&3), "Entry 3 should remain");
+            assert!(inner.contains_key(&4), "New entry 4 should be present");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_under_capacity_does_not_evict() {
+        let cache: MetricsCache<i32, String> = MetricsCache {
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            default_ttl_minutes: 60,
+            max_capacity: 10,
+        };
+
+        cache.set(1, "a".to_string()).await;
+        cache.set(2, "b".to_string()).await;
+        cache.set(3, "c".to_string()).await;
+
+        {
+            let inner = cache.cache.read().await;
+            assert_eq!(inner.len(), 3, "All 3 entries should be present");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_invalidate_by_funnel() {
+        let cache: MetricsCache<FunnelMetricsCacheKey, String> = MetricsCache::new(60);
+
+        let key1 = FunnelMetricsCacheKey {
+            funnel_id: 1,
+            environment_id: None,
+            country_code: None,
+            start_date: None,
+            end_date: None,
+        };
+        let key2 = FunnelMetricsCacheKey {
+            funnel_id: 1,
+            environment_id: Some(5),
+            country_code: None,
+            start_date: None,
+            end_date: None,
+        };
+        let key3 = FunnelMetricsCacheKey {
+            funnel_id: 2,
+            environment_id: None,
+            country_code: None,
+            start_date: None,
+            end_date: None,
+        };
+
+        cache.set(key1, "metrics1".to_string()).await;
+        cache.set(key2, "metrics2".to_string()).await;
+        cache.set(key3, "metrics3".to_string()).await;
+
+        // Invalidate funnel 1 — should remove key1 and key2, keep key3
+        cache.invalidate_by_funnel(1).await;
+
+        {
+            let inner = cache.cache.read().await;
+            assert_eq!(inner.len(), 1, "Only funnel 2 entry should remain");
+            assert!(
+                inner.contains_key(&FunnelMetricsCacheKey {
+                    funnel_id: 2,
+                    environment_id: None,
+                    country_code: None,
+                    start_date: None,
+                    end_date: None,
+                }),
+                "Funnel 2 entry should still be present"
+            );
+        }
     }
 }

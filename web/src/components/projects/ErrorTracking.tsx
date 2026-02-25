@@ -239,6 +239,110 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
 
   const hasDsn = Boolean(dsnInfo?.[0]?.dsn)
 
+  // Generate AI prompt for coding agents to set up error tracking
+  const getErrorTrackingAiPrompt = () => {
+    const dsn = allDsns?.[0]?.dsn || 'YOUR_DSN_HERE'
+    const envName = allDsns?.[0]
+      ? environments?.find((e) => e.id === allDsns[0].environment_id)?.name || 'production'
+      : 'production'
+
+    return `Add Sentry-compatible error tracking to my application. The error tracking endpoint uses a Sentry-compatible DSN.
+
+## DSN
+
+\`\`\`
+${dsn}
+\`\`\`
+
+## JavaScript (Browser)
+
+### Install
+\`\`\`bash
+npm install @sentry/browser
+\`\`\`
+
+### Initialize
+\`\`\`javascript
+import * as Sentry from "@sentry/browser";
+
+Sentry.init({
+  dsn: "${dsn}",
+  environment: "${envName}",
+  integrations: [
+    new Sentry.BrowserTracing(),
+    new Sentry.Replay(),
+  ],
+  tracesSampleRate: 1.0,
+  replaysSessionSampleRate: 0.1,
+  replaysOnErrorSampleRate: 1.0,
+});
+\`\`\`
+
+## React
+
+### Install
+\`\`\`bash
+npm install @sentry/react
+\`\`\`
+
+### Initialize
+\`\`\`javascript
+import * as Sentry from "@sentry/react";
+
+Sentry.init({
+  dsn: "${dsn}",
+  environment: "${envName}",
+  integrations: [
+    Sentry.replayIntegration(),
+  ],
+  tracesSampleRate: 1.0,
+  replaysSessionSampleRate: 0.1,
+  replaysOnErrorSampleRate: 1.0,
+});
+\`\`\`
+
+## Node.js
+
+### Install
+\`\`\`bash
+npm install @sentry/node
+\`\`\`
+
+### Initialize
+\`\`\`javascript
+const Sentry = require("@sentry/node");
+
+Sentry.init({
+  dsn: "${dsn}",
+  environment: "${envName}",
+  tracesSampleRate: 1.0,
+});
+\`\`\`
+
+## Python
+
+### Install
+\`\`\`bash
+pip install sentry-sdk
+\`\`\`
+
+### Initialize
+\`\`\`python
+import sentry_sdk
+
+sentry_sdk.init(
+    dsn="${dsn}",
+    environment="${envName}",
+    traces_sample_rate=1.0,
+    profiles_sample_rate=1.0,
+)
+\`\`\`
+
+## Verification
+
+After setup, trigger a test error and check the Temps error tracking dashboard to confirm events are arriving.`
+  }
+
   if (
     isCheckingErrors ||
     isLoadingEnvironments ||
@@ -669,22 +773,30 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
             >
               <Card>
                 <CardHeader>
-                  <CollapsibleTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      className="w-full justify-between p-0 hover:bg-transparent"
+                  <div className="flex items-center justify-between gap-2">
+                    <CollapsibleTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        className="flex-1 justify-between p-0 hover:bg-transparent"
+                      >
+                        <CardTitle className="text-base">
+                          SDK Setup Instructions
+                        </CardTitle>
+                        <ChevronDown
+                          className={cn(
+                            'h-5 w-5 transition-transform',
+                            isDsnConfigOpen && 'rotate-180'
+                          )}
+                        />
+                      </Button>
+                    </CollapsibleTrigger>
+                    <CopyButton
+                      value={getErrorTrackingAiPrompt()}
+                      className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium"
                     >
-                      <CardTitle className="text-base">
-                        SDK Setup Instructions
-                      </CardTitle>
-                      <ChevronDown
-                        className={cn(
-                          'h-5 w-5 transition-transform',
-                          isDsnConfigOpen && 'rotate-180'
-                        )}
-                      />
-                    </Button>
-                  </CollapsibleTrigger>
+                      Copy AI Prompt
+                    </CopyButton>
+                  </div>
                 </CardHeader>
                 <CollapsibleContent>
                   <CardContent className="space-y-6">

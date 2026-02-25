@@ -51,6 +51,9 @@ members = [
     "crates/temps-vulnerability-scanner",
     "crates/temps-kv",
     "crates/temps-blob",
+    "crates/temps-environments",
+    "crates/temps-screenshots",
+    "crates/temps-embeddings",
 ]
 
 [workspace.package]

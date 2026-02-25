@@ -1,6 +1,6 @@
 import type { Command } from 'commander'
-import { requireAuth } from '../../config/store.js'
-import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import { requireAuth, config, credentials } from '../../config/store.js'
+import { setupClient, client, getErrorMessage, normalizeApiUrl } from '../../lib/api-client.js'
 import {
   listErrorGroups,
   getErrorGroup,
@@ -12,9 +12,12 @@ import {
   getErrorDashboardStats,
 } from '../../api/sdk.gen.js'
 import type { ErrorGroupResponse, ErrorEventResponse, ErrorTimeSeriesDataResponse } from '../../api/types.gen.js'
-import { withSpinner } from '../../ui/spinner.js'
+import { withSpinner, startSpinner, succeedSpinner, failSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue, formatRelativeTime } from '../../ui/output.js'
+import { readFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { resolve, basename } from 'node:path'
 
 interface ListOptions {
   projectId: string
@@ -77,6 +80,61 @@ interface DashboardOptions {
 }
 
 const ERROR_STATUSES = ['unresolved', 'resolved', 'ignored']
+
+// Source map interfaces
+interface SourceMapUploadOptions {
+  projectId: string
+  release: string
+  file: string
+  filePath?: string
+  dist?: string
+}
+
+interface SourceMapListOptions {
+  projectId: string
+  release: string
+  json?: boolean
+}
+
+interface SourceMapReleasesOptions {
+  projectId: string
+  json?: boolean
+}
+
+interface SourceMapDeleteReleaseOptions {
+  projectId: string
+  release: string
+}
+
+interface SourceMapDeleteOneOptions {
+  projectId: string
+  sourceMapId: string
+}
+
+// Source map API response shapes
+interface SourceMapResponse {
+  id: number
+  project_id: number
+  release: string
+  file_path: string
+  dist?: string
+  size_bytes: number
+  checksum?: string
+  created_at: string
+}
+
+interface SourceMapListResponse {
+  source_maps: SourceMapResponse[]
+  total: number
+}
+
+interface ReleaseListResponse {
+  releases: string[]
+}
+
+interface DeleteResponse {
+  deleted: number
+}
 
 export function registerErrorsCommands(program: Command): void {
   const errors = program
@@ -160,6 +218,52 @@ export function registerErrorsCommands(program: Command): void {
     .option('--compare', 'Compare to previous period')
     .option('--json', 'Output in JSON format')
     .action(getErrorDashboardAction)
+
+  // Source maps subcommand group
+  const sourcemaps = errors
+    .command('sourcemaps')
+    .alias('sm')
+    .description('Manage source maps for error symbolication')
+
+  sourcemaps
+    .command('upload')
+    .description('Upload a source map file for a release')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .requiredOption('--release <version>', 'Release version (e.g. commit SHA)')
+    .requiredOption('--file <path>', 'Path to the .map file')
+    .option('--file-path <urlpath>', 'URL path in stack traces (e.g. ~/assets/main.js)')
+    .option('--dist <dist>', 'Distribution identifier')
+    .action(uploadSourceMap)
+
+  sourcemaps
+    .command('list')
+    .alias('ls')
+    .description('List source maps for a release')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .requiredOption('--release <version>', 'Release version')
+    .option('--json', 'Output in JSON format')
+    .action(listSourceMaps)
+
+  sourcemaps
+    .command('releases')
+    .description('List all releases that have source maps')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .option('--json', 'Output in JSON format')
+    .action(listSourceMapReleases)
+
+  sourcemaps
+    .command('delete')
+    .description('Delete all source maps for a release')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .requiredOption('--release <version>', 'Release version')
+    .action(deleteReleaseSourceMaps)
+
+  sourcemaps
+    .command('delete-one')
+    .description('Delete a specific source map by ID')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .requiredOption('--source-map-id <id>', 'Source map ID')
+    .action(deleteSourceMap)
 }
 
 async function listErrorGroupsAction(options: ListOptions): Promise<void> {
@@ -519,6 +623,233 @@ async function getErrorTimelineAction(options: TimelineOptions): Promise<void> {
 
   printTable(timeSeries, columns, { style: 'minimal' })
   newline()
+}
+
+async function uploadSourceMap(options: SourceMapUploadOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  if (isNaN(projectId)) {
+    warning('Invalid project ID')
+    return
+  }
+
+  const resolvedPath = resolve(options.file)
+  if (!existsSync(resolvedPath)) {
+    warning(`File does not exist: ${resolvedPath}`)
+    return
+  }
+
+  const filename = basename(resolvedPath)
+  startSpinner(`Uploading source map: ${filename}...`)
+
+  const apiUrl = normalizeApiUrl(config.get('apiUrl'))
+  const apiKey = await credentials.getApiKey()
+  const uploadUrl = `${apiUrl}/projects/${projectId}/releases/${encodeURIComponent(options.release)}/source-maps`
+
+  try {
+    const fileData = await readFile(resolvedPath)
+    const uint8Data = new Uint8Array(fileData.buffer, fileData.byteOffset, fileData.byteLength)
+
+    const formData = new FormData()
+    formData.append('file', new Blob([uint8Data], { type: 'application/json' }), filename)
+    if (options.filePath) {
+      formData.append('file_path', options.filePath)
+    }
+    if (options.dist) {
+      formData.append('dist', options.dist)
+    }
+
+    const response = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: formData,
+    })
+
+    if (!response.ok) {
+      const errorText = await response.text()
+      failSpinner(`Upload failed: ${response.status}`)
+      warning(errorText)
+      return
+    }
+
+    const result = (await response.json()) as SourceMapResponse
+    succeedSpinner(`Source map uploaded (id=${result.id})`)
+
+    newline()
+    keyValue('ID', result.id.toString())
+    keyValue('Release', result.release)
+    keyValue('File Path', result.file_path)
+    keyValue('Size', formatBytes(result.size_bytes))
+    if (result.dist) keyValue('Dist', result.dist)
+    newline()
+  } catch (err) {
+    failSpinner('Upload failed')
+    throw err
+  }
+}
+
+async function listSourceMaps(options: SourceMapListOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  if (isNaN(projectId)) {
+    warning('Invalid project ID')
+    return
+  }
+
+  const apiUrl = normalizeApiUrl(config.get('apiUrl'))
+  const apiKey = await credentials.getApiKey()
+  const url = `${apiUrl}/projects/${projectId}/releases/${encodeURIComponent(options.release)}/source-maps`
+
+  const result = await withSpinner('Fetching source maps...', async () => {
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    })
+    if (!response.ok) {
+      const errorText = await response.text()
+      throw new Error(`Request failed (${response.status}): ${errorText}`)
+    }
+    return response.json() as Promise<SourceMapListResponse>
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  newline()
+  header(`${icons.info} Source Maps for Release "${options.release}" (${result.total})`)
+
+  if (result.source_maps.length === 0) {
+    info('No source maps found for this release')
+    newline()
+    return
+  }
+
+  const columns: TableColumn<SourceMapResponse>[] = [
+    { header: 'ID', key: 'id', width: 6 },
+    { header: 'File Path', key: 'file_path' },
+    { header: 'Dist', accessor: (m) => m.dist ?? '-' },
+    { header: 'Size', accessor: (m) => formatBytes(m.size_bytes) },
+    { header: 'Uploaded', accessor: (m) => formatRelativeTime(m.created_at) },
+  ]
+
+  printTable(result.source_maps, columns, { style: 'minimal' })
+  newline()
+}
+
+async function listSourceMapReleases(options: SourceMapReleasesOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  if (isNaN(projectId)) {
+    warning('Invalid project ID')
+    return
+  }
+
+  const apiUrl = normalizeApiUrl(config.get('apiUrl'))
+  const apiKey = await credentials.getApiKey()
+  const url = `${apiUrl}/projects/${projectId}/source-map-releases`
+
+  const result = await withSpinner('Fetching releases...', async () => {
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    })
+    if (!response.ok) {
+      const errorText = await response.text()
+      throw new Error(`Request failed (${response.status}): ${errorText}`)
+    }
+    return response.json() as Promise<ReleaseListResponse>
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  newline()
+  header(`${icons.info} Releases with Source Maps for Project ${projectId}`)
+
+  if (result.releases.length === 0) {
+    info('No releases with source maps found')
+    newline()
+    return
+  }
+
+  for (const release of result.releases) {
+    info(`  ${colors.bold(release)}`)
+  }
+  newline()
+}
+
+async function deleteReleaseSourceMaps(options: SourceMapDeleteReleaseOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  if (isNaN(projectId)) {
+    warning('Invalid project ID')
+    return
+  }
+
+  const apiUrl = normalizeApiUrl(config.get('apiUrl'))
+  const apiKey = await credentials.getApiKey()
+  const url = `${apiUrl}/projects/${projectId}/releases/${encodeURIComponent(options.release)}/source-maps`
+
+  const result = await withSpinner(`Deleting source maps for release "${options.release}"...`, async () => {
+    const response = await fetch(url, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${apiKey}` },
+    })
+    if (!response.ok) {
+      const errorText = await response.text()
+      throw new Error(`Request failed (${response.status}): ${errorText}`)
+    }
+    return response.json() as Promise<DeleteResponse>
+  })
+
+  success(`Deleted ${result.deleted} source map(s) for release "${options.release}"`)
+}
+
+async function deleteSourceMap(options: SourceMapDeleteOneOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  const sourceMapId = parseInt(options.sourceMapId, 10)
+  if (isNaN(projectId) || isNaN(sourceMapId)) {
+    warning('Invalid project ID or source map ID')
+    return
+  }
+
+  const apiUrl = normalizeApiUrl(config.get('apiUrl'))
+  const apiKey = await credentials.getApiKey()
+  const url = `${apiUrl}/projects/${projectId}/source-maps/${sourceMapId}`
+
+  await withSpinner(`Deleting source map #${sourceMapId}...`, async () => {
+    const response = await fetch(url, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${apiKey}` },
+    })
+    if (!response.ok && response.status !== 204) {
+      const errorText = await response.text()
+      throw new Error(`Request failed (${response.status}): ${errorText}`)
+    }
+  })
+
+  success(`Source map #${sourceMapId} deleted`)
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
 }
 
 async function getErrorDashboardAction(options: DashboardOptions): Promise<void> {
