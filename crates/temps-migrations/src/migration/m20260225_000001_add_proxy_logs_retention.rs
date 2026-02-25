@@ -8,6 +8,16 @@ impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
 
+        // Enable compression on the proxy_logs hypertable
+        db.execute_unprepared(
+            "ALTER TABLE proxy_logs SET (
+                timescaledb.compress,
+                timescaledb.compress_segmentby = 'project_id',
+                timescaledb.compress_orderby = 'timestamp DESC'
+            )",
+        )
+        .await?;
+
         // Add compression policy: compress chunks older than 7 days
         db.execute_unprepared(
             "SELECT add_compression_policy('proxy_logs', INTERVAL '7 days', if_not_exists => TRUE)",
