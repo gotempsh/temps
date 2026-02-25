@@ -20,6 +20,7 @@ import { ProjectSettings } from '@/components/project/ProjectSettings'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
+import { ProjectMonitoring } from '@/components/project/ProjectMonitoring'
 import { MonitorDetail } from '@/components/project/MonitorDetail'
 import { ErrorTracking } from '@/components/projects/ErrorTracking'
 import { EnvironmentsTabsView } from './EnvironmentsTabsView'
@@ -370,6 +371,10 @@ export function ProjectDetail() {
               <Route
                 path="monitors/:monitorId"
                 element={<MonitorDetail project={project} />}
+              />
+              <Route
+                path="monitoring"
+                element={<ProjectMonitoring project={project} />}
               />
               <Route
                 path="errors"

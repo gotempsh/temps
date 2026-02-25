@@ -1083,32 +1083,44 @@ impl ContainerDeployer for DockerRuntime {
             .map_err(|e| DeployerError::Other(format!("Failed to get container stats: {}", e)))?
             .ok_or_else(|| DeployerError::Other("No stats available".to_string()))?;
 
-        // Extract CPU percentage
-        let cpu_percent = if let (Some(cpu), Some(system)) = (
-            stats_data
+        // Extract CPU percentage using delta between cpu_stats and precpu_stats
+        let cpu_percent = {
+            let current_cpu = stats_data
                 .cpu_stats
                 .as_ref()
-                .and_then(|cs| cs.cpu_usage.as_ref()),
-            stats_data
+                .and_then(|cs| cs.cpu_usage.as_ref())
+                .and_then(|cu| cu.total_usage);
+            let current_system = stats_data
                 .cpu_stats
                 .as_ref()
-                .and_then(|cs| cs.system_cpu_usage),
-        ) {
-            let cpu_total = cpu.total_usage.unwrap_or(0);
-            if system > 0 && cpu_total > 0 {
-                let cpu_delta = cpu_total as f64;
-                let system_delta = system as f64;
-                let num_cpus = stats_data
-                    .cpu_stats
-                    .as_ref()
-                    .and_then(|cs| cs.online_cpus)
-                    .unwrap_or(1) as f64;
-                ((cpu_delta / system_delta) * num_cpus * 100.0).clamp(0.0, 100.0)
-            } else {
-                0.0
+                .and_then(|cs| cs.system_cpu_usage);
+            let prev_cpu = stats_data
+                .precpu_stats
+                .as_ref()
+                .and_then(|cs| cs.cpu_usage.as_ref())
+                .and_then(|cu| cu.total_usage);
+            let prev_system = stats_data
+                .precpu_stats
+                .as_ref()
+                .and_then(|cs| cs.system_cpu_usage);
+
+            match (current_cpu, current_system, prev_cpu, prev_system) {
+                (Some(cur_cpu), Some(cur_sys), Some(pre_cpu), Some(pre_sys)) => {
+                    let cpu_delta = cur_cpu as f64 - pre_cpu as f64;
+                    let system_delta = cur_sys as f64 - pre_sys as f64;
+                    if system_delta > 0.0 && cpu_delta >= 0.0 {
+                        let num_cpus = stats_data
+                            .cpu_stats
+                            .as_ref()
+                            .and_then(|cs| cs.online_cpus)
+                            .unwrap_or(1) as f64;
+                        ((cpu_delta / system_delta) * num_cpus * 100.0).clamp(0.0, 100.0)
+                    } else {
+                        0.0
+                    }
+                }
+                _ => 0.0,
             }
-        } else {
-            0.0
         };
 
         // Extract memory stats

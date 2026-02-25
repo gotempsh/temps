@@ -254,7 +254,7 @@ const FullAppRoutes = () => {
                 <Route path="/backups" element={<Backups />} />
                 <Route path="/backups/s3-sources/new" element={<CreateS3Source />} />
                 <Route path="/monitoring" element={<Monitoring />}>
-                  <Route index element={<Navigate to="project" replace />} />
+                  <Route index element={<Navigate to="resources" replace />} />
                   <Route path="providers/add" element={<AddNotificationProvider />} />
                   <Route path="providers/edit/:id" element={<EditNotificationProvider />} />
                   <Route path=":section" element={<MonitoringSettings />} />

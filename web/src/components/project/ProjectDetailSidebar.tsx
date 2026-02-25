@@ -8,6 +8,7 @@ import {
   ChevronRight,
   Database,
   FileText,
+  Gauge,
   GitBranch,
   Home,
   Layers,
@@ -136,6 +137,11 @@ const baseNavItems: NavItem[] = [
     url: 'monitors',
     icon: Activity,
     kbd: 'M',
+  },
+  {
+    title: 'Monitoring',
+    url: 'monitoring',
+    icon: Gauge,
   },
 
   // Debugging (Medium Frequency)

@@ -539,7 +539,7 @@ impl ProxyLogService {
             SELECT
                 bucket::timestamptz as bucket,
                 COALESCE(count, 0) as request_count,
-                COALESCE(avg_response_time, 0) as avg_response_time_ms,
+                COALESCE(avg_response_time, 0)::float8 as avg_response_time_ms,
                 COALESCE(error_count, 0) as error_count,
                 COALESCE(total_request_bytes, 0) as total_request_bytes,
                 COALESCE(total_response_bytes, 0) as total_response_bytes
@@ -628,6 +628,12 @@ impl ProxyLogService {
         if let Some(status_code) = filters.status_code {
             query = query.filter(proxy_logs::Column::StatusCode.eq(status_code));
         }
+        if let Some(ref class) = filters.status_code_class {
+            if let Some((min, max)) = Self::status_class_range(class) {
+                query = query.filter(proxy_logs::Column::StatusCode.gte(min));
+                query = query.filter(proxy_logs::Column::StatusCode.lt(max));
+            }
+        }
         if let Some(routing_status) = filters.routing_status {
             query = query.filter(proxy_logs::Column::RoutingStatus.eq(routing_status));
         }
@@ -676,6 +682,17 @@ impl ProxyLogService {
             where_clauses.push(format!("status_code = ${}", param_index));
             *param_index += 1;
         }
+        if let Some(ref class) = filters.status_code_class {
+            if let Some((min, max)) = Self::status_class_range(class) {
+                where_clauses.push(format!(
+                    "status_code >= ${} AND status_code < ${}",
+                    param_index,
+                    *param_index + 1
+                ));
+                *param_index += 2;
+                let _ = (min, max); // used via add_filter_values
+            }
+        }
         if filters.routing_status.is_some() {
             where_clauses.push(format!("routing_status = ${}", param_index));
             *param_index += 1;
@@ -716,6 +733,12 @@ impl ProxyLogService {
         }
         if let Some(status_code) = filters.status_code {
             values.push(status_code.into());
+        }
+        if let Some(ref class) = filters.status_code_class {
+            if let Some((min, max)) = Self::status_class_range(class) {
+                values.push(min.into());
+                values.push(max.into());
+            }
         }
         if let Some(ref routing_status) = filters.routing_status {
             values.push(routing_status.clone().into());
@@ -768,6 +791,19 @@ impl ProxyLogService {
         // Verify second part is a valid unit
         valid_units.contains(&parts[1])
     }
+
+    /// Convert a status code class like "2xx", "3xx", "4xx", "5xx" to a (min, max) range.
+    /// Returns None if the class is not recognized.
+    fn status_class_range(class: &str) -> Option<(i16, i16)> {
+        match class {
+            "1xx" => Some((100, 200)),
+            "2xx" => Some((200, 300)),
+            "3xx" => Some((300, 400)),
+            "4xx" => Some((400, 500)),
+            "5xx" => Some((500, 600)),
+            _ => None,
+        }
+    }
 }
 
 /// Filters for statistics queries
@@ -780,6 +816,8 @@ pub struct StatsFilters {
     pub deployment_id: Option<i32>,
     pub host: Option<String>,
     pub status_code: Option<i16>,
+    /// Filter by status code class (e.g. "2xx", "3xx", "4xx", "5xx")
+    pub status_code_class: Option<String>,
     pub routing_status: Option<String>,
     pub request_source: Option<String>,
     pub is_bot: Option<bool>,
@@ -934,6 +972,7 @@ mod tests {
             deployment_id: Some(3),
             host: Some("example.com".to_string()),
             status_code: Some(404),
+            status_code_class: None,
             routing_status: Some("routed".to_string()),
             request_source: Some("proxy".to_string()),
             is_bot: Some(false),
@@ -999,6 +1038,7 @@ mod tests {
             deployment_id: Some(3),
             host: Some("example.com".to_string()),
             status_code: Some(404),
+            status_code_class: None,
             routing_status: Some("routed".to_string()),
             request_source: Some("proxy".to_string()),
             is_bot: Some(false),
@@ -1047,6 +1087,7 @@ mod tests {
         assert!(filters.deployment_id.is_none());
         assert!(filters.host.is_none());
         assert!(filters.status_code.is_none());
+        assert!(filters.status_code_class.is_none());
         assert!(filters.routing_status.is_none());
         assert!(filters.request_source.is_none());
         assert!(filters.is_bot.is_none());
