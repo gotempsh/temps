@@ -35,6 +35,13 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { maskValue, shouldMaskValue } from '@/lib/masking'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import {
   AlertCircle,
   ArrowLeft,
   ArrowUpCircle,
@@ -43,6 +50,7 @@ import {
   EyeOff,
   HardDrive,
   Loader2,
+  MoreVertical,
   Pencil,
   RefreshCcw,
   Trash2,
@@ -271,36 +279,6 @@ export function ServiceDetail() {
               </Button>
             </Link>
             <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setIsBackupDialogOpen(true)}
-              className="gap-2"
-            >
-              <HardDrive className="h-4 w-4" />
-              Backup
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setIsEditDialogOpen(true)}
-              className="gap-2"
-            >
-              <Pencil className="h-4 w-4" />
-              Edit
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setIsUpgradeDialogOpen(true)}
-              className="gap-2"
-            >
-              <ArrowUpCircle className="h-4 w-4" />
-              Upgrade
-            </Button>
-
-            <div className="w-px h-6 bg-border" />
-
-            <Button
               variant={
                 service.service.status === 'running' ? 'destructive' : 'default'
               }
@@ -321,14 +299,35 @@ export function ServiceDetail() {
                   ? 'Creating...'
                   : 'Start'}
             </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setIsDeleteDialogOpen(true)}
-              className="text-destructive hover:text-destructive hover:bg-destructive/10"
-            >
-              <Trash2 className="h-4 w-4" />
-            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon" className="h-8 w-8">
+                  <MoreVertical className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={() => setIsBackupDialogOpen(true)}>
+                  <HardDrive className="h-4 w-4 mr-2" />
+                  Backup
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setIsEditDialogOpen(true)}>
+                  <Pencil className="h-4 w-4 mr-2" />
+                  Edit
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setIsUpgradeDialogOpen(true)}>
+                  <ArrowUpCircle className="h-4 w-4 mr-2" />
+                  Upgrade
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={() => setIsDeleteDialogOpen(true)}
+                  className="text-destructive focus:text-destructive"
+                >
+                  <Trash2 className="h-4 w-4 mr-2" />
+                  Delete
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
 
