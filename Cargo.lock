@@ -10720,6 +10720,7 @@ dependencies = [
  "temps-entities",
  "temps-environments",
  "temps-error-tracking",
+ "temps-external-plugins",
  "temps-geo",
  "temps-git",
  "temps-import",
@@ -10790,20 +10791,15 @@ dependencies = [
  "axum 0.8.6",
  "base64 0.22.1",
  "chrono",
- "flate2",
  "futures",
  "hex",
- "hyper 1.7.0",
- "hyper-util",
  "log",
  "once_cell",
  "rand 0.8.5",
- "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
- "tar",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
@@ -11149,6 +11145,24 @@ dependencies = [
  "temps-plugin-sdk",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "temps-external-plugins"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.6",
+ "hyper 1.7.0",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "temps-config",
+ "temps-core",
+ "tokio",
+ "tracing",
+ "utoipa",
+ "uuid",
 ]
 
 [[package]]

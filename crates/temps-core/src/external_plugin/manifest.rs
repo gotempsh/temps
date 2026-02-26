@@ -4,9 +4,10 @@
 //! They are the canonical definitions — the `temps-plugin-sdk` crate re-exports them.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Where the plugin's nav entry appears in the Temps UI sidebar.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NavSection {
     /// Main platform navigation (Dashboard, Projects, Storage, Domains, Monitoring)
@@ -18,7 +19,7 @@ pub enum NavSection {
 }
 
 /// A navigation entry that the plugin contributes to the Temps UI.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NavEntry {
     /// Display label in the sidebar
     pub label: String,
@@ -33,7 +34,7 @@ pub struct NavEntry {
 }
 
 /// Describes the plugin's embedded UI bundle.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UiManifest {
     /// JavaScript entry point filename relative to the bundle root
     pub entry_js: String,
@@ -46,7 +47,7 @@ pub struct UiManifest {
 }
 
 /// A client-side route provided by the plugin UI.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UiRoute {
     /// Route path pattern (e.g., "/my-plugin", "/my-plugin/:id")
     pub path: String,
@@ -55,7 +56,7 @@ pub struct UiRoute {
 }
 
 /// The complete plugin manifest — the handshake contract.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PluginManifest {
     /// Unique plugin identifier (kebab-case, e.g., "backup-manager")
     pub name: String,

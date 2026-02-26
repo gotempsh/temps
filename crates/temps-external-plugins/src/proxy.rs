@@ -32,7 +32,7 @@ impl PluginProxy {
 
 /// Create an axum Router that proxies all requests to an external plugin.
 ///
-/// Mounts at `/api/x/{plugin_name}` — strips the prefix before forwarding.
+/// Mounts at `/x/{plugin_name}` — strips the prefix before forwarding.
 /// Adds Temps headers (user context, request ID, auth signature).
 pub fn create_plugin_proxy_router(proxy: PluginProxy) -> Router {
     Router::new().fallback(proxy_handler).with_state(proxy)
@@ -51,11 +51,8 @@ async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Re
         "Proxying request to external plugin"
     );
 
-    // Build the target URL for the plugin (just path + query)
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(path);
 
-    // Forward the request to the plugin over Unix socket
-    // We use reqwest with a unix socket connector
     match forward_to_unix_socket(&proxy, request, path_and_query).await {
         Ok(response) => response,
         Err(e) => {
@@ -82,7 +79,6 @@ async fn forward_to_unix_socket(
     use hyper_util::rt::TokioIo;
     use tokio::net::UnixStream;
 
-    // Connect to the plugin's Unix socket
     let stream = UnixStream::connect(&proxy.socket_path).await.map_err(|e| {
         format!(
             "Cannot connect to plugin socket {}: {}",
@@ -93,22 +89,18 @@ async fn forward_to_unix_socket(
 
     let io = TokioIo::new(stream);
 
-    // Create a hyper connection
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
         .map_err(|e| format!("HTTP handshake failed: {}", e))?;
 
-    // Spawn connection driver
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             error!("Plugin proxy connection error: {}", e);
         }
     });
 
-    // Build the forwarded request
     let (mut parts, body) = original_request.into_parts();
 
-    // Inject Temps headers
     parts.headers.insert(
         "x-temps-plugin",
         proxy
@@ -124,13 +116,11 @@ async fn forward_to_unix_socket(
             .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("")),
     );
 
-    // Rewrite the URI to just the path (plugin doesn't know about /api/x/{name} prefix)
     let target_uri: hyper::Uri = path_and_query
         .parse()
         .map_err(|e| format!("Invalid URI '{}': {}", path_and_query, e))?;
     parts.uri = target_uri;
 
-    // Ensure Host header is set (required for HTTP/1.1)
     parts.headers.insert(
         hyper::header::HOST,
         hyper::header::HeaderValue::from_static("localhost"),
@@ -138,13 +128,11 @@ async fn forward_to_unix_socket(
 
     let forwarded_request = Request::from_parts(parts, body);
 
-    // Send request to plugin
     let response = sender
         .send_request(forwarded_request)
         .await
         .map_err(|e| format!("Plugin request failed: {}", e))?;
 
-    // Convert hyper::Response<Incoming> to axum::Response<Body>
     let (parts, body) = response.into_parts();
     let body = Body::new(body);
     Ok(Response::from_parts(parts, body))

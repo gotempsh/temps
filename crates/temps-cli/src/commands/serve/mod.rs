@@ -122,25 +122,27 @@ impl ServeCommand {
 
         // Create shared route table instance (used by both console API and proxy)
         let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
-        let listener = Arc::new(temps_routes::RouteTableListener::new(
+        let route_table_listener = Arc::new(temps_routes::RouteTableListener::new(
             route_table.clone(),
             self.database_url.clone(),
         ));
 
         let rt = tokio::runtime::Runtime::new()?;
-        // Start the route table listener
-        rt.spawn(async move {
-            if let Err(e) = listener.start_listening().await {
+        // Start the route table listener (block_on to ensure initial load completes)
+        let route_table_listener_clone = route_table_listener.clone();
+        rt.block_on(async move {
+            if let Err(e) = route_table_listener_clone.start_listening().await {
                 tracing::error!("Route table listener failed: {}", e);
             }
         });
 
         // Start the project change listener
+        // Keep the listener alive on the stack so its Drop doesn't abort the background task
         let project_listener = temps_routes::ProjectChangeListener::new(
             self.database_url.clone(),
             route_table.clone(),
         );
-        rt.spawn(async move {
+        rt.block_on(async {
             if let Err(e) = project_listener.start_listening().await {
                 tracing::error!("Project change listener failed: {}", e);
             }

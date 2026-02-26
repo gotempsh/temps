@@ -7533,6 +7533,10 @@ export type StatsFilters = {
     request_source?: string | null;
     routing_status?: string | null;
     status_code?: number | null;
+    /**
+     * Filter by status code class (e.g. "2xx", "3xx", "4xx", "5xx")
+     */
+    status_code_class?: string | null;
 };
 
 export type StatusBucket = {
@@ -23267,6 +23271,10 @@ export type GetTodayStatsData = {
          * Filter by status code
          */
         status_code?: number | null;
+        /**
+         * Filter by status code class (e.g. "2xx", "3xx", "4xx", "5xx")
+         */
+        status_code_class?: string | null;
         /**
          * Filter by routing status
          */

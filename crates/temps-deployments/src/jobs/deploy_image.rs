@@ -81,6 +81,8 @@ pub struct DeploymentOutput {
     pub container_ids: Vec<String>,
     /// List of all allocated host ports (one per replica)
     pub host_ports: Vec<u16>,
+    /// The resolved container port (from image EXPOSE, config, or default)
+    pub container_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -477,6 +479,7 @@ impl DeployImageJob {
         // Deploy multiple replicas
         let mut all_container_ids = Vec::new();
         let mut all_host_ports = Vec::new();
+        let mut resolved_container_port: Option<u16> = None;
         let mut deployment_error: Option<WorkflowError> = None;
 
         for replica_index in 0..self.config.replicas {
@@ -494,9 +497,11 @@ impl DeployImageJob {
                 .deploy_single_replica(image_output, context, replica_index)
                 .await
             {
-                Ok((container_id, host_port)) => {
+                Ok((container_id, host_port, container_port)) => {
                     all_container_ids.push(container_id);
                     all_host_ports.push(host_port);
+                    // All replicas share the same container port
+                    resolved_container_port = Some(container_port);
                 }
                 Err(e) => {
                     self.log(
@@ -550,6 +555,7 @@ impl DeployImageJob {
             resources: self.config.resources.clone(),
             container_ids: all_container_ids,
             host_ports: all_host_ports,
+            container_port: resolved_container_port.unwrap_or(self.config.port as u16),
         })
     }
 
@@ -559,7 +565,7 @@ impl DeployImageJob {
         image_output: &BuildImageOutput,
         context: &WorkflowContext,
         replica_index: u32,
-    ) -> Result<(String, u16), WorkflowError> {
+    ) -> Result<(String, u16, u16), WorkflowError> {
         // Prepare deployment request using temps-deployer types
         self.log(context, "Deploying container image...".to_string())
             .await?;
@@ -1027,8 +1033,12 @@ impl DeployImageJob {
         )
         .await?;
 
-        // Return container ID and host port
-        Ok((deploy_result.container_id, deploy_result.host_port))
+        // Return container ID, host port, and container port
+        Ok((
+            deploy_result.container_id,
+            deploy_result.host_port,
+            deploy_result.container_port,
+        ))
     }
 
     async fn validate_deployment_config(
@@ -1125,7 +1135,7 @@ impl WorkflowTask for DeployImageJob {
             context.set_output(
                 &self.job_id,
                 "container_port",
-                deployment_output.host_ports[0] as i32,
+                deployment_output.container_port as i32,
             )?;
 
             // Set artifact for first container

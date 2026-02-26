@@ -8,13 +8,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use temps_core::external_plugin::{HandshakeMessage, PluginManifest};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use super::manifest::{HandshakeMessage, PluginManifest};
-use super::proxy::PluginProxy;
+use crate::proxy::PluginProxy;
 
 /// State of a single external plugin process.
 #[derive(Debug)]
@@ -36,8 +36,6 @@ impl ExternalPluginProcess {
     pub fn shutdown(&mut self) {
         if let Some(id) = self.child.id() {
             debug!(plugin = %self.manifest.name, pid = id, "Killing plugin process");
-            // start_kill sends SIGKILL on Unix. For a more graceful approach,
-            // the plugin should handle the socket being closed.
             if let Err(e) = self.child.start_kill() {
                 warn!(
                     plugin = %self.manifest.name,
@@ -109,7 +107,6 @@ pub struct ExternalPluginManager {
 
 impl ExternalPluginManager {
     pub fn new(config: ExternalPluginConfig) -> Self {
-        // Generate a random auth secret for this session
         let auth_secret = uuid::Uuid::new_v4().to_string();
 
         Self {
@@ -123,7 +120,6 @@ impl ExternalPluginManager {
     ///
     /// Returns the list of successfully started plugin manifests.
     pub async fn discover_and_start(&self) -> Vec<PluginManifest> {
-        // Ensure directories exist
         for dir in [
             &self.config.plugins_dir,
             &self.config.sockets_dir,
@@ -136,7 +132,6 @@ impl ExternalPluginManager {
             }
         }
 
-        // Scan for plugin binaries
         let binaries = match self.scan_plugins_dir().await {
             Ok(bins) => bins,
             Err(e) => {
@@ -191,7 +186,6 @@ impl ExternalPluginManager {
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
 
-            // Skip directories, hidden files, and non-executable files
             if path.is_dir() {
                 continue;
             }
@@ -203,7 +197,6 @@ impl ExternalPluginManager {
                 continue;
             }
 
-            // On Unix, check executable permission
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -216,7 +209,6 @@ impl ExternalPluginManager {
 
             #[cfg(not(unix))]
             {
-                // On non-Unix, accept any file
                 binaries.push(path);
             }
         }
@@ -241,7 +233,6 @@ impl ExternalPluginManager {
         // Remove stale socket
         let _ = tokio::fs::remove_file(&socket_path).await;
 
-        // Spawn the plugin process
         debug!(binary = %binary_name, "Spawning external plugin");
 
         let mut child = Command::new(binary_path)
@@ -258,7 +249,6 @@ impl ExternalPluginManager {
             .spawn()
             .map_err(|e| format!("Failed to spawn {}: {}", binary_name, e))?;
 
-        // Read handshake messages from stdout
         let stdout = child
             .stdout
             .take()
@@ -341,7 +331,6 @@ impl ExternalPluginManager {
             });
         }
 
-        // Extract UI assets if the plugin has them
         if has_ui {
             let ui_dir = self.config.ui_assets_dir.join(&manifest.name);
             debug!(
@@ -353,7 +342,6 @@ impl ExternalPluginManager {
 
         let result_manifest = manifest.clone();
 
-        // Store the process
         let process = ExternalPluginProcess {
             manifest,
             binary_path: binary_path.to_path_buf(),
@@ -381,8 +369,6 @@ impl ExternalPluginManager {
     }
 
     /// Create a PluginProxy for a given plugin name.
-    ///
-    /// Returns None if the plugin is not running.
     pub async fn proxy_for(&self, plugin_name: &str) -> Option<PluginProxy> {
         let plugins = self.plugins.read().await;
         plugins.get(plugin_name).map(|process| {

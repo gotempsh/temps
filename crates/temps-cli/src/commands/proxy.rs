@@ -240,12 +240,13 @@ impl ProxyCommand {
         rt.block_on(async { listener.start_listening().await })?;
 
         // Start project change listener
+        // Keep the listener alive on the stack so its Drop doesn't abort the background task
         info!("Starting project change listener...");
         let project_listener = temps_routes::ProjectChangeListener::new(
             self.database_url.clone(),
             route_table.clone(),
         );
-        rt.spawn(async move {
+        rt.block_on(async {
             if let Err(e) = project_listener.start_listening().await {
                 tracing::error!("Project change listener failed: {}", e);
             }

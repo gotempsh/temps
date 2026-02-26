@@ -4,19 +4,25 @@ import { useQuery } from '@tanstack/react-query'
 
 /**
  * Fetch the list of external plugin manifests from /api/x/plugins.
- * This endpoint returns an array of PluginManifest objects for all
- * running external plugins.
+ * Returns an empty array if the endpoint is unavailable (e.g., no plugins loaded).
  */
 async function fetchPluginManifests(): Promise<PluginManifest[]> {
-  const response = await client.get<PluginManifest[]>({
-    url: '/x/plugins',
-  })
-  return response.data ?? []
+  try {
+    const response = await client.get<PluginManifest[]>({
+      url: '/x/plugins',
+    })
+    return response.data ?? []
+  } catch {
+    // Endpoint may not exist if no external plugins are configured.
+    // Degrade gracefully — no plugins is the default.
+    return []
+  }
 }
 
 /**
  * React Query hook to get the list of external plugins.
  * Caches for 5 minutes since plugins rarely change at runtime.
+ * Never throws — returns an empty list on failure.
  */
 export function usePlugins() {
   return useQuery({
@@ -24,6 +30,6 @@ export function usePlugins() {
     queryFn: fetchPluginManifests,
     staleTime: 5 * 60 * 1000,
     gcTime: 10 * 60 * 1000,
-    retry: 1,
+    retry: false,
   })
 }
