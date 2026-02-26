@@ -57,6 +57,10 @@ pub fn configure_routes() -> Router<OtelAppState> {
         )
         .route("/otel/traces", get(query_handler::query_traces))
         .route(
+            "/otel/trace-summaries",
+            get(query_handler::query_trace_summaries),
+        )
+        .route(
             "/otel/traces/{project_id}/{trace_id}",
             get(query_handler::get_trace),
         )

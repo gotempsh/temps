@@ -1,12 +1,13 @@
 import {
   EnvironmentResponse,
   ProjectResponse,
-  SpanRecord,
   SpanStatusCode,
+  TraceSummary,
 } from '@/api/client'
 import {
   getEnvironmentsOptions,
-  queryTracesOptions,
+  getProjectDeploymentsOptions,
+  queryTraceSummariesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -22,7 +23,6 @@ import {
   Collapsible,
   CollapsibleContent,
 } from '@/components/ui/collapsible'
-import { CopyButton } from '@/components/ui/copy-button'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Input } from '@/components/ui/input'
 import {
@@ -66,37 +66,6 @@ interface TracesListProps {
 
 type TimeRange = '1h' | '6h' | '24h' | '7d' | '30d'
 
-/** Group spans by trace_id and pick a representative root span for each trace. */
-function groupByTrace(spans: SpanRecord[]) {
-  const traceMap = new Map<
-    string,
-    { root: SpanRecord; spanCount: number; errorCount: number }
-  >()
-
-  for (const span of spans) {
-    const existing = traceMap.get(span.trace_id)
-    if (!existing) {
-      traceMap.set(span.trace_id, {
-        root: span,
-        spanCount: 1,
-        errorCount: span.status_code === 'ERROR' ? 1 : 0,
-      })
-    } else {
-      existing.spanCount++
-      if (span.status_code === 'ERROR') existing.errorCount++
-      // Prefer the root span (no parent) or the longest span
-      if (
-        !span.parent_span_id ||
-        span.duration_ms > existing.root.duration_ms
-      ) {
-        existing.root = span
-      }
-    }
-  }
-
-  return Array.from(traceMap.values())
-}
-
 function statusBadge(status: SpanStatusCode) {
   switch (status) {
     case 'OK':
@@ -104,7 +73,7 @@ function statusBadge(status: SpanStatusCode) {
     case 'ERROR':
       return <Badge variant="destructive">Error</Badge>
     default:
-      return <Badge variant="secondary">Unset</Badge>
+      return null
   }
 }
 
@@ -143,7 +112,7 @@ function durationColor(ms: number): string {
   return 'text-red-600 dark:text-red-400'
 }
 
-const PAGE_SIZE = 50
+const PAGE_SIZE = 10
 
 // ── Setup Section ───────────────────────────────────────────────────
 
@@ -178,25 +147,14 @@ function OtelSetupSection({ project }: { project: ProjectResponse }) {
 
   const nextjsSetupCode = `// instrumentation.ts (project root)
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto'
-import { Resource } from '@opentelemetry/resources'
 import { NodeSDK } from '@opentelemetry/sdk-node'
 import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-node'
-import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions'
 
 export function register() {
-  const exporter = new OTLPTraceExporter({
-    url: '${otlpEndpoint}/traces',
-    headers: {
-      'Authorization': 'Bearer <YOUR_API_KEY>',
-    },
-  })
-
+  // OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME, and auth headers
+  // are auto-configured via environment variables on Temps deployments.
   const sdk = new NodeSDK({
-    resource: new Resource({
-      [ATTR_SERVICE_NAME]: '${project.name}',
-      [ATTR_SERVICE_VERSION]: '1.0.0',
-    }),
-    spanProcessors: [new BatchSpanProcessor(exporter)],
+    spanProcessors: [new BatchSpanProcessor(new OTLPTraceExporter())],
   })
 
   sdk.start()
@@ -212,13 +170,15 @@ const nextConfig = {
 
 module.exports = nextConfig`
 
-  const envVarsCode = `OTEL_EXPORTER_OTLP_ENDPOINT=${otlpEndpoint}
+  const envVarsCode = `# These are auto-injected on Temps deployments.
+# Only set manually for external hosting (Vercel, Netlify, etc.).
+OTEL_EXPORTER_OTLP_ENDPOINT=${otlpEndpoint}
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer <YOUR_API_KEY>"
 OTEL_SERVICE_NAME=${project.name}`
 
   const installCmd =
-    'npm install @opentelemetry/sdk-node @opentelemetry/sdk-trace-node @opentelemetry/exporter-trace-otlp-proto @opentelemetry/resources @opentelemetry/semantic-conventions'
+    'npm install @opentelemetry/sdk-node @opentelemetry/sdk-trace-node @opentelemetry/exporter-trace-otlp-proto'
 
   return (
     <Card>
@@ -228,44 +188,19 @@ OTEL_SERVICE_NAME=${project.name}`
           Setup OpenTelemetry
         </CardTitle>
         <CardDescription>
-          Send traces, metrics, and logs from your application to Temps via
-          OTLP.
+          Apps deployed on Temps get OpenTelemetry environment variables
+          automatically. Just add the SDK to start sending traces.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
-        {/* Environment selector + endpoint */}
-        <div className="space-y-3">
-          <div className="flex items-center gap-3">
-            <span className="text-sm font-medium shrink-0">
-              Environment:
-            </span>
-            <Select value={selectedEnvId} onValueChange={setSelectedEnvId}>
-              <SelectTrigger className="w-[200px]">
-                <SelectValue placeholder="Select environment" />
-              </SelectTrigger>
-              <SelectContent>
-                {environments?.map((env: EnvironmentResponse) => (
-                  <SelectItem key={env.id} value={String(env.id)}>
-                    {env.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="space-y-1.5">
-            <span className="text-sm font-medium">OTLP Endpoint</span>
-            <div className="flex items-center gap-2 rounded-md border bg-muted/50 px-3 py-2">
-              <code className="flex-1 text-sm font-mono break-all">
-                {otlpEndpoint}
-              </code>
-              <CopyButton value={otlpEndpoint} minimal />
-            </div>
-            <p className="text-xs text-muted-foreground">
-              The OTLP SDK appends <code>/traces</code>, <code>/metrics</code>,
-              and <code>/logs</code> automatically.
-            </p>
-          </div>
+        {/* Auto-injected note */}
+        <div className="rounded-md border border-green-200 bg-green-50 dark:border-green-900/50 dark:bg-green-900/10 p-3">
+          <p className="text-xs text-green-800 dark:text-green-200">
+            <strong>Deployed on Temps?</strong> The OTLP endpoint, auth token,
+            service name, and version are injected automatically on every
+            deployment. You only need to install the SDK and create the
+            instrumentation file below.
+          </p>
         </div>
 
         {/* Step 1: Install */}
@@ -298,26 +233,40 @@ OTEL_SERVICE_NAME=${project.name}`
           />
         </div>
 
-        {/* Alternative: env vars */}
+        {/* External hosting: manual env vars */}
         <div className="space-y-2">
           <h4 className="text-sm font-medium">
-            Alternative: Environment variables only
+            External hosting (Vercel, Netlify, etc.)
           </h4>
           <p className="text-xs text-muted-foreground">
-            If you use <code>@vercel/otel</code> or any OTLP-compatible SDK,
-            you can configure via environment variables instead:
+            If your app is <strong>not</strong> deployed on Temps, set these
+            environment variables manually:
           </p>
-          <CodeBlock code={envVarsCode} language="bash" title=".env" />
-        </div>
 
-        {/* Note about API key */}
-        <div className="rounded-md border border-yellow-200 bg-yellow-50 dark:border-yellow-900/50 dark:bg-yellow-900/10 p-3">
-          <p className="text-xs text-yellow-800 dark:text-yellow-200">
-            Replace <code>&lt;YOUR_API_KEY&gt;</code> with your Temps API key (
-            <code>tk_...</code>). You can create one in{' '}
-            <strong>Settings &rarr; API Keys</strong>. Deployment tokens (
-            <code>dt_...</code>) also work and don&apos;t need the project ID
-            header.
+          {/* Environment selector for endpoint */}
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-muted-foreground shrink-0">
+              Environment:
+            </span>
+            <Select value={selectedEnvId} onValueChange={setSelectedEnvId}>
+              <SelectTrigger className="w-[200px] h-8">
+                <SelectValue placeholder="Select environment" />
+              </SelectTrigger>
+              <SelectContent>
+                {environments?.map((env: EnvironmentResponse) => (
+                  <SelectItem key={env.id} value={String(env.id)}>
+                    {env.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <CodeBlock code={envVarsCode} language="bash" title=".env" />
+          <p className="text-xs text-muted-foreground">
+            Replace <code>&lt;YOUR_API_KEY&gt;</code> with a Temps API key (
+            <code>tk_...</code>) from{' '}
+            <strong>Settings &rarr; API Keys</strong>.
           </p>
         </div>
       </CardContent>
@@ -346,6 +295,12 @@ export default function TracesList({ project }: TracesListProps) {
   )
   const [search, setSearch] = useState(
     () => searchParams.get('q') || ''
+  )
+  const [environmentId, setEnvironmentId] = useState(
+    () => searchParams.get('env') || 'all'
+  )
+  const [deploymentId, setDeploymentId] = useState(
+    () => searchParams.get('deploy') || 'all'
   )
   const [page, setPage] = useState(() => {
     const p = searchParams.get('page')
@@ -376,6 +331,29 @@ export default function TracesList({ project }: TracesListProps) {
     return { startTime: start.toISOString(), endTime: now.toISOString() }
   }, [timeRange])
 
+  // Fetch environments for the filter dropdown
+  const { data: environments } = useQuery({
+    ...getEnvironmentsOptions({
+      path: { project_id: project.id },
+    }),
+    enabled: !!project.id,
+  })
+
+  // Fetch deployments for the selected environment (or all)
+  const { data: deploymentsData } = useQuery({
+    ...getProjectDeploymentsOptions({
+      path: { id: project.id },
+      query: {
+        environment_id:
+          environmentId !== 'all' ? Number(environmentId) : undefined,
+        per_page: 50,
+      },
+    }),
+    enabled: !!project.id,
+  })
+
+  const deployments = deploymentsData?.deployments
+
   // Sync state to URL
   useEffect(() => {
     const params = new URLSearchParams()
@@ -383,9 +361,11 @@ export default function TracesList({ project }: TracesListProps) {
     if (serviceName) params.set('service', serviceName)
     if (status !== 'all') params.set('status', status)
     if (search) params.set('q', search)
+    if (environmentId !== 'all') params.set('env', environmentId)
+    if (deploymentId !== 'all') params.set('deploy', deploymentId)
     if (page > 1) params.set('page', page.toString())
     setSearchParams(params, { replace: true })
-  }, [timeRange, serviceName, status, search, page, setSearchParams])
+  }, [timeRange, serviceName, status, search, environmentId, deploymentId, page, setSearchParams])
 
   // Breadcrumbs
   useEffect(() => {
@@ -396,9 +376,9 @@ export default function TracesList({ project }: TracesListProps) {
     ])
   }, [project.name, project.slug, setBreadcrumbs])
 
-  // Fetch spans
+  // Fetch trace summaries (one row per trace, server-side aggregation)
   const { data, isLoading, isFetching, refetch } = useQuery({
-    ...queryTracesOptions({
+    ...queryTraceSummariesOptions({
       query: {
         project_id: project.id,
         start_time: startTime,
@@ -406,25 +386,26 @@ export default function TracesList({ project }: TracesListProps) {
         service_name: serviceName || undefined,
         status: status !== 'all' ? status : undefined,
         trace_id: search || undefined,
-        limit: PAGE_SIZE * 3, // Fetch more to group by trace
+        environment_id:
+          environmentId !== 'all' ? Number(environmentId) : undefined,
+        deployment_id:
+          deploymentId !== 'all' ? Number(deploymentId) : undefined,
+        limit: PAGE_SIZE,
         offset: (page - 1) * PAGE_SIZE,
       },
     }),
   })
 
-  const traces = useMemo(() => {
-    if (!data?.data) return []
-    return groupByTrace(data.data)
-  }, [data])
+  const traces: TraceSummary[] = data?.data ?? []
+  const totalCount = data?.total ?? 0
+  const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE))
 
   // Extract unique service names for the filter dropdown
   const serviceNames = useMemo(() => {
-    if (!data?.data) return []
-    const names = new Set(data.data.map((s) => s.resource.service_name))
+    if (!traces.length) return []
+    const names = new Set(traces.map((t) => t.service_name))
     return Array.from(names).sort()
-  }, [data])
-
-  const totalCount = data?.count ?? 0
+  }, [traces])
 
   const handleTimeRangeChange = useCallback(
     (v: string) => {
@@ -447,11 +428,26 @@ export default function TracesList({ project }: TracesListProps) {
     },
     []
   )
+  const handleEnvironmentChange = useCallback(
+    (v: string) => {
+      setEnvironmentId(v)
+      setDeploymentId('all') // Reset deployment when environment changes
+      setPage(1)
+    },
+    []
+  )
+  const handleDeploymentChange = useCallback(
+    (v: string) => {
+      setDeploymentId(v)
+      setPage(1)
+    },
+    []
+  )
 
   return (
     <div className="space-y-4">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-2xl font-bold tracking-tight">Traces</h2>
           <p className="text-sm text-muted-foreground">
@@ -474,14 +470,14 @@ export default function TracesList({ project }: TracesListProps) {
             className="gap-2"
           >
             <Settings2 className="h-3.5 w-3.5" />
-            Setup
+            <span className="hidden sm:inline">Setup</span>
             <ChevronDown
               className={`h-3.5 w-3.5 transition-transform ${showSetup ? 'rotate-180' : ''}`}
             />
           </Button>
           {totalCount > 0 && (
             <span className="text-sm text-muted-foreground">
-              {totalCount.toLocaleString()} span{totalCount !== 1 ? 's' : ''}
+              {totalCount.toLocaleString()} trace{totalCount !== 1 ? 's' : ''}
             </span>
           )}
         </div>
@@ -520,9 +516,46 @@ export default function TracesList({ project }: TracesListProps) {
                 <SelectItem value="all">All Status</SelectItem>
                 <SelectItem value="OK">OK</SelectItem>
                 <SelectItem value="ERROR">Error</SelectItem>
-                <SelectItem value="UNSET">Unset</SelectItem>
               </SelectContent>
             </Select>
+
+            {environments && environments.length > 0 && (
+              <Select
+                value={environmentId}
+                onValueChange={handleEnvironmentChange}
+              >
+                <SelectTrigger className="w-[180px]">
+                  <SelectValue placeholder="Environment" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All Environments</SelectItem>
+                  {environments.map((env: EnvironmentResponse) => (
+                    <SelectItem key={env.id} value={String(env.id)}>
+                      {env.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+
+            {deployments && deployments.length > 0 && (
+              <Select
+                value={deploymentId}
+                onValueChange={handleDeploymentChange}
+              >
+                <SelectTrigger className="w-[180px]">
+                  <SelectValue placeholder="Deployment" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All Deployments</SelectItem>
+                  {deployments.map((d) => (
+                    <SelectItem key={d.id} value={String(d.id)}>
+                      #{d.id}{d.slug ? ` (${d.slug})` : ''}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
 
             {serviceNames.length > 0 && (
               <Select
@@ -571,12 +604,12 @@ export default function TracesList({ project }: TracesListProps) {
           icon={Workflow}
           title="No traces found"
           description={
-            search || serviceName || status !== 'all'
+            search || serviceName || status !== 'all' || environmentId !== 'all' || deploymentId !== 'all'
               ? 'Try adjusting your filters or time range.'
               : 'Traces will appear here once your application sends data via OpenTelemetry.'
           }
           action={
-            !search && !serviceName && status === 'all' && !showSetup ? (
+            !search && !serviceName && status === 'all' && environmentId === 'all' && deploymentId === 'all' && !showSetup ? (
               <Button
                 variant="outline"
                 size="sm"
@@ -591,12 +624,13 @@ export default function TracesList({ project }: TracesListProps) {
         />
       ) : (
         <>
-          <div className="rounded-md border">
+           <div className="rounded-md border">
             <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead className="w-[300px]">Trace</TableHead>
                   <TableHead>Service</TableHead>
+                  {environmentId === 'all' && <TableHead>Environment</TableHead>}
                   <TableHead>Kind</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead className="text-right">Duration</TableHead>
@@ -605,56 +639,67 @@ export default function TracesList({ project }: TracesListProps) {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {traces.map(({ root, spanCount, errorCount }) => (
+                {traces.map((trace) => (
                   <TableRow
-                    key={root.trace_id}
+                    key={trace.trace_id}
                     className="cursor-pointer hover:bg-muted/50"
-                    onClick={() => navigate(root.trace_id)}
+                    onClick={() => navigate(trace.trace_id)}
                   >
                     <TableCell>
                       <div className="flex flex-col gap-0.5">
                         <span className="font-medium truncate max-w-[280px]">
-                          {root.name}
+                          {trace.root_span_name}
                         </span>
                         <span className="text-xs text-muted-foreground font-mono truncate max-w-[280px]">
-                          {root.trace_id.slice(0, 16)}...
+                          {trace.trace_id.slice(0, 16)}...
                         </span>
                       </div>
                     </TableCell>
                     <TableCell>
                       <span className="text-sm">
-                        {root.resource.service_name}
+                        {trace.service_name}
                       </span>
                     </TableCell>
-                    <TableCell>{kindBadge(root.kind)}</TableCell>
+                    {environmentId === 'all' && (
+                      <TableCell>
+                        {trace.deployment_environment ? (
+                          <Badge variant="secondary" className="font-normal">
+                            {trace.deployment_environment}
+                          </Badge>
+                        ) : (
+                          <span className="text-xs text-muted-foreground">—</span>
+                        )}
+                      </TableCell>
+                    )}
+                    <TableCell>{kindBadge(trace.kind)}</TableCell>
                     <TableCell>
                       <div className="flex items-center gap-1.5">
-                        {errorCount > 0
+                        {trace.error_count > 0
                           ? statusBadge('ERROR')
-                          : statusBadge(root.status_code)}
-                        {errorCount > 0 && (
+                          : statusBadge('OK')}
+                        {trace.error_count > 0 && (
                           <span className="flex items-center text-xs text-destructive">
                             <AlertTriangle className="mr-0.5 h-3 w-3" />
-                            {errorCount}
+                            {trace.error_count}
                           </span>
                         )}
                       </div>
                     </TableCell>
                     <TableCell className="text-right">
                       <span
-                        className={`font-mono text-sm ${durationColor(root.duration_ms)}`}
+                        className={`font-mono text-sm ${durationColor(trace.duration_ms)}`}
                       >
-                        {formatDuration(root.duration_ms)}
+                        {formatDuration(trace.duration_ms)}
                       </span>
                     </TableCell>
                     <TableCell className="text-right">
                       <Badge variant="outline" className="font-mono">
-                        {spanCount}
+                        {trace.span_count}
                       </Badge>
                     </TableCell>
                     <TableCell className="text-right text-sm text-muted-foreground">
                       {format(
-                        new Date(root.start_time),
+                        new Date(trace.start_time),
                         'MMM d, HH:mm:ss.SSS'
                       )}
                     </TableCell>
@@ -667,7 +712,8 @@ export default function TracesList({ project }: TracesListProps) {
           {/* Pagination */}
           <div className="flex items-center justify-between">
             <div className="text-sm text-muted-foreground">
-              Showing {traces.length} trace{traces.length !== 1 ? 's' : ''}
+              Showing {(page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, totalCount)} of{' '}
+              {totalCount.toLocaleString()} trace{totalCount !== 1 ? 's' : ''}
             </div>
             <div className="flex items-center gap-1">
               <Button
@@ -679,13 +725,13 @@ export default function TracesList({ project }: TracesListProps) {
                 <ChevronLeft className="h-4 w-4" />
               </Button>
               <span className="px-3 text-sm text-muted-foreground">
-                Page {page}
+                Page {page} of {totalPages}
               </span>
               <Button
                 variant="outline"
                 size="sm"
                 onClick={() => setPage((p) => p + 1)}
-                disabled={traces.length < PAGE_SIZE}
+                disabled={page >= totalPages}
               >
                 <ChevronRight className="h-4 w-4" />
               </Button>

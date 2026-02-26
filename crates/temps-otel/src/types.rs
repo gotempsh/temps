@@ -184,6 +184,23 @@ pub struct SpanRecord {
     pub events: Vec<SpanEvent>,
 }
 
+/// A trace summary for the list view — one row per trace, aggregated from spans.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TraceSummary {
+    pub trace_id: String,
+    pub root_span_name: String,
+    pub service_name: String,
+    /// The deployment environment from the root span's resource attributes (e.g. "production").
+    pub deployment_environment: Option<String>,
+    pub kind: SpanKind,
+    pub status_code: SpanStatusCode,
+    #[schema(value_type = String, format = DateTime)]
+    pub start_time: DateTime<Utc>,
+    pub duration_ms: f64,
+    pub span_count: i64,
+    pub error_count: i64,
+}
+
 // ── Logs ─────────────────────────────────────────────────────────────
 
 /// Log severity level (simplified from OTel's 24 levels).
@@ -356,6 +373,10 @@ pub struct TraceQuery {
     pub min_duration_ms: Option<f64>,
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
+    /// Filter by environment ID (joins with deployments table).
+    pub environment_id: Option<i32>,
+    /// Filter by deployment ID (direct column on otel_spans).
+    pub deployment_id: Option<i32>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }

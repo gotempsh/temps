@@ -27,7 +27,6 @@ import {
   AlertCircle,
   CheckCircle2,
   XCircle,
-  Info,
   RefreshCw,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
@@ -102,7 +101,7 @@ function statusIcon(status?: string) {
     case 'OK':
       return <CheckCircle2 className="h-3.5 w-3.5 text-green-500" />
     default:
-      return <Info className="h-3.5 w-3.5 text-muted-foreground" />
+      return null
   }
 }
 
@@ -203,6 +202,13 @@ export default function TraceDetail({ project }: TraceDetailProps) {
     })
     return Array.from(set)
   }, [spans])
+
+  // Trace-level status: error if any span has ERROR, otherwise OK
+  const hasError = useMemo(
+    () => spans.some((s) => s.status_code?.toUpperCase() === 'ERROR'),
+    [spans]
+  )
+  const traceStatus = hasError ? 'ERROR' : 'OK'
 
   if (isLoading) {
     return (
@@ -323,9 +329,9 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           <CardContent className="p-4">
             <p className="text-xs text-muted-foreground mb-1">Status</p>
             <div className="flex items-center gap-2">
-              {statusIcon(rootSpan?.status_code)}
+              {statusIcon(traceStatus)}
               <span className="text-lg font-semibold">
-                {rootSpan?.status_code || 'Unset'}
+                {hasError ? 'Error' : 'OK'}
               </span>
             </div>
           </CardContent>
@@ -480,9 +486,12 @@ export default function TraceDetail({ project }: TraceDetailProps) {
                   <div className="space-y-2">
                     <div className="flex items-center gap-2">
                       {statusIcon(selectedSpan.status_code)}
-                      <Badge variant={statusBadgeVariant(selectedSpan.status_code)}>
-                        {selectedSpan.status_code || 'Unset'}
-                      </Badge>
+                      {selectedSpan.status_code?.toUpperCase() !== 'UNSET' &&
+                        selectedSpan.status_code && (
+                          <Badge variant={statusBadgeVariant(selectedSpan.status_code)}>
+                            {selectedSpan.status_code}
+                          </Badge>
+                        )}
                       <Badge variant="outline">
                         {kindLabel(selectedSpan.kind)}
                       </Badge>

@@ -5792,7 +5792,6 @@ export type PipelineStats = {
     metrics_stored: number;
     spans_dropped: number;
     spans_received: number;
-    spans_sampled_out: number;
     spans_stored: number;
 };
 
@@ -8035,6 +8034,30 @@ export type TodayStatsResponse = {
 
 export type TokenRenewalRequest = {
     refresh_token: string;
+};
+
+export type TraceSummariesResponse = {
+    data: Array<TraceSummary>;
+    total: number;
+};
+
+/**
+ * A trace summary for the list view — one row per trace, aggregated from spans.
+ */
+export type TraceSummary = {
+    /**
+     * The deployment environment from the root span's resource attributes (e.g. "production").
+     */
+    deployment_environment?: string | null;
+    duration_ms: number;
+    error_count: number;
+    kind: SpanKind;
+    root_span_name: string;
+    service_name: string;
+    span_count: number;
+    start_time: string;
+    status_code: SpanStatusCode;
+    trace_id: string;
 };
 
 export type TracesResponse = {
@@ -18033,6 +18056,84 @@ export type GetQuotaResponses = {
 
 export type GetQuotaResponse = GetQuotaResponses[keyof GetQuotaResponses];
 
+export type QueryTraceSummariesData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Filter by trace ID
+         */
+        trace_id?: string;
+        /**
+         * Filter by service name
+         */
+        service_name?: string;
+        /**
+         * Filter by status (OK, ERROR)
+         */
+        status?: string;
+        /**
+         * Minimum trace duration in ms
+         */
+        min_duration_ms?: number;
+        /**
+         * Start time (RFC 3339)
+         */
+        start_time?: string;
+        /**
+         * End time (RFC 3339)
+         */
+        end_time?: string;
+        /**
+         * Filter by environment ID
+         */
+        environment_id?: number;
+        /**
+         * Filter by deployment ID
+         */
+        deployment_id?: number;
+        /**
+         * Max traces to return (default: 50, max: 100)
+         */
+        limit?: number;
+        /**
+         * Offset for pagination
+         */
+        offset?: number;
+    };
+    url: '/otel/trace-summaries';
+};
+
+export type QueryTraceSummariesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type QueryTraceSummariesError = QueryTraceSummariesErrors[keyof QueryTraceSummariesErrors];
+
+export type QueryTraceSummariesResponses = {
+    /**
+     * Trace summaries
+     */
+    200: TraceSummariesResponse;
+};
+
+export type QueryTraceSummariesResponse = QueryTraceSummariesResponses[keyof QueryTraceSummariesResponses];
+
 export type QueryTracesData = {
     body?: never;
     path?: never;
@@ -18065,6 +18166,14 @@ export type QueryTracesData = {
          * End time (RFC 3339)
          */
         end_time?: string;
+        /**
+         * Filter by environment ID
+         */
+        environment_id?: number;
+        /**
+         * Filter by deployment ID
+         */
+        deployment_id?: number;
         /**
          * Max spans to return (default: 100, max: 1000)
          */
@@ -18265,6 +18374,171 @@ export type IngestTracesErrors = {
 export type IngestTracesError = IngestTracesErrors[keyof IngestTracesErrors];
 
 export type IngestTracesResponses = {
+    /**
+     * Traces accepted (OTLP protobuf response)
+     */
+    200: unknown;
+};
+
+export type IngestLogsByPathData = {
+    /**
+     * OTLP ExportLogsServiceRequest (protobuf, optionally gzip/zstd compressed)
+     */
+    body: string;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+    };
+    query?: never;
+    url: '/otel/v1/{project_id}/{environment_id}/{deployment_id}/logs';
+};
+
+export type IngestLogsByPathErrors = {
+    /**
+     * Invalid payload
+     */
+    400: ProblemDetails;
+    /**
+     * Missing or invalid API key
+     */
+    401: ProblemDetails;
+    /**
+     * Storage quota exceeded
+     */
+    413: ProblemDetails;
+    /**
+     * Rate limit exceeded
+     */
+    429: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type IngestLogsByPathError = IngestLogsByPathErrors[keyof IngestLogsByPathErrors];
+
+export type IngestLogsByPathResponses = {
+    /**
+     * Logs accepted (OTLP protobuf response)
+     */
+    200: unknown;
+};
+
+export type IngestMetricsByPathData = {
+    /**
+     * OTLP ExportMetricsServiceRequest (protobuf, optionally gzip/zstd compressed)
+     */
+    body: string;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+    };
+    query?: never;
+    url: '/otel/v1/{project_id}/{environment_id}/{deployment_id}/metrics';
+};
+
+export type IngestMetricsByPathErrors = {
+    /**
+     * Invalid payload
+     */
+    400: ProblemDetails;
+    /**
+     * Missing or invalid API key
+     */
+    401: ProblemDetails;
+    /**
+     * Storage quota exceeded
+     */
+    413: ProblemDetails;
+    /**
+     * Rate limit exceeded
+     */
+    429: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type IngestMetricsByPathError = IngestMetricsByPathErrors[keyof IngestMetricsByPathErrors];
+
+export type IngestMetricsByPathResponses = {
+    /**
+     * Metrics accepted (OTLP protobuf response)
+     */
+    200: unknown;
+};
+
+export type IngestTracesByPathData = {
+    /**
+     * OTLP ExportTraceServiceRequest (protobuf, optionally gzip/zstd compressed)
+     */
+    body: string;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+    };
+    query?: never;
+    url: '/otel/v1/{project_id}/{environment_id}/{deployment_id}/traces';
+};
+
+export type IngestTracesByPathErrors = {
+    /**
+     * Invalid payload
+     */
+    400: ProblemDetails;
+    /**
+     * Missing or invalid API key
+     */
+    401: ProblemDetails;
+    /**
+     * Storage quota exceeded
+     */
+    413: ProblemDetails;
+    /**
+     * Rate limit exceeded
+     */
+    429: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type IngestTracesByPathError = IngestTracesByPathErrors[keyof IngestTracesByPathErrors];
+
+export type IngestTracesByPathResponses = {
     /**
      * Traces accepted (OTLP protobuf response)
      */

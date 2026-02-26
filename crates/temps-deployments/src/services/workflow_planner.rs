@@ -63,6 +63,12 @@ impl WorkflowPlanner {
     ///    - `NEXT_PUBLIC_SENTRY_DSN` is added when preset is Next.js
     ///    - `VITE_PUBLIC_SENTRY_DSN` is added when preset is Vite
     /// 4. Deployment token environment variables (TEMPS_API_URL and TEMPS_API_TOKEN) - for API access from deployed apps
+    /// 5. OpenTelemetry environment variables for automatic instrumentation:
+    ///    - `OTEL_EXPORTER_OTLP_ENDPOINT` - OTLP endpoint URL
+    ///    - `OTEL_EXPORTER_OTLP_PROTOCOL` - always `http/protobuf`
+    ///    - `OTEL_EXPORTER_OTLP_HEADERS` - auth header with deployment token
+    ///    - `OTEL_SERVICE_NAME` - project name
+    ///    - `OTEL_SERVICE_VERSION` - commit SHA (when available)
     ///
     /// IMPORTANT: If any external service fails to provide env vars, the entire deployment will fail
     /// with a meaningful error message. This prevents silent failures where containers would be
@@ -308,6 +314,42 @@ impl WorkflowPlanner {
                     e
                 );
             }
+        }
+
+        // 5. OpenTelemetry environment variables for automatic instrumentation
+        // Standard OTel SDK env vars so deployed apps can send traces/metrics/logs
+        // without any manual configuration. Uses the same deployment token for auth.
+        // See: https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/
+        if let Some(api_url) = env_vars_map.get("TEMPS_API_URL").cloned() {
+            // TEMPS_API_URL is "{base}/api", OTLP endpoint is "{base}/api/otel"
+            env_vars_map.insert(
+                "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+                format!("{}/otel", api_url),
+            );
+            env_vars_map.insert(
+                "OTEL_EXPORTER_OTLP_PROTOCOL".to_string(),
+                "http/protobuf".to_string(),
+            );
+
+            // Auth header using the deployment token (already in TEMPS_API_TOKEN)
+            if let Some(token) = env_vars_map.get("TEMPS_API_TOKEN").cloned() {
+                env_vars_map.insert(
+                    "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
+                    format!("Authorization=Bearer {}", token),
+                );
+            }
+
+            env_vars_map.insert("OTEL_SERVICE_NAME".to_string(), project.name.clone());
+
+            // Use commit SHA as service version when available
+            if let Some(ref commit_sha) = deployment.commit_sha {
+                env_vars_map.insert("OTEL_SERVICE_VERSION".to_string(), commit_sha.clone());
+            }
+
+            debug!(
+                "Set OTEL_EXPORTER_OTLP_ENDPOINT for project {} environment {}",
+                project.id, environment.id
+            );
         }
 
         info!(

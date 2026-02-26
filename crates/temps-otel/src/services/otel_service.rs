@@ -223,6 +223,17 @@ impl OtelService {
         self.storage.query_spans(query).await
     }
 
+    pub async fn query_trace_summaries(
+        &self,
+        query: TraceQuery,
+    ) -> Result<Vec<TraceSummary>, OtelError> {
+        self.storage.query_trace_summaries(query).await
+    }
+
+    pub async fn count_traces(&self, query: TraceQuery) -> Result<u64, OtelError> {
+        self.storage.count_traces(query).await
+    }
+
     pub async fn get_trace(
         &self,
         project_id: i32,

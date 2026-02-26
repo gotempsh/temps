@@ -293,6 +293,141 @@ impl OtelStorage for MockOtelStorage {
         Ok(vec![])
     }
 
+    async fn query_trace_summaries(&self, query: TraceQuery) -> StorageResult<Vec<TraceSummary>> {
+        let spans = self.spans.lock().unwrap();
+
+        // Group spans by trace_id, applying the same filters as query_spans
+        let mut trace_map: std::collections::HashMap<String, (Vec<&SpanRecord>, i64)> =
+            std::collections::HashMap::new();
+
+        for span in spans.iter() {
+            if span.project_id != query.project_id {
+                continue;
+            }
+            if let Some(ref tid) = query.trace_id {
+                if span.trace_id != *tid {
+                    continue;
+                }
+            }
+            if let Some(ref svc) = query.service_name {
+                if span.resource.service_name != *svc {
+                    continue;
+                }
+            }
+            if let Some(min_dur) = query.min_duration_ms {
+                if span.duration_ms < min_dur {
+                    continue;
+                }
+            }
+            trace_map
+                .entry(span.trace_id.clone())
+                .or_insert_with(|| (vec![], 0))
+                .0
+                .push(span);
+        }
+
+        // Apply status filter at trace level
+        let mut summaries: Vec<TraceSummary> = trace_map
+            .into_iter()
+            .filter_map(|(trace_id, (spans_in_trace, _))| {
+                let error_count = spans_in_trace
+                    .iter()
+                    .filter(|s| s.status_code == SpanStatusCode::Error)
+                    .count() as i64;
+
+                // Status filter: ERROR = traces with errors, OK = traces without
+                match query.status {
+                    Some(SpanStatusCode::Error) if error_count == 0 => return None,
+                    Some(SpanStatusCode::Ok) if error_count > 0 => return None,
+                    _ => {}
+                }
+
+                // Pick root span (no parent) or longest span
+                let root = spans_in_trace
+                    .iter()
+                    .filter(|s| s.parent_span_id.is_none())
+                    .max_by(|a, b| a.duration_ms.partial_cmp(&b.duration_ms).unwrap())
+                    .or_else(|| {
+                        spans_in_trace
+                            .iter()
+                            .max_by(|a, b| a.duration_ms.partial_cmp(&b.duration_ms).unwrap())
+                    })?;
+
+                let status_code = if error_count > 0 {
+                    SpanStatusCode::Error
+                } else {
+                    SpanStatusCode::Ok
+                };
+
+                Some(TraceSummary {
+                    trace_id,
+                    root_span_name: root.name.clone(),
+                    service_name: root.resource.service_name.clone(),
+                    deployment_environment: root.resource.deployment_environment.clone(),
+                    kind: root.kind,
+                    status_code,
+                    start_time: root.start_time,
+                    duration_ms: root.duration_ms,
+                    span_count: spans_in_trace.len() as i64,
+                    error_count,
+                })
+            })
+            .collect();
+
+        // Sort by start_time descending
+        summaries.sort_by(|a, b| b.start_time.cmp(&a.start_time));
+
+        // Apply pagination
+        let offset = query.offset.unwrap_or(0) as usize;
+        let limit = query.limit.unwrap_or(50).min(100) as usize;
+        let paged = summaries.into_iter().skip(offset).take(limit).collect();
+
+        Ok(paged)
+    }
+
+    async fn count_traces(&self, query: TraceQuery) -> StorageResult<u64> {
+        let spans = self.spans.lock().unwrap();
+
+        let mut trace_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut trace_errors: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+
+        for span in spans.iter() {
+            if span.project_id != query.project_id {
+                continue;
+            }
+            if let Some(ref tid) = query.trace_id {
+                if span.trace_id != *tid {
+                    continue;
+                }
+            }
+            if let Some(ref svc) = query.service_name {
+                if span.resource.service_name != *svc {
+                    continue;
+                }
+            }
+            trace_ids.insert(span.trace_id.clone());
+            if span.status_code == SpanStatusCode::Error {
+                trace_errors.insert(span.trace_id.clone(), true);
+            }
+        }
+
+        // Apply status filter at trace level
+        let count = match query.status {
+            Some(SpanStatusCode::Error) => trace_ids
+                .iter()
+                .filter(|tid| trace_errors.contains_key(*tid))
+                .count(),
+            Some(SpanStatusCode::Ok) => trace_ids
+                .iter()
+                .filter(|tid| !trace_errors.contains_key(*tid))
+                .count(),
+            _ => trace_ids.len(),
+        };
+
+        Ok(count as u64)
+    }
+
     async fn apply_retention(&self, _project_id: i32) -> StorageResult<u64> {
         Ok(0)
     }

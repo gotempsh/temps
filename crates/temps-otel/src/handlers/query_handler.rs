@@ -39,6 +39,8 @@ pub struct TraceQueryParams {
     pub min_duration_ms: Option<f64>,
     pub start_time: Option<String>,
     pub end_time: Option<String>,
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }
@@ -85,6 +87,12 @@ pub struct MetricNamesResponse {
 pub struct TracesResponse {
     pub data: Vec<SpanRecord>,
     pub count: usize,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TraceSummariesResponse {
+    pub data: Vec<TraceSummary>,
+    pub total: u64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -209,6 +217,8 @@ pub async fn list_metric_names(
         ("min_duration_ms" = Option<f64>, Query, description = "Minimum span duration in ms"),
         ("start_time" = Option<String>, Query, description = "Start time (RFC 3339)"),
         ("end_time" = Option<String>, Query, description = "End time (RFC 3339)"),
+        ("environment_id" = Option<i32>, Query, description = "Filter by environment ID"),
+        ("deployment_id" = Option<i32>, Query, description = "Filter by deployment ID"),
         ("limit" = Option<u64>, Query, description = "Max spans to return (default: 100, max: 1000)"),
         ("offset" = Option<u64>, Query, description = "Offset for pagination"),
     ),
@@ -241,6 +251,8 @@ pub async fn query_traces(
         min_duration_ms: params.min_duration_ms,
         start_time: params.start_time.as_deref().and_then(parse_datetime),
         end_time: params.end_time.as_deref().and_then(parse_datetime),
+        environment_id: params.environment_id,
+        deployment_id: params.deployment_id,
         limit: params.limit,
         offset: params.offset,
     };
@@ -249,6 +261,73 @@ pub async fn query_traces(
     let count = data.len();
 
     Ok(Json(TracesResponse { data, count }))
+}
+
+/// Query trace summaries — one row per trace with span count, error count,
+/// root span info, and proper trace-level pagination.
+#[utoipa::path(
+    tag = "OTel",
+    get,
+    path = "/otel/trace-summaries",
+    params(
+        ("project_id" = i32, Query, description = "Project ID"),
+        ("trace_id" = Option<String>, Query, description = "Filter by trace ID"),
+        ("service_name" = Option<String>, Query, description = "Filter by service name"),
+        ("status" = Option<String>, Query, description = "Filter by status (OK, ERROR)"),
+        ("min_duration_ms" = Option<f64>, Query, description = "Minimum trace duration in ms"),
+        ("start_time" = Option<String>, Query, description = "Start time (RFC 3339)"),
+        ("end_time" = Option<String>, Query, description = "End time (RFC 3339)"),
+        ("environment_id" = Option<i32>, Query, description = "Filter by environment ID"),
+        ("deployment_id" = Option<i32>, Query, description = "Filter by deployment ID"),
+        ("limit" = Option<u64>, Query, description = "Max traces to return (default: 50, max: 100)"),
+        ("offset" = Option<u64>, Query, description = "Offset for pagination"),
+    ),
+    responses(
+        (status = 200, description = "Trace summaries", body = TraceSummariesResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn query_trace_summaries(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Query(params): Query<TraceQueryParams>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+
+    let status = params.status.as_deref().map(|s| match s {
+        "OK" | "ok" => SpanStatusCode::Ok,
+        "ERROR" | "error" => SpanStatusCode::Error,
+        _ => SpanStatusCode::Unset,
+    });
+
+    let query = TraceQuery {
+        project_id: params.project_id,
+        trace_id: params.trace_id,
+        service_name: params.service_name,
+        status,
+        min_duration_ms: params.min_duration_ms,
+        start_time: params.start_time.as_deref().and_then(parse_datetime),
+        end_time: params.end_time.as_deref().and_then(parse_datetime),
+        environment_id: params.environment_id,
+        deployment_id: params.deployment_id,
+        limit: params.limit,
+        offset: params.offset,
+    };
+
+    // Clone query for the count call (which ignores limit/offset)
+    let count_query = TraceQuery {
+        limit: None,
+        offset: None,
+        ..query.clone()
+    };
+
+    let data = state.otel_service.query_trace_summaries(query).await?;
+    let total = state.otel_service.count_traces(count_query).await?;
+
+    Ok(Json(TraceSummariesResponse { data, total }))
 }
 
 /// Get all spans for a specific trace.

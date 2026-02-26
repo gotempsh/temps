@@ -596,6 +596,19 @@ impl OtelStorage for TimescaleDbStorage {
             values.push(end.into());
             param_idx += 1;
         }
+        if let Some(deployment_id) = query.deployment_id {
+            where_clauses.push(format!("deployment_id = ${}", param_idx));
+            values.push(deployment_id.into());
+            param_idx += 1;
+        }
+        if let Some(environment_id) = query.environment_id {
+            where_clauses.push(format!(
+                "deployment_id IN (SELECT id FROM deployments WHERE environment_id = ${})",
+                param_idx
+            ));
+            values.push(environment_id.into());
+            param_idx += 1;
+        }
 
         let where_sql = where_clauses.join(" AND ");
 
@@ -630,6 +643,223 @@ impl OtelStorage for TimescaleDbStorage {
             .collect();
 
         Ok(spans)
+    }
+
+    async fn query_trace_summaries(&self, query: TraceQuery) -> StorageResult<Vec<TraceSummary>> {
+        let limit = query.limit.unwrap_or(50).min(100);
+        let offset = query.offset.unwrap_or(0);
+
+        let mut where_clauses = vec!["project_id = $1".to_string()];
+        let mut values: Vec<sea_orm::Value> = vec![query.project_id.into()];
+        let mut param_idx = 2u32;
+
+        if let Some(ref tid) = query.trace_id {
+            where_clauses.push(format!("trace_id = ${}", param_idx));
+            values.push(tid.clone().into());
+            param_idx += 1;
+        }
+        if let Some(ref svc) = query.service_name {
+            where_clauses.push(format!("service_name = ${}", param_idx));
+            values.push(svc.clone().into());
+            param_idx += 1;
+        }
+        if let Some(min_dur) = query.min_duration_ms {
+            where_clauses.push(format!("duration_ms >= ${}", param_idx));
+            values.push(min_dur.into());
+            param_idx += 1;
+        }
+        if let Some(start) = query.start_time {
+            where_clauses.push(format!("start_time >= ${}", param_idx));
+            values.push(start.into());
+            param_idx += 1;
+        }
+        if let Some(end) = query.end_time {
+            where_clauses.push(format!("start_time <= ${}", param_idx));
+            values.push(end.into());
+            param_idx += 1;
+        }
+        if let Some(deployment_id) = query.deployment_id {
+            where_clauses.push(format!("deployment_id = ${}", param_idx));
+            values.push(deployment_id.into());
+            param_idx += 1;
+        }
+        if let Some(environment_id) = query.environment_id {
+            where_clauses.push(format!(
+                "deployment_id IN (SELECT id FROM deployments WHERE environment_id = ${})",
+                param_idx
+            ));
+            values.push(environment_id.into());
+            param_idx += 1;
+        }
+
+        // status filter: if ERROR, find traces that have at least one error span
+        // if OK, find traces with no error spans
+        let status_having = match query.status {
+            Some(crate::types::SpanStatusCode::Error) => {
+                "HAVING COUNT(*) FILTER (WHERE status_code = 'ERROR') > 0"
+            }
+            Some(crate::types::SpanStatusCode::Ok) => {
+                "HAVING COUNT(*) FILTER (WHERE status_code = 'ERROR') = 0"
+            }
+            _ => "",
+        };
+
+        let where_sql = where_clauses.join(" AND ");
+
+        // Aggregate per trace_id: pick root span (NULL parent) or longest span,
+        // count total spans and error spans, compute trace duration.
+        let sql = format!(
+            r#"
+            SELECT
+                trace_id,
+                (array_agg(name ORDER BY
+                    CASE WHEN parent_span_id IS NULL THEN 0 ELSE 1 END,
+                    duration_ms DESC
+                ))[1] AS root_span_name,
+                (array_agg(service_name ORDER BY
+                    CASE WHEN parent_span_id IS NULL THEN 0 ELSE 1 END,
+                    duration_ms DESC
+                ))[1] AS service_name,
+                (array_agg(kind ORDER BY
+                    CASE WHEN parent_span_id IS NULL THEN 0 ELSE 1 END,
+                    duration_ms DESC
+                ))[1] AS kind,
+                (array_agg(deployment_environment ORDER BY
+                    CASE WHEN parent_span_id IS NULL THEN 0 ELSE 1 END,
+                    duration_ms DESC
+                ))[1] AS deployment_environment,
+                MIN(start_time) AS start_time,
+                MAX(duration_ms) AS duration_ms,
+                COUNT(*)::bigint AS span_count,
+                COUNT(*) FILTER (WHERE status_code = 'ERROR')::bigint AS error_count
+            FROM otel_spans
+            WHERE {where_sql}
+            GROUP BY trace_id
+            {status_having}
+            ORDER BY MIN(start_time) DESC
+            LIMIT ${param_idx} OFFSET ${next_param}
+            "#,
+            next_param = param_idx + 1
+        );
+        values.push((limit as i64).into());
+        values.push((offset as i64).into());
+
+        let results = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await?;
+
+        let summaries = results
+            .iter()
+            .filter_map(|row| {
+                let trace_id: String = row.try_get("", "trace_id").ok()?;
+                let root_span_name: String = row.try_get("", "root_span_name").ok()?;
+                let service_name: String = row.try_get("", "service_name").ok()?;
+                let kind_str: String = row.try_get("", "kind").ok()?;
+                let deployment_environment: Option<String> =
+                    row.try_get("", "deployment_environment").ok().flatten();
+                let start_time: DateTime<Utc> = row.try_get("", "start_time").ok()?;
+                let duration_ms: f64 = row.try_get("", "duration_ms").ok()?;
+                let span_count: i64 = row.try_get("", "span_count").ok()?;
+                let error_count: i64 = row.try_get("", "error_count").ok()?;
+
+                let kind = match kind_str.as_str() {
+                    "Server" => crate::types::SpanKind::Server,
+                    "Client" => crate::types::SpanKind::Client,
+                    "Producer" => crate::types::SpanKind::Producer,
+                    "Consumer" => crate::types::SpanKind::Consumer,
+                    "Internal" => crate::types::SpanKind::Internal,
+                    _ => crate::types::SpanKind::Internal,
+                };
+
+                let status_code = if error_count > 0 {
+                    crate::types::SpanStatusCode::Error
+                } else {
+                    crate::types::SpanStatusCode::Ok
+                };
+
+                Some(TraceSummary {
+                    trace_id,
+                    root_span_name,
+                    service_name,
+                    deployment_environment,
+                    kind,
+                    status_code,
+                    start_time,
+                    duration_ms,
+                    span_count,
+                    error_count,
+                })
+            })
+            .collect();
+
+        Ok(summaries)
+    }
+
+    async fn count_traces(&self, query: TraceQuery) -> StorageResult<u64> {
+        let mut where_clauses = vec!["project_id = $1".to_string()];
+        let mut values: Vec<sea_orm::Value> = vec![query.project_id.into()];
+        let mut param_idx = 2u32;
+
+        if let Some(ref tid) = query.trace_id {
+            where_clauses.push(format!("trace_id = ${}", param_idx));
+            values.push(tid.clone().into());
+            param_idx += 1;
+        }
+        if let Some(ref svc) = query.service_name {
+            where_clauses.push(format!("service_name = ${}", param_idx));
+            values.push(svc.clone().into());
+            param_idx += 1;
+        }
+        if let Some(start) = query.start_time {
+            where_clauses.push(format!("start_time >= ${}", param_idx));
+            values.push(start.into());
+            param_idx += 1;
+        }
+        if let Some(end) = query.end_time {
+            where_clauses.push(format!("start_time <= ${}", param_idx));
+            values.push(end.into());
+            param_idx += 1;
+        }
+        if let Some(deployment_id) = query.deployment_id {
+            where_clauses.push(format!("deployment_id = ${}", param_idx));
+            values.push(deployment_id.into());
+            param_idx += 1;
+        }
+        if let Some(environment_id) = query.environment_id {
+            where_clauses.push(format!(
+                "deployment_id IN (SELECT id FROM deployments WHERE environment_id = ${})",
+                param_idx
+            ));
+            values.push(environment_id.into());
+            let _ = param_idx;
+        }
+
+        let where_sql = where_clauses.join(" AND ");
+
+        let sql = format!(
+            "SELECT COUNT(DISTINCT trace_id)::bigint AS cnt FROM otel_spans WHERE {where_sql}"
+        );
+
+        let result = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await?;
+
+        if let Some(row) = result {
+            let cnt: i64 = row.try_get("", "cnt").unwrap_or(0);
+            Ok(cnt as u64)
+        } else {
+            Ok(0)
+        }
     }
 
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>> {

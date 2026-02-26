@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use crate::error::OtelError;
 use crate::types::{
     HealthSummary, Insight, InsightStatus, LogQuery, LogRecord, MetricBucket, MetricPoint,
-    MetricQuery, SpanRecord, StorageQuota, TraceQuery,
+    MetricQuery, SpanRecord, StorageQuota, TraceQuery, TraceSummary,
 };
 
 /// Result type for storage operations.
@@ -68,6 +68,14 @@ pub trait OtelStorage: Send + Sync {
 
     /// Query trace spans matching the given filters.
     async fn query_spans(&self, query: TraceQuery) -> StorageResult<Vec<SpanRecord>>;
+
+    /// Query trace summaries for the list view — one row per trace with
+    /// span count, error count, and root span info. Pagination applies
+    /// to traces (not individual spans).
+    async fn query_trace_summaries(&self, query: TraceQuery) -> StorageResult<Vec<TraceSummary>>;
+
+    /// Count distinct traces matching the given filters (for pagination).
+    async fn count_traces(&self, query: TraceQuery) -> StorageResult<u64>;
 
     /// Get all spans for a single trace ID.
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>>;
