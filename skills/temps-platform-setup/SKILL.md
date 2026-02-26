@@ -48,7 +48,7 @@ Complete guide for installing and managing the Temps self-hosted deployment plat
 
 ```bash
 # Download and install Temps binary
-curl -fsSL https://temps.sh/deploy.sh | sh
+curl -fsSL https://temps.sh/deploy.sh | bash
 
 # Reload shell configuration
 source ~/.zshrc  # or ~/.bashrc for bash users

@@ -419,7 +419,7 @@ export type AvailableContainerInfo = {
      */
     exposed_ports?: Array<number>;
     /**
-     * Docker image name (e.g., "postgres:18-alpine")
+     * Docker image name (e.g., "gotempsh/postgres-walg:18-bookworm")
      */
     image: string;
     /**
@@ -720,6 +720,48 @@ export type ConnectionResponse = {
 export type ConnectionTestResult = {
     message: string;
     success: boolean;
+};
+
+/**
+ * Payload for server-side event ingestion via the console API.
+ *
+ * The app backend reads the encrypted `_temps_visitor_id` and `_temps_sid`
+ * cookie values from the user's request and forwards them here.
+ * Temps decrypts them server-side to resolve visitor/session identity.
+ */
+export type ConsoleEventPayload = {
+    /**
+     * Deployment ID to attribute the event to
+     */
+    deployment_id: number;
+    /**
+     * Environment ID to attribute the event to
+     */
+    environment_id: number;
+    /**
+     * Arbitrary JSON event data
+     */
+    event_data?: unknown;
+    /**
+     * Event name (e.g. "purchase", "signup", custom event names)
+     */
+    event_name: string;
+    /**
+     * Page path context (defaults to "/")
+     */
+    request_path?: string;
+    /**
+     * Query string context
+     */
+    request_query?: string;
+    /**
+     * Encrypted `_temps_sid` cookie value from the user's browser
+     */
+    session_id?: string | null;
+    /**
+     * Encrypted `_temps_visitor_id` cookie value from the user's browser
+     */
+    visitor_id?: string | null;
 };
 
 /**
@@ -8017,7 +8059,7 @@ export type UpdateErrorGroupRequest = {
 
 export type UpdateExternalServiceRequest = {
     /**
-     * Docker image to use for the service (e.g., "postgres:18-alpine", "timescale/timescaledb-ha:pg18")
+     * Docker image to use for the service (e.g., "gotempsh/postgres-walg:18-bookworm", "timescale/timescaledb-ha:pg18")
      * When provided, the service will be recreated with the new image while preserving data
      */
     docker_image?: string | null;
@@ -8063,7 +8105,7 @@ export type UpdateIpAccessControlRequest = {
  */
 export type UpdateKvRequest = {
     /**
-     * Docker image to use (e.g., "redis:8-alpine", "redis:8-alpine")
+     * Docker image to use (e.g., "gotempsh/redis-walg:8-bookworm")
      */
     docker_image?: string | null;
 };
@@ -8236,7 +8278,7 @@ export type UpdateWebhookRequestBody = {
 
 export type UpgradeExternalServiceRequest = {
     /**
-     * Docker image to upgrade to (e.g., "postgres:18-alpine")
+     * Docker image to upgrade to (e.g., "gotempsh/postgres-walg:18-bookworm")
      * This will trigger pg_upgrade for PostgreSQL or equivalent upgrade procedures for other services
      */
     docker_image: string;
@@ -16021,10 +16063,20 @@ export type ListIpAccessControlData = {
 
 export type ListIpAccessControlErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type ListIpAccessControlError = ListIpAccessControlErrors[keyof ListIpAccessControlErrors];
 
 export type ListIpAccessControlResponses = {
     /**
@@ -16046,16 +16098,26 @@ export type CreateIpAccessControlErrors = {
     /**
      * Invalid request
      */
-    400: unknown;
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * Duplicate IP address
      */
-    409: unknown;
+    409: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type CreateIpAccessControlError = CreateIpAccessControlErrors[keyof CreateIpAccessControlErrors];
 
 export type CreateIpAccessControlResponses = {
     /**
@@ -16080,10 +16142,20 @@ export type CheckIpBlockedData = {
 
 export type CheckIpBlockedErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type CheckIpBlockedError = CheckIpBlockedErrors[keyof CheckIpBlockedErrors];
 
 export type CheckIpBlockedResponses = {
     /**
@@ -16106,14 +16178,24 @@ export type DeleteIpAccessControlData = {
 
 export type DeleteIpAccessControlErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * IP access control rule not found
      */
-    404: unknown;
+    404: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type DeleteIpAccessControlError = DeleteIpAccessControlErrors[keyof DeleteIpAccessControlErrors];
 
 export type DeleteIpAccessControlResponses = {
     /**
@@ -16138,14 +16220,24 @@ export type GetIpAccessControlData = {
 
 export type GetIpAccessControlErrors = {
     /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
      * IP access control rule not found
      */
-    404: unknown;
+    404: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type GetIpAccessControlError = GetIpAccessControlErrors[keyof GetIpAccessControlErrors];
 
 export type GetIpAccessControlResponses = {
     /**
@@ -16172,16 +16264,26 @@ export type UpdateIpAccessControlErrors = {
     /**
      * Invalid request
      */
-    400: unknown;
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
     /**
      * IP access control rule not found
      */
-    404: unknown;
+    404: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type UpdateIpAccessControlError = UpdateIpAccessControlErrors[keyof UpdateIpAccessControlErrors];
 
 export type UpdateIpAccessControlResponses = {
     /**
@@ -20639,6 +20741,44 @@ export type GetEventTypeBreakdownResponses = {
 };
 
 export type GetEventTypeBreakdownResponse = GetEventTypeBreakdownResponses[keyof GetEventTypeBreakdownResponses];
+
+export type RecordConsoleEventData = {
+    body: ConsoleEventPayload;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/events/ingest';
+};
+
+export type RecordConsoleEventErrors = {
+    /**
+     * Bad request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RecordConsoleEventResponses = {
+    /**
+     * Event recorded successfully
+     */
+    200: unknown;
+};
 
 export type GetPropertyBreakdownData = {
     body?: never;

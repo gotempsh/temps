@@ -153,6 +153,25 @@ mod docker_utils {
             })
         }
 
+        /// Build S3Credentials from the test container's configuration.
+        /// In tests, credentials are plaintext (not encrypted).
+        ///
+        /// Uses `host.docker.internal` instead of `localhost` because these credentials
+        /// are passed as environment variables to WAL-G running *inside* Docker containers.
+        /// From inside a container, `localhost` refers to the container itself, not the host
+        /// where MinIO is exposed. `host.docker.internal` resolves to the host on Docker Desktop.
+        pub fn s3_credentials(&self) -> super::super::S3Credentials {
+            super::super::S3Credentials {
+                access_key_id: self.access_key.clone(),
+                secret_key: self.secret_key.clone(),
+                region: "us-east-1".to_string(),
+                endpoint: Some(format!("http://host.docker.internal:{}", self.port)),
+                bucket_name: self.bucket_name.clone(),
+                bucket_path: "".to_string(),
+                force_path_style: true,
+            }
+        }
+
         /// Stop and remove the MinIO container
         pub async fn cleanup(&self) -> Result<()> {
             use bollard::query_parameters::{RemoveContainerOptions, StopContainerOptions};
@@ -302,12 +321,41 @@ pub fn create_mock_external_service(
     }
 }
 
-/// Create a mock database connection (in-memory SQLite)
+/// Create a mock database connection (in-memory SQLite) with required tables
+/// for integration tests that exercise backup_to_s3 / restore_from_s3.
 pub async fn create_mock_db() -> Result<sea_orm::DatabaseConnection> {
+    use sea_orm::ConnectionTrait;
+
     let db_url = "sqlite::memory:";
     let db_conn = sea_orm::Database::connect(db_url)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create mock database: {}", e))?;
+
+    // Create the external_service_backups table used by backup_to_s3 implementations.
+    // This mirrors the PostgreSQL schema but uses SQLite-compatible types.
+    db_conn
+        .execute_unprepared(
+            "CREATE TABLE IF NOT EXISTS external_service_backups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id INTEGER NOT NULL,
+                backup_id INTEGER NOT NULL,
+                backup_type TEXT NOT NULL,
+                state TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                size_bytes INTEGER,
+                s3_location TEXT NOT NULL,
+                error_message TEXT,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                checksum TEXT,
+                compression_type TEXT NOT NULL DEFAULT 'gzip',
+                created_by INTEGER NOT NULL DEFAULT 0,
+                expires_at TEXT
+            )",
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create external_service_backups table: {}", e))?;
+
     Ok(db_conn)
 }
 

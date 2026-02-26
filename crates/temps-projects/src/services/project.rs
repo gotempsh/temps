@@ -1327,9 +1327,10 @@ impl ProjectService {
             .map_err(|e| ProjectError::Other(e.to_string()))?
             .ok_or_else(|| ProjectError::NotFound("Project not found".to_string()))?;
 
-        // Validate environment belongs to this project
+        // Validate environment belongs to this project and is not soft-deleted
         let environment = temps_entities::environments::Entity::find_by_id(environment_id)
             .filter(temps_entities::environments::Column::ProjectId.eq(project_id))
+            .filter(temps_entities::environments::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await
             .map_err(|e| ProjectError::Other(e.to_string()))?

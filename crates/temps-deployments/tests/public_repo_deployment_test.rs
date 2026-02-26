@@ -227,9 +227,17 @@ mod public_repo_tests {
     ];
 
     #[tokio::test]
-    #[ignore] // Heavy integration test: clones public repos, builds Docker images, deploys containers.
-              // Run explicitly with: cargo test -p temps-deployments test_deploy_public_repositories -- --ignored
     async fn test_deploy_public_repositories() {
+        // Heavy integration test: clones public repos, builds Docker images, deploys containers.
+        // Enable with: TEMPS_INTEGRATION_TESTS=1 cargo test -p temps-deployments test_deploy_public_repositories
+        if std::env::var("TEMPS_INTEGRATION_TESTS").is_err() {
+            println!("Integration tests disabled; set TEMPS_INTEGRATION_TESTS=1 to enable");
+            return;
+        }
+        if bollard::Docker::connect_with_local_defaults().is_err() {
+            println!("Docker not available, skipping test");
+            return;
+        }
         // Enable verbose Docker build output
         // SAFETY: This is only called from a single-threaded test; no concurrent access.
         unsafe {

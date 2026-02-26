@@ -1101,10 +1101,14 @@ impl SessionReplayService {
             .await?
             .ok_or_else(|| SessionReplayError::SessionNotFound(session_id.to_string()))?;
 
-        // Get events using the integer session ID
+        // Get events using the integer session ID.
+        // Limit to 50 000 events to avoid loading hundreds of MB for very long sessions.
+        const MAX_REPLAY_EVENTS: u64 = 50_000;
+
         let events = session_replay_events::Entity::find()
             .filter(session_replay_events::Column::SessionId.eq(row.id))
             .order_by_asc(session_replay_events::Column::Timestamp)
+            .limit(MAX_REPLAY_EVENTS)
             .all(self.db.as_ref())
             .await?;
 
@@ -1385,18 +1389,14 @@ impl SessionReplayService {
         session.is_active = Set(false);
         session.update(self.db.as_ref()).await?;
 
-        // Soft delete all events for this session using the integer ID
-        let events = session_replay_events::Entity::find()
+        // Soft delete all events for this session in a single UPDATE instead of
+        // loading every event into memory and updating one by one (N+1).
+        session_replay_events::Entity::update_many()
+            .col_expr(session_replay_events::Column::IsActive, Expr::value(false))
             .filter(session_replay_events::Column::SessionId.eq(session_int_id))
             .filter(session_replay_events::Column::IsActive.eq(true))
-            .all(self.db.as_ref())
+            .exec(self.db.as_ref())
             .await?;
-
-        for event in events {
-            let mut event: session_replay_events::ActiveModel = event.into();
-            event.is_active = Set(false);
-            event.update(self.db.as_ref()).await?;
-        }
 
         Ok(())
     }

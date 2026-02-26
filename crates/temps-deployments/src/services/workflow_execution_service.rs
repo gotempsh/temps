@@ -1297,8 +1297,9 @@ impl WorkflowExecutionService {
         // Get the deployment to find its environment_id
         let deployment = self.get_deployment(deployment_id).await?;
 
-        // Update the environment
+        // Update the environment (only if not soft-deleted)
         let environment = environments::Entity::find_by_id(deployment.environment_id)
+            .filter(environments::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| {

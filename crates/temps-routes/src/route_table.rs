@@ -262,9 +262,10 @@ impl CachedPeerTable {
         );
 
         for env_domain in env_domains {
-            // Fetch environment if not cached
+            // Fetch environment if not cached (skip soft-deleted)
             if !environments_cache.contains_key(&env_domain.environment_id) {
                 if let Ok(Some(env)) = environments::Entity::find_by_id(env_domain.environment_id)
+                    .filter(environments::Column::DeletedAt.is_null())
                     .one(self.db.as_ref())
                     .await
                 {
@@ -452,10 +453,11 @@ impl CachedPeerTable {
         );
 
         for custom_domain in custom_domains {
-            // Fetch environment if not cached
+            // Fetch environment if not cached (skip soft-deleted)
             if !environments_cache.contains_key(&custom_domain.environment_id) {
                 if let Ok(Some(env)) =
                     environments::Entity::find_by_id(custom_domain.environment_id)
+                        .filter(environments::Column::DeletedAt.is_null())
                         .one(self.db.as_ref())
                         .await
                 {
@@ -569,6 +571,7 @@ impl CachedPeerTable {
         let all_envs = environments::Entity::find()
             .filter(environments::Column::Subdomain.is_not_null())
             .filter(environments::Column::CurrentDeploymentId.is_not_null())
+            .filter(environments::Column::DeletedAt.is_null())
             .all(self.db.as_ref())
             .await?;
 
@@ -720,9 +723,10 @@ impl CachedPeerTable {
         // This ensures we have complete coverage of all running deployments
         debug!("Loading all active deployments for environments...");
 
-        // Get all environments with current_deployment_id
+        // Get all environments with current_deployment_id (exclude soft-deleted)
         let all_active_envs = environments::Entity::find()
             .filter(environments::Column::CurrentDeploymentId.is_not_null())
+            .filter(environments::Column::DeletedAt.is_null())
             .all(self.db.as_ref())
             .await?;
 
@@ -878,6 +882,7 @@ impl CachedPeerTable {
 pub struct RouteTableListener {
     peer_table: Arc<CachedPeerTable>,
     database_url: String,
+    task_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl RouteTableListener {
@@ -885,6 +890,7 @@ impl RouteTableListener {
         Self {
             peer_table,
             database_url,
+            task_handle: std::sync::Mutex::new(None),
         }
     }
 
@@ -909,7 +915,8 @@ impl RouteTableListener {
         );
 
         // Spawn background task to handle notifications
-        tokio::spawn(async move {
+        let peer_table = self.peer_table.clone();
+        let handle = tokio::spawn(async move {
             loop {
                 match listener.recv().await {
                     Ok(notification) => {
@@ -918,15 +925,12 @@ impl RouteTableListener {
                             notification.payload()
                         );
 
-                        debug!("🔄 Route table synchronizing...");
+                        debug!("Route table synchronizing...");
 
-                        if let Err(e) = self.peer_table.load_routes().await {
+                        if let Err(e) = peer_table.load_routes().await {
                             error!("Failed to reload routes: {}", e);
                         } else {
-                            debug!(
-                                "✅ Route table synchronized ({} entries)",
-                                self.peer_table.len()
-                            );
+                            debug!("Route table synchronized ({} entries)", peer_table.len());
                         }
                     }
                     Err(e) => {
@@ -954,7 +958,28 @@ impl RouteTableListener {
             }
         });
 
+        // Store the handle so it can be aborted on drop
+        if let Ok(mut guard) = self.task_handle.lock() {
+            *guard = Some(handle);
+        }
+
         Ok(())
+    }
+
+    /// Stop the background listener task
+    pub fn shutdown(&self) {
+        if let Ok(mut guard) = self.task_handle.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+                info!("Route table listener stopped");
+            }
+        }
+    }
+}
+
+impl Drop for RouteTableListener {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -1174,5 +1199,51 @@ mod tests {
         assert!(!route.is_static());
         assert_eq!(route.static_dir(), None);
         assert_eq!(route.get_backend_addr(), "10.0.0.1:9000");
+    }
+
+    // ========================================================================
+    // RouteTableListener lifecycle tests
+    // ========================================================================
+
+    #[test]
+    fn test_route_table_listener_new_has_no_task() {
+        let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
+        let peer_table = Arc::new(CachedPeerTable::new(db));
+        let listener = RouteTableListener::new(
+            peer_table,
+            "postgresql://fake:fake@localhost/fake".to_string(),
+        );
+
+        let guard = listener.task_handle.lock().unwrap();
+        assert!(guard.is_none(), "New listener should have no task handle");
+    }
+
+    #[test]
+    fn test_route_table_listener_shutdown_without_start_is_safe() {
+        let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
+        let peer_table = Arc::new(CachedPeerTable::new(db));
+        let listener = RouteTableListener::new(
+            peer_table,
+            "postgresql://fake:fake@localhost/fake".to_string(),
+        );
+
+        // Calling shutdown before start should not panic
+        listener.shutdown();
+
+        let guard = listener.task_handle.lock().unwrap();
+        assert!(guard.is_none());
+    }
+
+    #[test]
+    fn test_route_table_listener_drop_without_start_is_safe() {
+        let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
+        let peer_table = Arc::new(CachedPeerTable::new(db));
+        let listener = RouteTableListener::new(
+            peer_table,
+            "postgresql://fake:fake@localhost/fake".to_string(),
+        );
+
+        // Dropping without starting should not panic
+        drop(listener);
     }
 }

@@ -50,3 +50,5 @@ woothee = { workspace = true }
 tokio = { workspace = true }
 testcontainers = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
+tower = { version = "0.5", features = ["util"] }
+uuid = { version = "1", features = ["v4"] }

@@ -59,7 +59,7 @@ impl ParameterStrategy for PostgresParameterStrategy {
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("postgres:18-alpine".to_string()),
+                JsonValue::String("gotempsh/postgres-walg:18-bookworm".to_string()),
             );
         }
 
@@ -147,8 +147,8 @@ impl ParameterStrategy for PostgresParameterStrategy {
                 },
                 "docker_image": {
                     "type": "string",
-                    "description": "Docker image (updateable, e.g., postgres:18-alpine)",
-                    "default": "postgres:18-alpine"
+                    "description": "Docker image (updateable, e.g., gotempsh/postgres-walg:18-bookworm)",
+                    "default": "gotempsh/postgres-walg:18-bookworm"
                 }
             },
             "readonly": ["database", "username", "password", "host"]
@@ -181,7 +181,7 @@ impl ParameterStrategy for RedisParameterStrategy {
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("redis:8-alpine".to_string()),
+                JsonValue::String("gotempsh/redis-walg:8-bookworm".to_string()),
             );
         }
 
@@ -240,8 +240,8 @@ impl ParameterStrategy for RedisParameterStrategy {
                 },
                 "docker_image": {
                     "type": "string",
-                    "description": "Docker image (updateable, e.g., redis:8-alpine)",
-                    "default": "redis:8-alpine"
+                    "description": "Docker image (updateable, e.g., gotempsh/redis-walg:8-bookworm)",
+                    "default": "gotempsh/redis-walg:8-bookworm"
                 }
             },
             "readonly": ["password"]
@@ -921,7 +921,7 @@ mod tests {
         let mut updates = HashMap::new();
         updates.insert(
             "docker_image".to_string(),
-            JsonValue::String("postgres:18-alpine".to_string()),
+            JsonValue::String("gotempsh/postgres-walg:18-bookworm".to_string()),
         );
         updates.insert("port".to_string(), JsonValue::String("5433".to_string()));
 
@@ -948,7 +948,7 @@ mod tests {
         let mut updates = HashMap::new();
         updates.insert(
             "docker_image".to_string(),
-            JsonValue::String("redis:8-alpine".to_string()),
+            JsonValue::String("gotempsh/redis-walg:8-bookworm".to_string()),
         );
 
         let result = strategy.validate_for_update(&updates);
@@ -1007,20 +1007,20 @@ mod tests {
         let mut existing = HashMap::new();
         existing.insert(
             "docker_image".to_string(),
-            JsonValue::String("postgres:17-alpine".to_string()),
+            JsonValue::String("gotempsh/postgres-walg:17-bookworm".to_string()),
         );
 
         let mut updates = HashMap::new();
         updates.insert(
             "docker_image".to_string(),
-            JsonValue::String("postgres:18-alpine".to_string()),
+            JsonValue::String("gotempsh/postgres-walg:18-bookworm".to_string()),
         );
 
         let result = strategy.merge_updates(&mut existing, updates);
         assert!(result.is_ok());
         assert_eq!(
             existing.get("docker_image").and_then(|v| v.as_str()),
-            Some("postgres:18-alpine")
+            Some("gotempsh/postgres-walg:18-bookworm")
         );
     }
 }

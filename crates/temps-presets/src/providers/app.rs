@@ -58,10 +58,9 @@ impl App {
     #[cfg(test)]
     pub fn new_with_errors(path: &str) -> Result<Self> {
         let current_dir = std::env::current_dir()?;
-        let source = current_dir
-            .join(path)
-            .canonicalize()
-            .context("Failed to read app source directory")?;
+        let source = current_dir.join(path).canonicalize().map_err(|e| {
+            anyhow::anyhow!("Failed to read app source directory '{}': {}", path, e)
+        })?;
 
         let mut files = HashMap::new();
         let mut paths = Vec::new();
@@ -77,7 +76,12 @@ impl App {
     }
 
     /// Walk directory tree and collect files
-    fn walk_dir(dir: &Path, base: &Path, files: &mut HashMap<String, String>, paths: &mut Vec<String>) -> Result<()> {
+    fn walk_dir(
+        dir: &Path,
+        base: &Path,
+        files: &mut HashMap<String, String>,
+        paths: &mut Vec<String>,
+    ) -> Result<()> {
         use std::fs;
 
         for entry in fs::read_dir(dir)? {
@@ -108,7 +112,9 @@ impl App {
     /// Check if a directory exists
     pub fn includes_directory(&self, name: &str) -> bool {
         let dir_prefix = format!("{}/", name);
-        self.paths.iter().any(|p| p.starts_with(&dir_prefix) || p == name)
+        self.paths
+            .iter()
+            .any(|p| p.starts_with(&dir_prefix) || p == name)
     }
 
     /// Find files matching a glob-like pattern
@@ -117,7 +123,8 @@ impl App {
         let regex_pattern = glob_to_regex(pattern);
         let re = regex::Regex::new(&regex_pattern)?;
 
-        let matches: Vec<String> = self.files
+        let matches: Vec<String> = self
+            .files
             .keys()
             .filter(|path| re.is_match(path))
             .cloned()
@@ -132,7 +139,8 @@ impl App {
         let re = regex::Regex::new(&regex_pattern)?;
 
         // Get all unique directory paths
-        let mut dirs: Vec<String> = self.paths
+        let mut dirs: Vec<String> = self
+            .paths
             .iter()
             .filter_map(|p| {
                 let path = Path::new(p);
@@ -145,10 +153,7 @@ impl App {
         dirs.sort();
         dirs.dedup();
 
-        let matches: Vec<String> = dirs
-            .into_iter()
-            .filter(|dir| re.is_match(dir))
-            .collect();
+        let matches: Vec<String> = dirs.into_iter().filter(|dir| re.is_match(dir)).collect();
 
         Ok(matches)
     }
@@ -226,8 +231,8 @@ impl App {
         T: DeserializeOwned,
     {
         let contents = self.read_file(name)?;
-        let toml_file = toml::from_str(&contents)
-            .with_context(|| format!("Error reading {} as TOML", name))?;
+        let toml_file =
+            toml::from_str(&contents).with_context(|| format!("Error reading {} as TOML", name))?;
         Ok(toml_file)
     }
 
@@ -270,9 +275,7 @@ impl App {
     /// Helper: Check if package.json has a dependency
     pub fn has_dependency(&self, dep: &str) -> bool {
         if let Ok(pkg) = self.read_json::<serde_json::Value>("package.json") {
-            pkg.get("dependencies")
-                .and_then(|d| d.get(dep))
-                .is_some()
+            pkg.get("dependencies").and_then(|d| d.get(dep)).is_some()
         } else {
             false
         }
@@ -297,9 +300,7 @@ impl App {
     /// Helper: Check if package.json has a script
     pub fn has_script(&self, script: &str) -> bool {
         if let Ok(pkg) = self.read_json::<serde_json::Value>("package.json") {
-            pkg.get("scripts")
-                .and_then(|s| s.get(script))
-                .is_some()
+            pkg.get("scripts").and_then(|s| s.get(script)).is_some()
         } else {
             false
         }
@@ -374,7 +375,10 @@ mod tests {
     fn test_from_tree() {
         let mut files = HashMap::new();
         files.insert("package.json".to_string(), r#"{"name":"test"}"#.to_string());
-        files.insert("src/index.ts".to_string(), "console.log('hello')".to_string());
+        files.insert(
+            "src/index.ts".to_string(),
+            "console.log('hello')".to_string(),
+        );
 
         let app = App::from_tree(PathBuf::from("/test"), files);
 
@@ -439,7 +443,7 @@ mod tests {
         let mut files = HashMap::new();
         files.insert(
             "package.json".to_string(),
-            r#"{"name":"test","version":"1.0.0"}"#.to_string()
+            r#"{"name":"test","version":"1.0.0"}"#.to_string(),
         );
 
         let app = App::from_tree(PathBuf::from("/test"), files);
@@ -458,7 +462,7 @@ mod tests {
         let mut files = HashMap::new();
         files.insert(
             "package.json".to_string(),
-            r#"{"name":"test","version":"1.0.0"}"#.to_string()
+            r#"{"name":"test","version":"1.0.0"}"#.to_string(),
         );
 
         let app = App::from_tree(PathBuf::from("/test"), files);
@@ -481,7 +485,8 @@ mod tests {
                     /* Block comment */
                     "target": "es2015"
                 }
-            }"#.to_string()
+            }"#
+            .to_string(),
         );
 
         let app = App::from_tree(PathBuf::from("/test"), files);
@@ -509,11 +514,12 @@ mod tests {
         files.insert(
             "src/App.tsx".to_string(),
             r#"import React from 'react';
-            function App() { return <div className="app">Hello</div>; }"#.to_string()
+            function App() { return <div className="app">Hello</div>; }"#
+                .to_string(),
         );
         files.insert(
             "src/index.ts".to_string(),
-            "console.log('hello')".to_string()
+            "console.log('hello')".to_string(),
         );
 
         let app = App::from_tree(PathBuf::from("/test"), files);

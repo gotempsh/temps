@@ -16,6 +16,7 @@ use tracing::{error, info};
 pub struct ProjectChangeListener {
     database_url: String,
     peer_table: Arc<CachedPeerTable>,
+    task_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ProjectChangeListener {
@@ -24,52 +25,74 @@ impl ProjectChangeListener {
         Self {
             database_url,
             peer_table,
+            task_handle: std::sync::Mutex::new(None),
         }
     }
 
-    /// Start listening for project change notifications
-    /// This runs in a background task and listens indefinitely
-    pub async fn start_listening(self) -> Result<()> {
+    /// Start listening for project change notifications in a background task.
+    /// The task runs until `shutdown()` is called or the listener is dropped.
+    pub async fn start_listening(&self) -> Result<()> {
         use sqlx::postgres::{PgListener, PgPool};
 
         // Create PostgreSQL listener using sqlx
         let pool = PgPool::connect(&self.database_url).await?;
-        let mut listener = PgListener::connect_with(&pool).await?;
+        let mut pg_listener = PgListener::connect_with(&pool).await?;
 
-        listener.listen("project_route_change").await?;
+        pg_listener.listen("project_route_change").await?;
         info!("Started listening for project_route_change events");
 
-        loop {
-            match listener.recv().await {
-                Ok(notification) => {
-                    self.handle_project_change(notification.payload()).await;
-                }
-                Err(e) => {
-                    error!("Error receiving project change notification: {}", e);
+        let peer_table = self.peer_table.clone();
 
-                    // Attempt to reconnect after error
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        let handle = tokio::spawn(async move {
+            loop {
+                match pg_listener.recv().await {
+                    Ok(notification) => {
+                        Self::handle_project_change_static(&peer_table, notification.payload())
+                            .await;
+                    }
+                    Err(e) => {
+                        error!("Error receiving project change notification: {}", e);
 
-                    match PgListener::connect_with(&pool).await {
-                        Ok(mut new_listener) => {
-                            if let Err(e) = new_listener.listen("project_route_change").await {
-                                error!("Failed to re-subscribe to project_route_change: {}", e);
-                            } else {
-                                listener = new_listener;
-                                info!("Reconnected to project_route_change listener");
+                        // Attempt to reconnect after error
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+                        match PgListener::connect_with(&pool).await {
+                            Ok(mut new_listener) => {
+                                if let Err(e) = new_listener.listen("project_route_change").await {
+                                    error!("Failed to re-subscribe to project_route_change: {}", e);
+                                } else {
+                                    pg_listener = new_listener;
+                                    info!("Reconnected to project_route_change listener");
+                                }
                             }
-                        }
-                        Err(e) => {
-                            error!("Failed to reconnect project_route_change listener: {}", e);
+                            Err(e) => {
+                                error!("Failed to reconnect project_route_change listener: {}", e);
+                            }
                         }
                     }
                 }
+            }
+        });
+
+        if let Ok(mut guard) = self.task_handle.lock() {
+            *guard = Some(handle);
+        }
+
+        Ok(())
+    }
+
+    /// Stop the background listener task
+    pub fn shutdown(&self) {
+        if let Ok(mut guard) = self.task_handle.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+                info!("Project change listener stopped");
             }
         }
     }
 
     /// Handle a route change notification (project or environment)
-    async fn handle_project_change(&self, payload: &str) {
+    async fn handle_project_change_static(peer_table: &CachedPeerTable, payload: &str) {
         // Try to parse as RouteChangePayload which handles both project and environment changes
         match serde_json::from_str::<RouteChangePayload>(payload) {
             Ok(change) => {
@@ -95,7 +118,7 @@ impl ProjectChangeListener {
                 }
 
                 // Reload all routes when any change happens
-                if let Err(e) = self.peer_table.load_routes().await {
+                if let Err(e) = peer_table.load_routes().await {
                     error!("Failed to reload routes after change: {}", e);
                 }
             }
@@ -106,6 +129,12 @@ impl ProjectChangeListener {
                 );
             }
         }
+    }
+}
+
+impl Drop for ProjectChangeListener {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -196,5 +225,51 @@ mod tests {
             }
             _ => panic!("Expected Environment payload"),
         }
+    }
+
+    // ========================================================================
+    // ProjectChangeListener lifecycle tests
+    // ========================================================================
+
+    #[test]
+    fn test_project_change_listener_new_has_no_task() {
+        let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
+        let peer_table = Arc::new(CachedPeerTable::new(db));
+        let listener = ProjectChangeListener::new(
+            "postgresql://fake:fake@localhost/fake".to_string(),
+            peer_table,
+        );
+
+        let guard = listener.task_handle.lock().unwrap();
+        assert!(guard.is_none(), "New listener should have no task handle");
+    }
+
+    #[test]
+    fn test_project_change_listener_shutdown_without_start_is_safe() {
+        let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
+        let peer_table = Arc::new(CachedPeerTable::new(db));
+        let listener = ProjectChangeListener::new(
+            "postgresql://fake:fake@localhost/fake".to_string(),
+            peer_table,
+        );
+
+        // Calling shutdown before start should not panic
+        listener.shutdown();
+
+        let guard = listener.task_handle.lock().unwrap();
+        assert!(guard.is_none());
+    }
+
+    #[test]
+    fn test_project_change_listener_drop_without_start_is_safe() {
+        let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
+        let peer_table = Arc::new(CachedPeerTable::new(db));
+        let listener = ProjectChangeListener::new(
+            "postgresql://fake:fake@localhost/fake".to_string(),
+            peer_table,
+        );
+
+        // Dropping without starting should not panic
+        drop(listener);
     }
 }

@@ -13,12 +13,22 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { toast } from 'sonner'
 import * as z from 'zod'
+import { getSupportedImages } from './UpgradeServiceDialog'
+
+const CUSTOM_IMAGE_VALUE = '__custom__'
 
 interface EditServiceFormProps {
   service: ExternalServiceInfo
@@ -176,6 +186,20 @@ export function EditServiceForm({
     }
   }, [parameters, currentParameters, form])
 
+  const supportedImages = getSupportedImages(service.service_type)
+  const [useCustomImage, setUseCustomImage] = useState(false)
+
+  // Determine if the docker_image field value matches a supported image
+  const dockerImageValue = form.watch('parameters.docker_image') as string | undefined
+  const isKnownImage = supportedImages.some((s) => s.image === dockerImageValue)
+
+  // On mount, if the current docker_image isn't in the list, show custom input
+  useEffect(() => {
+    if (dockerImageValue && !supportedImages.some((s) => s.image === dockerImageValue)) {
+      setUseCustomImage(true)
+    }
+  }, [dockerImageValue, supportedImages])
+
   const updateServiceMut = useMutation({
     ...updateServiceMutation(),
     meta: {
@@ -252,6 +276,73 @@ export function EditServiceForm({
               type?: string
               x_editable?: boolean
             }
+
+            // Render docker_image as a select with custom fallback
+            if (paramObj.name === 'docker_image' && supportedImages.length > 0) {
+              return (
+                <FormField
+                  key={paramObj.name}
+                  control={form.control}
+                  name={`parameters.${paramObj.name}`}
+                  render={({ field }) => {
+                    const selectValue = isKnownImage
+                      ? (field.value as string)
+                      : CUSTOM_IMAGE_VALUE
+
+                    return (
+                      <FormItem>
+                        <FormLabel>{paramObj.name}</FormLabel>
+                        <Select
+                          value={selectValue}
+                          onValueChange={(val) => {
+                            if (val === CUSTOM_IMAGE_VALUE) {
+                              setUseCustomImage(true)
+                              field.onChange('')
+                            } else {
+                              setUseCustomImage(false)
+                              field.onChange(val)
+                            }
+                          }}
+                        >
+                          <FormControl>
+                            <SelectTrigger>
+                              <SelectValue placeholder="Select an image..." />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent>
+                            {supportedImages.map((img) => (
+                              <SelectItem key={img.image} value={img.image}>
+                                {img.label}
+                              </SelectItem>
+                            ))}
+                            <SelectItem value={CUSTOM_IMAGE_VALUE}>
+                              Custom image...
+                            </SelectItem>
+                          </SelectContent>
+                        </Select>
+                        {useCustomImage && (
+                          <FormControl>
+                            <Input
+                              value={field.value as string}
+                              onChange={field.onChange}
+                              placeholder="e.g. postgres:18-bookworm"
+                              autoFocus
+                            />
+                          </FormControl>
+                        )}
+                        {paramObj.description && (
+                          <p className="text-sm text-muted-foreground">
+                            {paramObj.description}
+                          </p>
+                        )}
+                        <FormMessage />
+                      </FormItem>
+                    )
+                  }}
+                />
+              )
+            }
+
             return (
               <FormField
                 key={paramObj.name}

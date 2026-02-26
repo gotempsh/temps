@@ -1,9 +1,9 @@
 version: '3.9'
 
 services:
-  # PostgreSQL Database (with TimescaleDB extension)
+  # PostgreSQL Database (with TimescaleDB + WAL-G for backups)
   postgres:
-    image: timescale/timescaledb-ha:pg18
+    image: gotempsh/timescaledb-walg:pg18
     container_name: temps-postgres
     restart: always
     environment:
@@ -18,7 +18,15 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./timescaledb.conf:/etc/postgresql/postgresql.conf:ro
+    # NOTE: archive_command is NOT set here on purpose.
+    # Command-line parameters take highest priority in PostgreSQL and cannot be
+    # overridden by ALTER SYSTEM. After the first backup, Temps uses ALTER SYSTEM
+    # to set archive_command to source walg.env and run wal-g wal-push.
+    command: >
+      postgres
+      -c wal_level=replica
+      -c archive_mode=on
+      -c archive_timeout=60
     networks:
       - temps-network
     healthcheck:

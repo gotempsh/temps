@@ -5,6 +5,7 @@
 
 use chrono::{Datelike, Timelike, Utc, Weekday};
 use std::sync::Arc;
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration as TokioDuration};
 use tracing::{debug, error, info, warn};
 
@@ -15,34 +16,58 @@ use crate::services::NotificationPreferencesService;
 pub struct DigestScheduler {
     digest_service: Arc<DigestService>,
     preferences_service: Arc<NotificationPreferencesService>,
+    task_handle: Option<JoinHandle<()>>,
 }
 
 impl DigestScheduler {
-    /// Create a new digest scheduler and start the background task
+    /// Create a new digest scheduler (does not start the background task).
+    /// Call `start()` to begin scheduling.
     pub fn new(
         digest_service: Arc<DigestService>,
         preferences_service: Arc<NotificationPreferencesService>,
-    ) -> Arc<Self> {
-        let scheduler = Arc::new(Self {
+    ) -> Self {
+        Self {
             digest_service,
             preferences_service,
+            task_handle: None,
+        }
+    }
+
+    /// Start the background scheduler task.
+    /// The scheduler runs until `shutdown()` is called or the DigestScheduler is dropped.
+    pub fn start(&mut self) {
+        if self.task_handle.is_some() {
+            info!("Weekly digest scheduler already running");
+            return;
+        }
+
+        let digest_service = self.digest_service.clone();
+        let preferences_service = self.preferences_service.clone();
+
+        let handle = tokio::spawn(async move {
+            Self::run_scheduler(digest_service, preferences_service).await;
         });
 
-        // Spawn background task
-        let scheduler_clone = scheduler.clone();
-        tokio::spawn(async move {
-            scheduler_clone.run_scheduler().await;
-        });
-
+        self.task_handle = Some(handle);
         info!("Weekly digest scheduler started");
-        scheduler
+    }
+
+    /// Shutdown the background scheduler task gracefully.
+    pub fn shutdown(&mut self) {
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+            info!("Weekly digest scheduler stopped");
+        }
     }
 
     /// Main scheduler loop - calculates exact sleep duration until next scheduled time
-    async fn run_scheduler(&self) {
+    async fn run_scheduler(
+        digest_service: Arc<DigestService>,
+        preferences_service: Arc<NotificationPreferencesService>,
+    ) {
         loop {
             // Get current preferences
-            let preferences = match self.preferences_service.get_preferences().await {
+            let preferences = match preferences_service.get_preferences().await {
                 Ok(prefs) => prefs,
                 Err(e) => {
                     error!("Failed to get preferences: {}", e);
@@ -60,7 +85,7 @@ impl DigestScheduler {
             }
 
             // Calculate duration until next scheduled time
-            let sleep_duration = self.calculate_next_run_duration(&preferences);
+            let sleep_duration = Self::calculate_next_run_duration_static(&preferences);
 
             info!(
                 "Next weekly digest scheduled in {} hours ({} minutes)",
@@ -72,7 +97,10 @@ impl DigestScheduler {
             sleep(sleep_duration).await;
 
             // Send the digest
-            match self.send_digest(&preferences).await {
+            match digest_service
+                .generate_and_send_weekly_digest(preferences.digest_sections.clone())
+                .await
+            {
                 Ok(_) => {
                     info!("Successfully sent weekly digest");
                 }
@@ -84,8 +112,7 @@ impl DigestScheduler {
     }
 
     /// Calculate duration until next scheduled run
-    fn calculate_next_run_duration(
-        &self,
+    fn calculate_next_run_duration_static(
         preferences: &crate::services::NotificationPreferences,
     ) -> TokioDuration {
         let now = Utc::now();
@@ -144,20 +171,6 @@ impl DigestScheduler {
         TokioDuration::from_secs(seconds as u64)
     }
 
-    /// Send the weekly digest
-    async fn send_digest(
-        &self,
-        preferences: &crate::services::NotificationPreferences,
-    ) -> anyhow::Result<()> {
-        info!("Sending weekly digest");
-
-        self.digest_service
-            .generate_and_send_weekly_digest(preferences.digest_sections.clone())
-            .await?;
-
-        Ok(())
-    }
-
     /// Parse weekday string to Weekday enum
     fn parse_weekday(day: &str) -> Weekday {
         match day.to_lowercase().as_str() {
@@ -195,9 +208,45 @@ impl DigestScheduler {
     }
 }
 
+impl Drop for DigestScheduler {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_core::EncryptionService;
+    use temps_database::test_utils::TestDatabase;
+
+    /// Helper to create a DigestScheduler with real DB-backed services.
+    async fn create_test_scheduler() -> (DigestScheduler, TestDatabase) {
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+
+        let encryption_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let encryption_service = Arc::new(
+            EncryptionService::new(encryption_key).expect("Failed to create encryption service"),
+        );
+
+        let notification_service = Arc::new(crate::services::NotificationService::new(
+            test_db.connection_arc(),
+            encryption_service,
+        ));
+
+        let digest_service = Arc::new(super::super::DigestService::new(
+            test_db.connection_arc(),
+            notification_service,
+        ));
+        let preferences_service = Arc::new(crate::services::NotificationPreferencesService::new(
+            test_db.connection_arc(),
+        ));
+
+        let scheduler = DigestScheduler::new(digest_service, preferences_service);
+        (scheduler, test_db)
+    }
 
     #[test]
     fn test_parse_weekday() {
@@ -229,5 +278,85 @@ mod tests {
         assert_eq!(DigestScheduler::parse_minute("23:59"), 59);
         assert_eq!(DigestScheduler::parse_minute("invalid"), 0); // Default
         assert_eq!(DigestScheduler::parse_minute("09"), 0); // No colon, default to 0
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_new_does_not_start_task() {
+        let (scheduler, _db) = create_test_scheduler().await;
+
+        // new() should NOT have a running task
+        assert!(scheduler.task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_start_creates_task() {
+        let (mut scheduler, _db) = create_test_scheduler().await;
+
+        scheduler.start();
+        assert!(scheduler.task_handle.is_some());
+
+        // Cleanup
+        scheduler.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_shutdown_clears_task() {
+        let (mut scheduler, _db) = create_test_scheduler().await;
+
+        scheduler.start();
+        assert!(scheduler.task_handle.is_some());
+
+        scheduler.shutdown();
+        assert!(scheduler.task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_double_start_is_noop() {
+        let (mut scheduler, _db) = create_test_scheduler().await;
+
+        scheduler.start();
+        let handle_ptr = scheduler
+            .task_handle
+            .as_ref()
+            .map(|h| format!("{:?}", h))
+            .unwrap();
+
+        // Second start should not replace the handle
+        scheduler.start();
+        let handle_ptr_2 = scheduler
+            .task_handle
+            .as_ref()
+            .map(|h| format!("{:?}", h))
+            .unwrap();
+
+        assert_eq!(handle_ptr, handle_ptr_2, "Second start should be a no-op");
+
+        scheduler.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_shutdown_without_start_is_safe() {
+        let (mut scheduler, _db) = create_test_scheduler().await;
+
+        // shutdown on an unstarted scheduler should not panic
+        scheduler.shutdown();
+        assert!(scheduler.task_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_drop_aborts_task() {
+        let (mut scheduler, _db) = create_test_scheduler().await;
+
+        scheduler.start();
+        let handle = scheduler.task_handle.as_ref().unwrap().abort_handle();
+
+        // Drop the scheduler — should abort the task via Drop impl
+        drop(scheduler);
+
+        // Give tokio a tick to process the abort
+        tokio::task::yield_now().await;
+
+        // The task should have been aborted
+        assert!(handle.is_finished());
     }
 }

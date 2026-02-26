@@ -421,13 +421,30 @@ impl OutageDetectionService {
         Ok(())
     }
 
-    /// Scan all active monitors and detect outages from recent checks
-    /// This is useful for catching up after service restart
+    /// Scan all active monitors and detect outages from recent checks.
+    /// Also prunes cached state for monitors that are no longer active in the database,
+    /// preventing unbounded growth of the in-memory state map.
     pub async fn scan_monitors(&self) -> Result<Vec<OutageEvent>, OutageError> {
         let monitors = status_monitors::Entity::find()
             .filter(status_monitors::Column::IsActive.eq(true))
             .all(self.db.as_ref())
             .await?;
+
+        // Prune cached state for monitors that are no longer active
+        let active_ids: std::collections::HashSet<i32> = monitors.iter().map(|m| m.id).collect();
+        {
+            let mut states = self.monitor_states.write().await;
+            let before = states.len();
+            states.retain(|id, _| active_ids.contains(id));
+            let pruned = before - states.len();
+            if pruned > 0 {
+                debug!(
+                    "Pruned {} stale monitor state entries ({} active)",
+                    pruned,
+                    states.len()
+                );
+            }
+        }
 
         let mut events = Vec::new();
 
@@ -654,5 +671,168 @@ mod tests {
             IncidentSeverity::Critical.to_priority(),
             NotificationPriority::Critical
         ));
+    }
+
+    #[tokio::test]
+    async fn test_clear_monitor_state() {
+        use async_trait::async_trait;
+        use temps_core::notifications::{EmailMessage, NotificationData, NotificationError};
+
+        struct NoopNotificationService;
+
+        #[async_trait]
+        impl NotificationService for NoopNotificationService {
+            async fn send_notification(
+                &self,
+                _notification: NotificationData,
+            ) -> Result<(), NotificationError> {
+                Ok(())
+            }
+            async fn send_email(&self, _message: EmailMessage) -> Result<(), NotificationError> {
+                Ok(())
+            }
+            async fn is_configured(&self) -> Result<bool, NotificationError> {
+                Ok(false)
+            }
+        }
+
+        let db = Arc::new(sea_orm::Database::connect("sqlite::memory:").await.unwrap());
+        let service = OutageDetectionService::new(db, Arc::new(NoopNotificationService));
+
+        // Manually insert some monitor states
+        {
+            let mut states = service.monitor_states.write().await;
+            states.insert(
+                1,
+                MonitorState {
+                    status: MonitorStatus::Operational,
+                    active_incident_id: None,
+                    consecutive_failures: 0,
+                },
+            );
+            states.insert(
+                2,
+                MonitorState {
+                    status: MonitorStatus::Down,
+                    active_incident_id: Some(42),
+                    consecutive_failures: 5,
+                },
+            );
+            states.insert(
+                3,
+                MonitorState {
+                    status: MonitorStatus::Degraded,
+                    active_incident_id: None,
+                    consecutive_failures: 1,
+                },
+            );
+        }
+
+        // Verify initial state
+        {
+            let states = service.monitor_states.read().await;
+            assert_eq!(states.len(), 3);
+        }
+
+        // Clear monitor 2
+        service.clear_monitor_state(2).await;
+
+        {
+            let states = service.monitor_states.read().await;
+            assert_eq!(states.len(), 2);
+            assert!(!states.contains_key(&2), "Monitor 2 should be removed");
+            assert!(states.contains_key(&1), "Monitor 1 should remain");
+            assert!(states.contains_key(&3), "Monitor 3 should remain");
+        }
+
+        // Clear non-existent monitor — should not panic
+        service.clear_monitor_state(999).await;
+
+        {
+            let states = service.monitor_states.read().await;
+            assert_eq!(states.len(), 2, "No change for non-existent monitor");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_monitor_statuses() {
+        use async_trait::async_trait;
+        use temps_core::notifications::{EmailMessage, NotificationData, NotificationError};
+
+        struct NoopNotificationService;
+
+        #[async_trait]
+        impl NotificationService for NoopNotificationService {
+            async fn send_notification(
+                &self,
+                _notification: NotificationData,
+            ) -> Result<(), NotificationError> {
+                Ok(())
+            }
+            async fn send_email(&self, _message: EmailMessage) -> Result<(), NotificationError> {
+                Ok(())
+            }
+            async fn is_configured(&self) -> Result<bool, NotificationError> {
+                Ok(false)
+            }
+        }
+
+        let db = Arc::new(sea_orm::Database::connect("sqlite::memory:").await.unwrap());
+        let service = OutageDetectionService::new(db, Arc::new(NoopNotificationService));
+
+        // Empty initially
+        let statuses = service.get_monitor_statuses().await;
+        assert!(statuses.is_empty());
+
+        // Insert states
+        {
+            let mut states = service.monitor_states.write().await;
+            states.insert(
+                10,
+                MonitorState {
+                    status: MonitorStatus::Operational,
+                    active_incident_id: None,
+                    consecutive_failures: 0,
+                },
+            );
+            states.insert(
+                20,
+                MonitorState {
+                    status: MonitorStatus::Down,
+                    active_incident_id: Some(1),
+                    consecutive_failures: 3,
+                },
+            );
+        }
+
+        let statuses = service.get_monitor_statuses().await;
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[&10], MonitorStatus::Operational);
+        assert_eq!(statuses[&20], MonitorStatus::Down);
+    }
+
+    #[test]
+    fn test_monitor_state_struct() {
+        let state = MonitorState {
+            status: MonitorStatus::Down,
+            active_incident_id: Some(42),
+            consecutive_failures: 3,
+        };
+
+        assert!(state.status.is_outage());
+        assert_eq!(state.active_incident_id, Some(42));
+        assert_eq!(state.consecutive_failures, 3);
+    }
+
+    #[test]
+    fn test_outage_error_display() {
+        let db_err = OutageError::Database("connection refused".to_string());
+        assert_eq!(db_err.to_string(), "Database error: connection refused");
+
+        let not_found = OutageError::MonitorNotFound(42);
+        assert_eq!(not_found.to_string(), "Monitor not found: 42");
+
+        let notif_err = OutageError::Notification("timeout".to_string());
+        assert_eq!(notif_err.to_string(), "Notification error: timeout");
     }
 }

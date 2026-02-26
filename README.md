@@ -27,7 +27,7 @@
 </p>
 
 ```bash
-curl -fsSL https://temps.sh/deploy.sh | sh
+curl -fsSL https://temps.sh/deploy.sh | bash
 ```
 
 ![Temps Dashboard](assets/screenshots/dashboard.png)
@@ -130,7 +130,7 @@ Ship with a Model Context Protocol server (`@temps-sdk/mcp`) so AI agents can de
 ## Quick Start
 
 ```bash
-curl -fsSL https://temps.sh/deploy.sh | sh
+curl -fsSL https://temps.sh/deploy.sh | bash
 ```
 
 **Tested on:** Ubuntu 24.04 / 22.04 &nbsp;|&nbsp; Also works on macOS

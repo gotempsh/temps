@@ -1,6 +1,4 @@
 use crate::geoip_service::GeoIpService;
-use anyhow::Context;
-
 use chrono::Utc;
 use sea_orm::{prelude::*, QueryFilter, QueryOrder, QuerySelect, Set};
 use std::sync::Arc;
@@ -58,24 +56,23 @@ impl IpAddressService {
             return Ok(existing_ip.into());
         }
 
-        let geo_data = match self
-            .geoip_service
-            .geolocate(
-                ip_address_str
-                    .parse::<std::net::IpAddr>()
-                    .context("Invalid IP address")?,
-            )
-            .await
-        {
-            Ok(data) => Some(data),
-            Err(e) => {
-                error!(
-                    "Failed to get geolocation data for IP {}: {}",
-                    ip_address_str, e
-                );
-                None
-            }
-        };
+        let geo_data =
+            match self
+                .geoip_service
+                .geolocate(ip_address_str.parse::<std::net::IpAddr>().map_err(|e| {
+                    anyhow::anyhow!("Invalid IP address '{}': {}", ip_address_str, e)
+                })?)
+                .await
+            {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    error!(
+                        "Failed to get geolocation data for IP {}: {}",
+                        ip_address_str, e
+                    );
+                    None
+                }
+            };
 
         let new_ip = ip_geolocations::ActiveModel {
             ip_address: Set(ip_address_str.to_string()),
@@ -96,10 +93,13 @@ impl IpAddressService {
             ..Default::default()
         };
 
-        let result = new_ip
-            .insert(self.db.as_ref())
-            .await
-            .context("Failed to create IP address record")?;
+        let result = new_ip.insert(self.db.as_ref()).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create IP address record for '{}': {}",
+                ip_address_str,
+                e
+            )
+        })?;
 
         info!("Created new IP address record for {}", ip_address_str);
         Ok(result.into())
@@ -117,7 +117,13 @@ impl IpAddressService {
                 ip_record
                     .ip_address
                     .parse::<std::net::IpAddr>()
-                    .context("Invalid IP address in database")?,
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Invalid IP address in database for record {}: {}",
+                            ip_id,
+                            e
+                        )
+                    })?,
             )
             .await?;
 
@@ -135,7 +141,7 @@ impl IpAddressService {
         let updated = active_model
             .update(self.db.as_ref())
             .await
-            .context("Failed to update IP address record")?;
+            .map_err(|e| anyhow::anyhow!("Failed to update IP address record {}: {}", ip_id, e))?;
 
         Ok(updated.into())
     }
@@ -155,7 +161,7 @@ impl IpAddressService {
             .limit(limit)
             .all(self.db.as_ref())
             .await
-            .context("Failed to load IP addresses")?;
+            .map_err(|e| anyhow::anyhow!("Failed to load IP addresses: {}", e))?;
 
         Ok(results.into_iter().map(|ip| ip.into()).collect())
     }

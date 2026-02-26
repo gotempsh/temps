@@ -10,7 +10,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use axum::extract::Request;
@@ -423,7 +423,7 @@ impl PluginRoutes {
 
 /// Type-safe service registry for dependency injection
 pub struct ServiceRegistry {
-    services: Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    services: RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
 }
 
 impl Default for ServiceRegistry {
@@ -436,7 +436,7 @@ impl ServiceRegistry {
     /// Create a new service registry
     pub fn new() -> Self {
         Self {
-            services: Mutex::new(HashMap::new()),
+            services: RwLock::new(HashMap::new()),
         }
     }
 
@@ -444,7 +444,7 @@ impl ServiceRegistry {
     pub fn register<T: Send + Sync + 'static + ?Sized>(&self, service: Arc<T>) {
         debug!("Registering service: {}", std::any::type_name::<T>());
         self.services
-            .lock()
+            .write()
             .unwrap()
             .insert(TypeId::of::<T>(), Box::new(service));
     }
@@ -452,7 +452,7 @@ impl ServiceRegistry {
     /// Get a service if it's registered
     pub fn get<T: Send + Sync + 'static + ?Sized>(&self) -> Option<Arc<T>> {
         self.services
-            .lock()
+            .read()
             .unwrap()
             .get(&TypeId::of::<T>())
             .and_then(|any| any.downcast_ref::<Arc<T>>())
@@ -473,7 +473,7 @@ impl ServiceRegistry {
 
 /// Registry for plugin-specific state (used for routing)
 pub struct PluginStateRegistry {
-    states: Mutex<HashMap<String, Box<dyn Any + Send + Sync>>>,
+    states: RwLock<HashMap<String, Box<dyn Any + Send + Sync>>>,
 }
 
 impl Default for PluginStateRegistry {
@@ -485,7 +485,7 @@ impl Default for PluginStateRegistry {
 impl PluginStateRegistry {
     pub fn new() -> Self {
         Self {
-            states: Mutex::new(HashMap::new()),
+            states: RwLock::new(HashMap::new()),
         }
     }
 
@@ -497,7 +497,7 @@ impl PluginStateRegistry {
     ) {
         debug!("Registering plugin state for: {}", plugin_name);
         self.states
-            .lock()
+            .write()
             .unwrap()
             .insert(plugin_name.to_string(), Box::new(state));
     }
@@ -508,7 +508,7 @@ impl PluginStateRegistry {
         plugin_name: &str,
     ) -> Option<Arc<T>> {
         self.states
-            .lock()
+            .read()
             .unwrap()
             .get(plugin_name)
             .and_then(|any| any.downcast_ref::<Arc<T>>())
@@ -1021,50 +1021,46 @@ pub mod middleware_helpers {
         }
     }
 
-    /// Create CORS middleware
-    pub fn cors_middleware(
-        _plugin_name: &str,
-        allowed_origins: Vec<String>,
-    ) -> impl Fn(
-        Request,
-        Next,
-    ) -> Pin<Box<dyn Future<Output = Result<Response, axum::http::StatusCode>> + Send>>
-           + Send
-           + Sync {
-        move |req: Request, next: Next| {
-            let allowed_origins = allowed_origins.clone();
-            Box::pin(async move {
-                let origin = req
-                    .headers()
-                    .get("origin")
-                    .and_then(|h| h.to_str().ok())
-                    .map(|s| s.to_string());
+    /// Create a CORS layer using `tower_http::cors::CorsLayer`.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use tower_http::cors::{CorsLayer, Any};
+    /// use axum::http::Method;
+    ///
+    /// let cors = CorsLayer::new()
+    ///     .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+    ///     .allow_headers(Any)
+    ///     .allow_origin(Any);  // or use .allow_origin("https://example.com".parse::<HeaderValue>().unwrap())
+    /// ```
+    ///
+    /// Apply the layer directly to your Axum `Router`:
+    /// ```rust,no_run
+    /// router.layer(cors)
+    /// ```
+    pub fn cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLayer {
+        use axum::http::{HeaderValue, Method};
+        use tower_http::cors::CorsLayer;
 
-                let mut response = next.run(req).await;
+        let mut layer = CorsLayer::new().allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ]);
 
-                // Add CORS headers
-                if let Some(origin) = origin {
-                    if allowed_origins.contains(&origin)
-                        || allowed_origins.contains(&"*".to_string())
-                    {
-                        response.headers_mut().insert(
-                            "access-control-allow-origin",
-                            axum::http::HeaderValue::from_str(&origin).unwrap(),
-                        );
-                    }
-                }
-
-                response.headers_mut().insert(
-                    "access-control-allow-methods",
-                    axum::http::HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
-                );
-                response.headers_mut().insert(
-                    "access-control-allow-headers",
-                    axum::http::HeaderValue::from_static("Content-Type, Authorization"),
-                );
-
-                Ok(response)
-            })
+        if allowed_origins.iter().any(|o| o == "*") {
+            layer = layer.allow_origin(tower_http::cors::Any);
+        } else {
+            let origins: Vec<HeaderValue> = allowed_origins
+                .iter()
+                .filter_map(|o| o.parse::<HeaderValue>().ok())
+                .collect();
+            layer = layer.allow_origin(origins);
         }
+
+        layer
     }
 }

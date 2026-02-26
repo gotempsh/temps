@@ -43,12 +43,23 @@ Add to your Claude Desktop configuration file:
 {
   "mcpServers": {
     "temps": {
-      "command": "node",
-      "args": ["/absolute/path/to/temps/mcp/dist/index.js"]
+      "command": "npx",
+      "args": [
+        "-y",
+        "@temps-sdk/mcp",
+        "--tools",
+        "deployments,analytics,projects"
+      ],
+      "env": {
+        "TEMPS_API_URL": "<api_url>",
+        "TEMPS_API_KEY": "<api_key>"
+      }
     }
   }
 }
 ```
+
+Replace `<api_url>` with your Temps instance URL and `<api_key>` with an API key from your Temps dashboard.
 
 Restart Claude Desktop to activate the server.
 

@@ -326,8 +326,9 @@ pub async fn deploy_from_image(
             )));
     }
 
-    // 2. Verify environment exists and belongs to project
+    // 2. Verify environment exists, belongs to project, and is not deleted
     let environment = environments::Entity::find_by_id(environment_id)
+        .filter(environments::Column::DeletedAt.is_null())
         .one(state.db.as_ref())
         .await
         .map_err(|e| {
@@ -576,8 +577,9 @@ pub async fn deploy_from_static(
             )));
     }
 
-    // 2. Verify environment exists and belongs to project
+    // 2. Verify environment exists, belongs to project, and is not deleted
     let environment = environments::Entity::find_by_id(environment_id)
+        .filter(environments::Column::DeletedAt.is_null())
         .one(state.db.as_ref())
         .await
         .map_err(|e| {
@@ -858,8 +860,9 @@ pub async fn deploy_from_image_upload(
             )));
     }
 
-    // 2. Verify environment exists and belongs to project
+    // 2. Verify environment exists, belongs to project, and is not deleted
     let environment = environments::Entity::find_by_id(environment_id)
+        .filter(environments::Column::DeletedAt.is_null())
         .one(state.db.as_ref())
         .await
         .map_err(|e| {

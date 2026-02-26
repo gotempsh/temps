@@ -148,7 +148,7 @@ pub struct ImportExternalServiceRequest {
 pub struct UpdateExternalServiceRequest {
     pub name: Option<String>,
     pub parameters: HashMap<String, serde_json::Value>,
-    /// Docker image to use for the service (e.g., "postgres:18-alpine", "timescale/timescaledb-ha:pg18")
+    /// Docker image to use for the service (e.g., "gotempsh/postgres-walg:18-bookworm", "timescale/timescaledb-ha:pg18")
     /// When provided, the service container will be recreated with the new image
     pub docker_image: Option<String>,
 }
@@ -997,14 +997,29 @@ impl ExternalServiceManager {
         let service_instance =
             self.create_service_instance(service.name.clone(), service_type_enum);
 
-        // Start the service
-        service_instance
-            .start()
-            .await
-            .map_err(|e| ExternalServiceError::StartFailed {
-                id: service_id,
-                reason: e.to_string(),
-            })?;
+        // Try to start the existing container first
+        match service_instance.start().await {
+            Ok(()) => {}
+            Err(e) => {
+                // If start failed (e.g., container was removed and in-memory config is empty),
+                // fall back to full initialization which loads config from DB and recreates
+                // the container.
+                info!(
+                    "Direct start failed for service {} ({}), falling back to initialize: {}",
+                    service_id, service.name, e
+                );
+                self.initialize_service(service_id)
+                    .await
+                    .map_err(|init_err| ExternalServiceError::StartFailed {
+                        id: service_id,
+                        reason: format!(
+                            "Start failed: {}. Re-initialize also failed: {}",
+                            e, init_err
+                        ),
+                    })?;
+                return self.get_service_info(service_id).await;
+            }
+        }
 
         // Update status to running
         let mut service_update: external_services::ActiveModel = service.into();
@@ -2209,7 +2224,7 @@ mod tests {
         params.insert("max_connections".to_string(), JsonValue::Number(100.into()));
         params.insert(
             "docker_image".to_string(),
-            JsonValue::String("postgres:18-alpine".to_string()),
+            JsonValue::String("gotempsh/postgres-walg:18-bookworm".to_string()),
         );
 
         let request = CreateExternalServiceRequest {
@@ -2298,7 +2313,6 @@ mod tests {
 
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
-    #[ignore] // TODO: Implement service stop/start functionality
     async fn test_stop_and_start_service() {
         let (manager, _test_db) = setup_test_manager().await;
         let random_unused_port = get_unused_port();
@@ -2339,7 +2353,6 @@ mod tests {
 
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
-    #[ignore] // TODO: Implement service deletion functionality
     async fn test_delete_service() {
         let (manager, _test_db) = setup_test_manager().await;
 
@@ -2375,7 +2388,6 @@ mod tests {
 
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
-    #[ignore] // TODO: Implement service parameter update functionality
     async fn test_update_service_parameters() {
         let (manager, _test_db) = setup_test_manager().await;
 
@@ -2435,7 +2447,6 @@ mod tests {
 
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
-    #[ignore] // TODO: Implement get service by name functionality
     async fn test_get_service_by_name() {
         let (manager, _test_db) = setup_test_manager().await;
 
@@ -2467,7 +2478,6 @@ mod tests {
 
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
-    #[ignore] // TODO: Implement get service by slug functionality
     async fn test_get_service_by_slug() {
         let (manager, _test_db) = setup_test_manager().await;
 
@@ -2544,7 +2554,6 @@ mod tests {
 
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
-    #[ignore] // TODO: Implement get_service_environment_variables functionality
     async fn test_service_environment_variables() {
         let (manager, _test_db) = setup_test_manager().await;
         let random_unused_port = get_unused_port();
@@ -2631,7 +2640,7 @@ mod tests {
         params.insert("max_connections".to_string(), JsonValue::Number(100.into()));
         params.insert(
             "docker_image".to_string(),
-            JsonValue::String("postgres:18-alpine".to_string()),
+            JsonValue::String("gotempsh/postgres-walg:18-bookworm".to_string()),
         );
 
         let request = CreateExternalServiceRequest {
@@ -2678,7 +2687,6 @@ mod tests {
 
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
-    #[ignore] // FIXME: Parameter validation not implemented - code auto-generates missing parameters (port, password)
     async fn test_validate_parameters_fails_with_missing_required() {
         let (manager, _test_db) = setup_test_manager().await;
 
@@ -2794,7 +2802,7 @@ mod tests {
             "Initial docker_image should be postgres:18"
         );
 
-        // Step 2: Update docker_image parameter to postgres:18-alpine (same major version, different variant).
+        // Step 2: Update docker_image parameter to gotempsh/postgres-walg:18-bookworm (same major version, different variant).
         // Only include updateable parameters - readonly params (database, username, password, host)
         // are rejected by validate_for_update().
         let mut update_params = HashMap::new();
@@ -2807,7 +2815,7 @@ mod tests {
         let update_request = UpdateExternalServiceRequest {
             name: None,
             parameters: update_params,
-            docker_image: Some("postgres:18-alpine".to_string()),
+            docker_image: Some("gotempsh/postgres-walg:18-bookworm".to_string()),
         };
 
         // Update the service - same major version so data is compatible.
@@ -2828,8 +2836,8 @@ mod tests {
         let updated_params = updated_details.current_parameters.unwrap();
         assert_eq!(
             updated_params.get("docker_image").and_then(|v| v.as_str()),
-            Some("postgres:18-alpine"),
-            "Docker image parameter should be updated to postgres:18-alpine"
+            Some("gotempsh/postgres-walg:18-bookworm"),
+            "Docker image parameter should be updated to gotempsh/postgres-walg:18-bookworm"
         );
 
         // Cleanup - force delete to remove even unhealthy containers
@@ -2910,7 +2918,6 @@ mod tests {
 
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
-    #[ignore] // TODO: Implement masked environment variables functionality
     async fn test_masked_environment_variables() {
         let (manager, _test_db) = setup_test_manager().await;
         // Find a random unused port on the system
@@ -3206,7 +3213,7 @@ mod tests {
         let update_request = UpdateExternalServiceRequest {
             name: None,
             parameters: update_params,
-            docker_image: Some("postgres:18-alpine".to_string()),
+            docker_image: Some("gotempsh/postgres-walg:18-bookworm".to_string()),
         };
 
         let result = manager.update_service(service_id, update_request).await;
@@ -3217,7 +3224,7 @@ mod tests {
         let params = details.current_parameters.unwrap();
         assert_eq!(
             params.get("docker_image").and_then(|v| v.as_str()),
-            Some("postgres:18-alpine")
+            Some("gotempsh/postgres-walg:18-bookworm")
         );
 
         // Cleanup
@@ -3458,8 +3465,8 @@ mod tests {
         let container = AvailableContainer {
             container_id: "abc123".to_string(),
             container_name: "postgres-prod".to_string(),
-            image: "postgres:15-alpine".to_string(),
-            version: "15-alpine".to_string(),
+            image: "gotempsh/postgres-walg:15-bookworm".to_string(),
+            version: "15-bookworm".to_string(),
             service_type: ServiceType::Postgres,
             is_running: true,
             exposed_ports: vec![5432],
@@ -3467,8 +3474,8 @@ mod tests {
 
         assert_eq!(container.container_id, "abc123");
         assert_eq!(container.container_name, "postgres-prod");
-        assert_eq!(container.image, "postgres:15-alpine");
-        assert_eq!(container.version, "15-alpine");
+        assert_eq!(container.image, "gotempsh/postgres-walg:15-bookworm");
+        assert_eq!(container.version, "15-bookworm");
         assert_eq!(container.service_type, ServiceType::Postgres);
         assert!(container.is_running);
     }
@@ -3476,8 +3483,8 @@ mod tests {
     #[test]
     fn test_service_type_detection_postgres() {
         let images = vec![
-            "postgres:15-alpine",
-            "postgres:16-bullseye",
+            "gotempsh/postgres-walg:15-bookworm",
+            "gotempsh/postgres-walg:16-bookworm",
             "timescaledb/timescaledb-ha:pg15",
         ];
 
@@ -3498,7 +3505,11 @@ mod tests {
 
     #[test]
     fn test_service_type_detection_redis() {
-        let images = vec!["redis:8-alpine", "redis:latest", "redis:6.2-bullseye"];
+        let images = vec![
+            "gotempsh/redis-walg:8-bookworm",
+            "redis:latest",
+            "redis:6.2-bullseye",
+        ];
 
         for image in images {
             let detected = if image.contains("redis") {
@@ -3512,7 +3523,11 @@ mod tests {
 
     #[test]
     fn test_service_type_detection_mongodb() {
-        let images = vec!["mongo:7.0", "mongo:latest", "mongo:6.0-ubuntu"];
+        let images = vec![
+            "gotempsh/mongodb-walg:7.0",
+            "mongo:latest",
+            "gotempsh/mongodb-walg:8.0",
+        ];
 
         for image in images {
             let detected = if image.contains("mongo") {
@@ -3614,7 +3629,7 @@ mod tests {
             "username": "postgres",
             "password": "secret",
             "container_id": "abc123",
-            "docker_image": "postgres:15-alpine",
+            "docker_image": "gotempsh/postgres-walg:15-bookworm",
         });
 
         assert_eq!(params["host"], "localhost");
@@ -3648,7 +3663,7 @@ mod tests {
         // =============================
         //
         // Step 1: Create PostgreSQL v17 container
-        //   - Image: postgres:17-alpine
+        //   - Image: gotempsh/postgres-walg:17-bookworm
         //   - Environment: POSTGRES_DB=testdb, POSTGRES_USER=pguser, POSTGRES_PASSWORD=pgpass
         //   - Port: 5432 exposed
         //   - Name: test-postgres-v17-upgrade

@@ -173,16 +173,6 @@ pub struct GroupedPageMetricsResponse {
     pub grouped_by: String,
 }
 
-// Internal struct for SQL query results
-#[derive(Debug, Default)]
-struct MetricPercentiles {
-    avg: Option<f32>,
-    p75: Option<f32>,
-    p90: Option<f32>,
-    p95: Option<f32>,
-    p99: Option<f32>,
-}
-
 pub struct PerformanceService {
     db: Arc<DatabaseConnection>,
 }
@@ -203,14 +193,50 @@ impl PerformanceService {
         }
     }
 
-    /// Apply device type filter to a SeaORM query, translating frontend values
-    /// to woothee categories stored in the database.
-    fn apply_device_filter(
-        query: Select<performance_metrics::Entity>,
-        device_type: &str,
-    ) -> Select<performance_metrics::Entity> {
-        let categories = Self::woothee_device_types(device_type);
-        query.filter(performance_metrics::Column::DeviceType.is_in(categories))
+    /// Build the WHERE clause and params for percentile/time-series SQL queries.
+    fn build_percentile_where(
+        project_id: i32,
+        start_date: UtcDateTime,
+        end_date: UtcDateTime,
+        environment_id: Option<i32>,
+        deployment_id: Option<i32>,
+        device_type: Option<String>,
+    ) -> (String, Vec<sea_orm::Value>) {
+        let mut conditions = vec![
+            "project_id = $1".to_string(),
+            "recorded_at >= $2".to_string(),
+            "recorded_at <= $3".to_string(),
+        ];
+        let mut params: Vec<sea_orm::Value> =
+            vec![project_id.into(), start_date.into(), end_date.into()];
+        let mut idx = 3;
+
+        if let Some(env_id) = environment_id {
+            idx += 1;
+            conditions.push(format!("environment_id = ${}", idx));
+            params.push(env_id.into());
+        }
+
+        if let Some(dep_id) = deployment_id {
+            idx += 1;
+            conditions.push(format!("deployment_id = ${}", idx));
+            params.push(dep_id.into());
+        }
+
+        if let Some(ref device) = device_type {
+            let categories = Self::woothee_device_types(device);
+            let placeholders: Vec<String> = categories
+                .iter()
+                .map(|c| {
+                    idx += 1;
+                    params.push(c.clone().into());
+                    format!("${}", idx)
+                })
+                .collect();
+            conditions.push(format!("device_type IN ({})", placeholders.join(", ")));
+        }
+
+        (conditions.join(" AND "), params)
     }
 
     pub async fn get_metrics(
@@ -222,75 +248,161 @@ impl PerformanceService {
         deployment_id: Option<i32>,
         device_type: Option<String>,
     ) -> Result<PerformanceMetricsResponse, PerformanceError> {
-        // Get all metrics for the project and date range
-        let mut query = performance_metrics::Entity::find()
-            .filter(performance_metrics::Column::ProjectId.eq(project_id))
-            .filter(performance_metrics::Column::RecordedAt.between(start_date, end_date));
+        let (where_clause, params) = Self::build_percentile_where(
+            project_id,
+            start_date,
+            end_date,
+            environment_id,
+            deployment_id,
+            device_type,
+        );
 
-        if let Some(env_id) = environment_id {
-            query = query.filter(performance_metrics::Column::EnvironmentId.eq(env_id));
+        // Use SQL percentile_cont to compute all stats in a single query — no data loaded into Rust
+        let sql = format!(
+            r#"
+            SELECT
+                AVG(ttfb)::float4 as ttfb_avg,
+                AVG(lcp)::float4 as lcp_avg,
+                AVG(fid)::float4 as fid_avg,
+                AVG(fcp)::float4 as fcp_avg,
+                AVG(cls)::float4 as cls_avg,
+                AVG(inp)::float4 as inp_avg,
+                (percentile_cont(0.75) WITHIN GROUP (ORDER BY ttfb))::float4 as ttfb_p75,
+                (percentile_cont(0.75) WITHIN GROUP (ORDER BY lcp))::float4 as lcp_p75,
+                (percentile_cont(0.75) WITHIN GROUP (ORDER BY fid))::float4 as fid_p75,
+                (percentile_cont(0.75) WITHIN GROUP (ORDER BY fcp))::float4 as fcp_p75,
+                (percentile_cont(0.75) WITHIN GROUP (ORDER BY cls))::float4 as cls_p75,
+                (percentile_cont(0.75) WITHIN GROUP (ORDER BY inp))::float4 as inp_p75,
+                (percentile_cont(0.90) WITHIN GROUP (ORDER BY ttfb))::float4 as ttfb_p90,
+                (percentile_cont(0.90) WITHIN GROUP (ORDER BY lcp))::float4 as lcp_p90,
+                (percentile_cont(0.90) WITHIN GROUP (ORDER BY fid))::float4 as fid_p90,
+                (percentile_cont(0.90) WITHIN GROUP (ORDER BY fcp))::float4 as fcp_p90,
+                (percentile_cont(0.90) WITHIN GROUP (ORDER BY cls))::float4 as cls_p90,
+                (percentile_cont(0.90) WITHIN GROUP (ORDER BY inp))::float4 as inp_p90,
+                (percentile_cont(0.95) WITHIN GROUP (ORDER BY ttfb))::float4 as ttfb_p95,
+                (percentile_cont(0.95) WITHIN GROUP (ORDER BY lcp))::float4 as lcp_p95,
+                (percentile_cont(0.95) WITHIN GROUP (ORDER BY fid))::float4 as fid_p95,
+                (percentile_cont(0.95) WITHIN GROUP (ORDER BY fcp))::float4 as fcp_p95,
+                (percentile_cont(0.95) WITHIN GROUP (ORDER BY cls))::float4 as cls_p95,
+                (percentile_cont(0.95) WITHIN GROUP (ORDER BY inp))::float4 as inp_p95,
+                (percentile_cont(0.99) WITHIN GROUP (ORDER BY ttfb))::float4 as ttfb_p99,
+                (percentile_cont(0.99) WITHIN GROUP (ORDER BY lcp))::float4 as lcp_p99,
+                (percentile_cont(0.99) WITHIN GROUP (ORDER BY fid))::float4 as fid_p99,
+                (percentile_cont(0.99) WITHIN GROUP (ORDER BY fcp))::float4 as fcp_p99,
+                (percentile_cont(0.99) WITHIN GROUP (ORDER BY cls))::float4 as cls_p99,
+                (percentile_cont(0.99) WITHIN GROUP (ORDER BY inp))::float4 as inp_p99
+            FROM performance_metrics
+            WHERE {}
+            "#,
+            where_clause
+        );
+
+        #[derive(FromQueryResult)]
+        struct PercentileRow {
+            ttfb_avg: Option<f32>,
+            lcp_avg: Option<f32>,
+            fid_avg: Option<f32>,
+            fcp_avg: Option<f32>,
+            cls_avg: Option<f32>,
+            inp_avg: Option<f32>,
+            ttfb_p75: Option<f32>,
+            lcp_p75: Option<f32>,
+            fid_p75: Option<f32>,
+            fcp_p75: Option<f32>,
+            cls_p75: Option<f32>,
+            inp_p75: Option<f32>,
+            ttfb_p90: Option<f32>,
+            lcp_p90: Option<f32>,
+            fid_p90: Option<f32>,
+            fcp_p90: Option<f32>,
+            cls_p90: Option<f32>,
+            inp_p90: Option<f32>,
+            ttfb_p95: Option<f32>,
+            lcp_p95: Option<f32>,
+            fid_p95: Option<f32>,
+            fcp_p95: Option<f32>,
+            cls_p95: Option<f32>,
+            inp_p95: Option<f32>,
+            ttfb_p99: Option<f32>,
+            lcp_p99: Option<f32>,
+            fid_p99: Option<f32>,
+            fcp_p99: Option<f32>,
+            cls_p99: Option<f32>,
+            inp_p99: Option<f32>,
         }
 
-        if let Some(dep_id) = deployment_id {
-            query = query.filter(performance_metrics::Column::DeploymentId.eq(dep_id));
-        }
+        let row = PercentileRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &sql,
+            params,
+        ))
+        .one(self.db.as_ref())
+        .await?;
 
-        if let Some(ref device) = device_type {
-            query = Self::apply_device_filter(query, device);
-        }
-
-        let metrics = query.all(self.db.as_ref()).await?;
-
-        // Calculate simple averages and percentiles
-        let ttfb_values: Vec<f32> = metrics.iter().filter_map(|m| m.ttfb).collect();
-        let lcp_values: Vec<f32> = metrics.iter().filter_map(|m| m.lcp).collect();
-        let fid_values: Vec<f32> = metrics.iter().filter_map(|m| m.fid).collect();
-        let fcp_values: Vec<f32> = metrics.iter().filter_map(|m| m.fcp).collect();
-        let cls_values: Vec<f32> = metrics.iter().filter_map(|m| m.cls).collect();
-        let inp_values: Vec<f32> = metrics.iter().filter_map(|m| m.inp).collect();
-
-        let ttfb = Self::calculate_stats(&ttfb_values);
-        let lcp = Self::calculate_stats(&lcp_values);
-        let fid = Self::calculate_stats(&fid_values);
-        let fcp = Self::calculate_stats(&fcp_values);
-        let cls = Self::calculate_stats(&cls_values);
-        let inp = Self::calculate_stats(&inp_values);
+        let row = row.unwrap_or(PercentileRow {
+            ttfb_avg: None,
+            lcp_avg: None,
+            fid_avg: None,
+            fcp_avg: None,
+            cls_avg: None,
+            inp_avg: None,
+            ttfb_p75: None,
+            lcp_p75: None,
+            fid_p75: None,
+            fcp_p75: None,
+            cls_p75: None,
+            inp_p75: None,
+            ttfb_p90: None,
+            lcp_p90: None,
+            fid_p90: None,
+            fcp_p90: None,
+            cls_p90: None,
+            inp_p90: None,
+            ttfb_p95: None,
+            lcp_p95: None,
+            fid_p95: None,
+            fcp_p95: None,
+            cls_p95: None,
+            inp_p95: None,
+            ttfb_p99: None,
+            lcp_p99: None,
+            fid_p99: None,
+            fcp_p99: None,
+            cls_p99: None,
+            inp_p99: None,
+        });
 
         Ok(PerformanceMetricsResponse {
-            ttfb: ttfb.avg,
-            lcp: lcp.avg,
-            fid: fid.avg,
-            fcp: fcp.avg,
-            cls: cls.avg,
-            inp: inp.avg,
-
-            ttfb_p75: ttfb.p75,
-            lcp_p75: lcp.p75,
-            fid_p75: fid.p75,
-            fcp_p75: fcp.p75,
-            cls_p75: cls.p75,
-            inp_p75: inp.p75,
-
-            ttfb_p90: ttfb.p90,
-            lcp_p90: lcp.p90,
-            fid_p90: fid.p90,
-            fcp_p90: fcp.p90,
-            cls_p90: cls.p90,
-            inp_p90: inp.p90,
-
-            ttfb_p95: ttfb.p95,
-            lcp_p95: lcp.p95,
-            fid_p95: fid.p95,
-            fcp_p95: fcp.p95,
-            cls_p95: cls.p95,
-            inp_p95: inp.p95,
-
-            ttfb_p99: ttfb.p99,
-            lcp_p99: lcp.p99,
-            fid_p99: fid.p99,
-            fcp_p99: fcp.p99,
-            cls_p99: cls.p99,
-            inp_p99: inp.p99,
+            ttfb: row.ttfb_avg,
+            lcp: row.lcp_avg,
+            fid: row.fid_avg,
+            fcp: row.fcp_avg,
+            cls: row.cls_avg,
+            inp: row.inp_avg,
+            ttfb_p75: row.ttfb_p75,
+            lcp_p75: row.lcp_p75,
+            fid_p75: row.fid_p75,
+            fcp_p75: row.fcp_p75,
+            cls_p75: row.cls_p75,
+            inp_p75: row.inp_p75,
+            ttfb_p90: row.ttfb_p90,
+            lcp_p90: row.lcp_p90,
+            fid_p90: row.fid_p90,
+            fcp_p90: row.fcp_p90,
+            cls_p90: row.cls_p90,
+            inp_p90: row.inp_p90,
+            ttfb_p95: row.ttfb_p95,
+            lcp_p95: row.lcp_p95,
+            fid_p95: row.fid_p95,
+            fcp_p95: row.fcp_p95,
+            cls_p95: row.cls_p95,
+            inp_p95: row.inp_p95,
+            ttfb_p99: row.ttfb_p99,
+            lcp_p99: row.lcp_p99,
+            fid_p99: row.fid_p99,
+            fcp_p99: row.fcp_p99,
+            cls_p99: row.cls_p99,
+            inp_p99: row.inp_p99,
         })
     }
 
@@ -303,105 +415,198 @@ impl PerformanceService {
         deployment_id: Option<i32>,
         device_type: Option<String>,
     ) -> Result<MetricsOverTimeResponse, PerformanceError> {
-        // Get all metrics for percentile calculations
-        let mut percentile_query = performance_metrics::Entity::find()
-            .filter(performance_metrics::Column::ProjectId.eq(project_id))
-            .filter(performance_metrics::Column::RecordedAt.between(start_date, end_date));
+        let (where_clause, params) = Self::build_percentile_where(
+            project_id,
+            start_date,
+            end_date,
+            environment_id,
+            deployment_id,
+            device_type,
+        );
 
-        if let Some(env_id) = environment_id {
-            percentile_query =
-                percentile_query.filter(performance_metrics::Column::EnvironmentId.eq(env_id));
+        // Single SQL query: percentiles + time-bucketed averages in one round-trip.
+        // The percentiles CTE computes aggregates without loading rows into Rust.
+        // The time_series CTE uses time_bucket (TimescaleDB) for hourly averages.
+        let sql = format!(
+            r#"
+            WITH percentiles AS (
+                SELECT
+                    AVG(ttfb)::float4 as ttfb_avg,
+                    AVG(lcp)::float4 as lcp_avg,
+                    AVG(fid)::float4 as fid_avg,
+                    AVG(fcp)::float4 as fcp_avg,
+                    AVG(cls)::float4 as cls_avg,
+                    AVG(inp)::float4 as inp_avg,
+                    (percentile_cont(0.75) WITHIN GROUP (ORDER BY ttfb))::float4 as ttfb_p75,
+                    (percentile_cont(0.75) WITHIN GROUP (ORDER BY lcp))::float4 as lcp_p75,
+                    (percentile_cont(0.75) WITHIN GROUP (ORDER BY fid))::float4 as fid_p75,
+                    (percentile_cont(0.75) WITHIN GROUP (ORDER BY fcp))::float4 as fcp_p75,
+                    (percentile_cont(0.75) WITHIN GROUP (ORDER BY cls))::float4 as cls_p75,
+                    (percentile_cont(0.75) WITHIN GROUP (ORDER BY inp))::float4 as inp_p75,
+                    (percentile_cont(0.90) WITHIN GROUP (ORDER BY ttfb))::float4 as ttfb_p90,
+                    (percentile_cont(0.90) WITHIN GROUP (ORDER BY lcp))::float4 as lcp_p90,
+                    (percentile_cont(0.90) WITHIN GROUP (ORDER BY fid))::float4 as fid_p90,
+                    (percentile_cont(0.90) WITHIN GROUP (ORDER BY fcp))::float4 as fcp_p90,
+                    (percentile_cont(0.90) WITHIN GROUP (ORDER BY cls))::float4 as cls_p90,
+                    (percentile_cont(0.90) WITHIN GROUP (ORDER BY inp))::float4 as inp_p90,
+                    (percentile_cont(0.95) WITHIN GROUP (ORDER BY ttfb))::float4 as ttfb_p95,
+                    (percentile_cont(0.95) WITHIN GROUP (ORDER BY lcp))::float4 as lcp_p95,
+                    (percentile_cont(0.95) WITHIN GROUP (ORDER BY fid))::float4 as fid_p95,
+                    (percentile_cont(0.95) WITHIN GROUP (ORDER BY fcp))::float4 as fcp_p95,
+                    (percentile_cont(0.95) WITHIN GROUP (ORDER BY cls))::float4 as cls_p95,
+                    (percentile_cont(0.95) WITHIN GROUP (ORDER BY inp))::float4 as inp_p95,
+                    (percentile_cont(0.99) WITHIN GROUP (ORDER BY ttfb))::float4 as ttfb_p99,
+                    (percentile_cont(0.99) WITHIN GROUP (ORDER BY lcp))::float4 as lcp_p99,
+                    (percentile_cont(0.99) WITHIN GROUP (ORDER BY fid))::float4 as fid_p99,
+                    (percentile_cont(0.99) WITHIN GROUP (ORDER BY fcp))::float4 as fcp_p99,
+                    (percentile_cont(0.99) WITHIN GROUP (ORDER BY cls))::float4 as cls_p99,
+                    (percentile_cont(0.99) WITHIN GROUP (ORDER BY inp))::float4 as inp_p99
+                FROM performance_metrics
+                WHERE {where_clause}
+            ),
+            time_series AS (
+                SELECT
+                    time_bucket('1 hour', recorded_at) as bucket,
+                    AVG(ttfb)::float4 as ttfb,
+                    AVG(lcp)::float4 as lcp,
+                    AVG(fid)::float4 as fid,
+                    AVG(fcp)::float4 as fcp,
+                    AVG(cls)::float4 as cls,
+                    AVG(inp)::float4 as inp
+                FROM performance_metrics
+                WHERE {where_clause}
+                GROUP BY bucket
+                ORDER BY bucket ASC
+            )
+            SELECT
+                ts.bucket as "timestamp",
+                ts.ttfb, ts.lcp, ts.fid, ts.fcp, ts.cls, ts.inp,
+                p.ttfb_p75, p.lcp_p75, p.fid_p75, p.fcp_p75, p.cls_p75, p.inp_p75,
+                p.ttfb_p90, p.lcp_p90, p.fid_p90, p.fcp_p90, p.cls_p90, p.inp_p90,
+                p.ttfb_p95, p.lcp_p95, p.fid_p95, p.fcp_p95, p.cls_p95, p.inp_p95,
+                p.ttfb_p99, p.lcp_p99, p.fid_p99, p.fcp_p99, p.cls_p99, p.inp_p99
+            FROM time_series ts
+            CROSS JOIN percentiles p
+            "#,
+            where_clause = where_clause
+        );
+
+        // The CTE references the same WHERE twice, but with the same param positions.
+        // PostgreSQL allows re-use of $N placeholders, so we pass params once.
+
+        #[derive(FromQueryResult)]
+        struct OverTimeRow {
+            timestamp: UtcDateTime,
+            ttfb: Option<f32>,
+            lcp: Option<f32>,
+            fid: Option<f32>,
+            fcp: Option<f32>,
+            cls: Option<f32>,
+            inp: Option<f32>,
+            ttfb_p75: Option<f32>,
+            lcp_p75: Option<f32>,
+            fid_p75: Option<f32>,
+            fcp_p75: Option<f32>,
+            cls_p75: Option<f32>,
+            inp_p75: Option<f32>,
+            ttfb_p90: Option<f32>,
+            lcp_p90: Option<f32>,
+            fid_p90: Option<f32>,
+            fcp_p90: Option<f32>,
+            cls_p90: Option<f32>,
+            inp_p90: Option<f32>,
+            ttfb_p95: Option<f32>,
+            lcp_p95: Option<f32>,
+            fid_p95: Option<f32>,
+            fcp_p95: Option<f32>,
+            cls_p95: Option<f32>,
+            inp_p95: Option<f32>,
+            ttfb_p99: Option<f32>,
+            lcp_p99: Option<f32>,
+            fid_p99: Option<f32>,
+            fcp_p99: Option<f32>,
+            cls_p99: Option<f32>,
+            inp_p99: Option<f32>,
         }
 
-        if let Some(dep_id) = deployment_id {
-            percentile_query =
-                percentile_query.filter(performance_metrics::Column::DeploymentId.eq(dep_id));
-        }
-
-        if let Some(ref device) = device_type {
-            percentile_query = Self::apply_device_filter(percentile_query, device);
-        }
-
-        let all_metrics = percentile_query.all(self.db.as_ref()).await?;
-
-        // Calculate percentiles
-        let ttfb_values: Vec<f32> = all_metrics.iter().filter_map(|m| m.ttfb).collect();
-        let lcp_values: Vec<f32> = all_metrics.iter().filter_map(|m| m.lcp).collect();
-        let fid_values: Vec<f32> = all_metrics.iter().filter_map(|m| m.fid).collect();
-        let fcp_values: Vec<f32> = all_metrics.iter().filter_map(|m| m.fcp).collect();
-        let cls_values: Vec<f32> = all_metrics.iter().filter_map(|m| m.cls).collect();
-        let inp_values: Vec<f32> = all_metrics.iter().filter_map(|m| m.inp).collect();
-
-        let ttfb = Self::calculate_stats(&ttfb_values);
-        let lcp = Self::calculate_stats(&lcp_values);
-        let fid = Self::calculate_stats(&fid_values);
-        let fcp = Self::calculate_stats(&fcp_values);
-        let cls = Self::calculate_stats(&cls_values);
-        let inp = Self::calculate_stats(&inp_values);
-
-        // Get time series data
-        let mut time_query = performance_metrics::Entity::find()
-            .filter(performance_metrics::Column::ProjectId.eq(project_id))
-            .filter(performance_metrics::Column::RecordedAt.between(start_date, end_date))
-            .order_by_asc(performance_metrics::Column::RecordedAt);
-
-        if let Some(env_id) = environment_id {
-            time_query = time_query.filter(performance_metrics::Column::EnvironmentId.eq(env_id));
-        }
-
-        if let Some(dep_id) = deployment_id {
-            time_query = time_query.filter(performance_metrics::Column::DeploymentId.eq(dep_id));
-        }
-
-        if let Some(ref device) = device_type {
-            time_query = Self::apply_device_filter(time_query, device);
-        }
-
-        let metrics = time_query.all(self.db.as_ref()).await?;
+        let rows = OverTimeRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &sql,
+            params,
+        ))
+        .all(self.db.as_ref())
+        .await?;
 
         let mut result = MetricsOverTimeResponse {
-            timestamps: Vec::new(),
-            ttfb: Vec::new(),
-            lcp: Vec::new(),
-            fid: Vec::new(),
-            fcp: Vec::new(),
-            cls: Vec::new(),
-            inp: Vec::new(),
-            // Single values for percentiles
-            ttfb_p75: ttfb.p75,
-            lcp_p75: lcp.p75,
-            fid_p75: fid.p75,
-            fcp_p75: fcp.p75,
-            cls_p75: cls.p75,
-            inp_p75: inp.p75,
-            ttfb_p90: ttfb.p90,
-            lcp_p90: lcp.p90,
-            fid_p90: fid.p90,
-            fcp_p90: fcp.p90,
-            cls_p90: cls.p90,
-            inp_p90: inp.p90,
-            ttfb_p95: ttfb.p95,
-            lcp_p95: lcp.p95,
-            fid_p95: fid.p95,
-            fcp_p95: fcp.p95,
-            cls_p95: cls.p95,
-            inp_p95: inp.p95,
-            ttfb_p99: ttfb.p99,
-            lcp_p99: lcp.p99,
-            fid_p99: fid.p99,
-            fcp_p99: fcp.p99,
-            cls_p99: cls.p99,
-            inp_p99: inp.p99,
+            timestamps: Vec::with_capacity(rows.len()),
+            ttfb: Vec::with_capacity(rows.len()),
+            lcp: Vec::with_capacity(rows.len()),
+            fid: Vec::with_capacity(rows.len()),
+            fcp: Vec::with_capacity(rows.len()),
+            cls: Vec::with_capacity(rows.len()),
+            inp: Vec::with_capacity(rows.len()),
+            // Percentiles are the same for every row; take from first (or None if empty)
+            ttfb_p75: None,
+            lcp_p75: None,
+            fid_p75: None,
+            fcp_p75: None,
+            cls_p75: None,
+            inp_p75: None,
+            ttfb_p90: None,
+            lcp_p90: None,
+            fid_p90: None,
+            fcp_p90: None,
+            cls_p90: None,
+            inp_p90: None,
+            ttfb_p95: None,
+            lcp_p95: None,
+            fid_p95: None,
+            fcp_p95: None,
+            cls_p95: None,
+            inp_p95: None,
+            ttfb_p99: None,
+            lcp_p99: None,
+            fid_p99: None,
+            fcp_p99: None,
+            cls_p99: None,
+            inp_p99: None,
         };
 
-        for metric in metrics {
-            result.timestamps.push(metric.recorded_at.to_rfc3339());
-            result.ttfb.push(metric.ttfb);
-            result.lcp.push(metric.lcp);
-            result.fid.push(metric.fid);
-            result.fcp.push(metric.fcp);
-            result.cls.push(metric.cls);
-            result.inp.push(metric.inp);
+        if let Some(first) = rows.first() {
+            result.ttfb_p75 = first.ttfb_p75;
+            result.lcp_p75 = first.lcp_p75;
+            result.fid_p75 = first.fid_p75;
+            result.fcp_p75 = first.fcp_p75;
+            result.cls_p75 = first.cls_p75;
+            result.inp_p75 = first.inp_p75;
+            result.ttfb_p90 = first.ttfb_p90;
+            result.lcp_p90 = first.lcp_p90;
+            result.fid_p90 = first.fid_p90;
+            result.fcp_p90 = first.fcp_p90;
+            result.cls_p90 = first.cls_p90;
+            result.inp_p90 = first.inp_p90;
+            result.ttfb_p95 = first.ttfb_p95;
+            result.lcp_p95 = first.lcp_p95;
+            result.fid_p95 = first.fid_p95;
+            result.fcp_p95 = first.fcp_p95;
+            result.cls_p95 = first.cls_p95;
+            result.inp_p95 = first.inp_p95;
+            result.ttfb_p99 = first.ttfb_p99;
+            result.lcp_p99 = first.lcp_p99;
+            result.fid_p99 = first.fid_p99;
+            result.fcp_p99 = first.fcp_p99;
+            result.cls_p99 = first.cls_p99;
+            result.inp_p99 = first.inp_p99;
+        }
+
+        for row in &rows {
+            result.timestamps.push(row.timestamp.to_rfc3339());
+            result.ttfb.push(row.ttfb);
+            result.lcp.push(row.lcp);
+            result.fid.push(row.fid);
+            result.fcp.push(row.fcp);
+            result.cls.push(row.cls);
+            result.inp.push(row.inp);
         }
 
         Ok(result)
@@ -537,30 +742,6 @@ impl PerformanceService {
             total_events,
             grouped_by: group_by_name.to_string(),
         })
-    }
-
-    fn calculate_stats(values: &[f32]) -> MetricPercentiles {
-        if values.is_empty() {
-            return MetricPercentiles::default();
-        }
-
-        let mut sorted = values.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        let len = sorted.len();
-        let avg = sorted.iter().sum::<f32>() / len as f32;
-        let p75 = sorted.get((len * 75) / 100).copied();
-        let p90 = sorted.get((len * 90) / 100).copied();
-        let p95 = sorted.get((len * 95) / 100).copied();
-        let p99 = sorted.get((len * 99) / 100).copied();
-
-        MetricPercentiles {
-            avg: Some(avg),
-            p75,
-            p90,
-            p95,
-            p99,
-        }
     }
 
     /// Record performance metrics from client

@@ -384,13 +384,32 @@ impl WebhookEventListener {
     }
 }
 
+impl Drop for WebhookEventListener {
+    fn drop(&mut self) {
+        // Abort the background task if it's still running.
+        // We can't call the async stop() from Drop, but we can abort the handle
+        // which will cause the spawned task to be cancelled immediately.
+        // try_write() is synchronous and won't block — it fails if the lock is held.
+        match self.task_handle.try_write() {
+            Ok(mut guard) => {
+                if let Some(handle) = guard.take() {
+                    handle.abort();
+                }
+            }
+            Err(_) => {
+                // Lock is held — this is rare during Drop. The task will be cleaned
+                // up when the Arc<RwLock> is fully dropped and the JoinHandle is dropped.
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_listener_lifecycle() {
-        // Create mock services
+    /// Helper to create a test listener with mock services
+    async fn create_test_listener() -> WebhookEventListener {
         let db = Arc::new(sea_orm::Database::connect("sqlite::memory:").await.unwrap());
         let encryption_service = Arc::new(
             temps_core::EncryptionService::new(
@@ -403,7 +422,12 @@ mod tests {
             temps_queue::BroadcastQueueService::create_broadcast_channel(100);
         let queue = Arc::new(queue_service) as Arc<dyn JobQueue>;
 
-        let listener = WebhookEventListener::new(webhook_service, db.clone(), queue);
+        WebhookEventListener::new(webhook_service, db.clone(), queue)
+    }
+
+    #[tokio::test]
+    async fn test_listener_lifecycle() {
+        let listener = create_test_listener().await;
 
         // Test initial state
         assert!(!listener.is_running().await);
@@ -413,6 +437,62 @@ mod tests {
         assert!(listener.is_running().await);
 
         // Stop listener
+        listener.stop().await;
+        assert!(!listener.is_running().await);
+    }
+
+    #[tokio::test]
+    async fn test_listener_drop_when_not_started() {
+        let listener = create_test_listener().await;
+
+        // Dropping an unstarted listener should not panic
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn test_listener_drop_aborts_running_task() {
+        let listener = create_test_listener().await;
+
+        listener.start().await.unwrap();
+        assert!(listener.is_running().await);
+
+        // Capture the abort handle before dropping
+        let handle = {
+            let guard = listener.task_handle.read().await;
+            guard.as_ref().unwrap().abort_handle()
+        };
+
+        // Drop the listener — Drop impl should abort the background task
+        drop(listener);
+
+        // Give tokio a tick to process the abort
+        tokio::task::yield_now().await;
+
+        assert!(
+            handle.is_finished(),
+            "Background task should be aborted after Drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_listener_double_start_is_noop() {
+        let listener = create_test_listener().await;
+
+        listener.start().await.unwrap();
+        assert!(listener.is_running().await);
+
+        // Starting again should succeed without error
+        listener.start().await.unwrap();
+        assert!(listener.is_running().await);
+
+        listener.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_listener_stop_when_not_started_is_safe() {
+        let listener = create_test_listener().await;
+
+        // Stopping an unstarted listener should not panic
         listener.stop().await;
         assert!(!listener.is_running().await);
     }

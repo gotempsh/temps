@@ -200,6 +200,42 @@ pub struct EventMetricsPayload {
     pub inp: Option<f32>,
 }
 
+/// Payload for server-side event ingestion via the console API.
+///
+/// The app backend reads the encrypted `_temps_visitor_id` and `_temps_sid`
+/// cookie values from the user's request and forwards them here.
+/// Temps decrypts them server-side to resolve visitor/session identity.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ConsoleEventPayload {
+    /// Event name (e.g. "purchase", "signup", custom event names)
+    pub event_name: String,
+    /// Arbitrary JSON event data
+    #[serde(default = "default_event_data")]
+    pub event_data: serde_json::Value,
+    /// Encrypted `_temps_visitor_id` cookie value from the user's browser
+    pub visitor_id: Option<String>,
+    /// Encrypted `_temps_sid` cookie value from the user's browser
+    pub session_id: Option<String>,
+    /// Environment ID to attribute the event to
+    pub environment_id: i32,
+    /// Deployment ID to attribute the event to
+    pub deployment_id: i32,
+    /// Page path context (defaults to "/")
+    #[serde(default = "default_request_path")]
+    pub request_path: String,
+    /// Query string context
+    #[serde(default)]
+    pub request_query: String,
+}
+
+fn default_event_data() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+fn default_request_path() -> String {
+    "/".to_string()
+}
+
 /// Query parameters for property breakdown (group by column)
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct PropertyBreakdownQuery {

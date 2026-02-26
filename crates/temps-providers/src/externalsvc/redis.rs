@@ -1,11 +1,11 @@
 use crate::utils::ensure_network_exists;
 
 use super::{ExternalService, ServiceConfig, ServiceType};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::{body_full, Docker};
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use redis::{aio::ConnectionManager, Client};
 use schemars::JsonSchema;
 use sea_orm::prelude::*;
@@ -45,7 +45,7 @@ pub struct RedisInputConfig {
     )]
     pub password: Option<String>,
 
-    /// Full Docker image reference (e.g., "redis:8-alpine")
+    /// Full Docker image reference (e.g., "gotempsh/redis-walg:8-bookworm")
     #[serde(default = "default_docker_image")]
     #[schemars(example = "example_docker_image", default = "default_docker_image")]
     pub docker_image: String,
@@ -135,11 +135,11 @@ fn example_password() -> &'static str {
 }
 
 fn default_docker_image() -> String {
-    "redis:8-alpine".to_string()
+    "gotempsh/redis-walg:8-bookworm".to_string()
 }
 
 fn example_docker_image() -> &'static str {
-    "redis:8-alpine"
+    "gotempsh/redis-walg:8-bookworm"
 }
 
 fn is_port_available(port: u16) -> bool {
@@ -554,6 +554,540 @@ impl RedisService {
     }
 }
 
+impl RedisService {
+    /// Restore from a WAL-G backup stored in S3.
+    ///
+    /// WAL-G restore requires stopping Redis, fetching the backup (which writes
+    /// dump.rdb via WALG_STREAM_RESTORE_COMMAND), and restarting.
+    async fn restore_from_walg(
+        &self,
+        s3_credentials: &super::S3Credentials,
+        walg_s3_prefix: &str,
+    ) -> Result<()> {
+        let container_name = self.get_container_name();
+
+        info!(
+            "Restoring Redis from WAL-G backup (prefix: {}) in container '{}'",
+            walg_s3_prefix, container_name
+        );
+
+        // Get the Redis image from the running container for the helper
+        let container_info = self
+            .docker
+            .inspect_container(
+                &container_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await?;
+        let redis_image = container_info
+            .config
+            .as_ref()
+            .and_then(|c| c.image.clone())
+            .unwrap_or_else(|| "gotempsh/redis-walg:8-bookworm".to_string());
+
+        // Build WAL-G environment variables for the helper container.
+        // WALG_STREAM_RESTORE_COMMAND tells WAL-G how to write the restored data.
+        let mut walg_env: Vec<String> = vec![
+            format!("WALG_S3_PREFIX={}", walg_s3_prefix),
+            format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
+            format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
+            format!("AWS_REGION={}", s3_credentials.region),
+            // WALG_STREAM_CREATE_COMMAND is required even for fetch (WAL-G validates it)
+            "WALG_STREAM_CREATE_COMMAND=echo noop".to_string(),
+            "WALG_STREAM_RESTORE_COMMAND=cat > /data/dump.rdb".to_string(),
+        ];
+
+        // Resolve S3 endpoint for use inside the Docker container.
+        if let Some(resolved_endpoint) = s3_credentials
+            .resolve_endpoint_for_container(&self.docker, &container_name)
+            .await
+        {
+            walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
+        }
+        if s3_credentials.force_path_style {
+            walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
+        }
+
+        // Step 1: Stop the Redis container so it's not using the data volume.
+        // Redis is PID 1, so stopping the container cleanly shuts down Redis and
+        // ensures no autosave can overwrite the dump.rdb we're about to write.
+        //
+        // IMPORTANT: Disable the restart policy first. The container has
+        // restart_policy=always, so Docker would immediately restart it after stop,
+        // preventing the helper container from writing to the shared volume.
+        info!("Disabling restart policy and stopping Redis container for restore");
+        self.docker
+            .update_container(
+                &container_name,
+                bollard::models::ContainerUpdateBody {
+                    restart_policy: Some(bollard::models::RestartPolicy {
+                        name: Some(bollard::models::RestartPolicyNameEnum::NO),
+                        maximum_retry_count: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to disable restart policy: {}", e))?;
+
+        self.docker
+            .stop_container(&container_name, None::<StopContainerOptions>)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to stop Redis container for restore: {}", e))?;
+
+        // Step 2: Use an ephemeral helper container with volumes_from to run WAL-G fetch.
+        // We can't exec into a stopped container, so we create a helper that shares
+        // the same data volume and runs WAL-G backup-fetch there.
+        info!("Fetching WAL-G backup via helper container");
+        let helper_name = format!("{}-restore-helper", container_name);
+
+        use bollard::models::{ContainerCreateBody, HostConfig};
+        // The helper runs WAL-G fetch (which writes dump.rdb) and then replaces the AOF
+        // base file with the restored RDB. Redis 7+ with --appendonly yes loads from the
+        // multi-part AOF in appendonlydir/ (base RDB + incremental AOF files). If we just
+        // delete appendonlydir, Redis recreates an EMPTY one on startup and ignores dump.rdb.
+        //
+        // Fix: After fetching the backup to dump.rdb, we:
+        // 1. Remove the old appendonlydir contents
+        // 2. Create a fresh appendonlydir with our dump.rdb as the base RDB
+        // 3. Write a manifest that points to our base RDB only (no incremental files)
+        //
+        // This way Redis loads our restored data through its normal AOF loading path.
+        let restore_script = concat!(
+            "wal-g backup-fetch LATEST 2>&1 && ",
+            "rm -rf /data/appendonlydir && ",
+            "mkdir -p /data/appendonlydir && ",
+            "cp /data/dump.rdb /data/appendonlydir/appendonly.aof.1.base.rdb && ",
+            "printf 'file appendonly.aof.1.base.rdb seq 1 type b\\n' > /data/appendonlydir/appendonly.aof.manifest && ",
+            "chown -R redis:redis /data/appendonlydir && ",
+            "echo 'Restore helper completed successfully'"
+        );
+        let helper_config = ContainerCreateBody {
+            image: Some(redis_image),
+            cmd: Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                restore_script.to_string(),
+            ]),
+            env: Some(walg_env),
+            host_config: Some(HostConfig {
+                volumes_from: Some(vec![container_name.clone()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let helper = self
+            .docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&helper_name)
+                        .build(),
+                ),
+                helper_config,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create restore helper container: {}", e))?;
+
+        self.docker
+            .start_container(
+                &helper.id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to start restore helper container: {}", e))?;
+
+        // Wait for helper to finish
+        use futures::StreamExt;
+        let wait_result = self
+            .docker
+            .wait_container(
+                &helper.id,
+                None::<bollard::query_parameters::WaitContainerOptions>,
+            )
+            .next()
+            .await;
+
+        // Capture helper container logs before cleanup for diagnostics
+        let log_output = {
+            use bollard::query_parameters::LogsOptions;
+            let mut log_stream = self.docker.logs(
+                &helper.id,
+                Some(LogsOptions {
+                    stdout: true,
+                    stderr: true,
+                    follow: false,
+                    ..Default::default()
+                }),
+            );
+            let mut logs = String::new();
+            while let Some(Ok(chunk)) = log_stream.next().await {
+                logs.push_str(&chunk.to_string());
+            }
+            logs
+        };
+
+        if log_output.is_empty() {
+            info!(
+                "WAL-G restore helper produced no output for '{}'",
+                container_name
+            );
+        } else {
+            info!(
+                "WAL-G restore helper logs for '{}': {}",
+                container_name,
+                log_output.trim()
+            );
+        }
+
+        // Clean up helper container
+        let _ = self
+            .docker
+            .remove_container(
+                &helper.id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: false,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        if let Some(Ok(wait_response)) = wait_result {
+            if wait_response.status_code != 0 {
+                return Err(anyhow::anyhow!(
+                    "WAL-G backup-fetch helper exited with code {} for container '{}'. Logs: {}",
+                    wait_response.status_code,
+                    container_name,
+                    log_output.trim()
+                ));
+            }
+        }
+
+        // Step 3: Re-enable restart policy and start the original Redis container.
+        // Redis will load the restored dump.rdb on startup.
+        info!("Starting Redis with restored data");
+        self.docker
+            .update_container(
+                &container_name,
+                bollard::models::ContainerUpdateBody {
+                    restart_policy: Some(bollard::models::RestartPolicy {
+                        name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
+                        maximum_retry_count: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to re-enable restart policy: {}", e))?;
+
+        self.docker
+            .start_container(
+                &container_name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to start Redis after restore: {}", e))?;
+
+        // Wait for container to be healthy
+        self.wait_for_container_health(&self.docker, &container_name)
+            .await?;
+
+        info!("Redis WAL-G restore completed successfully");
+        Ok(())
+    }
+
+    /// Restore from a legacy backup (pre-WAL-G .tar files containing dump.rdb/appendonly.aof).
+    /// Falls back to the old approach: download from S3, extract, upload to container.
+    async fn restore_from_legacy(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        backup_location: &str,
+        s3_source: &temps_entities::s3_sources::Model,
+    ) -> Result<()> {
+        info!(
+            "Restoring Redis from legacy backup format: {}",
+            backup_location
+        );
+
+        // Get the backup object from S3
+        let get_obj = s3_client
+            .get_object()
+            .bucket(&s3_source.bucket_name)
+            .key(backup_location)
+            .send()
+            .await?;
+
+        // Read the backup data
+        let backup_data = get_obj.body.collect().await?.to_vec();
+
+        let container_name = self.get_container_name();
+
+        self.docker
+            .stop_container(&container_name, None::<StopContainerOptions>)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to stop Redis container for restore: {}", e))?;
+
+        // Create a temporary directory
+        let temp_dir = tempfile::tempdir()?;
+        let tar_path = temp_dir.path().join("backup.tar");
+
+        // Write the tar file
+        tokio::fs::write(&tar_path, backup_data).await?;
+
+        // Extract the tar file
+        let tar_file = std::fs::File::open(&tar_path)?;
+        let mut archive = tar::Archive::new(tar_file);
+        archive.unpack(temp_dir.path())?;
+
+        // Create a new tar archive with the extracted files in the correct structure
+        let mut tar = tar::Builder::new(Vec::new());
+        for file in &["dump.rdb", "appendonly.aof"] {
+            let file_path = temp_dir.path().join(file);
+            if file_path.exists() {
+                tar.append_path_with_name(&file_path, file)?;
+            }
+        }
+        let tar_data = tar.into_inner()?;
+
+        // Copy both files into the container's data directory
+        self.docker
+            .upload_to_container(
+                &container_name,
+                Some(bollard::query_parameters::UploadToContainerOptions {
+                    path: "/data".to_string(),
+                    ..Default::default()
+                }),
+                body_full(bytes::Bytes::from(tar_data)),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to upload backup files to container: {}", e))?;
+
+        // Start Redis server again
+        self.docker
+            .start_container(
+                &container_name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to start Redis container after restore: {}", e))?;
+
+        // Wait for container to be healthy
+        self.wait_for_container_health(&self.docker, &container_name)
+            .await?;
+
+        info!("Redis legacy restore completed successfully");
+        Ok(())
+    }
+
+    /// Check if the WAL-G binary is available inside a container.
+    async fn container_has_walg(&self, container_name: &str) -> bool {
+        use bollard::exec::{CreateExecOptions, StartExecOptions};
+
+        let exec = match self
+            .docker
+            .create_exec(
+                container_name,
+                CreateExecOptions {
+                    cmd: Some(vec!["which", "wal-g"]),
+                    attach_stdout: Some(false),
+                    attach_stderr: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+
+        if self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(StartExecOptions {
+                    detach: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .is_err()
+        {
+            return false;
+        }
+
+        loop {
+            match self.docker.inspect_exec(&exec.id).await {
+                Ok(inspect) => {
+                    if inspect.running == Some(false) {
+                        return inspect.exit_code == Some(0);
+                    }
+                }
+                Err(_) => return false,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Legacy Redis backup using BGSAVE + file copy.
+    /// Fallback for containers without WAL-G (e.g., `redis:8-alpine`).
+    async fn backup_to_s3_legacy(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        backup: temps_entities::backups::Model,
+        s3_source: &temps_entities::s3_sources::Model,
+        subpath: &str,
+        pool: &temps_database::DbConnection,
+        external_service: &temps_entities::external_services::Model,
+    ) -> Result<String> {
+        use chrono::Utc;
+        use sea_orm::*;
+        use std::io::Write;
+
+        info!("Starting Redis backup to S3 via legacy BGSAVE");
+
+        let backup_record = temps_entities::external_service_backups::Entity::insert(
+            temps_entities::external_service_backups::ActiveModel {
+                service_id: Set(external_service.id),
+                backup_id: Set(backup.id),
+                backup_type: Set("full".to_string()),
+                state: Set("running".to_string()),
+                started_at: Set(Utc::now()),
+                s3_location: Set("".to_string()),
+                metadata: Set(serde_json::json!({
+                    "service_type": "redis",
+                    "service_name": self.name,
+                    "backup_tool": "bgsave",
+                })),
+                compression_type: Set("none".to_string()),
+                created_by: Set(0),
+                ..Default::default()
+            },
+        )
+        .exec_with_returning(pool)
+        .await?;
+
+        let container_name = self.get_container_name();
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path = temp_dir.path();
+
+        // Execute BGSAVE
+        self.docker
+            .create_exec(
+                &container_name,
+                bollard::exec::CreateExecOptions {
+                    cmd: Some(vec!["redis-cli", "BGSAVE"]),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // Copy dump.rdb and appendonly.aof from container
+        for file in &["dump.rdb", "appendonly.aof"] {
+            let cat_exec = self
+                .docker
+                .create_exec(
+                    &container_name,
+                    bollard::exec::CreateExecOptions {
+                        cmd: Some(vec!["cat", &format!("/data/{}", file)]),
+                        attach_stdout: Some(true),
+                        attach_stderr: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+
+            let file_path = temp_path.join(file);
+            let mut temp_file = std::fs::File::create(&file_path)?;
+
+            let output = self.docker.start_exec(&cat_exec.id, None).await?;
+            if let bollard::exec::StartExecResults::Attached { output, .. } = output {
+                use futures::stream::StreamExt;
+                let mut stream = output.boxed();
+                while let Some(result) = stream.next().await {
+                    match result {
+                        Ok(log_output) => match log_output {
+                            bollard::container::LogOutput::StdOut { message }
+                            | bollard::container::LogOutput::StdErr { message } => {
+                                temp_file.write_all(&message)?;
+                            }
+                            _ => (),
+                        },
+                        Err(e) => {
+                            error!("Error streaming backup data for {}: {}", file, e);
+                            let mut backup_update:
+                                temps_entities::external_service_backups::ActiveModel =
+                                backup_record.clone().into();
+                            backup_update.state = Set("failed".to_string());
+                            backup_update.error_message = Set(Some(e.to_string()));
+                            backup_update.finished_at = Set(Some(Utc::now()));
+                            backup_update.update(pool).await?;
+                            return Err(anyhow::anyhow!("Failed to stream backup data: {}", e));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Create tar archive
+        let tar_path = temp_path.join("redis_backup.tar");
+        let tar_file = std::fs::File::create(&tar_path)?;
+        let mut tar_builder = tar::Builder::new(tar_file);
+        for file in &["dump.rdb", "appendonly.aof"] {
+            let file_path = temp_path.join(file);
+            tar_builder.append_path_with_name(&file_path, file)?;
+        }
+        tar_builder.finish()?;
+
+        let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+        let backup_key = format!(
+            "{}/redis_backup_{}.tar",
+            subpath.trim_matches('/'),
+            timestamp
+        );
+
+        let size_bytes = std::fs::metadata(&tar_path)?.len() as i32;
+
+        if size_bytes == 0 {
+            let mut backup_update: temps_entities::external_service_backups::ActiveModel =
+                backup_record.clone().into();
+            backup_update.state = Set("failed".to_string());
+            backup_update.finished_at = Set(Some(Utc::now()));
+            backup_update.error_message =
+                Set(Some("Backup failed: backup file has zero size".to_string()));
+            backup_update.update(pool).await?;
+            return Err(anyhow::anyhow!(
+                "Redis backup failed: backup file has zero size"
+            ));
+        }
+
+        s3_client
+            .put_object()
+            .bucket(&s3_source.bucket_name)
+            .key(&backup_key)
+            .body(aws_sdk_s3::primitives::ByteStream::from_path(&tar_path).await?)
+            .content_type("application/x-tar")
+            .send()
+            .await?;
+
+        let mut backup_update: temps_entities::external_service_backups::ActiveModel =
+            backup_record.clone().into();
+        backup_update.state = Set("completed".to_string());
+        backup_update.finished_at = Set(Some(Utc::now()));
+        backup_update.size_bytes = Set(Some(size_bytes));
+        backup_update.s3_location = Set(backup_key.clone());
+        backup_update.update(pool).await?;
+
+        info!("Redis legacy backup completed successfully: {}", backup_key);
+        Ok(backup_key)
+    }
+}
+
 /// Internal port used by Redis inside the container
 const REDIS_INTERNAL_PORT: &str = "6379";
 
@@ -657,7 +1191,9 @@ impl ExternalService for RedisService {
         parameters: &HashMap<String, String>,
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
-        let port = parameters.get("port").context("Missing port parameter")?;
+        let port = parameters
+            .get("port")
+            .ok_or_else(|| anyhow::anyhow!("Missing port parameter"))?;
         let password = parameters.get("password");
 
         // Get effective host and port based on deployment mode
@@ -962,23 +1498,55 @@ impl ExternalService for RedisService {
         Ok(())
     }
 
-    /// Backup Redis data to S3
+    /// Backup Redis data to S3.
+    ///
+    /// Detects whether the container has WAL-G installed:
+    /// - **WAL-G available**: Uses `wal-g backup-push` with stream commands. Zero data
+    ///   flows through the Temps process.
+    /// - **WAL-G not available** (legacy images like `redis:8-alpine`): Falls back to
+    ///   BGSAVE + file copy + tar upload.
     async fn backup_to_s3(
         &self,
         s3_client: &aws_sdk_s3::Client,
+        s3_credentials: &super::S3Credentials,
         backup: temps_entities::backups::Model,
         s3_source: &temps_entities::s3_sources::Model,
         subpath: &str,
-        _subpath_root: &str,
+        subpath_root: &str,
         pool: &temps_database::DbConnection,
         external_service: &temps_entities::external_services::Model,
-        _service_config: ServiceConfig,
+        service_config: ServiceConfig,
     ) -> Result<String> {
+        use bollard::exec::CreateExecOptions;
         use chrono::Utc;
         use sea_orm::*;
-        use std::io::Write;
 
-        info!("Starting Redis backup to S3");
+        let container_name = self.get_container_name();
+
+        if !self.container_has_walg(&container_name).await {
+            info!(
+                "WAL-G not found in container '{}', falling back to legacy BGSAVE backup",
+                container_name
+            );
+            return self
+                .backup_to_s3_legacy(
+                    s3_client,
+                    backup,
+                    s3_source,
+                    subpath,
+                    pool,
+                    external_service,
+                )
+                .await;
+        }
+
+        info!("Starting Redis backup to S3 via WAL-G");
+
+        let metadata = serde_json::json!({
+            "service_type": "redis",
+            "service_name": self.name,
+            "backup_tool": "wal-g",
+        });
 
         // Create a backup record
         let backup_record = temps_entities::external_service_backups::Entity::insert(
@@ -989,231 +1557,191 @@ impl ExternalService for RedisService {
                 state: Set("running".to_string()),
                 started_at: Set(Utc::now()),
                 s3_location: Set("".to_string()),
-                metadata: Set(serde_json::json!({
-                    "service_type": "redis",
-                    "service_name": self.name,
-                })),
-                compression_type: Set("none".to_string()),
-                created_by: Set(0), // System user ID
+                metadata: Set(metadata),
+                compression_type: Set("lz4".to_string()), // WAL-G uses LZ4 by default
+                created_by: Set(0),
                 ..Default::default()
             },
         )
         .exec_with_returning(pool)
         .await?;
 
-        // Get container name
-        let container_name = self.get_container_name();
+        // Build the WAL-G S3 prefix using the STABLE subpath_root (no date component).
+        // All WAL-G backups must share the same prefix for retention management to work.
+        let walg_s3_prefix = format!(
+            "s3://{}/{}/walg",
+            s3_credentials.bucket_name,
+            subpath_root.trim_matches('/')
+        );
 
-        // Create a temporary directory for the backup
-        let temp_dir = tempfile::tempdir()?;
-        let temp_path = temp_dir.path();
+        // Get Redis password from the service config (database), NOT from in-memory config.
+        // The in-memory config may be None after a server restart if init() wasn't called.
+        let redis_password = self
+            .get_redis_config(service_config)
+            .map(|c| c.password.clone())
+            .unwrap_or_default();
 
-        // Execute BGSAVE to create a new RDB file without blocking
-        self.docker
+        // Build WAL-G environment variables for docker exec.
+        // WALG_STREAM_CREATE_COMMAND tells WAL-G how to create the backup stream.
+        //
+        // redis-cli --rdb writes the RDB snapshot to a file. We can't use /dev/stdout
+        // directly because redis-cli tries to ftruncate() and fsync() the output file,
+        // which fail on /dev/stdout (exit code 1). Instead, we write to a temp file
+        // and cat it to stdout for WAL-G to capture the stream.
+        let stream_create_cmd = if redis_password.is_empty() {
+            "redis-cli --rdb /tmp/redis_backup.rdb && cat /tmp/redis_backup.rdb".to_string()
+        } else {
+            format!(
+                "redis-cli -a '{}' --rdb /tmp/redis_backup.rdb && cat /tmp/redis_backup.rdb",
+                redis_password
+            )
+        };
+
+        let mut walg_env: Vec<String> = vec![
+            format!("WALG_S3_PREFIX={}", walg_s3_prefix),
+            format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
+            format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
+            format!("AWS_REGION={}", s3_credentials.region),
+            format!("WALG_STREAM_CREATE_COMMAND={}", stream_create_cmd),
+            format!("WALG_STREAM_RESTORE_COMMAND=cat > /data/dump.rdb"),
+        ];
+
+        if !redis_password.is_empty() {
+            walg_env.push(format!("WALG_REDIS_PASSWORD={}", redis_password));
+        }
+
+        // Resolve S3 endpoint for use inside the Docker container.
+        if let Some(resolved_endpoint) = s3_credentials
+            .resolve_endpoint_for_container(&self.docker, &container_name)
+            .await
+        {
+            walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
+        }
+        if s3_credentials.force_path_style {
+            walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
+        }
+
+        // Run wal-g backup-push inside the running Redis container
+        let walg_cmd = vec!["sh", "-c", "wal-g backup-push 2>&1"];
+        let walg_env_refs: Vec<&str> = walg_env.iter().map(|s| s.as_str()).collect();
+
+        info!(
+            "Running wal-g backup-push in container '{}' (S3 prefix: {})",
+            container_name, walg_s3_prefix
+        );
+
+        let exec = self
+            .docker
             .create_exec(
                 &container_name,
-                bollard::exec::CreateExecOptions {
-                    cmd: Some(vec!["redis-cli", "BGSAVE"]),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
+                CreateExecOptions {
+                    cmd: Some(walg_cmd),
+                    attach_stdout: Some(false),
+                    attach_stderr: Some(false),
+                    env: Some(walg_env_refs),
                     ..Default::default()
                 },
             )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create wal-g exec in container {}: {}",
+                    container_name,
+                    e
+                )
+            })?;
+
+        // Start WAL-G in detached mode — no data flows through the Temps process
+        use bollard::exec::StartExecOptions;
+        self.docker
+            .start_exec(
+                &exec.id,
+                Some(StartExecOptions {
+                    detach: true,
+                    ..Default::default()
+                }),
+            )
             .await?;
 
-        // Wait a moment for BGSAVE to complete
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-        // Copy both dump.rdb and appendonly.aof from container
-        for file in &["dump.rdb", "appendonly.aof"] {
-            let cat_exec = self
-                .docker
-                .create_exec(
-                    &container_name,
-                    bollard::exec::CreateExecOptions {
-                        cmd: Some(vec!["cat", &format!("/data/{}", file)]),
-                        attach_stdout: Some(true),
-                        attach_stderr: Some(true),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-
-            let file_path = temp_path.join(file);
-            let mut temp_file = std::fs::File::create(&file_path)?;
-
-            let output = self.docker.start_exec(&cat_exec.id, None).await?;
-            if let bollard::exec::StartExecResults::Attached { output, .. } = output {
-                let mut stream = output.boxed();
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(log_output) => match log_output {
-                            bollard::container::LogOutput::StdOut { message }
-                            | bollard::container::LogOutput::StdErr { message } => {
-                                temp_file.write_all(&message)?;
-                            }
-                            _ => (),
-                        },
-                        Err(e) => {
-                            error!("Error streaming backup data for {}: {}", file, e);
-                            // Update backup record with error
-                            let mut backup_update: temps_entities::external_service_backups::ActiveModel = backup_record.clone().into();
-                            backup_update.state = Set("failed".to_string());
-                            backup_update.error_message = Set(Some(e.to_string()));
-                            backup_update.finished_at = Set(Some(Utc::now()));
-                            temps_entities::external_service_backups::Entity::update(backup_update)
-                                .exec(pool)
-                                .await?;
-                            return Err(anyhow::anyhow!("Failed to stream backup data: {}", e));
-                        }
-                    }
+        // Poll for completion
+        loop {
+            let inspect = self.docker.inspect_exec(&exec.id).await?;
+            if let Some(running) = inspect.running {
+                if !running {
+                    break;
                 }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+
+        // Check WAL-G exit code
+        let exec_inspect = self.docker.inspect_exec(&exec.id).await?;
+        if let Some(exit_code) = exec_inspect.exit_code {
+            if exit_code != 0 {
+                let error_msg = format!(
+                    "wal-g backup-push failed with exit code {} in container '{}'",
+                    exit_code, container_name
+                );
+                error!("{}", error_msg);
+                let mut backup_update: temps_entities::external_service_backups::ActiveModel =
+                    backup_record.clone().into();
+                backup_update.state = Set("failed".to_string());
+                backup_update.error_message = Set(Some(error_msg.clone()));
+                backup_update.finished_at = Set(Some(Utc::now()));
+                let _ = backup_update.update(pool).await;
+                return Err(anyhow::anyhow!("{}", error_msg));
             }
         }
 
-        // Create a tar archive containing both files
-        let tar_path = temp_path.join("redis_backup.tar");
-        let tar_file = std::fs::File::create(&tar_path)?;
-        let mut tar_builder = tar::Builder::new(tar_file);
-
-        // Add both files to the tar archive
-        for file in &["dump.rdb", "appendonly.aof"] {
-            let file_path = temp_path.join(file);
-            tar_builder.append_path_with_name(&file_path, file)?;
-        }
-        tar_builder.finish()?;
-
-        // Generate backup path in S3
-        let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
-        let backup_key = format!(
-            "{}/redis_backup_{}.tar",
-            subpath.trim_matches('/'),
-            timestamp
-        );
-
-        // Get file size before upload
-        let size_bytes = std::fs::metadata(&tar_path)?.len() as i32;
-
-        // Validate backup size - a zero-size backup indicates failure
-        if size_bytes == 0 {
-            let mut backup_update: temps_entities::external_service_backups::ActiveModel =
-                backup_record.clone().into();
-            backup_update.state = Set("failed".to_string());
-            backup_update.finished_at = Set(Some(Utc::now()));
-            backup_update.error_message =
-                Set(Some("Backup failed: backup file has zero size".to_string()));
-            backup_update.update(pool).await?;
-            return Err(anyhow::anyhow!(
-                "Redis backup failed: backup file has zero size"
-            ));
-        }
-
-        // Upload to S3
-        s3_client
-            .put_object()
-            .bucket(&s3_source.bucket_name)
-            .key(&backup_key)
-            .body(aws_sdk_s3::primitives::ByteStream::from_path(&tar_path).await?)
-            .content_type("application/x-tar")
-            .send()
-            .await?;
+        // The backup location is the WAL-G S3 prefix
+        let backup_location = walg_s3_prefix.clone();
 
         // Update backup record with success
         let mut backup_update: temps_entities::external_service_backups::ActiveModel =
             backup_record.clone().into();
         backup_update.state = Set("completed".to_string());
         backup_update.finished_at = Set(Some(Utc::now()));
-        backup_update.size_bytes = Set(Some(size_bytes));
-        backup_update.s3_location = Set(backup_key.clone());
+        backup_update.s3_location = Set(backup_location.clone());
         backup_update.update(pool).await?;
 
-        info!("Redis backup completed successfully");
-        Ok(backup_key)
+        info!(
+            "Redis WAL-G backup completed successfully (prefix: {})",
+            walg_s3_prefix
+        );
+        Ok(backup_location)
     }
 
+    /// Restore Redis data from S3 using WAL-G or legacy format
+    ///
+    /// For WAL-G backups (s3:// prefix): Runs `wal-g backup-fetch LATEST` inside the container.
+    /// WAL-G downloads the backup from S3 and writes the RDB file via WALG_STREAM_RESTORE_COMMAND.
+    ///
+    /// For legacy backups (.tar files): Falls back to the old approach — downloads from S3,
+    /// extracts dump.rdb/appendonly.aof, and copies them into the container.
     async fn restore_from_s3(
         &self,
         s3_client: &aws_sdk_s3::Client,
+        s3_credentials: &super::S3Credentials,
         backup_location: &str,
         s3_source: &temps_entities::s3_sources::Model,
         _service_config: ServiceConfig,
     ) -> Result<()> {
         info!("Starting Redis restore from S3: {}", backup_location);
 
-        // Get the backup object from S3
-        let get_obj = s3_client
-            .get_object()
-            .bucket(&s3_source.bucket_name)
-            .key(backup_location)
-            .send()
-            .await?;
-
-        // Read the backup data
-        let backup_data = get_obj.body.collect().await?.to_vec();
-
-        // Get container name
-        let container_name = self.get_container_name();
-
-        self.docker
-            .stop_container(&container_name, None::<StopContainerOptions>)
-            .await
-            .context("Failed to stop Redis container")?;
-
-        // Create a temporary directory
-        let temp_dir = tempfile::tempdir()?;
-        let tar_path = temp_dir.path().join("backup.tar");
-
-        // Write the tar file
-        tokio::fs::write(&tar_path, backup_data).await?;
-
-        // Extract the tar file
-        let tar_file = std::fs::File::open(&tar_path)?;
-        let mut archive = tar::Archive::new(tar_file);
-        archive.unpack(temp_dir.path())?;
-
-        // Create a new tar archive with the extracted files in the correct structure
-        let mut tar = tar::Builder::new(Vec::new());
-        for file in &["dump.rdb", "appendonly.aof"] {
-            let file_path = temp_dir.path().join(file);
-            if file_path.exists() {
-                tar.append_path_with_name(&file_path, file)?;
-            }
+        if backup_location.starts_with("s3://") {
+            // WAL-G backup: use wal-g backup-fetch
+            self.restore_from_walg(s3_credentials, backup_location)
+                .await
+        } else {
+            // Legacy backup: fall back to old tar-based approach
+            self.restore_from_legacy(s3_client, backup_location, s3_source)
+                .await
         }
-        let tar_data = tar.into_inner()?;
-
-        // Copy both files into the container's data directory
-        self.docker
-            .upload_to_container(
-                &container_name,
-                Some(bollard::query_parameters::UploadToContainerOptions {
-                    path: "/data".to_string(),
-                    ..Default::default()
-                }),
-                body_full(bytes::Bytes::from(tar_data)),
-            )
-            .await
-            .context("Failed to upload backup files to container")?;
-
-        // Start Redis server again
-        self.docker
-            .start_container(
-                &container_name,
-                None::<bollard::query_parameters::StartContainerOptions>,
-            )
-            .await
-            .context("Failed to start Redis container")?;
-
-        // Wait for container to be healthy
-        self.wait_for_container_health(&self.docker, &container_name)
-            .await?;
-
-        info!("Redis restore completed successfully");
-        Ok(())
     }
 
     fn get_default_docker_image(&self) -> (String, String) {
         // Return (image_name, version)
-        ("redis".to_string(), "7-alpine".to_string())
+        ("gotempsh/redis-walg".to_string(), "8-bookworm".to_string())
     }
 
     async fn get_current_docker_image(&self) -> Result<(String, String)> {
@@ -1242,7 +1770,7 @@ impl ExternalService for RedisService {
     }
 
     fn get_default_version(&self) -> String {
-        "7-alpine".to_string()
+        "8-bookworm".to_string()
     }
 
     async fn get_current_version(&self) -> Result<String> {
@@ -1302,11 +1830,11 @@ impl ExternalService for RedisService {
             anyhow::anyhow!("Could not determine image for container '{}'", container_id)
         })?;
 
-        // Extract version from image name (e.g., "redis:8-alpine" -> "7")
+        // Extract version from image name (e.g., "gotempsh/redis-walg:8-bookworm" -> "8-bookworm")
         let version = if let Some(tag_pos) = image.rfind(':') {
             image[tag_pos + 1..].to_string()
         } else {
-            "7-alpine".to_string()
+            "8-bookworm".to_string()
         };
 
         // Extract port from additional config if provided, otherwise use 6379
@@ -1421,7 +1949,6 @@ mod tests {
 
     #[cfg(feature = "docker-tests")]
     #[tokio::test]
-    #[ignore] // Requires Docker
     async fn test_port_change_after_creation() {
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let service = RedisService::new("test-port-change".to_string(), docker);
@@ -1474,8 +2001,14 @@ mod tests {
         let service = RedisService::new("test-image".to_string(), docker);
 
         let (image_name, version) = service.get_default_docker_image();
-        assert_eq!(image_name, "redis", "Default image should be redis");
-        assert_eq!(version, "7-alpine", "Default version should be 7-alpine");
+        assert_eq!(
+            image_name, "gotempsh/redis-walg",
+            "Default image should be gotempsh/redis-walg"
+        );
+        assert_eq!(
+            version, "8-bookworm",
+            "Default version should be 8-bookworm"
+        );
     }
 
     #[test]
@@ -1485,14 +2018,17 @@ mod tests {
             host: "localhost".to_string(),
             port: Some("6379".to_string()),
             password: Some("mypassword".to_string()),
-            docker_image: "redis:8-alpine".to_string(),
+            docker_image: "gotempsh/redis-walg:8-bookworm".to_string(),
         };
 
         // Convert to runtime config
         let runtime_config: RedisConfig = input_config.into();
 
         // Verify docker_image is used directly
-        assert_eq!(runtime_config.docker_image, "redis:8-alpine");
+        assert_eq!(
+            runtime_config.docker_image,
+            "gotempsh/redis-walg:8-bookworm"
+        );
     }
 
     #[test]
@@ -1502,7 +2038,7 @@ mod tests {
             host: "localhost".to_string(),
             port: Some("6379".to_string()),
             password: Some("mypassword".to_string()),
-            docker_image: "redis:8-alpine".to_string(),
+            docker_image: "gotempsh/redis-walg:8-bookworm".to_string(),
         };
 
         // Convert to runtime config
@@ -1510,7 +2046,7 @@ mod tests {
 
         // Verify docker_image is used
         assert_eq!(
-            runtime_config.docker_image, "redis:8-alpine",
+            runtime_config.docker_image, "gotempsh/redis-walg:8-bookworm",
             "Docker image should use provided docker_image"
         );
     }
@@ -1582,27 +2118,27 @@ mod tests {
         let config = ServiceConfig {
             name: "test-redis-import".to_string(),
             service_type: ServiceType::Redis,
-            version: Some("7-alpine".to_string()),
+            version: Some("8-bookworm".to_string()),
             parameters: serde_json::json!({
                 "host": "localhost",
                 "port": 6379,
                 "password": "",
                 "db": 0,
-                "docker_image": "redis:8-alpine",
+                "docker_image": "gotempsh/redis-walg:8-bookworm",
                 "container_id": "xyz789abc123",
             }),
         };
 
         assert_eq!(config.name, "test-redis-import");
         assert_eq!(config.service_type, ServiceType::Redis);
-        assert_eq!(config.version, Some("7-alpine".to_string()));
+        assert_eq!(config.version, Some("8-bookworm".to_string()));
         assert_eq!(config.parameters["port"], 6379);
     }
 
     #[test]
     fn test_import_redis_version_extraction() {
         let test_cases = vec![
-            ("redis:8-alpine", "8-alpine"),
+            ("gotempsh/redis-walg:8-bookworm", "8-bookworm"),
             ("redis:latest", "latest"),
             ("redis:6.2", "6.2"),
             ("redis:7.0-alpine", "7.0-alpine"),
@@ -1708,7 +2244,7 @@ mod tests {
             "host": "localhost",
             "port": redis_port.to_string(),
             "password": redis_password,
-            "docker_image": "redis:8-alpine",
+            "docker_image": "gotempsh/redis-walg:8-bookworm",
         });
 
         let redis_config = ServiceConfig {
@@ -1734,7 +2270,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
         // Connect to Redis and set some test data
-        let connection_url = format!("redis://localhost:{}", redis_port);
+        let connection_url = format!("redis://:{}@localhost:{}", redis_password, redis_port);
         let redis_client = match redis::Client::open(connection_url.as_str()) {
             Ok(client) => client,
             Err(e) => {
@@ -1830,9 +2366,11 @@ mod tests {
         let external_service = create_mock_external_service(service_name.clone(), "redis", "7");
 
         // Perform backup to S3
+        let s3_creds = minio.s3_credentials();
         let backup_location = match redis_service
             .backup_to_s3(
                 &minio.s3_client,
+                &s3_creds,
                 backup,
                 &minio.s3_source,
                 "backups/redis",
@@ -1900,6 +2438,7 @@ mod tests {
         match redis_service
             .restore_from_s3(
                 &minio.s3_client,
+                &s3_creds,
                 &backup_location,
                 &minio.s3_source,
                 redis_config.clone(),

@@ -1821,8 +1821,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // FIXME: Flaky test - real-time log streaming timing issues. Needs refactoring as integration test
     async fn test_websocket_handler_end_to_end_with_server() {
+        // FIXME: Flaky test - real-time log streaming timing issues.
+        // Needs refactoring as a proper integration test.
+        // Set TEMPS_FLAKY_TESTS=1 to enable.
+        if std::env::var("TEMPS_FLAKY_TESTS").is_err() {
+            println!("Flaky test skipped; set TEMPS_FLAKY_TESTS=1 to enable");
+            return;
+        }
         use axum::extract::Request;
         use axum::middleware;
         use sea_orm::{ActiveModelTrait, Set};
@@ -2036,8 +2042,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires actual Docker container
     async fn test_container_logs_by_id_websocket() {
+        if bollard::Docker::connect_with_local_defaults().is_err() {
+            println!("Docker not available, skipping test");
+            return;
+        }
         use axum::extract::Request;
         use axum::middleware;
         use sea_orm::{ActiveModelTrait, Set};
@@ -2253,8 +2262,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires actual Docker container
     async fn test_filtered_container_logs_websocket() {
+        if bollard::Docker::connect_with_local_defaults().is_err() {
+            println!("Docker not available, skipping test");
+            return;
+        }
         use axum::extract::Request;
         use axum::middleware;
         use sea_orm::{ActiveModelTrait, Set};

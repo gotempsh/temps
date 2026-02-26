@@ -382,7 +382,9 @@ impl BackupCommand {
             format!("Reading backup metadata from: {}", backup.metadata_location).bright_white()
         );
         let metadata_key = backup.metadata_location.trim_start_matches('/').to_string();
-        let binding = metadata_key.replace("backup.postgresql.gz", "metadata.json");
+        let binding = metadata_key
+            .replace("backup.sql.gz", "metadata.json")
+            .replace("backup.postgresql.gz", "metadata.json");
         let metadata_key = binding;
         let metadata_key = metadata_key.as_str();
         let metadata_data = rt.block_on(async {
@@ -917,10 +919,27 @@ impl BackupCommand {
             updated_at: chrono::Utc::now(),
         };
 
+        // Build decrypted S3 credentials for services that pass them to external tools
+        let s3_credentials = temps_providers::S3Credentials {
+            access_key_id: s3_source.access_key_id.clone(),
+            secret_key: s3_source.secret_key.clone(),
+            region: s3_source.region.clone(),
+            endpoint: s3_source.endpoint.clone(),
+            bucket_name: s3_source.bucket_name.clone(),
+            bucket_path: s3_source.bucket_path.clone(),
+            force_path_style: s3_source.force_path_style.unwrap_or(true),
+        };
+
         // Call the trait's restore_from_s3 method
         let backup_location = ext_backup.s3_location.trim_start_matches('/');
         service
-            .restore_from_s3(s3_client, backup_location, &s3_source, service_config)
+            .restore_from_s3(
+                s3_client,
+                &s3_credentials,
+                backup_location,
+                &s3_source,
+                service_config,
+            )
             .await
             .map_err(|e| anyhow::anyhow!("Failed to restore service: {}", e))?;
 
@@ -991,7 +1010,9 @@ impl BackupCommand {
         // Download and parse metadata.json
         println!("{}", "Reading backup metadata...".bright_white());
         let metadata_key = backup.metadata_location.trim_start_matches('/').to_string();
-        let binding = metadata_key.replace("backup.postgresql.gz", "metadata.json");
+        let binding = metadata_key
+            .replace("backup.sql.gz", "metadata.json")
+            .replace("backup.postgresql.gz", "metadata.json");
         let metadata_key = binding;
         let metadata_key = metadata_key.as_str();
 

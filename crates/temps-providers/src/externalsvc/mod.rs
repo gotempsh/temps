@@ -27,6 +27,163 @@ pub use redis::RedisService;
 pub use rustfs::RustfsService;
 pub use s3::S3Service;
 
+/// Decrypted S3 credentials for services that need to pass them to external tools
+/// (e.g., WAL-G running inside a Docker container via `docker exec`).
+/// The `backup_to_s3` orchestrator decrypts the encrypted credentials from the
+/// `s3_sources` model and passes them through this struct.
+#[derive(Debug, Clone)]
+pub struct S3Credentials {
+    pub access_key_id: String,
+    pub secret_key: String,
+    pub region: String,
+    pub endpoint: Option<String>,
+    pub bucket_name: String,
+    pub bucket_path: String,
+    pub force_path_style: bool,
+}
+
+impl S3Credentials {
+    /// Resolve the S3 endpoint for use inside a Docker container.
+    ///
+    /// When WAL-G runs inside a Docker container via `docker exec`, `localhost` in the
+    /// S3 endpoint refers to the container itself, not the host machine. This method
+    /// detects `localhost`/`127.0.0.1` endpoints and resolves them to a Docker-accessible
+    /// address by:
+    ///
+    /// 1. Finding a running container on the target network that exposes the S3 port
+    /// 2. Falling back to `host.docker.internal` if no container is found on the network
+    ///
+    /// For non-localhost endpoints (e.g., `https://s3.amazonaws.com`), the endpoint is
+    /// returned unchanged since the container can reach external addresses directly.
+    pub async fn resolve_endpoint_for_container(
+        &self,
+        docker: &bollard::Docker,
+        container_name: &str,
+    ) -> Option<String> {
+        let endpoint = self.endpoint.as_ref()?;
+
+        // Parse the endpoint URL to extract host and port
+        let url = if endpoint.starts_with("http") {
+            endpoint.clone()
+        } else {
+            format!("http://{}", endpoint)
+        };
+
+        // Check if the host is localhost/127.0.0.1
+        let is_localhost = url.contains("://localhost") || url.contains("://127.0.0.1");
+        if !is_localhost {
+            // External endpoint (e.g., s3.amazonaws.com) — usable as-is from the container
+            return Some(endpoint.clone());
+        }
+
+        // Extract port from the endpoint URL
+        let port: Option<u16> = url.split("://").nth(1).and_then(|host_port| {
+            host_port
+                .split('/')
+                .next()
+                .and_then(|hp| hp.rsplit(':').next())
+                .and_then(|p| p.parse().ok())
+        });
+
+        // Determine which Docker network the target container is on
+        let target_network = match docker
+            .inspect_container(
+                container_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(info) => info
+                .network_settings
+                .and_then(|ns| ns.networks)
+                .and_then(|nets| nets.into_keys().next()),
+            Err(_) => None,
+        };
+
+        // Search for an S3/MinIO container on the same network that exposes the matching port
+        if let (Some(port), Some(network)) = (port, &target_network) {
+            if let Ok(containers) = docker
+                .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                    all: false, // only running containers
+                    ..Default::default()
+                }))
+                .await
+            {
+                for container in &containers {
+                    // Skip the target container itself
+                    let names = container.names.as_deref().unwrap_or(&[]);
+                    let container_name_clean = names
+                        .first()
+                        .map(|n| n.trim_start_matches('/'))
+                        .unwrap_or("");
+                    if container_name_clean == container_name {
+                        continue;
+                    }
+
+                    // Check if this container is on the same network
+                    let on_same_network = container
+                        .network_settings
+                        .as_ref()
+                        .and_then(|ns| ns.networks.as_ref())
+                        .is_some_and(|nets| nets.contains_key(network.as_str()));
+
+                    if !on_same_network {
+                        continue;
+                    }
+
+                    // Check if this container exposes the matching host port
+                    let has_matching_port = container
+                        .ports
+                        .as_ref()
+                        .is_some_and(|ports| ports.iter().any(|p| p.public_port == Some(port)));
+
+                    if has_matching_port {
+                        // Found the S3 container — use its internal port
+                        let internal_port = container
+                            .ports
+                            .as_ref()
+                            .and_then(|ports| {
+                                ports
+                                    .iter()
+                                    .find(|p| p.public_port == Some(port))
+                                    .map(|p| p.private_port)
+                            })
+                            .unwrap_or(port);
+
+                        let scheme = if url.starts_with("https") {
+                            "https"
+                        } else {
+                            "http"
+                        };
+                        let resolved =
+                            format!("{}://{}:{}", scheme, container_name_clean, internal_port);
+                        tracing::info!(
+                            "Resolved S3 endpoint '{}' -> '{}' (container '{}' on network '{}')",
+                            endpoint,
+                            resolved,
+                            container_name_clean,
+                            network
+                        );
+                        return Some(resolved);
+                    }
+                }
+            }
+        }
+
+        // Fallback: use host.docker.internal (works on Docker Desktop for macOS/Windows,
+        // and on Linux with --add-host=host.docker.internal:host-gateway)
+        let resolved = url
+            .replace("://localhost", "://host.docker.internal")
+            .replace("://127.0.0.1", "://host.docker.internal");
+        tracing::info!(
+            "Resolved S3 endpoint '{}' -> '{}' (fallback to host.docker.internal)",
+            endpoint,
+            resolved
+        );
+        Some(resolved)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceConfig {
     pub name: String,
@@ -148,7 +305,7 @@ pub struct AvailableContainer {
     pub container_id: String,
     /// Container name
     pub container_name: String,
-    /// Docker image name (e.g., "postgres:18-alpine")
+    /// Docker image name (e.g., "gotempsh/postgres-walg:18-bookworm")
     pub image: String,
     /// Extracted version from image (e.g., "17")
     pub version: String,
@@ -247,11 +404,14 @@ pub trait ExternalService: Send + Sync {
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)>;
 
     /// Backup the service data to an S3 location
+    /// s3_client: Pre-built S3 client with decrypted credentials (for services that upload via AWS SDK)
+    /// s3_credentials: Decrypted S3 credentials (for services that use WAL-G / external tools)
     /// s3_source: The S3 source configuration to use for backup
     /// subpath: The subpath within the S3 bucket where the backup should be stored
     async fn backup_to_s3(
         &self,
         _s3_client: &aws_sdk_s3::Client,
+        _s3_credentials: &S3Credentials,
         _backup: temps_entities::backups::Model,
         _s3_source: &temps_entities::s3_sources::Model,
         _subpath: &str,
@@ -267,6 +427,7 @@ pub trait ExternalService: Send + Sync {
     async fn restore_from_s3(
         &self,
         _s3_client: &aws_sdk_s3::Client,
+        _s3_credentials: &S3Credentials,
         _backup_location: &str,
         _s3_source: &temps_entities::s3_sources::Model,
         _service_config: ServiceConfig,

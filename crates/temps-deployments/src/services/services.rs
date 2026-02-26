@@ -1183,15 +1183,27 @@ impl DeploymentService {
                 .await?;
 
             for container in containers {
-                self.deployer
-                    .stop_container(&container.container_id)
-                    .await
-                    .map_err(|e| {
-                        DeploymentError::Other(format!(
-                            "Failed to stop container {}: {}",
+                // Stop container with timeout - don't fail the whole teardown if one container fails
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    self.deployer.stop_container(&container.container_id),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!(
+                            "Failed to stop container {} during teardown: {} (continuing)",
                             container.container_id, e
-                        ))
-                    })?;
+                        );
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Timed out stopping container {} after 30s during teardown (continuing)",
+                            container.container_id
+                        );
+                    }
+                }
 
                 // Mark container as deleted
                 let mut active_container: deployment_containers::ActiveModel = container.into();
@@ -1775,24 +1787,48 @@ impl DeploymentService {
                 container.container_id, environment_id
             );
 
-            // Stop the container
-            if let Err(e) = self.deployer.stop_container(&container.container_id).await {
-                warn!(
-                    "Failed to stop container {}: {} (continuing anyway)",
-                    container.container_id, e
-                );
+            // Stop the container with a 30-second timeout to prevent hanging
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.deployer.stop_container(&container.container_id),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(
+                        "Failed to stop container {}: {} (continuing anyway)",
+                        container.container_id, e
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        "Timed out stopping container {} after 30s (continuing anyway)",
+                        container.container_id
+                    );
+                }
             }
 
-            // Remove the container
-            if let Err(e) = self
-                .deployer
-                .remove_container(&container.container_id)
-                .await
+            // Remove the container with a 15-second timeout
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                self.deployer.remove_container(&container.container_id),
+            )
+            .await
             {
-                warn!(
-                    "Failed to remove container {}: {} (continuing anyway)",
-                    container.container_id, e
-                );
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(
+                        "Failed to remove container {}: {} (continuing anyway)",
+                        container.container_id, e
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        "Timed out removing container {} after 15s (continuing anyway)",
+                        container.container_id
+                    );
+                }
             }
 
             // Update container status to stopped

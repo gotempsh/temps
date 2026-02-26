@@ -823,9 +823,10 @@ pub async fn trigger_project_pipeline(
             .build());
     };
 
-    // Get the environment for audit logging
+    // Get the environment for audit logging (only active environments)
     let environment = temps_entities::environments::Entity::find_by_id(environment_id)
         .filter(temps_entities::environments::Column::ProjectId.eq(id))
+        .filter(temps_entities::environments::Column::DeletedAt.is_null())
         .one(state.project_service.db.as_ref())
         .await
         .map_err(|e| {

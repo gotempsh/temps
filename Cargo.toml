@@ -52,6 +52,9 @@ members = [
     "crates/temps-kv",
     "crates/temps-blob",
     "crates/temps-otel",
+    "crates/temps-environments",
+    "crates/temps-screenshots",
+    "crates/temps-embeddings",
 ]
 
 [workspace.package]
