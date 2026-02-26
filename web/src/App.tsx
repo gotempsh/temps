@@ -8,6 +8,7 @@ import { ThemeProvider } from '@/components/providers/ThemeProvider'
 import { ThemeWrapper } from '@/components/theme/ThemeWrapper'
 import { ProjectsProvider } from '@/contexts/ProjectsContext'
 import { PresetProvider } from '@/contexts/PresetContext'
+import { PluginsProvider } from '@/contexts/PluginsContext'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
 import { lazy, Suspense } from 'react'
@@ -28,6 +29,7 @@ import { MonitoringSettings } from './components/monitoring/MonitoringSettings'
 import { AddNotificationProvider } from './pages/AddNotificationProvider'
 import { EditNotificationProvider } from './pages/EditNotificationProvider'
 import { Monitoring } from './pages/Monitoring'
+import { PluginPage } from './pages/plugins/PluginPage'
 // Lazy load all pages
 const Dashboard = lazy(() =>
   import('./pages/Dashboard').then((m) => ({ default: m.Dashboard }))
@@ -278,6 +280,8 @@ const FullAppRoutes = () => {
                 <Route path="/keys/new" element={<ApiKeyCreate />} />
                 <Route path="/keys/:id" element={<ApiKeyDetail />} />
                 <Route path="/keys/:id/edit" element={<ApiKeyEdit />} />
+                {/* External plugin routes */}
+                <Route path="/plugins/:pluginName/*" element={<PluginPage />} />
                 <Route path="*" element={<NotFound />} />
               </Routes>
             </div>
@@ -299,7 +303,9 @@ const AuthenticatedRoutes = () => {
 
   return (
     <PlatformAccessProvider>
-      <FullAppRoutes />
+      <PluginsProvider>
+        <FullAppRoutes />
+      </PluginsProvider>
     </PlatformAccessProvider>
   )
 }

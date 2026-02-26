@@ -11,7 +11,6 @@ use futures::FutureExt;
 use include_dir::{include_dir, Dir};
 use rand::Rng;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
-use std::future::IntoFuture;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -921,11 +920,69 @@ pub async fn start_console_api(
         );
     }
 
+    // ── External plugins (standalone binary plugins) ─────────────────────
+    // Scan ~/.temps/plugins/ for executable binaries, spawn each one,
+    // perform the handshake, and create proxy routes.
+    debug!("Discovering external plugins...");
+    let external_plugin_config = temps_core::external_plugin::ExternalPluginConfig::new(
+        config.data_dir.clone(),
+        config.database_url.clone(),
+    );
+    let external_plugin_manager = Arc::new(
+        temps_core::external_plugin::ExternalPluginManager::new(external_plugin_config),
+    );
+    let external_manifests = external_plugin_manager.discover_and_start().await;
+
+    // Build proxy routes for each external plugin: /api/x/{plugin_name}/*
+    let mut external_router = Router::new();
+    for manifest in &external_manifests {
+        if let Some(proxy) = external_plugin_manager.proxy_for(&manifest.name).await {
+            let proxy_router =
+                temps_core::external_plugin::proxy::create_plugin_proxy_router(proxy);
+            let prefix = format!("/x/{}", manifest.name);
+            debug!(
+                plugin = %manifest.name,
+                prefix = %prefix,
+                "Mounting external plugin proxy"
+            );
+            external_router = external_router.nest(&prefix, proxy_router);
+        }
+    }
+
+    // Add an endpoint to list all external plugin manifests.
+    // The frontend fetches this to dynamically add routes and nav entries.
+    let manifests_for_api = external_manifests.clone();
+    external_router = external_router.route(
+        "/x/plugins",
+        axum::routing::get(move || {
+            let manifests = manifests_for_api.clone();
+            async move { axum::Json(manifests) }
+        }),
+    );
+
+    if !external_manifests.is_empty() {
+        info!(
+            "Loaded {} external plugin(s): {}",
+            external_manifests.len(),
+            external_manifests
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    } else {
+        debug!(
+            "No external plugins found in {}",
+            config.data_dir.join("plugins").display()
+        );
+    }
+
     // Build the application with all plugin routes and OpenAPI schemas
     debug!("Building application with plugin routes");
     let app = plugin_manager
         .build_application()
         .map_err(|e| anyhow::anyhow!("Failed to build application: {}", e))?
+        .merge(external_router) // External plugin proxy routes under /api/x/*
         .merge(create_swagger_router(&plugin_manager)?)
         .fallback(serve_static_file);
 
@@ -941,7 +998,18 @@ pub async fn start_console_api(
         debug!("Console API ready signal sent");
     }
 
-    axum::serve(listener, app).into_future().await?;
+    // Graceful shutdown: listen for Ctrl+C, then shut down external plugins before exiting.
+    // Note: The proxy server has its own CtrlCShutdownSignal. The console API server
+    // shuts down external plugins when it receives the same signal.
+    let external_manager_for_shutdown = external_plugin_manager.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Console API received shutdown signal, stopping external plugins...");
+            external_manager_for_shutdown.shutdown_all().await;
+            info!("External plugins shut down");
+        })
+        .await?;
     info!("Console API server exited");
     Ok(())
 }

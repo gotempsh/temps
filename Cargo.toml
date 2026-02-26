@@ -54,6 +54,8 @@ members = [
     "crates/temps-environments",
     "crates/temps-screenshots",
     "crates/temps-embeddings",
+    "crates/temps-plugin-sdk",
+    "examples/example-plugin",
 ]
 
 [workspace.package]

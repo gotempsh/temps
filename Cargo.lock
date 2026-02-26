@@ -10790,15 +10790,21 @@ dependencies = [
  "axum 0.8.6",
  "base64 0.22.1",
  "chrono",
+ "flate2",
  "futures",
  "hex",
+ "hyper 1.7.0",
+ "hyper-util",
  "log",
  "once_cell",
  "rand 0.8.5",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
+ "tar",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tower-http",
@@ -11133,6 +11139,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-example-plugin"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.6",
+ "chrono",
+ "serde",
+ "serde_json",
+ "temps-plugin-sdk",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "temps-geo"
 version = "0.1.0"
 dependencies = [
@@ -11418,6 +11437,31 @@ dependencies = [
  "tokio-test",
  "tower 0.4.13",
  "tracing",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "temps-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.6",
+ "clap",
+ "flate2",
+ "hyper 1.7.0",
+ "hyper-util",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "tar",
+ "temps-core",
+ "temps-entities",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-stream",
+ "tower 0.5.2",
+ "tracing",
+ "tracing-subscriber",
  "utoipa",
  "uuid",
 ]
@@ -12541,6 +12585,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12550,12 +12604,15 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
 ]
 
 [[package]]

@@ -38,10 +38,12 @@ import {
 
 import { ProjectResponse } from '@/api/client'
 import { useAuth } from '@/contexts/AuthContext'
+import { usePluginsContext } from '@/contexts/PluginsContext'
 import { useProjects } from '@/contexts/ProjectsContext'
+import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { cn } from '@/lib/utils'
 import { ChevronRight, type LucideIcon } from 'lucide-react'
-import { useEffect } from 'react'
+import { useEffect, useMemo } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar'
 import {
@@ -342,10 +344,35 @@ export default function AppSidebar() {
   const { projects } = useProjects()
   const { setIsMinimal, isMinimal, isMobile } = useSidebar()
   const { isDemoMode } = useAuth()
+  const { platformNavEntries, settingsNavEntries } = usePluginsContext()
   const location = useLocation()
 
+  // Merge plugin nav entries into the platform section
+  const pluginPlatformItems = useMemo(
+    () =>
+      platformNavEntries.map((entry) => ({
+        title: entry.label,
+        url: entry.path,
+        icon: resolvePluginIcon(entry.icon),
+      })),
+    [platformNavEntries]
+  )
+
+  // Merge plugin nav entries into the settings section
+  const pluginSettingsItems = useMemo(
+    () =>
+      settingsNavEntries.map((entry) => ({
+        title: entry.label,
+        url: entry.path,
+        icon: resolvePluginIcon(entry.icon),
+      })),
+    [settingsNavEntries]
+  )
+
   // Use restricted navigation in demo mode (accessed via demo.<preview_domain> subdomain)
-  const navMainItems = isDemoMode ? navMainDemo : navMainAll
+  const navMainItems = isDemoMode
+    ? navMainDemo
+    : [...navMainAll, ...pluginPlatformItems]
 
   // Auto-collapse sidebar when on project detail pages
   useEffect(() => {
@@ -397,7 +424,11 @@ export default function AppSidebar() {
           <NavMain items={navMainItems} />
           <NavProjects projects={projects} />
           {/* Hide settings section in demo mode */}
-          {!isDemoMode && <NavSettings items={data.navSettings} />}
+          {!isDemoMode && (
+            <NavSettings
+              items={[...data.navSettings, ...pluginSettingsItems]}
+            />
+          )}
           <SidebarGroup />
         </SidebarContent>
         <SidebarFooter>
