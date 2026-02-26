@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions release workflow for Linux AMD64
 - Release automation script (`scripts/release.sh`)
 - Comprehensive development and release documentation
+- Resource monitoring tab in project sidebar and monitoring settings page with per-environment CPU, memory, and disk metrics
+- Browse Data button on linked service cards in the project storage page
+- `status_code_class` query parameter (1xx/2xx/3xx/4xx/5xx) for proxy log stats endpoints
+- TimescaleDB compression (7-day) and retention (30-day) policies for `proxy_logs` hypertable
+- `cargo clippy` pre-commit hook enabled to catch lint issues before CI
 
 ### Changed
 - `ServiceRegistry` and `PluginStateRegistry` now use `RwLock` instead of `Mutex`, allowing concurrent reads during request handling
@@ -33,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed `clippy::only_used_in_recursion` warning in workflow executor
 - Rewrote CLAUDE.md with comprehensive error handling, resilience, and testing guidance
 - Refined service parameter strategies in `temps-providers`
+- Service detail header reorganized: data actions (Browse Data, Backup, Edit, Upgrade) separated from destructive actions (Stop/Start, Delete) with a visual divider
+- Vulnerability scanner now uses `--pkg-types library` for image scans and filters out `gobinary`/`rustbinary` result types, reporting only project dependency CVEs instead of OS packages or embedded binary vulnerabilities
 
 ### Removed
 - Deleted legacy `web/src/pages/CreateService.tsx` and `CreateServiceRefactored.tsx` (superseded by current service creation flow)
@@ -40,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Install script command in documentation now uses `bash` instead of `sh`, fixing failures on Ubuntu 24 where `/bin/sh` is `dash` (#15)
 - Build failures when web UI is skipped in debug mode
+- CPU percentage calculation in container stats now uses delta between `cpu_stats` and `precpu_stats` instead of absolute values
+- `avg_response_time` cast to `float8` in proxy log time bucket stats for correct type handling
 
 ### Security
 - Addressed security audit findings in `temps-cli` skill: removed `curl|sh` pattern, credential path disclosure, and secret-like example tokens

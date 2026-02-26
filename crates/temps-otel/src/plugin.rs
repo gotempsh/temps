@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn test_otel_plugin_default() {
-        let plugin = OtelPlugin::default();
+        let plugin = OtelPlugin;
         assert_eq!(plugin.name(), "otel");
     }
 

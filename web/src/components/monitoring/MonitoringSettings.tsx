@@ -42,6 +42,7 @@ import {
   type RouteAlertsFormData,
   type WeeklyDigestFormData,
 } from './schemas'
+import { ResourceMonitoring } from './ResourceMonitoring'
 
 interface AlertComponentProps<T> {
   onSave: (data: T) => Promise<void>
@@ -877,6 +878,7 @@ export function MonitoringSettings() {
   }
 
   const settingsSections = [
+    { id: 'resources', label: 'Resources' },
     { id: 'project', label: 'Project Health' },
     { id: 'domains', label: 'Domains' },
     { id: 'backups', label: 'Backups' },
@@ -1043,6 +1045,11 @@ export function MonitoringSettings() {
   }
 
   const renderContent = () => {
+    // Resources tab doesn't depend on preferences
+    if (currentSection === 'resources') {
+      return <ResourceMonitoring />
+    }
+
     if (isLoading) {
       return (
         <div className="flex items-center justify-center py-6">
@@ -1211,7 +1218,11 @@ export function MonitoringSettings() {
       </div>
 
       {/* Content - Shared between mobile and desktop */}
-      <Card className="p-6">{renderContent()}</Card>
+      {currentSection === 'resources' ? (
+        renderContent()
+      ) : (
+        <Card className="p-6">{renderContent()}</Card>
+      )}
     </div>
   )
 }

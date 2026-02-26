@@ -23192,6 +23192,10 @@ export type GetTimeBucketStatsData = {
          */
         status_code?: number;
         /**
+         * Filter by status code class (e.g. "2xx", "3xx", "4xx", "5xx")
+         */
+        status_code_class?: string;
+        /**
          * Filter by routing status
          */
         routing_status?: string;

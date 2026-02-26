@@ -35,6 +35,13 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { maskValue, shouldMaskValue } from '@/lib/masking'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import {
   AlertCircle,
   ArrowLeft,
   ArrowUpCircle,
@@ -43,6 +50,7 @@ import {
   EyeOff,
   HardDrive,
   Loader2,
+  MoreVertical,
   Pencil,
   RefreshCcw,
   Trash2,
@@ -60,6 +68,7 @@ export function ServiceDetail() {
   const [isUpgradeDialogOpen, setIsUpgradeDialogOpen] = useState(false)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
   const [isBackupDialogOpen, setIsBackupDialogOpen] = useState(false)
+  const [isStopDialogOpen, setIsStopDialogOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [visibleParameters, setVisibleParameters] = useState<Set<string>>(
     new Set()
@@ -162,10 +171,17 @@ export function ServiceDetail() {
     if (!service) return
 
     if (service.service.status === 'running') {
-      stopService.mutate({ path: { id: parseInt(id!) } })
+      setIsStopDialogOpen(true)
     } else if (service.service.status === 'stopped') {
       startService.mutate({ path: { id: parseInt(id!) } })
     }
+  }
+
+  const handleStop = async () => {
+    stopService.mutate(
+      { path: { id: parseInt(id!) } },
+      { onSettled: () => setIsStopDialogOpen(false) }
+    )
   }
 
   const handleDelete = async () => {
@@ -264,68 +280,68 @@ export function ServiceDetail() {
           </div>
 
           <div className="flex items-center gap-2 self-start sm:self-auto">
-            <Button
-              variant={
-                service.service.status === 'running' ? 'destructive' : 'default'
-              }
-              size="sm"
-              disabled={
-                service.service.status === 'creating' ||
-                startService.isPending ||
-                stopService.isPending
-              }
-              onClick={handleServiceAction}
-            >
-              {(startService.isPending || stopService.isPending) && (
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-              )}
-              {service.service.status === 'running'
-                ? 'Stop'
-                : service.service.status === 'creating'
-                  ? 'Creating...'
-                  : 'Start'}
-            </Button>
             <Link to={`/storage/${id}/browse`}>
               <Button variant="outline" size="sm" className="gap-2">
                 <Database className="h-4 w-4" />
                 Browse Data
               </Button>
             </Link>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setIsEditDialogOpen(true)}
-              className="gap-2"
-            >
-              <Pencil className="h-4 w-4" />
-              Edit
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setIsUpgradeDialogOpen(true)}
-              className="gap-2"
-            >
-              <ArrowUpCircle className="h-4 w-4" />
-              Upgrade
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setIsBackupDialogOpen(true)}
-              className="gap-2"
-            >
-              <HardDrive className="h-4 w-4" />
-              Backup
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setIsDeleteDialogOpen(true)}
-              className="text-destructive hover:text-destructive hover:bg-destructive/10"
-            >
-              <Trash2 className="h-4 w-4" />
-            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon" className="h-8 w-8">
+                  <MoreVertical className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={() => setIsBackupDialogOpen(true)}>
+                  <HardDrive className="h-4 w-4 mr-2" />
+                  Backup
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setIsEditDialogOpen(true)}>
+                  <Pencil className="h-4 w-4 mr-2" />
+                  Edit
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setIsUpgradeDialogOpen(true)}>
+                  <ArrowUpCircle className="h-4 w-4 mr-2" />
+                  Upgrade
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={handleServiceAction}
+                  disabled={
+                    service.service.status === 'creating' ||
+                    startService.isPending ||
+                    stopService.isPending
+                  }
+                  className={
+                    service.service.status === 'running'
+                      ? 'text-destructive focus:text-destructive'
+                      : ''
+                  }
+                >
+                  {(startService.isPending || stopService.isPending) ? (
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  ) : service.service.status === 'running' ? (
+                    <AlertCircle className="h-4 w-4 mr-2" />
+                  ) : (
+                    <RefreshCcw className="h-4 w-4 mr-2" />
+                  )}
+                  {service.service.status === 'running'
+                    ? 'Stop'
+                    : service.service.status === 'creating'
+                      ? 'Creating...'
+                      : 'Start'}
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={() => setIsDeleteDialogOpen(true)}
+                  className="text-destructive focus:text-destructive"
+                >
+                  <Trash2 className="h-4 w-4 mr-2" />
+                  Delete
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
 
@@ -507,6 +523,40 @@ export function ServiceDetail() {
           </Card>
         </div>
       </div>
+
+      <Dialog open={isStopDialogOpen} onOpenChange={setIsStopDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Stop Service</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to stop{' '}
+              <span className="font-medium text-foreground">
+                {service.service.name}
+              </span>
+              ? All connected projects will lose access to this service until it
+              is started again.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setIsStopDialogOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleStop}
+              disabled={stopService.isPending}
+            >
+              {stopService.isPending && (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              )}
+              Stop Service
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={isDeleteDialogOpen} onOpenChange={setIsDeleteDialogOpen}>
         <DialogContent>

@@ -150,7 +150,7 @@ fn build_trace_request(
 ) -> temps_otel::proto::collector::trace::v1::ExportTraceServiceRequest {
     let root_id: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
     let child_id: [u8; 8] = [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18];
-    let base = 1700000000_000_000_000u64;
+    let base = 1_700_000_000_000_000_000_u64;
 
     temps_otel::proto::collector::trace::v1::ExportTraceServiceRequest {
         resource_spans: vec![temps_otel::proto::trace::v1::ResourceSpans {
@@ -248,7 +248,7 @@ fn build_metrics_request(
                     data: Some(temps_otel::proto::metrics::v1::metric::Data::Gauge(
                         temps_otel::proto::metrics::v1::Gauge {
                             data_points: vec![temps_otel::proto::metrics::v1::NumberDataPoint {
-                                time_unix_nano: 1700000000_000_000_000,
+                                time_unix_nano: 1_700_000_000_000_000_000,
                                 value: Some(
                                     temps_otel::proto::metrics::v1::number_data_point::Value::AsDouble(42.5),
                                 ),
@@ -289,8 +289,8 @@ fn build_logs_request(
             scope_logs: vec![temps_otel::proto::logs::v1::ScopeLogs {
                 scope: None,
                 log_records: vec![temps_otel::proto::logs::v1::LogRecord {
-                    time_unix_nano: 1700000000_000_000_000,
-                    observed_time_unix_nano: 1700000000_000_000_000,
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    observed_time_unix_nano: 1_700_000_000_000_000_000,
                     severity_number: severity,
                     severity_text: String::new(),
                     body: Some(temps_otel::proto::common::v1::AnyValue {
@@ -403,7 +403,7 @@ async fn test_e2e_ingest_error_trace_always_stored() {
     };
 
     let trace_id: [u8; 16] = [0xDD; 16];
-    let trace_id_hex = hex::encode(&trace_id);
+    let trace_id_hex = hex::encode(trace_id);
 
     // Build a trace with an ERROR span (always kept by sampler)
     let mut request = build_trace_request(&trace_id, "error-app");

@@ -432,7 +432,7 @@ mod tests {
         assert!(LogSeverity::Warn >= LogSeverity::Warn);
         assert!(LogSeverity::Error >= LogSeverity::Warn);
         assert!(LogSeverity::Fatal >= LogSeverity::Warn);
-        assert!(!(LogSeverity::Info >= LogSeverity::Warn));
+        assert!(LogSeverity::Info < LogSeverity::Warn);
     }
 
     // ── InsightSeverity ordering ────────────────────────────────────
@@ -503,7 +503,7 @@ mod tests {
         assert_eq!(AttributeValue::String("hello".into()).to_string(), "hello");
         assert_eq!(AttributeValue::Bool(true).to_string(), "true");
         assert_eq!(AttributeValue::Int(42).to_string(), "42");
-        assert_eq!(AttributeValue::Double(3.14).to_string(), "3.14");
+        assert_eq!(AttributeValue::Double(3.15).to_string(), "3.15");
         assert_eq!(
             AttributeValue::Bytes(vec![1, 2, 3]).to_string(),
             "<3 bytes>"

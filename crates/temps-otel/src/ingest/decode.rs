@@ -60,7 +60,7 @@ pub fn decode_metrics_request(
 
         for sm in &rm.scope_metrics {
             for metric in &sm.metrics {
-                extract_metric_points(&metric, &resource, project_id, deployment_id, &mut points);
+                extract_metric_points(metric, &resource, project_id, deployment_id, &mut points);
             }
         }
     }
@@ -476,9 +476,9 @@ mod tests {
 
     #[test]
     fn test_nanos_to_datetime() {
-        let nanos: u64 = 1700000000_000_000_000;
+        let nanos: u64 = 1_700_000_000_000_000_000;
         let dt = nanos_to_datetime(nanos);
-        assert_eq!(dt.timestamp(), 1700000000);
+        assert_eq!(dt.timestamp(), 1_700_000_000);
         assert_eq!(dt.timestamp_subsec_nanos(), 0);
     }
 
@@ -490,9 +490,9 @@ mod tests {
 
     #[test]
     fn test_nanos_to_datetime_subsecond() {
-        let nanos: u64 = 1700000000_500_000_000; // 0.5s
+        let nanos: u64 = 1_700_000_000_500_000_000; // 0.5s
         let dt = nanos_to_datetime(nanos);
-        assert_eq!(dt.timestamp(), 1700000000);
+        assert_eq!(dt.timestamp(), 1_700_000_000);
         assert_eq!(dt.timestamp_subsec_nanos(), 500_000_000);
     }
 
@@ -656,8 +656,8 @@ mod tests {
             &[],
             "failing-operation",
             2, // SERVER
-            1700000000_000_000_000,
-            1700000000_200_000_000,
+            1_700_000_000_000_000_000,
+            1_700_000_000_200_000_000,
             2, // ERROR
         );
 
@@ -699,7 +699,7 @@ mod tests {
         // DB child has no children
         let db_child = by_name["SELECT * FROM users"];
         assert!(
-            tree.get(&db_child.span_id).is_none(),
+            !tree.contains_key(&db_child.span_id),
             "DB child should be a leaf"
         );
     }
@@ -748,7 +748,7 @@ mod tests {
                         data: Some(proto::metrics::v1::metric::Data::Gauge(
                             proto::metrics::v1::Gauge {
                                 data_points: vec![proto::metrics::v1::NumberDataPoint {
-                                    time_unix_nano: 1700000000_000_000_000,
+                                    time_unix_nano: 1_700_000_000_000_000_000,
                                     value: Some(
                                         proto::metrics::v1::number_data_point::Value::AsDouble(
                                             75.5,
@@ -797,8 +797,8 @@ mod tests {
                 scope_logs: vec![proto::logs::v1::ScopeLogs {
                     scope: None,
                     log_records: vec![proto::logs::v1::LogRecord {
-                        time_unix_nano: 1700000000_000_000_000,
-                        observed_time_unix_nano: 1700000000_001_000_000,
+                        time_unix_nano: 1_700_000_000_000_000_000,
+                        observed_time_unix_nano: 1_700_000_000_001_000_000,
                         severity_number: 17, // ERROR
                         severity_text: "ERROR".into(),
                         body: Some(proto::common::v1::AnyValue {
@@ -861,7 +861,7 @@ mod tests {
                     scope_logs: vec![proto::logs::v1::ScopeLogs {
                         scope: None,
                         log_records: vec![proto::logs::v1::LogRecord {
-                            time_unix_nano: 1700000000_000_000_000,
+                            time_unix_nano: 1_700_000_000_000_000_000,
                             severity_number,
                             body: Some(proto::common::v1::AnyValue {
                                 value: Some(proto::common::v1::any_value::Value::StringValue(

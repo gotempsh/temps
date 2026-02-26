@@ -40,6 +40,7 @@ fn test_resource() -> ResourceInfo {
 }
 
 /// Build a sample SpanRecord.
+#[allow(clippy::too_many_arguments)]
 fn sample_span(
     project_id: i32,
     trace_id: &str,

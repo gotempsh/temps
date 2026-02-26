@@ -1,5 +1,5 @@
-/// Generated OTLP protobuf types for OpenTelemetry data ingest.
-/// These are compiled from the official OpenTelemetry proto definitions.
+//! Generated OTLP protobuf types for OpenTelemetry data ingest.
+//! These are compiled from the official OpenTelemetry proto definitions.
 
 pub mod common {
     pub mod v1 {

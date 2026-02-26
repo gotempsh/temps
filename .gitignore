@@ -30,3 +30,7 @@ target_old
 *.rec
 
 .env
+.env.local
+
+# Content / blog drafts
+content/

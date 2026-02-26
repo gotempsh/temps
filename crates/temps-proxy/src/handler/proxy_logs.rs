@@ -234,6 +234,8 @@ pub struct StatsQuery {
     pub host: Option<String>,
     /// Filter by status code
     pub status_code: Option<i16>,
+    /// Filter by status code class (e.g. "2xx", "3xx", "4xx", "5xx")
+    pub status_code_class: Option<String>,
     /// Filter by routing status
     pub routing_status: Option<String>,
     /// Filter by request source
@@ -254,6 +256,7 @@ impl From<StatsQuery> for StatsFilters {
             deployment_id: query.deployment_id,
             host: query.host,
             status_code: query.status_code,
+            status_code_class: query.status_code_class,
             routing_status: query.routing_status,
             request_source: query.request_source,
             is_bot: query.is_bot,
@@ -289,6 +292,8 @@ pub struct TimeBucketStatsQuery {
     pub host: Option<String>,
     /// Filter by status code
     pub status_code: Option<i16>,
+    /// Filter by status code class (e.g. "2xx", "3xx", "4xx", "5xx")
+    pub status_code_class: Option<String>,
     /// Filter by routing status
     pub routing_status: Option<String>,
     /// Filter by request source
@@ -334,6 +339,7 @@ async fn get_today_stats(
         || query.deployment_id.is_some()
         || query.host.is_some()
         || query.status_code.is_some()
+        || query.status_code_class.is_some()
         || query.routing_status.is_some()
         || query.request_source.is_some()
         || query.is_bot.is_some()
@@ -380,6 +386,7 @@ async fn get_time_bucket_stats(
         || query.deployment_id.is_some()
         || query.host.is_some()
         || query.status_code.is_some()
+        || query.status_code_class.is_some()
         || query.routing_status.is_some()
         || query.request_source.is_some()
         || query.is_bot.is_some()
@@ -393,6 +400,7 @@ async fn get_time_bucket_stats(
             deployment_id: query.deployment_id,
             host: query.host,
             status_code: query.status_code,
+            status_code_class: query.status_code_class,
             routing_status: query.routing_status,
             request_source: query.request_source,
             is_bot: query.is_bot,

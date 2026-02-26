@@ -1283,15 +1283,20 @@ function DetailField({
   if (value === null || value === undefined || value === '') return null
   const display = String(value)
   return (
-    <div className="space-y-0.5">
+    <div className="space-y-0.5 min-w-0">
       <p className="text-xs text-muted-foreground">{label}</p>
-      <div className="flex items-center gap-1.5">
-        <p className={`text-sm ${mono ? 'font-mono' : ''}`}>{display}</p>
+      <div className="flex items-center gap-1.5 min-w-0">
+        <p
+          className={`text-sm truncate ${mono ? 'font-mono' : ''}`}
+          title={display}
+        >
+          {display}
+        </p>
         {copyable && (
           <CopyButton
             value={display}
             minimal
-            className="h-5 w-5 p-0 opacity-0 group-hover/detail:opacity-100 transition-opacity"
+            className="h-5 w-5 p-0 shrink-0 opacity-0 group-hover/detail:opacity-100 transition-opacity"
           />
         )}
       </div>

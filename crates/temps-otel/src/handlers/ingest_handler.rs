@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_error_io_maps_to_500() {
-        let err = OtelError::Io(std::io::Error::new(std::io::ErrorKind::Other, "test"));
+        let err = OtelError::Io(std::io::Error::other("test"));
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
     }

@@ -400,7 +400,7 @@ export function ServiceDataBrowser() {
 
     expandPath()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedPath])
+  }, [selectedPath, treeNodes.length])
 
   // Get entity info when entity is selected
   const { data: entityInfo, isLoading: entityInfoLoading } = useQuery({

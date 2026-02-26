@@ -144,8 +144,8 @@ impl OtelStorage for MockOtelStorage {
                     .map(|min| s.duration_ms >= min)
                     .unwrap_or(true)
             })
-            .cloned()
             .take(query.limit.unwrap_or(100) as usize)
+            .cloned()
             .collect();
         Ok(filtered)
     }
@@ -179,8 +179,8 @@ impl OtelStorage for MockOtelStorage {
                     .map(|s| l.body.contains(s.as_str()))
                     .unwrap_or(true)
             })
-            .cloned()
             .take(query.limit.unwrap_or(100) as usize)
+            .cloned()
             .collect();
         Ok(filtered)
     }
@@ -333,6 +333,7 @@ pub fn resource(service_name: &str) -> proto::resource::v1::Resource {
 }
 
 /// Build a single protobuf Span.
+#[allow(clippy::too_many_arguments)]
 pub fn span(
     trace_id: &[u8; 16],
     span_id: &[u8; 8],
@@ -409,7 +410,7 @@ pub fn build_sample_trace_tree() -> (String, Vec<u8>) {
     let child_http_id: [u8; 8] = [0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28];
     let grandchild_id: [u8; 8] = [0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38];
 
-    let base_time: u64 = 1700000000_000_000_000; // ~2023-11-14
+    let base_time: u64 = 1_700_000_000_000_000_000; // ~2023-11-14
 
     let root = span(
         &trace_id,
