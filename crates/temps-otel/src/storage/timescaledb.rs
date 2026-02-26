@@ -649,45 +649,42 @@ impl OtelStorage for TimescaleDbStorage {
         let limit = query.limit.unwrap_or(50).min(100);
         let offset = query.offset.unwrap_or(0);
 
-        let mut where_clauses = vec!["project_id = $1".to_string()];
+        let mut where_clauses = vec!["s.project_id = $1".to_string()];
         let mut values: Vec<sea_orm::Value> = vec![query.project_id.into()];
         let mut param_idx = 2u32;
 
         if let Some(ref tid) = query.trace_id {
-            where_clauses.push(format!("trace_id = ${}", param_idx));
+            where_clauses.push(format!("s.trace_id = ${}", param_idx));
             values.push(tid.clone().into());
             param_idx += 1;
         }
         if let Some(ref svc) = query.service_name {
-            where_clauses.push(format!("service_name = ${}", param_idx));
+            where_clauses.push(format!("s.service_name = ${}", param_idx));
             values.push(svc.clone().into());
             param_idx += 1;
         }
         if let Some(min_dur) = query.min_duration_ms {
-            where_clauses.push(format!("duration_ms >= ${}", param_idx));
+            where_clauses.push(format!("s.duration_ms >= ${}", param_idx));
             values.push(min_dur.into());
             param_idx += 1;
         }
         if let Some(start) = query.start_time {
-            where_clauses.push(format!("start_time >= ${}", param_idx));
+            where_clauses.push(format!("s.start_time >= ${}", param_idx));
             values.push(start.into());
             param_idx += 1;
         }
         if let Some(end) = query.end_time {
-            where_clauses.push(format!("start_time <= ${}", param_idx));
+            where_clauses.push(format!("s.start_time <= ${}", param_idx));
             values.push(end.into());
             param_idx += 1;
         }
         if let Some(deployment_id) = query.deployment_id {
-            where_clauses.push(format!("deployment_id = ${}", param_idx));
+            where_clauses.push(format!("s.deployment_id = ${}", param_idx));
             values.push(deployment_id.into());
             param_idx += 1;
         }
         if let Some(environment_id) = query.environment_id {
-            where_clauses.push(format!(
-                "deployment_id IN (SELECT id FROM deployments WHERE environment_id = ${})",
-                param_idx
-            ));
+            where_clauses.push(format!("e.id = ${}", param_idx));
             values.push(environment_id.into());
             param_idx += 1;
         }
@@ -696,10 +693,10 @@ impl OtelStorage for TimescaleDbStorage {
         // if OK, find traces with no error spans
         let status_having = match query.status {
             Some(crate::types::SpanStatusCode::Error) => {
-                "HAVING COUNT(*) FILTER (WHERE status_code = 'ERROR') > 0"
+                "HAVING COUNT(*) FILTER (WHERE s.status_code = 'ERROR') > 0"
             }
             Some(crate::types::SpanStatusCode::Ok) => {
-                "HAVING COUNT(*) FILTER (WHERE status_code = 'ERROR') = 0"
+                "HAVING COUNT(*) FILTER (WHERE s.status_code = 'ERROR') = 0"
             }
             _ => "",
         };
@@ -708,35 +705,39 @@ impl OtelStorage for TimescaleDbStorage {
 
         // Aggregate per trace_id: pick root span (NULL parent) or longest span,
         // count total spans and error spans, compute trace duration.
+        // LEFT JOIN deployments + environments to resolve the environment name
+        // from the deployment record, falling back to the OTel resource attribute.
         let sql = format!(
             r#"
             SELECT
-                trace_id,
-                (array_agg(name ORDER BY
-                    CASE WHEN parent_span_id IS NULL THEN 0 ELSE 1 END,
-                    duration_ms DESC
+                s.trace_id,
+                (array_agg(s.name ORDER BY
+                    CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
+                    s.duration_ms DESC
                 ))[1] AS root_span_name,
-                (array_agg(service_name ORDER BY
-                    CASE WHEN parent_span_id IS NULL THEN 0 ELSE 1 END,
-                    duration_ms DESC
+                (array_agg(s.service_name ORDER BY
+                    CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
+                    s.duration_ms DESC
                 ))[1] AS service_name,
-                (array_agg(kind ORDER BY
-                    CASE WHEN parent_span_id IS NULL THEN 0 ELSE 1 END,
-                    duration_ms DESC
+                (array_agg(s.kind ORDER BY
+                    CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
+                    s.duration_ms DESC
                 ))[1] AS kind,
-                (array_agg(deployment_environment ORDER BY
-                    CASE WHEN parent_span_id IS NULL THEN 0 ELSE 1 END,
-                    duration_ms DESC
+                (array_agg(COALESCE(e.name, s.deployment_environment) ORDER BY
+                    CASE WHEN s.parent_span_id IS NULL THEN 0 ELSE 1 END,
+                    s.duration_ms DESC
                 ))[1] AS deployment_environment,
-                MIN(start_time) AS start_time,
-                MAX(duration_ms) AS duration_ms,
+                MIN(s.start_time) AS start_time,
+                MAX(s.duration_ms) AS duration_ms,
                 COUNT(*)::bigint AS span_count,
-                COUNT(*) FILTER (WHERE status_code = 'ERROR')::bigint AS error_count
-            FROM otel_spans
+                COUNT(*) FILTER (WHERE s.status_code = 'ERROR')::bigint AS error_count
+            FROM otel_spans s
+            LEFT JOIN deployments d ON d.id = s.deployment_id
+            LEFT JOIN environments e ON e.id = d.environment_id
             WHERE {where_sql}
-            GROUP BY trace_id
+            GROUP BY s.trace_id
             {status_having}
-            ORDER BY MIN(start_time) DESC
+            ORDER BY MIN(s.start_time) DESC
             LIMIT ${param_idx} OFFSET ${next_param}
             "#,
             next_param = param_idx + 1
