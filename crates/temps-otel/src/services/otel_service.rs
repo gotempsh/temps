@@ -1,24 +1,25 @@
-//! Core OTel service orchestrating ingest, sampling, and storage.
+//! Core OTel service orchestrating ingest and storage.
+//!
+//! Sampling is the responsibility of the client SDK (head-based sampling).
+//! The server stores all spans it receives.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, RwLock,
+    Arc,
 };
 use tracing::{error, warn};
 
 use crate::error::OtelError;
 use crate::ingest::auth::{OtelAuthService, ProjectAuth};
 use crate::ingest::rate_limit::RateLimiter;
-use crate::ingest::sampler::{SamplerConfig, TraceSampler};
 use crate::storage::OtelStorage;
 use crate::types::*;
 
-/// Core OTel service that orchestrates ingest, sampling, and storage.
+/// Core OTel service that orchestrates ingest and storage.
 pub struct OtelService {
     storage: Arc<dyn OtelStorage>,
     auth_service: Arc<OtelAuthService>,
     rate_limiter: Arc<RateLimiter>,
-    sampler: RwLock<TraceSampler>,
     stats: PipelineStatsAtomic,
 }
 
@@ -29,7 +30,6 @@ struct PipelineStatsAtomic {
     metrics_dropped: AtomicU64,
     spans_received: AtomicU64,
     spans_stored: AtomicU64,
-    spans_sampled_out: AtomicU64,
     spans_dropped: AtomicU64,
     logs_received: AtomicU64,
     logs_stored_db: AtomicU64,
@@ -46,7 +46,6 @@ impl Default for PipelineStatsAtomic {
             metrics_dropped: AtomicU64::new(0),
             spans_received: AtomicU64::new(0),
             spans_stored: AtomicU64::new(0),
-            spans_sampled_out: AtomicU64::new(0),
             spans_dropped: AtomicU64::new(0),
             logs_received: AtomicU64::new(0),
             logs_stored_db: AtomicU64::new(0),
@@ -67,14 +66,19 @@ impl OtelService {
             storage,
             auth_service,
             rate_limiter,
-            sampler: RwLock::new(TraceSampler::new(SamplerConfig::default())),
             stats: PipelineStatsAtomic::default(),
         }
     }
 
-    /// Authenticate an API key.
-    pub async fn authenticate(&self, api_key: &str) -> Result<ProjectAuth, OtelError> {
-        self.auth_service.authenticate(api_key).await
+    /// Authenticate a token (API key `tk_` or deployment token `dt_`).
+    pub async fn authenticate(
+        &self,
+        token: &str,
+        header_project_id: Option<i32>,
+    ) -> Result<ProjectAuth, OtelError> {
+        self.auth_service
+            .authenticate(token, header_project_id)
+            .await
     }
 
     /// Check rate limit for a project.
@@ -128,36 +132,27 @@ impl OtelService {
         }
     }
 
-    /// Ingest trace spans with tail-based sampling.
+    /// Ingest trace spans — stores all received spans.
+    ///
+    /// Sampling is the client SDK's responsibility (head-based).
+    /// The server stores everything it receives.
     pub async fn ingest_spans(&self, spans: Vec<SpanRecord>) -> Result<u64, OtelError> {
         let count = spans.len() as u64;
         self.stats
             .spans_received
             .fetch_add(count, Ordering::Relaxed);
 
-        // Apply tail-based sampling
-        let (kept, sampled_out) = {
-            let sampler = self.sampler.read().unwrap_or_else(|e| e.into_inner());
-            sampler.sample(spans)
-        };
-
-        self.stats
-            .spans_sampled_out
-            .fetch_add(sampled_out, Ordering::Relaxed);
-
-        if kept.is_empty() {
+        if spans.is_empty() {
             return Ok(0);
         }
 
-        match self.storage.store_spans(kept).await {
+        match self.storage.store_spans(spans).await {
             Ok(stored) => {
                 self.stats.spans_stored.fetch_add(stored, Ordering::Relaxed);
                 Ok(stored)
             }
             Err(e) => {
-                self.stats
-                    .spans_dropped
-                    .fetch_add(count - sampled_out, Ordering::Relaxed);
+                self.stats.spans_dropped.fetch_add(count, Ordering::Relaxed);
                 self.stats.ingest_errors.fetch_add(1, Ordering::Relaxed);
                 error!(count, error = %e, "Failed to store spans");
                 Err(e)
@@ -276,7 +271,6 @@ impl OtelService {
             metrics_dropped: self.stats.metrics_dropped.load(Ordering::Relaxed),
             spans_received: self.stats.spans_received.load(Ordering::Relaxed),
             spans_stored: self.stats.spans_stored.load(Ordering::Relaxed),
-            spans_sampled_out: self.stats.spans_sampled_out.load(Ordering::Relaxed),
             spans_dropped: self.stats.spans_dropped.load(Ordering::Relaxed),
             logs_received: self.stats.logs_received.load(Ordering::Relaxed),
             logs_stored_db: self.stats.logs_stored_db.load(Ordering::Relaxed),
@@ -289,13 +283,6 @@ impl OtelService {
     /// Access to storage for background jobs (anomaly detection, health computation).
     pub fn storage(&self) -> &Arc<dyn OtelStorage> {
         &self.storage
-    }
-
-    /// Update the sampler's P95 latency threshold.
-    pub fn update_p95_threshold(&self, p95_ms: f64) {
-        if let Ok(mut sampler) = self.sampler.write() {
-            sampler.update_latency_threshold(p95_ms);
-        }
     }
 }
 
@@ -331,19 +318,17 @@ mod tests {
         let spans = decode::decode_traces_request(&encoded, 1, None).unwrap();
         assert_eq!(spans.len(), 4);
 
-        let _stored = svc.ingest_spans(spans).await.unwrap();
+        let stored = svc.ingest_spans(spans).await.unwrap();
 
-        // Sampler keeps all spans (all have OK status, and probabilistic
-        // sampling is 1% but the sampler always keeps error/slow spans;
-        // with default config these are all fast+OK so most may be sampled out)
-        // At minimum, stats should reflect what was received
+        // All received spans are stored (no server-side sampling)
+        assert_eq!(stored, 4);
         let stats = svc.pipeline_stats();
         assert_eq!(stats.spans_received, 4);
-        assert_eq!(stats.spans_stored + stats.spans_sampled_out, 4);
+        assert_eq!(stats.spans_stored, 4);
     }
 
     #[tokio::test]
-    async fn test_ingest_spans_error_span_always_kept() {
+    async fn test_ingest_spans_error_span_stored() {
         let mock = MockOtelStorage::new();
         let (svc, storage) = make_service(mock);
 
@@ -367,8 +352,7 @@ mod tests {
         let spans = decode::decode_traces_request(&encoded, 1, None).unwrap();
         let stored = svc.ingest_spans(spans).await.unwrap();
 
-        // Error traces are always kept by the sampler
-        assert_eq!(stored, 1, "Error span must be kept");
+        assert_eq!(stored, 1);
         let stored_spans = storage.stored_spans();
         assert_eq!(stored_spans.len(), 1);
         assert_eq!(stored_spans[0].status_code, SpanStatusCode::Error);
@@ -380,7 +364,6 @@ mod tests {
         *mock.fail_store_spans.lock().unwrap() = Some("disk full".into());
         let (svc, _storage) = make_service(mock);
 
-        // Use an error span so the sampler keeps it
         let trace_id: [u8; 16] = [0xCC; 16];
         let span_id: [u8; 8] = [0xDD; 8];
         let error_span = test_support::span(
@@ -592,14 +575,5 @@ mod tests {
         assert!(svc.check_rate_limit(1).is_ok());
         let result = svc.check_rate_limit(1);
         assert!(matches!(result, Err(OtelError::RateLimitExceeded { .. })));
-    }
-
-    #[test]
-    fn test_update_p95_threshold() {
-        let mock = MockOtelStorage::new();
-        let (svc, _) = make_service(mock);
-
-        // Should not panic
-        svc.update_p95_threshold(150.0);
     }
 }

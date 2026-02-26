@@ -179,6 +179,7 @@ pub async fn extract_auth_from_request(
                         return Ok(AuthContext::new_deployment_token(
                             validated.project_id,
                             validated.environment_id,
+                            validated.deployment_id,
                             validated.token_id,
                             validated.name,
                             validated.permissions,

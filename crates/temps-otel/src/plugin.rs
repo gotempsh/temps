@@ -8,7 +8,7 @@ use std::time::Duration;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
@@ -49,14 +49,9 @@ pub struct OtelConfig {
     // Quota
     pub quota_bytes_per_project: u64,
 
-    // Sampling
-    pub sample_rate: f64,
-    pub latency_threshold_ms: f64,
-
     // Background tasks
     pub enable_health_compute: bool,
     pub enable_anomaly_detection: bool,
-    pub p95_update_interval_secs: u64,
 }
 
 impl Default for OtelConfig {
@@ -73,11 +68,8 @@ impl Default for OtelConfig {
             rate_limit_requests: 1000,
             rate_limit_window_secs: 60,
             quota_bytes_per_project: 10 * 1024 * 1024 * 1024, // 10 GB
-            sample_rate: 0.01,                                // 1%
-            latency_threshold_ms: 1000.0,
             enable_health_compute: true,
             enable_anomaly_detection: true,
-            p95_update_interval_secs: 300, // 5 minutes
         }
     }
 }
@@ -125,16 +117,6 @@ impl OtelConfig {
                 config.quota_bytes_per_project = gb * 1024 * 1024 * 1024;
             }
         }
-        if let Ok(v) = std::env::var("TEMPS_OTEL_SAMPLE_RATE") {
-            if let Ok(rate) = v.parse() {
-                config.sample_rate = rate;
-            }
-        }
-        if let Ok(v) = std::env::var("TEMPS_OTEL_LATENCY_THRESHOLD_MS") {
-            if let Ok(ms) = v.parse() {
-                config.latency_threshold_ms = ms;
-            }
-        }
         if let Ok(v) = std::env::var("TEMPS_OTEL_ENABLE_HEALTH_COMPUTE") {
             config.enable_health_compute = v != "0" && v != "false";
         }
@@ -162,6 +144,9 @@ impl OtelConfig {
         ingest_handler::ingest_metrics,
         ingest_handler::ingest_traces,
         ingest_handler::ingest_logs,
+        ingest_handler::ingest_metrics_by_path,
+        ingest_handler::ingest_traces_by_path,
+        ingest_handler::ingest_logs_by_path,
         query_handler::query_metrics,
         query_handler::list_metric_names,
         query_handler::query_traces,
@@ -329,29 +314,7 @@ impl TempsPlugin for OtelPlugin {
                 }
             });
 
-            // 2. P95 feedback loop (updates sampler threshold)
-            let p95_otel_service = otel_service.clone();
-            let p95_storage = storage.clone();
-            let p95_interval = config.p95_update_interval_secs;
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(p95_interval));
-                loop {
-                    interval.tick().await;
-                    // Compute P95 across all services (empty service_name = all)
-                    match p95_storage.get_p95_latency(0, "", 15).await {
-                        Ok(p95) if p95 > 0.0 => {
-                            debug!(p95_ms = p95, "Updating sampler P95 latency threshold");
-                            p95_otel_service.update_p95_threshold(p95);
-                        }
-                        Ok(_) => {} // No data yet
-                        Err(e) => {
-                            warn!(error = %e, "Failed to compute P95 latency for sampler");
-                        }
-                    }
-                }
-            });
-
-            // 3. Health compute service
+            // 2. Health compute service
             if config.enable_health_compute {
                 let health_service = Arc::new(HealthComputeService::new(storage.clone()));
                 tokio::spawn(async move {

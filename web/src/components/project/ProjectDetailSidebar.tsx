@@ -19,6 +19,7 @@ import {
   Key,
   Globe,
   Boxes,
+  Workflow,
 } from 'lucide-react'
 import {
   useCallback,
@@ -142,6 +143,11 @@ const baseNavItems: NavItem[] = [
     title: 'Monitoring',
     url: 'monitoring',
     icon: Gauge,
+  },
+  {
+    title: 'Traces',
+    url: 'traces',
+    icon: Workflow,
   },
 
   // Debugging (Medium Frequency)

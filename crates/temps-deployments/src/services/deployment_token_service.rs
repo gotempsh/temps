@@ -33,6 +33,7 @@ pub struct DeploymentTokenResponse {
     pub id: i32,
     pub project_id: i32,
     pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
     pub name: String,
     pub token_prefix: String,
     pub permissions: Option<Vec<String>>,
@@ -52,6 +53,7 @@ impl From<DeploymentTokenModel> for DeploymentTokenResponse {
             id: model.id,
             project_id: model.project_id,
             environment_id: model.environment_id,
+            deployment_id: model.deployment_id,
             name: model.name,
             token_prefix: model.token_prefix,
             permissions: model
@@ -71,6 +73,7 @@ pub struct CreateDeploymentTokenResponse {
     pub id: i32,
     pub project_id: i32,
     pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
     pub name: String,
     pub token_prefix: String,
     pub permissions: Option<Vec<String>>,
@@ -95,6 +98,8 @@ pub struct CreateDeploymentTokenRequest {
     pub name: String,
     /// Optional environment ID - if not set, token applies to all environments
     pub environment_id: Option<i32>,
+    /// Optional deployment ID - if set, token is scoped to a specific deployment
+    pub deployment_id: Option<i32>,
     /// List of permissions (e.g., ["visitors:enrich", "emails:send"])
     /// If not provided, defaults to full access
     #[schema(example = json!(["visitors:enrich", "emails:send"]))]
@@ -264,6 +269,7 @@ impl DeploymentTokenService {
         let new_token = DeploymentTokenActiveModel {
             project_id: Set(project_id),
             environment_id: Set(request.environment_id),
+            deployment_id: Set(request.deployment_id),
             name: Set(request.name.clone()),
             token_hash: Set(token_hash),
             token_prefix: Set(token_prefix.clone()),
@@ -284,6 +290,7 @@ impl DeploymentTokenService {
             id: token_model.id,
             project_id: token_model.project_id,
             environment_id: token_model.environment_id,
+            deployment_id: token_model.deployment_id,
             name: token_model.name,
             token_prefix,
             permissions: permissions_json.and_then(|p| serde_json::from_value(p).ok()),
@@ -480,13 +487,14 @@ impl DeploymentTokenService {
         ))
     }
 
-    /// Get the active deployment token for a project/environment combination
+    /// Get the active deployment token for a project/environment/deployment combination
     /// Used during deployment to inject TEMPS_API_TOKEN
     /// Returns the token value if one exists, or creates a default one
     pub async fn get_or_create_deployment_token(
         &self,
         project_id: i32,
         environment_id: Option<i32>,
+        deployment_id: Option<i32>,
     ) -> Result<String, DeploymentTokenServiceError> {
         // First, try to find an existing active token for this project/environment
         let mut query = DeploymentTokenEntity::find()
@@ -593,6 +601,7 @@ impl DeploymentTokenService {
         let new_token = DeploymentTokenActiveModel {
             project_id: Set(project_id),
             environment_id: Set(environment_id),
+            deployment_id: Set(deployment_id),
             name: Set(default_name),
             token_hash: Set(token_hash),
             token_prefix: Set(token_prefix),
@@ -701,6 +710,7 @@ mod tests {
         let request = CreateDeploymentTokenRequest {
             name: "Test Token".to_string(),
             environment_id: None,
+            deployment_id: None,
             permissions: Some(vec![
                 "visitors:enrich".to_string(),
                 "emails:send".to_string(),
@@ -729,6 +739,7 @@ mod tests {
         let request = CreateDeploymentTokenRequest {
             name: "Default Perms Token".to_string(),
             environment_id: None,
+            deployment_id: None,
             permissions: None, // Should default to full access
             expires_at: None,
         };
@@ -751,6 +762,7 @@ mod tests {
         let request = CreateDeploymentTokenRequest {
             name: "Invalid Perm Token".to_string(),
             environment_id: None,
+            deployment_id: None,
             permissions: Some(vec!["invalid:permission".to_string()]),
             expires_at: None,
         };
@@ -773,6 +785,7 @@ mod tests {
         let request1 = CreateDeploymentTokenRequest {
             name: "Duplicate Name".to_string(),
             environment_id: None,
+            deployment_id: None,
             permissions: None,
             expires_at: None,
         };
@@ -785,6 +798,7 @@ mod tests {
         let request2 = CreateDeploymentTokenRequest {
             name: "Duplicate Name".to_string(),
             environment_id: None,
+            deployment_id: None,
             permissions: None,
             expires_at: None,
         };
@@ -809,6 +823,7 @@ mod tests {
             let request = CreateDeploymentTokenRequest {
                 name: format!("Token {}", i),
                 environment_id: None,
+                deployment_id: None,
                 permissions: None,
                 expires_at: None,
             };
@@ -833,6 +848,7 @@ mod tests {
         let request = CreateDeploymentTokenRequest {
             name: "Get Token Test".to_string(),
             environment_id: None,
+            deployment_id: None,
             permissions: None,
             expires_at: None,
         };
@@ -857,6 +873,7 @@ mod tests {
         let request = CreateDeploymentTokenRequest {
             name: "Original Name".to_string(),
             environment_id: None,
+            deployment_id: None,
             permissions: None,
             expires_at: None,
         };
@@ -891,6 +908,7 @@ mod tests {
         let request = CreateDeploymentTokenRequest {
             name: "Delete Me".to_string(),
             environment_id: None,
+            deployment_id: None,
             permissions: None,
             expires_at: None,
         };
@@ -915,6 +933,7 @@ mod tests {
         let request = CreateDeploymentTokenRequest {
             name: "Validate Me".to_string(),
             environment_id: None,
+            deployment_id: None,
             permissions: Some(vec!["visitors:enrich".to_string()]),
             expires_at: None,
         };
@@ -942,6 +961,7 @@ mod tests {
         let request = CreateDeploymentTokenRequest {
             name: "Expired Token".to_string(),
             environment_id: None,
+            deployment_id: None,
             permissions: None,
             expires_at: Some(Utc::now() - Duration::days(1)), // Already expired
         };
@@ -1235,6 +1255,7 @@ mod tests {
         let request = CreateDeploymentTokenRequest {
             name: "Test Token".to_string(),
             environment_id: None,
+            deployment_id: None,
             permissions: Some(vec!["visitors:enrich".to_string()]),
             expires_at: None,
         };
@@ -1389,6 +1410,7 @@ mod tests {
             id: 1,
             project_id: 100,
             environment_id: Some(50),
+            deployment_id: None,
             name: "Test Token".to_string(),
             token: "dt_abcdefghij1234567890abcdefghij1234567890".to_string(),
             token_prefix: "dt_abcdef...".to_string(),
@@ -1411,6 +1433,7 @@ mod tests {
             id: 1,
             project_id: 100,
             environment_id: None,
+            deployment_id: None,
             name: "API Token".to_string(),
             token_prefix: "dt_xyz123...".to_string(),
             permissions: Some(vec![

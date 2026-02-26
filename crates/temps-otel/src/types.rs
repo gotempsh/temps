@@ -336,7 +336,6 @@ pub struct PipelineStats {
     pub metrics_dropped: u64,
     pub spans_received: u64,
     pub spans_stored: u64,
-    pub spans_sampled_out: u64,
     pub spans_dropped: u64,
     pub logs_received: u64,
     pub logs_stored_db: u64,

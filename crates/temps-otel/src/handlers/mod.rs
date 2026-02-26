@@ -10,10 +10,15 @@ use crate::OtelAppState;
 
 /// Configure all OTel routes.
 ///
-/// Ingest routes (OTLP/HTTP on the API):
+/// Ingest routes (OTLP/HTTP, header-based auth):
 ///   POST /otel/v1/metrics
 ///   POST /otel/v1/traces
 ///   POST /otel/v1/logs
+///
+/// Ingest routes (OTLP/HTTP, IDs in URL path):
+///   POST /otel/v1/{project_id}/{environment_id}/{deployment_id}/metrics
+///   POST /otel/v1/{project_id}/{environment_id}/{deployment_id}/traces
+///   POST /otel/v1/{project_id}/{environment_id}/{deployment_id}/logs
 ///
 /// Query routes (authenticated, for the monitoring UI):
 ///   GET /otel/metrics
@@ -27,10 +32,23 @@ use crate::OtelAppState;
 ///   GET /otel/pipeline-stats
 pub fn configure_routes() -> Router<OtelAppState> {
     Router::new()
-        // OTLP ingest endpoints
+        // OTLP ingest endpoints (header-based auth)
         .route("/otel/v1/metrics", post(ingest_handler::ingest_metrics))
         .route("/otel/v1/traces", post(ingest_handler::ingest_traces))
         .route("/otel/v1/logs", post(ingest_handler::ingest_logs))
+        // OTLP ingest endpoints (project/environment/deployment in path)
+        .route(
+            "/otel/v1/{project_id}/{environment_id}/{deployment_id}/metrics",
+            post(ingest_handler::ingest_metrics_by_path),
+        )
+        .route(
+            "/otel/v1/{project_id}/{environment_id}/{deployment_id}/traces",
+            post(ingest_handler::ingest_traces_by_path),
+        )
+        .route(
+            "/otel/v1/{project_id}/{environment_id}/{deployment_id}/logs",
+            post(ingest_handler::ingest_logs_by_path),
+        )
         // Query endpoints
         .route("/otel/metrics", get(query_handler::query_metrics))
         .route(

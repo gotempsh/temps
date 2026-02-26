@@ -26,7 +26,7 @@ message Span {
   bytes span_id = 2;
   string trace_state = 3;
   bytes parent_span_id = 4;
-  uint32 flags = 16;
+  fixed32 flags = 16;
   string name = 5;
 
   enum SpanKind {
@@ -60,7 +60,7 @@ message Span {
     string trace_state = 3;
     repeated opentelemetry.proto.common.v1.KeyValue attributes = 4;
     uint32 dropped_attributes_count = 5;
-    uint32 flags = 6;
+    fixed32 flags = 6;
   }
 
   repeated Link links = 13;

@@ -3833,6 +3833,33 @@ export type HealthCheckConfiguration = {
     timeout: number;
 };
 
+export type HealthResponse = {
+    summaries: Array<HealthSummary>;
+};
+
+/**
+ * Overall health status.
+ */
+export type HealthStatus = 'healthy' | 'degraded' | 'down' | 'unknown';
+
+/**
+ * Pre-computed health summary for a project environment.
+ */
+export type HealthSummary = {
+    computed_at: string;
+    cpu_usage_pct: number;
+    environment_id?: number | null;
+    error_rate: number;
+    last_deploy_at?: string | null;
+    last_deploy_id?: number | null;
+    memory_usage_pct: number;
+    p95_latency_ms: number;
+    project_id: number;
+    service_name: string;
+    status: HealthStatus;
+    uptime_pct: number;
+};
+
 /**
  * Describes a level in the data source hierarchy
  */
@@ -4234,6 +4261,42 @@ export type IncrResponse = {
 export type InitAuthResponse = {
     auth_url: string;
     session_token: string;
+};
+
+/**
+ * An anomaly insight.
+ */
+export type Insight = {
+    anomaly_ids: Array<number>;
+    correlated_deploy_id?: number | null;
+    created_at: string;
+    description: string;
+    environment?: string | null;
+    id: number;
+    metric_name?: string | null;
+    project_id: number;
+    resolved_at?: string | null;
+    service_name: string;
+    severity: InsightSeverity;
+    started_at: string;
+    status: InsightStatus;
+    title: string;
+    updated_at: string;
+};
+
+/**
+ * Severity of an anomaly insight.
+ */
+export type InsightSeverity = 'low' | 'medium' | 'high' | 'critical';
+
+/**
+ * Status of an insight.
+ */
+export type InsightStatus = 'active' | 'resolved';
+
+export type InsightsResponse = {
+    count: number;
+    data: Array<Insight>;
 };
 
 /**
@@ -4682,9 +4745,38 @@ export type LocationInfo = {
     region?: string | null;
 };
 
+/**
+ * A single log record ready for storage.
+ */
+export type LogRecord = {
+    attributes: {
+        [key: string]: string;
+    };
+    body: string;
+    deployment_id?: number | null;
+    observed_timestamp: string;
+    project_id: number;
+    resource: ResourceInfo;
+    severity: LogSeverity;
+    severity_text: string;
+    span_id?: string | null;
+    timestamp: string;
+    trace_id?: string | null;
+};
+
+/**
+ * Log severity level (simplified from OTel's 24 levels).
+ */
+export type LogSeverity = 'TRACE' | 'DEBUG' | 'INFO' | 'WARN' | 'ERROR' | 'FATAL';
+
 export type LoginRequest = {
     email: string;
     password: string;
+};
+
+export type LogsResponse = {
+    count: number;
+    data: Array<LogRecord>;
 };
 
 export type MagicLinkRequest = {
@@ -4730,6 +4822,26 @@ export type ManualAction = {
  */
 export type ManualActionTiming = 'before-migration' | 'after-migration' | 'within-hours';
 
+/**
+ * A time-bucketed metric aggregate for chart display.
+ */
+export type MetricBucket = {
+    avg_value: number;
+    bucket: string;
+    count: number;
+    max_value: number;
+    min_value: number;
+};
+
+export type MetricNamesResponse = {
+    names: Array<string>;
+};
+
+/**
+ * The type of an OTel metric.
+ */
+export type MetricType = 'gauge' | 'sum' | 'histogram';
+
 export type MetricsOverTimeResponse = {
     cls: Array<number | null>;
     cls_p75?: number | null;
@@ -4770,6 +4882,11 @@ export type MetricsQuery = {
     environment_id?: number | null;
     project_id: number;
     start_date: string;
+};
+
+export type MetricsResponse = {
+    count: number;
+    data: Array<MetricBucket>;
 };
 
 export type MfaRequiredResponse = {
@@ -5662,6 +5779,28 @@ export type PermissionInfo = {
 };
 
 /**
+ * Internal pipeline statistics for self-observability.
+ */
+export type PipelineStats = {
+    ingest_errors: number;
+    logs_dropped: number;
+    logs_received: number;
+    logs_stored_db: number;
+    logs_stored_s3: number;
+    metrics_dropped: number;
+    metrics_received: number;
+    metrics_stored: number;
+    spans_dropped: number;
+    spans_received: number;
+    spans_sampled_out: number;
+    spans_stored: number;
+};
+
+export type PipelineStatsResponse = {
+    stats: PipelineStats;
+};
+
+/**
  * Plan complexity indicator
  */
 export type PlanComplexity = 'low' | 'medium' | 'high';
@@ -6291,6 +6430,10 @@ export type QueryDataResponse = {
     total_count: number;
 };
 
+export type QuotaResponse = {
+    quota: StorageQuota;
+};
+
 /**
  * Rate limiting configuration (subset of global RateLimitSettings)
  */
@@ -6483,6 +6626,18 @@ export type ResourceCounts = {
     environments: number;
     projects: number;
     services: number;
+};
+
+/**
+ * Resource attributes extracted from OTel resource descriptors.
+ */
+export type ResourceInfo = {
+    attributes: {
+        [key: string]: unknown;
+    };
+    deployment_environment?: string | null;
+    service_name: string;
+    service_version?: string | null;
 };
 
 /**
@@ -7422,6 +7577,50 @@ export type SourceMapResponse = {
 export type SourceType = 'git' | 'docker_image' | 'static_files' | 'manual';
 
 /**
+ * A span event (log-like annotation on a span).
+ */
+export type SpanEvent = {
+    attributes: {
+        [key: string]: string;
+    };
+    name: string;
+    timestamp: string;
+};
+
+/**
+ * Span kind.
+ */
+export type SpanKind = 'UNSPECIFIED' | 'INTERNAL' | 'SERVER' | 'CLIENT' | 'PRODUCER' | 'CONSUMER';
+
+/**
+ * A single trace span ready for storage.
+ */
+export type SpanRecord = {
+    attributes: {
+        [key: string]: string;
+    };
+    deployment_id?: number | null;
+    duration_ms: number;
+    end_time: string;
+    events: Array<SpanEvent>;
+    kind: SpanKind;
+    name: string;
+    parent_span_id?: string | null;
+    project_id: number;
+    resource: ResourceInfo;
+    span_id: string;
+    start_time: string;
+    status_code: SpanStatusCode;
+    status_message: string;
+    trace_id: string;
+};
+
+/**
+ * Span status code.
+ */
+export type SpanStatusCode = 'UNSET' | 'OK' | 'ERROR';
+
+/**
  * Speed metrics payload for recording web vitals
  */
 export type SpeedMetricsPayload = {
@@ -7533,6 +7732,10 @@ export type StatsFilters = {
     request_source?: string | null;
     routing_status?: string | null;
     status_code?: number | null;
+    /**
+     * Filter by status code class (e.g. "2xx", "3xx", "4xx", "5xx")
+     */
+    status_code_class?: string | null;
 };
 
 export type StatusBucket = {
@@ -7625,6 +7828,19 @@ export type StepResult = {
      * Whether this step succeeded
      */
     success: boolean;
+};
+
+/**
+ * Quota usage information for a project.
+ */
+export type StorageQuota = {
+    limit_bytes: number;
+    logs_bytes: number;
+    metrics_bytes: number;
+    project_id: number;
+    total_bytes: number;
+    traces_bytes: number;
+    usage_pct: number;
 };
 
 export type SyncedRepositoryListQuery = {
@@ -7819,6 +8035,11 @@ export type TodayStatsResponse = {
 
 export type TokenRenewalRequest = {
     refresh_token: string;
+};
+
+export type TracesResponse = {
+    count: number;
+    data: Array<SpanRecord>;
 };
 
 export type TriggerDigestResponse = {
@@ -17477,6 +17698,579 @@ export type ListOrdersResponses = {
 
 export type ListOrdersResponse2 = ListOrdersResponses[keyof ListOrdersResponses];
 
+export type GetHealthData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Filter by environment ID
+         */
+        environment_id?: number;
+    };
+    url: '/otel/health/{project_id}';
+};
+
+export type GetHealthErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetHealthError = GetHealthErrors[keyof GetHealthErrors];
+
+export type GetHealthResponses = {
+    /**
+     * Health summaries
+     */
+    200: HealthResponse;
+};
+
+export type GetHealthResponse = GetHealthResponses[keyof GetHealthResponses];
+
+export type ListInsightsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Filter by status (active, resolved)
+         */
+        status?: string;
+        /**
+         * Max insights to return (default: 20, max: 100)
+         */
+        limit?: number;
+        /**
+         * Offset for pagination
+         */
+        offset?: number;
+    };
+    url: '/otel/insights/{project_id}';
+};
+
+export type ListInsightsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListInsightsError = ListInsightsErrors[keyof ListInsightsErrors];
+
+export type ListInsightsResponses = {
+    /**
+     * Insights list
+     */
+    200: InsightsResponse;
+};
+
+export type ListInsightsResponse = ListInsightsResponses[keyof ListInsightsResponses];
+
+export type QueryLogsData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Filter by severity (TRACE, DEBUG, INFO, WARN, ERROR, FATAL)
+         */
+        severity?: string;
+        /**
+         * Filter by service name
+         */
+        service_name?: string;
+        /**
+         * Full-text search in log body (ILIKE)
+         */
+        search?: string;
+        /**
+         * Filter by correlated trace ID
+         */
+        trace_id?: string;
+        /**
+         * Start time (RFC 3339)
+         */
+        start_time?: string;
+        /**
+         * End time (RFC 3339)
+         */
+        end_time?: string;
+        /**
+         * Max logs to return (default: 100, max: 1000)
+         */
+        limit?: number;
+        /**
+         * Offset for pagination
+         */
+        offset?: number;
+    };
+    url: '/otel/logs';
+};
+
+export type QueryLogsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type QueryLogsError = QueryLogsErrors[keyof QueryLogsErrors];
+
+export type QueryLogsResponses = {
+    /**
+     * Log records
+     */
+    200: LogsResponse;
+};
+
+export type QueryLogsResponse = QueryLogsResponses[keyof QueryLogsResponses];
+
+export type ListMetricNamesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/otel/metric-names/{project_id}';
+};
+
+export type ListMetricNamesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListMetricNamesError = ListMetricNamesErrors[keyof ListMetricNamesErrors];
+
+export type ListMetricNamesResponses = {
+    /**
+     * List of metric names
+     */
+    200: MetricNamesResponse;
+};
+
+export type ListMetricNamesResponse = ListMetricNamesResponses[keyof ListMetricNamesResponses];
+
+export type QueryMetricsData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Filter by metric name
+         */
+        metric_name?: string;
+        /**
+         * Filter by service name
+         */
+        service_name?: string;
+        /**
+         * Filter by deployment environment
+         */
+        environment?: string;
+        /**
+         * Start time (RFC 3339)
+         */
+        start_time?: string;
+        /**
+         * End time (RFC 3339)
+         */
+        end_time?: string;
+        /**
+         * Bucket interval (e.g. '1 hour', '5 minutes')
+         */
+        bucket_interval?: string;
+        /**
+         * Max buckets to return (default: 1000)
+         */
+        limit?: number;
+    };
+    url: '/otel/metrics';
+};
+
+export type QueryMetricsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type QueryMetricsError = QueryMetricsErrors[keyof QueryMetricsErrors];
+
+export type QueryMetricsResponses = {
+    /**
+     * Metrics data
+     */
+    200: MetricsResponse;
+};
+
+export type QueryMetricsResponse = QueryMetricsResponses[keyof QueryMetricsResponses];
+
+export type GetPipelineStatsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/otel/pipeline-stats';
+};
+
+export type GetPipelineStatsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type GetPipelineStatsError = GetPipelineStatsErrors[keyof GetPipelineStatsErrors];
+
+export type GetPipelineStatsResponses = {
+    /**
+     * Pipeline statistics
+     */
+    200: PipelineStatsResponse;
+};
+
+export type GetPipelineStatsResponse = GetPipelineStatsResponses[keyof GetPipelineStatsResponses];
+
+export type GetQuotaData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/otel/quota/{project_id}';
+};
+
+export type GetQuotaErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetQuotaError = GetQuotaErrors[keyof GetQuotaErrors];
+
+export type GetQuotaResponses = {
+    /**
+     * Storage quota
+     */
+    200: QuotaResponse;
+};
+
+export type GetQuotaResponse = GetQuotaResponses[keyof GetQuotaResponses];
+
+export type QueryTracesData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Filter by trace ID
+         */
+        trace_id?: string;
+        /**
+         * Filter by service name
+         */
+        service_name?: string;
+        /**
+         * Filter by status (OK, ERROR, UNSET)
+         */
+        status?: string;
+        /**
+         * Minimum span duration in ms
+         */
+        min_duration_ms?: number;
+        /**
+         * Start time (RFC 3339)
+         */
+        start_time?: string;
+        /**
+         * End time (RFC 3339)
+         */
+        end_time?: string;
+        /**
+         * Max spans to return (default: 100, max: 1000)
+         */
+        limit?: number;
+        /**
+         * Offset for pagination
+         */
+        offset?: number;
+    };
+    url: '/otel/traces';
+};
+
+export type QueryTracesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type QueryTracesError = QueryTracesErrors[keyof QueryTracesErrors];
+
+export type QueryTracesResponses = {
+    /**
+     * Trace spans
+     */
+    200: TracesResponse;
+};
+
+export type QueryTracesResponse = QueryTracesResponses[keyof QueryTracesResponses];
+
+export type GetTraceData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Trace ID (hex)
+         */
+        trace_id: string;
+    };
+    query?: never;
+    url: '/otel/traces/{project_id}/{trace_id}';
+};
+
+export type GetTraceErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetTraceError = GetTraceErrors[keyof GetTraceErrors];
+
+export type GetTraceResponses = {
+    /**
+     * Trace spans tree
+     */
+    200: TracesResponse;
+};
+
+export type GetTraceResponse = GetTraceResponses[keyof GetTraceResponses];
+
+export type IngestLogsData = {
+    /**
+     * OTLP ExportLogsServiceRequest (protobuf, optionally gzip/zstd compressed)
+     */
+    body: string;
+    path?: never;
+    query?: never;
+    url: '/otel/v1/logs';
+};
+
+export type IngestLogsErrors = {
+    /**
+     * Invalid payload
+     */
+    400: ProblemDetails;
+    /**
+     * Missing or invalid API key
+     */
+    401: ProblemDetails;
+    /**
+     * Storage quota exceeded
+     */
+    413: ProblemDetails;
+    /**
+     * Rate limit exceeded
+     */
+    429: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type IngestLogsError = IngestLogsErrors[keyof IngestLogsErrors];
+
+export type IngestLogsResponses = {
+    /**
+     * Logs accepted (OTLP protobuf response)
+     */
+    200: unknown;
+};
+
+export type IngestMetricsData = {
+    /**
+     * OTLP ExportMetricsServiceRequest (protobuf, optionally gzip/zstd compressed)
+     */
+    body: string;
+    path?: never;
+    query?: never;
+    url: '/otel/v1/metrics';
+};
+
+export type IngestMetricsErrors = {
+    /**
+     * Invalid payload
+     */
+    400: ProblemDetails;
+    /**
+     * Missing or invalid API key
+     */
+    401: ProblemDetails;
+    /**
+     * Storage quota exceeded
+     */
+    413: ProblemDetails;
+    /**
+     * Rate limit exceeded
+     */
+    429: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type IngestMetricsError = IngestMetricsErrors[keyof IngestMetricsErrors];
+
+export type IngestMetricsResponses = {
+    /**
+     * Metrics accepted (OTLP protobuf response)
+     */
+    200: unknown;
+};
+
+export type IngestTracesData = {
+    /**
+     * OTLP ExportTraceServiceRequest (protobuf, optionally gzip/zstd compressed)
+     */
+    body: string;
+    path?: never;
+    query?: never;
+    url: '/otel/v1/traces';
+};
+
+export type IngestTracesErrors = {
+    /**
+     * Invalid payload
+     */
+    400: ProblemDetails;
+    /**
+     * Missing or invalid API key
+     */
+    401: ProblemDetails;
+    /**
+     * Storage quota exceeded
+     */
+    413: ProblemDetails;
+    /**
+     * Rate limit exceeded
+     */
+    429: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type IngestTracesError = IngestTracesErrors[keyof IngestTracesErrors];
+
+export type IngestTracesResponses = {
+    /**
+     * Traces accepted (OTLP protobuf response)
+     */
+    200: unknown;
+};
+
 export type HasPerformanceMetricsData = {
     body?: never;
     path?: never;
@@ -23267,6 +24061,10 @@ export type GetTodayStatsData = {
          * Filter by status code
          */
         status_code?: number | null;
+        /**
+         * Filter by status code class (e.g. "2xx", "3xx", "4xx", "5xx")
+         */
+        status_code_class?: string | null;
         /**
          * Filter by routing status
          */

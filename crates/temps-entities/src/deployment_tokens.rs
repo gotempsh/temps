@@ -22,6 +22,9 @@ pub struct Model {
     /// Optional environment ID - if set, token is specific to that environment
     /// If null, token applies to all environments in the project
     pub environment_id: Option<i32>,
+    /// Optional deployment ID - if set, token was created for a specific deployment
+    /// Used by OTel and other services to associate data with a deployment
+    pub deployment_id: Option<i32>,
     pub name: String,
     pub token_hash: String,
     /// First 8 characters for identification in UI
@@ -55,6 +58,12 @@ pub enum Relation {
     )]
     Environment,
     #[sea_orm(
+        belongs_to = "crate::deployments::Entity",
+        from = "Column::DeploymentId",
+        to = "crate::deployments::Column::Id"
+    )]
+    Deployment,
+    #[sea_orm(
         belongs_to = "crate::users::Entity",
         from = "Column::CreatedBy",
         to = "crate::users::Column::Id"
@@ -71,6 +80,12 @@ impl Related<crate::projects::Entity> for Entity {
 impl Related<crate::environments::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Environment.def()
+    }
+}
+
+impl Related<crate::deployments::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Deployment.def()
     }
 }
 

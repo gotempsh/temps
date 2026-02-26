@@ -19,7 +19,7 @@ pub struct SamplerConfig {
 impl Default for SamplerConfig {
     fn default() -> Self {
         Self {
-            base_sample_rate: 0.01,       // 1%
+            base_sample_rate: 1.0,        // 100% — keep all traces by default
             latency_threshold_ms: 1000.0, // default 1s until P95 is computed
         }
     }

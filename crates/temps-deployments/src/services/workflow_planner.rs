@@ -71,6 +71,7 @@ impl WorkflowPlanner {
         &self,
         project: &projects::Model,
         environment: &environments::Model,
+        deployment: &deployments::Model,
     ) -> anyhow::Result<std::collections::HashMap<String, String>> {
         use std::collections::HashMap;
         use temps_entities::{env_var_environments, env_vars, project_services};
@@ -270,7 +271,11 @@ impl WorkflowPlanner {
                 // Get or create the deployment token
                 match self
                     .deployment_token_service
-                    .get_or_create_deployment_token(project.id, Some(environment.id))
+                    .get_or_create_deployment_token(
+                        project.id,
+                        Some(environment.id),
+                        Some(deployment.id),
+                    )
                     .await
                 {
                     Ok(token) => {
@@ -548,7 +553,7 @@ impl WorkflowPlanner {
 
         // Gather environment variables for the deployment
         let env_vars = self
-            .gather_environment_variables(project, environment)
+            .gather_environment_variables(project, environment, deployment)
             .await?;
         debug!(
             "📦 Gathered {} environment variables for deployment",

@@ -4,6 +4,16 @@ use temps_entities::deployment_tokens::DeploymentTokenPermission;
 use temps_entities::users;
 use utoipa::ToSchema;
 
+/// Info extracted from a deployment token auth source.
+#[derive(Debug, Clone)]
+pub struct DeploymentTokenInfo {
+    pub project_id: i32,
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
+    pub token_id: i32,
+    pub token_name: String,
+}
+
 // Simplified user schema for OpenAPI documentation
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserSchema {
@@ -37,6 +47,7 @@ pub enum AuthSource {
     DeploymentToken {
         project_id: i32,
         environment_id: Option<i32>,
+        deployment_id: Option<i32>,
         token_id: i32,
         token_name: String,
         permissions: Vec<DeploymentTokenPermission>,
@@ -65,6 +76,7 @@ pub enum AuthSourceSchema {
     DeploymentToken {
         project_id: i32,
         environment_id: Option<i32>,
+        deployment_id: Option<i32>,
         token_id: i32,
         token_name: String,
         permissions: Vec<String>,
@@ -152,6 +164,7 @@ impl AuthContext {
     pub fn new_deployment_token(
         project_id: i32,
         environment_id: Option<i32>,
+        deployment_id: Option<i32>,
         token_id: i32,
         token_name: String,
         permissions: Vec<DeploymentTokenPermission>,
@@ -161,6 +174,7 @@ impl AuthContext {
             source: AuthSource::DeploymentToken {
                 project_id,
                 environment_id,
+                deployment_id,
                 token_id,
                 token_name,
                 permissions: permissions.clone(),
@@ -266,15 +280,22 @@ impl AuthContext {
     }
 
     /// Get deployment token info if this is a deployment token auth
-    pub fn deployment_token_info(&self) -> Option<(i32, Option<i32>, i32, String)> {
+    pub fn deployment_token_info(&self) -> Option<DeploymentTokenInfo> {
         match &self.source {
             AuthSource::DeploymentToken {
                 project_id,
                 environment_id,
+                deployment_id,
                 token_id,
                 token_name,
                 ..
-            } => Some((*project_id, *environment_id, *token_id, token_name.clone())),
+            } => Some(DeploymentTokenInfo {
+                project_id: *project_id,
+                environment_id: *environment_id,
+                deployment_id: *deployment_id,
+                token_id: *token_id,
+                token_name: token_name.clone(),
+            }),
             _ => None,
         }
     }
@@ -283,6 +304,14 @@ impl AuthContext {
     pub fn project_id(&self) -> Option<i32> {
         match &self.source {
             AuthSource::DeploymentToken { project_id, .. } => Some(*project_id),
+            _ => None,
+        }
+    }
+
+    /// Get the deployment ID for deployment tokens
+    pub fn deployment_id(&self) -> Option<i32> {
+        match &self.source {
+            AuthSource::DeploymentToken { deployment_id, .. } => *deployment_id,
             _ => None,
         }
     }

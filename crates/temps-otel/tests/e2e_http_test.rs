@@ -339,6 +339,7 @@ async fn test_e2e_ingest_traces_and_query_back() {
                 .uri("/otel/v1/traces")
                 .header("content-type", "application/x-protobuf")
                 .header("authorization", format!("Bearer {TEST_API_KEY}"))
+                .header("x-temps-project-id", project_id.to_string())
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -424,6 +425,7 @@ async fn test_e2e_ingest_error_trace_always_stored() {
                 .uri("/otel/v1/traces")
                 .header("content-type", "application/x-protobuf")
                 .header("authorization", format!("Bearer {TEST_API_KEY}"))
+                .header("x-temps-project-id", project_id.to_string())
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -486,6 +488,7 @@ async fn test_e2e_ingest_metrics_and_query_back() {
                 .uri("/otel/v1/metrics")
                 .header("content-type", "application/x-protobuf")
                 .header("authorization", format!("Bearer {TEST_API_KEY}"))
+                .header("x-temps-project-id", project_id.to_string())
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -544,6 +547,7 @@ async fn test_e2e_ingest_logs_and_query_back() {
                 .uri("/otel/v1/logs")
                 .header("content-type", "application/x-protobuf")
                 .header("authorization", format!("Bearer {TEST_API_KEY}"))
+                .header("x-temps-project-id", project_id.to_string())
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -611,7 +615,7 @@ async fn test_e2e_missing_api_key_returns_401() {
 
 #[tokio::test]
 async fn test_e2e_invalid_api_key_returns_401() {
-    let Some((_db, router, _project_id)) = setup_e2e().await else {
+    let Some((_db, router, project_id)) = setup_e2e().await else {
         return;
     };
 
@@ -625,6 +629,7 @@ async fn test_e2e_invalid_api_key_returns_401() {
                 .uri("/otel/v1/traces")
                 .header("content-type", "application/x-protobuf")
                 .header("authorization", "Bearer tk_this_key_does_not_exist_in_db")
+                .header("x-temps-project-id", project_id.to_string())
                 .body(Body::from(body))
                 .unwrap(),
         )
@@ -642,7 +647,7 @@ async fn test_e2e_invalid_api_key_returns_401() {
 
 #[tokio::test]
 async fn test_e2e_pipeline_stats() {
-    let Some((_db, router, _project_id)) = setup_e2e().await else {
+    let Some((_db, router, project_id)) = setup_e2e().await else {
         return;
     };
 
@@ -658,6 +663,7 @@ async fn test_e2e_pipeline_stats() {
                 .uri("/otel/v1/metrics")
                 .header("content-type", "application/x-protobuf")
                 .header("authorization", format!("Bearer {TEST_API_KEY}"))
+                .header("x-temps-project-id", project_id.to_string())
                 .body(Body::from(body))
                 .unwrap(),
         )

@@ -29,6 +29,7 @@ mod m20260214_000002_add_analytics_performance_indexes;
 mod m20260217_000001_add_first_referrer_to_visitor;
 mod m20260225_000001_add_proxy_logs_retention;
 mod m20260225_000001_create_otel_tables;
+mod m20260226_000001_add_deployment_id_to_deployment_tokens;
 
 pub struct Migrator;
 
@@ -65,6 +66,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260217_000001_add_first_referrer_to_visitor::Migration),
             Box::new(m20260225_000001_add_proxy_logs_retention::Migration),
             Box::new(m20260225_000001_create_otel_tables::Migration),
+            Box::new(m20260226_000001_add_deployment_id_to_deployment_tokens::Migration),
         ]
     }
 }
