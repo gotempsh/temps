@@ -1,0 +1,75 @@
+[package]
+name = "temps-otel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+# Internal crates
+temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
+temps-database = { path = "../temps-database" }
+temps-entities = { path = "../temps-entities" }
+temps-deployer = { path = "../temps-deployer" }
+temps-auth = { path = "../temps-auth" }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling & logging
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Date/Time & UUID
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# Database
+sea-orm = { workspace = true }
+
+# HTTP framework
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+hyper = { workspace = true }
+
+# API documentation
+utoipa = { workspace = true }
+
+# Protobuf for OTLP
+prost = "0.13"
+
+# Compression
+flate2 = { workspace = true }
+zstd = "0.13"
+
+# S3 for log archival
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
+
+# Crypto for API key hashing
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# Rate limiting
+tokio-util = { workspace = true }
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tower = { workspace = true }
+http-body-util = { workspace = true }
+temps-migrations = { path = "../temps-migrations" }

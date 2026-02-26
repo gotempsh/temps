@@ -46,6 +46,7 @@ use temps_kv::KvPlugin;
 use temps_logs::LogsPlugin;
 use temps_monitoring::{DiskSpaceMonitor, OutageDetectionService};
 use temps_notifications::NotificationsPlugin;
+use temps_otel::plugin::OtelPlugin;
 use temps_projects::ProjectsPlugin;
 use temps_providers::ProvidersPlugin;
 use temps_proxy::ProxyPlugin;
@@ -737,6 +738,11 @@ pub async fn start_console_api(
     let status_page_plugin = Box::new(StatusPagePlugin::new());
     plugin_manager.register_plugin(status_page_plugin);
 
+    // 9.7. OtelPlugin - provides OpenTelemetry metrics, traces, and logs collection (depends on database)
+    debug!("Registering OtelPlugin");
+    let otel_plugin = Box::new(OtelPlugin::new());
+    plugin_manager.register_plugin(otel_plugin);
+
     // 10. AuthPlugin - provides authentication and authorization (depends on notification service)
     debug!("Registering AuthPlugin");
     let auth_plugin = Box::new(AuthPlugin::new());
@@ -919,6 +925,16 @@ pub async fn start_console_api(
         tracing::warn!(
             "NotificationService or JobQueue not available - outage detection disabled."
         );
+    }
+
+    // OTel background tasks: anomaly detection and health computation require
+    // iterating over active project IDs, which will be wired up when project
+    // discovery is integrated. The rate limiter is self-cleaning (evicts on check).
+    if service_context
+        .get_service::<temps_otel::OtelService>()
+        .is_some()
+    {
+        debug!("OTel plugin registered successfully; background tasks pending project discovery integration");
     }
 
     // Build the application with all plugin routes and OpenAPI schemas

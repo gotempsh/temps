@@ -51,6 +51,7 @@ members = [
     "crates/temps-vulnerability-scanner",
     "crates/temps-kv",
     "crates/temps-blob",
+    "crates/temps-otel",
 ]
 
 [workspace.package]

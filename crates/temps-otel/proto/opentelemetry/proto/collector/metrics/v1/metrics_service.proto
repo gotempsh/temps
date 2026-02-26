@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package opentelemetry.proto.collector.metrics.v1;
+
+import "opentelemetry/proto/metrics/v1/metrics.proto";
+
+message ExportMetricsServiceRequest {
+  repeated opentelemetry.proto.metrics.v1.ResourceMetrics resource_metrics = 1;
+}
+
+message ExportMetricsServiceResponse {
+  ExportMetricsPartialSuccess partial_success = 1;
+}
+
+message ExportMetricsPartialSuccess {
+  int64 rejected_data_points = 1;
+  string error_message = 2;
+}

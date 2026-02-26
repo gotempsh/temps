@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package opentelemetry.proto.collector.logs.v1;
+
+import "opentelemetry/proto/logs/v1/logs.proto";
+
+message ExportLogsServiceRequest {
+  repeated opentelemetry.proto.logs.v1.ResourceLogs resource_logs = 1;
+}
+
+message ExportLogsServiceResponse {
+  ExportLogsPartialSuccess partial_success = 1;
+}
+
+message ExportLogsPartialSuccess {
+  int64 rejected_log_records = 1;
+  string error_message = 2;
+}

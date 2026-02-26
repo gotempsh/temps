@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package opentelemetry.proto.resource.v1;
+
+import "opentelemetry/proto/common/v1/common.proto";
+
+message Resource {
+  repeated opentelemetry.proto.common.v1.KeyValue attributes = 1;
+  uint32 dropped_attributes_count = 2;
+}

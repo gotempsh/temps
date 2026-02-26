@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package opentelemetry.proto.collector.trace.v1;
+
+import "opentelemetry/proto/trace/v1/trace.proto";
+
+message ExportTraceServiceRequest {
+  repeated opentelemetry.proto.trace.v1.ResourceSpans resource_spans = 1;
+}
+
+message ExportTraceServiceResponse {
+  ExportTracePartialSuccess partial_success = 1;
+}
+
+message ExportTracePartialSuccess {
+  int64 rejected_spans = 1;
+  string error_message = 2;
+}

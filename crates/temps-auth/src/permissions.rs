@@ -204,6 +204,10 @@ pub enum Permission {
     StatusPageWrite,
     StatusPageCreate,
     StatusPageDelete,
+
+    // OTel / Observability permissions
+    OtelRead,
+    OtelWrite,
 }
 
 impl fmt::Display for Permission {
@@ -334,6 +338,8 @@ impl fmt::Display for Permission {
             Permission::StatusPageWrite => "status_page:write",
             Permission::StatusPageCreate => "status_page:create",
             Permission::StatusPageDelete => "status_page:delete",
+            Permission::OtelRead => "otel:read",
+            Permission::OtelWrite => "otel:write",
         };
         write!(f, "{}", name)
     }
@@ -468,6 +474,8 @@ impl Permission {
             "status_page:write" => Some(Permission::StatusPageWrite),
             "status_page:create" => Some(Permission::StatusPageCreate),
             "status_page:delete" => Some(Permission::StatusPageDelete),
+            "otel:read" => Some(Permission::OtelRead),
+            "otel:write" => Some(Permission::OtelWrite),
             _ => None,
         }
     }
@@ -599,6 +607,8 @@ impl Permission {
             Permission::StatusPageWrite,
             Permission::StatusPageCreate,
             Permission::StatusPageDelete,
+            Permission::OtelRead,
+            Permission::OtelWrite,
         ]
     }
 }
@@ -785,6 +795,8 @@ impl Role {
                 Permission::StatusPageWrite,
                 Permission::StatusPageCreate,
                 Permission::StatusPageDelete,
+                Permission::OtelRead,
+                Permission::OtelWrite,
             ],
             Role::User => &[
                 Permission::ProjectsRead,
@@ -878,6 +890,8 @@ impl Role {
                 Permission::StatusPageRead,
                 Permission::StatusPageWrite,
                 Permission::StatusPageCreate,
+                Permission::OtelRead,
+                Permission::OtelWrite,
             ],
             Role::Reader => &[
                 Permission::ProjectsRead,
@@ -915,6 +929,7 @@ impl Role {
                 Permission::BlobRead,
                 Permission::KvRead,
                 Permission::StatusPageRead,
+                Permission::OtelRead,
             ],
             Role::Mcp => &[
                 Permission::ProjectsRead,
