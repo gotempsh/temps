@@ -39,6 +39,7 @@ import {
   SquareTerminal,
   Upload,
   Users,
+  Workflow,
   type LucideIcon,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
@@ -302,6 +303,12 @@ const projectNavItems: NavigationItem[] = [
     url: 'monitors',
     icon: Activity,
     keywords: ['monitoring', 'uptime', 'health'],
+  },
+  {
+    title: 'Traces',
+    url: 'traces',
+    icon: Workflow,
+    keywords: ['traces', 'opentelemetry', 'otel', 'spans', 'tracing', 'distributed'],
   },
   {
     title: 'Project Settings',
