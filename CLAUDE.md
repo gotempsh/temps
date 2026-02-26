@@ -883,6 +883,16 @@ if (isLoading) return <Spinner />
 - Center content with `mx-auto` when using `max-w-*` constraints
 - Use cards for selections instead of dropdowns where practical
 
+### Mobile Responsiveness
+- **Tables**: wrap in `overflow-x-auto`; hide secondary columns with `hidden md:table-cell`
+- **Filter bars**: `flex flex-col gap-2 sm:flex-row sm:flex-wrap`; selects use `w-full sm:w-[Npx]`
+- **Grids**: `grid-cols-1` → `md:grid-cols-2` → `lg:grid-cols-3` (or `grid-cols-2 md:grid-cols-4` for stat cards)
+- **Side panels**: `flex-col lg:flex-row`; panel uses `w-full lg:w-[Npx]`
+- **Pagination**: compact `{page} / {totalPages}` on mobile; full "Showing X–Y of Z" `hidden sm:inline`
+- **Headers**: `flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between`
+- **Button text**: `hidden sm:inline` for labels next to icons; icon-only on mobile
+- **Min-width**: add `min-w-[Npx]` on scrollable containers so content doesn't collapse
+
 ### Testing with Playwright
 
 Local dev credentials:

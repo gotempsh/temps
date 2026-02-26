@@ -217,7 +217,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           <Skeleton className="h-9 w-9" />
           <Skeleton className="h-7 w-64" />
         </div>
-        <div className="grid grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           {['duration', 'spans', 'services', 'status'].map((label) => (
             <Skeleton key={`stat-skel-${label}`} className="h-20" />
           ))}
@@ -339,19 +339,19 @@ export default function TraceDetail({ project }: TraceDetailProps) {
       </div>
 
       {/* Waterfall + Detail panel */}
-      <div className="flex gap-4">
+      <div className="flex flex-col lg:flex-row gap-4">
         {/* Waterfall chart */}
-        <Card className={cn('flex-1', selectedSpan && 'w-1/2')}>
+        <Card className={cn('flex-1 min-w-0', selectedSpan && 'lg:w-1/2')}>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium">
               Span Waterfall
             </CardTitle>
           </CardHeader>
-          <CardContent className="p-0">
+          <CardContent className="p-0 overflow-x-auto">
             <ScrollArea className="h-[600px]">
               {/* Timeline header */}
-              <div className="flex items-center border-b px-4 py-2 text-xs text-muted-foreground sticky top-0 bg-background z-10">
-                <div className="w-[280px] shrink-0">Span Name</div>
+              <div className="flex items-center border-b px-4 py-2 text-xs text-muted-foreground sticky top-0 bg-background z-10 min-w-[500px]">
+                <div className="w-[180px] md:w-[280px] shrink-0">Span Name</div>
                 <div className="flex-1 flex justify-between">
                   <span>{formatTimestamp(new Date(traceStart).toISOString())}</span>
                   <span>{formatDuration(traceDuration)}</span>
@@ -389,13 +389,13 @@ export default function TraceDetail({ project }: TraceDetailProps) {
                             )
                           }
                           className={cn(
-                            'flex items-center w-full border-b px-4 py-1.5 text-left hover:bg-accent/50 transition-colors',
+                            'flex items-center w-full border-b px-4 py-1.5 text-left hover:bg-accent/50 transition-colors min-w-[500px]',
                             isSelected && 'bg-accent'
                           )}
                         >
                           {/* Span name with indent */}
                           <div
-                            className="w-[280px] shrink-0 flex items-center gap-1.5 min-w-0"
+                            className="w-[180px] md:w-[280px] shrink-0 flex items-center gap-1.5 min-w-0"
                             style={{
                               paddingLeft: `${node.depth * 16}px`,
                             }}
@@ -463,7 +463,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
 
         {/* Span detail panel */}
         {selectedSpan && (
-          <Card className="w-[400px] shrink-0">
+          <Card className="w-full lg:w-[400px] shrink-0">
             <CardHeader className="pb-2">
               <div className="flex items-center justify-between">
                 <CardTitle className="text-sm font-medium truncate">
@@ -480,7 +480,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
               </div>
             </CardHeader>
             <CardContent className="p-0">
-              <ScrollArea className="h-[560px]">
+              <ScrollArea className="h-[400px] lg:h-[560px]">
                 <div className="p-4 space-y-4">
                   {/* Basic info */}
                   <div className="space-y-2">

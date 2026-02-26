@@ -493,9 +493,9 @@ export default function TracesList({ project }: TracesListProps) {
       {/* Filters */}
       <Card>
         <CardContent className="p-3">
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
             <Select value={timeRange} onValueChange={handleTimeRangeChange}>
-              <SelectTrigger className="w-[140px]">
+              <SelectTrigger className="w-full sm:w-[140px]">
                 <Clock className="mr-2 h-3.5 w-3.5" />
                 <SelectValue />
               </SelectTrigger>
@@ -509,7 +509,7 @@ export default function TracesList({ project }: TracesListProps) {
             </Select>
 
             <Select value={status} onValueChange={handleStatusChange}>
-              <SelectTrigger className="w-[120px]">
+              <SelectTrigger className="w-full sm:w-[120px]">
                 <SelectValue placeholder="Status" />
               </SelectTrigger>
               <SelectContent>
@@ -524,7 +524,7 @@ export default function TracesList({ project }: TracesListProps) {
                 value={environmentId}
                 onValueChange={handleEnvironmentChange}
               >
-                <SelectTrigger className="w-[180px]">
+                <SelectTrigger className="w-full sm:w-[180px]">
                   <SelectValue placeholder="Environment" />
                 </SelectTrigger>
                 <SelectContent>
@@ -543,7 +543,7 @@ export default function TracesList({ project }: TracesListProps) {
                 value={deploymentId}
                 onValueChange={handleDeploymentChange}
               >
-                <SelectTrigger className="w-[180px]">
+                <SelectTrigger className="w-full sm:w-[180px]">
                   <SelectValue placeholder="Deployment" />
                 </SelectTrigger>
                 <SelectContent>
@@ -562,7 +562,7 @@ export default function TracesList({ project }: TracesListProps) {
                 value={serviceName || '__all__'}
                 onValueChange={handleServiceChange}
               >
-                <SelectTrigger className="w-[180px]">
+                <SelectTrigger className="w-full sm:w-[180px]">
                   <SelectValue placeholder="Service" />
                 </SelectTrigger>
                 <SelectContent>
@@ -576,7 +576,7 @@ export default function TracesList({ project }: TracesListProps) {
               </Select>
             )}
 
-            <div className="relative flex-1 min-w-[200px]">
+            <div className="relative flex-1 min-w-0 sm:min-w-[200px]">
               <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
               <Input
                 placeholder="Search by trace ID..."
@@ -624,18 +624,18 @@ export default function TracesList({ project }: TracesListProps) {
         />
       ) : (
         <>
-           <div className="rounded-md border">
+          <div className="rounded-md border overflow-x-auto">
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead className="w-[300px]">Trace</TableHead>
+                  <TableHead className="min-w-[200px] md:w-[300px]">Trace</TableHead>
                   <TableHead>Service</TableHead>
-                  {environmentId === 'all' && <TableHead>Environment</TableHead>}
-                  <TableHead>Kind</TableHead>
+                  {environmentId === 'all' && <TableHead className="hidden lg:table-cell">Environment</TableHead>}
+                  <TableHead className="hidden md:table-cell">Kind</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead className="text-right">Duration</TableHead>
-                  <TableHead className="text-right">Spans</TableHead>
-                  <TableHead className="text-right">Timestamp</TableHead>
+                  <TableHead className="hidden md:table-cell text-right">Spans</TableHead>
+                  <TableHead className="hidden md:table-cell text-right">Timestamp</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -647,10 +647,10 @@ export default function TracesList({ project }: TracesListProps) {
                   >
                     <TableCell>
                       <div className="flex flex-col gap-0.5">
-                        <span className="font-medium truncate max-w-[280px]">
+                        <span className="font-medium truncate max-w-[200px] md:max-w-[280px]">
                           {trace.root_span_name}
                         </span>
-                        <span className="text-xs text-muted-foreground font-mono truncate max-w-[280px]">
+                        <span className="text-xs text-muted-foreground font-mono truncate max-w-[200px] md:max-w-[280px]">
                           {trace.trace_id.slice(0, 16)}...
                         </span>
                       </div>
@@ -661,7 +661,7 @@ export default function TracesList({ project }: TracesListProps) {
                       </span>
                     </TableCell>
                     {environmentId === 'all' && (
-                      <TableCell>
+                      <TableCell className="hidden lg:table-cell">
                         {trace.deployment_environment ? (
                           <Badge variant="secondary" className="font-normal">
                             {trace.deployment_environment}
@@ -671,7 +671,7 @@ export default function TracesList({ project }: TracesListProps) {
                         )}
                       </TableCell>
                     )}
-                    <TableCell>{kindBadge(trace.kind)}</TableCell>
+                    <TableCell className="hidden md:table-cell">{kindBadge(trace.kind)}</TableCell>
                     <TableCell>
                       <div className="flex items-center gap-1.5">
                         {trace.error_count > 0
@@ -692,12 +692,12 @@ export default function TracesList({ project }: TracesListProps) {
                         {formatDuration(trace.duration_ms)}
                       </span>
                     </TableCell>
-                    <TableCell className="text-right">
+                    <TableCell className="hidden md:table-cell text-right">
                       <Badge variant="outline" className="font-mono">
                         {trace.span_count}
                       </Badge>
                     </TableCell>
-                    <TableCell className="text-right text-sm text-muted-foreground">
+                    <TableCell className="hidden md:table-cell text-right text-sm text-muted-foreground">
                       {format(
                         new Date(trace.start_time),
                         'MMM d, HH:mm:ss.SSS'
@@ -710,12 +710,17 @@ export default function TracesList({ project }: TracesListProps) {
           </div>
 
           {/* Pagination */}
-          <div className="flex items-center justify-between">
-            <div className="text-sm text-muted-foreground">
-              Showing {(page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, totalCount)} of{' '}
-              {totalCount.toLocaleString()} trace{totalCount !== 1 ? 's' : ''}
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div className="text-sm text-muted-foreground text-center sm:text-left">
+              <span className="hidden sm:inline">
+                Showing {(page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, totalCount)} of{' '}
+                {totalCount.toLocaleString()} trace{totalCount !== 1 ? 's' : ''}
+              </span>
+              <span className="sm:hidden">
+                {totalCount.toLocaleString()} trace{totalCount !== 1 ? 's' : ''}
+              </span>
             </div>
-            <div className="flex items-center gap-1">
+            <div className="flex items-center justify-center gap-1">
               <Button
                 variant="outline"
                 size="sm"
@@ -725,7 +730,7 @@ export default function TracesList({ project }: TracesListProps) {
                 <ChevronLeft className="h-4 w-4" />
               </Button>
               <span className="px-3 text-sm text-muted-foreground">
-                Page {page} of {totalPages}
+                {page} / {totalPages}
               </span>
               <Button
                 variant="outline"
