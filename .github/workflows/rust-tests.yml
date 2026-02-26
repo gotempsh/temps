@@ -30,6 +30,9 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Install wasm-pack and Build WASM
         run: |
           cargo install wasm-pack
@@ -76,6 +79,9 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Install wasm-pack and Build WASM
         run: |
           cargo install wasm-pack
@@ -115,6 +121,9 @@ jobs:
           # Use a shared cache key so test jobs can restore
           shared-key: test-build
           save-if: true
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install wasm-pack and Build WASM
         run: |
@@ -176,6 +185,7 @@ jobs:
               -p temps-email
               -p temps-analytics
               -p temps-analytics-events
+              -p temps-otel
 
     steps:
       - name: Checkout code
@@ -194,6 +204,9 @@ jobs:
         with:
           shared-key: test-build
           save-if: false
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install wasm-pack and Build WASM
         run: |
@@ -326,6 +339,9 @@ jobs:
         with:
           shared-key: test-build
           save-if: false
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install wasm-pack and Build WASM
         run: |

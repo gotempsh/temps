@@ -18,12 +18,41 @@ Thank you for your interest in contributing to Temps. Whether you are reporting 
 - **PostgreSQL** with TimescaleDB extension
 - **Bun** (for frontend development)
 - **Node.js** 18+
+- **protobuf compiler** (`protoc`) -- required by the `temps-otel` crate to compile OpenTelemetry `.proto` files
+- **wasm-pack** -- required to build the `temps-captcha-wasm` crate
+
+#### Installing protoc
+
+```bash
+# macOS
+brew install protobuf
+
+# Debian/Ubuntu
+sudo apt-get install -y protobuf-compiler
+
+# Fedora
+sudo dnf install -y protobuf-compiler
+
+# Or download from https://github.com/protocolbuffers/protobuf/releases
+```
+
+#### Installing wasm-pack
+
+```bash
+cargo install wasm-pack
+```
 
 ### Clone and Build
 
 ```bash
 git clone https://github.com/gotempsh/temps.git
 cd temps
+
+# Build the WASM captcha module (required before workspace compilation)
+cd crates/temps-captcha-wasm
+bun run build
+cd ../..
+
 cargo build --release
 ```
 
@@ -97,6 +126,7 @@ HTTP Handlers  ->  Service Layer  ->  Data Access (Sea-ORM)
 - `temps-proxy` -- reverse proxy with TLS/ACME support
 - `temps-auth` -- authentication and permission system
 - `temps-providers` -- external service providers (PostgreSQL, Redis, S3)
+- `temps-otel` -- OpenTelemetry ingest and query (OTLP/protobuf, requires `protoc`)
 
 ## Coding Standards
 
@@ -170,6 +200,7 @@ Pre-commit hooks run automatically on each commit to check formatting (`cargo fm
 - [ ] New functionality includes tests
 - [ ] Commit messages follow Conventional Commits
 - [ ] PR description explains the change
+- [ ] `CHANGELOG.md` updated under `[Unreleased]` (or add `skip-changelog` label)
 
 ## Good First Issues
 
