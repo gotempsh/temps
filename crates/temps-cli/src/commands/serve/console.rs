@@ -11,7 +11,6 @@ use futures::FutureExt;
 use include_dir::{include_dir, Dir};
 use rand::Rng;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
-use std::future::IntoFuture;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -372,7 +371,6 @@ fn prompt_for_admin_email() -> anyhow::Result<Option<String>> {
 }
 
 fn create_openapi(plugin_manager: &PluginManager) -> anyhow::Result<utoipa::openapi::OpenApi> {
-    // Get the unified OpenAPI schema from all plugins - fail if it can't be built
     plugin_manager
         .get_unified_openapi()
         .map_err(|e| anyhow::anyhow!("Failed to build unified OpenAPI schema: {}", e))
@@ -768,6 +766,17 @@ pub async fn start_console_api(
     let static_files_plugin = Box::new(StaticFilesPlugin::new());
     plugin_manager.register_plugin(static_files_plugin);
 
+    // 15. ExternalPluginsPlugin - discovers and manages standalone binary plugins
+    debug!("Registering ExternalPluginsPlugin");
+    let external_plugin_config = temps_external_plugins::manager::ExternalPluginConfig::new(
+        config.data_dir.clone(),
+        config.database_url.clone(),
+    );
+    let external_plugins_plugin = Box::new(temps_external_plugins::ExternalPluginsPlugin::new(
+        external_plugin_config,
+    ));
+    plugin_manager.register_plugin(external_plugins_plugin);
+
     // Initialize all plugins
     debug!("Initializing plugins");
     if let Err(e) = plugin_manager.initialize_plugins().await {
@@ -957,7 +966,22 @@ pub async fn start_console_api(
         debug!("Console API ready signal sent");
     }
 
-    axum::serve(listener, app).into_future().await?;
+    // Graceful shutdown: listen for Ctrl+C, then shut down external plugins before exiting.
+    // Note: The proxy server has its own CtrlCShutdownSignal. The console API server
+    // shuts down external plugins when it receives the same signal.
+    let external_plugins_service = plugin_manager
+        .service_context()
+        .get_service::<temps_external_plugins::ExternalPluginsService>();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Console API received shutdown signal, stopping external plugins...");
+            if let Some(service) = external_plugins_service {
+                service.shutdown_all().await;
+                info!("External plugins shut down");
+            }
+        })
+        .await?;
     info!("Console API server exited");
     Ok(())
 }

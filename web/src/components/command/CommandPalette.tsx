@@ -10,6 +10,8 @@ import {
   CommandList,
   CommandSeparator,
 } from '@/components/ui/command'
+import { usePluginsContext } from '@/contexts/PluginsContext'
+import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { useQuery } from '@tanstack/react-query'
 import Fuse from 'fuse.js'
 import {
@@ -377,6 +379,7 @@ export function CommandPalette() {
   const [search, setSearch] = useState('')
   const navigate = useNavigate()
   const location = useLocation()
+  const { plugins } = usePluginsContext()
 
   const { data: projectResponse, refetch: refetchProjects } = useQuery({
     ...getProjectsOptions({
@@ -425,12 +428,29 @@ export function CommandPalette() {
     command()
   }
 
+  // Build plugin navigation items for the command palette
+  const pluginNavItems: NavigationItem[] = useMemo(
+    () =>
+      plugins.flatMap((p) =>
+        p.nav
+          .filter((e) => e.section !== 'project')
+          .map((entry) => ({
+            title: entry.label,
+            url: entry.path,
+            icon: resolvePluginIcon(entry.icon),
+            keywords: ['plugin', p.name, entry.label.toLowerCase()],
+          }))
+      ),
+    [plugins]
+  )
+
   // Create Fuse instances for fuzzy search
   const navFuse = useMemo(() => {
     const allNavItems = [
       ...mainNavItems.map((item) => ({ ...item, category: 'Navigation' })),
       ...settingsNavItems.map((item) => ({ ...item, category: 'Settings' })),
       ...accountNavItems.map((item) => ({ ...item, category: 'Account' })),
+      ...pluginNavItems.map((item) => ({ ...item, category: 'Plugins' })),
     ]
 
     // Add project-specific navigation if we're on a project page
@@ -455,7 +475,7 @@ export function CommandPalette() {
       shouldSort: true,
       minMatchCharLength: 1,
     })
-  }, [currentProjectSlug, currentProject])
+  }, [currentProjectSlug, currentProject, pluginNavItems])
 
   const projectsFuse = useMemo(() => {
     return new Fuse(projects, {
@@ -486,6 +506,7 @@ export function CommandPalette() {
         navigation: mainNavItems,
         settings: settingsNavItems,
         account: accountNavItems,
+        plugins: pluginNavItems,
         projectNav: projectNavigation,
         projects: projects,
         actions: ['toggle-theme'],
@@ -498,6 +519,7 @@ export function CommandPalette() {
       navigation: [] as NavigationItem[],
       settings: [] as NavigationItem[],
       account: [] as NavigationItem[],
+      plugins: [] as NavigationItem[],
       projectNav: [] as NavigationItem[],
     }
 
@@ -516,6 +538,8 @@ export function CommandPalette() {
         groupedNavResults.settings.push(baseItem)
       } else if (item.category === 'Account') {
         groupedNavResults.account.push(baseItem)
+      } else if (item.category === 'Plugins') {
+        groupedNavResults.plugins.push(baseItem)
       } else if (item.category === 'Project') {
         groupedNavResults.projectNav.push(baseItem)
       }
@@ -537,6 +561,7 @@ export function CommandPalette() {
       navigation: groupedNavResults.navigation,
       settings: groupedNavResults.settings,
       account: groupedNavResults.account,
+      plugins: groupedNavResults.plugins,
       projectNav: groupedNavResults.projectNav,
       projects: filteredProjects,
       actions: actions,
@@ -546,6 +571,7 @@ export function CommandPalette() {
     navFuse,
     projectsFuse,
     projects,
+    pluginNavItems,
     currentProjectSlug,
     currentProject,
   ])
@@ -604,6 +630,25 @@ export function CommandPalette() {
             <>
               <CommandGroup heading="Settings">
                 {searchResults.settings.map((item) => (
+                  <CommandItem
+                    key={item.url}
+                    onSelect={() => runCommand(() => navigate(item.url))}
+                    className="flex items-center gap-2"
+                  >
+                    <item.icon className="h-4 w-4" />
+                    <span>{item.title}</span>
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+              <CommandSeparator />
+            </>
+          )}
+
+          {/* Plugins Navigation */}
+          {searchResults.plugins.length > 0 && (
+            <>
+              <CommandGroup heading="Plugins">
+                {searchResults.plugins.map((item) => (
                   <CommandItem
                     key={item.url}
                     onSelect={() => runCommand(() => navigate(item.url))}

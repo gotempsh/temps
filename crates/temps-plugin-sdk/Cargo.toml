@@ -1,0 +1,53 @@
+[package]
+name = "temps-plugin-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SDK for building external Temps plugins as standalone binaries"
+
+[dependencies]
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# HTTP framework (plugins build axum routers)
+axum = { workspace = true }
+
+# Database (plugins get direct DB access)
+sea-orm = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# CLI args
+clap = { version = "4", features = ["derive"] }
+
+# Unix socket support
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "http2"] }
+tower = { version = "0.5", features = ["util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+# OpenAPI
+utoipa = { workspace = true }
+
+# Shared types from temps
+temps-entities = { path = "../temps-entities" }
+temps-core = { path = "../temps-core" }
+
+# Tar extraction for UI bundles
+flate2 = "1"
+tar = "0.4"
+
+# UUID for request IDs
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

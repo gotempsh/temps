@@ -1,0 +1,3 @@
+[default.extend-words]
+# flate2 is a Rust crate name (zlib/deflate bindings)
+flate2 = "flate2"

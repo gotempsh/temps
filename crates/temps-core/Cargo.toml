@@ -38,3 +38,6 @@ once_cell = { workspace = true }
 url = "2.5"  # For URL validation and SSRF prevention
 
 # Internal dependencies - only core dependencies to avoid cycles
+
+[dev-dependencies]
+tempfile = { workspace = true }
