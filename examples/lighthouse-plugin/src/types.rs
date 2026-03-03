@@ -1,13 +1,14 @@
 //! Shared types for the Lighthouse Performance Audit plugin.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 // ============================================================================
 // Settings
 // ============================================================================
 
 /// Plugin-level configuration persisted in SQLite.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PluginSettings {
     /// Whether to auto-run audits on deployment events.
     pub auto_audit_on_deploy: bool,
@@ -50,7 +51,7 @@ impl Default for PluginSettings {
 }
 
 /// Partial update for plugin settings — only `Some` fields are written.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
 pub struct UpdateSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_audit_on_deploy: Option<bool>,
@@ -71,7 +72,7 @@ pub struct UpdateSettings {
 // ============================================================================
 
 /// Summary of an audit (returned in list view).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AuditSummary {
     pub id: String,
     pub url: String,
@@ -89,7 +90,7 @@ pub struct AuditSummary {
 }
 
 /// Full Lighthouse audit result with category details and diagnostics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LighthouseAudit {
     pub id: String,
     pub url: String,
@@ -114,7 +115,7 @@ pub struct LighthouseAudit {
     pub device: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditStatus {
     Running,
@@ -122,7 +123,7 @@ pub enum AuditStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditTrigger {
     /// Triggered automatically by a deployment event
@@ -132,7 +133,7 @@ pub enum AuditTrigger {
 }
 
 /// Core Web Vitals extracted from Lighthouse results.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CoreWebVitals {
     /// Largest Contentful Paint (milliseconds)
     pub lcp_ms: Option<f64>,
@@ -149,7 +150,7 @@ pub struct CoreWebVitals {
 }
 
 /// A single diagnostic or opportunity from the Lighthouse audit.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AuditDiagnostic {
     /// Audit ID from Lighthouse (e.g., "render-blocking-resources")
     pub id: String,
@@ -163,7 +164,7 @@ pub struct AuditDiagnostic {
     pub severity: DiagnosticSeverity,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverity {
     /// Score = 0 to 0.49
@@ -181,7 +182,7 @@ pub enum DiagnosticSeverity {
 // ============================================================================
 
 /// Request body for starting a manual audit.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct AuditRequest {
     pub url: String,
     /// Override device emulation for this audit.
@@ -190,12 +191,26 @@ pub struct AuditRequest {
     pub categories: Option<Vec<String>>,
 }
 
+/// Response body returned when a new audit is started.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct StartAuditResponse {
+    pub id: String,
+    pub status: String,
+    pub message: String,
+}
+
+/// Lighthouse CLI availability status.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct StatusResponse {
+    pub lighthouse_available: bool,
+}
+
 // ============================================================================
 // Score history for charts
 // ============================================================================
 
 /// A data point for the score timeline chart.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ScoreHistoryPoint {
     pub id: String,
     pub performance_score: Option<u32>,

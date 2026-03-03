@@ -1,5 +1,6 @@
 import { getPropertyBreakdownOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectResponse } from '@/api/client/types.gen'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -11,7 +12,7 @@ import {
 } from '@/components/ui/card'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import { Globe, Link } from 'lucide-react'
+import { ChevronLeft, Globe, Link } from 'lucide-react'
 import * as React from 'react'
 
 interface ReferrerIconProps {
@@ -22,19 +23,17 @@ interface ReferrerIconProps {
 function ReferrerIcon({ domain, className = 'h-5 w-5' }: ReferrerIconProps) {
   const [hasError, setHasError] = React.useState(false)
 
-  // For direct traffic or empty domains, show Link icon
   if (!domain || domain === 'Direct') {
     return <Link className={`${className} text-muted-foreground`} />
   }
 
-  // If favicon failed to load, show Globe icon
   if (hasError) {
     return <Globe className={`${className} text-muted-foreground`} />
   }
 
-  // Use Google's favicon service
-  // For Twitter/X domains, use x.com to get the X logo instead of the old Twitter bird
-  const faviconDomain = ['twitter.com', 't.co'].includes(domain) ? 'x.com' : domain
+  const faviconDomain = ['twitter.com', 't.co'].includes(domain)
+    ? 'x.com'
+    : domain
   const faviconUrl = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(faviconDomain)}&sz=32`
 
   return (
@@ -50,7 +49,6 @@ function ReferrerIcon({ domain, className = 'h-5 w-5' }: ReferrerIconProps) {
 function getDisplayName(hostname: string): string {
   if (!hostname || hostname === 'Direct') return 'Direct'
 
-  // Handle Google domains
   if (hostname.startsWith('google.') || hostname.startsWith('www.google.')) {
     return 'Google'
   }
@@ -133,6 +131,10 @@ export function ReferrersChart({
   endDate,
   environment,
 }: ReferrersChartProps) {
+  const [selectedReferrer, setSelectedReferrer] = React.useState<string | null>(
+    null,
+  )
+
   const { data, isLoading, error } = useQuery({
     ...getPropertyBreakdownOptions({
       path: {
@@ -148,6 +150,24 @@ export function ReferrersChart({
       },
     }),
     enabled: !!startDate && !!endDate,
+  })
+
+  // When a referrer is selected, show channel breakdown for context
+  const { data: channelData } = useQuery({
+    ...getPropertyBreakdownOptions({
+      path: {
+        project_id: project.id,
+      },
+      query: {
+        start_date: startDate ? startDate.toISOString() : '',
+        end_date: endDate ? endDate.toISOString() : '',
+        group_by: 'pathname',
+        environment_id: environment,
+        aggregation_level: 'visitors',
+        limit: 5,
+      },
+    }),
+    enabled: !!selectedReferrer && !!startDate && !!endDate,
   })
 
   const sortedReferrers = React.useMemo(() => {
@@ -166,22 +186,109 @@ export function ReferrersChart({
       })
   }, [data])
 
+  // Detail view for a selected referrer
+  if (selectedReferrer) {
+    const referrer = sortedReferrers.find(
+      (r) => r.hostname === selectedReferrer,
+    )
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-6 w-6"
+              onClick={() => setSelectedReferrer(null)}
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </Button>
+            <ReferrerIcon domain={selectedReferrer} className="h-5 w-5" />
+            {getDisplayName(selectedReferrer)}
+          </CardTitle>
+          <CardDescription>
+            {referrer
+              ? `${referrer.count.toLocaleString()} visitors (${referrer.percentage}%)`
+              : ''}
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-4">
+            <div>
+              <p className="text-sm font-medium mb-1 text-muted-foreground">
+                Hostname
+              </p>
+              <p className="text-sm font-mono">{selectedReferrer}</p>
+            </div>
+            {selectedReferrer !== 'Direct' && (
+              <div>
+                <Badge variant="outline" className="text-xs">
+                  <a
+                    href={`https://${selectedReferrer}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-1"
+                  >
+                    Visit site
+                    <Globe className="h-3 w-3" />
+                  </a>
+                </Badge>
+              </div>
+            )}
+            {channelData && channelData.items.length > 0 && (
+              <div>
+                <p className="text-sm font-medium mb-2 text-muted-foreground">
+                  Top Pages (all traffic)
+                </p>
+                <div className="space-y-2">
+                  {channelData.items.slice(0, 5).map((page) => (
+                    <div
+                      key={page.value}
+                      className="flex items-center justify-between text-sm"
+                    >
+                      <span className="font-mono truncate max-w-[200px]">
+                        {page.value || '/'}
+                      </span>
+                      <span className="text-muted-foreground">
+                        {page.count.toLocaleString()}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+    )
+  }
+
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Referrers</CardTitle>
-        <CardDescription>
-          {startDate && endDate
-            ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`
-            : 'Select a date range'}
-        </CardDescription>
+        <div className="flex items-center justify-between">
+          <div>
+            <CardTitle>Referrers</CardTitle>
+            <CardDescription>
+              {startDate && endDate
+                ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`
+                : 'Select a date range'}
+            </CardDescription>
+          </div>
+          <Badge variant="outline" className="text-xs">
+            Click for details
+          </Badge>
+        </div>
       </CardHeader>
       <CardContent>
         {isLoading ? (
           <div className="space-y-4 py-4">
             <div className="space-y-2">
               {[...Array(5)].map((_, i) => (
-                <div key={i} className="flex items-center justify-between">
+                <div
+                  key={`skeleton-ref-${i}`}
+                  className="flex items-center justify-between"
+                >
                   <div className="h-4 w-[150px] bg-muted animate-pulse rounded" />
                   <div className="h-4 w-[100px] bg-muted animate-pulse rounded" />
                 </div>
@@ -210,10 +317,18 @@ export function ReferrersChart({
         ) : (
           <div className="space-y-3" style={{ minHeight: '400px' }}>
             {sortedReferrers.map((referrer) => (
-              <div key={referrer.hostname} className="space-y-2">
+              <button
+                type="button"
+                key={referrer.hostname}
+                className="space-y-2 w-full text-left cursor-pointer hover:bg-muted/50 rounded-lg p-1 -mx-1"
+                onClick={() => setSelectedReferrer(referrer.hostname)}
+              >
                 <div className="flex items-center justify-between gap-4">
                   <div className="flex items-center gap-3 min-w-0 flex-1">
-                    <ReferrerIcon domain={referrer.hostname} className="h-5 w-5 shrink-0" />
+                    <ReferrerIcon
+                      domain={referrer.hostname}
+                      className="h-5 w-5 shrink-0"
+                    />
                     <span className="text-sm font-medium truncate">
                       {referrer.displayName}
                     </span>
@@ -233,7 +348,7 @@ export function ReferrersChart({
                     style={{ width: `${referrer.percentage}%` }}
                   />
                 </div>
-              </div>
+              </button>
             ))}
           </div>
         )}

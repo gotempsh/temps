@@ -256,6 +256,28 @@ pub struct PropertyBreakdownQuery {
     pub aggregation_level: AggregationLevel,
     /// Maximum number of results to return (default: 20, max: 100)
     pub limit: Option<i32>,
+    /// Filter by country (for region/city drill-downs). Requires geolocation join.
+    pub filter_country: Option<String>,
+    /// Filter by region (for city drill-downs). Requires geolocation join.
+    pub filter_region: Option<String>,
+    /// Filter by browser name (for browser version drill-downs)
+    pub filter_browser: Option<String>,
+    /// Filter by operating system name (for OS version drill-downs)
+    pub filter_os: Option<String>,
+}
+
+/// Optional filters for property breakdown drill-downs.
+/// These allow hierarchical navigation (e.g., country -> region -> city).
+#[derive(Debug, Default)]
+pub struct PropertyBreakdownFilters {
+    /// Filter by country name (for region/city drill-downs)
+    pub country: Option<String>,
+    /// Filter by region name (for city drill-downs)
+    pub region: Option<String>,
+    /// Filter by browser name (for version drill-downs)
+    pub browser: Option<String>,
+    /// Filter by operating system name (for version drill-downs)
+    pub operating_system: Option<String>,
 }
 
 /// Query parameters for property timeline (group by column over time)

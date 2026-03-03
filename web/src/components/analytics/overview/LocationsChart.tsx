@@ -12,9 +12,16 @@ import {
 } from '@/components/ui/card'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
+import { ChevronLeft, ChevronRight, MapPin } from 'lucide-react'
 import * as React from 'react'
 
 type LocationType = 'country' | 'region' | 'city'
+
+interface DrillState {
+  level: LocationType
+  country?: string
+  region?: string
+}
 
 interface LocationsChartProps {
   project: ProjectResponse
@@ -29,8 +36,7 @@ export function LocationsChart({
   endDate,
   environment,
 }: LocationsChartProps) {
-  const [locationType, setLocationType] =
-    React.useState<LocationType>('country')
+  const [drill, setDrill] = React.useState<DrillState>({ level: 'country' })
 
   const { data, isLoading, error } = useQuery({
     ...getPropertyBreakdownOptions({
@@ -40,10 +46,12 @@ export function LocationsChart({
       query: {
         start_date: startDate ? startDate.toISOString() : '',
         end_date: endDate ? endDate.toISOString() : '',
-        group_by: locationType,
+        group_by: drill.level,
         environment_id: environment,
         aggregation_level: 'visitors',
         limit: 10,
+        ...(drill.country ? { filter_country: drill.country } : {}),
+        ...(drill.region ? { filter_region: drill.region } : {}),
       },
     }),
     enabled: !!startDate && !!endDate,
@@ -54,57 +62,112 @@ export function LocationsChart({
     const total = data.items.reduce((sum, item) => sum + item.count, 0)
     return data.items
       .sort((a, b) => b.count - a.count)
-      .slice(0, 5)
       .map((item) => ({
         location: item.value || 'Unknown',
         visitors: item.count,
         percentage: ((item.count / total) * 100).toFixed(1),
-        // color: `var(--chart-${item.value})`,
       }))
   }, [data])
+
+  function handleClick(locationName: string) {
+    if (drill.level === 'country' && locationName !== 'Unknown') {
+      setDrill({ level: 'region', country: locationName })
+    } else if (drill.level === 'region' && locationName !== 'Unknown') {
+      setDrill({ level: 'city', country: drill.country, region: locationName })
+    }
+  }
+
+  function handleBack() {
+    if (drill.level === 'city') {
+      setDrill({ level: 'region', country: drill.country })
+    } else if (drill.level === 'region') {
+      setDrill({ level: 'country' })
+    }
+  }
+
+  const canDrillDown = drill.level !== 'city'
+  const canGoBack = drill.level !== 'country'
+
+  const breadcrumb = React.useMemo(() => {
+    const parts: string[] = []
+    if (drill.country) parts.push(drill.country)
+    if (drill.region) parts.push(drill.region)
+    return parts
+  }, [drill])
 
   return (
     <Card>
       <CardHeader>
         <div className="flex items-center justify-between">
           <div>
-            <CardTitle>Locations</CardTitle>
+            <CardTitle className="flex items-center gap-2">
+              {canGoBack && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-6 w-6"
+                  onClick={handleBack}
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </Button>
+              )}
+              Locations
+            </CardTitle>
             <CardDescription>
-              {startDate && endDate
-                ? `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`
-                : 'Select a date range'}
+              {breadcrumb.length > 0 ? (
+                <span className="flex items-center gap-1 flex-wrap">
+                  <button
+                    type="button"
+                    className="text-primary hover:underline cursor-pointer"
+                    onClick={() => setDrill({ level: 'country' })}
+                  >
+                    All Countries
+                  </button>
+                  {drill.country && (
+                    <>
+                      <ChevronRight className="h-3 w-3" />
+                      <button
+                        type="button"
+                        className={`${drill.level === 'region' ? 'font-medium' : 'text-primary hover:underline cursor-pointer'}`}
+                        onClick={() => {
+                          if (drill.level !== 'region') {
+                            setDrill({
+                              level: 'region',
+                              country: drill.country,
+                            })
+                          }
+                        }}
+                      >
+                        {drill.country}
+                      </button>
+                    </>
+                  )}
+                  {drill.region && (
+                    <>
+                      <ChevronRight className="h-3 w-3" />
+                      <span className="font-medium">{drill.region}</span>
+                    </>
+                  )}
+                </span>
+              ) : startDate && endDate ? (
+                `${format(startDate, 'LLL dd, y')} - ${format(endDate, 'LLL dd, y')}`
+              ) : (
+                'Select a date range'
+              )}
             </CardDescription>
           </div>
-          <div className="flex gap-1">
-            <Badge
-              variant={locationType === 'country' ? 'default' : 'outline'}
-              className="cursor-pointer text-xs"
-              onClick={() => setLocationType('country')}
-            >
-              Country
+          {canDrillDown && !canGoBack && (
+            <Badge variant="outline" className="text-xs">
+              Click to drill down
             </Badge>
-            <Badge
-              variant={locationType === 'region' ? 'default' : 'outline'}
-              className="cursor-pointer text-xs"
-              onClick={() => setLocationType('region')}
-            >
-              Region
-            </Badge>
-            <Badge
-              variant={locationType === 'city' ? 'default' : 'outline'}
-              className="cursor-pointer text-xs"
-              onClick={() => setLocationType('city')}
-            >
-              City
-            </Badge>
-          </div>
+          )}
         </div>
       </CardHeader>
       <CardContent className="space-y-6">
         {isLoading ? (
           <div className="space-y-4">
             {[...Array(5)].map((_, i) => (
-              <div key={i} className="space-y-2">
+              <div key={`skeleton-loc-${i}`} className="space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="h-4 w-[100px] bg-muted animate-pulse rounded" />
                   <div className="h-4 w-[60px] bg-muted animate-pulse rounded" />
@@ -135,12 +198,24 @@ export function LocationsChart({
         ) : (
           <div className="space-y-4">
             {chartData.map((location) => (
-              <div key={location.location} className="flex items-center">
+              <button
+                type="button"
+                key={location.location}
+                className={`flex items-center w-full text-left ${canDrillDown && location.location !== 'Unknown' ? 'cursor-pointer hover:bg-muted/50 rounded-lg p-1 -mx-1' : ''}`}
+                onClick={() => handleClick(location.location)}
+                disabled={!canDrillDown || location.location === 'Unknown'}
+              >
                 <div className="w-full">
                   <div className="flex items-center justify-between mb-1">
-                    <span className="text-sm font-medium">
-                      {location.location}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <MapPin className="h-3 w-3 text-muted-foreground" />
+                      <span className="text-sm font-medium">
+                        {location.location}
+                      </span>
+                      {canDrillDown && location.location !== 'Unknown' && (
+                        <ChevronRight className="h-3 w-3 text-muted-foreground" />
+                      )}
+                    </div>
                     <span className="text-sm text-muted-foreground">
                       {location.visitors.toLocaleString()} (
                       {location.percentage}%)
@@ -148,15 +223,14 @@ export function LocationsChart({
                   </div>
                   <div className="w-full h-2 bg-muted rounded-full overflow-hidden">
                     <div
-                      className="h-full transition-all"
+                      className="h-full bg-primary transition-all rounded-full"
                       style={{
                         width: `${location.percentage}%`,
-                        backgroundColor: location.color,
                       }}
                     />
                   </div>
                 </div>
-              </div>
+              </button>
             ))}
           </div>
         )}
@@ -164,7 +238,13 @@ export function LocationsChart({
       {!isLoading && !error && chartData.length > 0 && (
         <CardFooter className="flex-col items-start gap-2 text-sm">
           <div className="leading-none text-muted-foreground">
-            Showing top {chartData.length} locations by unique visitors
+            Showing top {chartData.length}{' '}
+            {drill.level === 'country'
+              ? 'countries'
+              : drill.level === 'region'
+                ? 'regions'
+                : 'cities'}{' '}
+            by unique visitors
           </div>
         </CardFooter>
       )}

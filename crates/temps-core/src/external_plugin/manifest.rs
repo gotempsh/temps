@@ -179,6 +179,12 @@ impl PluginManifestBuilder {
 pub struct PluginReady {
     pub ready: bool,
     pub has_ui: bool,
+    /// Optional OpenAPI schema (serialized JSON) for the plugin's endpoints.
+    ///
+    /// When present, Temps merges this into the unified API documentation
+    /// with paths prefixed under `/x/{plugin_name}/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openapi: Option<serde_json::Value>,
 }
 
 /// Handshake envelope: tagged union for messages from plugin to Temps.
@@ -276,6 +282,7 @@ mod tests {
         let ready_msg = HandshakeMessage::Ready(PluginReady {
             ready: true,
             has_ui: false,
+            openapi: None,
         });
         let json = serde_json::to_string(&ready_msg).unwrap();
         assert!(json.contains("\"type\":\"ready\""));

@@ -112,9 +112,14 @@ async fn run_plugin_async<P: ExternalPlugin>(
     );
 
     // Step 6: Signal ready to Temps (handshake phase 2)
+    // Include OpenAPI schema if the plugin provides one
+    let openapi_json = plugin
+        .openapi_schema()
+        .and_then(|schema| serde_json::to_value(&schema).ok());
     let ready_msg = HandshakeMessage::Ready(PluginReady {
         ready: true,
         has_ui: plugin.ui_assets().is_some(),
+        openapi: openapi_json,
     });
     let ready_json = serde_json::to_string(&ready_msg)?;
     println!("{}", ready_json);

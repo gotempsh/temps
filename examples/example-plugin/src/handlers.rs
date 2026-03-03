@@ -87,10 +87,22 @@ fn serve_embedded_file(dist: &Dir<'static>, path: &str) -> Response {
 // ============================================================================
 
 /// Start an SEO analysis for a URL. Crawls the site in the background.
+#[utoipa::path(
+    post,
+    path = "/analyze",
+    tag = "SEO Analysis",
+    request_body = AnalyzeRequest,
+    responses(
+        (status = 202, description = "Analysis started", body = AnalyzeResponse),
+        (status = 400, description = "Invalid URL or scheme"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 pub async fn start_analysis(
     State(state): State<AppState>,
     Json(req): Json<AnalyzeRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(StatusCode, Json<AnalyzeResponse>), (StatusCode, Json<serde_json::Value>)> {
     let parsed = Url::parse(&req.url).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -149,15 +161,25 @@ pub async fn start_analysis(
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({
-            "id": report_id,
-            "status": "running",
-            "message": format!("Analysis started for {} (max {} pages)", req.url, max_pages),
-        })),
+        Json(AnalyzeResponse {
+            id: report_id,
+            status: "running".into(),
+            message: format!("Analysis started for {} (max {} pages)", req.url, max_pages),
+        }),
     ))
 }
 
 /// List all reports (summary view).
+#[utoipa::path(
+    get,
+    path = "/reports",
+    tag = "SEO Reports",
+    responses(
+        (status = 200, description = "List of reports", body = Vec<ReportSummary>),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 pub async fn list_reports(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ReportSummary>>, (StatusCode, Json<serde_json::Value>)> {
@@ -171,6 +193,20 @@ pub async fn list_reports(
 }
 
 /// Get a full report with per-page details.
+#[utoipa::path(
+    get,
+    path = "/reports/{id}",
+    tag = "SEO Reports",
+    params(
+        ("id" = String, Path, description = "Report ID")
+    ),
+    responses(
+        (status = 200, description = "Full report", body = SeoReport),
+        (status = 404, description = "Report not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 pub async fn get_report(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -186,6 +222,20 @@ pub async fn get_report(
 }
 
 /// Delete a report.
+#[utoipa::path(
+    delete,
+    path = "/reports/{id}",
+    tag = "SEO Reports",
+    params(
+        ("id" = String, Path, description = "Report ID")
+    ),
+    responses(
+        (status = 204, description = "Report deleted"),
+        (status = 404, description = "Report not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 pub async fn delete_report(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -201,6 +251,16 @@ pub async fn delete_report(
 }
 
 /// Get plugin settings.
+#[utoipa::path(
+    get,
+    path = "/settings",
+    tag = "Settings",
+    responses(
+        (status = 200, description = "Plugin settings", body = PluginSettings),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 pub async fn get_settings(
     State(state): State<AppState>,
 ) -> Result<Json<PluginSettings>, (StatusCode, Json<serde_json::Value>)> {
@@ -214,6 +274,17 @@ pub async fn get_settings(
 }
 
 /// Update plugin settings (partial update).
+#[utoipa::path(
+    patch,
+    path = "/settings",
+    tag = "Settings",
+    request_body = UpdateSettings,
+    responses(
+        (status = 200, description = "Updated settings", body = PluginSettings),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 pub async fn update_settings(
     State(state): State<AppState>,
     Json(update): Json<UpdateSettings>,
@@ -231,6 +302,20 @@ pub async fn update_settings(
 ///
 /// Returns `text/plain` so the frontend can copy it directly to the clipboard
 /// for pasting into ChatGPT, Claude, etc.
+#[utoipa::path(
+    get,
+    path = "/reports/{id}/prompt",
+    tag = "SEO Reports",
+    params(
+        ("id" = String, Path, description = "Report ID")
+    ),
+    responses(
+        (status = 200, description = "LLM-friendly prompt as plain text"),
+        (status = 404, description = "Report not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 pub async fn get_report_prompt(
     State(state): State<AppState>,
     Path(id): Path<String>,

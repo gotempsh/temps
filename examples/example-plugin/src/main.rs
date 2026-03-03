@@ -69,6 +69,47 @@ pub fn ui_dist() -> &'static Dir<'static> {
 }
 
 // ============================================================================
+// OpenAPI doc
+// ============================================================================
+
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(
+        title = "SEO Analyzer",
+        version = "0.1.0",
+        description = "Crawl deployed sites and generate technical SEO reports with actionable insights."
+    ),
+    paths(
+        handlers::start_analysis,
+        handlers::list_reports,
+        handlers::get_report,
+        handlers::delete_report,
+        handlers::get_report_prompt,
+        handlers::get_settings,
+        handlers::update_settings,
+    ),
+    components(schemas(
+        types::AnalyzeRequest,
+        types::AnalyzeResponse,
+        types::ReportSummary,
+        types::ReportStatus,
+        types::SeoReport,
+        types::ReportSummaryStats,
+        types::PageAnalysis,
+        types::SeoIssue,
+        types::IssueSeverity,
+        types::PluginSettings,
+        types::UpdateSettings,
+    )),
+    tags(
+        (name = "SEO Analysis", description = "Start and manage crawl analyses"),
+        (name = "SEO Reports",  description = "Retrieve and delete SEO reports"),
+        (name = "Settings",     description = "Plugin configuration"),
+    )
+)]
+struct SeoApiDoc;
+
+// ============================================================================
 // Plugin Definition
 // ============================================================================
 
@@ -149,6 +190,11 @@ impl ExternalPlugin for SeoPlugin {
             .route("/ui/", get(handlers::serve_ui_index))
             .route("/ui/{*path}", get(handlers::serve_ui_asset))
             .with_state(state)
+    }
+
+    fn openapi_schema(&self) -> Option<utoipa::openapi::OpenApi> {
+        use utoipa::OpenApi as _;
+        Some(SeoApiDoc::openapi())
     }
 
     fn on_start(&self, ctx: &PluginContext) -> Result<(), PluginSdkError> {

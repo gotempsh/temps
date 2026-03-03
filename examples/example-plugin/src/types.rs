@@ -1,13 +1,14 @@
 //! Shared types for the SEO Analyzer plugin.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 // ============================================================================
 // Settings
 // ============================================================================
 
 /// Plugin-level configuration persisted in SQLite.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PluginSettings {
     /// Default number of pages to crawl when not specified per-analysis.
     pub default_max_pages: usize,
@@ -39,7 +40,7 @@ impl Default for PluginSettings {
 }
 
 /// Partial update for plugin settings — only `Some` fields are written.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
 pub struct UpdateSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_max_pages: Option<usize>,
@@ -56,7 +57,7 @@ pub struct UpdateSettings {
 // ============================================================================
 
 /// Summary of a report (returned in list view).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReportSummary {
     pub id: String,
     pub url: String,
@@ -71,7 +72,7 @@ pub struct ReportSummary {
 }
 
 /// Full SEO report with per-page analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SeoReport {
     pub id: String,
     pub url: String,
@@ -84,7 +85,7 @@ pub struct SeoReport {
     pub duration_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReportStatus {
     Running,
@@ -92,7 +93,7 @@ pub enum ReportStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReportSummaryStats {
     pub pages_crawled: usize,
     pub total_issues: usize,
@@ -113,7 +114,7 @@ pub struct ReportSummaryStats {
 // ============================================================================
 
 /// Analysis result for a single page.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PageAnalysis {
     pub url: String,
     pub status_code: u16,
@@ -144,7 +145,7 @@ pub struct PageAnalysis {
 // ============================================================================
 
 /// An individual SEO issue found on a page.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SeoIssue {
     pub severity: IssueSeverity,
     pub code: String,
@@ -152,7 +153,7 @@ pub struct SeoIssue {
     pub recommendation: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueSeverity {
     Critical,
@@ -161,13 +162,25 @@ pub enum IssueSeverity {
 }
 
 // ============================================================================
-// Request types
+// Request / response types
 // ============================================================================
 
 /// Request body for starting an analysis.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct AnalyzeRequest {
+    /// URL of the site to crawl (must be http or https).
     pub url: String,
     /// Number of pages to crawl. Falls back to plugin settings default if omitted.
     pub max_pages: Option<usize>,
+}
+
+/// Response when an analysis is successfully started.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AnalyzeResponse {
+    /// Unique report ID (UUID).
+    pub id: String,
+    /// Always `"running"` for a newly started analysis.
+    pub status: String,
+    /// Human-readable confirmation message.
+    pub message: String,
 }

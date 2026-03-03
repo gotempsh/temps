@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 temps-plugin-sdk = { path = "../../crates/temps-plugin-sdk" }
+utoipa = { workspace = true }
 
 axum = { version = "0.8" }
 sea-orm = { workspace = true }

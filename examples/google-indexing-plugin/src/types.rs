@@ -1,12 +1,13 @@
 //! Shared types for the Google Indexing API plugin.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 // ============================================================================
 // Settings
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginSettings {
     /// Whether the service account key has been configured
@@ -29,7 +30,7 @@ impl PluginSettings {
     pub const DEFAULT_DAILY_QUOTA: usize = 200;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSettings {
     pub auto_submit: Option<bool>,
@@ -76,7 +77,7 @@ pub struct SubmissionRecord {
 // ============================================================================
 
 /// Summary of a single submission record for API responses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmissionResponse {
     pub url: String,
@@ -91,7 +92,7 @@ pub struct SubmissionResponse {
 }
 
 /// Result of a Google Indexing API submission batch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmissionResult {
     /// Number of URLs successfully submitted
@@ -108,7 +109,7 @@ pub struct SubmissionResult {
     pub remaining_quota: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UrlSubmissionResult {
     pub url: String,
@@ -119,7 +120,7 @@ pub struct UrlSubmissionResult {
 }
 
 /// Quota status information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaStatus {
     pub daily_limit: usize,
@@ -129,7 +130,7 @@ pub struct QuotaStatus {
 }
 
 /// URL notification metadata from Google.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UrlStatus {
     pub url: String,
@@ -137,7 +138,7 @@ pub struct UrlStatus {
     pub latest_remove: Option<NotificationInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationInfo {
     pub url: String,
@@ -150,7 +151,7 @@ pub struct NotificationInfo {
 // API request types
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmitRequest {
     /// URLs to submit as URL_UPDATED
@@ -165,7 +166,7 @@ pub struct SubmitRequest {
     pub deployment_id: Option<i32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckStatusRequest {
     /// URL to check notification status for

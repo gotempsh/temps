@@ -477,9 +477,11 @@ impl AnalyticsEventsService {
         group_by_column: crate::types::PropertyColumn,
         aggregation_level: &str,
         limit: Option<i32>,
+        filters: Option<crate::types::PropertyBreakdownFilters>,
     ) -> Result<PropertyBreakdownResponse, EventsError> {
         let group_by_str = group_by_column.as_str();
         let limit_val = limit.unwrap_or(20).min(100);
+        let filters = filters.unwrap_or_default();
 
         // Determine aggregation field
         let (agg_field, agg_distinct) = match aggregation_level {
@@ -491,19 +493,36 @@ impl AnalyticsEventsService {
         // Check if we need to join with ip_geolocations
         let is_geo_column = matches!(group_by_str, "country" | "region" | "city");
         let is_referrer_column = group_by_str == "referrer_hostname";
+        let needs_geo_join = is_geo_column || filters.country.is_some() || filters.region.is_some();
 
-        let (from_clause, select_column) = if is_geo_column {
+        let (from_clause, select_column) = if needs_geo_join && is_geo_column {
             (
                 "events e LEFT JOIN ip_geolocations ig ON e.ip_geolocation_id = ig.id",
                 format!("COALESCE(ig.{}, 'Unknown')", group_by_str),
             )
+        } else if needs_geo_join {
+            // Non-geo column but we need the join for filtering
+            if is_referrer_column {
+                (
+                    "events e LEFT JOIN ip_geolocations ig ON e.ip_geolocation_id = ig.id",
+                    format!("COALESCE(e.{}, 'Direct')", group_by_str),
+                )
+            } else {
+                (
+                    "events e LEFT JOIN ip_geolocations ig ON e.ip_geolocation_id = ig.id",
+                    format!("COALESCE(e.{}, 'Unknown')", group_by_str),
+                )
+            }
         } else if is_referrer_column {
             (
                 "events e",
                 format!("COALESCE(e.{}, 'Direct')", group_by_str),
             )
         } else {
-            ("events e", format!("e.{}", group_by_str))
+            (
+                "events e",
+                format!("COALESCE(e.{}, 'Unknown')", group_by_str),
+            )
         };
 
         let mut conditions = vec!["e.project_id = $1".to_string()];
@@ -534,6 +553,26 @@ impl AnalyticsEventsService {
                 "COALESCE(e.event_name, e.event_type) = ${}",
                 param_idx
             ));
+            param_idx += 1;
+        }
+
+        // Apply drill-down filters
+        if filters.country.is_some() {
+            conditions.push(format!("ig.country = ${}", param_idx));
+            param_idx += 1;
+        }
+        if filters.region.is_some() {
+            conditions.push(format!("ig.region = ${}", param_idx));
+            param_idx += 1;
+        }
+        if filters.browser.is_some() {
+            conditions.push(format!("e.browser = ${}", param_idx));
+            param_idx += 1;
+        }
+        if filters.operating_system.is_some() {
+            conditions.push(format!("e.operating_system = ${}", param_idx));
+            // param_idx is not used after this but keep for consistency
+            let _ = param_idx;
         }
 
         let sql_query = format!(
@@ -589,6 +628,18 @@ impl AnalyticsEventsService {
         }
         if let Some(evt_name) = event_name {
             params.push(evt_name.into());
+        }
+        if let Some(country) = filters.country {
+            params.push(country.into());
+        }
+        if let Some(region) = filters.region {
+            params.push(region.into());
+        }
+        if let Some(browser) = filters.browser {
+            params.push(browser.into());
+        }
+        if let Some(os) = filters.operating_system {
+            params.push(os.into());
         }
 
         let results = BreakdownResult::find_by_statement(Statement::from_sql_and_values(

@@ -1,12 +1,13 @@
 //! Shared types for the IndexNow plugin.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 // ============================================================================
 // Settings
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginSettings {
     /// IndexNow API key (8-128 hex chars). Must be set before submissions work.
@@ -31,7 +32,7 @@ impl PluginSettings {
     pub const DEFAULT_USER_AGENT: &'static str = "TempsBot/1.0 (+https://temps.sh/bot)";
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSettings {
     pub api_key: Option<String>,
@@ -65,7 +66,7 @@ pub struct SubmissionRecord {
 // ============================================================================
 
 /// Summary of a single submission record for API responses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmissionResponse {
     pub url: String,
@@ -78,7 +79,7 @@ pub struct SubmissionResponse {
 }
 
 /// A page that might need resubmission.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PageSuggestion {
     pub url: String,
@@ -95,7 +96,7 @@ pub struct PageSuggestion {
     pub content_changed: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SuggestionReason {
     /// Never submitted before
@@ -111,7 +112,7 @@ pub enum SuggestionReason {
 }
 
 /// Result of an IndexNow submission batch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmissionResult {
     /// Number of URLs submitted
@@ -145,7 +146,7 @@ pub struct CrawledPage {
 // API request types
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmitRequest {
     /// URLs to submit. If empty, auto-discover from the site.
@@ -160,7 +161,7 @@ pub struct SubmitRequest {
     pub deployment_id: Option<i32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SuggestionsRequest {
     /// Base URL of the site to check
@@ -169,7 +170,7 @@ pub struct SuggestionsRequest {
     pub project_id: Option<i32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SuggestionsResponse {
     pub suggestions: Vec<PageSuggestion>,

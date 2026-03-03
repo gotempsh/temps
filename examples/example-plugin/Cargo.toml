@@ -26,6 +26,7 @@ uuid = { version = "1", features = ["v4"] }
 include_dir = "0.7"
 mime_guess = "2.0"
 thiserror = { workspace = true }
+utoipa = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -33,6 +33,51 @@ pub fn ui_dist() -> &'static Dir<'static> {
 }
 
 // ============================================================================
+// OpenAPI doc
+// ============================================================================
+
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(
+        title = "Google Indexing",
+        version = "0.1.0",
+        description = "Notify Google instantly when pages are updated or removed via the Indexing API."
+    ),
+    paths(
+        get_settings,
+        update_settings,
+        upload_service_account,
+        delete_service_account,
+        list_submissions,
+        delete_submission,
+        submit_urls,
+        check_url_status,
+        get_quota,
+    ),
+    components(schemas(
+        types::PluginSettings,
+        types::UpdateSettings,
+        types::SubmissionResponse,
+        types::SubmissionResult,
+        types::UrlSubmissionResult,
+        types::SubmitRequest,
+        types::CheckStatusRequest,
+        types::UrlStatus,
+        types::NotificationInfo,
+        types::QuotaStatus,
+        UploadServiceAccountRequest,
+        ServiceAccountInfo,
+    )),
+    tags(
+        (name = "Settings",        description = "Plugin configuration"),
+        (name = "Service Account", description = "Upload and manage Google service account credentials"),
+        (name = "Submissions",     description = "Manage and trigger Google Indexing API submissions"),
+        (name = "Quota",           description = "Monitor daily API quota usage"),
+    )
+)]
+struct GoogleIndexingApiDoc;
+
+// ============================================================================
 // Plugin definition
 // ============================================================================
 
@@ -125,6 +170,11 @@ impl ExternalPlugin for GoogleIndexingPlugin {
             .route("/ui/", get(serve_ui_index))
             .route("/ui/{*path}", get(serve_ui_asset))
             .with_state(state)
+    }
+
+    fn openapi_schema(&self) -> Option<utoipa::openapi::OpenApi> {
+        use utoipa::OpenApi as _;
+        Some(GoogleIndexingApiDoc::openapi())
     }
 
     fn on_start(&self, ctx: &PluginContext) -> Result<(), PluginSdkError> {
@@ -305,6 +355,16 @@ async fn auto_submit_on_deploy(
 
 // -- Settings ----------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/settings",
+    tag = "Settings",
+    responses(
+        (status = 200, description = "Plugin settings", body = PluginSettings),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 async fn get_settings(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<PluginSettings>, AppError> {
@@ -312,6 +372,17 @@ async fn get_settings(
     Ok(Json(settings))
 }
 
+#[utoipa::path(
+    patch,
+    path = "/settings",
+    tag = "Settings",
+    request_body = UpdateSettings,
+    responses(
+        (status = 200, description = "Updated plugin settings", body = PluginSettings),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 async fn update_settings(
     State(state): State<Arc<AppState>>,
     Json(update): Json<UpdateSettings>,
@@ -322,20 +393,32 @@ async fn update_settings(
 
 // -- Service account ---------------------------------------------------------
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct UploadServiceAccountRequest {
     /// The full JSON content of the service account key file
     key_json: String,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct ServiceAccountInfo {
     client_email: String,
     project_id: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/service-account",
+    tag = "Service Account",
+    request_body = UploadServiceAccountRequest,
+    responses(
+        (status = 201, description = "Service account key uploaded and validated", body = ServiceAccountInfo),
+        (status = 400, description = "Invalid key or authentication failure"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 async fn upload_service_account(
     State(state): State<Arc<AppState>>,
     Json(request): Json<UploadServiceAccountRequest>,
@@ -383,6 +466,16 @@ async fn upload_service_account(
     ))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/service-account",
+    tag = "Service Account",
+    responses(
+        (status = 204, description = "Service account key deleted"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 async fn delete_service_account(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, AppError> {
@@ -393,14 +486,26 @@ async fn delete_service_account(
 
 // -- Submissions -------------------------------------------------------------
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
 #[serde(rename_all = "camelCase")]
+#[into_params(parameter_in = Query)]
 struct ListSubmissionsQuery {
     host: Option<String>,
     project_id: Option<i32>,
     limit: Option<u64>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/submissions",
+    tag = "Submissions",
+    params(ListSubmissionsQuery),
+    responses(
+        (status = 200, description = "List of URL submissions", body = Vec<SubmissionResponse>),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 async fn list_submissions(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListSubmissionsQuery>,
@@ -429,11 +534,24 @@ async fn list_submissions(
     Ok(Json(responses))
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 struct DeleteSubmissionQuery {
     url: String,
 }
 
+#[utoipa::path(
+    delete,
+    path = "/submissions",
+    tag = "Submissions",
+    params(DeleteSubmissionQuery),
+    responses(
+        (status = 204, description = "Submission deleted"),
+        (status = 404, description = "Submission not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 async fn delete_submission(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DeleteSubmissionQuery>,
@@ -448,6 +566,18 @@ async fn delete_submission(
 
 // -- Submit ------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/submit",
+    tag = "Submissions",
+    request_body = SubmitRequest,
+    responses(
+        (status = 200, description = "Submission results", body = SubmissionResult),
+        (status = 400, description = "No URLs provided or service account not configured"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 async fn submit_urls(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SubmitRequest>,
@@ -543,6 +673,18 @@ async fn submit_urls(
 
 // -- Check URL status --------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/status",
+    tag = "Submissions",
+    request_body = CheckStatusRequest,
+    responses(
+        (status = 200, description = "URL notification status at Google", body = UrlStatus),
+        (status = 400, description = "Service account not configured"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 async fn check_url_status(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CheckStatusRequest>,
@@ -571,6 +713,16 @@ async fn check_url_status(
 
 // -- Quota -------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/quota",
+    tag = "Quota",
+    responses(
+        (status = 200, description = "Current daily quota status", body = QuotaStatus),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 async fn get_quota(State(state): State<Arc<AppState>>) -> Result<Json<QuotaStatus>, AppError> {
     let settings = state.store.get_settings().await?;
     let used_today = state.store.get_today_usage().await?;

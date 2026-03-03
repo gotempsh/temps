@@ -386,7 +386,11 @@ pub async fn get_hourly_visits(
         ("deployment_id" = Option<i32>, Query, description = "Filter by deployment ID"),
         ("event_name" = Option<String>, Query, description = "Filter by event name"),
         ("aggregation_level" = Option<String>, Query, description = "Aggregation level: events, sessions, or visitors - default: events"),
-        ("limit" = Option<i32>, Query, description = "Maximum number of results (default: 20, max: 100)")
+        ("limit" = Option<i32>, Query, description = "Maximum number of results (default: 20, max: 100)"),
+        ("filter_country" = Option<String>, Query, description = "Filter by country (for region/city drill-downs)"),
+        ("filter_region" = Option<String>, Query, description = "Filter by region (for city drill-downs)"),
+        ("filter_browser" = Option<String>, Query, description = "Filter by browser name (for version drill-downs)"),
+        ("filter_os" = Option<String>, Query, description = "Filter by OS name (for version drill-downs)")
     ),
     responses(
         (status = 200, description = "Successfully retrieved property breakdown", body = PropertyBreakdownResponse),
@@ -409,6 +413,13 @@ pub async fn get_property_breakdown(
 
     let aggregation_level = query.aggregation_level.as_str();
 
+    let filters = crate::types::PropertyBreakdownFilters {
+        country: query.filter_country,
+        region: query.filter_region,
+        browser: query.filter_browser,
+        operating_system: query.filter_os,
+    };
+
     let breakdown = state
         .events_service
         .get_property_breakdown(
@@ -421,6 +432,7 @@ pub async fn get_property_breakdown(
             query.group_by.clone(),
             aggregation_level,
             query.limit,
+            Some(filters),
         )
         .await
         .map_err(|e| {

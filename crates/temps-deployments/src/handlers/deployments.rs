@@ -2551,22 +2551,30 @@ mod tests {
             deployer,
         ));
 
-        let cron_service = Arc::new(
-            crate::services::database_cron_service::DatabaseCronConfigService::new(
-                db.clone(),
-                queue_service.clone(),
-            ),
-        );
-
-        let remote_deployment_service =
-            Arc::new(crate::services::RemoteDeploymentService::new(db.clone()));
-
         let encryption_service = Arc::new(
             temps_core::EncryptionService::new(
                 "0000000000000000000000000000000000000000000000000000000000000000",
             )
             .expect("Failed to create test encryption service"),
         );
+
+        let deployment_token_service = Arc::new(
+            crate::services::deployment_token_service::DeploymentTokenService::new(
+                db.clone(),
+                encryption_service.clone(),
+            ),
+        );
+
+        let cron_service = Arc::new(
+            crate::services::database_cron_service::DatabaseCronConfigService::new(
+                db.clone(),
+                queue_service.clone(),
+                deployment_token_service,
+            ),
+        );
+
+        let remote_deployment_service =
+            Arc::new(crate::services::RemoteDeploymentService::new(db.clone()));
 
         let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
             db.clone(),

@@ -75,10 +75,22 @@ impl TempsPlugin for DeploymentsPlugin {
                 }
             });
 
+            // Get encryption service for deployment token encryption (needed by cron service and workflow planner)
+            let encryption_service = context.require_service::<temps_core::EncryptionService>();
+
+            // Create DeploymentTokenService for cron secret retrieval
+            let deployment_token_service = Arc::new(
+                crate::services::deployment_token_service::DeploymentTokenService::new(
+                    db.clone(),
+                    encryption_service.clone(),
+                ),
+            );
+
             // Create DatabaseCronConfigService to manage cron jobs
             let database_cron_service = Arc::new(crate::services::DatabaseCronConfigService::new(
                 db.clone(),
                 queue_service.clone(),
+                deployment_token_service,
             ));
             let cron_service =
                 database_cron_service.clone() as Arc<dyn crate::jobs::CronConfigService>;
@@ -148,9 +160,6 @@ impl TempsPlugin for DeploymentsPlugin {
 
             // Get DSN service for automatic Sentry DSN generation (required)
             let dsn_service = context.require_service::<temps_error_tracking::DSNService>();
-
-            // Get encryption service for deployment token encryption
-            let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
             // Create JobProcessor with workflow execution capability
             let job_receiver = queue_service.subscribe();

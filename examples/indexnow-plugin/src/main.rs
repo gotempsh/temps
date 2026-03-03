@@ -32,6 +32,43 @@ pub fn ui_dist() -> &'static Dir<'static> {
 }
 
 // ============================================================================
+// OpenAPI doc
+// ============================================================================
+
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(
+        title = "IndexNow",
+        version = "0.1.0",
+        description = "Submit URLs to search engines instantly when deployments succeed via the IndexNow protocol."
+    ),
+    paths(
+        get_settings,
+        update_settings,
+        list_submissions,
+        delete_submission,
+        submit_urls,
+        get_suggestions,
+    ),
+    components(schemas(
+        types::PluginSettings,
+        types::UpdateSettings,
+        types::SubmissionResponse,
+        types::SubmissionResult,
+        types::SubmitRequest,
+        types::SuggestionsRequest,
+        types::SuggestionsResponse,
+        types::PageSuggestion,
+        types::SuggestionReason,
+    )),
+    tags(
+        (name = "Submissions", description = "Manage and trigger IndexNow URL submissions"),
+        (name = "Settings",    description = "Plugin configuration"),
+    )
+)]
+struct IndexNowApiDoc;
+
+// ============================================================================
 // Plugin definition
 // ============================================================================
 
@@ -107,6 +144,11 @@ impl ExternalPlugin for IndexNowPlugin {
             // Note: /health is already provided by the SDK runtime — do NOT add it here
             // or axum will panic on Router::merge due to conflicting routes.
             .with_state(state)
+    }
+
+    fn openapi_schema(&self) -> Option<utoipa::openapi::OpenApi> {
+        use utoipa::OpenApi as _;
+        Some(IndexNowApiDoc::openapi())
     }
 
     fn on_start(&self, ctx: &PluginContext) -> Result<(), PluginSdkError> {
@@ -322,6 +364,16 @@ async fn auto_submit_on_deploy(
 
 // -- Settings ----------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/settings",
+    tag = "Settings",
+    responses(
+        (status = 200, description = "Plugin settings", body = PluginSettings),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 async fn get_settings(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<PluginSettings>, AppError> {
@@ -329,6 +381,17 @@ async fn get_settings(
     Ok(Json(settings))
 }
 
+#[utoipa::path(
+    patch,
+    path = "/settings",
+    tag = "Settings",
+    request_body = UpdateSettings,
+    responses(
+        (status = 200, description = "Updated plugin settings", body = PluginSettings),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 async fn update_settings(
     State(state): State<Arc<AppState>>,
     Json(update): Json<UpdateSettings>,
@@ -339,14 +402,32 @@ async fn update_settings(
 
 // -- Submissions -------------------------------------------------------------
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
 #[serde(rename_all = "camelCase")]
+#[into_params(parameter_in = Query)]
 struct ListSubmissionsQuery {
     host: Option<String>,
     project_id: Option<i32>,
     limit: Option<u64>,
 }
 
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct DeleteSubmissionQuery {
+    url: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/submissions",
+    tag = "Submissions",
+    params(ListSubmissionsQuery),
+    responses(
+        (status = 200, description = "List of URL submissions", body = Vec<SubmissionResponse>),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 async fn list_submissions(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListSubmissionsQuery>,
@@ -373,11 +454,18 @@ async fn list_submissions(
     Ok(Json(responses))
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct DeleteSubmissionQuery {
-    url: String,
-}
-
+#[utoipa::path(
+    delete,
+    path = "/submissions",
+    tag = "Submissions",
+    params(DeleteSubmissionQuery),
+    responses(
+        (status = 204, description = "Submission deleted"),
+        (status = 404, description = "Submission not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 async fn delete_submission(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DeleteSubmissionQuery>,
@@ -392,6 +480,18 @@ async fn delete_submission(
 
 // -- Submit ------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/submit",
+    tag = "Submissions",
+    request_body = SubmitRequest,
+    responses(
+        (status = 200, description = "Submission result", body = SubmissionResult),
+        (status = 400, description = "Bad request — missing API key or URLs"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 async fn submit_urls(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SubmitRequest>,
@@ -497,6 +597,17 @@ async fn submit_urls(
 
 // -- Suggestions -------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/suggestions",
+    tag = "Submissions",
+    request_body = SuggestionsRequest,
+    responses(
+        (status = 200, description = "Pages that need (re)submission", body = SuggestionsResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 async fn get_suggestions(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SuggestionsRequest>,

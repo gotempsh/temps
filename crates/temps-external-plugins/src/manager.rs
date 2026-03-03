@@ -15,6 +15,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use sea_orm::DatabaseConnection;
+use utoipa::openapi::OpenApi;
 
 use crate::channel::PluginChannel;
 use crate::proxy::PluginProxy;
@@ -35,6 +36,8 @@ pub struct ExternalPluginProcess {
     pub has_ui: bool,
     /// Bidirectional channel for platform queries and event delivery
     pub channel: Option<PluginChannel>,
+    /// OpenAPI schema for the plugin's API endpoints (if provided during handshake)
+    pub openapi_schema: Option<OpenApi>,
 }
 
 impl ExternalPluginProcess {
@@ -527,7 +530,7 @@ impl ExternalPluginManager {
         debug!(plugin = %manifest.name, "Received manifest from plugin");
 
         // Read ready signal (handshake phase 2)
-        let has_ui = match tokio::time::timeout(self.config.handshake_timeout, async {
+        let (has_ui, openapi_schema) = match tokio::time::timeout(self.config.handshake_timeout, async {
             let line = reader
                 .next_line()
                 .await
@@ -545,7 +548,21 @@ impl ExternalPluginManager {
             match msg {
                 HandshakeMessage::Ready(r) => {
                     if r.ready {
-                        Ok(r.has_ui)
+                        // Parse the OpenAPI schema if provided
+                        let openapi = match r.openapi {
+                            Some(json) => match serde_json::from_value::<OpenApi>(json) {
+                                Ok(schema) => {
+                                    debug!(plugin = %manifest.name, "Received OpenAPI schema from plugin");
+                                    Some(schema)
+                                }
+                                Err(e) => {
+                                    warn!(plugin = %manifest.name, "Failed to parse OpenAPI schema: {}", e);
+                                    None
+                                }
+                            },
+                            None => None,
+                        };
+                        Ok((r.has_ui, openapi))
                     } else {
                         Err(format!("Plugin {} reported not ready", binary_name))
                     }
@@ -607,6 +624,7 @@ impl ExternalPluginManager {
             child,
             has_ui,
             channel,
+            openapi_schema,
         };
 
         self.plugins
@@ -624,6 +642,23 @@ impl ExternalPluginManager {
             .await
             .values()
             .map(|p| p.manifest.clone())
+            .collect()
+    }
+
+    /// Get OpenAPI schemas from all running plugins.
+    ///
+    /// Returns a map of plugin name -> OpenAPI schema.
+    pub async fn openapi_schemas(&self) -> Vec<(String, OpenApi)> {
+        self.plugins
+            .read()
+            .await
+            .iter()
+            .filter_map(|(name, process)| {
+                process
+                    .openapi_schema
+                    .as_ref()
+                    .map(|schema| (name.clone(), schema.clone()))
+            })
             .collect()
     }
 
@@ -980,8 +1015,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_kill_stale_processes_kills_real_process() {
         use tokio::process::Command;
 

@@ -22257,6 +22257,22 @@ export type GetPropertyBreakdownData = {
          * Maximum number of results (default: 20, max: 100)
          */
         limit?: number;
+        /**
+         * Filter by country (for region/city drill-downs)
+         */
+        filter_country?: string;
+        /**
+         * Filter by region (for city drill-downs)
+         */
+        filter_region?: string;
+        /**
+         * Filter by browser name (for version drill-downs)
+         */
+        filter_browser?: string;
+        /**
+         * Filter by OS name (for version drill-downs)
+         */
+        filter_os?: string;
     };
     url: '/projects/{project_id}/events/properties/breakdown';
 };

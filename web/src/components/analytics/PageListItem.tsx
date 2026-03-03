@@ -7,7 +7,7 @@ import {
 } from '@/components/ui/chart'
 import { Clock, ExternalLink, TrendingUp, Users } from 'lucide-react'
 import { useMemo } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { Area, AreaChart, XAxis, YAxis } from 'recharts'
 
 interface PageListItemProps {

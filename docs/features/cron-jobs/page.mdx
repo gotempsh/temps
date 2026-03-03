@@ -245,18 +245,16 @@ Temps invokes your endpoints using **GET** requests by default.
 
 ### Authentication
 
-Temps automatically includes an `Authorization` header when invoking cron endpoints:
+Temps automatically handles cron authentication for you:
+
+1. A `CRON_SECRET` environment variable is injected into your container on every deployment
+2. The cron scheduler sends an `Authorization` header when invoking your endpoints:
 
 ```
-Authorization: Bearer <TEMPS_CRON_SECRET>
+Authorization: Bearer <CRON_SECRET>
 ```
 
-**Set your cron secret as an environment variable:**
-
-```bash
-# In Temps dashboard: Project Settings > Environment Variables
-CRON_SECRET=your-secret-key-here
-```
+You don't need to configure anything. The secret is generated per project/environment and stays stable across redeployments.
 
 **Verify in your endpoint:**
 
@@ -606,10 +604,15 @@ For long-running tasks, consider:
     Test cron endpoints locally before deploying:
 
     ```bash
+    # Set a local CRON_SECRET for testing
+    export CRON_SECRET=test-secret
+
     # Invoke endpoint manually
     curl http://localhost:3000/api/cleanup \
-      -H "Authorization: Bearer your-cron-secret"
+      -H "Authorization: Bearer test-secret"
     ```
+
+    In production, `CRON_SECRET` is auto-injected by Temps. You only need to set it manually for local testing.
   </Property>
 </Properties>
 
@@ -635,12 +638,13 @@ For long-running tasks, consider:
     - Check deployment logs for cron configuration messages
   </Property>
   <Property name="401 Unauthorized errors">
-    **Cause:** Missing or incorrect `CRON_SECRET` environment variable.
+    **Cause:** Your endpoint is not reading the `CRON_SECRET` environment variable correctly.
 
     **Solution:**
-    - Set `CRON_SECRET` in your environment variables
-    - Verify it matches what your endpoint expects
-    - Check the Authorization header format
+    - `CRON_SECRET` is automatically injected by Temps on every deployment. You don't need to set it manually.
+    - Verify your endpoint reads `process.env.CRON_SECRET` (Node.js) or `os.environ['CRON_SECRET']` (Python)
+    - Check that your auth check compares against `Bearer ${process.env.CRON_SECRET}`
+    - Redeploy your application if the secret was not injected (older deployments before this feature may not have it)
   </Property>
   <Property name="Timeout errors">
     **Cause:** Job takes longer than 5-minute default timeout.
@@ -661,7 +665,7 @@ For long-running tasks, consider:
 
 ## Next Steps
 
-- **[Environment Variables](/docs/environment-variables)** - Store cron secrets securely
+- **[Environment Variables](/docs/environment-variables)** - Manage environment-specific configuration
 - **[Monitoring](/docs/monitoring)** - Track cron job health
 - **[Error Tracking](/docs/error-tracking)** - Catch cron endpoint errors
 - **[Logs](/docs/logs)** - Debug failed executions

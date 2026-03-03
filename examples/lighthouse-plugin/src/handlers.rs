@@ -76,10 +76,22 @@ fn serve_embedded_file(dist: &Dir<'static>, path: &str) -> Response {
 // ============================================================================
 
 /// Start a manual Lighthouse audit for a URL.
+#[utoipa::path(
+    post,
+    path = "/audit",
+    tag = "Audits",
+    request_body = AuditRequest,
+    responses(
+        (status = 202, description = "Audit started", body = StartAuditResponse),
+        (status = 400, description = "Invalid URL"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 pub async fn start_audit(
     State(state): State<AppState>,
     Json(req): Json<AuditRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(StatusCode, Json<StartAuditResponse>), (StatusCode, Json<serde_json::Value>)> {
     // Validate URL
     if !req.url.starts_with("http://") && !req.url.starts_with("https://") {
         return Err((
@@ -140,11 +152,11 @@ pub async fn start_audit(
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({
-            "id": audit_id,
-            "status": "running",
-            "message": format!("Lighthouse audit started for {} ({})", req.url, device),
-        })),
+        Json(StartAuditResponse {
+            id: audit_id.clone(),
+            status: "running".into(),
+            message: format!("Lighthouse audit started for {} ({})", req.url, device),
+        }),
     ))
 }
 
@@ -186,6 +198,16 @@ pub async fn run_audit_background(
 }
 
 /// List all audits.
+#[utoipa::path(
+    get,
+    path = "/audits",
+    tag = "Audits",
+    responses(
+        (status = 200, description = "List of audits", body = Vec<AuditSummary>),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 pub async fn list_audits(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<AuditSummary>>, (StatusCode, Json<serde_json::Value>)> {
@@ -199,6 +221,18 @@ pub async fn list_audits(
 }
 
 /// Get a full audit with details.
+#[utoipa::path(
+    get,
+    path = "/audits/{id}",
+    tag = "Audits",
+    params(("id" = String, Path, description = "Audit ID")),
+    responses(
+        (status = 200, description = "Audit details", body = LighthouseAudit),
+        (status = 404, description = "Audit not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 pub async fn get_audit(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -214,6 +248,18 @@ pub async fn get_audit(
 }
 
 /// Delete an audit.
+#[utoipa::path(
+    delete,
+    path = "/audits/{id}",
+    tag = "Audits",
+    params(("id" = String, Path, description = "Audit ID")),
+    responses(
+        (status = 204, description = "Audit deleted"),
+        (status = 404, description = "Audit not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 pub async fn delete_audit(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -229,6 +275,18 @@ pub async fn delete_audit(
 }
 
 /// Get raw Lighthouse JSON for an audit.
+#[utoipa::path(
+    get,
+    path = "/audits/{id}/raw",
+    tag = "Audits",
+    params(("id" = String, Path, description = "Audit ID")),
+    responses(
+        (status = 200, description = "Raw Lighthouse JSON output", content_type = "application/json"),
+        (status = 404, description = "Audit not found or raw JSON not available"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 pub async fn get_raw_json(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -248,6 +306,16 @@ pub async fn get_raw_json(
 }
 
 /// Get score history for charts.
+#[utoipa::path(
+    get,
+    path = "/history",
+    tag = "Audits",
+    responses(
+        (status = 200, description = "Score history data points", body = Vec<ScoreHistoryPoint>),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 pub async fn get_score_history(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ScoreHistoryPoint>>, (StatusCode, Json<serde_json::Value>)> {
@@ -261,14 +329,33 @@ pub async fn get_score_history(
 }
 
 /// Check if Lighthouse CLI is available.
-pub async fn get_status() -> Json<serde_json::Value> {
+#[utoipa::path(
+    get,
+    path = "/status",
+    tag = "Settings",
+    responses(
+        (status = 200, description = "Lighthouse CLI availability", body = StatusResponse),
+    ),
+    security(())
+)]
+pub async fn get_status() -> Json<StatusResponse> {
     let available = lighthouse::is_lighthouse_available().await;
-    Json(serde_json::json!({
-        "lighthouse_available": available,
-    }))
+    Json(StatusResponse {
+        lighthouse_available: available,
+    })
 }
 
 /// Get plugin settings.
+#[utoipa::path(
+    get,
+    path = "/settings",
+    tag = "Settings",
+    responses(
+        (status = 200, description = "Plugin settings", body = PluginSettings),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 pub async fn get_settings(
     State(state): State<AppState>,
 ) -> Result<Json<PluginSettings>, (StatusCode, Json<serde_json::Value>)> {
@@ -282,6 +369,17 @@ pub async fn get_settings(
 }
 
 /// Update plugin settings (partial update).
+#[utoipa::path(
+    patch,
+    path = "/settings",
+    tag = "Settings",
+    request_body = UpdateSettings,
+    responses(
+        (status = 200, description = "Updated plugin settings", body = PluginSettings),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(())
+)]
 pub async fn update_settings(
     State(state): State<AppState>,
     Json(update): Json<UpdateSettings>,

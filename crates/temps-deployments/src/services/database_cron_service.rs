@@ -20,6 +20,7 @@ use tokio::time::{self, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::jobs::configure_crons::{CronConfig, CronConfigError, CronConfigService};
+use crate::services::deployment_token_service::DeploymentTokenService;
 
 #[derive(Error, Debug)]
 pub enum CronServiceError {
@@ -71,14 +72,20 @@ pub struct DatabaseCronConfigService {
     db: Arc<DatabaseConnection>,
     http_client: Arc<reqwest::Client>,
     queue: Arc<dyn temps_core::JobQueue>,
+    deployment_token_service: Arc<DeploymentTokenService>,
 }
 
 impl DatabaseCronConfigService {
-    pub fn new(db: Arc<DbConnection>, queue: Arc<dyn temps_core::JobQueue>) -> Self {
+    pub fn new(
+        db: Arc<DbConnection>,
+        queue: Arc<dyn temps_core::JobQueue>,
+        deployment_token_service: Arc<DeploymentTokenService>,
+    ) -> Self {
         Self {
             db,
             http_client: Arc::new(reqwest::Client::new()),
             queue,
+            deployment_token_service,
         }
     }
 
@@ -555,10 +562,29 @@ impl DatabaseCronConfigService {
         let url = format!("{}{}", self.get_deployment_url(cron).await?, cron.path);
         debug!("Executing cron {} at {}", cron.id, url);
 
-        let response = self
-            .http_client
-            .get(&url)
-            .header("X-Cron-Job", "true")
+        let mut request = self.http_client.get(&url).header("X-Cron-Job", "true");
+
+        // Attach Authorization: Bearer <CRON_SECRET> so the deployed app can verify
+        // the request came from the Temps cron scheduler. The secret is the same
+        // deployment token injected as CRON_SECRET into the container env vars.
+        match self
+            .deployment_token_service
+            .get_or_create_deployment_token(cron.project_id, Some(cron.environment_id), None)
+            .await
+        {
+            Ok(token) => {
+                request = request.header("Authorization", format!("Bearer {}", token));
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to get deployment token for cron {} (project {}, env {}): {}. \
+                     Sending request without Authorization header.",
+                    cron.id, cron.project_id, cron.environment_id, e
+                );
+            }
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|e| CronServiceError::ExecutionError {
@@ -597,6 +623,18 @@ mod tests {
         fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
             unimplemented!("Not needed for tests")
         }
+    }
+
+    fn create_test_deployment_token_service(
+        db: Arc<DatabaseConnection>,
+    ) -> Arc<DeploymentTokenService> {
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .expect("Failed to create test encryption service"),
+        );
+        Arc::new(DeploymentTokenService::new(db, encryption_service))
     }
 
     // Helper function to create test project and environment
@@ -672,11 +710,12 @@ mod tests {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
         let queue = Arc::new(MockQueue);
+        let token_service = create_test_deployment_token_service(db.clone());
 
         // Create test project and environment
         let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
 
-        let service = DatabaseCronConfigService::new(db.clone(), queue);
+        let service = DatabaseCronConfigService::new(db.clone(), queue, token_service);
 
         let configs = vec![CronConfig {
             path: "/api/cron/cleanup".to_string(),
@@ -707,11 +746,12 @@ mod tests {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
         let queue = Arc::new(MockQueue);
+        let token_service = create_test_deployment_token_service(db.clone());
 
         // Create test project and environment
         let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
 
-        let service = DatabaseCronConfigService::new(db.clone(), queue);
+        let service = DatabaseCronConfigService::new(db.clone(), queue, token_service);
 
         // Create initial cron
         let configs = vec![CronConfig {
@@ -750,11 +790,12 @@ mod tests {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
         let queue = Arc::new(MockQueue);
+        let token_service = create_test_deployment_token_service(db.clone());
 
         // Create test project and environment
         let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
 
-        let service = DatabaseCronConfigService::new(db.clone(), queue);
+        let service = DatabaseCronConfigService::new(db.clone(), queue, token_service);
 
         // Create two crons
         let configs = vec![
@@ -804,6 +845,76 @@ mod tests {
             .find(|c| c.path == "/api/cron/task2")
             .unwrap();
         assert!(deleted_cron.deleted_at.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cron_secret_token_retrieval() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let token_service = create_test_deployment_token_service(db.clone());
+
+        // Create test project and environment
+        let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
+
+        // First call creates a new token
+        let token = token_service
+            .get_or_create_deployment_token(project.id, Some(environment.id), None)
+            .await
+            .expect("Should create deployment token");
+
+        assert!(!token.is_empty(), "Token should not be empty");
+
+        // Second call should return the same token (stable across calls)
+        let token_again = token_service
+            .get_or_create_deployment_token(project.id, Some(environment.id), None)
+            .await
+            .expect("Should retrieve existing deployment token");
+
+        assert_eq!(
+            token, token_again,
+            "CRON_SECRET should be stable: same token returned on subsequent calls"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cron_secret_differs_per_environment() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let token_service = create_test_deployment_token_service(db.clone());
+
+        // Create test project
+        let (project, env1) = create_test_project_and_environment(db.as_ref()).await?;
+
+        // Create a second environment
+        let env2 = temps_entities::environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("staging".to_string()),
+            slug: Set("staging".to_string()),
+            subdomain: Set("staging".to_string()),
+            host: Set("staging.local".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        };
+        let env2 = env2.insert(db.as_ref()).await?;
+
+        let token_env1 = token_service
+            .get_or_create_deployment_token(project.id, Some(env1.id), None)
+            .await
+            .expect("Should create token for env1");
+
+        let token_env2 = token_service
+            .get_or_create_deployment_token(project.id, Some(env2.id), None)
+            .await
+            .expect("Should create token for env2");
+
+        assert_ne!(
+            token_env1, token_env2,
+            "Each environment should get a unique CRON_SECRET"
+        );
 
         Ok(())
     }

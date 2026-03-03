@@ -60,6 +60,50 @@ use temps_plugin_sdk::prelude::*;
 use crate::db::AuditStore;
 use crate::handlers::AppState;
 
+// ============================================================================
+// OpenAPI doc
+// ============================================================================
+
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(
+        title = "Lighthouse Audits",
+        version = "0.1.0",
+        description = "Automated Lighthouse performance audits — track Core Web Vitals, accessibility, and SEO scores over time."
+    ),
+    paths(
+        handlers::start_audit,
+        handlers::list_audits,
+        handlers::get_audit,
+        handlers::delete_audit,
+        handlers::get_raw_json,
+        handlers::get_score_history,
+        handlers::get_status,
+        handlers::get_settings,
+        handlers::update_settings,
+    ),
+    components(schemas(
+        types::AuditRequest,
+        types::StartAuditResponse,
+        types::AuditSummary,
+        types::LighthouseAudit,
+        types::AuditStatus,
+        types::AuditTrigger,
+        types::CoreWebVitals,
+        types::AuditDiagnostic,
+        types::DiagnosticSeverity,
+        types::ScoreHistoryPoint,
+        types::StatusResponse,
+        types::PluginSettings,
+        types::UpdateSettings,
+    )),
+    tags(
+        (name = "Audits",   description = "Start, list, and manage Lighthouse audits"),
+        (name = "Settings", description = "Plugin configuration"),
+    )
+)]
+struct LighthouseApiDoc;
+
 /// Embed the web/dist/ directory at compile time.
 static UI_DIST: Dir = include_dir!("$CARGO_MANIFEST_DIR/web/dist");
 
@@ -123,6 +167,11 @@ impl ExternalPlugin for LighthousePlugin {
             .route("/ui/", get(handlers::serve_ui_index))
             .route("/ui/{*path}", get(handlers::serve_ui_asset))
             .with_state(state)
+    }
+
+    fn openapi_schema(&self) -> Option<utoipa::openapi::OpenApi> {
+        use utoipa::OpenApi as _;
+        Some(LighthouseApiDoc::openapi())
     }
 
     fn on_start(&self, ctx: &PluginContext) -> Result<(), PluginSdkError> {

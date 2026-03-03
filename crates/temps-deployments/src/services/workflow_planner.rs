@@ -63,12 +63,16 @@ impl WorkflowPlanner {
     ///    - `NEXT_PUBLIC_SENTRY_DSN` is added when preset is Next.js
     ///    - `VITE_PUBLIC_SENTRY_DSN` is added when preset is Vite
     /// 4. Deployment token environment variables (TEMPS_API_URL and TEMPS_API_TOKEN) - for API access from deployed apps
-    /// 5. OpenTelemetry environment variables for automatic instrumentation:
+    /// 5. Cron secret (`CRON_SECRET`) - derived from the deployment token, used to authenticate
+    ///    cron job HTTP requests via `Authorization: Bearer <CRON_SECRET>` header
+    /// 6. OpenTelemetry environment variables for automatic instrumentation:
     ///    - `OTEL_EXPORTER_OTLP_ENDPOINT` - OTLP endpoint URL
     ///    - `OTEL_EXPORTER_OTLP_PROTOCOL` - always `http/protobuf`
     ///    - `OTEL_EXPORTER_OTLP_HEADERS` - auth header with deployment token
     ///    - `OTEL_SERVICE_NAME` - project name
     ///    - `OTEL_SERVICE_VERSION` - commit SHA (when available)
+    /// 7. `CRON_SECRET` - the deployment token value, so deployed apps can verify
+    ///    that incoming cron requests are authentic
     ///
     /// IMPORTANT: If any external service fails to provide env vars, the entire deployment will fail
     /// with a meaningful error message. This prevents silent failures where containers would be
@@ -291,7 +295,11 @@ impl WorkflowPlanner {
                             environment.id,
                             &token[..8.min(token.len())]
                         );
-                        env_vars_map.insert("TEMPS_API_TOKEN".to_string(), token);
+                        env_vars_map.insert("TEMPS_API_TOKEN".to_string(), token.clone());
+
+                        // 5. CRON_SECRET - same token so the cron scheduler can send
+                        // Authorization: Bearer <CRON_SECRET> and the deployed app can verify it
+                        env_vars_map.insert("CRON_SECRET".to_string(), token);
                     }
                     Err(e) => {
                         // Warn about deployment token failure but don't fail the deployment

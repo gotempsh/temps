@@ -8,9 +8,14 @@ import { ProjectResponse } from '@/api/client/types.gen'
 import {
   AnalyticsMetrics,
   BrowsersChart,
+  ChannelsChart,
+  DevicesChart,
+  LanguagesChart,
   LocationsChart,
+  OperatingSystemChart,
   PagesChart,
   ReferrersChart,
+  UTMCampaignsChart,
 } from '@/components/analytics/overview'
 import { VisitorGlobePage } from '@/components/analytics/VisitorGlobe'
 import { LiveGlobePage } from '@/components/analytics/LiveGlobe'
@@ -629,10 +634,25 @@ function PagesTab({ project }: PagesTabProps) {
   const [searchParams, setSearchParams] = useSearchParams()
   const selectedPagePath = searchParams.get('path')
 
-  const [dateFilter, setDateFilter] = React.useState<AnalyticsDateFilter>({
-    quickFilter: '24hours',
-    dateRange: undefined,
-  })
+  // Restore date filter from URL search params (preserves context from overview)
+  const [dateFilter, setDateFilter] = React.useState<AnalyticsDateFilter>(
+    () => {
+      const filter = searchParams.get('filter') as QuickFilter | null
+      const from = searchParams.get('from')
+      const to = searchParams.get('to')
+
+      if (filter === 'custom' && from && to) {
+        return {
+          quickFilter: 'custom',
+          dateRange: { from: new Date(from), to: new Date(to) },
+        }
+      }
+      if (filter && QUICK_FILTERS.some((f) => f.value === filter)) {
+        return { quickFilter: filter, dateRange: undefined }
+      }
+      return { quickFilter: '24hours', dateRange: undefined }
+    }
+  )
   const [selectedEnvironment, setSelectedEnvironment] = React.useState<
     number | undefined
   >(undefined)
@@ -705,9 +725,42 @@ function PagesTab({ project }: PagesTabProps) {
     setTimeout(() => setIsRefreshing(false), 1000)
   }, [queryClient])
 
+  // Sync date filter to URL search params (preserves path param)
+  const updateDateFilter = React.useCallback(
+    (next: AnalyticsDateFilter) => {
+      setDateFilter(next)
+      const params = new URLSearchParams(searchParams)
+      params.set('filter', next.quickFilter)
+      if (
+        next.quickFilter === 'custom' &&
+        next.dateRange?.from &&
+        next.dateRange?.to
+      ) {
+        params.set('from', next.dateRange.from.toISOString())
+        params.set('to', next.dateRange.to.toISOString())
+      } else {
+        params.delete('from')
+        params.delete('to')
+      }
+      setSearchParams(params, { replace: true })
+    },
+    [searchParams, setSearchParams]
+  )
+
   const handleBackToList = React.useCallback(() => {
-    setSearchParams({})
-  }, [setSearchParams])
+    // Preserve date filter params when going back to list
+    const params = new URLSearchParams()
+    params.set('filter', dateFilter.quickFilter)
+    if (
+      dateFilter.quickFilter === 'custom' &&
+      dateFilter.dateRange?.from &&
+      dateFilter.dateRange?.to
+    ) {
+      params.set('from', dateFilter.dateRange.from.toISOString())
+      params.set('to', dateFilter.dateRange.to.toISOString())
+    }
+    setSearchParams(params)
+  }, [dateFilter, setSearchParams])
 
   return (
     <div className="space-y-6">
@@ -718,13 +771,13 @@ function PagesTab({ project }: PagesTabProps) {
         dateRange={dateFilter.dateRange}
         selectedEnvironment={selectedEnvironment}
         onFilterChange={(filter) =>
-          setDateFilter((prev) => ({ ...prev, quickFilter: filter }))
+          updateDateFilter({ ...dateFilter, quickFilter: filter })
         }
         onDateRangeChange={(range) =>
-          setDateFilter((prev) => ({
-            quickFilter: range ? 'custom' : prev.quickFilter,
+          updateDateFilter({
+            quickFilter: range ? 'custom' : dateFilter.quickFilter,
             dateRange: range,
-          }))
+          })
         }
         onEnvironmentChange={setSelectedEnvironment}
         onRefresh={handleRefresh}
@@ -1456,6 +1509,36 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
               environment={selectedEnvironment}
             />
             <BrowsersChart
+              project={project}
+              startDate={startDate}
+              endDate={endDate}
+              environment={selectedEnvironment}
+            />
+            <OperatingSystemChart
+              project={project}
+              startDate={startDate}
+              endDate={endDate}
+              environment={selectedEnvironment}
+            />
+            <DevicesChart
+              project={project}
+              startDate={startDate}
+              endDate={endDate}
+              environment={selectedEnvironment}
+            />
+            <ChannelsChart
+              project={project}
+              startDate={startDate}
+              endDate={endDate}
+              environment={selectedEnvironment}
+            />
+            <LanguagesChart
+              project={project}
+              startDate={startDate}
+              endDate={endDate}
+              environment={selectedEnvironment}
+            />
+            <UTMCampaignsChart
               project={project}
               startDate={startDate}
               endDate={endDate}
