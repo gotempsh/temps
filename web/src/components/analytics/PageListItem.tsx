@@ -32,6 +32,8 @@ export function PageListItem({
   project,
   sparkline,
 }: PageListItemProps) {
+  const [searchParams] = useSearchParams()
+
   const chartData = useMemo(() => {
     if (!sparkline?.points || sparkline.points.length === 0) return []
 
@@ -44,13 +46,28 @@ export function PageListItem({
     }))
   }, [sparkline])
 
+  const pageDetailUrl = useMemo(() => {
+    const base = `/projects/${project.slug}/analytics/pages?path=${encodeURIComponent(pagePath)}`
+    const filter = searchParams.get('filter')
+    const from = searchParams.get('from')
+    const to = searchParams.get('to')
+    const extra = [
+      filter ? `filter=${filter}` : '',
+      from ? `from=${from}` : '',
+      to ? `to=${to}` : '',
+    ]
+      .filter(Boolean)
+      .join('&')
+    return extra ? `${base}&${extra}` : base
+  }, [project.slug, pagePath, searchParams])
+
   return (
     <div className="group relative flex items-center gap-4 p-4 hover:bg-muted/50 transition-colors border-b last:border-b-0">
       {/* Page Info */}
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-2">
           <Link
-            to={`/projects/${project.slug}/analytics/pages?path=${encodeURIComponent(pagePath)}`}
+            to={pageDetailUrl}
             className="font-medium text-sm hover:text-primary transition-colors truncate"
           >
             {pagePath}

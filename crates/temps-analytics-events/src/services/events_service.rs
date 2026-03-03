@@ -571,7 +571,10 @@ impl AnalyticsEventsService {
         }
         if filters.operating_system.is_some() {
             conditions.push(format!("e.operating_system = ${}", param_idx));
-            // param_idx is not used after this but keep for consistency
+            param_idx += 1;
+        }
+        if filters.channel.is_some() {
+            conditions.push(format!("e.channel = ${}", param_idx));
             let _ = param_idx;
         }
 
@@ -640,6 +643,9 @@ impl AnalyticsEventsService {
         }
         if let Some(os) = filters.operating_system {
             params.push(os.into());
+        }
+        if let Some(channel) = filters.channel {
+            params.push(channel.into());
         }
 
         let results = BreakdownResult::find_by_statement(Statement::from_sql_and_values(

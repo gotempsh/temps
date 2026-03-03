@@ -22273,6 +22273,10 @@ export type GetPropertyBreakdownData = {
          * Filter by OS name (for version drill-downs)
          */
         filter_os?: string;
+        /**
+         * Filter by channel (for referrer drill-downs within a channel)
+         */
+        filter_channel?: string;
     };
     url: '/projects/{project_id}/events/properties/breakdown';
 };

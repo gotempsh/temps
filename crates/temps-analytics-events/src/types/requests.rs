@@ -264,6 +264,8 @@ pub struct PropertyBreakdownQuery {
     pub filter_browser: Option<String>,
     /// Filter by operating system name (for OS version drill-downs)
     pub filter_os: Option<String>,
+    /// Filter by channel name (for channel -> referrer drill-downs)
+    pub filter_channel: Option<String>,
 }
 
 /// Optional filters for property breakdown drill-downs.
@@ -278,6 +280,8 @@ pub struct PropertyBreakdownFilters {
     pub browser: Option<String>,
     /// Filter by operating system name (for version drill-downs)
     pub operating_system: Option<String>,
+    /// Filter by channel name (for channel -> referrer drill-downs)
+    pub channel: Option<String>,
 }
 
 /// Query parameters for property timeline (group by column over time)
