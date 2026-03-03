@@ -13,12 +13,14 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
+  DropdownMenuSeparator,
+  DropdownMenuLabel,
 } from '@/components/ui/dropdown-menu'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { VulnerabilityList } from '@/components/vulnerabilities/VulnerabilityList'
 import { Input } from '@/components/ui/input'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowLeft, Shield, Download, FileJson, FileSpreadsheet, Search, Package, Code, Filter } from 'lucide-react'
+import { ArrowLeft, Shield, Download, FileJson, FileSpreadsheet, Search, Package, Code, Filter, Sparkles, Copy } from 'lucide-react'
 import { Link, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import { useState, useMemo } from 'react'
@@ -91,6 +93,81 @@ function exportToCSV(vulnerabilities: VulnerabilityResponse[], scanId: string) {
   document.body.removeChild(link)
   URL.revokeObjectURL(url)
   toast.success('Vulnerabilities exported as CSV')
+}
+
+function generateVulnerabilityPrompt(
+  vulnerabilities: VulnerabilityResponse[],
+  filterLabel?: string
+): string {
+  if (vulnerabilities.length === 0) return ''
+
+  // Group by severity for the summary
+  const bySeverity: Record<string, VulnerabilityResponse[]> = {}
+  for (const v of vulnerabilities) {
+    const sev = v.severity || 'UNKNOWN'
+    if (!bySeverity[sev]) bySeverity[sev] = []
+    bySeverity[sev].push(v)
+  }
+
+  // Group by package for actionable output
+  const byPackage: Record<string, VulnerabilityResponse[]> = {}
+  for (const v of vulnerabilities) {
+    const key = `${v.package_name}@${v.installed_version}`
+    if (!byPackage[key]) byPackage[key] = []
+    byPackage[key].push(v)
+  }
+
+  const severityOrder = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN']
+  const summaryLines = severityOrder
+    .filter((s) => bySeverity[s]?.length)
+    .map((s) => `- ${s}: ${bySeverity[s].length}`)
+    .join('\n')
+
+  const title = filterLabel
+    ? `Fix ${filterLabel} vulnerabilities`
+    : 'Fix security vulnerabilities'
+
+  let prompt = `${title} found in a container scan.
+
+## Summary
+Total: ${vulnerabilities.length} vulnerabilities
+${summaryLines}
+
+## Vulnerabilities by package
+`
+
+  // Sort packages by highest severity first
+  const sortedPackages = Object.entries(byPackage).sort((a, b) => {
+    const maxSevA = Math.min(...a[1].map((v) => severityOrder.indexOf(v.severity || 'UNKNOWN')))
+    const maxSevB = Math.min(...b[1].map((v) => severityOrder.indexOf(v.severity || 'UNKNOWN')))
+    return maxSevA - maxSevB
+  })
+
+  for (const [pkg, vulns] of sortedPackages) {
+    const fixedVersions = [...new Set(vulns.map((v) => v.fixed_version).filter(Boolean))]
+    const cveIds = vulns.map((v) => v.vulnerability_id).join(', ')
+    const maxSeverity = severityOrder[Math.min(...vulns.map((v) => severityOrder.indexOf(v.severity || 'UNKNOWN')))]
+    const target = vulns[0].target || ''
+
+    prompt += `\n### ${pkg} [${maxSeverity}]`
+    if (target) prompt += `\nTarget: ${target}`
+    prompt += `\nCVEs: ${cveIds}`
+    if (fixedVersions.length > 0) {
+      prompt += `\nFix: upgrade to ${fixedVersions.join(' or ')}`
+    } else {
+      prompt += `\nFix: no fixed version available yet`
+    }
+    prompt += '\n'
+  }
+
+  prompt += `
+## Instructions
+1. For each package with a known fixed version, upgrade to that version.
+2. For packages without a fix, evaluate whether the vulnerability is reachable in our code and suggest mitigations (alternative packages, configuration changes, or workarounds).
+3. If upgrading a package would cause breaking changes, note what needs to change.
+4. Prioritize CRITICAL and HIGH severity fixes first.`
+
+  return prompt
 }
 
 export function ScanDetail() {
@@ -298,6 +375,54 @@ export function ScanDetail() {
                   <FileSpreadsheet className="h-4 w-4 mr-2" />
                   Export as CSV
                 </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+
+          {/* AI Prompt dropdown - only show if vulnerabilities exist */}
+          {totalVulnerabilities > 0 && vulnerabilities.length > 0 && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm">
+                  <Sparkles className="h-4 w-4 mr-2" />
+                  Copy AI Prompt
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-56">
+                <DropdownMenuLabel>Generate fix prompt</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={() => {
+                    navigator.clipboard.writeText(generateVulnerabilityPrompt(vulnerabilities))
+                    toast.success('AI prompt copied for all vulnerabilities')
+                  }}
+                >
+                  <Copy className="h-4 w-4 mr-2" />
+                  All vulnerabilities ({vulnerabilities.length})
+                </DropdownMenuItem>
+                {vulnerabilityTypes.length > 1 && (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuLabel>By type</DropdownMenuLabel>
+                    {vulnerabilityTypes.map((type) => {
+                      const typeVulns = vulnerabilities.filter((v) => v.type === type)
+                      return (
+                        <DropdownMenuItem
+                          key={type}
+                          onClick={() => {
+                            navigator.clipboard.writeText(
+                              generateVulnerabilityPrompt(typeVulns, type)
+                            )
+                            toast.success(`AI prompt copied for ${type} vulnerabilities`)
+                          }}
+                        >
+                          <Copy className="h-4 w-4 mr-2" />
+                          {type} ({typeVulns.length})
+                        </DropdownMenuItem>
+                      )
+                    })}
+                  </>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
           )}
