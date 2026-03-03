@@ -89,15 +89,34 @@ impl DatabaseCronConfigService {
         }
     }
 
+    /// Normalize a cron schedule to the 6-field format required by the `cron` crate.
+    ///
+    /// Users write standard 5-field cron expressions in `.temps.yaml`:
+    ///   "minute hour day month weekday"  (e.g. "0 0 * * *")
+    ///
+    /// The `cron` crate expects 6 fields (seconds prepended):
+    ///   "second minute hour day month weekday"  (e.g. "0 0 0 * * *")
+    ///
+    /// This function detects 5-field expressions and prepends "0 " for seconds.
+    /// 6-field and 7-field expressions are passed through unchanged.
+    fn normalize_schedule(schedule: &str) -> String {
+        let fields: Vec<&str> = schedule.split_whitespace().collect();
+        if fields.len() == 5 {
+            format!("0 {}", schedule)
+        } else {
+            schedule.to_string()
+        }
+    }
+
     /// Validate a cron schedule expression
     fn validate_cron_schedule(schedule: &str) -> Result<(), CronConfigError> {
-        let schedule_str = schedule.to_string();
+        let normalized = Self::normalize_schedule(schedule);
 
         // Parse the cron schedule
-        let parsed_schedule = cron::Schedule::from_str(schedule).map_err(|e| {
+        let parsed_schedule = cron::Schedule::from_str(&normalized).map_err(|e| {
             CronConfigError::InvalidSchedule(format!(
                 "Invalid cron expression '{}': {}",
-                schedule_str, e
+                schedule, e
             ))
         })?;
 
@@ -119,7 +138,9 @@ impl DatabaseCronConfigService {
 
     /// Calculate the next run time for a cron schedule
     fn calculate_next_run(schedule: &str) -> Result<UtcDateTime, CronConfigError> {
-        let parsed_schedule = cron::Schedule::from_str(schedule).map_err(|e| {
+        let normalized = Self::normalize_schedule(schedule);
+
+        let parsed_schedule = cron::Schedule::from_str(&normalized).map_err(|e| {
             CronConfigError::InvalidSchedule(format!("Invalid cron expression: {}", e))
         })?;
 
@@ -410,8 +431,9 @@ impl DatabaseCronConfigService {
             return Ok(());
         }
 
+        let normalized = Self::normalize_schedule(&cron.schedule);
         let schedule =
-            Schedule::from_str(&cron.schedule).map_err(|e| CronServiceError::InvalidSchedule {
+            Schedule::from_str(&normalized).map_err(|e| CronServiceError::InvalidSchedule {
                 schedule: cron.schedule.clone(),
                 message: e.to_string(),
             })?;
@@ -678,25 +700,82 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_cron_schedule_valid() {
-        // Valid schedules
+    fn test_normalize_schedule_5_field() {
+        // 5-field standard cron should get "0 " prepended
+        assert_eq!(
+            DatabaseCronConfigService::normalize_schedule("0 0 * * *"),
+            "0 0 0 * * *"
+        );
+        assert_eq!(
+            DatabaseCronConfigService::normalize_schedule("*/5 * * * *"),
+            "0 */5 * * * *"
+        );
+        assert_eq!(
+            DatabaseCronConfigService::normalize_schedule("0 9 * * 1"),
+            "0 0 9 * * 1"
+        );
+    }
+
+    #[test]
+    fn test_normalize_schedule_6_field_passthrough() {
+        // 6-field expressions should pass through unchanged
+        assert_eq!(
+            DatabaseCronConfigService::normalize_schedule("0 */5 * * * *"),
+            "0 */5 * * * *"
+        );
+        assert_eq!(
+            DatabaseCronConfigService::normalize_schedule("0 0 0 * * *"),
+            "0 0 0 * * *"
+        );
+    }
+
+    #[test]
+    fn test_validate_cron_schedule_valid_6_field() {
+        // 6-field schedules (explicit seconds) still work
         assert!(DatabaseCronConfigService::validate_cron_schedule("0 */5 * * * *").is_ok());
         assert!(DatabaseCronConfigService::validate_cron_schedule("0 0 * * * *").is_ok());
         assert!(DatabaseCronConfigService::validate_cron_schedule("0 0 0 * * *").is_ok());
     }
 
     #[test]
-    fn test_validate_cron_schedule_invalid() {
-        // Invalid: less than 1 minute apart
-        assert!(DatabaseCronConfigService::validate_cron_schedule("* * * * * *").is_err());
-
-        // Invalid syntax
-        assert!(DatabaseCronConfigService::validate_cron_schedule("invalid").is_err());
+    fn test_validate_cron_schedule_valid_5_field() {
+        // 5-field standard cron expressions (the format users write in .temps.yaml)
+        assert!(DatabaseCronConfigService::validate_cron_schedule("*/5 * * * *").is_ok());
+        assert!(DatabaseCronConfigService::validate_cron_schedule("0 * * * *").is_ok());
+        assert!(DatabaseCronConfigService::validate_cron_schedule("0 0 * * *").is_ok());
+        assert!(DatabaseCronConfigService::validate_cron_schedule("0 9 * * 1").is_ok());
+        assert!(DatabaseCronConfigService::validate_cron_schedule("0 0 1 * *").is_ok());
+        assert!(DatabaseCronConfigService::validate_cron_schedule("*/15 9-17 * * 1-5").is_ok());
     }
 
     #[test]
-    fn test_calculate_next_run() {
-        // Should return a future timestamp
+    fn test_validate_cron_schedule_invalid() {
+        // Invalid: less than 1 minute apart (6-field)
+        assert!(DatabaseCronConfigService::validate_cron_schedule("* * * * * *").is_err());
+
+        // Invalid: less than 1 minute apart (5-field with every-second after normalization
+        // won't happen since 5-field doesn't have seconds, but "* * * * *" = every minute which is ok)
+        // Actually "* * * * *" = every minute, which is exactly 1 minute apart, so it passes.
+
+        // Invalid syntax
+        assert!(DatabaseCronConfigService::validate_cron_schedule("invalid").is_err());
+        assert!(DatabaseCronConfigService::validate_cron_schedule("").is_err());
+    }
+
+    #[test]
+    fn test_calculate_next_run_5_field() {
+        // 5-field schedule should work after normalization
+        let next_run = DatabaseCronConfigService::calculate_next_run("0 * * * *");
+        assert!(next_run.is_ok());
+
+        let next_run_time = next_run.unwrap();
+        let now = Utc::now();
+        assert!(next_run_time > now);
+    }
+
+    #[test]
+    fn test_calculate_next_run_6_field() {
+        // 6-field schedule should still work
         let next_run = DatabaseCronConfigService::calculate_next_run("0 0 * * * *");
         assert!(next_run.is_ok());
 
@@ -706,7 +785,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_configure_crons_create_new() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_configure_crons_create_new_6_field() -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
         let queue = Arc::new(MockQueue);
@@ -736,6 +815,42 @@ mod tests {
         assert_eq!(crons_list.len(), 1);
         assert_eq!(crons_list[0].path, "/api/cron/cleanup");
         assert_eq!(crons_list[0].schedule, "0 0 * * * *");
+        assert!(crons_list[0].next_run.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_configure_crons_create_new_5_field() -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let queue = Arc::new(MockQueue);
+        let token_service = create_test_deployment_token_service(db.clone());
+
+        let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
+
+        let service = DatabaseCronConfigService::new(db.clone(), queue, token_service);
+
+        // Use standard 5-field cron (the format users actually write in .temps.yaml)
+        let configs = vec![CronConfig {
+            path: "/api/cron/daily".to_string(),
+            schedule: "0 0 * * *".to_string(),
+        }];
+
+        service
+            .configure_crons(project.id, environment.id, configs)
+            .await?;
+
+        let crons_list = crons::Entity::find()
+            .filter(crons::Column::ProjectId.eq(project.id))
+            .filter(crons::Column::EnvironmentId.eq(environment.id))
+            .all(db.as_ref())
+            .await?;
+
+        assert_eq!(crons_list.len(), 1);
+        assert_eq!(crons_list[0].path, "/api/cron/daily");
+        // Schedule stored as-is (5-field), normalization happens at validation/runtime
+        assert_eq!(crons_list[0].schedule, "0 0 * * *");
         assert!(crons_list[0].next_run.is_some());
 
         Ok(())

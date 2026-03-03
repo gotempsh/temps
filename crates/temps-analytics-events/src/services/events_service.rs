@@ -530,7 +530,9 @@ impl AnalyticsEventsService {
         conditions.push("e.timestamp <= $3".to_string());
 
         // For referrer_hostname, filter out self-referrals (project's own domains)
-        if is_referrer_column {
+        // Skip this filter when drilling down from a channel (filter_channel is set)
+        // because the channel overview already counted these visitors
+        if is_referrer_column && filters.channel.is_none() {
             conditions.push(
                 r#"(e.referrer_hostname IS NULL OR e.referrer_hostname NOT IN (
                     SELECT domain FROM project_custom_domains WHERE project_id = $1

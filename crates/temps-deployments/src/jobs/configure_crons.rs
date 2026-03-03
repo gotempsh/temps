@@ -229,15 +229,21 @@ impl ConfigureCronsJob {
             .collect();
 
         // Configure crons via service
-        self.cron_service
+        match self
+            .cron_service
             .configure_crons(self.project_id, self.environment_id, cron_configs)
             .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!("Failed to configure cron jobs: {}", e))
-            })?;
-
-        self.log("Cron configuration completed successfully".to_string())
-            .await?;
+        {
+            Ok(()) => {
+                self.log("✅ Cron configuration completed successfully".to_string())
+                    .await?;
+            }
+            Err(e) => {
+                let error_msg = format!("❌ Failed to configure cron jobs: {}", e);
+                self.log(error_msg.clone()).await?;
+                return Err(WorkflowError::JobExecutionFailed(error_msg));
+            }
+        }
 
         Ok(())
     }

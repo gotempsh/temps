@@ -51,46 +51,46 @@ function InstructionsContent() {
         <pre className="text-xs bg-muted p-4 rounded-md overflow-x-auto">
           {`cron:
   - path: "/api/ping"
-    schedule: "0 */5 * * * *"  # Every 5 minutes
+    schedule: "*/5 * * * *"    # Every 5 minutes
 
   - path: "/api/daily-backup"
-    schedule: "0 0 0 * * *"    # Daily at midnight
+    schedule: "0 0 * * *"      # Daily at midnight
 
   - path: "/api/weekly-report"
-    schedule: "0 0 0 * * 0"    # Weekly on Sunday`}
+    schedule: "0 0 * * 0"      # Weekly on Sunday`}
         </pre>
       </div>
 
       <div className="space-y-2">
         <h4 className="font-medium">Schedule Format</h4>
         <p className="text-sm text-muted-foreground">
-          The schedule uses standard cron syntax with 6 fields:
+          Standard cron syntax with 5 fields:
         </p>
-        <pre className="text-xs bg-muted p-2 rounded-md">{`second minute hour day month weekday`}</pre>
+        <pre className="text-xs bg-muted p-2 rounded-md">{`minute hour day month weekday`}</pre>
         <div className="text-sm text-muted-foreground space-y-1">
           <p>Common patterns:</p>
           <ul className="list-disc list-inside space-y-1">
             <li>
               <code className="text-xs bg-muted px-1 py-0.5 rounded">
-                0 */5 * * * *
+                */5 * * * *
               </code>{' '}
               - Every 5 minutes
             </li>
             <li>
               <code className="text-xs bg-muted px-1 py-0.5 rounded">
-                0 0 * * * *
+                0 * * * *
               </code>{' '}
               - Every hour
             </li>
             <li>
               <code className="text-xs bg-muted px-1 py-0.5 rounded">
-                0 0 0 * * *
+                0 0 * * *
               </code>{' '}
               - Daily at midnight
             </li>
             <li>
               <code className="text-xs bg-muted px-1 py-0.5 rounded">
-                0 0 0 * * 0
+                0 0 * * 0
               </code>{' '}
               - Weekly on Sunday
             </li>
