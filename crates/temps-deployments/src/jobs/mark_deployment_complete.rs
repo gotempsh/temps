@@ -6,7 +6,10 @@
 //! is live before they run.
 
 use async_trait::async_trait;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
+    Statement,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::{
@@ -16,7 +19,7 @@ use temps_core::{
 use temps_database::DbConnection;
 use temps_entities::{deployment_containers, deployments, environments, projects};
 use temps_logs::{LogLevel, LogService};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Output from MarkDeploymentCompleteJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +127,54 @@ impl MarkDeploymentCompleteJob {
         }
     }
 
+    /// Acquire a PostgreSQL advisory lock for the given environment to serialize
+    /// concurrent `mark_complete` operations. This prevents two deployments for
+    /// the same environment from racing on `current_deployment_id` updates and
+    /// container teardown. The lock is session-level and released explicitly
+    /// when we are done (or on disconnect).
+    ///
+    /// The lock key is derived from the environment_id with a fixed namespace
+    /// prefix to avoid collisions with other advisory lock users.
+    async fn acquire_environment_lock(
+        db: &DbConnection,
+        environment_id: i32,
+    ) -> Result<(), WorkflowError> {
+        // Use a two-key advisory lock: namespace 0x54454D50 ("TEMP") + environment_id
+        // This ensures we don't collide with any other advisory lock usage.
+        const LOCK_NAMESPACE: i32 = 0x5445_4D50_u32 as i32; // "TEMP"
+        db.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_advisory_lock($1, $2)",
+            vec![LOCK_NAMESPACE.into(), environment_id.into()],
+        ))
+        .await
+        .map_err(|e| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Failed to acquire advisory lock for environment {}: {}",
+                environment_id, e
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Release the PostgreSQL advisory lock for the given environment.
+    async fn release_environment_lock(db: &DbConnection, environment_id: i32) {
+        const LOCK_NAMESPACE: i32 = 0x5445_4D50_u32 as i32;
+        if let Err(e) = db
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT pg_advisory_unlock($1, $2)",
+                vec![LOCK_NAMESPACE.into(), environment_id.into()],
+            ))
+            .await
+        {
+            warn!(
+                "Failed to release advisory lock for environment {}: {}",
+                environment_id, e
+            );
+        }
+    }
+
     /// Mark deployment as complete and update environment
     /// Also updates deployment with workflow outputs (image info, container info)
     async fn mark_complete(
@@ -149,6 +200,40 @@ impl MarkDeploymentCompleteJob {
 
         let environment_id = deployment.environment_id;
 
+        // ── Serialize per environment ────────────────────────────────────
+        //
+        // Acquire an advisory lock keyed on environment_id. This blocks
+        // until any other in-flight mark_complete for the SAME environment
+        // finishes, preventing two deployments from racing on the same
+        // environment's current_deployment_id and tearing down each
+        // other's containers. Different environments proceed in parallel.
+        Self::acquire_environment_lock(self.db.as_ref(), environment_id).await?;
+        info!(
+            deployment_id = self.deployment_id,
+            environment_id, "Acquired advisory lock for environment"
+        );
+
+        // Ensure we release the lock on all exit paths (success or error)
+        let result = self
+            .mark_complete_inner(context, &deployment, environment_id)
+            .await;
+
+        Self::release_environment_lock(self.db.as_ref(), environment_id).await;
+        info!(
+            deployment_id = self.deployment_id,
+            environment_id, "Released advisory lock for environment"
+        );
+
+        result
+    }
+
+    /// Inner implementation of mark_complete, called with the advisory lock held.
+    async fn mark_complete_inner(
+        &self,
+        context: &WorkflowContext,
+        deployment: &deployments::Model,
+        environment_id: i32,
+    ) -> Result<MarkCompleteOutput, WorkflowError> {
         // Update deployment with workflow outputs
         let mut active_deployment: deployments::ActiveModel = deployment.clone().into();
 
@@ -352,9 +437,10 @@ impl MarkDeploymentCompleteJob {
         // the route listener calls load_routes(), and on success publishes
         // RouteTableUpdated to the queue with environment_id + deployment_id.
         // We wait here until we see the matching event or timeout.
-        const ROUTE_READY_TIMEOUT_SECS: u64 = 30;
+        const ROUTE_READY_TIMEOUT_SECS: u64 = 60;
         let route_ready = Self::wait_for_route_ready(
             &mut route_receiver,
+            self.db.as_ref(),
             environment_id,
             self.deployment_id,
             std::time::Duration::from_secs(ROUTE_READY_TIMEOUT_SECS),
@@ -542,40 +628,129 @@ impl MarkDeploymentCompleteJob {
         })
     }
 
-    /// Wait for a `RouteTableUpdated` job matching the given environment and
-    /// deployment. Returns `Ok(())` when confirmed, or `Err(reason)` on timeout
-    /// or queue failure.
+    /// Wait for the route table to reflect the new deployment.
+    ///
+    /// Uses a two-pronged approach:
+    ///   1. Listen for `RouteTableUpdated` broadcast events matching our environment.
+    ///      We match on environment_id only (not deployment_id) because with concurrent
+    ///      deployments the NOTIFY payload may carry a different deployment_id than ours
+    ///      even though load_routes() has already picked up our change.
+    ///   2. Periodically poll the database as a fallback in case the PG LISTEN
+    ///      notification was lost (e.g. during the 5-second reconnection window
+    ///      in ProjectChangeListener).
+    ///
+    /// After either signal fires, we verify against the database that the
+    /// environment still points to our deployment_id (it could have been
+    /// superseded by a concurrent deployment that acquired the advisory lock
+    /// after us — though with the lock that should not happen).
     async fn wait_for_route_ready(
         receiver: &mut Box<dyn JobReceiver>,
+        db: &DbConnection,
         environment_id: i32,
         deployment_id: i32,
         timeout: std::time::Duration,
     ) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + timeout;
+        // Poll the DB every 5 seconds as a fallback for lost NOTIFY messages
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        let mut next_poll = tokio::time::Instant::now() + POLL_INTERVAL;
 
         loop {
-            match tokio::time::timeout_at(deadline, receiver.recv()).await {
+            let wait_until = deadline.min(next_poll);
+
+            match tokio::time::timeout_at(wait_until, receiver.recv()).await {
                 Ok(Ok(Job::RouteTableUpdated(ref update)))
-                    if update.environment_id == Some(environment_id)
-                        && update.deployment_id == Some(deployment_id) =>
+                    if update.environment_id == Some(environment_id) =>
                 {
                     debug!(
-                        "Route table confirmed for environment {} deployment {} ({} routes)",
-                        environment_id, deployment_id, update.route_count
+                        "Route table event for environment {} (event deployment_id={:?}, \
+                         our deployment_id={}, {} routes) — verifying DB state",
+                        environment_id, update.deployment_id, deployment_id, update.route_count
                     );
-                    return Ok(());
+                    // Verify the environment actually points to our deployment
+                    match Self::verify_environment_deployment(db, environment_id, deployment_id)
+                        .await
+                    {
+                        Ok(true) => return Ok(()),
+                        Ok(false) => {
+                            // Environment was overwritten by a concurrent deployment.
+                            // This is a legitimate scenario when two deploys race; the
+                            // advisory lock should prevent it, but if it somehow happens,
+                            // report it clearly.
+                            return Err(format!(
+                                "Environment {} no longer points to deployment {} \
+                                 — superseded by another deployment",
+                                environment_id, deployment_id
+                            ));
+                        }
+                        Err(e) => {
+                            warn!(
+                                "DB verification failed after route event: {} — \
+                                 treating event as confirmation",
+                                e
+                            );
+                            // If we can't verify, trust the event (better than timing out)
+                            return Ok(());
+                        }
+                    }
                 }
                 Ok(Ok(_)) => {
-                    // Different job or different environment/deployment — keep waiting
+                    // Different job or different environment — keep waiting
                     continue;
                 }
                 Ok(Err(e)) => {
                     return Err(format!("Queue receive error: {}", e));
                 }
-                Err(_) => {
+                Err(_) if tokio::time::Instant::now() >= deadline => {
                     return Err("Timed out waiting for route table update".to_string());
                 }
+                Err(_) => {
+                    // Poll interval expired — check DB directly as fallback
+                    next_poll = tokio::time::Instant::now() + POLL_INTERVAL;
+                    debug!(
+                        "Polling DB for route confirmation (environment={}, deployment={})",
+                        environment_id, deployment_id
+                    );
+                    match Self::verify_environment_deployment(db, environment_id, deployment_id)
+                        .await
+                    {
+                        Ok(true) => {
+                            info!(
+                                "Route confirmed via DB poll for environment {} deployment {}",
+                                environment_id, deployment_id
+                            );
+                            return Ok(());
+                        }
+                        Ok(false) => {
+                            // Not yet confirmed or overwritten — keep waiting
+                            debug!(
+                                "DB poll: environment {} does not yet point to deployment {}",
+                                environment_id, deployment_id
+                            );
+                        }
+                        Err(e) => {
+                            warn!("DB poll failed: {} — continuing to wait for event", e);
+                        }
+                    }
+                }
             }
+        }
+    }
+
+    /// Check whether the environment's current_deployment_id matches what we expect.
+    /// Returns true if the environment points to our deployment_id.
+    async fn verify_environment_deployment(
+        db: &DbConnection,
+        environment_id: i32,
+        expected_deployment_id: i32,
+    ) -> Result<bool, sea_orm::DbErr> {
+        let env = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::DeletedAt.is_null())
+            .one(db)
+            .await?;
+        match env {
+            Some(env) => Ok(env.current_deployment_id == Some(expected_deployment_id)),
+            None => Ok(false),
         }
     }
 

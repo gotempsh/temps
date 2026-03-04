@@ -135,13 +135,18 @@ impl ProjectChangeListener {
                     }
                 };
 
-                // Reload all routes when any change happens
+                // Reload all routes when any change happens.
+                //
+                // NOTE: The environment_id and deployment_id in the event come from
+                // the PG NOTIFY payload, not from what load_routes() actually loaded.
+                // With concurrent deployments, the deployment_id may not match what
+                // the route table actually resolved to. Consumers (e.g. mark_complete)
+                // should verify the actual DB state rather than trusting this field.
                 if let Err(e) = peer_table.load_routes().await {
                     error!("Failed to reload routes after change: {}", e);
                 } else {
                     let route_count = peer_table.len();
 
-                    // Notify via queue that routes have been reloaded with context
                     let event =
                         temps_core::Job::RouteTableUpdated(temps_core::RouteTableUpdatedJob {
                             environment_id,
