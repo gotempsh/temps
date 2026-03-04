@@ -801,38 +801,45 @@ impl MongodbService {
 
         let output = self.docker.start_exec(&exec.id, None).await?;
 
-        let mut backup_data = Vec::new();
-        if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
-            use futures::stream::StreamExt;
-            while let Some(result) = output.next().await {
-                match result {
-                    Ok(log_output) => match log_output {
-                        bollard::container::LogOutput::StdOut { message } => {
-                            backup_data.extend_from_slice(&message);
+        // Stream mongodump output directly to a temp file instead of buffering
+        // the entire dump in memory (which caused multi-GB memory spikes).
+        let temp_file = tempfile::NamedTempFile::new()?;
+        let mut total_bytes: u64 = 0;
+        {
+            let mut writer = std::io::BufWriter::new(&temp_file);
+            if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
+                use futures::stream::StreamExt;
+                while let Some(result) = output.next().await {
+                    match result {
+                        Ok(log_output) => match log_output {
+                            bollard::container::LogOutput::StdOut { message } => {
+                                use std::io::Write;
+                                writer.write_all(&message)?;
+                                total_bytes += message.len() as u64;
+                            }
+                            bollard::container::LogOutput::StdErr { message } => {
+                                let stderr_str = String::from_utf8_lossy(&message);
+                                info!("mongodump stderr: {}", stderr_str);
+                            }
+                            _ => {}
+                        },
+                        Err(e) => {
+                            error!("Error reading exec output: {}", e);
+                            return Err(anyhow::anyhow!("Failed to read mongodump output: {}", e));
                         }
-                        bollard::container::LogOutput::StdErr { message } => {
-                            let stderr_str = String::from_utf8_lossy(&message);
-                            info!("mongodump stderr: {}", stderr_str);
-                        }
-                        _ => {}
-                    },
-                    Err(e) => {
-                        error!("Error reading exec output: {}", e);
-                        return Err(anyhow::anyhow!("Failed to read mongodump output: {}", e));
                     }
                 }
             }
+            use std::io::Write;
+            writer.flush()?;
         }
 
-        if backup_data.is_empty() {
+        if total_bytes == 0 {
             return Err(anyhow::anyhow!("Backup data is empty"));
         }
 
-        let temp_file = tempfile::NamedTempFile::new()?;
         let temp_path = temp_file.path().to_str().unwrap();
-        std::fs::write(temp_path, &backup_data)?;
-
-        info!("MongoDB legacy backup size: {} bytes", backup_data.len());
+        info!("MongoDB legacy backup size: {} bytes", total_bytes);
 
         let body = aws_sdk_s3::primitives::ByteStream::from_path(temp_path).await?;
         s3_client

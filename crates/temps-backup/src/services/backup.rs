@@ -1695,6 +1695,7 @@ impl BackupService {
             buffer.extend_from_slice(&chunk);
 
             if buffer.len() >= chunk_size {
+                let chunk_len = buffer.len();
                 match self
                     .upload_part(
                         s3_client,
@@ -1702,15 +1703,15 @@ impl BackupService {
                         s3_location,
                         upload_id,
                         part_number,
-                        buffer.clone(),
+                        std::mem::take(&mut buffer),
                     )
                     .await
                 {
                     Ok(part) => {
                         parts = parts.parts(part);
-                        total_size += buffer.len();
+                        total_size += chunk_len;
                         part_number += 1;
-                        buffer.clear();
+                        buffer.reserve(chunk_size);
                     }
                     Err(e) => {
                         self.abort_multipart_upload(
@@ -1728,6 +1729,7 @@ impl BackupService {
 
         // Handle remaining data
         if !buffer.is_empty() {
+            let chunk_len = buffer.len();
             match self
                 .upload_part(
                     s3_client,
@@ -1735,13 +1737,13 @@ impl BackupService {
                     s3_location,
                     upload_id,
                     part_number,
-                    buffer.clone(),
+                    std::mem::take(&mut buffer),
                 )
                 .await
             {
                 Ok(part) => {
                     parts = parts.parts(part);
-                    total_size += buffer.len();
+                    total_size += chunk_len;
                 }
                 Err(e) => {
                     self.abort_multipart_upload(
@@ -1925,7 +1927,6 @@ impl BackupService {
         s3_source: &temps_entities::s3_sources::Model,
     ) -> Result<(), BackupError> {
         use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-        use std::io::Read;
 
         info!("Restoring SQLite backup: {}", backup.backup_id);
 
@@ -1944,23 +1945,21 @@ impl BackupService {
             .await
             .map_err(|e| BackupError::S3(e.to_string()))?;
 
-        let data = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| BackupError::S3(e.to_string()))?
-            .into_bytes();
-
-        // Decompress data
-        let mut decoder = flate2::read::GzDecoder::new(&data[..]);
-        let mut decompressed_data = Vec::new();
-        decoder.read_to_end(&mut decompressed_data)?;
-
-        // Write decompressed DB bytes to a temporary file
-        let mut temp_file = NamedTempFile::new()?;
-        use std::io::Write;
-        temp_file.write_all(&decompressed_data)?;
-        temp_file.flush()?;
+        // Stream S3 response → gzip decoder → temp file on disk.
+        // Previous approach downloaded the entire compressed backup into memory and then
+        // decompressed into a second in-memory buffer, causing peak memory equal to
+        // compressed + decompressed size.
+        let temp_file = NamedTempFile::new()?;
+        {
+            let mut body_stream = response.body;
+            let mut decoder =
+                flate2::write::GzDecoder::new(std::io::BufWriter::new(temp_file.as_file()));
+            while let Some(chunk) = body_stream.next().await {
+                let chunk = chunk.map_err(|e| BackupError::S3(e.to_string()))?;
+                std::io::Write::write_all(&mut decoder, &chunk)?;
+            }
+            decoder.finish()?;
+        }
 
         // Determine the SQLite database file path from server configuration
         let database_url = &self.config_service.get_database_url();
@@ -2051,7 +2050,6 @@ impl BackupService {
         use bollard::models::ContainerCreateBody as Config;
         use bollard::query_parameters::RemoveContainerOptions;
         use bollard::Docker;
-        use std::io::Read;
 
         info!("Restoring PostgreSQL backup: {}", backup.backup_id);
 
@@ -2069,18 +2067,6 @@ impl BackupService {
             .send()
             .await
             .map_err(|e| BackupError::S3(e.to_string()))?;
-
-        let data = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| BackupError::S3(e.to_string()))?
-            .into_bytes();
-
-        // Decompress data
-        let mut decoder = flate2::read::GzDecoder::new(&data[..]);
-        let mut decompressed_data = Vec::new();
-        decoder.read_to_end(&mut decompressed_data)?;
 
         // Get database URL from server configuration
         let database_url = &self.config_service.get_database_url();
@@ -2128,7 +2114,10 @@ impl BackupService {
                 message: format!("Failed to pull Docker image: {}", e),
             })?;
 
-        // Write decompressed backup to a bind-mount directory so the sidecar can read it
+        // Stream S3 response → gzip decoder → temp file on disk.
+        // Previous approach downloaded the entire compressed backup into memory and then
+        // decompressed into a second in-memory buffer, causing peak memory equal to
+        // compressed + decompressed size (e.g. 10 GB + 28 GB = 38 GB).
         let restore_dir = self
             .config_service
             .data_dir()
@@ -2148,15 +2137,24 @@ impl BackupService {
         let host_restore_path = restore_dir.join(&restore_filename);
         let container_restore_path = format!("/restore/{}", restore_filename);
 
-        tokio::fs::write(&host_restore_path, &decompressed_data)
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!(
-                    "Failed to write restore file {}: {}",
-                    host_restore_path.display(),
-                    e
-                ),
-            })?;
+        // Stream-decompress S3 body directly to disk — constant memory usage
+        {
+            let mut body_stream = response.body;
+            let out_file =
+                std::fs::File::create(&host_restore_path).map_err(|e| BackupError::Internal {
+                    message: format!(
+                        "Failed to create restore file {}: {}",
+                        host_restore_path.display(),
+                        e
+                    ),
+                })?;
+            let mut decoder = flate2::write::GzDecoder::new(std::io::BufWriter::new(out_file));
+            while let Some(chunk) = body_stream.next().await {
+                let chunk = chunk.map_err(|e| BackupError::S3(e.to_string()))?;
+                std::io::Write::write_all(&mut decoder, &chunk)?;
+            }
+            decoder.finish()?;
+        }
 
         // Create sidecar container name
         let container_name = format!("temps-pg-restore-{}", uuid::Uuid::new_v4());
