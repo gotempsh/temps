@@ -1,0 +1,182 @@
+export const metadata = {
+  title: 'Deploy a Rails App',
+  description: 'Deploy a Ruby on Rails application on Temps with PostgreSQL, Puma, and automatic HTTPS.',
+  alternates: {
+    canonical: '/docs/deploy-rails',
+  },
+}
+
+# Deploy a Rails App
+
+This tutorial walks you through deploying a Ruby on Rails application on Temps with PostgreSQL, Puma, and asset precompilation. By the end, you will have a production Rails app with automatic HTTPS. {{ className: 'lead' }}
+
+---
+
+## What you will build {{ anchor: true, id: 'what-you-will-build' }}
+
+- A Rails app deployed from a Git repository
+- PostgreSQL database provisioned and connected
+- Puma as the production application server
+- Assets precompiled during build
+- Automatic HTTPS and deployment on every push
+
+**Time required:** 15 minutes.
+
+**Prerequisites:**
+- A running Temps instance ([install guide](/docs/your-first-deployment))
+- A Rails app in a Git repository
+- (Optional) A custom domain
+
+---
+
+## Step 1: Prepare your app {{ anchor: true, id: 'prepare' }}
+
+### Configure database for production
+
+Update `config/database.yml` to use `DATABASE_URL`:
+
+```yaml {{ title: 'config/database.yml' }}
+production:
+  adapter: postgresql
+  url: <%= ENV['DATABASE_URL'] %>
+  pool: <%= ENV.fetch('RAILS_MAX_THREADS') { 5 } %>
+```
+
+### Add a health check
+
+```ruby {{ title: 'config/routes.rb' }}
+Rails.application.routes.draw do
+  get '/health', to: proc { [200, { 'Content-Type' => 'application/json' }, ['{"status":"ok"}']] }
+
+  # ... your existing routes
+end
+```
+
+### Create a Dockerfile
+
+```dockerfile {{ title: 'Dockerfile' }}
+FROM ruby:3.3-slim AS builder
+
+RUN apt-get update -qq && apt-get install -y build-essential libpq-dev git nodejs npm
+RUN npm install -g yarn
+
+WORKDIR /app
+COPY Gemfile Gemfile.lock ./
+RUN bundle config set --local deployment true && \
+    bundle config set --local without 'development test' && \
+    bundle install
+
+COPY . .
+RUN SECRET_KEY_BASE=placeholder RAILS_ENV=production bundle exec rails assets:precompile
+
+FROM ruby:3.3-slim
+RUN apt-get update -qq && apt-get install -y libpq5 && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /app /app
+
+ENV RAILS_ENV=production
+ENV RAILS_LOG_TO_STDOUT=true
+ENV RAILS_SERVE_STATIC_FILES=true
+
+EXPOSE 3000
+CMD ["bundle", "exec", "puma", "-C", "config/puma.rb"]
+```
+
+### Configure Puma
+
+```ruby {{ title: 'config/puma.rb' }}
+workers ENV.fetch('WEB_CONCURRENCY') { 2 }
+threads_count = ENV.fetch('RAILS_MAX_THREADS') { 5 }
+threads threads_count, threads_count
+
+port ENV.fetch('PORT') { 3000 }
+environment ENV.fetch('RAILS_ENV') { 'production' }
+
+preload_app!
+```
+
+---
+
+## Step 2: Create a project {{ anchor: true, id: 'create-project' }}
+
+1. Open the Temps dashboard
+2. Click **New Project**
+3. Enter a name (e.g., `my-rails-app`)
+4. Click **Create**
+
+Or use the CLI:
+
+```bash
+bunx @temps-sdk/cli projects create -n "my-rails-app" -d "Rails application"
+```
+
+---
+
+## Step 3: Provision a database {{ anchor: true, id: 'database' }}
+
+1. Go to your project → **Services**
+2. Click **Add Service** → **PostgreSQL**
+3. Temps creates the database and sets `DATABASE_URL` automatically
+
+Or via CLI:
+
+```bash
+bunx @temps-sdk/cli services create -p my-rails-app -t postgres -n "rails-db"
+```
+
+---
+
+## Step 4: Connect your repository {{ anchor: true, id: 'connect-repo' }}
+
+1. Go to your project → **Settings** → **Git**
+2. Connect your Git provider and select your repository
+
+```bash
+bunx @temps-sdk/cli projects git -p my-rails-app --owner yourorg --repo my-rails-app --branch main -y
+```
+
+---
+
+## Step 5: Set environment variables {{ anchor: true, id: 'env-vars' }}
+
+| Variable | Value | Notes |
+| -------- | ----- | ----- |
+| `SECRET_KEY_BASE` | `bin/rails secret` output | Required for production |
+| `RAILS_ENV` | `production` | Production mode |
+| `RAILS_SERVE_STATIC_FILES` | `true` | Serve assets from Rails |
+
+`DATABASE_URL` is set automatically by the managed PostgreSQL service.
+
+---
+
+## Step 6: Deploy {{ anchor: true, id: 'deploy' }}
+
+```bash
+bunx @temps-sdk/cli deploy my-rails-app -b main -e production -y
+```
+
+---
+
+## Step 7: Run migrations {{ anchor: true, id: 'migrations' }}
+
+After your first deploy:
+
+```bash
+bunx @temps-sdk/cli exec my-rails-app -- bundle exec rails db:migrate
+```
+
+For subsequent deployments, add migrations to your start command:
+
+```dockerfile
+CMD ["sh", "-c", "bundle exec rails db:migrate && bundle exec puma -C config/puma.rb"]
+```
+
+---
+
+## What to do next {{ anchor: true, id: 'next-steps' }}
+
+- [Add a custom domain](/docs/add-a-custom-domain) — point your domain to this deployment
+- [Set up preview deployments](/docs/set-up-preview-deployments) — get a preview URL for every pull request
+- [Add monitoring](/docs/monitoring) — uptime checks and alerts
+- [Set up backups](/docs/set-up-backups-and-monitoring) — automated database backups

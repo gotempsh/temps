@@ -1,0 +1,184 @@
+export const metadata = {
+  title: 'Deploy a Laravel App',
+  description: 'Deploy a Laravel application on Temps with PostgreSQL, queue workers, and automatic HTTPS.',
+  alternates: {
+    canonical: '/docs/deploy-laravel',
+  },
+}
+
+# Deploy a Laravel App
+
+This tutorial walks you through deploying a Laravel application on Temps with PostgreSQL, Nginx, and PHP-FPM. By the end, you will have a production Laravel app with automatic HTTPS. {{ className: 'lead' }}
+
+---
+
+## What you will build {{ anchor: true, id: 'what-you-will-build' }}
+
+- A Laravel app deployed from a Git repository
+- PostgreSQL database provisioned and connected
+- Nginx + PHP-FPM in a single container
+- Automatic HTTPS and deployment on every push
+
+**Time required:** 15 minutes.
+
+**Prerequisites:**
+- A running Temps instance ([install guide](/docs/your-first-deployment))
+- A Laravel app in a Git repository
+- (Optional) A custom domain
+
+---
+
+## Step 1: Prepare your app {{ anchor: true, id: 'prepare' }}
+
+### Configure environment
+
+Laravel reads configuration from environment variables via the `.env` file. In production, Temps injects these at runtime.
+
+Key settings in your `config/database.php`:
+
+```php {{ title: 'config/database.php (excerpt)' }}
+'default' => env('DB_CONNECTION', 'pgsql'),
+
+'connections' => [
+    'pgsql' => [
+        'driver' => 'pgsql',
+        'url' => env('DATABASE_URL'),
+        'host' => env('DB_HOST', '127.0.0.1'),
+        'port' => env('DB_PORT', '5432'),
+        'database' => env('DB_DATABASE', 'laravel'),
+        'username' => env('DB_USERNAME', 'root'),
+        'password' => env('DB_PASSWORD', ''),
+    ],
+],
+```
+
+### Add a health check
+
+```php {{ title: 'routes/web.php' }}
+Route::get('/health', function () {
+    return response()->json(['status' => 'ok']);
+});
+```
+
+### Create a Dockerfile
+
+```dockerfile {{ title: 'Dockerfile' }}
+FROM php:8.3-fpm-alpine AS base
+
+RUN apk add --no-cache nginx postgresql-dev && \
+    docker-php-ext-install pdo_pgsql opcache
+
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+WORKDIR /app
+COPY composer.json composer.lock ./
+RUN composer install --no-dev --no-scripts --optimize-autoloader
+
+COPY . .
+RUN composer dump-autoload --optimize && \
+    php artisan config:cache && \
+    php artisan route:cache && \
+    php artisan view:cache
+
+COPY docker/nginx.conf /etc/nginx/http.d/default.conf
+
+RUN chown -R www-data:www-data storage bootstrap/cache
+
+EXPOSE 8080
+CMD sh -c "php-fpm -D && nginx -g 'daemon off;'"
+```
+
+### Create Nginx config
+
+```nginx {{ title: 'docker/nginx.conf' }}
+server {
+    listen 8080;
+    server_name _;
+    root /app/public;
+    index index.php;
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ \.php$ {
+        fastcgi_pass 127.0.0.1:9000;
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        include fastcgi_params;
+    }
+}
+```
+
+---
+
+## Step 2: Create a project {{ anchor: true, id: 'create-project' }}
+
+1. Open the Temps dashboard
+2. Click **New Project**
+3. Enter a name (e.g., `my-laravel-app`)
+
+```bash
+bunx @temps-sdk/cli projects create -n "my-laravel-app" -d "Laravel application"
+```
+
+---
+
+## Step 3: Provision a database {{ anchor: true, id: 'database' }}
+
+```bash
+bunx @temps-sdk/cli services create -p my-laravel-app -t postgres -n "laravel-db"
+```
+
+The `DATABASE_URL` environment variable is automatically injected.
+
+---
+
+## Step 4: Connect your repository {{ anchor: true, id: 'connect-repo' }}
+
+```bash
+bunx @temps-sdk/cli projects git -p my-laravel-app --owner yourorg --repo my-laravel-app --branch main -y
+```
+
+---
+
+## Step 5: Set environment variables {{ anchor: true, id: 'env-vars' }}
+
+| Variable | Value | Notes |
+| -------- | ----- | ----- |
+| `APP_KEY` | `php artisan key:generate --show` | Required |
+| `APP_ENV` | `production` | Production mode |
+| `APP_DEBUG` | `false` | Never debug in production |
+| `APP_URL` | `https://yourdomain.com` | Your domain |
+
+`DATABASE_URL` is set automatically by the managed PostgreSQL service.
+
+---
+
+## Step 6: Deploy {{ anchor: true, id: 'deploy' }}
+
+```bash
+bunx @temps-sdk/cli deploy my-laravel-app -b main -e production -y
+```
+
+---
+
+## Step 7: Run migrations {{ anchor: true, id: 'migrations' }}
+
+```bash
+bunx @temps-sdk/cli exec my-laravel-app -- php artisan migrate --force
+```
+
+For subsequent deployments, add to your start command:
+
+```dockerfile
+CMD sh -c "php artisan migrate --force && php-fpm -D && nginx -g 'daemon off;'"
+```
+
+---
+
+## What to do next {{ anchor: true, id: 'next-steps' }}
+
+- [Add a custom domain](/docs/add-a-custom-domain) — point your domain to this deployment
+- [Set up preview deployments](/docs/set-up-preview-deployments) — get a preview URL for every pull request
+- [Add monitoring](/docs/monitoring) — uptime checks and alerts
+- [Set up backups](/docs/set-up-backups-and-monitoring) — automated database backups

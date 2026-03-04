@@ -1,0 +1,142 @@
+export const metadata = {
+  title: 'Deploy an Astro Site',
+  description: 'Deploy an Astro site on Temps with static or SSR output and automatic HTTPS.',
+  alternates: {
+    canonical: '/docs/deploy-astro',
+  },
+}
+
+# Deploy an Astro Site
+
+This tutorial walks you through deploying an Astro site on Temps. Astro works great for content-heavy sites and supports both static output and server-side rendering with the Node adapter. {{ className: 'lead' }}
+
+---
+
+## What you will build {{ anchor: true, id: 'what-you-will-build' }}
+
+- An Astro site deployed from a Git repository
+- Static or SSR deployment depending on your adapter
+- Automatic HTTPS and deployment on every push
+
+**Time required:** 10 minutes.
+
+**Prerequisites:**
+- A running Temps instance ([install guide](/docs/your-first-deployment))
+- An Astro project in a Git repository
+- (Optional) A custom domain
+
+---
+
+## Option A: Static Astro site {{ anchor: true, id: 'static' }}
+
+### Step 1: Prepare your app
+
+Static is Astro's default output mode. Verify your `astro.config.mjs`:
+
+```javascript {{ title: 'astro.config.mjs' }}
+import { defineConfig } from 'astro/config';
+
+export default defineConfig({
+  // output defaults to 'static'
+});
+```
+
+And your `package.json`:
+
+```json {{ title: 'package.json' }}
+{
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "astro": "^5.0"
+  }
+}
+```
+
+Astro outputs static files to `dist/`. Temps detects this and serves them.
+
+### Step 2: Deploy
+
+```bash
+bunx @temps-sdk/cli projects create -n "my-astro-site" -d "Astro website"
+bunx @temps-sdk/cli projects git -p my-astro-site --owner yourorg --repo my-astro-site --branch main --preset static -y
+bunx @temps-sdk/cli deploy my-astro-site -b main -e production -y
+```
+
+---
+
+## Option B: Astro SSR with Node adapter {{ anchor: true, id: 'ssr' }}
+
+### Step 1: Install the Node adapter
+
+```bash
+npx astro add node
+```
+
+This updates your `astro.config.mjs`:
+
+```javascript {{ title: 'astro.config.mjs' }}
+import { defineConfig } from 'astro/config';
+import node from '@astrojs/node';
+
+export default defineConfig({
+  output: 'server',
+  adapter: node({
+    mode: 'standalone',
+  }),
+});
+```
+
+### Step 2: Create a Dockerfile
+
+```dockerfile {{ title: 'Dockerfile' }}
+FROM node:22-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:22-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=builder /app/dist ./dist
+EXPOSE 4321
+CMD ["node", "dist/server/entry.mjs"]
+```
+
+### Step 3: Deploy
+
+```bash
+bunx @temps-sdk/cli deploy my-astro-site -b main -e production -y
+```
+
+---
+
+## Environment variables {{ anchor: true, id: 'env-vars' }}
+
+Astro uses `PUBLIC_` prefixed variables for client-side access:
+
+```bash
+# Server-only
+DATABASE_URL=postgres://user:pass@host:5432/db
+API_SECRET=your-secret
+
+# Available in client-side code
+PUBLIC_API_URL=https://api.example.com
+```
+
+<Note>
+  Variables with the `PUBLIC_` prefix are embedded at build time. Redeploy after changing them.
+</Note>
+
+---
+
+## What to do next {{ anchor: true, id: 'next-steps' }}
+
+- [Add a custom domain](/docs/add-a-custom-domain) — point your domain to this deployment
+- [Set up preview deployments](/docs/set-up-preview-deployments) — get a preview URL for every pull request
+- [Add monitoring](/docs/monitoring) — uptime checks and alerts

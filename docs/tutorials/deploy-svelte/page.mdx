@@ -1,0 +1,156 @@
+export const metadata = {
+  title: 'Deploy a SvelteKit App',
+  description: 'Deploy a SvelteKit application on Temps with SSR, API endpoints, and automatic HTTPS.',
+  alternates: {
+    canonical: '/docs/deploy-svelte',
+  },
+}
+
+# Deploy a SvelteKit App
+
+This tutorial walks you through deploying a SvelteKit application on Temps. SvelteKit supports static, server-rendered, and hybrid output — all work on Temps. {{ className: 'lead' }}
+
+---
+
+## What you will build {{ anchor: true, id: 'what-you-will-build' }}
+
+- A SvelteKit app deployed from a Git repository
+- SSR with the Node adapter or static prerendering
+- Automatic HTTPS and deployment on every push
+
+**Time required:** 10 minutes.
+
+**Prerequisites:**
+- A running Temps instance ([install guide](/docs/your-first-deployment))
+- A SvelteKit app in a Git repository
+- (Optional) A custom domain
+
+---
+
+## Step 1: Prepare your app {{ anchor: true, id: 'prepare' }}
+
+### Install the Node adapter
+
+For SSR deployments, use the Node adapter:
+
+```bash
+npm install -D @sveltejs/adapter-node
+```
+
+Update your `svelte.config.js`:
+
+```javascript {{ title: 'svelte.config.js' }}
+import adapter from '@sveltejs/adapter-node';
+
+export default {
+  kit: {
+    adapter: adapter()
+  }
+};
+```
+
+For static sites, use `@sveltejs/adapter-static` instead.
+
+### Verify your package.json
+
+```json {{ title: 'package.json' }}
+{
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-node": "^5.0",
+    "@sveltejs/kit": "^2.0",
+    "svelte": "^5.0",
+    "vite": "^6.0"
+  }
+}
+```
+
+### Add a health check
+
+```javascript {{ title: 'src/routes/health/+server.js' }}
+import { json } from '@sveltejs/kit';
+
+export function GET() {
+  return json({ status: 'ok' });
+}
+```
+
+---
+
+## Step 2: Create a project {{ anchor: true, id: 'create-project' }}
+
+1. Open the Temps dashboard
+2. Click **New Project**
+3. Connect your repository
+4. Temps detects SvelteKit automatically
+
+Or via CLI:
+
+```bash
+bunx @temps-sdk/cli projects create -n "my-svelte-app" -d "SvelteKit application"
+bunx @temps-sdk/cli projects git -p my-svelte-app --owner yourorg --repo my-svelte-app --branch main -y
+```
+
+---
+
+## Step 3: Create a Dockerfile (optional) {{ anchor: true, id: 'dockerfile' }}
+
+Temps auto-detects SvelteKit, but you can customize:
+
+```dockerfile {{ title: 'Dockerfile' }}
+FROM node:22-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:22-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=builder /app/build ./build
+COPY --from=builder /app/package.json .
+EXPOSE 3000
+CMD ["node", "build"]
+```
+
+---
+
+## Step 4: Deploy {{ anchor: true, id: 'deploy' }}
+
+Push to your connected branch, or deploy manually:
+
+```bash
+bunx @temps-sdk/cli deploy my-svelte-app -b main -e production -y
+```
+
+---
+
+## Environment variables {{ anchor: true, id: 'env-vars' }}
+
+SvelteKit uses `PUBLIC_` prefixed variables for client-side access:
+
+```bash
+# Server-only (available in +server.js, +page.server.js, hooks)
+DATABASE_URL=postgres://user:pass@host:5432/db
+API_SECRET=your-secret
+
+# Available in client-side code
+PUBLIC_API_URL=https://api.example.com
+```
+
+<Note>
+  `PUBLIC_` variables are embedded at build time. Redeploy after changing them. Server-only variables are available at runtime.
+</Note>
+
+---
+
+## What to do next {{ anchor: true, id: 'next-steps' }}
+
+- [Add a custom domain](/docs/add-a-custom-domain) — point your domain to this deployment
+- [Set up preview deployments](/docs/set-up-preview-deployments) — get a preview URL for every pull request
+- [Add monitoring](/docs/monitoring) — uptime checks and alerts

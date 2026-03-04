@@ -1,0 +1,134 @@
+export const metadata = {
+  title: 'Deploy an Angular App',
+  description: 'Deploy an Angular application on Temps with SSR or static hosting and automatic HTTPS.',
+  alternates: {
+    canonical: '/docs/deploy-angular',
+  },
+}
+
+# Deploy an Angular App
+
+This tutorial walks you through deploying an Angular application on Temps. Whether you are building a static SPA or using Angular SSR, Temps handles both configurations. {{ className: 'lead' }}
+
+---
+
+## What you will build {{ anchor: true, id: 'what-you-will-build' }}
+
+- An Angular app deployed from a Git repository
+- Static or SSR deployment
+- Automatic HTTPS and deployment on every push
+
+**Time required:** 10 minutes.
+
+**Prerequisites:**
+- A running Temps instance ([install guide](/docs/your-first-deployment))
+- An Angular app in a Git repository
+- (Optional) A custom domain
+
+---
+
+## Option A: Static Angular SPA {{ anchor: true, id: 'static-spa' }}
+
+### Step 1: Prepare your app
+
+Verify your `package.json` has the build script:
+
+```json {{ title: 'package.json' }}
+{
+  "name": "my-angular-app",
+  "scripts": {
+    "start": "ng serve",
+    "build": "ng build"
+  },
+  "dependencies": {
+    "@angular/core": "^19.0.0"
+  }
+}
+```
+
+Angular builds static files to `dist/<project-name>/browser/` by default. Temps detects this and serves them.
+
+### Step 2: Deploy
+
+1. Open the Temps dashboard and create a new project
+2. Connect your repository
+3. Temps detects Angular and configures the build
+4. Push to deploy
+
+```bash
+bunx @temps-sdk/cli projects create -n "my-angular-app" -d "Angular application"
+bunx @temps-sdk/cli projects git -p my-angular-app --owner yourorg --repo my-angular-app --branch main --preset static -y
+bunx @temps-sdk/cli deploy my-angular-app -b main -e production -y
+```
+
+---
+
+## Option B: Angular SSR {{ anchor: true, id: 'angular-ssr' }}
+
+### Step 1: Prepare your app
+
+Angular 19+ includes SSR support. Make sure your `angular.json` has SSR enabled:
+
+```json {{ title: 'angular.json (excerpt)' }}
+{
+  "projects": {
+    "my-app": {
+      "architect": {
+        "build": {
+          "options": {
+            "outputMode": "server"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+### Step 2: Create a Dockerfile
+
+```dockerfile {{ title: 'Dockerfile' }}
+FROM node:22-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:22-alpine
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+EXPOSE 4000
+CMD ["node", "dist/my-app/server/server.mjs"]
+```
+
+### Step 3: Deploy
+
+Connect your repository and push:
+
+```bash
+bunx @temps-sdk/cli deploy my-angular-app -b main -e production -y
+```
+
+---
+
+## Environment variables {{ anchor: true, id: 'env-vars' }}
+
+Angular does not have built-in runtime environment variable support. Common patterns:
+
+1. **Build-time**: Use `environment.ts` files and swap at build time
+2. **Runtime**: Fetch a config JSON file at startup
+
+For build-time variables, set them in Temps and reference in your build:
+
+```bash
+API_URL=https://api.example.com
+```
+
+---
+
+## What to do next {{ anchor: true, id: 'next-steps' }}
+
+- [Add a custom domain](/docs/add-a-custom-domain) — point your domain to this deployment
+- [Set up preview deployments](/docs/set-up-preview-deployments) — get a preview URL for every pull request
+- [Add monitoring](/docs/monitoring) — uptime checks and alerts

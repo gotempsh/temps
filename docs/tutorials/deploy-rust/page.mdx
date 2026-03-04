@@ -1,0 +1,187 @@
+export const metadata = {
+  title: 'Deploy a Rust App',
+  description: 'Deploy a Rust web application on Temps with a minimal container image, PostgreSQL, and automatic HTTPS.',
+  alternates: {
+    canonical: '/docs/deploy-rust',
+  },
+}
+
+# Deploy a Rust App
+
+This tutorial walks you through deploying a Rust web application on Temps. Rust produces fast, memory-efficient binaries — perfect for high-performance web services. {{ className: 'lead' }}
+
+---
+
+## What you will build {{ anchor: true, id: 'what-you-will-build' }}
+
+- A Rust web app deployed from a Git repository
+- A minimal container image
+- PostgreSQL database (optional)
+- Automatic HTTPS and deployment on every push
+
+**Time required:** 10 minutes.
+
+**Prerequisites:**
+- A running Temps instance ([install guide](/docs/your-first-deployment))
+- A Rust web app in a Git repository (Axum, Actix, Rocket, or any framework)
+- (Optional) A custom domain
+
+---
+
+## Step 1: Prepare your app {{ anchor: true, id: 'prepare' }}
+
+### Add a health check endpoint
+
+Example using Axum:
+
+```rust {{ title: 'src/main.rs' }}
+use axum::{routing::get, Json, Router};
+use serde_json::{json, Value};
+use std::env;
+
+#[tokio::main]
+async fn main() {
+    let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let addr = format!("0.0.0.0:{port}");
+
+    let app = Router::new()
+        .route("/health", get(health))
+        // ... your existing routes
+        ;
+
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn health() -> Json<Value> {
+    Json(json!({"status": "ok"}))
+}
+```
+
+### Create a Dockerfile
+
+Rust needs a build stage with the full toolchain and a minimal runtime stage:
+
+```dockerfile {{ title: 'Dockerfile' }}
+FROM rust:1.83-alpine AS builder
+
+RUN apk add --no-cache musl-dev
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+# Cache dependencies
+RUN mkdir src && echo "fn main() {}" > src/main.rs && \
+    cargo build --release && \
+    rm -rf src
+
+COPY . .
+RUN touch src/main.rs && cargo build --release
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+
+COPY --from=builder /app/target/release/my-app /usr/local/bin/app
+
+EXPOSE 8080
+CMD ["app"]
+```
+
+<Note>
+  The dummy `main.rs` trick caches dependency compilation. Subsequent builds only recompile your source code, reducing build times significantly.
+</Note>
+
+---
+
+## Step 2: Create a project {{ anchor: true, id: 'create-project' }}
+
+1. Open the Temps dashboard
+2. Click **New Project**
+3. Connect your repository
+
+```bash
+bunx @temps-sdk/cli projects create -n "my-rust-app" -d "Rust application"
+bunx @temps-sdk/cli projects git -p my-rust-app --owner yourorg --repo my-rust-app --branch main -y
+```
+
+---
+
+## Step 3: Provision a database (optional) {{ anchor: true, id: 'database' }}
+
+If your app needs PostgreSQL:
+
+```bash
+bunx @temps-sdk/cli services create -p my-rust-app -t postgres -n "rust-db"
+```
+
+The `DATABASE_URL` environment variable is automatically injected. Connect with sqlx or diesel:
+
+```rust
+let database_url = std::env::var("DATABASE_URL")
+    .expect("DATABASE_URL must be set");
+```
+
+---
+
+## Step 4: Set environment variables {{ anchor: true, id: 'env-vars' }}
+
+| Variable | Value | Notes |
+| -------- | ----- | ----- |
+| `PORT` | Auto-set by Temps | Do not override |
+| `RUST_LOG` | `info` | Controls log verbosity |
+| `ENVIRONMENT` | `production` | Your app can read this |
+
+---
+
+## Step 5: Deploy {{ anchor: true, id: 'deploy' }}
+
+```bash
+bunx @temps-sdk/cli deploy my-rust-app -b main -e production -y
+```
+
+Temps will:
+1. Build your Rust binary (this takes 2-5 minutes on first deploy)
+2. Create a minimal Alpine-based container
+3. Start the binary and run health checks
+4. Route traffic and issue an SSL certificate
+
+<Note>
+  First Rust builds are slow because all dependencies compile from source. Subsequent builds use Docker layer caching and are much faster.
+</Note>
+
+---
+
+## Build optimization {{ anchor: true, id: 'build-optimization' }}
+
+### Speed up builds with cargo-chef
+
+For faster builds, use `cargo-chef` to cache dependency compilation:
+
+```dockerfile {{ title: 'Dockerfile (optimized)' }}
+FROM rust:1.83-alpine AS chef
+RUN apk add --no-cache musl-dev && cargo install cargo-chef
+WORKDIR /app
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY . .
+RUN cargo build --release
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /app/target/release/my-app /usr/local/bin/app
+EXPOSE 8080
+CMD ["app"]
+```
+
+---
+
+## What to do next {{ anchor: true, id: 'next-steps' }}
+
+- [Add a custom domain](/docs/add-a-custom-domain) — point your domain to this deployment
+- [Set up preview deployments](/docs/set-up-preview-deployments) — get a preview URL for every pull request
+- [Add monitoring](/docs/monitoring) — uptime checks and alerts

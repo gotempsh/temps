@@ -1,0 +1,212 @@
+export const metadata = {
+  title: 'Deploy a Django App',
+  description: 'Deploy a Django application on Temps with PostgreSQL, static files, Gunicorn, and automatic HTTPS.',
+  alternates: {
+    canonical: '/docs/deploy-django',
+  },
+}
+
+# Deploy a Django App
+
+This tutorial walks you through deploying a Django application on Temps with PostgreSQL, static file serving, and Gunicorn. By the end, you will have a production Django app with automatic HTTPS and deployments on every push. {{ className: 'lead' }}
+
+---
+
+## What you will build {{ anchor: true, id: 'what-you-will-build' }}
+
+- A Django app deployed from a Git repository
+- PostgreSQL database provisioned and connected
+- Static files collected and served via WhiteNoise
+- Gunicorn as the production WSGI server
+- Automatic HTTPS and deployment on every push
+
+**Time required:** 15 minutes.
+
+**Prerequisites:**
+- A running Temps instance ([install guide](/docs/your-first-deployment))
+- A Django app in a Git repository
+- (Optional) A custom domain
+
+---
+
+## Step 1: Prepare your app {{ anchor: true, id: 'prepare' }}
+
+### Add production dependencies
+
+Make sure your `requirements.txt` includes a production WSGI server and static file handler:
+
+```txt {{ title: 'requirements.txt' }}
+django>=5.0
+gunicorn>=22.0
+whitenoise>=6.0
+psycopg2-binary>=2.9
+```
+
+### Configure settings for production
+
+Update your `settings.py` to read from environment variables:
+
+```python {{ title: 'settings.py' }}
+import os
+
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'change-me')
+DEBUG = os.environ.get('DJANGO_DEBUG', 'False') == 'True'
+ALLOWED_HOSTS = os.environ.get('DJANGO_ALLOWED_HOSTS', '*').split(',')
+
+# Database — use DATABASE_URL from Temps managed services
+import dj_database_url
+DATABASES = {
+    'default': dj_database_url.config(
+        default=os.environ.get('DATABASE_URL', 'sqlite:///db.sqlite3')
+    )
+}
+
+# Static files with WhiteNoise
+STATIC_URL = '/static/'
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
+MIDDLEWARE.insert(1, 'whitenoise.middleware.WhiteNoiseMiddleware')
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+```
+
+### Add a health check endpoint
+
+```python {{ title: 'urls.py' }}
+from django.http import JsonResponse
+
+def health(request):
+    return JsonResponse({'status': 'ok'})
+
+urlpatterns = [
+    # ... your existing URLs
+    path('health/', health),
+]
+```
+
+### Create a Procfile or Dockerfile
+
+Temps auto-detects Python projects. For Django, provide a start command:
+
+```txt {{ title: 'Procfile' }}
+web: gunicorn myproject.wsgi:application --bind 0.0.0.0:$PORT --workers 3
+```
+
+Or use a Dockerfile for full control:
+
+```dockerfile {{ title: 'Dockerfile' }}
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+RUN python manage.py collectstatic --noinput
+
+EXPOSE 8000
+CMD ["gunicorn", "myproject.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3"]
+```
+
+---
+
+## Step 2: Create a project {{ anchor: true, id: 'create-project' }}
+
+1. Open the Temps dashboard
+2. Click **New Project**
+3. Enter a name (e.g., `my-django-app`)
+4. Click **Create**
+
+Or use the CLI:
+
+```bash
+bunx @temps-sdk/cli projects create -n "my-django-app" -d "Django application"
+```
+
+---
+
+## Step 3: Provision a database {{ anchor: true, id: 'database' }}
+
+Django needs PostgreSQL in production. Create a managed database in Temps:
+
+1. Go to your project → **Services**
+2. Click **Add Service** → **PostgreSQL**
+3. Temps creates the database and sets `DATABASE_URL` automatically
+
+Or via CLI:
+
+```bash
+bunx @temps-sdk/cli services create -p my-django-app -t postgres -n "django-db"
+```
+
+The `DATABASE_URL` environment variable is automatically injected into your app's environment.
+
+---
+
+## Step 4: Connect your repository {{ anchor: true, id: 'connect-repo' }}
+
+1. Go to your project → **Settings** → **Git**
+2. Connect your GitHub, GitLab, Bitbucket, or Gitea account
+3. Select your repository and branch
+
+Or via CLI:
+
+```bash
+bunx @temps-sdk/cli projects git -p my-django-app --owner yourorg --repo my-django-app --branch main --preset python -y
+```
+
+---
+
+## Step 5: Set environment variables {{ anchor: true, id: 'env-vars' }}
+
+Go to your project → **Environment Variables** and add:
+
+| Variable | Value | Notes |
+| -------- | ----- | ----- |
+| `DJANGO_SECRET_KEY` | (generate a random key) | Required for production |
+| `DJANGO_DEBUG` | `False` | Never run debug in production |
+| `DJANGO_ALLOWED_HOSTS` | `yourdomain.com` | Your domain name |
+
+`DATABASE_URL` is set automatically by the managed PostgreSQL service.
+
+---
+
+## Step 6: Deploy {{ anchor: true, id: 'deploy' }}
+
+Push to your connected branch, or deploy manually:
+
+```bash
+bunx @temps-sdk/cli deploy my-django-app -b main -e production -y
+```
+
+Temps will:
+1. Detect your Python/Django project
+2. Build the Docker image
+3. Run `collectstatic` during build
+4. Start Gunicorn on the configured port
+5. Run health checks before routing traffic
+6. Issue an SSL certificate for your domain
+
+---
+
+## Step 7: Run migrations {{ anchor: true, id: 'migrations' }}
+
+After your first deploy, run Django migrations:
+
+```bash
+bunx @temps-sdk/cli exec my-django-app -- python manage.py migrate
+```
+
+For subsequent deployments, add migrations to your build or release command in the Dockerfile:
+
+```dockerfile
+RUN python manage.py collectstatic --noinput
+CMD ["sh", "-c", "python manage.py migrate && gunicorn myproject.wsgi:application --bind 0.0.0.0:8000 --workers 3"]
+```
+
+---
+
+## What to do next {{ anchor: true, id: 'next-steps' }}
+
+- [Add a custom domain](/docs/add-a-custom-domain) — point your domain to this deployment
+- [Set up preview deployments](/docs/set-up-preview-deployments) — get a preview URL for every pull request
+- [Add monitoring](/docs/monitoring) — uptime checks and alerts
+- [Set up backups](/docs/set-up-backups-and-monitoring) — automated database backups

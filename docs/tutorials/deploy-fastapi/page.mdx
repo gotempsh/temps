@@ -1,0 +1,200 @@
+export const metadata = {
+  title: 'Deploy a FastAPI App',
+  description: 'Deploy a FastAPI application on Temps with PostgreSQL, Uvicorn, and automatic HTTPS.',
+  alternates: {
+    canonical: '/docs/deploy-fastapi',
+  },
+}
+
+# Deploy a FastAPI App
+
+This tutorial walks you through deploying a FastAPI application on Temps with PostgreSQL, Uvicorn, and automatic HTTPS. By the end, you will have a production FastAPI app with automatic deployments on every push. {{ className: 'lead' }}
+
+---
+
+## What you will build {{ anchor: true, id: 'what-you-will-build' }}
+
+- A FastAPI app deployed from a Git repository
+- PostgreSQL database provisioned and connected
+- Uvicorn as the production ASGI server
+- Automatic HTTPS and deployment on every push
+
+**Time required:** 10 minutes.
+
+**Prerequisites:**
+- A running Temps instance ([install guide](/docs/your-first-deployment))
+- A FastAPI app in a Git repository
+- (Optional) A custom domain
+
+---
+
+## Step 1: Prepare your app {{ anchor: true, id: 'prepare' }}
+
+### Add production dependencies
+
+Make sure your `requirements.txt` includes a production ASGI server:
+
+```txt {{ title: 'requirements.txt' }}
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+alembic>=1.14
+python-dotenv>=1.0
+```
+
+### Configure database connection
+
+Use environment variables for your database connection:
+
+```python {{ title: 'app/database.py' }}
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
+
+DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///./app.db')
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+class Base(DeclarativeBase):
+    pass
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+```
+
+### Add a health check endpoint
+
+```python {{ title: 'app/main.py' }}
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get('/health')
+def health():
+    return {'status': 'ok'}
+
+# ... your existing routes
+```
+
+### Create a Dockerfile
+
+```dockerfile {{ title: 'Dockerfile' }}
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+```
+
+---
+
+## Step 2: Create a project {{ anchor: true, id: 'create-project' }}
+
+1. Open the Temps dashboard
+2. Click **New Project**
+3. Enter a name (e.g., `my-fastapi-app`)
+4. Click **Create**
+
+Or use the CLI:
+
+```bash
+bunx @temps-sdk/cli projects create -n "my-fastapi-app" -d "FastAPI application"
+```
+
+---
+
+## Step 3: Provision a database {{ anchor: true, id: 'database' }}
+
+Create a managed PostgreSQL database:
+
+1. Go to your project → **Services**
+2. Click **Add Service** → **PostgreSQL**
+3. Temps creates the database and sets `DATABASE_URL` automatically
+
+Or via CLI:
+
+```bash
+bunx @temps-sdk/cli services create -p my-fastapi-app -t postgres -n "fastapi-db"
+```
+
+The `DATABASE_URL` environment variable is automatically injected into your app's environment.
+
+---
+
+## Step 4: Connect your repository {{ anchor: true, id: 'connect-repo' }}
+
+1. Go to your project → **Settings** → **Git**
+2. Connect your GitHub, GitLab, Bitbucket, or Gitea account
+3. Select your repository and branch
+
+Or via CLI:
+
+```bash
+bunx @temps-sdk/cli projects git -p my-fastapi-app --owner yourorg --repo my-fastapi-app --branch main --preset python -y
+```
+
+---
+
+## Step 5: Set environment variables {{ anchor: true, id: 'env-vars' }}
+
+Go to your project → **Environment Variables** and add:
+
+| Variable | Value | Notes |
+| -------- | ----- | ----- |
+| `SECRET_KEY` | (generate a random key) | For JWT or session signing |
+| `ENVIRONMENT` | `production` | Controls debug mode |
+
+`DATABASE_URL` is set automatically by the managed PostgreSQL service.
+
+---
+
+## Step 6: Deploy {{ anchor: true, id: 'deploy' }}
+
+Push to your connected branch, or deploy manually:
+
+```bash
+bunx @temps-sdk/cli deploy my-fastapi-app -b main -e production -y
+```
+
+Temps will:
+1. Detect your Python project
+2. Build the Docker image
+3. Start Uvicorn on the configured port
+4. Run health checks before routing traffic
+5. Issue an SSL certificate for your domain
+
+---
+
+## Step 7: Run migrations {{ anchor: true, id: 'migrations' }}
+
+After your first deploy, run Alembic migrations:
+
+```bash
+bunx @temps-sdk/cli exec my-fastapi-app -- alembic upgrade head
+```
+
+For subsequent deployments, add migrations to your start command:
+
+```dockerfile
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4"]
+```
+
+---
+
+## What to do next {{ anchor: true, id: 'next-steps' }}
+
+- [Add a custom domain](/docs/add-a-custom-domain) — point your domain to this deployment
+- [Set up preview deployments](/docs/set-up-preview-deployments) — get a preview URL for every pull request
+- [Add monitoring](/docs/monitoring) — uptime checks and alerts
+- [Set up backups](/docs/set-up-backups-and-monitoring) — automated database backups

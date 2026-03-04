@@ -1,0 +1,162 @@
+export const metadata = {
+  title: 'Deploy a Remix App',
+  description: 'Deploy a Remix application on Temps with SSR, loaders, actions, and automatic HTTPS.',
+  alternates: {
+    canonical: '/docs/deploy-remix',
+  },
+}
+
+# Deploy a Remix App
+
+This tutorial walks you through deploying a Remix application on Temps. Remix runs on a Node.js server with full SSR, loaders, and actions. {{ className: 'lead' }}
+
+---
+
+## What you will build {{ anchor: true, id: 'what-you-will-build' }}
+
+- A Remix app deployed from a Git repository
+- Server-side rendering with loaders and actions
+- Automatic HTTPS and deployment on every push
+
+**Time required:** 10 minutes.
+
+**Prerequisites:**
+- A running Temps instance ([install guide](/docs/your-first-deployment))
+- A Remix app in a Git repository
+- (Optional) A custom domain
+
+---
+
+## Step 1: Prepare your app {{ anchor: true, id: 'prepare' }}
+
+### Verify your package.json
+
+Remix v2+ uses Vite as the build tool:
+
+```json {{ title: 'package.json' }}
+{
+  "scripts": {
+    "dev": "remix vite:dev",
+    "build": "remix vite:build",
+    "start": "remix-serve ./build/server/index.js"
+  },
+  "dependencies": {
+    "@remix-run/node": "^2.0",
+    "@remix-run/react": "^2.0",
+    "@remix-run/serve": "^2.0"
+  }
+}
+```
+
+### Add a health check
+
+```typescript {{ title: 'app/routes/health.tsx' }}
+import { json } from '@remix-run/node';
+
+export function loader() {
+  return json({ status: 'ok' });
+}
+```
+
+---
+
+## Step 2: Create a project {{ anchor: true, id: 'create-project' }}
+
+1. Open the Temps dashboard
+2. Click **New Project**
+3. Connect your repository
+4. Temps detects Remix automatically
+
+Or via CLI:
+
+```bash
+bunx @temps-sdk/cli projects create -n "my-remix-app" -d "Remix application"
+bunx @temps-sdk/cli projects git -p my-remix-app --owner yourorg --repo my-remix-app --branch main -y
+```
+
+---
+
+## Step 3: Create a Dockerfile (optional) {{ anchor: true, id: 'dockerfile' }}
+
+Temps auto-detects Remix, but you can customize:
+
+```dockerfile {{ title: 'Dockerfile' }}
+FROM node:22-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:22-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=builder /app/build ./build
+COPY --from=builder /app/package.json .
+COPY --from=builder /app/node_modules ./node_modules
+EXPOSE 3000
+CMD ["npm", "run", "start"]
+```
+
+---
+
+## Step 4: Configure environment variables {{ anchor: true, id: 'env-vars' }}
+
+Remix loads environment variables on the server. Access them in loaders and actions:
+
+```typescript
+// Available in loaders and actions
+export function loader() {
+  const apiKey = process.env.API_KEY;
+  // ...
+}
+```
+
+To expose variables to the client, pass them through a root loader.
+
+Set variables in the Temps dashboard under **Environment Variables**.
+
+---
+
+## Step 5: Deploy {{ anchor: true, id: 'deploy' }}
+
+Push to your connected branch, or deploy manually:
+
+```bash
+bunx @temps-sdk/cli deploy my-remix-app -b main -e production -y
+```
+
+Temps will:
+1. Detect your Remix project
+2. Build the Docker image
+3. Run `remix vite:build`
+4. Start `remix-serve` on the configured port
+5. Run health checks and route traffic
+
+---
+
+## Database integration {{ anchor: true, id: 'database' }}
+
+If your Remix app needs a database, provision one in Temps:
+
+```bash
+bunx @temps-sdk/cli services create -p my-remix-app -t postgres -n "remix-db"
+```
+
+The `DATABASE_URL` is automatically injected. Use Prisma or Drizzle to connect:
+
+```typescript {{ title: 'app/db.server.ts' }}
+import { drizzle } from 'drizzle-orm/postgres-js';
+import postgres from 'postgres';
+
+const client = postgres(process.env.DATABASE_URL!);
+export const db = drizzle(client);
+```
+
+---
+
+## What to do next {{ anchor: true, id: 'next-steps' }}
+
+- [Add a custom domain](/docs/add-a-custom-domain) — point your domain to this deployment
+- [Set up preview deployments](/docs/set-up-preview-deployments) — get a preview URL for every pull request
+- [Add monitoring](/docs/monitoring) — uptime checks and alerts

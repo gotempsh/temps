@@ -1,0 +1,152 @@
+export const metadata = {
+  title: 'Deploy a Go App',
+  description: 'Deploy a Go application on Temps with a tiny container image, PostgreSQL, and automatic HTTPS.',
+  alternates: {
+    canonical: '/docs/deploy-go',
+  },
+}
+
+# Deploy a Go App
+
+This tutorial walks you through deploying a Go application on Temps. Go produces a single static binary, making it ideal for lightweight container deployments. {{ className: 'lead' }}
+
+---
+
+## What you will build {{ anchor: true, id: 'what-you-will-build' }}
+
+- A Go app deployed from a Git repository
+- A minimal container image (under 20 MB)
+- PostgreSQL database (optional)
+- Automatic HTTPS and deployment on every push
+
+**Time required:** 10 minutes.
+
+**Prerequisites:**
+- A running Temps instance ([install guide](/docs/your-first-deployment))
+- A Go app in a Git repository
+- (Optional) A custom domain
+
+---
+
+## Step 1: Prepare your app {{ anchor: true, id: 'prepare' }}
+
+### Add a health check endpoint
+
+```go {{ title: 'main.go' }}
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"os"
+)
+
+func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// ... your existing routes
+
+	log.Printf("Listening on :%s", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+```
+
+### Create a Dockerfile
+
+Go compiles to a static binary, so the final image can use `scratch` or `alpine`:
+
+```dockerfile {{ title: 'Dockerfile' }}
+FROM golang:1.23-alpine AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /server .
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+
+COPY --from=builder /server /server
+
+EXPOSE 8080
+CMD ["/server"]
+```
+
+<Note>
+  Using `CGO_ENABLED=0` produces a statically linked binary. If your app needs cgo (for example, SQLite), remove this flag and use `alpine` as the base image.
+</Note>
+
+---
+
+## Step 2: Create a project {{ anchor: true, id: 'create-project' }}
+
+1. Open the Temps dashboard
+2. Click **New Project**
+3. Connect your repository
+
+```bash
+bunx @temps-sdk/cli projects create -n "my-go-app" -d "Go application"
+bunx @temps-sdk/cli projects git -p my-go-app --owner yourorg --repo my-go-app --branch main -y
+```
+
+---
+
+## Step 3: Provision a database (optional) {{ anchor: true, id: 'database' }}
+
+If your app needs PostgreSQL:
+
+```bash
+bunx @temps-sdk/cli services create -p my-go-app -t postgres -n "go-db"
+```
+
+The `DATABASE_URL` environment variable is automatically injected. Parse it in your app:
+
+```go
+import "os"
+
+dbURL := os.Getenv("DATABASE_URL")
+```
+
+---
+
+## Step 4: Set environment variables {{ anchor: true, id: 'env-vars' }}
+
+Set any variables your app needs in the Temps dashboard:
+
+| Variable | Value | Notes |
+| -------- | ----- | ----- |
+| `PORT` | Auto-set by Temps | Do not override |
+| `ENVIRONMENT` | `production` | Your app can read this |
+
+---
+
+## Step 5: Deploy {{ anchor: true, id: 'deploy' }}
+
+```bash
+bunx @temps-sdk/cli deploy my-go-app -b main -e production -y
+```
+
+Temps will:
+1. Build your Go binary in the Docker build stage
+2. Create a minimal container image
+3. Start the binary and run health checks
+4. Route traffic and issue an SSL certificate
+
+---
+
+## What to do next {{ anchor: true, id: 'next-steps' }}
+
+- [Add a custom domain](/docs/add-a-custom-domain) — point your domain to this deployment
+- [Set up preview deployments](/docs/set-up-preview-deployments) — get a preview URL for every pull request
+- [Add monitoring](/docs/monitoring) — uptime checks and alerts
