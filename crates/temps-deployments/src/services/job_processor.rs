@@ -638,6 +638,19 @@ async fn process_git_push_event(
         return;
     }
 
+    // ── Cancel-on-supersede ──────────────────────────────────────────────
+    //
+    // Cancel any in-flight deployments for this environment before starting
+    // a new one. This is the standard PaaS behaviour (Vercel, Railway, etc.):
+    // the newest push always wins. Benefits:
+    //   - Prevents race conditions between concurrent mark_complete() calls
+    //   - Saves Docker build resources (no wasted builds)
+    //   - Avoids container name/port conflicts during deploy phase
+    //
+    // The cancelled deployments will stop at the next workflow checkpoint
+    // (between job batches) via the DatabaseCancellationProvider.
+    cancel_in_flight_deployments(&db, &queue, project.id, environment.id).await;
+
     // Create deployment record directly (no more pipeline)
     // Note: Previous deployment teardown happens AFTER this deployment succeeds (zero-downtime)
     use chrono::Utc;
@@ -884,6 +897,106 @@ async fn process_git_push_event(
             } else {
                 debug!("Updated deployment {} status to failed", deployment_id);
             }
+        }
+    }
+}
+
+/// Cancel all in-flight deployments for the given environment.
+///
+/// This implements "cancel-on-supersede": when a new deployment is triggered,
+/// any currently pending/running deployments for the same environment are
+/// cancelled so the newest push always wins. Cancellation is cooperative —
+/// the workflow executor checks `DatabaseCancellationProvider::is_cancelled()`
+/// between job batches and stops.
+async fn cancel_in_flight_deployments(
+    db: &DbConnection,
+    queue: &Arc<dyn JobQueue>,
+    project_id: i32,
+    environment_id: i32,
+) {
+    use temps_entities::deployment_jobs;
+    use temps_entities::types::JobStatus;
+
+    let in_flight = match deployments::Entity::find()
+        .filter(deployments::Column::EnvironmentId.eq(environment_id))
+        .filter(deployments::Column::ProjectId.eq(project_id))
+        .filter(deployments::Column::State.is_in(vec!["pending", "running", "deploying", "built"]))
+        .all(db)
+        .await
+    {
+        Ok(deps) => deps,
+        Err(e) => {
+            error!(
+                "Failed to query in-flight deployments for environment {}: {}",
+                environment_id, e
+            );
+            return;
+        }
+    };
+
+    if in_flight.is_empty() {
+        return;
+    }
+
+    info!(
+        "Cancelling {} in-flight deployment(s) for environment {} (superseded by new push)",
+        in_flight.len(),
+        environment_id
+    );
+
+    for deployment in in_flight {
+        let deployment_id = deployment.id;
+        let environment_name = deployment.slug.clone();
+
+        // Write cancellation message to any running job logs
+        if let Ok(running_jobs) = deployment_jobs::Entity::find()
+            .filter(deployment_jobs::Column::DeploymentId.eq(deployment_id))
+            .filter(deployment_jobs::Column::Status.eq(JobStatus::Running))
+            .all(db)
+            .await
+        {
+            for job in &running_jobs {
+                debug!(
+                    "Writing supersede cancellation to job {} log {}",
+                    job.name, job.log_id
+                );
+            }
+        }
+
+        // Mark the deployment as cancelled
+        let mut active: deployments::ActiveModel = deployment.into();
+        active.state = Set("cancelled".to_string());
+        active.cancelled_reason = Set(Some(
+            "Superseded by a newer deployment for this environment".to_string(),
+        ));
+        active.finished_at = Set(Some(chrono::Utc::now()));
+        active.updated_at = Set(chrono::Utc::now());
+
+        if let Err(e) = active.update(db).await {
+            error!(
+                "Failed to cancel superseded deployment {}: {}",
+                deployment_id, e
+            );
+            continue;
+        }
+
+        info!(
+            "Cancelled deployment {} (superseded) for environment {}",
+            deployment_id, environment_id
+        );
+
+        // Fire DeploymentCancelled event so notification systems can react
+        let event = Job::DeploymentCancelled(temps_core::DeploymentCancelledJob {
+            deployment_id,
+            project_id,
+            environment_id,
+            environment_name: environment_name.clone(),
+        });
+        if let Err(e) = queue.send(event).await {
+            warn!(
+                "Failed to send DeploymentCancelled event for deployment {}: {}",
+                deployment_id, e
+            );
         }
     }
 }

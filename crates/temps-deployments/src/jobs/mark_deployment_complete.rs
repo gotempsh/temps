@@ -370,6 +370,46 @@ impl MarkDeploymentCompleteJob {
             }
         }
 
+        // ── Pre-flight: staleness check ──────────────────────────────────
+        //
+        // Before doing any work, verify this deployment hasn't been cancelled
+        // (e.g. by cancel-on-supersede when a newer push arrived). This is a
+        // safety net — the workflow executor also checks cancellation between
+        // batches, but there is a window between the last batch completing and
+        // mark_complete starting where a cancellation could have been set.
+        let current_state = deployments::Entity::find_by_id(self.deployment_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to re-check deployment {} state: {}",
+                    self.deployment_id, e
+                ))
+            })?
+            .ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Deployment {} disappeared during mark_complete",
+                    self.deployment_id
+                ))
+            })?;
+
+        if current_state.state == "cancelled" {
+            info!(
+                deployment_id = self.deployment_id,
+                environment_id,
+                reason = ?current_state.cancelled_reason,
+                "Deployment was cancelled before mark_complete — aborting"
+            );
+            return Err(WorkflowError::JobExecutionFailed(format!(
+                "Deployment {} was cancelled: {}",
+                self.deployment_id,
+                current_state
+                    .cancelled_reason
+                    .as_deref()
+                    .unwrap_or("no reason")
+            )));
+        }
+
         // ── Phase 1: Switch route table to the new deployment ────────────
         //
         // Subscribe to the queue BEFORE updating current_deployment_id so we
