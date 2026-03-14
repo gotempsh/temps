@@ -14,9 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - AI usage analytics: per-model token tracking with agent/session context, BYOK vs platform key breakdown
 - Vercel AI SDK tracing examples (Node.js) and Python GenAI tracing examples
 - AI tracing documentation page
+- Funnel card step pipeline: funnel list cards now show a horizontal pipeline of steps with completions count and conversion rate per step (e.g., `page_view 1,234 → signup 890 (72%)`) alongside the existing summary metrics
 
 ### Fixed
 - GenAI trace token counts showed as zero: PostgreSQL `SUM(bigint)` returns `numeric` type, causing Sea-ORM `try_get::<Option<i64>>` to silently fail; added `::bigint` cast to all SUM expressions
+- Funnel edit page always showed "Funnel Not Found": `EditFunnel` used `useParams()` to read `funnelId`, but no matching React Router `<Route>` with a `:funnelId` parameter was defined; `funnelId` was always `undefined`, so the funnel lookup always failed; now parsed from the URL and passed as a numeric prop
+- Funnel card metrics never loaded (empty cards): `formatDateForAPI` produced `yyyy-MM-dd HH:mm:ss` format but the backend query string parser expects ISO 8601 (`YYYY-MM-DDTHH:MM:SSZ`); deserialization failed on every metrics request; changed to `date.toISOString()`
 
 ### Added
 - Multi-node cluster support: distribute deployments across a control plane and multiple worker nodes connected via WireGuard private networking
