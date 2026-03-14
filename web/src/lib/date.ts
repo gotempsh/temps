@@ -1,9 +1,7 @@
-import { formatInTimeZone } from 'date-fns-tz'
 import { format } from 'date-fns'
 
 export const formatDateForAPI = (date: Date) => {
-  const utcDate = formatInTimeZone(date, 'UTC', 'yyyy-MM-dd HH:mm:ss')
-  return utcDate
+  return date.toISOString()
 }
 
 export const formatUTCDate = (dateString: string | number) => {

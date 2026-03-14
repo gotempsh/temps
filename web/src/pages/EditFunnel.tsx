@@ -11,16 +11,16 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import * as React from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 
 interface EditFunnelProps {
   project: ProjectResponse
+  funnelId: number
 }
 
-export function EditFunnel({ project }: EditFunnelProps) {
-  const { funnelId } = useParams<{ funnelId: string }>()
+export function EditFunnel({ project, funnelId }: EditFunnelProps) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -42,7 +42,7 @@ export function EditFunnel({ project }: EditFunnelProps) {
 
   const funnel = React.useMemo(() => {
     if (!funnels || !funnelId) return null
-    return funnels.find((f) => f.id === parseInt(funnelId))
+    return funnels.find((f) => f.id === funnelId)
   }, [funnels, funnelId])
 
   React.useEffect(() => {
@@ -93,7 +93,7 @@ export function EditFunnel({ project }: EditFunnelProps) {
     updateFunnel.mutate({
       path: {
         project_id: project.id,
-        funnel_id: parseInt(funnelId),
+        funnel_id: funnelId,
       },
       body: {
         name: formData.name.trim(),

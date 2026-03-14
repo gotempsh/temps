@@ -11,7 +11,14 @@ import { getFunnelMetricsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { formatDateForAPI } from '@/lib/date'
 import { useQuery } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
-import { Users, TrendingUp, Clock, Trash2, Pencil } from 'lucide-react'
+import {
+  Users,
+  TrendingUp,
+  Clock,
+  Trash2,
+  Pencil,
+  ChevronRight,
+} from 'lucide-react'
 
 interface FunnelCardProps {
   funnel: FunnelResponse
@@ -28,7 +35,11 @@ export function FunnelCard({
   onView,
   onEdit,
 }: FunnelCardProps) {
-  const { data: metrics, isLoading: metricsLoading } = useQuery({
+  const {
+    data: metrics,
+    isLoading: metricsLoading,
+    isError,
+  } = useQuery({
     ...getFunnelMetricsOptions({
       path: {
         project_id: project.id,
@@ -39,6 +50,7 @@ export function FunnelCard({
         end_date: formatDateForAPI(new Date()),
       },
     }),
+    retry: false,
   })
 
   return (
@@ -91,39 +103,71 @@ export function FunnelCard({
             ))}
           </div>
         ) : metrics ? (
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="flex items-center gap-2">
-              <Users className="h-4 w-4 text-muted-foreground" />
-              <div>
-                <p className="text-sm text-muted-foreground">Total Entries</p>
-                <p className="text-lg font-semibold">
-                  {metrics.total_entries.toLocaleString()}
-                </p>
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="flex items-center gap-2">
+                <Users className="h-4 w-4 text-muted-foreground" />
+                <div>
+                  <p className="text-sm text-muted-foreground">Total Entries</p>
+                  <p className="text-lg font-semibold">
+                    {metrics.total_entries.toLocaleString()}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <TrendingUp className="h-4 w-4 text-muted-foreground" />
+                <div>
+                  <p className="text-sm text-muted-foreground">
+                    Conversion Rate
+                  </p>
+                  <p className="text-lg font-semibold">
+                    {metrics.overall_conversion_rate.toFixed(1)}%
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <Clock className="h-4 w-4 text-muted-foreground" />
+                <div>
+                  <p className="text-sm text-muted-foreground">
+                    Avg. Completion Time
+                  </p>
+                  <p className="text-lg font-semibold">
+                    {Math.round(metrics.average_completion_time_seconds / 60)}m
+                  </p>
+                </div>
               </div>
             </div>
-            <div className="flex items-center gap-2">
-              <TrendingUp className="h-4 w-4 text-muted-foreground" />
-              <div>
-                <p className="text-sm text-muted-foreground">Conversion Rate</p>
-                <p className="text-lg font-semibold">
-                  {metrics.overall_conversion_rate.toFixed(1)}%
-                </p>
+            {metrics.step_conversions.length > 0 && (
+              <div className="flex items-center gap-1 overflow-x-auto">
+                {metrics.step_conversions
+                  .sort((a, b) => a.step_order - b.step_order)
+                  .map((step, index) => (
+                    <div key={step.step_id} className="flex items-center gap-1">
+                      <div className="flex items-center gap-1.5 rounded-md bg-muted/50 px-2.5 py-1.5 text-xs shrink-0">
+                        <span className="font-medium">{step.step_name}</span>
+                        <span className="text-muted-foreground">
+                          {step.completions.toLocaleString()}
+                        </span>
+                        {step.conversion_rate < 100 && (
+                          <span className="text-muted-foreground">
+                            ({step.conversion_rate.toFixed(0)}%)
+                          </span>
+                        )}
+                      </div>
+                      {index < metrics.step_conversions.length - 1 && (
+                        <ChevronRight className="h-3 w-3 text-muted-foreground shrink-0" />
+                      )}
+                    </div>
+                  ))}
               </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <Clock className="h-4 w-4 text-muted-foreground" />
-              <div>
-                <p className="text-sm text-muted-foreground">
-                  Avg. Completion Time
-                </p>
-                <p className="text-lg font-semibold">
-                  {Math.round(metrics.average_completion_time_seconds / 60)}m
-                </p>
-              </div>
-            </div>
+            )}
           </div>
+        ) : isError ? (
+          <p className="text-sm text-muted-foreground">
+            Failed to load metrics
+          </p>
         ) : (
-          <p className="text-muted-foreground">No data available</p>
+          <p className="text-sm text-muted-foreground">No data available</p>
         )}
       </CardContent>
     </Card>

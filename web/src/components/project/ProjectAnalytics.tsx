@@ -1692,7 +1692,8 @@ function FunnelAnalytics({ project }: ProjectAnalyticsProps) {
     location.pathname.includes('/funnels/') &&
     location.pathname.includes('/edit')
   ) {
-    return <EditFunnel project={project} />
+    const funnelId = parseInt(location.pathname.split('/funnels/')[1])
+    return <EditFunnel project={project} funnelId={funnelId} />
   }
 
   const isDetailView =
