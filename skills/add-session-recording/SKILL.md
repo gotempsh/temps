@@ -6,13 +6,15 @@ description: |
 
 # Add Session Recording
 
-Implement privacy-aware session recording with Temps SDK using rrweb under the hood.
+Privacy-aware session recording with Temps SDK (rrweb under the hood).
 
 ## Installation
 
 ```bash
 npm install @temps-sdk/react-analytics
 ```
+
+**Validate**: Confirm the package resolves — run `npm ls @temps-sdk/react-analytics` and check for no peer dependency warnings.
 
 ## Quick Setup
 
@@ -60,6 +62,8 @@ export function Providers({ children }) {
 </SessionRecordingProvider>
 ```
 
+**Validate**: After adding the providers, open DevTools Network tab and look for outgoing requests to `/api/_temps/recordings`. If no requests appear, verify `enabled={true}` and that `TempsAnalyticsProvider` wraps `SessionRecordingProvider`.
+
 ## Control Recording Programmatically
 
 ```tsx
@@ -88,39 +92,24 @@ function RecordingControls() {
 
 ## Privacy Controls
 
-### Block Sensitive Content
+Three methods to protect sensitive content:
 
 ```tsx
-// Method 1: CSS class (configured in provider)
+// CSS class (configured via blockClass in provider)
 <div className="sensitive">
   <CreditCardForm />
 </div>
 
-// Method 2: Data attribute
+// Data attribute — block entirely
 <input type="password" data-rr-block />
+<section data-rr-block><MedicalRecords /></section>
 
-// Method 3: Mask text (shows asterisks in replay)
+// Data attribute — mask (shows asterisks in replay)
 <span data-rr-mask>{socialSecurityNumber}</span>
-```
-
-### Common Patterns
-
-```tsx
-// Payment forms - block entirely
-<form className="sensitive">
-  <input name="card" />
-  <input name="cvv" />
-</form>
-
-// Personal data - mask individual fields
-<input name="ssn" data-rr-block />
 <input name="dob" data-rr-mask />
-
-// Entire sections
-<section data-rr-block>
-  <MedicalRecords />
-</section>
 ```
+
+**Validate**: After adding privacy attributes, record a test session and replay it in the Temps dashboard. Confirm that blocked elements appear as placeholders and masked fields show asterisks.
 
 ## GDPR Consent Flow
 
@@ -195,10 +184,10 @@ function CheckoutPage() {
 }
 ```
 
-## Verification
+## Final Verification
 
-1. Open browser DevTools Network tab
-2. Look for requests to `/api/_temps/recordings`
-3. Interact with your app
-4. Check Temps dashboard for session replays
-5. Verify sensitive data is masked/blocked
+1. Open DevTools Network tab — confirm requests to `/api/_temps/recordings`
+2. Interact with the app to generate recording data
+3. Check Temps dashboard for session replays
+4. Replay a session and verify sensitive data is masked/blocked
+5. Test the GDPR consent flow: decline consent, then confirm no recording requests are sent

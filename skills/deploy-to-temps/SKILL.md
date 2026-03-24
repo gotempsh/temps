@@ -6,7 +6,7 @@ description: |
 
 # Deploy to Temps
 
-Deploy applications to Temps with automatic framework detection and optimized builds.
+Deploy applications to Temps with automatic framework detection.
 
 ## Supported Frameworks
 
@@ -34,22 +34,18 @@ Deploy applications to Temps with automatic framework detection and optimized bu
 ### Via CLI
 
 ```bash
-# Install Temps CLI
 npm install -g @temps-sdk/cli
-
-# Login
 temps login
-
-# Deploy current directory
 temps deploy
-
-# Deploy with specific settings
+# Or with explicit settings:
 temps deploy --project my-app --branch main
 ```
 
+**Validate**: Run `temps whoami` after login to confirm authentication. After `temps deploy`, check the returned deployment URL responds with HTTP 200.
+
 ## Dockerfile Generation
 
-Temps auto-generates optimized Dockerfiles. For custom needs:
+Temps auto-generates Dockerfiles. For custom needs:
 
 ### Next.js (Standalone)
 
@@ -137,19 +133,14 @@ EXPOSE 8080
 CMD ["./main"]
 ```
 
+**Validate**: Build the Docker image locally with `docker build -t test .` and run it with `docker run -p 3000:3000 test` to confirm it starts and serves traffic before deploying.
+
 ## Environment Variables
 
-Configure in Temps dashboard or via CLI:
-
 ```bash
-# Set environment variable
 temps env set DATABASE_URL="postgres://..."
-
-# Set from .env file
-temps env import .env
-
-# List variables
-temps env list
+temps env import .env   # Import from .env file
+temps env list          # Verify all variables are set
 ```
 
 ## Build Configuration
@@ -170,21 +161,20 @@ Create `temps.json` in project root:
 }
 ```
 
+**Validate**: Run `temps env list` to confirm variables are set. Missing variables cause runtime errors, not build errors.
+
 ## Git-based Deployments
 
 ### Auto-deploy on Push
 
-1. In Temps dashboard, enable "Auto-deploy"
-2. Select branches to auto-deploy
-3. Each push triggers a new deployment
+1. Enable "Auto-deploy" in Temps dashboard and select branches
+2. Each push triggers a new deployment
 
 ### Preview Deployments
 
-Enable "Preview deployments" to create unique URLs for each PR.
+Enable "Preview deployments" to generate unique URLs per PR.
 
 ### Deploy Hooks
-
-Create webhooks for custom CI/CD:
 
 ```bash
 curl -X POST https://your-temps.com/api/projects/123/deploy \
@@ -193,22 +183,21 @@ curl -X POST https://your-temps.com/api/projects/123/deploy \
   -d '{"branch": "main", "commit": "abc123"}'
 ```
 
+**Validate**: After setting up auto-deploy, push a test commit and confirm a new deployment appears in the dashboard within 60 seconds.
+
 ## Rollbacks
 
 ```bash
-# List deployments
 temps deployments list
-
-# Rollback to specific deployment
-temps rollback --deployment-id 456
-
-# Rollback to previous
-temps rollback --previous
+temps rollback --deployment-id 456   # Specific deployment
+temps rollback --previous            # Previous deployment
 ```
+
+**Validate**: After rollback, verify the deployment URL serves the expected version. Check `temps deployments list` to confirm the active deployment ID changed.
 
 ## Health Checks
 
-Configure health checks in `temps.json`:
+Configure in `temps.json`:
 
 ```json
 {
@@ -238,17 +227,8 @@ Configure health checks in `temps.json`:
 
 ## Troubleshooting
 
-**Build fails?**
-- Check build logs in dashboard
-- Verify `buildCommand` is correct
-- Ensure all dependencies are in package.json
-
-**Container won't start?**
-- Check `PORT` environment variable is used
-- Verify health check endpoint works
-- Review container logs
-
-**Deployment stuck?**
-- Check resource limits aren't exceeded
-- Verify Docker image builds locally
-- Review deployment logs
+| Symptom | Check |
+|---------|-------|
+| Build fails | Build logs in dashboard, `buildCommand` correctness, missing dependencies |
+| Container won't start | `PORT` env var usage, health check endpoint, container logs |
+| Deployment stuck | Resource limits, local Docker build, deployment logs |

@@ -10,170 +10,59 @@ Configure the Temps MCP server to manage projects and deployments from AI assist
 
 ## Installation
 
-### Option 1: npx (Recommended)
-
-No installation needed - runs directly:
-
-```json
-{
-  "mcpServers": {
-    "temps": {
-      "command": "npx",
-      "args": ["-y", "@temps-sdk/mcp"],
-      "env": {
-        "TEMPS_API_URL": "https://your-temps-instance.com",
-        "TEMPS_API_KEY": "your-api-key"
-      }
-    }
-  }
-}
-```
-
-### Option 2: Global Install
-
-```bash
-npm install -g @temps-sdk/mcp
-```
+**npx (recommended)** — no install needed. Or install globally: `npm install -g @temps-sdk/mcp`
 
 ## Configuration by Client
 
-### Claude Desktop (macOS)
+All clients use the same MCP server block — only the config file location and JSON key differ:
 
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
+| Client | Config file | Root key |
+|--------|------------|----------|
+| Claude Desktop (macOS) | `~/Library/Application Support/Claude/claude_desktop_config.json` | `mcpServers` |
+| Claude Desktop (Windows) | `%APPDATA%\Claude\claude_desktop_config.json` | `mcpServers` |
+| Claude Code (VS Code) | `.vscode/settings.json` or user settings | `claude.mcpServers` |
+
+**Server block** (nest under the appropriate root key):
 
 ```json
-{
-  "mcpServers": {
-    "temps": {
-      "command": "npx",
-      "args": ["-y", "@temps-sdk/mcp"],
-      "env": {
-        "TEMPS_API_URL": "https://your-temps-instance.com",
-        "TEMPS_API_KEY": "your-api-key"
-      }
-    }
+"temps": {
+  "command": "npx",
+  "args": ["-y", "@temps-sdk/mcp"],
+  "env": {
+    "TEMPS_API_URL": "https://your-temps-instance.com",
+    "TEMPS_API_KEY": "your-api-key"
   }
 }
 ```
-
-### Claude Desktop (Windows)
-
-Edit `%APPDATA%\Claude\claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "temps": {
-      "command": "npx",
-      "args": ["-y", "@temps-sdk/mcp"],
-      "env": {
-        "TEMPS_API_URL": "https://your-temps-instance.com",
-        "TEMPS_API_KEY": "your-api-key"
-      }
-    }
-  }
-}
-```
-
-### Claude Code (VS Code)
-
-Add to `.vscode/settings.json` or user settings:
-
-```json
-{
-  "claude.mcpServers": {
-    "temps": {
-      "command": "npx",
-      "args": ["-y", "@temps-sdk/mcp"],
-      "env": {
-        "TEMPS_API_URL": "https://your-temps-instance.com",
-        "TEMPS_API_KEY": "your-api-key"
-      }
-    }
-  }
-}
-```
-
-## Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `TEMPS_API_URL` | Yes | Your Temps instance URL |
-| `TEMPS_API_KEY` | Yes | API key from Temps dashboard |
 
 ### Getting Your API Key
 
-1. Log into your Temps dashboard
-2. Navigate to Settings > API Keys
-3. Create a new API key with appropriate permissions
-4. Copy the key (it's only shown once)
+1. Log into Temps dashboard → Settings → API Keys
+2. Create a new key with appropriate permissions
+3. Copy immediately (shown once only)
 
 ## Available Tools
 
-Once configured, these tools become available:
-
-### list_projects
-
-List all projects in your Temps instance.
-
-```
-Parameters:
-- page (optional): Page number, default 1
-- page_size (optional): Items per page, default 20, max 100
-```
-
-### get_project
-
-Get details of a specific project.
-
-```
-Parameters:
-- project_id (required): The project ID
-```
-
-### list_deployments
-
-List deployments for a project.
-
-```
-Parameters:
-- project_id (required): The project ID
-- page (optional): Page number, default 1
-- page_size (optional): Items per page, default 20, max 100
-```
+| Tool | Required params | Optional params | Description |
+|------|----------------|-----------------|-------------|
+| `list_projects` | — | `page` (default 1), `page_size` (default 20, max 100) | List all projects |
+| `get_project` | `project_id` | — | Get project details |
+| `list_deployments` | `project_id` | `page` (default 1), `page_size` (default 20, max 100) | List project deployments |
 
 ## Available Prompts
 
-### add_react_analytics
-
-Guided setup for adding Temps analytics to React applications.
-
-```
-Arguments:
-- framework (required): nextjs-app, nextjs-pages, vite, cra, remix
-- project_id (optional): Your Temps project ID
-```
+| Prompt | Required args | Optional args | Description |
+|--------|--------------|---------------|-------------|
+| `add_react_analytics` | `framework` (nextjs-app, nextjs-pages, vite, cra, remix) | `project_id` | Guided React analytics setup |
 
 ## Verification
 
-After configuration, restart your client and verify:
-
-1. Ask: "List my Temps projects"
-2. The assistant should use `list_projects` tool
-3. You should see your projects listed
+After configuration, restart your client, then ask: "List my Temps projects" — the assistant should invoke `list_projects` and return results.
 
 ## Troubleshooting
 
-**Tools not appearing?**
-- Restart your MCP client completely
-- Verify JSON syntax is valid
-- Check that npx is in your PATH
-
-**Connection errors?**
-- Verify TEMPS_API_URL is accessible
-- Check API key has correct permissions
-- Try accessing the URL in a browser
-
-**Permission denied?**
-- Ensure API key has read permissions for projects
-- Check API key hasn't expired
+| Symptom | Checks |
+|---------|--------|
+| Tools not appearing | Restart MCP client; verify JSON syntax; confirm `npx` is in PATH |
+| Connection errors | Verify `TEMPS_API_URL` is reachable; check API key permissions |
+| Permission denied | Ensure API key has read permissions; check key hasn't expired |

@@ -1,6 +1,6 @@
 ---
 name: temps-plugin
-description: >
+description: |
   Build external plugins for the Temps deployment platform. Use when the user wants to create, modify,
   or debug a Temps plugin binary — a standalone Rust process that communicates with Temps over a Unix
   domain socket. Also use when the user mentions "temps plugin", "external plugin", "plugin binary",
@@ -25,6 +25,7 @@ Temps (main process)
   ├── Proxies /api/x/{plugin_name}/* → Unix socket
   ├── Serves plugin UI at /api/x/{plugin_name}/ui/*
   └── Delivers platform events over the WebSocket channel
+      (plugin exits if WebSocket not connected within 30s — ensure Temps is running)
 ```
 
 Plugins are **self-contained binaries**. They own their own HTTP routes (axum Router), optional React UI (embedded via `include_dir`), and SQLite database (via sea-orm in their `data_dir`).
@@ -233,8 +234,10 @@ impl ExternalPlugin for YourPlugin {
             .route("/ui", get(redirect_to_ui))
             .route("/ui/", get(serve_ui_index))
             .route("/ui/{*path}", get(serve_ui_asset))
-            // DO NOT add /health — SDK already provides it!
+            // DO NOT add /health — SDK already provides it (axum panics on duplicate routes)!
             .with_state(state)
+            // WARNING: router() runs inside a tokio runtime — block_on() deadlocks.
+            // Always use block_in_place(|| Handle::current().block_on(...)) as shown above.
     }
 
     fn on_event(&self, _ctx: &PluginContext, event: temps_core::external_plugin::PluginEvent) {
@@ -251,7 +254,7 @@ temps_plugin_sdk::main!(YourPlugin);
 
 ### 4. UI Serving Handlers
 
-These are the same for every plugin — copy verbatim:
+Standard boilerplate for all plugins — `redirect_to_ui` (301 → `ui/`), `serve_ui_index`, `serve_ui_asset` (with SPA fallback), and `serve_embedded_file` (mime detection + cache headers: `no-cache` for index.html, immutable for assets):
 
 ```rust
 async fn redirect_to_ui() -> Response {
@@ -262,15 +265,11 @@ async fn redirect_to_ui() -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-async fn serve_ui_index() -> Response {
-    serve_embedded_file(ui_dist(), "index.html")
-}
+async fn serve_ui_index() -> Response { serve_embedded_file(ui_dist(), "index.html") }
 
 async fn serve_ui_asset(Path(path): Path<String>) -> Response {
     let dist = ui_dist();
-    if dist.get_file(&path).is_some() {
-        return serve_embedded_file(dist, &path);
-    }
+    if dist.get_file(&path).is_some() { return serve_embedded_file(dist, &path); }
     serve_embedded_file(dist, "index.html")  // SPA fallback
 }
 
@@ -414,7 +413,7 @@ pub struct UpdateSettings {
 
 ### 8. React UI (web/)
 
-**vite.config.ts** — Critical: `base` must match the Temps proxy path:
+**vite.config.ts** — `base` MUST be `/api/x/{plugin_name}/ui/` (with trailing slash) or JS/CSS assets will 404:
 
 ```ts
 import { defineConfig } from "vite";
@@ -452,22 +451,15 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 ```
 
-**router.ts** — Hash-based routing (plugins run in an iframe):
+**router.ts** — Hash-based routing (plugins run in an iframe). Cache the parsed route in `getSnapshot()` — `useSyncExternalStore` compares by reference (`Object.is`), so returning a new object each time causes infinite re-renders:
 
 ```ts
-import { useSyncExternalStore, useCallback } from "react";
-
-// IMPORTANT: useSyncExternalStore compares by reference (Object.is).
-// Cache the parsed route to avoid infinite re-renders.
 let cachedHash = "";
 let cachedRoute: Route = { kind: "list" };
 
 function getSnapshot(): Route {
   const hash = window.location.hash;
-  if (hash !== cachedHash) {
-    cachedHash = hash;
-    cachedRoute = parseHash(hash);
-  }
+  if (hash !== cachedHash) { cachedHash = hash; cachedRoute = parseHash(hash); }
   return cachedRoute;
 }
 ```
@@ -503,32 +495,23 @@ mod tests {
 }
 ```
 
-Run tests: `cargo test -p temps-your-plugin`
+**Validate:** `cargo test -p temps-your-plugin` passes all tests. Run `cargo check -p temps-your-plugin` after every modification.
 
 ## Build & Deploy
 
 ```bash
-# Check compilation
-cargo check -p temps-your-plugin
-
-# Run tests
-cargo test -p temps-your-plugin
-
-# Build without UI (fast, for Rust dev)
-cargo build -p temps-your-plugin
-
-# Build the web UI separately
-cd examples/your-plugin/web && bun install && bun run build
-
-# Build with embedded UI
-FORCE_WEB_BUILD=1 cargo build -p temps-your-plugin
+cargo check -p temps-your-plugin                     # check compilation
+cargo test -p temps-your-plugin                      # run tests
+cargo build -p temps-your-plugin                     # build without UI (fast)
+FORCE_WEB_BUILD=1 cargo build -p temps-your-plugin   # build with embedded UI
 
 # Symlink into plugins directory for local dev
 ln -sf $(pwd)/target/debug/temps-your-plugin crates/temps-cli/temps_data/plugins/
-
-# Restart Temps to pick up the new plugin
-# (reload only restarts plugins, not the server — but new plugins need a full restart)
 ```
+
+**After rebuilding:** Restart Temps to pick up the new binary — the symlink points to `target/debug/...` but Temps keeps the old process running. Set `RUST_LOG=temps_external_plugins=debug` to see plugin stderr in Temps logs.
+
+**Validate:** After restart, the plugin appears in the console sidebar and `curl localhost:3000/api/x/your-plugin/health` returns OK.
 
 ## Available Platform Events
 
@@ -541,14 +524,6 @@ Subscribe via `.event("event_name")` in the manifest builder:
 
 Events are delivered over the WebSocket channel and fall back to HTTP `POST /_events`.
 
-## Common Gotchas
-
-1. **Duplicate /health route** — The SDK runtime registers `/health`. Adding it in your router causes an axum panic on merge.
-2. **Deadlock in router()** — `router()` is called from within a tokio runtime. Using `block_on()` directly deadlocks. Must use `block_in_place(|| Handle::current().block_on(...))`.
-3. **Plugin not loading after rebuild** — The symlink points to `target/debug/...`. After `cargo build`, the binary is updated but Temps keeps the old process. Must restart Temps (or use Reload Plugins in the UI if the binary signature hasn't changed).
-4. **Plugin stderr not visible** — Set `RUST_LOG=temps_external_plugins=debug` to see plugin stderr output in Temps logs.
-5. **Vite base path mismatch** — The `base` in `vite.config.ts` must be `/api/x/{plugin_name}/ui/` (with trailing slash). A mismatch causes 404s for JS/CSS assets.
-6. **Channel timeout** — If Temps doesn't connect the WebSocket channel within 30s, the plugin exits. This usually means Temps isn't running or can't reach the socket.
 
 ## Reference Implementations
 

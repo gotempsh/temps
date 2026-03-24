@@ -37,6 +37,10 @@ Temps automatically:
 2. Provisions Let's Encrypt certificate
 3. Enables HTTPS
 
+> **Checkpoint**: Confirm the domain shows "Active" status in Dashboard > Domains before proceeding to advanced configuration.
+
+---
+
 ## Challenge Types
 
 ### HTTP-01 (Default)
@@ -64,6 +68,10 @@ Required for wildcard domains (`*.example.com`).
 
 3. Temps creates DNS TXT record automatically
 
+> **Checkpoint**: Verify the TXT record was created by running `dig -t TXT _acme-challenge.example.com` before proceeding.
+
+---
+
 ## Wildcard Domains
 
 For `*.example.com` to match `app.example.com`, `api.example.com`, etc:
@@ -90,6 +98,8 @@ For `*.example.com` to match `app.example.com`, `api.example.com`, etc:
    *.example.com
    ```
 
+---
+
 ## DNS Records Reference
 
 ### Subdomain (Recommended)
@@ -114,6 +124,8 @@ example.com -> CNAME -> your-project.temps.io (proxied)
 ```
 *.example.com -> CNAME -> your-project.temps.io
 ```
+
+---
 
 ## Certificate Management
 
@@ -162,6 +174,8 @@ Add both domains and configure redirect:
 
 Automatic - all HTTP requests redirect to HTTPS.
 
+---
+
 ## Troubleshooting
 
 **DNS not propagating?**
@@ -183,6 +197,8 @@ Automatic - all HTTP requests redirect to HTTPS.
 - Clear browser cache
 - Check certificate in browser: `https://app.example.com`
 - Verify intermediate certificates are served
+
+---
 
 ## API Reference
 

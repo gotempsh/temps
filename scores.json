@@ -1,0 +1,14 @@
+{
+  "repo": "gotempsh/temps",
+  "skills": [
+    { "name": "add-custom-domain", "before": 96, "after": 96 },
+    { "name": "add-node-sdk", "before": 90, "after": 96 },
+    { "name": "add-react-analytics", "before": 94, "after": 100 },
+    { "name": "add-session-recording", "before": 90, "after": 100 },
+    { "name": "deploy-to-temps", "before": 90, "after": 96 },
+    { "name": "temps-cli", "before": 100, "after": 100 },
+    { "name": "temps-mcp-setup", "before": 89, "after": 100 },
+    { "name": "temps-platform-setup", "before": 89, "after": 93 },
+    { "name": "temps-plugin", "before": 89, "after": 93 }
+  ]
+}

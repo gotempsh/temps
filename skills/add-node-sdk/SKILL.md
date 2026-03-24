@@ -30,18 +30,11 @@ const temps = new Temps({
 });
 ```
 
+**Validate**: Confirm `TEMPS_API_KEY` and `TEMPS_PROJECT_ID` are set in your environment. The SDK throws `TempsError` on initialization if the API key is missing or invalid.
+
 ## Server-Side Event Tracking
 
-Track events from your backend:
-
 ```typescript
-import { Temps } from '@temps-sdk/node';
-
-const temps = new Temps({
-  apiKey: process.env.TEMPS_API_KEY,
-  projectId: process.env.TEMPS_PROJECT_ID,
-});
-
 // Track an event
 await temps.track('purchase_completed', {
   userId: 'user_123',
@@ -87,9 +80,9 @@ app.use((req, res, next) => {
 });
 ```
 
-## KV Storage
+**Validate**: After calling `temps.track()`, verify events appear in the Temps dashboard under your project's analytics tab. Check for `TempsError` or `RateLimitError` if events are not recorded.
 
-Simple key-value storage with automatic JSON serialization:
+## KV Storage
 
 ```typescript
 import { KV } from '@temps-sdk/kv';
@@ -140,9 +133,9 @@ const result = await kv.list({
 });
 ```
 
-## Blob Storage
+**Validate**: Test `kv.set()` then `kv.get()` for the same key. A successful round-trip confirms connectivity and serialization are working.
 
-Store and retrieve files:
+## Blob Storage
 
 ```typescript
 import { Blob } from '@temps-sdk/blob';
@@ -223,9 +216,9 @@ try {
 }
 ```
 
-## TypeScript Support
+**Validate**: After `blob.put()`, call `blob.get()` for the same path. For signed URLs, open the URL in a browser to confirm access and expiry behavior.
 
-Full TypeScript support with generics:
+## TypeScript Support
 
 ```typescript
 interface User {
@@ -255,8 +248,8 @@ await kv.set<User>('user:123', {
 
 ## Best Practices
 
-1. **Initialize once**: Create SDK instance at app startup
-2. **Use environment variables**: Never hardcode API keys
-3. **Handle errors gracefully**: Wrap SDK calls in try/catch
-4. **Use namespaces in KV**: Organize keys by feature/domain
-5. **Set TTLs appropriately**: Don't store temporary data forever
+- Initialize the SDK once at app startup
+- Never hardcode API keys — use environment variables
+- Wrap all SDK calls in try/catch (see Error Handling above)
+- Use KV namespaces to organize keys by feature/domain
+- Set TTLs on temporary data to avoid unbounded storage growth

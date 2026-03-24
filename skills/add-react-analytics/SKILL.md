@@ -17,7 +17,7 @@ npm install @temps-sdk/react-analytics
 
 ## Framework Setup
 
-Detect the user's framework and apply the appropriate setup:
+Detect the user's framework and apply the matching setup below.
 
 ### Next.js App Router (13+)
 
@@ -86,6 +86,10 @@ export default function App() {
 }
 ```
 
+> **Checkpoint**: After wrapping your app with `TempsAnalyticsProvider`, start the dev server and confirm no console errors appear. Check the Network tab for requests to `/api/_temps` on page load.
+
+---
+
 ## Provider Configuration
 
 ```tsx
@@ -103,6 +107,8 @@ export default function App() {
   {children}
 </TempsAnalyticsProvider>
 ```
+
+---
 
 ## Available Hooks
 
@@ -164,6 +170,8 @@ function UserProfile({ user }) {
 }
 ```
 
+---
+
 ## Session Recording
 
 For privacy-aware session replay, see [SESSION_RECORDING.md](references/SESSION_RECORDING.md).
@@ -180,10 +188,13 @@ import { SessionRecordingProvider } from '@temps-sdk/react-analytics';
 </SessionRecordingProvider>
 ```
 
+---
+
 ## Verification Checklist
 
-After implementation:
+After implementation, confirm each step before considering the integration complete:
+
 1. Check browser DevTools Network tab for `/api/_temps` requests
 2. Verify events appear in Temps dashboard
-3. Test session recording playback
-4. Confirm Web Vitals are being captured
+3. Test session recording playback (if enabled)
+4. Confirm Web Vitals are being captured in the Performance section
