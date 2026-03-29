@@ -39,7 +39,7 @@ jobs:
       TEMPS_DATA_DIR: /tmp/temps-data
       ADMIN_EMAIL: admin@localho.st
       ADMIN_PASSWORD: E2eTestPass123!
-      API_BASE: http://localhost:8081
+      API_BASE: http://localhost:8081/api
 
     steps:
       - name: Free up disk space
@@ -257,14 +257,21 @@ jobs:
               continue
             fi
 
-            PROJECT_ID=$(echo "$CREATE_BODY" | jq -r '.id')
+            PROJECT_ID=$(echo "$CREATE_BODY" | jq -r '.id' 2>/dev/null || true)
+            if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "null" ]; then
+              echo "FAIL: Could not parse project ID from response"
+              echo "$CREATE_BODY"
+              RESULTS+=("$APP_NAME: FAIL (parse project ID)")
+              FAILED=$((FAILED + 1))
+              continue
+            fi
             echo "Project created: id=$PROJECT_ID"
 
             # --- Get production environment ID ---
             ENV_RESPONSE=$(curl -s \
               -H "Authorization: Bearer $API_KEY" \
               "$API_BASE/projects/$PROJECT_ID/environments")
-            ENV_ID=$(echo "$ENV_RESPONSE" | jq -r '.[0].id // .environments[0].id // empty')
+            ENV_ID=$(echo "$ENV_RESPONSE" | jq -r '.[0].id // .environments[0].id // empty' 2>/dev/null || true)
 
             if [ -z "$ENV_ID" ]; then
               echo "FAIL: Could not find environment for project $PROJECT_ID"
@@ -304,8 +311,8 @@ jobs:
                 -H "Authorization: Bearer $API_KEY" \
                 "$API_BASE/projects/$PROJECT_ID/deployments?per_page=1")
 
-              DEPLOY_STATE=$(echo "$DEPLOY_LIST" | jq -r '.deployments[0].status // "pending"')
-              DEPLOY_ID=$(echo "$DEPLOY_LIST" | jq -r '.deployments[0].id // empty')
+              DEPLOY_STATE=$(echo "$DEPLOY_LIST" | jq -r '.deployments[0].status // "pending"' 2>/dev/null || echo "pending")
+              DEPLOY_ID=$(echo "$DEPLOY_LIST" | jq -r '.deployments[0].id // empty' 2>/dev/null || true)
 
               if [ "$DEPLOY_STATE" = "running" ] || [ "$DEPLOY_STATE" = "deployed" ] || [ "$DEPLOY_STATE" = "completed" ]; then
                 echo "Deployment $DEPLOY_ID reached state: $DEPLOY_STATE"
