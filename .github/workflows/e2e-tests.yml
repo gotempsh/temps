@@ -135,6 +135,13 @@ jobs:
             --skip-geolite2-download \
             --output-format json
 
+      - name: Prepare temps runtime files
+        run: |
+          # Sync encryption key to working directory (temps serve reads from cwd)
+          cp "$TEMPS_DATA_DIR/encryption_key" ./encryption_key 2>/dev/null || true
+          # Symlink GeoLite2 to working directory
+          ln -sf "$TEMPS_DATA_DIR/GeoLite2-City.mmdb" ./GeoLite2-City.mmdb 2>/dev/null || true
+
       - name: Start temps serve
         run: |
           ./target/release/temps serve \
@@ -143,9 +150,17 @@ jobs:
             --address 0.0.0.0:3000 \
             --tls-address 0.0.0.0:3443 \
             --disable-https-redirect \
-            --screenshot-provider noop &
+            --screenshot-provider noop \
+            > /tmp/temps.log 2>&1 &
           echo $! > /tmp/temps.pid
           echo "Temps server started with PID $(cat /tmp/temps.pid)"
+          # Give it a moment to either start or crash
+          sleep 3
+          if ! kill -0 $(cat /tmp/temps.pid) 2>/dev/null; then
+            echo "ERROR: Temps server died immediately. Logs:"
+            cat /tmp/temps.log
+            exit 1
+          fi
 
       - name: Wait for platform health
         run: |
@@ -378,6 +393,14 @@ jobs:
         if: failure()
         run: |
           echo "=== Temps server logs (last 100 lines) ==="
+          if [ -f /tmp/temps.log ]; then
+            tail -100 /tmp/temps.log
+          else
+            echo "No temps log file found"
+          fi
+
+          echo ""
+          echo "=== Temps process status ==="
           if [ -f /tmp/temps.pid ]; then
             PID=$(cat /tmp/temps.pid)
             echo "Temps PID: $PID"
