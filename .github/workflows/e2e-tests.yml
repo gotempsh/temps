@@ -39,7 +39,7 @@ jobs:
       TEMPS_DATA_DIR: /tmp/temps-data
       ADMIN_EMAIL: admin@localho.st
       ADMIN_PASSWORD: E2eTestPass123!
-      API_BASE: http://localhost:8081/api
+      API_BASE: http://localhost:8081
 
     steps:
       - name: Free up disk space
@@ -285,8 +285,8 @@ jobs:
             # --- Get production environment ID ---
             ENV_RESPONSE=$(curl -s \
               -H "Authorization: Bearer $API_KEY" \
-              "$API_BASE/projects/$PROJECT_ID")
-            ENV_ID=$(echo "$ENV_RESPONSE" | jq -r '.environments[0].id // empty')
+              "$API_BASE/projects/$PROJECT_ID/environments")
+            ENV_ID=$(echo "$ENV_RESPONSE" | jq -r '.[0].id // .environments[0].id // empty')
 
             if [ -z "$ENV_ID" ]; then
               echo "FAIL: Could not find environment for project $PROJECT_ID"
