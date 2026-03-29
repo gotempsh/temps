@@ -281,24 +281,12 @@ jobs:
             fi
             echo "Environment ID: $ENV_ID"
 
-            # --- Trigger pipeline ---
-            TRIGGER_RESPONSE=$(curl -s -w "\n%{http_code}" \
-              -X POST "$API_BASE/projects/$PROJECT_ID/trigger-pipeline" \
-              -H "Authorization: Bearer $API_KEY" \
-              -H "Content-Type: application/json" \
-              -d "{\"branch\": \"$BRANCH\", \"environment_id\": $ENV_ID}")
-
-            HTTP_CODE=$(echo "$TRIGGER_RESPONSE" | tail -1)
-            TRIGGER_BODY=$(echo "$TRIGGER_RESPONSE" | head -n -1)
-
-            if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
-              echo "FAIL: Pipeline trigger failed with HTTP $HTTP_CODE"
-              echo "$TRIGGER_BODY" | jq . 2>/dev/null || echo "$TRIGGER_BODY"
-              RESULTS+=("$APP_NAME: FAIL (trigger pipeline)")
-              FAILED=$((FAILED + 1))
-              continue
-            fi
-            echo "Pipeline triggered successfully"
+            # Project creation auto-triggers the initial deployment via queue.
+            # Do NOT call trigger-pipeline here — it would create a second deployment
+            # that cancels the first via cancel_in_flight_deployments, causing a race
+            # where polling sees the cancelled deployment instead of the new one.
+            echo "Waiting for auto-triggered deployment to be created..."
+            sleep 5
 
             # --- Poll deployment status ---
             echo "Polling deployment status (timeout: 10 minutes)..."
