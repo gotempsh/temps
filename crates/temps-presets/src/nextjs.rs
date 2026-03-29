@@ -745,6 +745,17 @@ mod tests {
 
         let project_dir = temp_dir.join("nextjs-hello-world");
 
+        // Remove node_modules from copied fixture — Docker must install its own
+        // (local node_modules may contain platform-specific binaries)
+        let _ = std::fs::remove_dir_all(project_dir.join("node_modules"));
+
+        // Write .dockerignore to prevent node_modules from leaking into build context
+        std::fs::write(
+            project_dir.join(".dockerignore"),
+            "node_modules\n.next\n",
+        )
+        .expect("Failed to write .dockerignore");
+
         // Generate Dockerfile using the preset
         let preset = NextJs;
         let dockerfile_result = preset.dockerfile(DockerfileConfig {
@@ -772,6 +783,7 @@ mod tests {
         let build_result = Command::new("docker")
             .args([
                 "build",
+                "--no-cache",
                 "-t", &image_name,
                 "-f", dockerfile_path.to_str().unwrap(),
                 project_dir.to_str().unwrap(),
@@ -800,7 +812,14 @@ mod tests {
 
         // Run the container
         let container_name = format!("temps-nextjs-test-{}", test_id);
-        let host_port = 3099; // Use a non-standard port to avoid conflicts
+
+        // Clean up any stale containers from previous test runs
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &container_name])
+            .output();
+
+        // Use a dynamic port to avoid conflicts
+        let host_port = 30000 + (test_id % 10000) as u16;
 
         println!("Starting container: {}", container_name);
 
