@@ -178,45 +178,23 @@ jobs:
           curl -s -o /dev/null -w "Console HTTP %{http_code}" http://localhost:8081/
           echo ""
 
-      - name: Authenticate and create API key
+      - name: Create API key via CLI
         id: auth
         run: |
-          # Login to get session cookie
-          LOGIN_RESPONSE=$(curl -s -w "\n%{http_code}" -c /tmp/cookies.txt \
-            -X POST "$API_BASE/auth/login" \
-            -H "Content-Type: application/json" \
-            -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASSWORD\"}")
+          API_OUTPUT=$(./target/release/temps api-key \
+            --database-url "$DATABASE_URL" \
+            --name "e2e-test" \
+            --role admin \
+            --output-format json 2>&1)
+          echo "CLI output: $API_OUTPUT"
 
-          HTTP_CODE=$(echo "$LOGIN_RESPONSE" | tail -1)
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "Login failed with HTTP $HTTP_CODE"
-            echo "$LOGIN_RESPONSE" | head -n -1
-            exit 1
-          fi
-          echo "Login successful"
-
-          # Create API key using session cookie
-          APIKEY_RESPONSE=$(curl -s -w "\n%{http_code}" -b /tmp/cookies.txt \
-            -X POST "$API_BASE/api-keys" \
-            -H "Content-Type: application/json" \
-            -d '{"name":"e2e-test","role_type":"admin"}')
-
-          HTTP_CODE=$(echo "$APIKEY_RESPONSE" | tail -1)
-          APIKEY_BODY=$(echo "$APIKEY_RESPONSE" | head -n -1)
-          if [ "$HTTP_CODE" != "201" ] && [ "$HTTP_CODE" != "200" ]; then
-            echo "API key creation failed with HTTP $HTTP_CODE"
-            echo "$APIKEY_BODY"
+          API_KEY=$(echo "$API_OUTPUT" | jq -r '.api_key // empty' 2>/dev/null)
+          if [ -z "$API_KEY" ]; then
+            echo "Failed to extract API key from CLI output"
             exit 1
           fi
 
-          API_KEY=$(echo "$APIKEY_BODY" | jq -r '.api_key' 2>/dev/null || true)
-          if [ -z "$API_KEY" ] || [ "$API_KEY" = "null" ]; then
-            echo "Failed to extract API key from response"
-            echo "$APIKEY_BODY"
-            exit 1
-          fi
-
-          echo "API key created successfully"
+          echo "API key created: ${API_KEY:0:12}..."
           echo "api_key=$API_KEY" >> $GITHUB_OUTPUT
 
       - name: Deploy example applications
