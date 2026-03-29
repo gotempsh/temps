@@ -30,12 +30,20 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Cache wasm-pack binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: ${{ runner.os }}-wasm-pack-0.13
+
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install wasm-pack and Build WASM
         run: |
-          cargo install wasm-pack
+          if [ ! -f ~/.cargo/bin/wasm-pack ]; then
+            cargo install wasm-pack
+          fi
           cd crates/temps-captcha-wasm
           bun run build
 
@@ -79,12 +87,20 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Cache wasm-pack binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: ${{ runner.os }}-wasm-pack-0.13
+
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install wasm-pack and Build WASM
         run: |
-          cargo install wasm-pack
+          if [ ! -f ~/.cargo/bin/wasm-pack ]; then
+            cargo install wasm-pack
+          fi
           cd crates/temps-captcha-wasm
           bun run build
 
@@ -122,12 +138,20 @@ jobs:
           shared-key: test-build
           save-if: true
 
+      - name: Cache wasm-pack binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: ${{ runner.os }}-wasm-pack-0.13
+
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install wasm-pack and Build WASM
         run: |
-          cargo install wasm-pack
+          if [ ! -f ~/.cargo/bin/wasm-pack ]; then
+            cargo install wasm-pack
+          fi
           cd crates/temps-captcha-wasm
           bun run build
 
@@ -205,12 +229,20 @@ jobs:
           shared-key: test-build
           save-if: false
 
+      - name: Cache wasm-pack binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: ${{ runner.os }}-wasm-pack-0.13
+
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install wasm-pack and Build WASM
         run: |
-          cargo install wasm-pack
+          if [ ! -f ~/.cargo/bin/wasm-pack ]; then
+            cargo install wasm-pack
+          fi
           cd crates/temps-captcha-wasm
           bun run build
 
@@ -340,12 +372,20 @@ jobs:
           shared-key: test-build
           save-if: false
 
+      - name: Cache wasm-pack binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: ${{ runner.os }}-wasm-pack-0.13
+
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install wasm-pack and Build WASM
         run: |
-          cargo install wasm-pack
+          if [ ! -f ~/.cargo/bin/wasm-pack ]; then
+            cargo install wasm-pack
+          fi
           cd crates/temps-captcha-wasm
           bun run build
 
