@@ -193,8 +193,9 @@ impl DownloadRepoJob {
     }
 
     /// Create temporary directory for repository
-    /// Uses unix epoch timestamp to avoid conflicts when reinstalling temps with reused deployment IDs
-    fn create_temp_dir(&self, _context: &WorkflowContext) -> Result<PathBuf, WorkflowError> {
+    /// Uses deployment ID + timestamp to guarantee uniqueness across concurrent deployments
+    /// and across reinstalls with reused deployment IDs
+    fn create_temp_dir(&self, context: &WorkflowContext) -> Result<PathBuf, WorkflowError> {
         use std::time::SystemTime;
 
         let unix_epoch = SystemTime::now()
@@ -202,8 +203,10 @@ impl DownloadRepoJob {
             .map_err(|e| WorkflowError::Other(format!("Failed to get unix timestamp: {}", e)))?
             .as_secs();
 
-        let temp_dir = std::path::PathBuf::from("/tmp/temps-deployments")
-            .join(format!("deployment-{}", unix_epoch));
+        let temp_dir = std::path::PathBuf::from("/tmp/temps-deployments").join(format!(
+            "deployment-{}-{}",
+            context.deployment_id, unix_epoch
+        ));
         std::fs::create_dir_all(&temp_dir).map_err(WorkflowError::IoError)?;
         Ok(temp_dir)
     }
