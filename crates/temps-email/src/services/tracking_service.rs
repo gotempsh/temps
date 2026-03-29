@@ -3,6 +3,7 @@
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder,
 };
 use std::sync::Arc;
 use temps_entities::{email_events, email_links, emails};
@@ -290,7 +291,10 @@ impl TrackingService {
             query = query.filter(email_events::Column::EventType.eq(et));
         }
 
-        let events = query.all(self.db.as_ref()).await?;
+        let events = query
+            .order_by_asc(email_events::Column::Id)
+            .all(self.db.as_ref())
+            .await?;
         Ok(events)
     }
 
