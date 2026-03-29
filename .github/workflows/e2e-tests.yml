@@ -15,7 +15,6 @@ jobs:
   e2e-test:
     name: E2E Deployment Tests
     runs-on: ubuntu-latest
-    # Run after the test build job from rust-tests.yml to reuse its Rust cache
     needs: []
     timeout-minutes: 60
 
@@ -40,7 +39,7 @@ jobs:
       TEMPS_DATA_DIR: /tmp/temps-data
       ADMIN_EMAIL: admin@localho.st
       ADMIN_PASSWORD: E2eTestPass123!
-      API_BASE: http://localhost:3000
+      API_BASE: http://localhost:8081/api
 
     steps:
       - name: Free up disk space
@@ -60,12 +59,11 @@ jobs:
         with:
           bun-version: latest
 
-      # Reuse the same Rust dependency cache as rust-tests.yml build-tests job
-      - name: Restore Rust cache
+      - name: Rust cache (release build)
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test-build
-          save-if: false
+          shared-key: e2e-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cache Bun dependencies
         uses: actions/cache@v4
@@ -75,12 +73,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-bun-
 
+      - name: Cache wasm-pack binary
+        id: wasm-pack-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: ${{ runner.os }}-wasm-pack-0.13
+
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install wasm-pack and build WASM
         run: |
-          cargo install wasm-pack
+          if [ ! -f ~/.cargo/bin/wasm-pack ]; then
+            cargo install wasm-pack
+          fi
           cd crates/temps-captcha-wasm
           bun install
           bun run build
@@ -149,6 +156,7 @@ jobs:
             --data-dir "$TEMPS_DATA_DIR" \
             --address 0.0.0.0:3000 \
             --tls-address 0.0.0.0:3443 \
+            --console-address 0.0.0.0:8081 \
             --disable-https-redirect \
             --screenshot-provider noop \
             > /tmp/temps.log 2>&1 &
@@ -165,9 +173,9 @@ jobs:
       - name: Wait for platform health
         run: |
           echo "Waiting for Temps to become healthy..."
-          timeout 120 bash -c 'until curl -sf http://localhost:3000/health > /dev/null 2>&1; do sleep 2; done'
+          timeout 120 bash -c 'until curl -sf http://localhost:8081/ > /dev/null 2>&1; do sleep 2; done'
           echo "Platform is healthy"
-          curl -s http://localhost:3000/health | head -c 200
+          curl -s -o /dev/null -w "Console HTTP %{http_code}" http://localhost:8081/
           echo ""
 
       - name: Authenticate and create API key
@@ -201,7 +209,7 @@ jobs:
             exit 1
           fi
 
-          API_KEY=$(echo "$APIKEY_BODY" | jq -r '.api_key')
+          API_KEY=$(echo "$APIKEY_BODY" | jq -r '.api_key' 2>/dev/null || true)
           if [ -z "$API_KEY" ] || [ "$API_KEY" = "null" ]; then
             echo "Failed to extract API key from response"
             echo "$APIKEY_BODY"
