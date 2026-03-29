@@ -97,6 +97,13 @@ jobs:
           FORCE_WEB_BUILD: 1
           CARGO_INCREMENTAL: 0
 
+      - name: Generate self-signed localho.st certificate
+        run: |
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -keyout localho.st.key -out localho.st.crt \
+            -days 1 -nodes -subj "/CN=localho.st" \
+            -addext "subjectAltName=DNS:localho.st,DNS:*.localho.st"
+
       - name: Install localho.st certificate into trust store
         run: |
           sudo cp localho.st.crt /usr/local/share/ca-certificates/localho.st.crt
