@@ -43,6 +43,7 @@ import { useForm } from 'react-hook-form'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import { useEnterSubmit } from '@/hooks/useEnterSubmit'
 
 type DnsProviderType =
   | 'cloudflare'
@@ -670,6 +671,14 @@ export function AddDnsProvider() {
   }
 
   const selectedProvider = PROVIDERS.find((p) => p.type === providerType)
+
+  const handleEnterSubmit = useEnterSubmit(() => {
+    if (currentStep === 'credentials') {
+      handleSubmit()
+    } else {
+      handleNext()
+    }
+  })
 
   // Render basic information form fields based on provider type
   const renderBasicInfoFields = () => {
@@ -1342,7 +1351,7 @@ export function AddDnsProvider() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="space-y-6 p-6 max-w-3xl mx-auto">
+      <div className="space-y-6 p-6 max-w-3xl mx-auto" onKeyDown={handleEnterSubmit}>
         {/* Header */}
         <div className="flex items-center gap-4">
           <Button

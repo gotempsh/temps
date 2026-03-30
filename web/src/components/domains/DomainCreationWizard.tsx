@@ -27,6 +27,7 @@ import { useCallback, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import { useEnterSubmit } from '@/hooks/useEnterSubmit'
 
 const domainWizardSchema = z.object({
   domain: z
@@ -137,9 +138,17 @@ export function DomainCreationWizard({
 
   const watchedValues = useWatch({ control: form.control })
 
+  const handleEnterSubmit = useEnterSubmit(() => {
+    if (step === 'confirm') {
+      form.handleSubmit(handleSubmit)()
+    } else {
+      handleNext()
+    }
+  })
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl">
+      <DialogContent className="sm:max-w-2xl" onKeyDown={handleEnterSubmit}>
         <DialogHeader>
           <DialogTitle>Add New Domain & Certificate</DialogTitle>
         </DialogHeader>

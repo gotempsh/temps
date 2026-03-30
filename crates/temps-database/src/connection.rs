@@ -114,11 +114,29 @@ pub async fn establish_connection(database_url: &str) -> ServiceResult<Arc<DbCon
         .await
         .map_err(ServiceError::Database)?;
 
+    let max_conn: u32 = std::env::var("TEMPS_DB_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    let min_conn: u32 = std::env::var("TEMPS_DB_MIN_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let acquire_timeout_secs: u64 = std::env::var("TEMPS_DB_ACQUIRE_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let idle_timeout_secs: u64 = std::env::var("TEMPS_DB_IDLE_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
+
     let mut opt = ConnectOptions::new(database_url);
-    opt.max_connections(100)
-        .min_connections(5)
-        .connect_timeout(CONNECTION_TIMEOUT)
-        .sqlx_logging(false); // Disable verbose SQL query logging
+    opt.max_connections(max_conn)
+        .min_connections(min_conn)
+        .connect_timeout(Duration::from_secs(acquire_timeout_secs))
+        .idle_timeout(Duration::from_secs(idle_timeout_secs))
+        .sqlx_logging(false);
 
     // Connect with timeout
     let db = match timeout(CONNECTION_TIMEOUT, Database::connect(opt)).await {

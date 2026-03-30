@@ -23,6 +23,7 @@ import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import { useEnterSubmit } from '@/hooks/useEnterSubmit'
 
 const domainWizardSchema = z.object({
   domain: z
@@ -108,9 +109,17 @@ export function AddDomain() {
 
   const watchedValues = useWatch({ control: form.control })
 
+  const handleEnterSubmit = useEnterSubmit(() => {
+    if (step === 'confirm') {
+      form.handleSubmit(handleSubmit)()
+    } else {
+      handleNext()
+    }
+  })
+
   return (
     <div className="flex-1 overflow-auto">
-      <div className="max-w-3xl mx-auto space-y-6">
+      <div className="max-w-3xl mx-auto space-y-6" onKeyDown={handleEnterSubmit}>
         {/* Header */}
         <div className="flex items-center gap-4">
           <Button

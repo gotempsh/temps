@@ -13,9 +13,9 @@ mod mod_rs {
 
 // Re-export main types for easy access
 pub use {
-    all_presets, detect_node_framework, detect_preset_from_files, get_preset_by_slug,
-    DockerfileWithArgs, JavaPreset, NixpacksPreset, NixpacksProvider, NodeFramework,
-    PackageManager, Preset, PresetConfig, ProjectType,
+    all_presets, detect_all_presets_from_files, detect_node_framework, detect_preset_from_files,
+    get_preset_by_slug, DockerfileWithArgs, JavaPreset, NixpacksPreset, NixpacksProvider,
+    NodeFramework, PackageManager, Preset, PresetConfig, ProjectType,
 };
 
 #[cfg(test)]
@@ -188,23 +188,27 @@ mod tests {
             "apps/web/next.config.js".to_string(),
             "apps/web/package.json".to_string(),
             "apps/api/Dockerfile".to_string(),
-            "apps/api/main.go".to_string(),
+            "apps/api/go.mod".to_string(),
             "packages/ui/vite.config.ts".to_string(),
             "packages/ui/package.json".to_string(),
         ];
         let presets = detect_presets_from_file_tree(&files);
 
-        assert_eq!(presets.len(), 3);
+        // apps/api has both Dockerfile and Go, apps/web has Next.js, packages/ui has Vite
+        assert_eq!(presets.len(), 4);
 
-        // Root should come first
+        // Sorted by path then slug
         assert_eq!(presets[0].path, "apps/api");
         assert_eq!(presets[0].slug, "dockerfile");
 
-        assert_eq!(presets[1].path, "apps/web");
-        assert_eq!(presets[1].slug, "nextjs");
+        assert_eq!(presets[1].path, "apps/api");
+        assert_eq!(presets[1].slug, "go");
 
-        assert_eq!(presets[2].path, "packages/ui");
-        assert_eq!(presets[2].slug, "vite");
+        assert_eq!(presets[2].path, "apps/web");
+        assert_eq!(presets[2].slug, "nextjs");
+
+        assert_eq!(presets[3].path, "packages/ui");
+        assert_eq!(presets[3].slug, "vite");
     }
 
     #[test]
@@ -246,13 +250,43 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_presets_from_file_tree_dockerfile_priority() {
+    fn test_detect_presets_from_file_tree_multiple_presets_same_path() {
         let files = vec!["Dockerfile".to_string(), "next.config.js".to_string()];
         let presets = detect_presets_from_file_tree(&files);
 
-        // Dockerfile has higher priority
-        assert_eq!(presets.len(), 1);
-        assert_eq!(presets[0].slug, "dockerfile");
+        // Both presets should be detected for the same path
+        assert_eq!(presets.len(), 2);
+        let slugs: Vec<&str> = presets.iter().map(|p| p.slug.as_str()).collect();
+        assert!(slugs.contains(&"dockerfile"));
+        assert!(slugs.contains(&"nextjs"));
+        // Both should have the root path
+        assert!(presets.iter().all(|p| p.path == "./"));
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_three_presets_same_path() {
+        let files = vec![
+            "Dockerfile".to_string(),
+            "docker-compose.yml".to_string(),
+            "next.config.ts".to_string(),
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 3);
+        let slugs: Vec<&str> = presets.iter().map(|p| p.slug.as_str()).collect();
+        assert!(slugs.contains(&"docker-compose"));
+        assert!(slugs.contains(&"dockerfile"));
+        assert!(slugs.contains(&"nextjs"));
+    }
+
+    #[test]
+    fn test_detect_preset_from_files_returns_highest_priority() {
+        // detect_preset_from_files still returns only the highest-priority match
+        let files = vec!["Dockerfile".to_string(), "next.config.js".to_string()];
+        let preset = detect_preset_from_files(&files);
+
+        assert!(preset.is_some());
+        assert_eq!(preset.unwrap().slug(), "dockerfile");
     }
 
     #[test]
@@ -392,8 +426,24 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_all_presets_from_files_multiple() {
+        // All matching presets should be returned, ordered by priority
+        let files = vec![
+            "Dockerfile".to_string(),
+            "next.config.js".to_string(),
+            "vite.config.js".to_string(),
+        ];
+        let presets = detect_all_presets_from_files(&files);
+
+        assert_eq!(presets.len(), 3);
+        assert_eq!(presets[0].slug(), "dockerfile");
+        assert_eq!(presets[1].slug(), "nextjs");
+        assert_eq!(presets[2].slug(), "vite");
+    }
+
+    #[test]
     fn test_preset_priority_docker_first() {
-        // Docker should be detected first even if other config files exist
+        // detect_preset_from_files returns highest-priority (first) match
         let files = vec![
             "Dockerfile".to_string(),
             "next.config.js".to_string(),

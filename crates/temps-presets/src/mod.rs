@@ -296,25 +296,40 @@ pub fn get_preset_by_slug(slug: &str) -> Option<Box<dyn Preset>> {
 }
 
 pub fn detect_preset_from_files(files: &[String]) -> Option<Box<dyn Preset>> {
-    // Check for Docker Compose files first
+    // Returns the highest-priority preset for deployment decisions
+    detect_all_presets_from_files(files).into_iter().next()
+}
+
+/// Detect ALL matching presets for a set of files in a single directory.
+///
+/// Unlike `detect_preset_from_files` which returns only the highest-priority match,
+/// this returns every preset that matches the directory's files. This allows users
+/// to choose between e.g. Dockerfile, Docker Compose, and Next.js when all three
+/// config files exist in the same directory.
+///
+/// Results are ordered by priority (Docker Compose first, then Dockerfile, then frameworks).
+pub fn detect_all_presets_from_files(files: &[String]) -> Vec<Box<dyn Preset>> {
+    let mut presets: Vec<Box<dyn Preset>> = Vec::new();
+
+    // Check for Docker Compose files
     if files.iter().any(|path| {
         docker_compose::COMPOSE_FILE_NAMES
             .iter()
             .any(|name| path.ends_with(name))
     }) {
-        return Some(Box::new(docker_compose::DockerComposePreset));
+        presets.push(Box::new(docker_compose::DockerComposePreset));
     }
 
     // Check for Dockerfile
     if files.iter().any(|path| path.ends_with("Dockerfile")) {
-        return Some(Box::new(DockerfilePreset));
+        presets.push(Box::new(DockerfilePreset));
     }
 
     // Check for Docusaurus
     if files.iter().any(|path| {
         path.ends_with("docusaurus.config.js") || path.ends_with("docusaurus.config.ts")
     }) {
-        return Some(Box::new(Docusaurus));
+        presets.push(Box::new(Docusaurus));
     }
 
     // Check for Next.js
@@ -323,7 +338,7 @@ pub fn detect_preset_from_files(files: &[String]) -> Option<Box<dyn Preset>> {
             || path.ends_with("next.config.mjs")
             || path.ends_with("next.config.ts")
     }) {
-        return Some(Box::new(NextJs));
+        presets.push(Box::new(NextJs));
     }
 
     // Check for Vite
@@ -331,27 +346,27 @@ pub fn detect_preset_from_files(files: &[String]) -> Option<Box<dyn Preset>> {
         .iter()
         .any(|path| path.ends_with("vite.config.js") || path.ends_with("vite.config.ts"))
     {
-        return Some(Box::new(Vite));
+        presets.push(Box::new(Vite));
     }
 
     // Check for Create React App
     if files.iter().any(|path| path.contains("react-scripts")) {
-        return Some(Box::new(CreateReactApp));
+        presets.push(Box::new(CreateReactApp));
     }
 
     // Check for Rsbuild
     if files.iter().any(|path| path.ends_with("rsbuild.config.ts")) {
-        return Some(Box::new(Rsbuild));
+        presets.push(Box::new(Rsbuild));
     }
 
     // Check for Rust (Cargo.toml)
     if files.iter().any(|path| path.ends_with("Cargo.toml")) {
-        return Some(Box::new(RustPreset::new()));
+        presets.push(Box::new(RustPreset::new()));
     }
 
     // Check for Go (go.mod)
     if files.iter().any(|path| path.ends_with("go.mod")) {
-        return Some(Box::new(GoPreset::new()));
+        presets.push(Box::new(GoPreset::new()));
     }
 
     // Check for Python (requirements.txt, pyproject.toml, setup.py)
@@ -361,7 +376,7 @@ pub fn detect_preset_from_files(files: &[String]) -> Option<Box<dyn Preset>> {
             || path.ends_with("setup.py")
             || path.ends_with("Pipfile")
     }) {
-        return Some(Box::new(PythonPreset::new()));
+        presets.push(Box::new(PythonPreset::new()));
     }
 
     // Check for Java (pom.xml, build.gradle, build.gradle.kts)
@@ -370,19 +385,15 @@ pub fn detect_preset_from_files(files: &[String]) -> Option<Box<dyn Preset>> {
             || path.ends_with("build.gradle")
             || path.ends_with("build.gradle.kts")
     }) {
-        return Some(Box::new(JavaPreset::new()));
+        presets.push(Box::new(JavaPreset::new()));
     }
 
     // Only detect Nixpacks if there's an explicit nixpacks.toml file
-    // This prevents Nixpacks from being auto-detected for every path
-    // Users can still manually select Nixpacks when creating a project
     if files.iter().any(|path| path.ends_with("nixpacks.toml")) {
-        return Some(Box::new(NixpacksPreset::auto()));
+        presets.push(Box::new(NixpacksPreset::auto()));
     }
 
-    // No preset detected - return None
-    // This prevents false positives for directories like "src", "public", etc.
-    None
+    presets
 }
 
 /// Information about a detected preset in a specific directory
@@ -472,7 +483,8 @@ pub fn detect_presets_from_file_tree(files: &[String]) -> Vec<DetectedPreset> {
             continue;
         }
 
-        if let Some(preset) = detect_preset_from_files(dir_files) {
+        let detected = detect_all_presets_from_files(dir_files);
+        for preset in detected {
             // Use relative paths: "./" for root, subdirectory name for others
             let path = if dir.is_empty() {
                 "./".to_string()
@@ -513,16 +525,17 @@ pub fn detect_presets_from_file_tree(files: &[String]) -> Vec<DetectedPreset> {
         }
     }
 
-    // Sort presets by path for consistent output (root "./" comes first)
+    // Sort presets by path for consistent output (root "./" comes first), then by slug
     presets.sort_by(|a, b| {
         // Root should come first
-        if a.path == "./" && b.path != "./" {
+        let path_ord = if a.path == "./" && b.path != "./" {
             std::cmp::Ordering::Less
         } else if a.path != "./" && b.path == "./" {
             std::cmp::Ordering::Greater
         } else {
             a.path.cmp(&b.path)
-        }
+        };
+        path_ord.then_with(|| a.slug.cmp(&b.slug))
     });
 
     presets

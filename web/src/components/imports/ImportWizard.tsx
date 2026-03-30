@@ -53,6 +53,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { getProject } from '@/api/client'
+import { useEnterSubmit } from '@/hooks/useEnterSubmit'
 
 type WizardStep =
   | 'select-source'
@@ -1152,8 +1153,12 @@ export function ImportWizard({ onCancel, className }: ImportWizardProps) {
   const currentStepConfig = STEP_CONFIG[currentStep]
   const StepIcon = currentStepConfig.icon
 
+  const handleEnterSubmit = useEnterSubmit(() => {
+    handleNext()
+  })
+
   return (
-    <div className={cn('space-y-6', className)}>
+    <div className={cn('space-y-6', className)} onKeyDown={handleEnterSubmit}>
       {/* Header */}
       <div className="flex items-center gap-4">
         <div className="flex items-center justify-center h-12 w-12 rounded-lg bg-primary/10">

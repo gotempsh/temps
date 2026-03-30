@@ -63,6 +63,26 @@ postgresql://[user[:password]@][host][:port][/database][?param1=value1&...]
 export TEMPS_DATABASE_URL=postgresql://temps:password@localhost:5432/temps
 ```
 
+### Connection Pool Tuning
+
+Control the PostgreSQL connection pool size and timeouts:
+
+| Variable                     | Default | Description                               |
+| ---------------------------- | ------- | ----------------------------------------- |
+| `TEMPS_DB_MAX_CONNECTIONS`   | `100`   | Maximum connections in the pool            |
+| `TEMPS_DB_MIN_CONNECTIONS`   | `5`     | Minimum idle connections kept open         |
+| `TEMPS_DB_ACQUIRE_TIMEOUT`   | `30`    | Seconds to wait for a connection           |
+| `TEMPS_DB_IDLE_TIMEOUT`      | `600`   | Seconds before idle connections are closed |
+
+For small servers (2GB RAM), reduce `TEMPS_DB_MAX_CONNECTIONS` to `20-30`. If you see `slow_acquire_threshold` warnings in logs, it means the pool is saturated — either increase the max or investigate long-running queries.
+
+```bash
+# Example: tuning for a small VPS
+export TEMPS_DB_MAX_CONNECTIONS=30
+export TEMPS_DB_MIN_CONNECTIONS=2
+export TEMPS_DB_IDLE_TIMEOUT=300
+```
+
 ### Data Directory
 
 Temps stores sensitive data in the data directory (`~/.temps` by default):
