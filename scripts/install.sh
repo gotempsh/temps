@@ -82,7 +82,7 @@ esac
 
 GITHUB=${GITHUB-"https://github.com"}
 
-github_repo="$GITHUB/davidviejo/temps"
+github_repo="$GITHUB/gotempsh/temps"
 
 exe_name=temps
 
@@ -92,7 +92,7 @@ if [[ $# = 0 ]]; then
 
     # Temporarily disable pipefail to handle API errors gracefully
     set +e
-    temps_tag=$(curl --silent "https://api.github.com/repos/davidviejo/temps/releases/latest" |
+    temps_tag=$(curl --silent "https://api.github.com/repos/gotempsh/temps/releases/latest" |
                 grep '"tag_name":' |
                 sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null)
     set -e
@@ -100,9 +100,9 @@ if [[ $# = 0 ]]; then
     if [[ -z "$temps_tag" ]]; then
         echo ""
         error "No releases found. Please specify a version explicitly:
-    curl -fsSL https://raw.githubusercontent.com/davidviejo/temps/main/scripts/install.sh | bash -s v0.1.0
+    curl -fsSL https://raw.githubusercontent.com/gotempsh/temps/main/scripts/install.sh | bash -s v0.1.0
 
-Or check available versions at: https://github.com/davidviejo/temps/releases"
+Or check available versions at: https://github.com/gotempsh/temps/releases"
     fi
 
     info "Latest version: $temps_tag"
