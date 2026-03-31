@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Multi-preset detection**: `detect_all_presets_from_files` returns all matching presets per directory (e.g., Dockerfile + Next.js + Docker Compose in the same root), letting users choose their preferred deployment method instead of silently picking the highest-priority match
+- **Database pool configuration**: env vars `TEMPS_DB_MAX_CONNECTIONS` (default 100), `TEMPS_DB_MIN_CONNECTIONS` (default 1), `TEMPS_DB_ACQUIRE_TIMEOUT` (default 30s), and `TEMPS_DB_IDLE_TIMEOUT` (default 600s) for tuning the SQLx connection pool on resource-constrained servers
+- **Enter-submit in wizards**: `useEnterSubmit` hook added to Domain, DNS Provider, Domain Creation, and Import wizards — pressing Enter advances to the next step or submits on the final step
+- Documentation for new pool environment variables in the environment variables reference
+
+### Fixed
+- Database connections could accumulate without recycling due to missing `idle_timeout` on the connection pool; now defaults to 10 minutes
+- `gh release create` failure on duplicate tags: removed invalid `--clobber` flag, then re-added correctly
+- Install script and Homebrew formula pointed to `davidviejo/temps` instead of `gotempsh/temps`, causing 404s on binary download
+
 ## [0.0.7] - 2026-03-29
 
 ### Added
