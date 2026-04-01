@@ -57,6 +57,8 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
         // Tracking
         tracking::track_open,
         tracking::track_click,
+        tracking::get_global_event_stats,
+        tracking::get_global_events,
         tracking::get_email_tracking,
         tracking::get_email_events,
         tracking::get_email_links,
@@ -90,6 +92,8 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
             tracking::EmailTrackingResponse,
             tracking::TrackedLinkResponse,
             tracking::TrackingEventResponse,
+            tracking::GlobalEventStatsResponse,
+            tracking::PaginatedEventsResponse,
             // Validation types
             validation::ValidateEmailRequest,
             validation::ValidateEmailResponse,

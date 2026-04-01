@@ -202,7 +202,17 @@ pub struct GlobalEventsQuery {
 }
 
 /// GET /emails/events/stats
-async fn get_global_event_stats(
+#[utoipa::path(
+    tag = "Email Tracking",
+    get,
+    path = "/emails/events/stats",
+    responses(
+        (status = 200, description = "Global tracking statistics", body = GlobalEventStatsResponse),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_global_event_stats(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -232,7 +242,22 @@ async fn get_global_event_stats(
 }
 
 /// GET /emails/events
-async fn get_global_events(
+#[utoipa::path(
+    tag = "Email Tracking",
+    get,
+    path = "/emails/events",
+    params(
+        ("event_type" = Option<String>, Query, description = "Filter by event type (open, click)"),
+        ("page" = Option<u64>, Query, description = "Page number (default: 1)"),
+        ("page_size" = Option<u64>, Query, description = "Page size (default: 20, max: 100)"),
+    ),
+    responses(
+        (status = 200, description = "Paginated tracking events", body = PaginatedEventsResponse),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_global_events(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Query(query): Query<GlobalEventsQuery>,
