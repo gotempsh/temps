@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Database pool configuration**: env vars `TEMPS_DB_MAX_CONNECTIONS` (default 100), `TEMPS_DB_MIN_CONNECTIONS` (default 1), `TEMPS_DB_ACQUIRE_TIMEOUT` (default 30s), and `TEMPS_DB_IDLE_TIMEOUT` (default 600s) for tuning the SQLx connection pool on resource-constrained servers
 - **Enter-submit in wizards**: `useEnterSubmit` hook added to Domain, DNS Provider, Domain Creation, and Import wizards — pressing Enter advances to the next step or submits on the final step
 - Documentation for new pool environment variables in the environment variables reference
+- **Email tracking — tracked HTML storage**: new `tracked_html_body` column stores the final HTML sent to the provider (with tracking pixel and rewritten links), separate from the original `html_body` to avoid triggering fake opens in dashboard previews
+- **Email tracking — per-link click breakdown**: email detail page now shows each tracked link with its individual click count
 
 ### Security
 - **Container exec tenant isolation**: `exec_command` and `container_terminal` handlers now verify the container belongs to the requested project/environment before allowing access, preventing cross-tenant container exec
@@ -23,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump `rustls` 0.23.34 → 0.23.37
 
 ### Fixed
+- Email tracking open/click endpoints returned 500 (`RequestMetadata` extension not found) because public routes lacked the middleware; now gracefully falls back to extracting IP/UA from headers
+- Email tracking events failed with `column "link_url" does not exist` on databases where the column was missing; added migration to backfill
 - Database connections could accumulate without recycling due to missing `idle_timeout` on the connection pool; now defaults to 10 minutes
 - `gh release create` failure on duplicate tags: removed invalid `--clobber` flag, then re-added correctly
 - Install script and Homebrew formula pointed to `davidviejo/temps` instead of `gotempsh/temps`, causing 404s on binary download
