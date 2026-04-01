@@ -66,12 +66,11 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 function HeadersDisplay({ headers }: { headers: Record<string, string> | null | undefined }) {
-  if (!headers) return null
+  if (!headers || Object.keys(headers).length === 0) {
+    return <p className="text-sm text-muted-foreground">No custom headers were set for this email.</p>
+  }
 
   const entries = Object.entries(headers)
-  if (entries.length === 0) {
-    return <p className="text-sm text-muted-foreground">No headers available</p>
-  }
 
   return (
     <div className="space-y-2">
