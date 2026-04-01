@@ -583,7 +583,7 @@ export function EmailDetail() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Email', href: '/settings/email' },
+      { label: 'Email', href: '/settings/email?tab=emails' },
       { label: email?.subject || 'Email Details' },
     ])
   }, [setBreadcrumbs, email?.subject])
@@ -593,7 +593,7 @@ export function EmailDetail() {
       <div className="container max-w-6xl mx-auto py-6 space-y-6">
         <div className="flex items-center gap-4">
           <Button variant="ghost" size="sm" asChild>
-            <Link to="/settings/email">
+            <Link to="/settings/email?tab=emails">
               <ArrowLeft className="h-4 w-4 mr-2" />
               Back to Emails
             </Link>
@@ -609,7 +609,7 @@ export function EmailDetail() {
       <div className="container max-w-6xl mx-auto py-6 space-y-6">
         <div className="flex items-center gap-4">
           <Button variant="ghost" size="sm" asChild>
-            <Link to="/settings/email">
+            <Link to="/settings/email?tab=emails">
               <ArrowLeft className="h-4 w-4 mr-2" />
               Back to Emails
             </Link>
@@ -631,7 +631,7 @@ export function EmailDetail() {
     <div className="container max-w-6xl mx-auto py-6 space-y-6">
       <div className="flex items-center gap-4">
         <Button variant="ghost" size="sm" asChild>
-          <Link to="/settings/email">
+          <Link to="/settings/email?tab=emails">
             <ArrowLeft className="h-4 w-4 mr-2" />
             Back to Emails
           </Link>
