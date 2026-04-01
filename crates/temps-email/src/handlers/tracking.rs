@@ -258,6 +258,7 @@ async fn get_global_events(
             .into_iter()
             .map(|e| TrackingEventResponse {
                 id: e.id,
+                email_id: e.email_id.to_string(),
                 event_type: e.event_type,
                 link_url: e.link_url,
                 link_index: e.link_index,
@@ -305,6 +306,7 @@ pub struct TrackedLinkResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TrackingEventResponse {
     pub id: i64,
+    pub email_id: String,
     pub event_type: String,
     pub link_url: Option<String>,
     pub link_index: Option<i32>,
@@ -447,6 +449,7 @@ pub async fn get_email_events(
         .into_iter()
         .map(|e| TrackingEventResponse {
             id: e.id,
+            email_id: e.email_id.to_string(),
             event_type: e.event_type,
             link_url: e.link_url,
             link_index: e.link_index,
