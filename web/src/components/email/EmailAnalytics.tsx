@@ -135,8 +135,10 @@ function RateCard({
 
 function EventIcon({ type }: { type: string }) {
   switch (type) {
+    case 'open':
     case 'opened':
       return <Eye className="h-3.5 w-3.5 text-blue-500" />
+    case 'click':
     case 'clicked':
       return <MousePointerClick className="h-3.5 w-3.5 text-green-500" />
     case 'delivered':
@@ -354,7 +356,7 @@ export function EmailAnalytics() {
                           )}
                         </TableCell>
                         <TableCell className="hidden md:table-cell max-w-[250px]">
-                          {event.event_type === 'clicked' && !!event.metadata?.url ? (
+                          {(event.event_type === 'click' || event.event_type === 'clicked') && !!event.metadata?.url ? (
                             <span className="text-xs text-muted-foreground truncate block flex items-center gap-1">
                               <Globe className="h-3 w-3 shrink-0" />
                               {String(event.metadata!.url)}

@@ -37,6 +37,19 @@ pub struct ExtractedLink {
     pub original_url: String,
 }
 
+/// Global tracking statistics
+#[derive(Debug, Clone)]
+pub struct GlobalTrackingStats {
+    pub delivered: u64,
+    pub opened: u64,
+    pub clicked: u64,
+    pub bounced: u64,
+    pub complained: u64,
+    pub open_rate: Option<f64>,
+    pub click_rate: Option<f64>,
+    pub bounce_rate: Option<f64>,
+}
+
 /// Event recorded for tracking
 #[derive(Debug, Clone)]
 pub struct TrackingEvent {
@@ -337,6 +350,93 @@ impl TrackingService {
             .all(self.db.as_ref())
             .await?;
         Ok(events)
+    }
+
+    /// Get global tracking stats (aggregated from emails table)
+    pub async fn get_global_stats(&self) -> Result<GlobalTrackingStats, EmailError> {
+        use sea_orm::{DatabaseBackend, FromQueryResult, Statement};
+
+        #[derive(FromQueryResult)]
+        struct StatsRow {
+            total_sent: i64,
+            total_opens: i64,
+            total_clicks: i64,
+            emails_with_opens: i64,
+            emails_with_clicks: i64,
+        }
+
+        let sql = r#"
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'sent') AS total_sent,
+                COALESCE(SUM(open_count), 0) AS total_opens,
+                COALESCE(SUM(click_count), 0) AS total_clicks,
+                COUNT(*) FILTER (WHERE open_count > 0) AS emails_with_opens,
+                COUNT(*) FILTER (WHERE click_count > 0) AS emails_with_clicks
+            FROM emails
+            WHERE track_opens = true OR track_clicks = true
+        "#;
+
+        let row = StatsRow::find_by_statement(Statement::from_string(
+            DatabaseBackend::Postgres,
+            sql.to_string(),
+        ))
+        .one(self.db.as_ref())
+        .await?
+        .unwrap_or(StatsRow {
+            total_sent: 0,
+            total_opens: 0,
+            total_clicks: 0,
+            emails_with_opens: 0,
+            emails_with_clicks: 0,
+        });
+
+        let delivered = row.total_sent;
+        let open_rate = if delivered > 0 {
+            Some(row.emails_with_opens as f64 / delivered as f64 * 100.0)
+        } else {
+            None
+        };
+        let click_rate = if delivered > 0 {
+            Some(row.emails_with_clicks as f64 / delivered as f64 * 100.0)
+        } else {
+            None
+        };
+
+        Ok(GlobalTrackingStats {
+            delivered: delivered as u64,
+            opened: row.total_opens as u64,
+            clicked: row.total_clicks as u64,
+            bounced: 0,
+            complained: 0,
+            open_rate,
+            click_rate,
+            bounce_rate: Some(0.0),
+        })
+    }
+
+    /// Get all tracking events across all emails (paginated)
+    pub async fn get_all_events(
+        &self,
+        event_type: Option<&str>,
+        page: u64,
+        page_size: u64,
+    ) -> Result<(Vec<email_events::Model>, u64), EmailError> {
+        use sea_orm::PaginatorTrait;
+
+        let mut query = email_events::Entity::find();
+
+        if let Some(et) = event_type {
+            query = query.filter(email_events::Column::EventType.eq(et));
+        }
+
+        let paginator = query
+            .order_by_desc(email_events::Column::Id)
+            .paginate(self.db.as_ref(), page_size);
+
+        let total = paginator.num_items().await?;
+        let events = paginator.fetch_page(page.saturating_sub(1)).await?;
+
+        Ok((events, total))
     }
 
     /// Get tracked links for an email
