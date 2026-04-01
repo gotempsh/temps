@@ -53,7 +53,7 @@ export function Settings() {
     register,
     handleSubmit,
     control,
-    formState: { isDirty, isSubmitting },
+    formState: { isDirty, isSubmitting, errors },
     reset,
     setValue,
   } = useForm<SettingsFormData>({
@@ -95,8 +95,9 @@ export function Settings() {
       await updateSettings.mutateAsync(data)
       reset(data)
       toast.success('Settings saved successfully')
-    } catch {
-      toast.error('Failed to save settings. Please try again.')
+    } catch (err: any) {
+      const detail = err?.body?.detail || err?.message || 'Failed to save settings. Please try again.'
+      toast.error(detail)
     }
   }
 
@@ -139,8 +140,25 @@ export function Settings() {
               id="external-url"
               type="url"
               placeholder="https://your-domain.com"
-              {...register('external_url')}
+              {...register('external_url', {
+                validate: (value) => {
+                  if (!value) return true // optional
+                  const trimmed = value.trim()
+                  if (!trimmed) return true
+                  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://'))
+                    return 'Must start with http:// or https://'
+                  if (trimmed.includes('#') || trimmed.includes('?'))
+                    return 'Must not contain # or ? characters'
+                  try { new URL(trimmed) } catch {
+                    return 'Must be a valid URL'
+                  }
+                  return true
+                },
+              })}
             />
+            {errors.external_url && (
+              <p className="text-sm text-destructive">{errors.external_url.message}</p>
+            )}
             <p className="text-sm text-muted-foreground">
               Used for OAuth callbacks, webhooks, and external integrations
             </p>

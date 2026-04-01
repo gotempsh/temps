@@ -333,6 +333,27 @@ async fn update_settings(
         }
     }
 
+    // Validate and sanitize external_url
+    if let Some(ref mut ext_url) = settings.external_url {
+        *ext_url = ext_url.trim().to_string();
+        *ext_url = ext_url.trim_end_matches('/').to_string();
+        if !ext_url.starts_with("http://") && !ext_url.starts_with("https://") {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail("External URL must start with http:// or https://")
+                .build());
+        }
+        if ext_url.contains('#') || ext_url.contains('?') {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail("External URL must not contain '#' or '?' characters")
+                .build());
+        }
+        if url::Url::parse(ext_url).is_err() {
+            return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .detail("External URL is not a valid URL")
+                .build());
+        }
+    }
+
     match app_state.config_service.update_settings(settings).await {
         Ok(_) => {
             let audit = SettingsUpdatedAudit {
