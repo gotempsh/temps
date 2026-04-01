@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Enter-submit in wizards**: `useEnterSubmit` hook added to Domain, DNS Provider, Domain Creation, and Import wizards — pressing Enter advances to the next step or submits on the final step
 - Documentation for new pool environment variables in the environment variables reference
 
+### Security
+- **Container exec tenant isolation**: `exec_command` and `container_terminal` handlers now verify the container belongs to the requested project/environment before allowing access, preventing cross-tenant container exec
+- **Path traversal protection**: `FilesystemStorage::resolve_path` rejects storage keys containing `..` components, preventing potential directory escape
+- Bump `aws-lc-sys` 0.38.0 → 0.39.1 (RUSTSEC-2026-0044, RUSTSEC-2026-0048: X.509 name constraints bypass)
+- Bump `rustls-webpki` 0.103.7 → 0.103.10 (RUSTSEC-2026-0049: CRL distribution point matching)
+- Bump `tar` 0.4.44 → 0.4.45 (RUSTSEC-2026-0067, RUSTSEC-2026-0068: symlink follow and PAX header issues)
+- Bump `rkyv` 0.7.45 → 0.7.46 (RUSTSEC-2026-0001: undefined behavior on OOM)
+- Bump `rustls` 0.23.34 → 0.23.37
+
 ### Fixed
 - Database connections could accumulate without recycling due to missing `idle_timeout` on the connection pool; now defaults to 10 minutes
 - `gh release create` failure on duplicate tags: removed invalid `--clobber` flag, then re-added correctly
