@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Email tracking analytics UI**: event timeline on email detail page showing individual open/click/bounce/delivery events with IP, user-agent, and metadata; new Analytics tab with delivery rate cards and global event log
+- **Global email events endpoint**: `GET /emails/events` lists tracking events across all emails with optional `email_id` and `event_type` filters
 - **Multi-preset detection**: `detect_all_presets_from_files` returns all matching presets per directory (e.g., Dockerfile + Next.js + Docker Compose in the same root), letting users choose their preferred deployment method instead of silently picking the highest-priority match
 - **Database pool configuration**: env vars `TEMPS_DB_MAX_CONNECTIONS` (default 100), `TEMPS_DB_MIN_CONNECTIONS` (default 1), `TEMPS_DB_ACQUIRE_TIMEOUT` (default 30s), and `TEMPS_DB_IDLE_TIMEOUT` (default 600s) for tuning the SQLx connection pool on resource-constrained servers
 - **Enter-submit in wizards**: `useEnterSubmit` hook added to Domain, DNS Provider, Domain Creation, and Import wizards — pressing Enter advances to the next step or submits on the final step
