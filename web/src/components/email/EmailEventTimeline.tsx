@@ -52,18 +52,31 @@ async function fetchEmailEvents(
 ): Promise<PaginatedEmailEvents> {
   const searchParams = new URLSearchParams()
   if (params.event_type) searchParams.set('event_type', params.event_type)
-  if (params.page) searchParams.set('page', params.page.toString())
-  if (params.page_size) searchParams.set('page_size', params.page_size.toString())
 
-  const response = await fetch(`/api/emails/${emailId}/events?${searchParams}`)
+  const response = await fetch(`/api/emails/${emailId}/tracking/events?${searchParams}`)
   if (!response.ok) throw new Error('Failed to fetch email events')
-  return response.json()
+  const events: EmailEvent[] = await response.json()
+
+  // Backend returns a flat array; apply client-side pagination
+  const page = params.page ?? 1
+  const pageSize = params.page_size ?? 20
+  const start = (page - 1) * pageSize
+  const paged = events.slice(start, start + pageSize)
+
+  return {
+    events: paged,
+    total: events.length,
+    page,
+    page_size: pageSize,
+  }
 }
 
 function EventIcon({ type }: { type: string }) {
   switch (type) {
+    case 'open':
     case 'opened':
       return <Eye className="h-4 w-4 text-blue-500" />
+    case 'click':
     case 'clicked':
       return <MousePointerClick className="h-4 w-4 text-green-500" />
     case 'delivered':
@@ -79,7 +92,9 @@ function EventIcon({ type }: { type: string }) {
 
 function EventBadge({ type }: { type: string }) {
   const variants: Record<string, { variant: 'default' | 'secondary' | 'destructive' | 'outline'; label: string }> = {
+    open: { variant: 'secondary', label: 'Opened' },
     opened: { variant: 'secondary', label: 'Opened' },
+    click: { variant: 'default', label: 'Clicked' },
     clicked: { variant: 'default', label: 'Clicked' },
     delivered: { variant: 'outline', label: 'Delivered' },
     bounced: { variant: 'destructive', label: 'Bounced' },
@@ -185,8 +200,8 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
             <SelectContent>
               <SelectItem value="all">All events</SelectItem>
               <SelectItem value="delivered">Delivered</SelectItem>
-              <SelectItem value="opened">Opened</SelectItem>
-              <SelectItem value="clicked">Clicked</SelectItem>
+              <SelectItem value="open">Opened</SelectItem>
+              <SelectItem value="click">Clicked</SelectItem>
               <SelectItem value="bounced">Bounced</SelectItem>
               <SelectItem value="complained">Complained</SelectItem>
             </SelectContent>
@@ -225,7 +240,7 @@ export function EmailEventTimeline({ emailId }: { emailId: string }) {
                   </div>
 
                   <div className="flex items-center gap-3 text-xs text-muted-foreground flex-wrap">
-                    {event.event_type === 'clicked' && !!event.metadata?.url && (
+                    {(event.event_type === 'click' || event.event_type === 'clicked') && !!event.metadata?.url && (
                       <span className="flex items-center gap-1 truncate max-w-[300px]">
                         <Globe className="h-3 w-3 shrink-0" />
                         <span className="truncate">{String(event.metadata!.url)}</span>
