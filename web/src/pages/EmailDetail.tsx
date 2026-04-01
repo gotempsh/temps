@@ -188,6 +188,8 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
   const hasText = !!email.text_body
   const defaultTab = hasHtml ? 'preview' : hasText ? 'text' : 'details'
 
+  const hasTracking = !!(email as any).track_clicks || !!(email as any).track_opens
+
   const { data: trackingLinks } = useQuery({
     queryKey: ['email-tracking-links', email.id],
     queryFn: async () => {
@@ -200,6 +202,28 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
       return res.data ?? []
     },
     enabled: !!(email as any).track_clicks,
+  })
+
+  const { data: trackingEvents } = useQuery({
+    queryKey: ['email-tracking-events', email.id],
+    queryFn: async () => {
+      const res = await client.get<
+        {
+          id: number
+          event_type: string
+          link_url: string | null
+          link_index: number | null
+          ip_address: string | null
+          user_agent: string | null
+          created_at: string
+        }[]
+      >({
+        url: '/emails/{id}/tracking/events',
+        path: { id: email.id },
+      })
+      return res.data ?? []
+    },
+    enabled: hasTracking,
   })
 
   return (
@@ -416,6 +440,60 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
                 </div>
               </div>
             )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Tracking Events Timeline */}
+      {trackingEvents && trackingEvents.length > 0 && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base flex items-center gap-2">
+              <Clock className="h-4 w-4" />
+              Tracking Events ({trackingEvents.length})
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-3">
+              {trackingEvents.map((event) => (
+                <div
+                  key={event.id}
+                  className="flex items-start gap-3 text-sm border-b last:border-b-0 pb-3 last:pb-0"
+                >
+                  <Badge
+                    variant={event.event_type === 'open' ? 'secondary' : 'default'}
+                    className="shrink-0 mt-0.5"
+                  >
+                    {event.event_type === 'open' ? (
+                      <Eye className="h-3 w-3 mr-1" />
+                    ) : (
+                      <MousePointerClick className="h-3 w-3 mr-1" />
+                    )}
+                    {event.event_type}
+                  </Badge>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs text-muted-foreground">
+                      {format(new Date(event.created_at), 'PPp')}
+                    </p>
+                    {event.link_url && (
+                      <p className="text-xs text-blue-500 truncate" title={event.link_url}>
+                        {event.link_url}
+                      </p>
+                    )}
+                    <div className="flex gap-3 mt-1 text-xs text-muted-foreground">
+                      {event.ip_address && <span>IP: {event.ip_address}</span>}
+                      {event.user_agent && (
+                        <span className="truncate" title={event.user_agent}>
+                          {event.user_agent.length > 50
+                            ? event.user_agent.substring(0, 50) + '…'
+                            : event.user_agent}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
           </CardContent>
         </Card>
       )}
