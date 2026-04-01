@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump `rustls` 0.23.34 → 0.23.37
 
 ### Fixed
+- Email event timeline returned 404: UI fetched from `/emails/{id}/events` (unregistered plugin route) instead of `/emails/{id}/tracking/events`; also fixed event type mismatches (`open`/`click` vs `opened`/`clicked`) and added client-side pagination for flat array response
 - Email tracking open/click endpoints returned 500 (`RequestMetadata` extension not found) because public routes lacked the middleware; now gracefully falls back to extracting IP/UA from headers
 - Email tracking events failed with `column "link_url" does not exist` on databases where the column was missing; added migration to backfill
 - Database connections could accumulate without recycling due to missing `idle_timeout` on the connection pool; now defaults to 10 minutes
