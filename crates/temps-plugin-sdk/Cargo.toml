@@ -44,7 +44,7 @@ temps-core = { path = "../temps-core" }
 
 # Tar extraction for UI bundles
 flate2 = "1"
-tar = "0.4"
+tar = "0.4.45"
 
 # UUID for request IDs
 uuid = { workspace = true }

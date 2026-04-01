@@ -46,5 +46,5 @@ base64 = "0.22"
 regex = "1.11"
 hyper = { workspace = true }
 flate2 = "1.0"
-tar = "0.4"
+tar = "0.4.45"
 tempfile = "3.10"

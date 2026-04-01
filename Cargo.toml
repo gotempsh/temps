@@ -240,7 +240,7 @@ regex = "1.11"
 # Compression & Archive
 # ============================================================================
 flate2 = "1.0"
-tar = "0.4"
+tar = "0.4.45"
 zip = "2.2"
 zstd = "0.13"
 
@@ -318,6 +318,15 @@ opt-level = 2      # Optimize dependencies
 # - atty 0.2.14: RESOLVED in Pingora 0.7.0 (upgraded to clap 4.5)
 # - idna 0.2.3: RESOLVED by upgrading check-if-email-exists 0.9 → 0.11
 # - lru 0.12.5: RESOLVED by upgrading aws-sdk-s3 (new version dropped lru 0.12)
+# - aws-lc-sys 0.38.0 (RUSTSEC-2026-0044, RUSTSEC-2026-0048): RESOLVED by cargo update aws-lc-rs → 1.16.2
+# - rustls-webpki 0.103.7 (RUSTSEC-2026-0049): RESOLVED by cargo update rustls-webpki → 0.103.10
+# - tar 0.4.44 (RUSTSEC-2026-0067, RUSTSEC-2026-0068): RESOLVED by bumping tar to 0.4.45
+# - rkyv 0.7.45 (RUSTSEC-2026-0001): RESOLVED by cargo update rkyv → 0.7.46
+#
+# 5. RUSTSEC-2023-0071: rsa 0.9.10 (MEDIUM severity)
+#    - Title: Marvin Attack: potential key recovery through timing sidechannels
+#    - Status: No fixed upgrade available upstream
+#    - Mitigation: RSA used for SSH key operations only, not exposed to network timing attacks
 #
 # All remaining items are transitive dependencies from third-party crates that we
 # cannot directly patch without forking. Monitoring upstream for updates.

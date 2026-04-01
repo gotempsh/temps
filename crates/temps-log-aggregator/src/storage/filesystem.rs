@@ -43,8 +43,32 @@ impl FilesystemStorage {
     }
 
     /// Resolve a storage key to an absolute filesystem path.
-    fn resolve_path(&self, key: &str) -> PathBuf {
-        self.base_path.join(key)
+    ///
+    /// Rejects keys containing path traversal components (`..`) to prevent
+    /// escaping the base directory.
+    fn resolve_path(&self, key: &str) -> Result<PathBuf, LogAggregatorError> {
+        // Reject path traversal attempts
+        if key.contains("..") {
+            return Err(LogAggregatorError::StorageConfiguration {
+                message: format!("Invalid storage key (path traversal rejected): {}", key),
+            });
+        }
+
+        let resolved = self.base_path.join(key);
+
+        // Double-check the resolved path stays within base_path
+        // (handles edge cases like symlinks if base_path is canonical)
+        if !resolved.starts_with(&self.base_path) {
+            return Err(LogAggregatorError::StorageConfiguration {
+                message: format!(
+                    "Storage key '{}' resolves outside base path '{}'",
+                    key,
+                    self.base_path.display()
+                ),
+            });
+        }
+
+        Ok(resolved)
     }
 
     /// Ensure the parent directory of a file path exists.
@@ -63,7 +87,7 @@ impl FilesystemStorage {
 #[async_trait]
 impl LogStorage for FilesystemStorage {
     async fn write_chunk(&self, key: &str, data: &[u8]) -> Result<u64, LogAggregatorError> {
-        let path = self.resolve_path(key);
+        let path = self.resolve_path(key)?;
         Self::ensure_parent_dir(&path).await?;
 
         tokio::fs::write(&path, data)
@@ -80,7 +104,7 @@ impl LogStorage for FilesystemStorage {
     }
 
     async fn read_chunk(&self, key: &str) -> Result<Vec<u8>, LogAggregatorError> {
-        let path = self.resolve_path(key);
+        let path = self.resolve_path(key)?;
         tokio::fs::read(&path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 LogAggregatorError::ChunkNotFound {
@@ -116,7 +140,7 @@ impl LogStorage for FilesystemStorage {
     }
 
     async fn list_chunks(&self, prefix: &str) -> Result<Vec<String>, LogAggregatorError> {
-        let dir = self.resolve_path(prefix);
+        let dir = self.resolve_path(prefix)?;
         if !dir.exists() {
             return Ok(Vec::new());
         }
@@ -164,7 +188,7 @@ impl LogStorage for FilesystemStorage {
     }
 
     async fn delete_chunk(&self, key: &str) -> Result<(), LogAggregatorError> {
-        let path = self.resolve_path(key);
+        let path = self.resolve_path(key)?;
         match tokio::fs::remove_file(&path).await {
             Ok(()) => {
                 debug!(key = key, "Deleted chunk from filesystem");
@@ -183,7 +207,7 @@ impl LogStorage for FilesystemStorage {
     }
 
     async fn chunk_exists(&self, key: &str) -> Result<bool, LogAggregatorError> {
-        let path = self.resolve_path(key);
+        let path = self.resolve_path(key)?;
         Ok(path.exists())
     }
 }

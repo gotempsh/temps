@@ -64,7 +64,7 @@ pub struct ExecResponse {
 )]
 pub async fn exec_command(
     State(state): State<Arc<AppState>>,
-    Path((_project_id, _environment_id, container_id)): Path<(i32, i32, String)>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
     RequireAuth(auth): RequireAuth,
     Json(request): Json<ExecRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -75,6 +75,23 @@ pub async fn exec_command(
             .with_title("Invalid Command")
             .with_detail("Command cannot be empty"));
     }
+
+    // Verify the container belongs to this project/environment
+    let (container_record, _env) = state
+        .deployment_service
+        .get_container_detail(project_id, environment_id, container_id.clone())
+        .await
+        .map_err(|_| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Container Not Found")
+                .with_detail(format!(
+                    "Container {} not found in project {} environment {}",
+                    container_id, project_id, environment_id
+                ))
+        })?;
+
+    // Use the verified container ID from the database record
+    let verified_container_id = &container_record.container_id;
 
     let timeout = std::cmp::min(request.timeout_seconds.unwrap_or(30), 300);
 
@@ -89,7 +106,7 @@ pub async fn exec_command(
     };
 
     let exec = docker
-        .create_exec(&container_id, exec_config)
+        .create_exec(verified_container_id, exec_config)
         .await
         .map_err(|e| {
             problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -179,21 +196,38 @@ pub async fn exec_command(
 )]
 pub async fn container_terminal(
     State(state): State<Arc<AppState>>,
-    Path((_project_id, _environment_id, container_id)): Path<(i32, i32, String)>,
+    Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
     RequireAuth(auth): RequireAuth,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ContainersExec);
 
+    // Verify the container belongs to this project/environment
+    let (container_record, _env) = state
+        .deployment_service
+        .get_container_detail(project_id, environment_id, container_id.clone())
+        .await
+        .map_err(|_| {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Container Not Found")
+                .with_detail(format!(
+                    "Container {} not found in project {} environment {}",
+                    container_id, project_id, environment_id
+                ))
+        })?;
+
+    // Use the verified container ID from the database record
+    let verified_container_id = container_record.container_id;
+
     let docker = state.docker.clone();
 
     info!(
-        container_id = %container_id,
+        container_id = %verified_container_id,
         user = %auth.user_id(),
         "Terminal session requested"
     );
 
-    Ok(ws.on_upgrade(move |socket| handle_terminal_session(socket, docker, container_id)))
+    Ok(ws.on_upgrade(move |socket| handle_terminal_session(socket, docker, verified_container_id)))
 }
 
 /// Handle a persistent terminal WebSocket session
