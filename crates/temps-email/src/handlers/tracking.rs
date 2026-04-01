@@ -22,6 +22,27 @@ use uuid::Uuid;
 
 use super::types::AppState;
 
+/// Extract IP and user agent from RequestMetadata extension (if available) or headers
+fn extract_metadata(
+    metadata: &Option<axum::Extension<RequestMetadata>>,
+    headers: &axum::http::HeaderMap,
+) -> (Option<String>, Option<String>) {
+    if let Some(axum::Extension(meta)) = metadata {
+        (Some(meta.ip_address.clone()), Some(meta.user_agent.clone()))
+    } else {
+        let ip = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(|s| s.trim().to_string());
+        let ua = headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        (ip, ua)
+    }
+}
+
 // 1x1 transparent GIF
 const TRACKING_PIXEL: &[u8] = &[
     0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0xff, 0xff, 0xff,
@@ -66,7 +87,8 @@ pub fn routes() -> Router<Arc<AppState>> {
 pub async fn track_open(
     State(state): State<Arc<AppState>>,
     Path(email_id): Path<String>,
-    axum::Extension(metadata): axum::Extension<RequestMetadata>,
+    metadata: Option<axum::Extension<RequestMetadata>>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let email_id = match Uuid::parse_str(&email_id) {
         Ok(id) => id,
@@ -80,15 +102,9 @@ pub async fn track_open(
         }
     };
 
-    if let Err(e) = state
-        .tracking_service
-        .record_open(
-            email_id,
-            Some(metadata.ip_address.clone()),
-            Some(metadata.user_agent.clone()),
-        )
-        .await
-    {
+    let (ip, ua) = extract_metadata(&metadata, &headers);
+
+    if let Err(e) = state.tracking_service.record_open(email_id, ip, ua).await {
         warn!("Failed to record open event for email {}: {}", email_id, e);
     }
 
@@ -124,7 +140,8 @@ pub async fn track_open(
 pub async fn track_click(
     State(state): State<Arc<AppState>>,
     Path((email_id, link_index)): Path<(String, i32)>,
-    axum::Extension(metadata): axum::Extension<RequestMetadata>,
+    metadata: Option<axum::Extension<RequestMetadata>>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let email_id = match Uuid::parse_str(&email_id) {
         Ok(id) => id,
@@ -133,14 +150,11 @@ pub async fn track_click(
         }
     };
 
+    let (ip, ua) = extract_metadata(&metadata, &headers);
+
     match state
         .tracking_service
-        .record_click(
-            email_id,
-            link_index,
-            Some(metadata.ip_address.clone()),
-            Some(metadata.user_agent.clone()),
-        )
+        .record_click(email_id, link_index, ip, ua)
         .await
     {
         Ok(redirect_url) => Redirect::temporary(&redirect_url).into_response(),
