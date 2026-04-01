@@ -112,14 +112,21 @@ function EventBadge({ type }: { type: string }) {
 }
 
 function parseUserAgent(ua: string): string {
+  // Email image proxies (check first — they masquerade as browsers)
+  if (ua.includes('GoogleImageProxy') || ua.includes('ggpht.com')) return 'Gmail (Google Proxy)'
+  if (ua.includes('YahooMailProxy')) return 'Yahoo Mail (Proxy)'
+  if (ua.includes('Outlook-iOS') || ua.includes('Outlook-Android')) return 'Outlook Mobile'
+  // Email clients
   if (ua.includes('Gmail')) return 'Gmail'
   if (ua.includes('Yahoo')) return 'Yahoo Mail'
   if (ua.includes('Outlook') || ua.includes('Microsoft')) return 'Outlook'
   if (ua.includes('Thunderbird')) return 'Thunderbird'
-  if (ua.includes('Apple Mail') || ua.includes('AppleWebKit')) return 'Apple Mail'
-  if (ua.includes('Chrome')) return 'Chrome'
+  if (ua.includes('Apple Mail')) return 'Apple Mail'
+  // Browsers
+  if (ua.includes('Chrome') && !ua.includes('Chromium')) return 'Chrome'
   if (ua.includes('Firefox')) return 'Firefox'
-  if (ua.includes('Safari')) return 'Safari'
+  if (ua.includes('Safari') && !ua.includes('Chrome')) return 'Safari'
+  if (ua.includes('AppleWebKit')) return 'WebKit'
   if (ua.length > 50) return ua.substring(0, 50) + '...'
   return ua
 }
