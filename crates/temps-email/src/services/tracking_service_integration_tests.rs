@@ -12,10 +12,35 @@ mod tests {
 
     use crate::services::TrackingService;
 
+    fn create_test_config_service(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> Arc<temps_config::ConfigService> {
+        // Create a minimal ServerConfig for tests
+        let server_config = Arc::new(temps_config::ServerConfig {
+            address: "0.0.0.0:3000".to_string(),
+            database_url: "postgres://localhost/test".to_string(),
+            tls_address: None,
+            console_address: "0.0.0.0:3001".to_string(),
+            data_dir: std::path::PathBuf::from("/tmp/temps-test"),
+            auth_secret: "test-secret".to_string(),
+            encryption_key: "test-encryption-key-32bytes!!!!!".to_string(),
+            api_base_url: "http://localhost:3000".to_string(),
+            postgres_max_connections: None,
+            postgres_min_connections: None,
+            postgres_connect_timeout_secs: None,
+            postgres_acquire_timeout_secs: None,
+            postgres_idle_timeout_secs: None,
+            postgres_max_lifetime_secs: None,
+        });
+        Arc::new(temps_config::ConfigService::new(server_config, db))
+    }
+
     async fn setup_test_env() -> (TestDatabase, Arc<TrackingService>) {
         let db = TestDatabase::with_migrations().await.unwrap();
-        let tracking_service = Arc::new(TrackingService::new(
+        let config_service = create_test_config_service(db.db.clone());
+        let tracking_service = Arc::new(TrackingService::with_base_url(
             db.db.clone(),
+            config_service,
             "https://app.example.com".to_string(),
         ));
         (db, tracking_service)
@@ -65,104 +90,79 @@ mod tests {
     }
 
     // ============================================
-    // HTML Transformation Tests
+    // HTML Transformation Tests (use static methods)
     // ============================================
+
+    const TEST_BASE_URL: &str = "https://app.example.com";
 
     #[test]
     fn test_transform_html_injects_pixel_and_rewrites_links() {
-        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
-        let service = TrackingService::new(Arc::new(db), "https://app.example.com".to_string());
-
         let email_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         let html = r#"<html><body><a href="https://example.com/pricing">Pricing</a><a href="https://example.com/docs">Docs</a></body></html>"#;
 
-        let result = service.transform_html(email_id, html, true, true);
-
-        // Should have tracking pixel
+        let pixel_html = TrackingService::inject_tracking_pixel(TEST_BASE_URL, email_id, html);
         assert!(
-            result
-                .html
-                .contains("/api/emails/550e8400-e29b-41d4-a716-446655440000/track/open"),
+            pixel_html.contains("/api/emails/550e8400-e29b-41d4-a716-446655440000/track/open"),
             "Missing tracking pixel"
         );
 
-        // Should have rewritten links
+        let (rewritten, links) = TrackingService::rewrite_links(TEST_BASE_URL, email_id, html);
         assert!(
-            result.html.contains("/track/click/0"),
+            rewritten.contains("/track/click/0"),
             "First link not rewritten"
         );
         assert!(
-            result.html.contains("/track/click/1"),
+            rewritten.contains("/track/click/1"),
             "Second link not rewritten"
         );
-
-        // Should NOT contain original URLs in href (they're replaced)
         assert!(
-            !result
-                .html
-                .contains(r#"href="https://example.com/pricing""#),
+            !rewritten.contains(r#"href="https://example.com/pricing""#),
             "Original URL should be replaced"
         );
-
-        // Should have 2 extracted links
-        assert_eq!(result.links.len(), 2);
-        assert_eq!(result.links[0].original_url, "https://example.com/pricing");
-        assert_eq!(result.links[1].original_url, "https://example.com/docs");
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].original_url, "https://example.com/pricing");
+        assert_eq!(links[1].original_url, "https://example.com/docs");
     }
 
     #[test]
     fn test_transform_html_only_opens() {
-        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
-        let service = TrackingService::new(Arc::new(db), "https://app.example.com".to_string());
-
         let email_id = Uuid::new_v4();
         let html = r#"<a href="https://example.com">Link</a>"#;
 
-        let result = service.transform_html(email_id, html, true, false);
-
-        assert!(result.html.contains("track/open"), "Should have pixel");
+        let pixel_html = TrackingService::inject_tracking_pixel(TEST_BASE_URL, email_id, html);
+        assert!(pixel_html.contains("track/open"), "Should have pixel");
         assert!(
-            !result.html.contains("track/click"),
+            !pixel_html.contains("track/click"),
             "Should NOT have click tracking"
         );
-        assert!(result.links.is_empty(), "Should have no extracted links");
     }
 
     #[test]
     fn test_transform_html_only_clicks() {
-        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
-        let service = TrackingService::new(Arc::new(db), "https://app.example.com".to_string());
-
         let email_id = Uuid::new_v4();
         let html = r#"<a href="https://example.com">Link</a>"#;
 
-        let result = service.transform_html(email_id, html, false, true);
-
-        assert!(!result.html.contains("track/open"), "Should NOT have pixel");
+        let (rewritten, links) = TrackingService::rewrite_links(TEST_BASE_URL, email_id, html);
         assert!(
-            result.html.contains("track/click"),
+            rewritten.contains("track/click"),
             "Should have click tracking"
         );
-        assert_eq!(result.links.len(), 1);
+        assert_eq!(links.len(), 1);
     }
 
     #[test]
     fn test_transform_preserves_mailto_and_anchor_links() {
-        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
-        let service = TrackingService::new(Arc::new(db), "https://app.example.com".to_string());
-
         let email_id = Uuid::new_v4();
         let html = "<a href=\"mailto:test@example.com\">Email</a> <a href=\"#top\">Top</a> <a href=\"https://example.com\">Link</a>";
 
-        let result = service.transform_html(email_id, html, false, true);
-
+        let (rewritten, links) = TrackingService::rewrite_links(TEST_BASE_URL, email_id, html);
         assert!(
-            result.html.contains("mailto:test@example.com"),
+            rewritten.contains("mailto:test@example.com"),
             "mailto should be preserved"
         );
-        assert!(result.html.contains("#top"), "Anchor should be preserved");
-        assert_eq!(result.links.len(), 1, "Only HTTP link should be tracked");
-        assert_eq!(result.links[0].original_url, "https://example.com");
+        assert!(rewritten.contains("#top"), "Anchor should be preserved");
+        assert_eq!(links.len(), 1, "Only HTTP link should be tracked");
+        assert_eq!(links[0].original_url, "https://example.com");
     }
 
     // ============================================

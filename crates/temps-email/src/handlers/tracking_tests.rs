@@ -85,8 +85,29 @@ mod tests {
         let encryption_service = create_test_encryption_service();
         let provider_service = Arc::new(ProviderService::new(db.db.clone(), encryption_service));
         let domain_service = Arc::new(DomainService::new(db.db.clone(), provider_service.clone()));
-        let tracking_service = Arc::new(TrackingService::new(
+        let server_config = Arc::new(temps_config::ServerConfig {
+            address: "0.0.0.0:3000".to_string(),
+            database_url: "postgres://localhost/test".to_string(),
+            tls_address: None,
+            console_address: "0.0.0.0:3001".to_string(),
+            data_dir: std::path::PathBuf::from("/tmp/temps-test"),
+            auth_secret: "test-secret".to_string(),
+            encryption_key: "test-encryption-key-32bytes!!!!!".to_string(),
+            api_base_url: "http://localhost:3000".to_string(),
+            postgres_max_connections: None,
+            postgres_min_connections: None,
+            postgres_connect_timeout_secs: None,
+            postgres_acquire_timeout_secs: None,
+            postgres_idle_timeout_secs: None,
+            postgres_max_lifetime_secs: None,
+        });
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            server_config,
             db.db.clone(),
+        ));
+        let tracking_service = Arc::new(TrackingService::with_base_url(
+            db.db.clone(),
+            config_service,
             "http://localhost:3000".to_string(),
         ));
         let email_service = Arc::new(EmailService::new(

@@ -56,11 +56,9 @@ impl TempsPlugin for EmailPlugin {
             let domain_service = Arc::new(DomainService::new(db.clone(), provider_service.clone()));
             context.register_service(domain_service.clone());
 
-            // Create TrackingService
-            // Use TEMPS_BASE_URL env var if set, otherwise default
-            let base_url = std::env::var("TEMPS_BASE_URL")
-                .unwrap_or_else(|_| "http://localhost:3000".to_string());
-            let tracking_service = Arc::new(TrackingService::new(db.clone(), base_url));
+            // Create TrackingService — uses ConfigService to get external URL dynamically
+            let config_service = context.require_service::<temps_config::ConfigService>();
+            let tracking_service = Arc::new(TrackingService::new(db.clone(), config_service));
             context.register_service(tracking_service.clone());
 
             // Create EmailService with tracking support
