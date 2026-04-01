@@ -2,6 +2,7 @@
 
 import { getEmailOptions } from '@/api/client/@tanstack/react-query.gen'
 import { EmailResponse } from '@/api/client/types.gen'
+import { EmailEventTimeline } from '@/components/email/EmailEventTimeline'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -375,6 +376,11 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
             </div>
           </CardContent>
         </Card>
+      )}
+
+      {/* Event Timeline */}
+      {(email.track_opens || email.track_clicks) && (
+        <EmailEventTimeline emailId={email.id} />
       )}
 
       {/* Email Content */}

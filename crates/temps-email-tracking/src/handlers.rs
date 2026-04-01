@@ -40,6 +40,7 @@ pub struct TrackingState {
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        list_all_email_events,
         list_email_events,
         get_email_event_stats,
     ),
@@ -344,8 +345,77 @@ pub struct ListEmailEventsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ListAllEmailEventsQuery {
+    pub email_id: Option<String>,
+    pub event_type: Option<String>,
+    pub page: Option<u64>,
+    pub page_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct EmailEventStatsQuery {
     pub email_id: Option<String>,
+}
+
+/// GET /emails/events — list events across all emails with optional filters
+#[utoipa::path(
+    tag = "email-tracking",
+    get,
+    path = "/emails/events",
+    params(
+        ("email_id" = Option<String>, Query, description = "Filter by email ID"),
+        ("event_type" = Option<String>, Query, description = "Filter by event type"),
+        ("page" = Option<u64>, Query, description = "Page number (default: 1)"),
+        ("page_size" = Option<u64>, Query, description = "Page size (default: 20, max: 100)"),
+    ),
+    responses(
+        (status = 200, description = "Email events", body = PaginatedEmailEventsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_all_email_events(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<TrackingState>>,
+    Query(query): Query<ListAllEmailEventsQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EmailsRead);
+
+    let email_id = query
+        .email_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| {
+            temps_core::error_builder::bad_request()
+                .title("Invalid Email ID")
+                .detail("Invalid UUID in email_id query parameter")
+                .build()
+        })?;
+
+    let page = query.page.unwrap_or(1);
+    let page_size = std::cmp::min(query.page_size.unwrap_or(20), 100);
+
+    let (events, total) = state
+        .event_service
+        .list_events(ListEmailEventsOptions {
+            email_id,
+            event_type: query.event_type,
+            page: Some(page),
+            page_size: Some(page_size),
+        })
+        .await
+        .map_err(Problem::from)?;
+
+    let response = PaginatedEmailEventsResponse {
+        events: events.into_iter().map(EmailEventResponse::from).collect(),
+        total,
+        page,
+        page_size,
+    };
+
+    Ok(Json(response))
 }
 
 /// GET /emails/{email_id}/events
@@ -463,8 +533,9 @@ pub fn public_routes() -> Router<Arc<TrackingState>> {
 /// Authenticated API routes
 pub fn api_routes() -> Router<Arc<TrackingState>> {
     Router::new()
-        .route("/emails/{email_id}/events", get(list_email_events))
+        .route("/emails/events", get(list_all_email_events))
         .route("/emails/events/stats", get(get_email_event_stats))
+        .route("/emails/{email_id}/events", get(list_email_events))
 }
 
 /// All routes merged

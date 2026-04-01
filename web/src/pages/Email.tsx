@@ -1,3 +1,4 @@
+import { EmailAnalytics } from '@/components/email/EmailAnalytics'
 import { EmailDomainsManagement } from '@/components/email/EmailDomainsManagement'
 import { EmailProvidersManagement } from '@/components/email/EmailProvidersManagement'
 import { EmailsSentList } from '@/components/email/EmailsSentList'
@@ -35,10 +36,11 @@ export function Email() {
           </div>
 
           <Tabs value={activeTab} onValueChange={handleTabChange}>
-            <TabsList className="grid w-full grid-cols-4 lg:w-auto lg:grid-cols-none lg:inline-flex">
+            <TabsList className="grid w-full grid-cols-5 lg:w-auto lg:grid-cols-none lg:inline-flex">
               <TabsTrigger value="providers">Providers</TabsTrigger>
               <TabsTrigger value="domains">Domains</TabsTrigger>
               <TabsTrigger value="emails">Sent Emails</TabsTrigger>
+              <TabsTrigger value="analytics">Analytics</TabsTrigger>
               <TabsTrigger value="sdk">SDK</TabsTrigger>
             </TabsList>
 
@@ -52,6 +54,10 @@ export function Email() {
 
             <TabsContent value="emails" className="mt-6">
               <EmailsSentList />
+            </TabsContent>
+
+            <TabsContent value="analytics" className="mt-6">
+              <EmailAnalytics />
             </TabsContent>
 
             <TabsContent value="sdk" className="mt-6">
