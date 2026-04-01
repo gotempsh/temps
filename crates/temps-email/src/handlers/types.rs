@@ -319,6 +319,8 @@ pub struct EmailResponse {
     pub reply_to: Option<String>,
     pub subject: String,
     pub html_body: Option<String>,
+    /// The final HTML sent to the provider (with tracking pixel and rewritten links)
+    pub tracked_html_body: Option<String>,
     pub text_body: Option<String>,
     pub headers: Option<HashMap<String, String>>,
     pub tags: Option<Vec<String>>,

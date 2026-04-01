@@ -55,6 +55,7 @@ mod m20260326_000003_add_edge_public_key_to_nodes;
 mod m20260327_000001_add_service_name_to_custom_domains;
 mod m20260328_000001_create_email_events;
 mod m20260328_000002_add_check_path_to_status_monitors;
+mod m20260401_000001_add_tracked_html_body_to_emails;
 
 pub struct Migrator;
 
@@ -117,6 +118,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260327_000001_add_service_name_to_custom_domains::Migration),
             Box::new(m20260328_000001_create_email_events::Migration),
             Box::new(m20260328_000002_add_check_path_to_status_monitors::Migration),
+            Box::new(m20260401_000001_add_tracked_html_body_to_emails::Migration),
         ]
     }
 }

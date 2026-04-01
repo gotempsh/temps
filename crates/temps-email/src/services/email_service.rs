@@ -144,6 +144,7 @@ impl EmailService {
             reply_to: Set(request.reply_to.clone()),
             subject: Set(request.subject.clone()),
             html_body: Set(request.html.clone()),
+            tracked_html_body: Set(tracked_html.clone()),
             text_body: Set(request.text.clone()),
             headers: Set(request
                 .headers

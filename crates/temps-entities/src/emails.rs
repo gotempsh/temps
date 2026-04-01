@@ -22,6 +22,7 @@ pub struct Model {
     pub reply_to: Option<String>,
     pub subject: String,
     pub html_body: Option<String>,
+    pub tracked_html_body: Option<String>,
     pub text_body: Option<String>,
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub headers: Option<Json>,
