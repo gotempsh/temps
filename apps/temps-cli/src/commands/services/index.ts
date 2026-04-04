@@ -1073,6 +1073,15 @@ async function envAction(options: EnvOptions): Promise<void> {
     if (error) {
       throw new Error(getErrorMessage(error))
     }
+    // API returns HashMap<String, String> but OpenAPI spec says Vec<EnvironmentVariableInfo>
+    // Handle both formats for compatibility
+    if (data && !Array.isArray(data)) {
+      return Object.entries(data as Record<string, string>).map(([name, value]) => ({
+        name,
+        value: String(value),
+        sensitive: /password|secret|token|key/i.test(name),
+      }))
+    }
     return data ?? []
   })
 

@@ -81,7 +81,7 @@ export function registerEnvironmentsCommands(program: Command): void {
     .description('Get a specific environment variable')
     .option('-e, --environment <name>', 'Specify environment (if variable exists in multiple)')
     .action(async (key, options, cmd) => {
-      const projectSlug = cmd.parent!.parent!.opts().project
+      const projectSlug = cmd.parent!.opts().project
       return getEnvVar(projectSlug, key, options)
     })
 
@@ -92,7 +92,7 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('--no-preview', 'Exclude from preview environments')
     .option('--update', 'Update existing variable instead of creating new')
     .action(async (key, value, options, cmd) => {
-      const projectSlug = cmd.parent!.parent!.opts().project
+      const projectSlug = cmd.parent!.opts().project
       return setEnvVar(projectSlug, key, value, options)
     })
 
@@ -104,7 +104,7 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('-e, --environment <name>', 'Delete only from specific environment')
     .option('-f, --force', 'Skip confirmation')
     .action(async (key, options, cmd) => {
-      const projectSlug = cmd.parent!.parent!.opts().project
+      const projectSlug = cmd.parent!.opts().project
       return deleteEnvVar(projectSlug, key, options)
     })
 
@@ -114,7 +114,7 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('-e, --environments <names>', 'Comma-separated environment names')
     .option('--overwrite', 'Overwrite existing variables')
     .action(async (file, options, cmd) => {
-      const projectSlug = cmd.parent!.parent!.opts().project
+      const projectSlug = cmd.parent!.opts().project
       return importEnvVars(projectSlug, file, options)
     })
 
@@ -124,7 +124,7 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('-e, --environment <name>', 'Export from specific environment')
     .option('-o, --output <file>', 'Write to file instead of stdout')
     .action(async (options, cmd) => {
-      const projectSlug = cmd.parent!.parent!.opts().project
+      const projectSlug = cmd.parent!.opts().project
       return exportEnvVars(projectSlug, options)
     })
 
