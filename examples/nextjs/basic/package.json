@@ -11,7 +11,7 @@
   "dependencies": {
     "react": "19.2.3",
     "react-dom": "19.2.3",
-    "next": "16.1.5"
+    "next": "16.2.2"
   },
   "devDependencies": {
     "babel-plugin-react-compiler": "1.0.0",

@@ -271,7 +271,7 @@ woothee = "0.13.0"
 # Using git version for security fixes:
 # - Uses astral-tokio-tar instead of vulnerable tokio-tar (RUSTSEC-2025-0111)
 # - Compatible with bollard 0.19.x
-testcontainers =  "0.27.1"
+testcontainers =  "0.27.2"
 
 
 [profile.release]
@@ -309,10 +309,7 @@ opt-level = 2      # Optimize dependencies
 #    - Fix: Requires russh to upgrade libcrux dependencies
 #    - Status: Dev-dependency only, zero production impact
 #
-# 4. GHSA-xxx: astral-tokio-tar 0.5.6 (HIGH severity, dev-dependency only)
-#    - Path: testcontainers → astral-tokio-tar 0.5.6
-#    - Fix: No upstream fix available
-#    - Status: Dev-dependency only (testcontainers), zero production impact
+# 4. astral-tokio-tar: RESOLVED by upgrading testcontainers 0.27.1 → 0.27.2
 #
 # Previously resolved:
 # - atty 0.2.14: RESOLVED in Pingora 0.7.0 (upgraded to clap 4.5)
