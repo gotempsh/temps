@@ -1388,7 +1388,9 @@ pub async fn get_container_detail(
         .get_container_env_variables(project_id, environment_id, container_id.clone())
         .await
     {
-        let sensitive_keys = ["password", "secret", "token", "key", "auth", "api_key"];
+        let sensitive_keys = [
+            "password", "secret", "token", "key", "auth", "api_key", "npm_rc",
+        ];
         for (key, value) in vars {
             let is_masked = sensitive_keys
                 .iter()

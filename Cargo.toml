@@ -289,12 +289,13 @@ opt-level = 3
 
 [profile.dev]
 opt-level = 0
-debug = true
+debug = "line-tables-only"
 incremental = true
-codegen-units = 16
+split-debuginfo = "unpacked"
 
 [profile.dev.package."*"]
-opt-level = 2      # Optimize dependencies
+opt-level = 1
+debug = false
 
 # ============================================================================
 # Dependency Overrides - Security Fixes

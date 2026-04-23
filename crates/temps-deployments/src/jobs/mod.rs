@@ -13,6 +13,7 @@ pub mod deploy_static_bundle;
 pub mod download_repo;
 pub mod mark_deployment_complete;
 pub mod node_health_check;
+pub mod npmrc;
 pub mod persist_static_assets;
 pub mod pipeline_validation;
 pub mod pull_external_image;

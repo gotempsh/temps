@@ -2441,7 +2441,10 @@ impl ExternalService for PostgresService {
     }
 
     async fn init(&self, config: ServiceConfig) -> Result<HashMap<String, String>> {
-        info!("Initializing PostgreSQL service {:?}", config);
+        info!(
+            "Initializing PostgreSQL service (name={}, type={:?}, version={:?})",
+            config.name, config.service_type, config.version
+        );
 
         // Parse input config and transform to runtime config
         let postgres_config = self.get_postgres_config(config)?;

@@ -504,6 +504,52 @@ impl BuildImageJob {
         Ok(dockerfile_with_args.build_args)
     }
 
+    /// Write a `.npmrc` file into the build context when the user provides
+    /// `NPM_RC` or `NPM_TOKEN` as a build env var.
+    ///
+    /// Matches the Vercel behavior: `NPM_RC` wins over `NPM_TOKEN` when both
+    /// are set. The file contents are never logged; only the source env var
+    /// name ("NPM_RC" or "NPM_TOKEN") is logged.
+    async fn ensure_npmrc(
+        &self,
+        context: &WorkflowContext,
+        build_context_dir: &Path,
+    ) -> Result<(), WorkflowError> {
+        // `build_config.build_args` is the flat map of user env vars / build args
+        // that workflow_planner.rs assembles for this job.
+        let env: HashMap<String, String> = self
+            .build_config
+            .build_args
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let Some(plan) = super::npmrc::plan_npmrc(&env) else {
+            return Ok(());
+        };
+
+        let npmrc_path = build_context_dir.join(".npmrc");
+        fs::write(&npmrc_path, &plan.contents).map_err(|e| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Failed to write .npmrc to {}: {}",
+                npmrc_path.display(),
+                e
+            ))
+        })?;
+
+        self.log(
+            context,
+            format!(
+                "Generated .npmrc from {} env var at {}",
+                plan.source.as_str(),
+                npmrc_path.display()
+            ),
+        )
+        .await?;
+
+        Ok(())
+    }
+
     /// Build the container image with real-time logging
     async fn build_image(
         &self,
@@ -541,6 +587,10 @@ impl BuildImageJob {
         let preset_build_args = self
             .ensure_dockerfile(context, &build_context, &dockerfile_path)
             .await?;
+
+        // Write .npmrc into the build context when NPM_RC / NPM_TOKEN env vars
+        // are provided (Vercel-compatible behavior). No-op otherwise.
+        self.ensure_npmrc(context, &build_context).await?;
 
         // Merge preset build args with user-provided build args
         // User-provided args take precedence

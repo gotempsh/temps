@@ -121,25 +121,31 @@ export function RepositoryList({
       errorTitle: 'Failed to sync repositories',
     },
     onSuccess: () => {
-      toast.success('Repositories synced successfully!')
+      // The sync now runs in the background: 202 means "started", not
+      // "finished". Client-side progress tracking lives on the connection
+      // row's `syncing` / `synced_repository_count` fields.
+      toast.success('Repository sync started', {
+        description: 'Watch the connection page for live progress.',
+      })
+      queryClient.invalidateQueries({
+        queryKey: ['listConnections'],
+      })
       refetch()
       queryClient.invalidateQueries({
         queryKey: ['listRepositoriesByConnection'],
       })
     },
     onError: (error: any) => {
-      if (error.detail) {
-        toast.error('Failed to sync repositories', {
-          description: error.detail,
-        })
-      } else {
-        toast.error(
-          `Failed to sync repositories: ${error?.message || 'Unknown error'}`,
-          {
-            description: error.detail,
-          }
-        )
-      }
+      // Server's drop-guard flips `syncing=false` on failure, so refresh
+      // the UI to avoid a stale spinner even on the error path.
+      queryClient.invalidateQueries({ queryKey: ['listConnections'] })
+
+      // RFC 7807 Problem Details — title + detail are where the useful
+      // context lives (e.g. 504 SyncTimeout, 409 SyncInProgress).
+      const title = error?.title || 'Failed to start repository sync'
+      const description =
+        error?.detail || error?.message || 'Unknown error. Try again.'
+      toast.error(title, { description })
     },
   })
 

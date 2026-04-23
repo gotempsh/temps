@@ -74,6 +74,15 @@ impl From<GitProviderManagerError> for Problem {
                 .with_detail(
                     "Repository synchronization is already in progress for this connection",
                 ),
+            GitProviderManagerError::SyncTimeout {
+                connection_id,
+                deadline_secs,
+            } => problem_new(StatusCode::GATEWAY_TIMEOUT)
+                .with_title("Sync Timed Out")
+                .with_detail(format!(
+                    "Repository sync for connection {} exceeded the {}s hard deadline and was aborted; the syncing flag has been reset so you can retry.",
+                    connection_id, deadline_secs
+                )),
             GitProviderManagerError::RepositoryNotFound(msg) => problem_new(StatusCode::NOT_FOUND)
                 .with_title("Repository Not Found")
                 .with_detail(msg),
@@ -367,6 +376,18 @@ pub struct RepositorySyncResponse {
     pub total_count: usize,
     #[schema(value_type = String, format = DateTime)]
     pub synced_at: UtcDateTime,
+}
+
+/// Returned by `POST /git-connections/{id}/sync` to acknowledge that a
+/// sync has been kicked off in the background. Clients should poll the
+/// connection's `syncing` and `synced_repository_count` fields to track
+/// progress rather than waiting on this response.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RepositorySyncStartedResponse {
+    pub connection_id: i32,
+    pub syncing: bool,
+    #[schema(value_type = String, format = DateTime)]
+    pub started_at: UtcDateTime,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -668,10 +689,14 @@ pub async fn list_connections(
     }))
 }
 
-/// Sync repositories from a connection
+/// Start a repository sync for a connection
 ///
-/// Synchronizes repository data from the git provider to the local database.
-/// This updates the local cache of repositories for faster access.
+/// Kicks off a background sync of the connection's repositories from the
+/// provider. Returns `202 Accepted` immediately — the caller should poll
+/// the connection endpoint for `syncing` / `synced_repository_count`
+/// updates rather than waiting on this response. The sync is guarded by
+/// a hard deadline and always releases the `syncing` flag on exit, so a
+/// client that disconnects mid-sync will not leave the connection stuck.
 #[utoipa::path(
     post,
     path = "/git-connections/{connection_id}/sync",
@@ -679,7 +704,7 @@ pub async fn list_connections(
         ("connection_id" = i32, Path, description = "Connection ID")
     ),
     responses(
-        (status = 200, description = "Repositories synced successfully", body = RepositorySyncResponse),
+        (status = 202, description = "Repository sync started in background", body = RepositorySyncStartedResponse),
         (status = 404, description = "Connection not found"),
         (status = 409, description = "Sync already in progress"),
         (status = 401, description = "Unauthorized"),
@@ -697,39 +722,23 @@ pub async fn sync_repositories(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitRepositoriesSync);
 
-    // Use the standard sync for all providers, including GitHub Apps
-    // The git_provider_manager now handles GitHub App installation token generation internally
-    let repositories = state
+    // Fire and forget: the manager spawns a detached task owning a drop
+    // guard that resets `syncing=false` on every exit path. We can
+    // safely respond 202 the moment the `syncing=true` write lands.
+    state
         .git_provider_manager
-        .sync_repositories(connection_id)
+        .clone()
+        .spawn_sync_repositories(connection_id)
         .await?;
-    let items: Vec<RepositoryResponse> = repositories
-        .iter()
-        .map(|r| RepositoryResponse {
-            id: r.id,
-            owner: r.owner.clone(),
-            name: r.name.clone(),
-            full_name: r.full_name.clone(),
-            description: r.description.clone(),
-            private: r.private,
-            default_branch: r.default_branch.clone(),
-            language: r.language.clone(),
-            created_at: r.created_at,
-            updated_at: r.updated_at,
-            pushed_at: r.pushed_at,
-            preset: convert_preset_json(r.preset.clone()),
-            clone_url: r.clone_url.clone(),
-            ssh_url: r.ssh_url.clone(),
-            git_provider_connection_id: r.git_provider_connection_id,
-        })
-        .collect();
 
-    let total_count = items.len();
-    Ok(Json(RepositorySyncResponse {
-        repositories: items,
-        total_count,
-        synced_at: chrono::Utc::now(),
-    }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RepositorySyncStartedResponse {
+            connection_id,
+            syncing: true,
+            started_at: chrono::Utc::now(),
+        }),
+    ))
 }
 
 /// List repositories for a specific connection
@@ -1713,6 +1722,7 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
             RepositoryListQuery,
             SyncedRepositoryListQuery,
             RepositoryListResponse,
+            RepositorySyncStartedResponse,
             CreateGitHubPATRequest,
             CreateGitLabPATRequest,
             CreateGitLabOAuthRequest,

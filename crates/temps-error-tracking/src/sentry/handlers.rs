@@ -168,8 +168,12 @@ async fn ingest_sentry_envelope(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    debug!("Query params: {:?}", params);
-    debug!("Headers: {:?}", headers);
+    // Log only key names — values and headers can contain the Sentry DSN auth key.
+    debug!(
+        "Sentry ingest: query param keys={:?}, header names={:?}",
+        params.keys().collect::<Vec<_>>(),
+        headers.keys().map(|k| k.as_str()).collect::<Vec<_>>()
+    );
     // Extract DSN key from auth header or query params
     let dsn_key = extract_dsn_key(&headers, &params);
 

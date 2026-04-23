@@ -625,8 +625,13 @@ async fn github_app_auth_callback(
         .and_then(|id| id.parse::<i64>().ok());
     let setup_action = params.get("setup_action").cloned();
 
-    // Log all parameters for debugging
-    info!("GitHub App auth callback - params: {:?}", params);
+    // Log parameter presence only — `code` is a sensitive OAuth authorization code.
+    info!(
+        "GitHub App auth callback - param keys: {:?}, installation_id={:?}, setup_action={:?}",
+        params.keys().collect::<Vec<_>>(),
+        installation_id,
+        setup_action
+    );
 
     if code.is_empty() {
         return Err(problem_new(StatusCode::BAD_REQUEST)

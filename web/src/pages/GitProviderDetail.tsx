@@ -122,13 +122,23 @@ export default function GitProviderDetail() {
       queryClient.invalidateQueries({ queryKey: listConnectionsQueryKey({}) })
     },
     onSuccess: () => {
-      showSuccess('Repositories synced successfully!')
+      // 202 = sync started, not finished. The background task updates
+      // `syncing` / `synced_repository_count` on the connection row as it
+      // progresses; the periodic refetch on this page surfaces that.
+      showSuccess('Repository sync started')
       refetchConnections()
       queryClient.invalidateQueries({ queryKey: listConnectionsQueryKey({}) })
     },
-    onError: () => {
-      // Server resets `syncing=false` in its cleanup path, so just refresh.
+    onError: (error: any) => {
+      // The backend's drop-guard resets `syncing=false` on failure too, so
+      // refresh the list to clear any stale "syncing" spinner.
       queryClient.invalidateQueries({ queryKey: listConnectionsQueryKey({}) })
+
+      // Surface the failure. RFC 7807 Problem Details puts the human
+      // message in `detail`; fall back to `title` then `message`.
+      const detail =
+        error?.detail || error?.title || error?.message || 'Unknown error'
+      showError(`Failed to start repository sync: ${detail}`)
     },
   })
 

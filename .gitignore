@@ -18,6 +18,7 @@ dist/
 .project
 .settings/
 target
+target2
 ai
 
 .cargo/config.toml

@@ -447,7 +447,10 @@ impl S3Service {
 
     async fn initialize_client(&self, config: ServiceConfig) -> Result<Client> {
         let s3_config = self.get_s3_config(config)?;
-        info!("Initializing S3 client with config {:?}", s3_config);
+        info!(
+            "Initializing S3 client (host={}, port={}, region={})",
+            s3_config.host, s3_config.port, s3_config.region
+        );
         let config = aws_sdk_s3::Config::builder()
             .endpoint_url(format!("http://{}:{}", s3_config.host, s3_config.port))
             .region(Region::new(s3_config.region))
@@ -605,11 +608,17 @@ impl ExternalService for S3Service {
     }
 
     async fn init(&self, config: ServiceConfig) -> Result<HashMap<String, String>> {
-        info!("Initializing S3 service {:?}", config);
+        info!(
+            "Initializing S3 service (name={}, type={:?}, version={:?})",
+            config.name, config.service_type, config.version
+        );
 
         // Parse input config and transform to runtime config
         let s3_config = self.get_s3_config(config)?;
-        info!("Initializing S3 config {:?}", s3_config);
+        info!(
+            "S3 runtime config (host={}, port={}, region={}, image={})",
+            s3_config.host, s3_config.port, s3_config.region, s3_config.docker_image
+        );
 
         // Store runtime config
         *self.config.write().await = Some(s3_config.clone());
@@ -633,7 +642,10 @@ impl ExternalService for S3Service {
             }
         }
 
-        info!("Inferred params {:?}", inferred_params);
+        info!(
+            "Inferred S3 params (keys: {:?})",
+            inferred_params.keys().collect::<Vec<_>>()
+        );
         Ok(inferred_params)
     }
 
@@ -1187,7 +1199,11 @@ impl ExternalService for S3Service {
         let mut error_logs = Vec::new();
 
         for cmd in commands {
-            info!("Executing command: {:?}", cmd);
+            // Log only the subcommand — args may contain credentials (e.g. `mc alias set`).
+            info!(
+                "Executing command: {:?}",
+                cmd.iter().take(3).collect::<Vec<_>>()
+            );
 
             let exec = self
                 .docker

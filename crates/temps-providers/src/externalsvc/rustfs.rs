@@ -1361,7 +1361,11 @@ impl ExternalService for RustfsService {
         let mut error_logs = Vec::new();
 
         for cmd in commands {
-            info!("Executing command: {:?}", cmd);
+            // Log only the subcommand — args may contain credentials (e.g. `mc alias set`).
+            info!(
+                "Executing command: {:?}",
+                cmd.iter().take(3).collect::<Vec<_>>()
+            );
 
             let (ok, _stdout, stderr) = self
                 .exec_in_container(&self.docker, &container.id, cmd)

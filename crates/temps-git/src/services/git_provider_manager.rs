@@ -87,6 +87,14 @@ pub enum GitProviderManagerError {
     #[error("Sync already in progress")]
     SyncInProgress,
 
+    #[error(
+        "Sync for connection {connection_id} exceeded hard deadline of {deadline_secs}s and was aborted"
+    )]
+    SyncTimeout {
+        connection_id: i32,
+        deadline_secs: u64,
+    },
+
     #[error("Connection token expired for connection ID {connection_id}. Please update your access token.")]
     ConnectionTokenExpired { connection_id: i32 },
 
@@ -95,6 +103,68 @@ pub enum GitProviderManagerError {
 
     #[error("OAuth state not found or expired: {0}")]
     OAuthStateInvalid(String),
+}
+
+/// Hard ceiling on a single sync run. If we haven't finished within this
+/// window something has gone badly wrong (stuck HTTPS connection, provider
+/// outage with retries spinning, etc) and we'd rather abort and release
+/// the `syncing` flag than hold it indefinitely. 30 minutes is well above
+/// a healthy 20,000-repo sync's wall time and well below "the user has
+/// given up and restarted the server."
+const SYNC_HARD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Drop guard that resets `syncing=false` on a connection when it leaves
+/// scope. Covers every exit path — Ok, Err, panic, task cancel, deadline
+/// timeout — so the flag never gets stuck in the `true` state.
+///
+/// The guard owns an `Arc<GitProviderManager>` so the write is issued
+/// against the live DB handle. Because `Drop` is synchronous, we spawn a
+/// detached tokio task to perform the update. If the runtime is shutting
+/// down and can't accept new tasks we log and move on — the startup
+/// reset in `plugin.rs` will clean up on the next boot.
+struct SyncFlagGuard {
+    manager: Option<Arc<GitProviderManager>>,
+    connection_id: i32,
+}
+
+impl SyncFlagGuard {
+    fn new(manager: Arc<GitProviderManager>, connection_id: i32) -> Self {
+        Self {
+            manager: Some(manager),
+            connection_id,
+        }
+    }
+}
+
+impl Drop for SyncFlagGuard {
+    fn drop(&mut self) {
+        let Some(manager) = self.manager.take() else {
+            return;
+        };
+        let connection_id = self.connection_id;
+        // Best-effort: if we're mid-tokio-shutdown, `spawn` will panic.
+        // Catch that so a panicking Drop doesn't bring down the process.
+        let spawn_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::spawn(async move {
+                if let Err(e) = manager
+                    .set_connection_syncing_status(connection_id, false)
+                    .await
+                {
+                    tracing::error!(
+                        connection_id,
+                        error = %e,
+                        "Failed to reset syncing flag from SyncFlagGuard"
+                    );
+                }
+            });
+        }));
+        if spawn_result.is_err() {
+            tracing::warn!(
+                connection_id,
+                "Could not spawn syncing-flag reset during Drop (runtime likely shutting down); startup reset will handle it"
+            );
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -886,23 +956,16 @@ impl GitProviderManager {
             )
             .await?;
 
-        // Synchronously sync repositories after creating the connection
-        match self.sync_repositories(connection.id).await {
-            Ok(repos) => {
-                tracing::info!(
-                    "Successfully synced {} repositories for GitHub PAT connection {}",
-                    repos.len(),
-                    connection.id
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to sync repositories for GitHub PAT connection {}: {}",
-                    connection.id,
-                    e
-                );
-                // Don't fail the provider creation if sync fails
-            }
+        // Kick off sync in the background so creating the provider returns
+        // quickly. The sync's own guard resets `syncing` on any exit path.
+        let manager = Arc::new(self.clone());
+        if let Err(e) = manager.spawn_sync_repositories(connection.id).await {
+            tracing::warn!(
+                "Failed to start background sync for GitHub PAT connection {}: {}",
+                connection.id,
+                e
+            );
+            // Don't fail the provider creation if sync can't be kicked off.
         }
 
         Ok(provider)
@@ -966,23 +1029,16 @@ impl GitProviderManager {
             )
             .await?;
 
-        // Optionally sync repositories immediately
-        match self.sync_repositories(connection.id).await {
-            Ok(repos) => {
-                tracing::info!(
-                    "Successfully synced {} repositories for GitLab PAT connection {}",
-                    repos.len(),
-                    connection.id
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to sync repositories for GitLab PAT connection {}: {}",
-                    connection.id,
-                    e
-                );
-                // Don't fail the provider creation if sync fails
-            }
+        // Kick off sync in the background so creating the provider returns
+        // quickly. The sync's own guard resets `syncing` on any exit path.
+        let manager = Arc::new(self.clone());
+        if let Err(e) = manager.spawn_sync_repositories(connection.id).await {
+            tracing::warn!(
+                "Failed to start background sync for GitLab PAT connection {}: {}",
+                connection.id,
+                e
+            );
+            // Don't fail the provider creation if sync can't be kicked off.
         }
 
         Ok(provider)
@@ -1328,69 +1384,133 @@ impl GitProviderManager {
     }
 
     /// Sync repositories from a connection
-    pub async fn sync_repositories(
-        &self,
+    /// Mark a connection as syncing and spawn the sync loop as a detached
+    /// background task.
+    ///
+    /// Returns as soon as `syncing=true` has been persisted, so the HTTP
+    /// caller can close the connection without interrupting the sync. The
+    /// spawned task owns a drop-guard that flips `syncing=false` on *any*
+    /// exit path — normal completion, error, timeout, or drop. The whole
+    /// inner sync is wrapped in a generous deadline to guarantee the flag
+    /// cannot get stuck forever even if the provider hangs mid-request.
+    ///
+    /// Returns `SyncInProgress` if the connection is already syncing.
+    pub async fn spawn_sync_repositories(
+        self: Arc<Self>,
         connection_id: i32,
-    ) -> Result<Vec<repositories::Model>, GitProviderManagerError> {
-        // Get connection and check if already syncing
+    ) -> Result<(), GitProviderManagerError> {
         let connection = self.get_connection(connection_id).await?;
-
         if connection.syncing {
             return Err(GitProviderManagerError::SyncInProgress);
         }
 
-        // Set syncing status to true
+        // Flip to syncing=true before returning so the client's immediate
+        // follow-up read observes the fresh state.
         self.set_connection_syncing_status(connection_id, true)
             .await?;
 
-        // Perform sync with cleanup on completion
-        let sync_result = self.sync_repositories_internal(connection_id).await;
+        let manager = self.clone();
+        tokio::spawn(async move {
+            manager.run_sync_guarded(connection_id).await;
+        });
 
-        // Always reset syncing status to false
-        if let Err(e) = self
-            .set_connection_syncing_status(connection_id, false)
-            .await
-        {
-            error!(
-                "Failed to reset syncing status for connection {}: {}",
-                connection_id, e
-            );
+        Ok(())
+    }
+
+    /// Synchronous variant of `spawn_sync_repositories` for callers that
+    /// need to block until the sync finishes (tests, CLI flows). Everyday
+    /// code paths should prefer `spawn_sync_repositories` so the sync
+    /// survives HTTP client disconnects.
+    pub async fn sync_repositories(
+        &self,
+        connection_id: i32,
+    ) -> Result<Vec<repositories::Model>, GitProviderManagerError> {
+        let connection = self.get_connection(connection_id).await?;
+        if connection.syncing {
+            return Err(GitProviderManagerError::SyncInProgress);
         }
-        match sync_result {
-            Ok(_) => {
+
+        self.set_connection_syncing_status(connection_id, true)
+            .await?;
+
+        // Hold the guard on the stack so even a panic inside the inner
+        // call unwinds through the Drop impl and resets the flag.
+        let guard = SyncFlagGuard::new(self.clone_arc(), connection_id);
+        let result = tokio::time::timeout(
+            SYNC_HARD_DEADLINE,
+            self.sync_repositories_internal(connection_id),
+        )
+        .await;
+        drop(guard);
+
+        match result {
+            Ok(Ok(())) => {
                 let repos = repositories::Entity::find()
                     .filter(repositories::Column::GitProviderConnectionId.eq(connection_id))
                     .order_by_desc(repositories::Column::PushedAt)
                     .all(self.db.as_ref())
                     .await?;
-                // Fire background jobs for preset calculation per repository
-                for repository in repos.clone() {
-                    let manager = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = manager
-                            .queue_service
-                            .send(temps_core::Job::CalculateRepositoryPreset(
-                                temps_core::CalculateRepositoryPresetJob {
-                                    repository_id: repository.id,
-                                },
-                            ))
-                            .await
-                        {
-                            tracing::error!(
-                                "Failed to queue preset calculation for repository {}: {}",
-                                repository.id,
-                                e
-                            );
-                        }
-                    });
-                }
                 Ok(repos)
             }
-            Err(e) => {
-                error!("Failed to sync repositories: {}", e);
+            Ok(Err(e)) => {
+                error!(
+                    connection_id,
+                    error = %e,
+                    "Repository sync failed"
+                );
                 Err(e)
             }
+            Err(_elapsed) => {
+                error!(
+                    connection_id,
+                    deadline_secs = SYNC_HARD_DEADLINE.as_secs(),
+                    "Repository sync exceeded hard deadline and was aborted"
+                );
+                Err(GitProviderManagerError::SyncTimeout {
+                    connection_id,
+                    deadline_secs: SYNC_HARD_DEADLINE.as_secs(),
+                })
+            }
         }
+    }
+
+    /// Runs the inner sync loop behind a drop-guard and a hard deadline.
+    /// Meant to be invoked from a detached `tokio::spawn` — never returns
+    /// errors to a caller, only logs them.
+    async fn run_sync_guarded(self: Arc<Self>, connection_id: i32) {
+        let guard = SyncFlagGuard::new(self.clone(), connection_id);
+        let outcome = tokio::time::timeout(
+            SYNC_HARD_DEADLINE,
+            self.sync_repositories_internal(connection_id),
+        )
+        .await;
+        drop(guard);
+
+        match outcome {
+            Ok(Ok(())) => {
+                tracing::info!(connection_id, "Repository sync completed");
+            }
+            Ok(Err(e)) => {
+                tracing::error!(
+                    connection_id,
+                    error = %e,
+                    "Repository sync failed; syncing flag has been reset"
+                );
+            }
+            Err(_elapsed) => {
+                tracing::error!(
+                    connection_id,
+                    deadline_secs = SYNC_HARD_DEADLINE.as_secs(),
+                    "Repository sync exceeded hard deadline and was aborted"
+                );
+            }
+        }
+    }
+
+    /// Wrap `&self` in an `Arc` copy of the manager. Used to hand the
+    /// manager into a `Drop` guard that needs owned access.
+    fn clone_arc(&self) -> Arc<Self> {
+        Arc::new(self.clone())
     }
 
     async fn sync_repositories_internal(

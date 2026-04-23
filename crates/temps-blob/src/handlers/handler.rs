@@ -490,7 +490,12 @@ pub async fn blob_enable(
     // Enable requires SystemAdmin permission
     permission_guard!(auth, SystemAdmin);
 
-    info!("Enabling Blob service with config: {:?}", request);
+    info!(
+        "Enabling Blob service (image={:?}, root_user_provided={}, root_password_provided={})",
+        request.docker_image,
+        request.root_user.is_some(),
+        request.root_password.is_some()
+    );
 
     // Check if the service already exists (might be stopped)
     let existing_service = state

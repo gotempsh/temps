@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use urlencoding;
 
 /// Input configuration for creating a Redis service
@@ -487,16 +487,11 @@ impl RedisService {
     }
 
     fn get_redis_config(&self, service_config: ServiceConfig) -> Result<RedisConfig> {
-        info!(
-            "get_redis_config - parsing parameters: {:?}",
-            service_config.parameters
-        );
-
         // Parse input config and transform to runtime config
         let input_config: RedisInputConfig = serde_json::from_value(service_config.parameters)
             .map_err(|e| anyhow::anyhow!("Failed to parse Redis configuration: {}", e))?;
 
-        info!(
+        debug!(
             "get_redis_config - parsed input config: port={:?}, password_provided={}",
             input_config.port,
             input_config.password.is_some()
@@ -504,7 +499,7 @@ impl RedisService {
 
         let redis_config = RedisConfig::from(input_config);
 
-        info!(
+        debug!(
             "get_redis_config - resulting config: port={}, password_len={}",
             redis_config.port,
             redis_config.password.len()
@@ -1117,7 +1112,10 @@ impl ExternalService for RedisService {
     }
 
     async fn init(&self, config: ServiceConfig) -> Result<HashMap<String, String>> {
-        info!("Initializing Redis service {:?}", config);
+        info!(
+            "Initializing Redis service (name={}, type={:?}, version={:?})",
+            config.name, config.service_type, config.version
+        );
 
         // Parse input config and transform to runtime config
         let redis_config = self.get_redis_config(config)?;
