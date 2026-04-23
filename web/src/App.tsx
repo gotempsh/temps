@@ -414,7 +414,10 @@ const FullAppRoutes = () => {
                 {/* Projects */}
                 <Route path="/projects/new" element={<NewProject />} />
                 <Route path="/projects/import-wizard" element={<Import />} />
-                <Route path="/projects/import/*" element={<ImportProject />} />
+                <Route
+                  path="/projects/import/:repositoryId"
+                  element={<ImportProject />}
+                />
                 <Route path="/projects/:slug/*" element={<ProjectDetail />} />
                 {/* Utility */}
                 <Route path="/ip/:ip" element={<IpGeolocationDetail />} />

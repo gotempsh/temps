@@ -69,6 +69,7 @@ mod m20260422_000001_external_service_health;
 mod m20260422_000002_add_git_connection_health;
 mod m20260423_000001_create_oauth_states;
 mod m20260423_000002_add_sync_progress_count;
+mod m20260423_000003_fix_gitlab_nested_group_owner;
 
 pub struct Migrator;
 
@@ -141,6 +142,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260422_000002_add_git_connection_health::Migration),
             Box::new(m20260423_000001_create_oauth_states::Migration),
             Box::new(m20260423_000002_add_sync_progress_count::Migration),
+            Box::new(m20260423_000003_fix_gitlab_nested_group_owner::Migration),
         ]
     }
 }

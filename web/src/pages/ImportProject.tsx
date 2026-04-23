@@ -1,10 +1,9 @@
 import {
   createProjectMutation,
-  getRepositoryBranchesOptions,
+  getBranchesByRepositoryIdOptions,
+  getRepositoryByIdOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import type { RepositoryResponse } from '@/api/client/types.gen'
 import { ProjectConfigurator } from '@/components/project/ProjectConfigurator'
-import { RepositorySelector } from '@/components/repository/RepositorySelector'
 import { Card, CardContent } from '@/components/ui/card'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -12,25 +11,20 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { GitBranchIcon, GithubIcon } from 'lucide-react'
-import { useEffect, useState } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { useEffect } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
 
 export function ImportProject() {
-  const location = useLocation()
-  const fullName = location.pathname.replace('/projects/import/', '')
-  const [owner, name] = fullName?.split('/') || ['', '']
-  const searchParams = new URLSearchParams(location.search)
-  const preferredConnectionId = searchParams.get('connection_id')
+  const { repositoryId: repositoryIdParam } = useParams<{
+    repositoryId: string
+  }>()
+  const repositoryId = repositoryIdParam
+    ? parseInt(repositoryIdParam, 10)
+    : NaN
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-
-  const [selectedRepository, setSelectedRepository] =
-    useState<RepositoryResponse | null>(null)
-  const [selectedConnectionId, setSelectedConnectionId] = useState<
-    number | null
-  >(null)
 
   useEffect(() => {
     setBreadcrumbs([
@@ -40,7 +34,27 @@ export function ImportProject() {
     ])
   }, [setBreadcrumbs])
 
-  usePageTitle(`Import ${fullName || 'Repository'}`)
+  // Fetch repository by ID. The backend derives owner/name/full_name and the
+  // git provider connection from the row itself, so the frontend doesn't need
+  // to URL-encode any repo path (which breaks for GitLab nested groups).
+  const {
+    data: selectedRepository,
+    isPending: isRepositoryPending,
+    isError: isRepositoryError,
+    error: repositoryError,
+  } = useQuery({
+    ...getRepositoryByIdOptions({
+      path: { repository_id: repositoryId },
+    }),
+    enabled: Number.isFinite(repositoryId),
+  })
+
+  const selectedConnectionId =
+    selectedRepository?.git_provider_connection_id ?? null
+
+  usePageTitle(
+    `Import ${selectedRepository?.full_name || 'Repository'}`
+  )
 
   const createProjectMutationM = useMutation({
     ...createProjectMutation(),
@@ -56,27 +70,12 @@ export function ImportProject() {
     },
   })
 
-  // Handle repository selection from RepositorySelector
-  const handleRepositorySelect = (
-    repo: RepositoryResponse,
-    connectionId: number
-  ) => {
-    setSelectedRepository(repo)
-    setSelectedConnectionId(connectionId)
-  }
-
-  // Fetch branches
+  // Fetch branches by repository ID (server derives the connection).
   const { data: branchesData } = useQuery({
-    ...getRepositoryBranchesOptions({
-      query: {
-        connection_id: selectedConnectionId || 0,
-      },
-      path: {
-        owner: selectedRepository?.owner || '',
-        repo: selectedRepository?.name || '',
-      },
+    ...getBranchesByRepositoryIdOptions({
+      path: { repository_id: repositoryId },
     }),
-    enabled: !!selectedRepository && !!selectedConnectionId,
+    enabled: !!selectedRepository && Number.isFinite(repositoryId),
   })
 
   return (
@@ -89,9 +88,7 @@ export function ImportProject() {
               <div className="flex items-center gap-2">
                 <GithubIcon className="h-5 w-5 text-muted-foreground" />
                 <span className="font-medium">
-                  {selectedRepository?.full_name ||
-                    fullName ||
-                    'Select Repository'}
+                  {selectedRepository?.full_name || 'Loading repository…'}
                 </span>
               </div>
               {selectedRepository && (
@@ -113,10 +110,6 @@ export function ImportProject() {
               <div
                 className={`w-2 h-2 rounded-full ${selectedRepository ? 'bg-primary' : 'bg-muted'}`}
               ></div>
-              <span>Select Repository</span>
-              <div
-                className={`w-2 h-2 rounded-full ml-4 ${selectedRepository ? 'bg-primary' : 'bg-muted'}`}
-              ></div>
               <span>Configure Project</span>
               <div className="w-2 h-2 bg-muted rounded-full ml-4"></div>
               <span>Deploy</span>
@@ -127,33 +120,24 @@ export function ImportProject() {
 
       {/* Main content */}
       <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8">
-        {!selectedRepository ? (
-          <div className="space-y-6">
-            <div>
-              <h2 className="text-2xl font-bold">Select Repository</h2>
-              <p className="text-sm text-muted-foreground mt-1">
-                Choose a repository to import as a project
+        {!Number.isFinite(repositoryId) ? (
+          <Card>
+            <CardContent className="pt-6">
+              <p className="text-sm text-destructive">
+                Invalid repository id in URL.
               </p>
-            </div>
-            <Card>
-              <CardContent className="pt-6">
-                <RepositorySelector
-                  value={selectedRepository}
-                  onChange={handleRepositorySelect}
-                  owner={owner}
-                  name={name}
-                  preferredConnectionId={
-                    preferredConnectionId
-                      ? parseInt(preferredConnectionId)
-                      : undefined
-                  }
-                  showSearch={!fullName} // Hide search if we have specific owner/name
-                  autoSelectIfOneMatch={!!fullName} // Auto-select if we have specific repo
-                />
-              </CardContent>
-            </Card>
-          </div>
-        ) : !branchesData ? (
+            </CardContent>
+          </Card>
+        ) : isRepositoryError ? (
+          <Card>
+            <CardContent className="pt-6">
+              <p className="text-sm text-destructive">
+                Failed to load repository:{' '}
+                {(repositoryError as Error)?.message || 'unknown error'}
+              </p>
+            </CardContent>
+          </Card>
+        ) : isRepositoryPending || !selectedRepository || !branchesData ? (
           <div className="space-y-6">
             <div>
               <h2 className="text-2xl font-bold">Configure Project</h2>
@@ -220,6 +204,8 @@ export function ImportProject() {
                 selectedRepository.pushed_at || new Date().toISOString(),
               updated_at:
                 selectedRepository.updated_at || new Date().toISOString(),
+              git_provider_connection_id:
+                selectedRepository.git_provider_connection_id,
             }}
             connectionId={selectedConnectionId!}
             branches={branchesData?.branches}

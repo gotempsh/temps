@@ -241,9 +241,11 @@ export function GitImportClone({
   const handleRepositoryClick = (repo: RepositoryResponse) => {
     if (mode === 'navigation') {
       // Navigation mode: navigate to import page
-      navigate(
-        `/projects/import/${repo.full_name}${selectedConnection ? `?connection_id=${selectedConnection}` : ''}`
-      )
+      if (!repo.id) {
+        toast.error('Repository is missing an id; cannot import')
+        return
+      }
+      navigate(`/projects/import/${repo.id}`)
     } else {
       // Inline mode: show configurator
       setSelectedRepository(repo)
@@ -317,6 +319,10 @@ export function GitImportClone({
             pushed_at: selectedRepository.pushed_at || new Date().toISOString(),
             updated_at:
               selectedRepository.updated_at || new Date().toISOString(),
+            git_provider_connection_id:
+              selectedRepository.git_provider_connection_id ??
+              Number(selectedConnection) ??
+              0,
           }}
           connectionId={useGitUrl ? undefined : Number(selectedConnection)}
           presetData={presetData}

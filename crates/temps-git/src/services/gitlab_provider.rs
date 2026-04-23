@@ -510,12 +510,14 @@ impl GitProviderService for GitLabProvider {
         let items: Vec<Repository> = projects
             .into_iter()
             .map(|p| {
+                // GitLab supports nested groups. `path_with_namespace` is the full
+                // project path (e.g. "group/subgroup/repo-slug"); `path` is the
+                // repo slug. Owner is everything before the last slash.
                 let owner = p
                     .path_with_namespace
-                    .split('/')
-                    .next()
-                    .unwrap_or(&p.path_with_namespace)
-                    .to_string();
+                    .rsplit_once('/')
+                    .map(|(ns, _)| ns.to_string())
+                    .unwrap_or_default();
 
                 Repository {
                     id: p.id.to_string(),
@@ -582,7 +584,7 @@ impl GitProviderService for GitLabProvider {
         #[derive(Deserialize)]
         struct GitLabProject {
             id: i64,
-            name: String,
+            path: String,
             path_with_namespace: String,
             description: Option<String>,
             visibility: String,
@@ -601,11 +603,19 @@ impl GitProviderService for GitLabProvider {
             .await
             .map_err(|e| GitProviderError::ApiError(e.to_string()))?;
 
+        // Recompute owner from path_with_namespace to handle nested groups,
+        // since the caller's `owner` may be a stale or partial value.
+        let owner = project
+            .path_with_namespace
+            .rsplit_once('/')
+            .map(|(ns, _)| ns.to_string())
+            .unwrap_or_else(|| owner.to_string());
+
         Ok(Repository {
             id: project.id.to_string(),
-            name: project.name,
+            name: project.path,
             full_name: project.path_with_namespace,
-            owner: owner.to_string(),
+            owner,
             description: project.description,
             private: project.visibility != "public",
             default_branch: project.default_branch.unwrap_or_else(|| "main".to_string()),
@@ -1360,7 +1370,7 @@ impl GitProviderService for GitLabProvider {
         #[derive(Deserialize)]
         struct GitLabProject {
             id: i64,
-            name: String,
+            path: String,
             path_with_namespace: String,
             description: Option<String>,
             visibility: String,
@@ -1379,8 +1389,12 @@ impl GitProviderService for GitLabProvider {
             .await
             .map_err(|e| GitProviderError::ApiError(format!("Failed to parse response: {}", e)))?;
 
-        let parts: Vec<&str> = project.path_with_namespace.split('/').collect();
-        let owner = parts.first().map(|s| s.to_string()).unwrap_or_default();
+        // Owner is everything in path_with_namespace except the trailing slug.
+        let owner = project
+            .path_with_namespace
+            .rsplit_once('/')
+            .map(|(ns, _)| ns.to_string())
+            .unwrap_or_default();
 
         info!(
             "Successfully created GitLab repository: {}",
@@ -1389,7 +1403,7 @@ impl GitProviderService for GitLabProvider {
 
         Ok(Repository {
             id: project.id.to_string(),
-            name: project.name,
+            name: project.path,
             full_name: project.path_with_namespace,
             owner,
             description: project.description,

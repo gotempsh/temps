@@ -351,6 +351,8 @@ pub struct RepositoryResponse {
     pub clone_url: Option<String>,
     /// SSH clone URL (e.g., git@github.com:owner/repo.git)
     pub ssh_url: Option<String>,
+    /// ID of the git provider connection this repository was synced from.
+    pub git_provider_connection_id: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -718,6 +720,7 @@ pub async fn sync_repositories(
             preset: convert_preset_json(r.preset.clone()),
             clone_url: r.clone_url.clone(),
             ssh_url: r.ssh_url.clone(),
+            git_provider_connection_id: r.git_provider_connection_id,
         })
         .collect();
 
@@ -841,6 +844,7 @@ pub async fn list_repositories_by_connection(
             preset: convert_preset_json(r.preset.clone()),
             clone_url: r.clone_url,
             ssh_url: r.ssh_url,
+            git_provider_connection_id: r.git_provider_connection_id,
         })
         .collect();
 
@@ -901,6 +905,7 @@ pub async fn list_repositories_by_provider(
             preset: convert_preset_json(r.preset.clone()),
             clone_url: r.clone_url,
             ssh_url: r.ssh_url,
+            git_provider_connection_id: r.git_provider_connection_id,
         })
         .collect();
     Ok(Json(response))
@@ -1015,6 +1020,7 @@ pub async fn list_synced_repositories(
             preset: convert_preset_json(r.preset.clone()),
             clone_url: r.clone_url,
             ssh_url: r.ssh_url,
+            git_provider_connection_id: r.git_provider_connection_id,
         })
         .collect();
 
@@ -1174,6 +1180,66 @@ pub async fn get_repository_by_name(
             preset: convert_preset_json(repository.preset),
             clone_url: repository.clone_url,
             ssh_url: repository.ssh_url,
+            git_provider_connection_id: repository.git_provider_connection_id,
+        }),
+    ))
+}
+
+/// Get repository by ID
+#[utoipa::path(
+    get,
+    path = "/repository/{repository_id}",
+    params(
+        ("repository_id" = i32, Path, description = "Repository ID")
+    ),
+    responses(
+        (status = 200, description = "Repository found", body = RepositoryResponse),
+        (status = 404, description = "Repository not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Git Providers",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_repository_by_id(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(repository_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_check!(auth, Permission::GitRepositoriesRead);
+
+    let repository = state
+        .git_provider_manager
+        .get_repository_by_id(repository_id)
+        .await
+        .map_err(|e| match e {
+            GitProviderManagerError::RepositoryNotFound(_) => problem_new(StatusCode::NOT_FOUND)
+                .with_title("Repository not found")
+                .with_detail(format!("Repository {} not found", repository_id)),
+            _ => problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Failed to find repository")
+                .with_detail(e.to_string()),
+        })?;
+
+    Ok((
+        StatusCode::OK,
+        Json(RepositoryResponse {
+            id: repository.id,
+            owner: repository.owner,
+            name: repository.name,
+            full_name: repository.full_name,
+            description: repository.description,
+            private: repository.private,
+            default_branch: repository.default_branch,
+            language: repository.language,
+            created_at: repository.created_at,
+            updated_at: repository.updated_at,
+            pushed_at: repository.pushed_at,
+            preset: convert_preset_json(repository.preset),
+            clone_url: repository.clone_url,
+            ssh_url: repository.ssh_url,
+            git_provider_connection_id: repository.git_provider_connection_id,
         }),
     ))
 }
@@ -1240,6 +1306,7 @@ pub async fn get_all_repositories_by_name(
             preset: convert_preset_json(repository.preset),
             clone_url: repository.clone_url,
             ssh_url: repository.ssh_url,
+            git_provider_connection_id: repository.git_provider_connection_id,
         })
         .collect();
 
@@ -1370,6 +1437,7 @@ pub fn configure_routes() -> axum::Router<Arc<AppState>> {
             get(get_repository_tags),
         )
         // New endpoints using repository ID (singular)
+        .route("/repository/{repository_id}", get(get_repository_by_id))
         .route(
             "/repository/{repository_id}/branches",
             get(get_branches_by_repository_id),
@@ -1614,6 +1682,7 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
         get_repository_preset_live,
         get_repository_preset_by_name,
         get_repository_by_name,
+        get_repository_by_id,
         get_all_repositories_by_name,
         create_github_pat_provider,
         create_gitlab_pat_provider,

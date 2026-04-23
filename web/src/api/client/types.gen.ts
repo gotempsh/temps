@@ -1193,6 +1193,12 @@ export type ConnectionResponse = {
     last_health_check_at?: string | null;
     last_synced_at?: string | null;
     provider_id: number;
+    /**
+     * Running count of repositories persisted by the current (or most
+     * recent) sync. Resets to 0 when a new sync begins; useful for showing
+     * live progress on large syncs.
+     */
+    synced_repository_count: number;
     syncing: boolean;
     updated_at: string;
     user_id?: number | null;
@@ -9035,6 +9041,10 @@ export type RepositoryResponse = {
     default_branch: string;
     description?: string | null;
     full_name: string;
+    /**
+     * ID of the git provider connection this repository was synced from.
+     */
+    git_provider_connection_id: number;
     id: number;
     language?: string | null;
     name: string;
@@ -11844,6 +11854,47 @@ export type UpdateProjectSettingsRequest = {
     repo_name?: string | null;
     repo_owner?: string | null;
     slug?: string | null;
+};
+
+/**
+ * Partial-update payload for provider credentials. Every field is optional;
+ * only the fields the user re-enters are applied. The server validates that
+ * the fields supplied make sense for the provider's current auth_method
+ * (e.g. `app_id` + `private_key` only apply to GitHub Apps).
+ */
+export type UpdateProviderCredentialsRequest = {
+    /**
+     * Application ID (GitHub App integer as string; GitLab App string).
+     */
+    app_id?: string | null;
+    /**
+     * GitLab App secret (not used by GitHub App — use `client_secret`).
+     */
+    app_secret?: string | null;
+    /**
+     * OAuth client ID (GitLab OAuth, GitHub App).
+     */
+    client_id?: string | null;
+    /**
+     * OAuth client secret (GitLab OAuth, GitHub App).
+     */
+    client_secret?: string | null;
+    /**
+     * GitHub App private key (PEM).
+     */
+    private_key?: string | null;
+    /**
+     * OAuth redirect URI (GitLab OAuth / GitLab App).
+     */
+    redirect_uri?: string | null;
+    /**
+     * PAT for PAT-type providers.
+     */
+    token?: string | null;
+    /**
+     * GitHub App webhook secret.
+     */
+    webhook_secret?: string | null;
 };
 
 export type UpdateProviderKeyRequest = {
@@ -21164,6 +21215,50 @@ export type GetProviderConnectionsResponses = {
 };
 
 export type GetProviderConnectionsResponse = GetProviderConnectionsResponses[keyof GetProviderConnectionsResponses];
+
+export type UpdateGitProviderCredentialsData = {
+    body: UpdateProviderCredentialsRequest;
+    path: {
+        /**
+         * Git provider ID
+         */
+        provider_id: number;
+    };
+    query?: never;
+    url: '/git-providers/{provider_id}/credentials';
+};
+
+export type UpdateGitProviderCredentialsErrors = {
+    /**
+     * Bad request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Provider not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateGitProviderCredentialsResponses = {
+    /**
+     * Credentials updated
+     */
+    200: ProviderResponse;
+};
+
+export type UpdateGitProviderCredentialsResponse = UpdateGitProviderCredentialsResponses[keyof UpdateGitProviderCredentialsResponses];
 
 export type DeactivateProviderData = {
     body?: never;
@@ -34010,6 +34105,38 @@ export type GetRepositoryPresetLiveResponses = {
 };
 
 export type GetRepositoryPresetLiveResponse = GetRepositoryPresetLiveResponses[keyof GetRepositoryPresetLiveResponses];
+
+export type GetRepositoryByIdData = {
+    body?: never;
+    path: {
+        /**
+         * Repository ID
+         */
+        repository_id: number;
+    };
+    query?: never;
+    url: '/repository/{repository_id}';
+};
+
+export type GetRepositoryByIdErrors = {
+    /**
+     * Repository not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetRepositoryByIdResponses = {
+    /**
+     * Repository found
+     */
+    200: RepositoryResponse;
+};
+
+export type GetRepositoryByIdResponse = GetRepositoryByIdResponses[keyof GetRepositoryByIdResponses];
 
 export type GetBranchesByRepositoryIdData = {
     body?: never;
