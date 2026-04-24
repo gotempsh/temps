@@ -31,6 +31,7 @@ import {
   CreditCard,
   Database,
   DatabaseBackup,
+  FileLock2,
   Folder,
   FolderPlus,
   GitBranch,
@@ -436,7 +437,13 @@ const projectNavItems: NavigationItem[] = [
     title: 'Environment Variables',
     url: 'settings/environment-variables',
     icon: Key,
-    keywords: ['variables', 'env', 'secrets', 'config'],
+    keywords: ['variables', 'env', 'config'],
+  },
+  {
+    title: 'Secrets',
+    url: 'settings/secrets',
+    icon: FileLock2,
+    keywords: ['secrets', 'secret files', 'mounted secrets', '/run/secrets'],
   },
   {
     title: 'Git Settings',

@@ -1984,6 +1984,31 @@ export type CreateProjectRequest = {
     use_default_wildcard?: boolean | null;
 };
 
+/**
+ * Request to create a new project secret.
+ *
+ * Project secrets are mounted into the container as files under
+ * `/run/secrets/<KEY>` (mode 0400, tmpfs) instead of as environment variables.
+ * Values are always encrypted at rest and never returned in plaintext from
+ * the API after create. Distinct from agent secrets (global `/settings/secrets`).
+ */
+export type CreateProjectSecretRequest = {
+    environment_ids?: Array<number>;
+    /**
+     * Include this secret in preview environments.
+     */
+    include_in_preview?: boolean;
+    /**
+     * Identifier for the secret. Becomes the filename at `/run/secrets/<KEY>`.
+     * Must start with a letter or underscore and contain only A-Z, a-z, 0-9, _.
+     */
+    key: string;
+    /**
+     * Plaintext value, <= 1 MiB.
+     */
+    value: string;
+};
+
 export type CreateProviderKeyRequest = {
     api_key: string;
     base_url?: string | null;
@@ -5008,6 +5033,10 @@ export type GetFunnelMetricsQuery = {
 export type GetOrCreateDsnRequest = {
     base_url?: string | null;
     deployment_id?: number | null;
+    environment_id?: number | null;
+};
+
+export type GetProjectSecretsQuery = {
     environment_id?: number | null;
 };
 
@@ -8208,6 +8237,27 @@ export type ProjectResponse = {
     updated_at: number;
 };
 
+export type ProjectSecretEnvironmentInfo = {
+    id: number;
+    main_url: string;
+    name: string;
+};
+
+/**
+ * Project secret metadata. There is deliberately no `value` field — secret
+ * plaintext is never returned after creation. Callers that need the value
+ * must read it from the mounted file inside the container.
+ */
+export type ProjectSecretResponse = {
+    created_at: number;
+    environments: Array<ProjectSecretEnvironmentInfo>;
+    id: number;
+    include_in_preview: boolean;
+    key: string;
+    project_id: number;
+    updated_at: number;
+};
+
 export type ProjectServiceInfo = {
     id: number;
     project: ProjectInfo;
@@ -9059,10 +9109,16 @@ export type RepositoryResponse = {
     updated_at: string;
 };
 
-export type RepositorySyncResponse = {
-    repositories: Array<RepositoryResponse>;
-    synced_at: string;
-    total_count: number;
+/**
+ * Returned by `POST /git-connections/{id}/sync` to acknowledge that a
+ * sync has been kicked off in the background. Clients should poll the
+ * connection's `syncing` and `synced_repository_count` fields to track
+ * progress rather than waiting on this response.
+ */
+export type RepositorySyncStartedResponse = {
+    connection_id: number;
+    started_at: string;
+    syncing: boolean;
 };
 
 export type ResetPasswordRequest = {
@@ -11835,6 +11891,20 @@ export type UpdateMcpRequest = {
 
 export type UpdatePreferencesRequest = {
     preferences: NotificationPreferencesResponse;
+};
+
+/**
+ * Request to update a project secret. The `value` field is optional — omit it
+ * to rotate only the environment scoping / preview flag without touching the
+ * ciphertext.
+ */
+export type UpdateProjectSecretRequest = {
+    environment_ids?: Array<number>;
+    include_in_preview?: boolean;
+    /**
+     * New plaintext value, <= 1 MiB. Omit to keep the existing value.
+     */
+    value?: string | null;
 };
 
 export type UpdateProjectSettingsRequest = {
@@ -20804,9 +20874,9 @@ export type SyncRepositoriesErrors = {
 
 export type SyncRepositoriesResponses = {
     /**
-     * Repositories synced successfully
+     * Repository sync started in background
      */
-    200: RepositorySyncResponse;
+    202: RepositorySyncStartedResponse;
 };
 
 export type SyncRepositoriesResponse = SyncRepositoriesResponses[keyof SyncRepositoriesResponses];
@@ -31277,6 +31347,155 @@ export type RevenueMetricsSummaryResponses = {
 };
 
 export type RevenueMetricsSummaryResponse = RevenueMetricsSummaryResponses[keyof RevenueMetricsSummaryResponses];
+
+export type ListProjectSecretsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Optional environment filter
+         */
+        environment_id?: number;
+    };
+    url: '/projects/{project_id}/secrets';
+};
+
+export type ListProjectSecretsErrors = {
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListProjectSecretsResponses = {
+    /**
+     * List of secrets (metadata only, no values)
+     */
+    200: Array<ProjectSecretResponse>;
+};
+
+export type ListProjectSecretsResponse = ListProjectSecretsResponses[keyof ListProjectSecretsResponses];
+
+export type CreateProjectSecretData = {
+    body: CreateProjectSecretRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/secrets';
+};
+
+export type CreateProjectSecretErrors = {
+    /**
+     * Invalid key or value too large
+     */
+    400: unknown;
+    /**
+     * Key already exists in project
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateProjectSecretResponses = {
+    /**
+     * Secret created
+     */
+    201: ProjectSecretResponse;
+};
+
+export type CreateProjectSecretResponse = CreateProjectSecretResponses[keyof CreateProjectSecretResponses];
+
+export type DeleteProjectSecretData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Secret ID
+         */
+        secret_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/secrets/{secret_id}';
+};
+
+export type DeleteProjectSecretErrors = {
+    /**
+     * Secret not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeleteProjectSecretResponses = {
+    /**
+     * Secret deleted
+     */
+    204: void;
+};
+
+export type DeleteProjectSecretResponse = DeleteProjectSecretResponses[keyof DeleteProjectSecretResponses];
+
+export type UpdateProjectSecretData = {
+    body: UpdateProjectSecretRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Secret ID
+         */
+        secret_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/secrets/{secret_id}';
+};
+
+export type UpdateProjectSecretErrors = {
+    /**
+     * Value too large
+     */
+    400: unknown;
+    /**
+     * Secret not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateProjectSecretResponses = {
+    /**
+     * Secret updated
+     */
+    200: ProjectSecretResponse;
+};
+
+export type UpdateProjectSecretResponse = UpdateProjectSecretResponses[keyof UpdateProjectSecretResponses];
 
 export type UpdateProjectSettingsData = {
     body: UpdateProjectSettingsRequest;

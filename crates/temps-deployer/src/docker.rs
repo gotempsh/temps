@@ -32,6 +32,19 @@ pub struct DockerRuntime {
 }
 
 impl DockerRuntime {
+    /// Per-container directory that holds plaintext secret files for bind-mounting
+    /// into `/run/secrets`. Lives outside `TempDir` because Docker keeps the
+    /// directory open for the container lifetime; cleanup happens in
+    /// `remove_container`.
+    fn secrets_host_dir(&self, container_name: &str) -> PathBuf {
+        // Use std::env::temp_dir() so the path matches what the Docker daemon
+        // can see — both daemon and us run on the same host in the local
+        // (non-remote) deployer path.
+        std::env::temp_dir()
+            .join("temps-secrets")
+            .join(container_name)
+    }
+
     pub fn new(docker: Arc<Docker>, use_buildkit: bool, network_name: String) -> Self {
         Self {
             docker,
@@ -952,6 +965,31 @@ impl ContainerDeployer for DockerRuntime {
             .as_ref()
             .map(|lc| lc.to_bollard_log_config());
 
+        // When secrets are present, materialize them as files in a per-container
+        // host directory (mode 0700) and bind-mount that directory into the
+        // container at /run/secrets (read-only). This matches how Docker Swarm
+        // delivers secrets: directory is created by the mount itself, so it
+        // works with any image (no requirement that /run/secrets pre-exist),
+        // and files are visible from container start (no race with start).
+        //
+        // Trade-off vs tmpfs: plaintext lives on the host filesystem under
+        // SecretsHostDir until the container is removed. The directory is
+        // mode 0700 root-owned; individual files are mode 0400. Cleanup is
+        // handled in `remove_container`.
+        let secrets_bind = if request.secrets.is_empty() {
+            None
+        } else {
+            let host_dir = self.secrets_host_dir(&request.container_name);
+            write_secrets_to_host_dir(&host_dir, &request.secrets).map_err(|e| {
+                DeployerError::SecretMountFailed {
+                    container_name: request.container_name.clone(),
+                    reason: format!("write host dir {}: {}", host_dir.display(), e),
+                }
+            })?;
+            // Docker bind-mount syntax: "<host_path>:<container_path>:<options>"
+            Some(format!("{}:/run/secrets:ro", host_dir.display()))
+        };
+
         let host_config = bollard::models::HostConfig {
             port_bindings: Some(port_bindings),
             network_mode: Some(self.network_name.clone()),
@@ -976,6 +1014,7 @@ impl ContainerDeployer for DockerRuntime {
             pids_limit: Some(512),
             // Security hardening: use init process for proper signal handling and zombie reaping
             init: Some(true),
+            binds: secrets_bind.map(|b| vec![b]),
             ..Default::default()
         };
 
@@ -1116,6 +1155,18 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn remove_container(&self, container_id: &str) -> Result<(), DeployerError> {
+        // Look up the container name before removal so we can clean up its
+        // per-container secrets host directory (if any). Inspect failures are
+        // non-fatal: we still try to remove the container.
+        let container_name = self
+            .docker
+            .inspect_container(container_id, None::<InspectContainerOptions>)
+            .await
+            .ok()
+            .and_then(|c| c.name)
+            // Docker prefixes inspect names with a leading '/'.
+            .map(|n| n.trim_start_matches('/').to_string());
+
         self.docker
             .remove_container(
                 container_id,
@@ -1126,6 +1177,20 @@ impl ContainerDeployer for DockerRuntime {
             )
             .await
             .map_err(|e| DeployerError::Other(format!("Failed to remove container: {}", e)))?;
+
+        if let Some(name) = container_name {
+            let dir = self.secrets_host_dir(&name);
+            if dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&dir) {
+                    warn!(
+                        "Failed to clean up secrets host dir {}: {}",
+                        dir.display(),
+                        e
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1418,6 +1483,60 @@ impl ContainerRuntime for DockerRuntime {
     }
 }
 
+/// Writes secrets as files into a per-container host directory for Docker
+/// to bind-mount into `/run/secrets`. The directory is created (or recreated)
+/// fresh on each call so stale entries from a previous deployment of the same
+/// container name don't leak through. Directory mode 0700, file mode 0400.
+///
+/// Rejects keys that would escape the directory (path separators, `.`, `..`)
+/// to defend against a maliciously-crafted secret name.
+fn write_secrets_to_host_dir(dir: &Path, secrets: &HashMap<String, String>) -> std::io::Result<()> {
+    use std::fs;
+    use std::io::Write;
+
+    // Recreate fresh — wipes any stale files from a previous container with
+    // the same name (rolling deploys, retries after failure, etc.).
+    if dir.exists() {
+        fs::remove_dir_all(dir)?;
+    }
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+
+    for (key, value) in secrets {
+        // Keys must be plain identifiers — defense-in-depth even though
+        // SecretService::validate_secret_key already enforces this.
+        if key.is_empty()
+            || key == "."
+            || key == ".."
+            || key.contains('/')
+            || key.contains('\\')
+            || key.contains('\0')
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid secret key '{}': contains path-separator characters",
+                    key
+                ),
+            ));
+        }
+        let path = dir.join(key);
+        let mut f = fs::File::create(&path)?;
+        f.write_all(value.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o400))?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod docker_tests {
     use super::*;
@@ -1439,6 +1558,77 @@ mod docker_tests {
             false,
             "test-network".to_string(),
         ))
+    }
+
+    #[test]
+    fn test_write_secrets_to_host_dir_creates_files_with_correct_perms() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("c1");
+
+        let mut secrets = HashMap::new();
+        secrets.insert("DB_PASSWORD".to_string(), "s3cret".to_string());
+        secrets.insert("API_KEY".to_string(), "abc\ndef".to_string());
+
+        write_secrets_to_host_dir(&dir, &secrets).expect("write");
+
+        let db = std::fs::read_to_string(dir.join("DB_PASSWORD")).unwrap();
+        assert_eq!(db, "s3cret");
+        let api = std::fs::read_to_string(dir.join("API_KEY")).unwrap();
+        assert_eq!(api, "abc\ndef");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            let file_mode = std::fs::metadata(dir.join("DB_PASSWORD"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o400);
+        }
+    }
+
+    #[test]
+    fn test_write_secrets_to_host_dir_overwrites_stale_dir() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("c2");
+
+        let mut first = HashMap::new();
+        first.insert("OLD".to_string(), "old".to_string());
+        write_secrets_to_host_dir(&dir, &first).unwrap();
+        assert!(dir.join("OLD").exists());
+
+        let mut second = HashMap::new();
+        second.insert("NEW".to_string(), "new".to_string());
+        write_secrets_to_host_dir(&dir, &second).unwrap();
+        // Stale file from first call must be gone
+        assert!(!dir.join("OLD").exists());
+        assert!(dir.join("NEW").exists());
+    }
+
+    #[test]
+    fn test_write_secrets_to_host_dir_rejects_path_traversal() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("c3");
+
+        for bad in ["..", ".", "../escape", "a/b", "a\\b", "with\0null"] {
+            let mut secrets = HashMap::new();
+            secrets.insert(bad.to_string(), "v".to_string());
+            let err = write_secrets_to_host_dir(&dir, &secrets).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "key={}", bad);
+        }
+    }
+
+    #[test]
+    fn test_write_secrets_to_host_dir_empty_creates_empty_dir() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("c4");
+        let secrets: HashMap<String, String> = HashMap::new();
+        write_secrets_to_host_dir(&dir, &secrets).unwrap();
+        assert!(dir.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -1574,6 +1764,7 @@ CMD ["cat", "/hello.txt"]
                         env.insert("TEST_VAR".to_string(), "test_value".to_string());
                         env
                     },
+                    secrets: HashMap::new(),
                     port_mappings: vec![],
                     network_name: None,
                     resource_limits: ResourceLimits {

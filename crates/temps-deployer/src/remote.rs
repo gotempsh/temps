@@ -557,6 +557,7 @@ mod tests {
             image_name: "nginx:latest".to_string(),
             container_name: "test-container".to_string(),
             environment_vars: std::collections::HashMap::new(),
+            secrets: std::collections::HashMap::new(),
             port_mappings: vec![],
             network_name: None,
             resource_limits: crate::ResourceLimits::default(),

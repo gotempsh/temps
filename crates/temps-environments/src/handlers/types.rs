@@ -6,10 +6,12 @@ use utoipa::ToSchema;
 
 use crate::services::env_var_service::EnvVarService;
 use crate::services::environment_service::EnvironmentService;
+use crate::services::secret_service::SecretService;
 
 pub struct AppState {
     pub environment_service: Arc<EnvironmentService>,
     pub env_var_service: Arc<EnvVarService>,
+    pub secret_service: Arc<SecretService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub deployment_service: Arc<dyn DeploymentCanceller>,
     /// Optional on-demand waker for starting/stopping containers during wake/sleep.
@@ -23,6 +25,7 @@ pub struct AppState {
 pub fn create_environment_app_state(
     environment_service: Arc<EnvironmentService>,
     env_var_service: Arc<EnvVarService>,
+    secret_service: Arc<SecretService>,
     audit_service: Arc<dyn AuditLogger>,
     deployment_service: Arc<dyn DeploymentCanceller>,
     on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
@@ -31,6 +34,7 @@ pub fn create_environment_app_state(
     Arc::new(AppState {
         environment_service,
         env_var_service,
+        secret_service,
         audit_service,
         deployment_service,
         on_demand_waker,
@@ -289,4 +293,64 @@ pub struct CreateEnvironmentRequest {
     /// If true, set this environment as the preview environment for the project
     #[serde(default)]
     pub set_as_preview: bool,
+}
+
+/// Request to create a new project secret.
+///
+/// Project secrets are mounted into the container as files under
+/// `/run/secrets/<KEY>` (mode 0400, tmpfs) instead of as environment variables.
+/// Values are always encrypted at rest and never returned in plaintext from
+/// the API after create. Distinct from agent secrets (global `/settings/secrets`).
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct CreateProjectSecretRequest {
+    /// Identifier for the secret. Becomes the filename at `/run/secrets/<KEY>`.
+    /// Must start with a letter or underscore and contain only A-Z, a-z, 0-9, _.
+    pub key: String,
+    /// Plaintext value, <= 1 MiB.
+    pub value: String,
+    #[serde(default)]
+    pub environment_ids: Vec<i32>,
+    /// Include this secret in preview environments.
+    #[serde(default = "default_include_in_preview")]
+    pub include_in_preview: bool,
+}
+
+/// Request to update a project secret. The `value` field is optional — omit it
+/// to rotate only the environment scoping / preview flag without touching the
+/// ciphertext.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct UpdateProjectSecretRequest {
+    /// New plaintext value, <= 1 MiB. Omit to keep the existing value.
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub environment_ids: Vec<i32>,
+    #[serde(default = "default_include_in_preview")]
+    pub include_in_preview: bool,
+}
+
+/// Project secret metadata. There is deliberately no `value` field — secret
+/// plaintext is never returned after creation. Callers that need the value
+/// must read it from the mounted file inside the container.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct ProjectSecretResponse {
+    pub id: i32,
+    pub project_id: i32,
+    pub key: String,
+    pub include_in_preview: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub environments: Vec<ProjectSecretEnvironmentInfo>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema, Clone)]
+pub struct ProjectSecretEnvironmentInfo {
+    pub id: i32,
+    pub name: String,
+    pub main_url: String,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct GetProjectSecretsQuery {
+    pub environment_id: Option<i32>,
 }

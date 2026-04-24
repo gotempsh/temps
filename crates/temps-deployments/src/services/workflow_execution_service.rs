@@ -602,6 +602,20 @@ impl WorkflowExecutionService {
                 let remote_env_variables: Option<HashMap<String, String>> = config
                     .get("remote_environment_variables")
                     .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+                // Get secrets (decrypted plaintext values to be mounted as files under
+                // /run/secrets/<KEY> by the deployer; never passed as env vars).
+                let secrets: HashMap<String, String> = config
+                    .get("secrets")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                if !secrets.is_empty() {
+                    debug!(
+                        "🔐 Mounting {} secret file(s) into container: {}",
+                        secrets.len(),
+                        secrets.keys().cloned().collect::<Vec<_>>().join(", ")
+                    );
+                }
                 debug!(
                     "🌍 Using {} environment variables for deployment (from job config): {}",
                     env_variables.len(),
@@ -680,6 +694,7 @@ impl WorkflowExecutionService {
                     .replicas(replicas)
                     .environment_variables(env_variables)
                     .remote_environment_variables(remote_env_variables)
+                    .secrets(secrets)
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone());
 

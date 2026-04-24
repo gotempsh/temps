@@ -9,6 +9,7 @@ import { GeneralSettings } from './settings/GeneralSettings'
 import { GitSettings } from './settings/GitSettings'
 import { ProjectSecuritySettings } from './settings/ProjectSecuritySettings'
 import { McpServersSettings } from './settings/McpServersSettings'
+import { SecretsSettings } from './settings/SecretsSettings'
 import { SkillsSettings } from './settings/SkillsSettings'
 import { WebhooksSettings } from './settings/WebhooksSettings'
 import { CreateWebhookPage } from './settings/webhooks/CreateWebhookPage'
@@ -33,6 +34,10 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
         <Route
           path="environment-variables"
           element={<EnvironmentVariablesSettings project={project} />}
+        />
+        <Route
+          path="secrets"
+          element={<SecretsSettings project={project} />}
         />
         <Route
           path="git"

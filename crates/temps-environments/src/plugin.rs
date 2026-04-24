@@ -9,6 +9,7 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::services::environment_service::EnvironmentService;
+use crate::services::secret_service::SecretService;
 use crate::EnvVarService;
 
 /// Environments Plugin for managing environment lifecycle and configurations
@@ -48,8 +49,11 @@ impl TempsPlugin for EnvironmentsPlugin {
             );
             context.register_service(environment_service);
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
-            let env_var_service = Arc::new(EnvVarService::new(db.clone(), encryption_service));
+            let env_var_service =
+                Arc::new(EnvVarService::new(db.clone(), encryption_service.clone()));
             context.register_service(env_var_service);
+            let secret_service = Arc::new(SecretService::new(db.clone(), encryption_service));
+            context.register_service(secret_service);
             tracing::debug!("Environments plugin services registered successfully");
             Ok(())
         })
@@ -59,6 +63,7 @@ impl TempsPlugin for EnvironmentsPlugin {
         let environment_service = context.require_service::<EnvironmentService>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
         let env_var_service = context.require_service::<EnvVarService>();
+        let secret_service = context.require_service::<SecretService>();
         let deployment_service = context.require_service::<dyn temps_core::DeploymentCanceller>();
         let on_demand_waker = context.get_service::<dyn temps_core::OnDemandWaker>();
         let integration_env_provider =
@@ -67,6 +72,7 @@ impl TempsPlugin for EnvironmentsPlugin {
         let app_state = crate::handlers::create_environment_app_state(
             environment_service,
             env_var_service,
+            secret_service,
             audit_service,
             deployment_service,
             on_demand_waker,

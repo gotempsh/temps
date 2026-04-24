@@ -126,6 +126,10 @@ pub struct DeploymentJobConfig {
     pub replicas: u32,
     pub port: u32,
     pub environment_variables: HashMap<String, String>,
+    /// Secret values (decrypted plaintext) mounted into the container as
+    /// files under `/run/secrets/<KEY>` by the deployer. Never injected as
+    /// environment variables; never visible via `docker inspect`.
+    pub secrets: HashMap<String, String>,
     pub resources: ResourceUsage,
     /// When `None`, HTTP health checks are skipped entirely (only container
     /// running status is verified). Set to `Some("/")` or a custom path to
@@ -164,6 +168,7 @@ impl Default for DeploymentJobConfig {
             replicas: 1,
             port: 8080,
             environment_variables: HashMap::new(),
+            secrets: HashMap::new(),
             resources: ResourceUsage::default(),
             health_check_path: Some("/".to_string()),
             ingress_enabled: false,
@@ -1056,6 +1061,7 @@ impl DeployImageJob {
             image_name: image_output.image_tag.clone(),
             container_name,
             environment_vars,
+            secrets: self.config.secrets.clone(),
             port_mappings,
             network_name: None,
             resource_limits,
@@ -1771,6 +1777,14 @@ impl DeployImageJobBuilder {
 
     pub fn environment_variables(mut self, env_vars: HashMap<String, String>) -> Self {
         self.config.environment_variables = env_vars;
+        self
+    }
+
+    /// Sets decrypted secret values for this deployment. They will be
+    /// materialized as files under `/run/secrets/<KEY>` (tmpfs, mode 0400)
+    /// inside the container.
+    pub fn secrets(mut self, secrets: HashMap<String, String>) -> Self {
+        self.config.secrets = secrets;
         self
     }
 

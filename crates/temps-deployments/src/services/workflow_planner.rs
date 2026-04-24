@@ -386,6 +386,82 @@ impl WorkflowPlanner {
         Ok(env_vars_map)
     }
 
+    /// Gathers secrets visible to this deployment, decrypted and keyed by name.
+    /// Returns a HashMap ready to be serialized into the job config under the
+    /// `secrets` field; the deployer mounts each entry as a file under
+    /// `/run/secrets/<KEY>`.
+    ///
+    /// Scoping matches the `gather_environment_variables` model:
+    ///   - Secrets with junction rows to this environment are included.
+    ///   - Secrets with no junction rows are treated as project-wide.
+    async fn gather_secrets(
+        &self,
+        project: &projects::Model,
+        environment: &environments::Model,
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        use std::collections::{HashMap, HashSet};
+        use temps_entities::{secret_environments, secrets};
+
+        let mut out: HashMap<String, String> = HashMap::new();
+
+        // 1. All secrets for this project.
+        let all_secrets = secrets::Entity::find()
+            .filter(secrets::Column::ProjectId.eq(project.id))
+            .all(self.db.as_ref())
+            .await?;
+
+        if all_secrets.is_empty() {
+            return Ok(out);
+        }
+
+        // 2. Junction rows — which secrets are environment-scoped.
+        let secret_ids: Vec<i32> = all_secrets.iter().map(|s| s.id).collect();
+        let junctions = secret_environments::Entity::find()
+            .filter(secret_environments::Column::SecretId.is_in(secret_ids))
+            .all(self.db.as_ref())
+            .await?;
+
+        let mut bindings: HashMap<i32, HashSet<i32>> = HashMap::new();
+        for j in junctions {
+            bindings
+                .entry(j.secret_id)
+                .or_default()
+                .insert(j.environment_id);
+        }
+
+        for secret in all_secrets {
+            let applies = match bindings.get(&secret.id) {
+                // No explicit bindings -> project-wide secret.
+                None => true,
+                // Environment-bound -> only if this environment is listed.
+                Some(envs) => envs.contains(&environment.id),
+            };
+            if !applies {
+                continue;
+            }
+
+            let plaintext = self
+                .encryption_service
+                .decrypt_string(&secret.value)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to decrypt secret '{}' (id={}): {}",
+                        secret.key,
+                        secret.id,
+                        e
+                    )
+                })?;
+            out.insert(secret.key, plaintext);
+        }
+
+        info!(
+            "Gathered {} secret file(s) for deployment to env {}",
+            out.len(),
+            environment.id
+        );
+        Ok(out)
+    }
+
     /// Build remote environment variables by rewriting connection strings for cross-node access.
     ///
     /// When `private_address` is set in multi-node settings, this method:
@@ -815,6 +891,11 @@ impl WorkflowPlanner {
             debug!("📦 Built remote environment variables for cross-node deployments");
         }
 
+        // Gather secrets — decrypted plaintext values, mounted as files at
+        // /run/secrets/<KEY> by the deployer. Intentionally NOT merged into
+        // env_vars so they don't appear in `docker inspect` or build args.
+        let secrets = self.gather_secrets(project, environment).await?;
+
         // Docker Compose preset uses its own deployment path
         if project.preset == temps_entities::preset::Preset::DockerCompose {
             return self
@@ -831,6 +912,7 @@ impl WorkflowPlanner {
                     deployment,
                     env_vars,
                     remote_env_vars,
+                    secrets,
                 )
                 .await
             }
@@ -845,6 +927,7 @@ impl WorkflowPlanner {
                     deployment,
                     env_vars,
                     remote_env_vars,
+                    secrets,
                 )
                 .await
             }
@@ -877,6 +960,7 @@ impl WorkflowPlanner {
         deployment: &deployments::Model,
         mut env_vars: std::collections::HashMap<String, String>,
         remote_env_vars: Option<std::collections::HashMap<String, String>>,
+        secrets: std::collections::HashMap<String, String>,
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
 
@@ -1154,6 +1238,13 @@ impl WorkflowPlanner {
             } else {
                 info!("No remote_environment_variables to store (single-node mode or no active nodes)");
             }
+            if !secrets.is_empty() {
+                info!(
+                    "Storing {} secret file(s) in deploy job config",
+                    secrets.len()
+                );
+                job_config["secrets"] = serde_json::to_value(&secrets).unwrap_or_default();
+            }
 
             jobs.push(JobDefinition {
                 job_id: "deploy_container".to_string(),
@@ -1193,21 +1284,8 @@ impl WorkflowPlanner {
                             ("dist/".to_string(), String::new()),
                         ],
                     )),
-                    // Custom Dockerfile: may contain a frontend app (e.g., Next.js with Dockerfile)
-                    // Try common frontend asset paths — job completes quickly if none exist
-                    temps_entities::preset::Preset::Dockerfile => Some((
-                        vec![
-                            ".next/static".to_string(),
-                            "dist/assets".to_string(),
-                            "build/static".to_string(),
-                        ],
-                        vec![
-                            (".next".to_string(), "_next".to_string()),
-                            ("dist/".to_string(), String::new()),
-                            ("build/".to_string(), String::new()),
-                        ],
-                    )),
-                    // Backend presets (Rust, Go, Python, Java, etc.) don't produce static assets
+                    // Dockerfile and backend presets don't produce predictable static assets.
+                    // Users who want stale-chunk fallback should pick a frontend preset.
                     _ => None,
                 };
 
@@ -1540,6 +1618,7 @@ impl WorkflowPlanner {
         deployment: &deployments::Model,
         env_vars: std::collections::HashMap<String, String>,
         remote_env_vars: Option<std::collections::HashMap<String, String>>,
+        secrets: std::collections::HashMap<String, String>,
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
 
@@ -1655,6 +1734,13 @@ impl WorkflowPlanner {
                 serde_json::to_value(remote_vars).unwrap_or_default();
         } else {
             info!("No remote_environment_variables for docker image deployment");
+        }
+        if !secrets.is_empty() {
+            info!(
+                "Storing {} secret file(s) in docker image deploy job config",
+                secrets.len()
+            );
+            job_config["secrets"] = serde_json::to_value(&secrets).unwrap_or_default();
         }
 
         jobs.push(JobDefinition {

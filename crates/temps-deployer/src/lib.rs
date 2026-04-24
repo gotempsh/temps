@@ -75,6 +75,12 @@ pub enum DeployerError {
     #[error("Resource allocation failed: {0}")]
     ResourceAllocationFailed(String),
 
+    #[error("Failed to mount secrets for container '{container_name}': {reason}")]
+    SecretMountFailed {
+        container_name: String,
+        reason: String,
+    },
+
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -130,6 +136,13 @@ pub struct DeployRequest {
     pub image_name: String,
     pub container_name: String,
     pub environment_vars: HashMap<String, String>,
+    /// Secret values (plaintext, already decrypted by the caller) to mount as
+    /// files under `/run/secrets/<KEY>` inside the container. Each file is
+    /// mode 0400, root-owned, stored on a tmpfs volume, not visible via
+    /// `docker inspect`. Total tmpfs size is capped; per-secret plaintext
+    /// must be <= 1 MiB (enforced upstream in `SecretService`).
+    #[serde(default)]
+    pub secrets: HashMap<String, String>,
     pub port_mappings: Vec<PortMapping>,
     pub network_name: Option<String>,
     pub resource_limits: ResourceLimits,
@@ -604,6 +617,7 @@ mod tests {
             image_name: "test-image:latest".to_string(),
             container_name: "test-container".to_string(),
             environment_vars: env_vars,
+            secrets: HashMap::new(),
             port_mappings,
             network_name: Some("test-network".to_string()),
             resource_limits: ResourceLimits::default(),
@@ -909,6 +923,7 @@ CMD ["echo", "Hello from container"]
             image_name: "node-app:latest".to_string(),
             container_name: "web-server".to_string(),
             environment_vars: env_vars.clone(),
+            secrets: HashMap::new(),
             port_mappings: vec![],
             network_name: None,
             resource_limits: ResourceLimits::default(),

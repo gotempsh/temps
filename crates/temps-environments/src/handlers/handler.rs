@@ -20,9 +20,11 @@ use utoipa::OpenApi;
 
 use super::types::{
     AddEnvironmentDomainRequest, CreateEnvironmentRequest, CreateEnvironmentVariableRequest,
-    EnvVarIntegrationInfo, EnvironmentDomainResponse, EnvironmentInfo, EnvironmentResponse,
-    EnvironmentVariableResponse, EnvironmentVariableValueResponse, GetEnvironmentVariablesQuery,
-    ResolvedEnvVarResponse, ResolvedEnvVarSource, UpdateEnvironmentSettingsRequest,
+    CreateProjectSecretRequest, EnvVarIntegrationInfo, EnvironmentDomainResponse, EnvironmentInfo,
+    EnvironmentResponse, EnvironmentVariableResponse, EnvironmentVariableValueResponse,
+    GetEnvironmentVariablesQuery, GetProjectSecretsQuery, ProjectSecretEnvironmentInfo,
+    ProjectSecretResponse, ResolvedEnvVarResponse, ResolvedEnvVarSource,
+    UpdateEnvironmentSettingsRequest, UpdateProjectSecretRequest,
 };
 use temps_core::problemdetails::Problem;
 
@@ -58,6 +60,35 @@ impl From<crate::services::env_var_service::EnvVarError> for Problem {
             }
             EnvVarError::Other(msg) => temps_core::error_builder::internal_server_error()
                 .detail(msg)
+                .build(),
+        }
+    }
+}
+
+impl From<crate::services::secret_service::SecretError> for Problem {
+    fn from(err: crate::services::secret_service::SecretError) -> Self {
+        use crate::services::secret_service::SecretError;
+        match err {
+            SecretError::NotFound { .. } => temps_core::error_builder::not_found()
+                .detail(err.to_string())
+                .build(),
+            SecretError::KeyAlreadyExists { .. } => temps_core::error_builder::conflict()
+                .detail(err.to_string())
+                .build(),
+            SecretError::ValueTooLarge { .. } => temps_core::error_builder::bad_request()
+                .detail(err.to_string())
+                .build(),
+            SecretError::InvalidKey { .. } => temps_core::error_builder::bad_request()
+                .detail(err.to_string())
+                .build(),
+            SecretError::EnvironmentNotFound { .. } => temps_core::error_builder::not_found()
+                .detail(err.to_string())
+                .build(),
+            SecretError::EncryptionFailed { .. }
+            | SecretError::DecryptionFailed { .. }
+            | SecretError::DatabaseConnection(_)
+            | SecretError::Database(_) => temps_core::error_builder::internal_server_error()
+                .detail(err.to_string())
                 .build(),
         }
     }
@@ -1392,6 +1423,216 @@ pub async fn create_environment(
         .into_response())
 }
 
+// ======================================================================
+// Secrets: file-mounted secret values.
+//
+// Secrets are delivered to containers as files under /run/secrets/<KEY>
+// (tmpfs, mode 0400) rather than as environment variables. Plaintext is
+// NEVER returned from the API after creation — GET responses always
+// carry only metadata. The mounted file inside the running container is
+// the source of truth for reads.
+// ======================================================================
+
+/// List project secrets (metadata only — values never returned).
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}/secrets",
+    tag = "Secrets",
+    operation_id = "listProjectSecrets",
+    responses(
+        (status = 200, description = "List of secrets (metadata only, no values)", body = Vec<ProjectSecretResponse>),
+        (status = 404, description = "Project not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = Option<i32>, Query, description = "Optional environment filter")
+    )
+)]
+pub async fn list_project_secrets(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
+    Query(params): Query<GetProjectSecretsQuery>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+
+    let secrets = state
+        .secret_service
+        .list(project_id, params.environment_id)
+        .await?;
+
+    let response: Vec<ProjectSecretResponse> = secrets
+        .into_iter()
+        .map(|s| ProjectSecretResponse {
+            id: s.id,
+            project_id: s.project_id,
+            key: s.key,
+            include_in_preview: s.include_in_preview,
+            created_at: s.created_at.timestamp_millis(),
+            updated_at: s.updated_at.timestamp_millis(),
+            environments: s
+                .environments
+                .into_iter()
+                .map(|env| ProjectSecretEnvironmentInfo {
+                    id: env.id,
+                    name: env.name,
+                    main_url: env.main_url,
+                })
+                .collect(),
+        })
+        .collect();
+
+    Ok(Json(response))
+}
+
+/// Create a new secret. The value is encrypted before storage and will be
+/// mounted as a file at `/run/secrets/<KEY>` on the next deployment.
+/// The plaintext value is NOT returned — the response carries only metadata.
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/secrets",
+    tag = "Secrets",
+    operation_id = "createProjectSecret",
+    request_body = CreateProjectSecretRequest,
+    responses(
+        (status = 201, description = "Secret created", body = ProjectSecretResponse),
+        (status = 400, description = "Invalid key or value too large"),
+        (status = 409, description = "Key already exists in project"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("project_id" = i32, Path, description = "Project ID")
+    )
+)]
+pub async fn create_project_secret(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Json(request): Json<CreateProjectSecretRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsCreate);
+
+    let secret = state
+        .secret_service
+        .create(
+            project_id,
+            request.environment_ids,
+            request.key,
+            request.value,
+            request.include_in_preview,
+        )
+        .await?;
+
+    let response = ProjectSecretResponse {
+        id: secret.id,
+        project_id: secret.project_id,
+        key: secret.key,
+        include_in_preview: secret.include_in_preview,
+        created_at: secret.created_at.timestamp_millis(),
+        updated_at: secret.updated_at.timestamp_millis(),
+        environments: secret
+            .environments
+            .into_iter()
+            .map(|env| ProjectSecretEnvironmentInfo {
+                id: env.id,
+                name: env.name,
+                main_url: env.main_url,
+            })
+            .collect(),
+    };
+
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// Update a project secret. Value rotation requires a redeploy to take effect —
+/// running containers keep their currently-mounted values until the next
+/// deployment.
+#[utoipa::path(
+    put,
+    path = "/projects/{project_id}/secrets/{secret_id}",
+    tag = "Secrets",
+    operation_id = "updateProjectSecret",
+    request_body = UpdateProjectSecretRequest,
+    responses(
+        (status = 200, description = "Secret updated", body = ProjectSecretResponse),
+        (status = 400, description = "Value too large"),
+        (status = 404, description = "Secret not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("secret_id" = i32, Path, description = "Secret ID")
+    )
+)]
+pub async fn update_project_secret(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, secret_id)): Path<(i32, i32)>,
+    RequireAuth(auth): RequireAuth,
+    Json(request): Json<UpdateProjectSecretRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsWrite);
+
+    let secret = state
+        .secret_service
+        .update(
+            project_id,
+            secret_id,
+            request.value,
+            request.environment_ids,
+            request.include_in_preview,
+        )
+        .await?;
+
+    let response = ProjectSecretResponse {
+        id: secret.id,
+        project_id: secret.project_id,
+        key: secret.key,
+        include_in_preview: secret.include_in_preview,
+        created_at: secret.created_at.timestamp_millis(),
+        updated_at: secret.updated_at.timestamp_millis(),
+        environments: secret
+            .environments
+            .into_iter()
+            .map(|env| ProjectSecretEnvironmentInfo {
+                id: env.id,
+                name: env.name,
+                main_url: env.main_url,
+            })
+            .collect(),
+    };
+
+    Ok(Json(response))
+}
+
+/// Delete a project secret. Running containers keep their mounted secret files
+/// until they are redeployed.
+#[utoipa::path(
+    delete,
+    path = "/projects/{project_id}/secrets/{secret_id}",
+    tag = "Secrets",
+    operation_id = "deleteProjectSecret",
+    responses(
+        (status = 204, description = "Secret deleted"),
+        (status = 404, description = "Secret not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("secret_id" = i32, Path, description = "Secret ID")
+    )
+)]
+pub async fn delete_project_secret(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, secret_id)): Path<(i32, i32)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsDelete);
+
+    state.secret_service.delete(project_id, secret_id).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
         // Environment routes
@@ -1459,6 +1700,15 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/projects/{project_id}/env-vars/resolved/{key}/value",
             get(get_resolved_environment_variable_value),
         )
+        // Secrets (file-mounted values at /run/secrets/<KEY>)
+        .route(
+            "/projects/{project_id}/secrets",
+            get(list_project_secrets).post(create_project_secret),
+        )
+        .route(
+            "/projects/{project_id}/secrets/{secret_id}",
+            put(update_project_secret).delete(delete_project_secret),
+        )
 }
 
 #[derive(OpenApi)]
@@ -1481,6 +1731,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         delete_environment_variable,
         get_environment_variable_value,
         get_resolved_environment_variable_value,
+        list_project_secrets,
+        create_project_secret,
+        update_project_secret,
+        delete_project_secret,
     ),
     components(
         schemas(
@@ -1497,10 +1751,16 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             ResolvedEnvVarResponse,
             ResolvedEnvVarSource,
             EnvVarIntegrationInfo,
+            CreateProjectSecretRequest,
+            UpdateProjectSecretRequest,
+            ProjectSecretResponse,
+            ProjectSecretEnvironmentInfo,
+            GetProjectSecretsQuery,
         )
     ),
     tags(
-        (name = "Environments", description = "Environment management operations")
+        (name = "Environments", description = "Environment management operations"),
+        (name = "Secrets", description = "File-mounted secrets (/run/secrets/<KEY>)")
     )
 )]
 pub struct ApiDoc;

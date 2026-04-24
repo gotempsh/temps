@@ -69,6 +69,8 @@ pub mod request_sessions;
 pub mod restore_runs;
 pub mod roles;
 pub mod s3_sources;
+pub mod secret_environments;
+pub mod secrets;
 pub mod service_members;
 pub mod sessions;
 pub mod source_type;
