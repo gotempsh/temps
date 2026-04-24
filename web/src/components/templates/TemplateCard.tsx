@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { TemplateResponse } from '@/api/client/types.gen'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -49,6 +50,12 @@ function getPresetIcon(preset: string): string {
 }
 
 export function TemplateCard({ template, onClick, selected }: TemplateCardProps) {
+  const [imageFailed, setImageFailed] = useState(false)
+  const [presetIconFailed, setPresetIconFailed] = useState(false)
+
+  const showImage = template.image_url && !imageFailed
+  const showPresetIcon = !showImage && !presetIconFailed
+
   return (
     <Card
       className={cn(
@@ -60,28 +67,23 @@ export function TemplateCard({ template, onClick, selected }: TemplateCardProps)
       <CardHeader className="pb-2">
         <div className="flex items-start justify-between gap-2">
           <div className="flex items-center gap-3">
-            <div className="h-10 w-10 rounded-md bg-muted flex items-center justify-center overflow-hidden">
-              {template.image_url ? (
+            <div className="h-10 w-10 rounded-md bg-muted flex items-center justify-center overflow-hidden text-muted-foreground">
+              {showImage ? (
                 <img
-                  src={template.image_url}
+                  src={template.image_url!}
                   alt={template.name}
                   className="h-8 w-8 object-contain"
-                  onError={(e) => {
-                    // Fallback to preset icon on error
-                    e.currentTarget.src = getPresetIcon(template.preset)
-                  }}
+                  onError={() => setImageFailed(true)}
                 />
-              ) : (
+              ) : showPresetIcon ? (
                 <img
                   src={getPresetIcon(template.preset)}
                   alt={template.preset}
                   className="h-6 w-6 object-contain"
-                  onError={(e) => {
-                    // Final fallback to server icon
-                    e.currentTarget.style.display = 'none'
-                    e.currentTarget.parentElement?.classList.add('text-muted-foreground')
-                  }}
+                  onError={() => setPresetIconFailed(true)}
                 />
+              ) : (
+                <Server className="h-5 w-5" />
               )}
             </div>
             <div>

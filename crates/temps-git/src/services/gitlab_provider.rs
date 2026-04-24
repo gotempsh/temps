@@ -766,7 +766,7 @@ impl GitProviderService for GitLabProvider {
             self.base_url, encoded_path, file_path
         );
         if let Some(ref_name) = branch {
-            url.push_str(&format!("?ref={}", ref_name));
+            url.push_str(&format!("?ref={}", urlencoding::encode(ref_name)));
         }
 
         let response = self
@@ -909,9 +909,10 @@ impl GitProviderService for GitLabProvider {
 
         let project_path = format!("{}/{}", owner, repo);
         let encoded_path = urlencoding::encode(&project_path);
+        let encoded_branch = urlencoding::encode(branch);
         let url = format!(
             "{}/api/v4/projects/{}/repository/commits/{}",
-            self.base_url, encoded_path, branch
+            self.base_url, encoded_path, encoded_branch
         );
 
         let response = self
@@ -1040,11 +1041,12 @@ impl GitProviderService for GitLabProvider {
         // URL encode the project path (owner/repo)
         let project_path = format!("{}/{}", owner, repo);
         let encoded_project = urlencoding::encode(&project_path);
+        let encoded_reference = urlencoding::encode(reference);
 
         // GitLab API endpoint for getting a commit
         let url = format!(
             "{}/api/v4/projects/{}/repository/commits/{}",
-            self.base_url, encoded_project, reference
+            self.base_url, encoded_project, encoded_reference
         );
 
         let response = self
@@ -1203,11 +1205,12 @@ impl GitProviderService for GitLabProvider {
         // URL encode the project path (owner/repo)
         let project_path = format!("{}/{}", owner, repo);
         let encoded_project = urlencoding::encode(&project_path);
+        let encoded_ref = urlencoding::encode(ref_spec);
 
         // Build the URL for downloading the archive (GitLab uses tar.gz by default)
         let url = format!(
             "{}/api/v4/projects/{}/repository/archive.tar.gz?sha={}",
-            self.base_url, encoded_project, ref_spec
+            self.base_url, encoded_project, encoded_ref
         );
 
         let client = self.get_client();

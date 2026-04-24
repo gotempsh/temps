@@ -140,12 +140,18 @@ export function ImportEnvDialog({
         const key = trimmedLine.substring(0, equalIndex).trim()
         let value = trimmedLine.substring(equalIndex + 1).trim()
 
-        // Remove surrounding quotes if present
+        // Remove surrounding quotes and unescape sequences.
+        // Mirrors apps/temps-cli/src/lib/env-file.ts so CLI and UI imports
+        // agree on multiline values like NPM_RC.
         if (
           (value.startsWith('"') && value.endsWith('"')) ||
           (value.startsWith("'") && value.endsWith("'"))
         ) {
-          value = value.substring(1, value.length - 1)
+          value = value
+            .substring(1, value.length - 1)
+            .replace(/\\n/g, '\n')
+            .replace(/\\"/g, '"')
+            .replace(/\\'/g, "'")
         }
 
         // Check if key already exists

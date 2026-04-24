@@ -28,6 +28,7 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { Eye, EyeOff, KeyRound, Plus, Upload } from 'lucide-react'
@@ -74,6 +75,7 @@ function EnvironmentVariableRow({
   const [isVisible, setIsVisible] = useState(false)
   const [isEditing, setIsEditing] = useState(false)
   const [editValue, setEditValue] = useState('')
+  const [isEditMultiline, setIsEditMultiline] = useState(false)
 
   const { data, refetch } = useQuery({
     ...getEnvironmentVariableValueOptions({
@@ -89,6 +91,8 @@ function EnvironmentVariableRow({
     if (data && typeof data === 'object' && 'value' in data) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setEditValue(data.value)
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setIsEditMultiline(data.value.includes('\n'))
     }
   }, [data])
 
@@ -313,12 +317,32 @@ function EnvironmentVariableRow({
           >
             <div className="space-y-4 py-4">
               <div className="space-y-2">
-                <label className="text-sm font-medium">Value</label>
-                <Input
-                  value={editValue}
-                  onChange={(e) => setEditValue(e.target.value)}
-                  className="font-mono"
-                />
+                <div className="flex items-center justify-between">
+                  <label className="text-sm font-medium">Value</label>
+                  <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <Checkbox
+                      checked={isEditMultiline}
+                      onCheckedChange={(checked) =>
+                        setIsEditMultiline(checked === true)
+                      }
+                    />
+                    Multiline (e.g. .npmrc)
+                  </label>
+                </div>
+                {isEditMultiline ? (
+                  <Textarea
+                    value={editValue}
+                    onChange={(e) => setEditValue(e.target.value)}
+                    className="font-mono resize-y"
+                    rows={6}
+                  />
+                ) : (
+                  <Input
+                    value={editValue}
+                    onChange={(e) => setEditValue(e.target.value)}
+                    className="font-mono"
+                  />
+                )}
               </div>
               <div className="space-y-2">
                 <label className="text-sm font-medium">Environments</label>
@@ -503,6 +527,7 @@ function AddEnvironmentVariableDialog({
 }: AddEnvironmentVariableDialogProps) {
   const [key, setKey] = useState('')
   const [value, setValue] = useState('')
+  const [isMultiline, setIsMultiline] = useState(false)
   const [selectedEnvironments, setSelectedEnvironments] = useState<number[]>([])
   const [includeInPreview, setIncludeInPreview] = useState(false)
   const [hasInitialized, setHasInitialized] = useState(false)
@@ -543,6 +568,7 @@ function AddEnvironmentVariableDialog({
     })
     setKey('')
     setValue('')
+    setIsMultiline(false)
     setSelectedEnvironments([])
     setIncludeInPreview(false)
   }
@@ -573,13 +599,34 @@ function AddEnvironmentVariableDialog({
               />
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">Value</label>
-              <Input
-                placeholder="Enter value"
-                value={value}
-                onChange={(e) => setValue(e.target.value)}
-                className="font-mono"
-              />
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-medium">Value</label>
+                <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Checkbox
+                    checked={isMultiline}
+                    onCheckedChange={(checked) =>
+                      setIsMultiline(checked === true)
+                    }
+                  />
+                  Multiline (e.g. .npmrc)
+                </label>
+              </div>
+              {isMultiline ? (
+                <Textarea
+                  placeholder="Enter multiline value"
+                  value={value}
+                  onChange={(e) => setValue(e.target.value)}
+                  className="font-mono resize-y"
+                  rows={6}
+                />
+              ) : (
+                <Input
+                  placeholder="Enter value"
+                  value={value}
+                  onChange={(e) => setValue(e.target.value)}
+                  className="font-mono"
+                />
+              )}
             </div>
             <div className="space-y-2">
               <div className="flex items-center gap-2">
@@ -638,6 +685,7 @@ function AddEnvironmentVariableDialog({
                 onOpenChange(false)
                 setKey('')
                 setValue('')
+                setIsMultiline(false)
                 setSelectedEnvironments([])
                 setIncludeInPreview(false)
               }}
