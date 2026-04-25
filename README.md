@@ -9,7 +9,7 @@
 ### The open-source, self-hosted deployment platform.
 ### Deploy, observe, and scale -- from a single binary.
 
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-blue.svg)](LICENSE.md)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
@@ -259,7 +259,13 @@ cargo build --release
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE).
+Temps is licensed under the [Functional Source License, Version 1.1, Apache 2.0 Future License](LICENSE.md) (FSL-1.1-Apache-2.0).
+
+- **Free to self-host** for any internal or commercial use.
+- **No competing hosted PaaS** that substitutes for Temps Cloud.
+- **Becomes Apache 2.0** two years after each release.
+
+Plain-English summary and FAQ: [LICENSING.md](LICENSING.md). For commercial licensing, email **dviejokfs@temps.sh**.
 
 ---
 

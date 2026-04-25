@@ -81,7 +81,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
+license = "LicenseRef-FSL-1.1-Apache-2.0"
+license-file = "LICENSE.md"
 authors = ["Temps Contributors"]
 repository = "https://github.com/gotempsh/temps"
 homepage = "https://github.com/gotempsh/temps"

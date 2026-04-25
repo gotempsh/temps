@@ -2,3 +2,7 @@
 # Bollard (Docker API client) uses "vertexes" as the field name,
 # matching the upstream Go/BuildKit API naming convention.
 vertexes = "vertexes"
+
+[default.extend-identifiers]
+# Company name, not a typo of "HashCorp"
+HashiCorp = "HashiCorp"

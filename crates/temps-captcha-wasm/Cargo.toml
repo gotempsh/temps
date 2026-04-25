@@ -2,7 +2,7 @@
 name = "temps-captcha-wasm"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license-file = "../../LICENSE.md"
 description = "WebAssembly proof-of-work solver for Temps CAPTCHA"
 
 [lib]

@@ -1,18 +1,14 @@
 Temps
 Copyright 2025 Temps Contributors
 
-This product is licensed under the Apache License, Version 2.0 (the "License").
-You may not use this product except in compliance with the License.
+This product is licensed under the Functional Source License, Version 1.1,
+with an Apache 2.0 Future License (FSL-1.1-Apache-2.0). The full legal text
+is in LICENSE.md; a plain-English summary is in LICENSING.md.
 
-You may obtain a copy of the License at
+Two years after each release, that release is additionally licensed under
+the Apache License, Version 2.0:
 
     http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
 
 ---
 
@@ -21,5 +17,4 @@ list of dependencies and their licenses, run:
 
     cargo tree --prefix none --no-dedupe
 
-For more information about the licenses of dependencies, see the individual
-crate documentation.
+Third-party dependencies remain licensed under their own terms.
