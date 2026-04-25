@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### License
+- **Relicensed from MIT/Apache-2.0 to FSL-1.1-Apache-2.0** ([64a7968](https://github.com/gotempsh/temps/commit/64a796851f683bd20548dc1a89526656a79297cb)): adopted the Functional Source License (same model as Sentry) with a 2-year Apache 2.0 future grant. Self-hosting remains free for any internal or commercial use; only competing hosted PaaS offerings are restricted, and only for 2 years per release. Existing MIT/Apache-2.0 releases keep their original licenses. See [`LICENSE.md`](./LICENSE.md) for the legal text and [`LICENSING.md`](./LICENSING.md) for a plain-English summary. Commercial licensing: dviejokfs@temps.sh.
+
 ### Added
 - **AI Agents framework**: `temps-agents` crate introducing project-scoped AI agents that run Claude CLI or OpenAI Codex against your codebase; agents are configured per-project with a system prompt, max turns, and a choice of AI provider
 - **Autopilot cron scheduling**: agents can be scheduled with a cron expression (e.g. `0 * * * *`) so they run automatically — the `CronScheduler` service manages all active schedules and fires agent runs without manual intervention
