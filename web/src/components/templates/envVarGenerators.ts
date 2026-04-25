@@ -46,19 +46,67 @@ function randomBase64(byteLength: number): string {
 }
 
 /**
- * Returns the inferred base domain — either the host the user is currently on
- * (so self-hosted installs derive their own URL) or `temps.sh` as a default.
+ * Resolves the base domain to use when building deployment URLs from a slug.
+ *
+ * Priority:
+ *   1. The platform's configured `preview_domain` setting (e.g. `*.example.com`
+ *      → `example.com`). This is the same value the proxy uses to route
+ *      `{slug}.{preview_domain}` to deployments — so the URL we generate
+ *      will actually resolve.
+ *   2. The hostname of `external_url` (used when `preview_domain` is empty).
+ *   3. The current browser host, but only when it's a public hostname (not
+ *      localhost / IP / port-bound) — covers self-hosted installs that
+ *      haven't completed onboarding yet.
+ *   4. `temps.sh` as a final fallback for unconfigured local dev.
+ */
+export function resolveBaseDomain(opts?: {
+  previewDomain?: string | null
+  externalUrl?: string | null
+}): string {
+  const previewDomain = opts?.previewDomain?.trim()
+  if (previewDomain) {
+    // Strip leading `*.` from wildcard entries like `*.example.com`.
+    return previewDomain.replace(/^\*\./, '')
+  }
+
+  const externalUrl = opts?.externalUrl?.trim()
+  if (externalUrl) {
+    try {
+      const host = new URL(externalUrl).hostname
+      if (host && !isLocalHost(host)) return host
+    } catch {
+      // ignore malformed URLs
+    }
+  }
+
+  if (typeof window !== 'undefined' && window.location?.hostname) {
+    const hostname = window.location.hostname
+    const host = window.location.host
+    if (!isLocalHost(hostname) && !host.includes(':')) return host
+  }
+
+  return 'temps.sh'
+}
+
+function isLocalHost(host: string): boolean {
+  return (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host.startsWith('127.') ||
+    host.startsWith('192.168.') ||
+    host.startsWith('10.') ||
+    host === '::1' ||
+    host === '[::1]'
+  )
+}
+
+/**
+ * @deprecated Prefer `resolveBaseDomain({ previewDomain, externalUrl })`.
+ * Kept for backwards compatibility with call sites that haven't yet been
+ * updated to pass platform settings.
  */
 export function inferBaseDomain(): string {
-  if (typeof window !== 'undefined' && window.location?.hostname) {
-    const host = window.location.host
-    // For local dev, prefer the canonical placeholder over `localhost:8080`.
-    if (host.includes('localhost') || host.startsWith('127.') || host.includes(':')) {
-      return 'temps.sh'
-    }
-    return host
-  }
-  return 'temps.sh'
+  return resolveBaseDomain()
 }
 
 /**
