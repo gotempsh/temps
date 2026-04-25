@@ -356,6 +356,106 @@ export function GitImportClone({
     },
   })
 
+  /**
+   * Validates a public git URL and, on success, populates `selectedRepository`
+   * (showing the configurator). Called both from the form's submit button and
+   * from a hydration effect when the page is loaded with `?repo=<url>` in the
+   * search params.
+   *
+   * Defined before the early returns below so this `useCallback` always runs
+   * (otherwise React throws "Rendered fewer hooks than expected" the first
+   * time `selectedTemplate` or `selectedRepository` triggers an early return).
+   */
+  const validateAndSelectGitUrl = useCallback(
+    async (
+      urlOverride?: string,
+      options: { silent?: boolean; pushToUrl?: boolean } = {}
+    ) => {
+      const url = (urlOverride ?? gitUrl).trim()
+      if (!url) {
+        toast.error('Please enter a git URL')
+        return
+      }
+
+      const parsed = parseGitUrl(url)
+      if (!parsed) {
+        toast.error(
+          'Invalid git URL. Please use a GitHub or GitLab repository URL.'
+        )
+        return
+      }
+
+      setParsedPublicRepo(parsed)
+      setIsValidatingUrl(true)
+
+      try {
+        const response = await fetch(
+          `/api/git/public/${parsed.provider}/${parsed.owner}/${parsed.repo}`
+        )
+
+        if (!response.ok) {
+          if (response.status === 404) {
+            toast.error('Repository not found or is not public')
+          } else if (response.status === 429) {
+            toast.error('Rate limit exceeded. Please try again later.')
+          } else {
+            toast.error('Failed to fetch repository information')
+          }
+          setParsedPublicRepo(null)
+          return
+        }
+
+        const repoInfo = await response.json()
+
+        const repoFromApi: RepositoryResponse = {
+          id: 0,
+          name: repoInfo.name,
+          full_name: repoInfo.full_name,
+          owner: repoInfo.owner,
+          private: false,
+          default_branch: repoInfo.default_branch,
+          description: repoInfo.description,
+          language: repoInfo.language,
+          clone_url: url,
+          ssh_url: null,
+          created_at: new Date().toISOString(),
+          pushed_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          preset: null,
+          stars: repoInfo.stars,
+          forks: repoInfo.forks,
+        } as RepositoryResponse & { stars?: number; forks?: number }
+
+        if (urlOverride) setGitUrl(url)
+        setSelectedRepository(repoFromApi)
+        setUseGitUrl(true)
+        if (!options.silent) {
+          toast.success(`Found repository: ${repoInfo.full_name}`)
+        }
+        if (options.pushToUrl && mode === 'navigation') {
+          updateSearchParams({ repo: url })
+        }
+      } catch (error) {
+        toast.error('Failed to validate repository URL')
+        setParsedPublicRepo(null)
+      } finally {
+        setIsValidatingUrl(false)
+      }
+    },
+    [gitUrl, mode, updateSearchParams]
+  )
+
+  // Hydrate `selectedRepository` from `?repo=<url>` on mount or browser back.
+  // Must live before the early returns so the hook order stays consistent.
+  useEffect(() => {
+    if (mode !== 'navigation') return
+    if (selectedSource !== 'git-url') return
+    if (!repoUrlFromUrl) return
+    if (selectedRepository && useGitUrl && gitUrl === repoUrlFromUrl) return
+    void validateAndSelectGitUrl(repoUrlFromUrl, { silent: true })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repoUrlFromUrl, selectedSource, mode])
+
   const handleRepositoryClick = (repo: RepositoryResponse) => {
     if (mode === 'navigation') {
       // Navigation mode: navigate to import page
@@ -495,110 +595,9 @@ export function GitImportClone({
     )
   }
 
-  /**
-   * Validates a public git URL and, on success, populates `selectedRepository`
-   * (showing the configurator). Called both from the form's submit button and
-   * from a hydration effect when the page is loaded with `?repo=<url>` in the
-   * search params.
-   *
-   * @param urlOverride – use this URL instead of the form `gitUrl` state
-   *   (lets us hydrate from the URL query param without a `setState` race).
-   * @param options.silent – suppress success toast for hydration paths
-   * @param options.pushToUrl – mirror the validated URL into search params
-   */
-  const validateAndSelectGitUrl = useCallback(
-    async (
-      urlOverride?: string,
-      options: { silent?: boolean; pushToUrl?: boolean } = {}
-    ) => {
-      const url = (urlOverride ?? gitUrl).trim()
-      if (!url) {
-        toast.error('Please enter a git URL')
-        return
-      }
-
-      const parsed = parseGitUrl(url)
-      if (!parsed) {
-        toast.error(
-          'Invalid git URL. Please use a GitHub or GitLab repository URL.'
-        )
-        return
-      }
-
-      setParsedPublicRepo(parsed)
-      setIsValidatingUrl(true)
-
-      try {
-        const response = await fetch(
-          `/api/git/public/${parsed.provider}/${parsed.owner}/${parsed.repo}`
-        )
-
-        if (!response.ok) {
-          if (response.status === 404) {
-            toast.error('Repository not found or is not public')
-          } else if (response.status === 429) {
-            toast.error('Rate limit exceeded. Please try again later.')
-          } else {
-            toast.error('Failed to fetch repository information')
-          }
-          setParsedPublicRepo(null)
-          return
-        }
-
-        const repoInfo = await response.json()
-
-        const repoFromApi: RepositoryResponse = {
-          id: 0,
-          name: repoInfo.name,
-          full_name: repoInfo.full_name,
-          owner: repoInfo.owner,
-          private: false,
-          default_branch: repoInfo.default_branch,
-          description: repoInfo.description,
-          language: repoInfo.language,
-          clone_url: url,
-          ssh_url: null,
-          created_at: new Date().toISOString(),
-          pushed_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-          preset: null,
-          stars: repoInfo.stars,
-          forks: repoInfo.forks,
-        } as RepositoryResponse & { stars?: number; forks?: number }
-
-        if (urlOverride) setGitUrl(url)
-        setSelectedRepository(repoFromApi)
-        setUseGitUrl(true)
-        if (!options.silent) {
-          toast.success(`Found repository: ${repoInfo.full_name}`)
-        }
-        if (options.pushToUrl && mode === 'navigation') {
-          updateSearchParams({ repo: url })
-        }
-      } catch (error) {
-        toast.error('Failed to validate repository URL')
-        setParsedPublicRepo(null)
-      } finally {
-        setIsValidatingUrl(false)
-      }
-    },
-    [gitUrl, mode, updateSearchParams]
-  )
-
   const handleGitUrlSubmit = () => {
     void validateAndSelectGitUrl(undefined, { pushToUrl: true })
   }
-
-  // Hydrate `selectedRepository` from `?repo=<url>` on mount or browser back.
-  // Skips work when the URL repo already matches the loaded selection.
-  useEffect(() => {
-    if (mode !== 'navigation') return
-    if (selectedSource !== 'git-url') return
-    if (!repoUrlFromUrl) return
-    if (selectedRepository && useGitUrl && gitUrl === repoUrlFromUrl) return
-    void validateAndSelectGitUrl(repoUrlFromUrl, { silent: true })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [repoUrlFromUrl, selectedSource, mode])
 
   // Source selection step
   if (!selectedSource) {
