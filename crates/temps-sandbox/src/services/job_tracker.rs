@@ -231,7 +231,7 @@ impl JobTracker {
                 started_at: job.started_at,
             });
         }
-        out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        out.sort_by_key(|job| std::cmp::Reverse(job.started_at));
         out
     }
 

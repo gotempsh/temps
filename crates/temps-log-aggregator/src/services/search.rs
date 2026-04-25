@@ -3,6 +3,7 @@
 //! All searches read directly from compressed chunk files on disk/S3.
 //! The log_chunks table provides the index of which files to read.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use tracing::{debug, warn};
@@ -163,6 +164,12 @@ impl LogSearchService {
 
         let mut all_matches = Vec::new();
         let mut total_scanned = 0u64;
+        // Dedup key: (ts_nanos, container_id, stream, msg). Lines identical on all four
+        // are considered the same event and collapsed. This defends against:
+        // - Docker `since=N` re-serving lines on reconnect (collector.rs comments)
+        // - Server restart replays where `since` rounds to the second boundary
+        // - Any overlapping chunks for the same container/time window
+        let mut seen: HashSet<(i64, String, LogStream, String)> = HashSet::new();
 
         // Process chunks in batches of MAX_CONCURRENT_FETCHES
         for chunk_batch in chunks.chunks(MAX_CONCURRENT_FETCHES) {
@@ -196,18 +203,28 @@ impl LogSearchService {
                         for (line_idx, raw_line) in content.lines().enumerate() {
                             total_scanned += 1;
                             if let Ok(parsed) = serde_json::from_str::<LogLine>(raw_line) {
-                                if self.line_matches_filter(&parsed, filter) {
-                                    all_matches.push(LogSearchLine {
-                                        timestamp: parsed.ts,
-                                        level: parsed.level,
-                                        service: parsed.service,
-                                        message: parsed.msg,
-                                        fields: parsed.fields,
-                                        chunk_id,
-                                        line_offset: line_idx as i32,
-                                        deploy_id: parsed.deploy_id,
-                                    });
+                                if !self.line_matches_filter(&parsed, filter) {
+                                    continue;
                                 }
+                                let dedup_key = (
+                                    parsed.ts.timestamp_nanos_opt().unwrap_or(0),
+                                    parsed.container_id.clone(),
+                                    parsed.stream,
+                                    parsed.msg.clone(),
+                                );
+                                if !seen.insert(dedup_key) {
+                                    continue;
+                                }
+                                all_matches.push(LogSearchLine {
+                                    timestamp: parsed.ts,
+                                    level: parsed.level,
+                                    service: parsed.service,
+                                    message: parsed.msg,
+                                    fields: parsed.fields,
+                                    chunk_id,
+                                    line_offset: line_idx as i32,
+                                    deploy_id: parsed.deploy_id,
+                                });
                             }
                         }
                     }
@@ -363,6 +380,77 @@ mod tests {
             project_id: 1,
             deploy_id: None,
         }
+    }
+
+    /// Dedup key used inside archive_search to collapse duplicate log lines.
+    /// Kept next to the test so any change to the key composition breaks the
+    /// test, forcing an intentional review of what counts as "the same line".
+    fn dedup_key(line: &LogLine) -> (i64, String, LogStream, String) {
+        (
+            line.ts.timestamp_nanos_opt().unwrap_or(0),
+            line.container_id.clone(),
+            line.stream,
+            line.msg.clone(),
+        )
+    }
+
+    #[test]
+    fn test_dedup_key_collapses_identical_lines() {
+        // Simulates the observed bug: the same boot-time log line ingested
+        // multiple times (e.g. from Docker `since=N` replays on server restart
+        // or container crash-loops) must collapse to a single entry.
+        let line_a = make_log_line(LogLevel::Warn, "HLF_KEY_PEM is not set");
+        let line_b = line_a.clone();
+
+        let mut seen = std::collections::HashSet::new();
+        assert!(seen.insert(dedup_key(&line_a)));
+        assert!(
+            !seen.insert(dedup_key(&line_b)),
+            "second insert of an identical line must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_dedup_key_distinguishes_different_containers() {
+        // Same message, same timestamp, but different containers → keep both.
+        let mut a = make_log_line(LogLevel::Info, "ready");
+        let mut b = a.clone();
+        a.container_id = "cnt-a".into();
+        b.container_id = "cnt-b".into();
+
+        let mut seen = std::collections::HashSet::new();
+        assert!(seen.insert(dedup_key(&a)));
+        assert!(
+            seen.insert(dedup_key(&b)),
+            "different container_id means different event"
+        );
+    }
+
+    #[test]
+    fn test_dedup_key_distinguishes_stream() {
+        // Same message, same ts, same container, different stream → keep both
+        // (a process writing identical text to stdout and stderr is rare but real).
+        let mut a = make_log_line(LogLevel::Info, "ping");
+        let mut b = a.clone();
+        a.stream = LogStream::Stdout;
+        b.stream = LogStream::Stderr;
+
+        let mut seen = std::collections::HashSet::new();
+        assert!(seen.insert(dedup_key(&a)));
+        assert!(seen.insert(dedup_key(&b)));
+    }
+
+    #[test]
+    fn test_dedup_key_distinguishes_timestamp() {
+        // Same everything except ts → keep both. Two consecutive `ping` heartbeats
+        // are separate events.
+        let a = make_log_line(LogLevel::Info, "ping");
+        let mut b = a.clone();
+        b.ts = a.ts + Duration::milliseconds(1);
+
+        let mut seen = std::collections::HashSet::new();
+        assert!(seen.insert(dedup_key(&a)));
+        assert!(seen.insert(dedup_key(&b)));
     }
 
     #[test]

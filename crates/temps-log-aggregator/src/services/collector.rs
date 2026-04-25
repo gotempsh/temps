@@ -130,12 +130,19 @@ impl CollectorService {
 
         // Query the DB for the latest chunk end timestamp for this container.
         // On server restart, this prevents replaying the entire container history.
+        //
+        // We add +1 second because Docker's `since` parameter is second-resolution
+        // AND inclusive — passing the raw `ended_at.timestamp()` would re-serve every
+        // line stamped in that same second (the boot-time burst in crash-loop
+        // scenarios was producing 10x duplicate rows per restart). Trading <1s of
+        // coverage for zero duplicates is the right call; the dedup layer in
+        // archive_search is the backstop for anything that still slips through.
         let resume_after = self
             .metadata_service
             .get_latest_chunk_end_for_container(container_id)
             .await
             .unwrap_or(None)
-            .map(|ts| ts.timestamp())
+            .map(|ts| ts.timestamp().saturating_add(1))
             .unwrap_or(0);
 
         if resume_after > 0 {
@@ -416,11 +423,14 @@ impl CollectorService {
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
 
-                    // Reconnect using last_seen_ts so we resume close to where we left off.
-                    // Docker `since` is integer seconds, so we may get up to ~1 second of
-                    // overlap. The chunk writer will buffer these; they end up in a new chunk
-                    // which is acceptable (minor duplication vs. data loss).
-                    let reconnect_options = Self::build_log_options(last_seen_ts);
+                    // Reconnect one second past the last line we successfully received.
+                    // Docker's `since` parameter is integer seconds and is inclusive, so
+                    // passing `last_seen_ts` would re-serve every line stamped at exactly
+                    // that second — producing visible duplicates in the UI. Trading a
+                    // worst-case <1s gap for no duplicates is the right default here;
+                    // the dedup layer in archive_search catches anything that slips through.
+                    let resume_from = last_seen_ts.saturating_add(1);
+                    let reconnect_options = Self::build_log_options(resume_from);
                     stream = docker.logs(&container_id, Some(reconnect_options));
                 }
                 None => {

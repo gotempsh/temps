@@ -33,7 +33,7 @@ pub struct LogLine {
 }
 
 /// Log output stream
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum LogStream {
     Stdout,
