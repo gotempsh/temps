@@ -375,7 +375,7 @@ impl OtelStorage for MockOtelStorage {
             .collect();
 
         // Sort by start_time descending
-        summaries.sort_by(|a, b| b.start_time.cmp(&a.start_time));
+        summaries.sort_by_key(|s| std::cmp::Reverse(s.start_time));
 
         // Apply pagination
         let offset = query.offset.unwrap_or(0) as usize;
@@ -529,7 +529,7 @@ impl OtelStorage for MockOtelStorage {
             })
             .collect();
 
-        summaries.sort_by(|a, b| b.start_time.cmp(&a.start_time));
+        summaries.sort_by_key(|s| std::cmp::Reverse(s.start_time));
         Ok(summaries)
     }
 
