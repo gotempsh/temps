@@ -72,17 +72,39 @@ function isLocalHost(host: string): boolean {
 }
 
 /**
+ * Parses `external_url` into its scheme, hostname, and (optional) port.
+ * Returns `null` for empty / malformed input.
+ */
+function parseExternalUrl(externalUrl?: string | null): DeploymentUrlBase | null {
+  const trimmed = externalUrl?.trim()
+  if (!trimmed) return null
+  try {
+    const url = new URL(trimmed)
+    if (!url.hostname) return null
+    return {
+      scheme: url.protocol === 'http:' ? 'http' : 'https',
+      host: url.hostname,
+      // `URL.port` is empty string when the port is the default for the scheme.
+      port: url.port || undefined,
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
  * Resolves the deployment-URL base used by the `app_url` generator.
  *
  * Priority:
  *   1. The platform's `preview_domain` (e.g. `*.example.com` → host
- *      `example.com`). This is the value the proxy uses to route
- *      `{slug}.{preview_domain}` to deployments — generated URLs match
- *      the proxy's actual rules. Always paired with `https` and no port,
- *      since `preview_domain` is a DNS-only concept.
- *   2. The full URL parts of `external_url` (scheme, host, port). Used
- *      when `preview_domain` is empty so generated URLs at least reach
- *      the same origin the user is configured to use.
+ *      `example.com`) — that's the value the proxy uses to route
+ *      `{slug}.{preview_domain}` to deployments. When `external_url` is
+ *      also set, we inherit its **scheme** and **port** so dev installs
+ *      like `external_url=http://localhost:8080` + `preview_domain=*.localho.st`
+ *      generate `http://my-app.localho.st:8080` instead of dropping the port.
+ *   2. The full URL parts of `external_url` (scheme, host, port) when
+ *      `preview_domain` is empty — generated URLs at least reach the same
+ *      origin the user is configured to use.
  *   3. The current browser location, when it's not localhost — covers
  *      self-hosted installs that haven't completed onboarding yet.
  *   4. `https://temps.sh` as a final fallback for unconfigured local dev.
@@ -91,29 +113,26 @@ export function resolveDeploymentUrlBase(opts?: {
   previewDomain?: string | null
   externalUrl?: string | null
 }): DeploymentUrlBase {
+  const externalUrlBase = parseExternalUrl(opts?.externalUrl)
   const previewDomain = opts?.previewDomain?.trim()
+
   if (previewDomain) {
-    return {
-      scheme: 'https',
-      host: previewDomain.replace(/^\*\./, ''),
+    const host = previewDomain.replace(/^\*\./, '')
+    // Inherit scheme + port from external_url when set, since `preview_domain`
+    // is a DNS-only concept and doesn't carry transport details. This is what
+    // makes dev installs work: `*.localho.st` + `http://localhost:8080`
+    // -> `http://{slug}.localho.st:8080`.
+    if (externalUrlBase) {
+      return {
+        scheme: externalUrlBase.scheme,
+        host,
+        port: externalUrlBase.port,
+      }
     }
+    return { scheme: 'https', host }
   }
 
-  const externalUrl = opts?.externalUrl?.trim()
-  if (externalUrl) {
-    try {
-      const url = new URL(externalUrl)
-      const host = url.hostname
-      if (host) {
-        const scheme = url.protocol === 'http:' ? 'http' : 'https'
-        // `URL.port` is empty when the port is the default for the scheme.
-        const port = url.port || undefined
-        return { scheme, host, port }
-      }
-    } catch {
-      // ignore malformed URLs
-    }
-  }
+  if (externalUrlBase) return externalUrlBase
 
   if (typeof window !== 'undefined' && window.location?.hostname) {
     const hostname = window.location.hostname
