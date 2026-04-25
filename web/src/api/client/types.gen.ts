@@ -3686,6 +3686,11 @@ export type EnvVarTemplateResponse = {
      */
     default?: string | null;
     /**
+     * Frontend-side generator hint for the default value
+     * (e.g. `app_url`, `random_secret`, `random_hex_32`)
+     */
+    default_generator?: string | null;
+    /**
      * Description of what this variable is used for
      */
     description?: string | null;

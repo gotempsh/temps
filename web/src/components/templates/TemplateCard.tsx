@@ -1,9 +1,9 @@
-import { useState } from 'react'
 import type { TemplateResponse } from '@/api/client/types.gen'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Star, Database, Server } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { TemplateImage } from './TemplateImage'
 
 interface TemplateCardProps {
   template: TemplateResponse
@@ -33,29 +33,7 @@ function getServiceLabel(service: string): string {
   return labels[service.toLowerCase()] || service
 }
 
-/** Map preset names to icon URLs */
-function getPresetIcon(preset: string): string {
-  const icons: Record<string, string> = {
-    nextjs: '/presets/nextjs.svg',
-    fastapi: '/presets/fastapi.svg',
-    django: '/presets/django.svg',
-    remix: '/presets/remix.svg',
-    nuxt: '/presets/nuxt.svg',
-    astro: '/presets/astro.svg',
-    rust: '/presets/rust.svg',
-    go: '/presets/go.svg',
-    nixpacks: '/presets/nixpacks.svg',
-  }
-  return icons[preset.toLowerCase()] || '/presets/default.svg'
-}
-
 export function TemplateCard({ template, onClick, selected }: TemplateCardProps) {
-  const [imageFailed, setImageFailed] = useState(false)
-  const [presetIconFailed, setPresetIconFailed] = useState(false)
-
-  const showImage = template.image_url && !imageFailed
-  const showPresetIcon = !showImage && !presetIconFailed
-
   return (
     <Card
       className={cn(
@@ -67,25 +45,13 @@ export function TemplateCard({ template, onClick, selected }: TemplateCardProps)
       <CardHeader className="pb-2">
         <div className="flex items-start justify-between gap-2">
           <div className="flex items-center gap-3">
-            <div className="h-10 w-10 rounded-md bg-muted flex items-center justify-center overflow-hidden text-muted-foreground">
-              {showImage ? (
-                <img
-                  src={template.image_url!}
-                  alt={template.name}
-                  className="h-8 w-8 object-contain"
-                  onError={() => setImageFailed(true)}
-                />
-              ) : showPresetIcon ? (
-                <img
-                  src={getPresetIcon(template.preset)}
-                  alt={template.preset}
-                  className="h-6 w-6 object-contain"
-                  onError={() => setPresetIconFailed(true)}
-                />
-              ) : (
-                <Server className="h-5 w-5" />
-              )}
-            </div>
+            <TemplateImage
+              imageUrl={template.image_url}
+              preset={template.preset}
+              alt={template.name}
+              className="h-10 w-10"
+              imgClassName="h-8 w-8"
+            />
             <div>
               <CardTitle className="text-base font-semibold flex items-center gap-2">
                 {template.name}

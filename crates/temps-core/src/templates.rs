@@ -27,6 +27,11 @@ pub struct EnvVarTemplate {
     /// Whether this variable is required
     #[serde(default)]
     pub required: bool,
+    /// Frontend-side generator for the default value. Recognised values:
+    /// `app_url` (https://{repo}.{base_domain}), `random_secret` (32-byte base64),
+    /// `random_hex_32` (32-byte hex). Unknown values are ignored client-side.
+    #[serde(default)]
+    pub default_generator: Option<String>,
 }
 
 /// Git repository reference (supports any git provider: GitHub, GitLab, Bitbucket, etc.)

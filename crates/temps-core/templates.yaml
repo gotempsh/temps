@@ -11,7 +11,6 @@ templates:
   - slug: nextjs-saas-starter
     name: Next.js SaaS Starter
     description: A complete SaaS starter kit with authentication, billing, and database integration
-    image_url: https://raw.githubusercontent.com/gotempsh/temps-examples/main/examples/nextjs-saas/preview.png
     git:
       url: https://github.com/gotempsh/temps-examples.git
       ref: main
@@ -34,10 +33,12 @@ templates:
       - name: NEXTAUTH_SECRET
         description: Secret for NextAuth.js sessions
         required: true
+        default_generator: random_hex_32
       - name: NEXTAUTH_URL
         description: Base URL for authentication callbacks
         example: https://your-app.temps.sh
         required: true
+        default_generator: app_url
       - name: STRIPE_SECRET_KEY
         description: Stripe secret API key
         example: sk_test_...
@@ -58,7 +59,6 @@ templates:
   - slug: nextjs-docs-template
     name: Next.js Docs Template
     description: A modern documentation site template with syntax highlighting, dark mode, and responsive design
-    image_url: https://raw.githubusercontent.com/gotempsh/temps-examples/main/examples/docs-template/preview.png
     git:
       url: https://github.com/gotempsh/temps-examples.git
       ref: main

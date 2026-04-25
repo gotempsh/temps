@@ -82,6 +82,9 @@ pub struct EnvVarTemplateResponse {
     pub description: Option<String>,
     /// Whether this variable is required
     pub required: bool,
+    /// Frontend-side generator hint for the default value
+    /// (e.g. `app_url`, `random_secret`, `random_hex_32`)
+    pub default_generator: Option<String>,
 }
 
 impl From<ProjectTemplate> for TemplateResponse {
@@ -118,6 +121,7 @@ impl From<EnvVarTemplate> for EnvVarTemplateResponse {
             default: env_var.default,
             description: env_var.description,
             required: env_var.required,
+            default_generator: env_var.default_generator,
         }
     }
 }
@@ -365,6 +369,7 @@ mod tests {
                 default: None,
                 description: Some("A test variable".to_string()),
                 required: true,
+                default_generator: None,
             }],
             is_public: true,
             is_featured: true,
@@ -398,6 +403,7 @@ mod tests {
             default: Some("postgres://localhost/default".to_string()),
             description: Some("Database connection URL".to_string()),
             required: true,
+            default_generator: None,
         };
 
         let response = EnvVarTemplateResponse::from(env_var);
