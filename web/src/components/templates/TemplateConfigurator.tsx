@@ -9,6 +9,7 @@ import { format } from 'date-fns'
 import {
   createProjectFromTemplateMutation,
   listConnectionsOptions,
+  listGitProvidersOptions,
   listServicesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
@@ -39,6 +40,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import { Label } from '@/components/ui/label'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -66,6 +69,7 @@ import {
   EyeOff,
   ExternalLink,
   GitBranch,
+  Gitlab,
   Loader2,
   Lock,
   Plus,
@@ -76,6 +80,26 @@ import {
   X,
 } from 'lucide-react'
 import Github from '@/icons/Github'
+
+/**
+ * Renders the correct icon for a Git provider type — used in the connection
+ * picker so a GitLab connection doesn't show the GitHub mark.
+ */
+function ProviderIcon({
+  providerType,
+  className = 'h-4 w-4',
+}: {
+  providerType: string | undefined
+  className?: string
+}) {
+  if (providerType === 'github' || providerType === 'github_app') {
+    return <Github className={className} />
+  }
+  if (providerType === 'gitlab') {
+    return <Gitlab className={className} />
+  }
+  return <GitBranch className={className} />
+}
 
 // Common service types
 const SERVICE_TYPES = [
@@ -168,6 +192,15 @@ export function TemplateConfigurator({
   const { data: connectionsData, isLoading: isLoadingConnections } = useQuery({
     ...listConnectionsOptions(),
   })
+
+  // Fetch git providers so we can render the right icon per connection
+  // (a GitLab connection should not show the GitHub mark).
+  const { data: gitProviders } = useQuery({
+    ...listGitProvidersOptions(),
+  })
+
+  const providerTypeForConnection = (conn: ConnectionResponse): string | undefined =>
+    gitProviders?.find((p) => p.id === conn.provider_id)?.provider_type
 
   // Fetch existing services
   const { data: existingServices, refetch: refetchServices } = useQuery({
@@ -484,38 +517,116 @@ export function TemplateConfigurator({
               <FormField
                 control={form.control}
                 name="gitProviderConnectionId"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Git Provider</FormLabel>
-                    <Select
-                      value={field.value?.toString()}
-                      onValueChange={(v) => field.onChange(parseInt(v, 10))}
-                    >
-                      <FormControl>
-                        <SelectTrigger>
-                          <SelectValue placeholder="Select a Git provider connection" />
-                        </SelectTrigger>
-                      </FormControl>
-                      <SelectContent>
-                        {connectionsData?.connections?.map((conn: ConnectionResponse) => (
-                          <SelectItem key={conn.id} value={conn.id.toString()}>
-                            <div className="flex items-center gap-2">
-                              <Github className="h-4 w-4" />
-                              <span>{conn.account_name}</span>
-                              <span className="text-xs text-muted-foreground">
-                                ({conn.account_type})
-                              </span>
-                            </div>
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <FormDescription>
-                      A new repository will be created in your connected Git account
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
+                render={({ field }) => {
+                  const conns = connectionsData?.connections ?? []
+                  const setValue = (id: number) => field.onChange(id)
+
+                  // Single connection: render as a read-only chip. The form
+                  // value is auto-set in the existing useEffect that picks
+                  // the first connection on mount, so no extra wiring needed.
+                  if (conns.length === 1) {
+                    const only = conns[0]
+                    return (
+                      <FormItem>
+                        <FormLabel>Git Provider</FormLabel>
+                        <div className="flex items-center gap-2 rounded-md border bg-muted/50 px-3 py-2">
+                          <ProviderIcon
+                            providerType={providerTypeForConnection(only)}
+                          />
+                          <span className="font-medium">{only.account_name}</span>
+                          <span className="text-xs text-muted-foreground">
+                            ({only.account_type})
+                          </span>
+                        </div>
+                        <FormDescription>
+                          A new repository will be created in your connected Git account
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )
+                  }
+
+                  // 2-4 connections: radio cards (clickable rows). Easier to
+                  // scan than a dropdown when the list is short.
+                  if (conns.length >= 2 && conns.length <= 4) {
+                    return (
+                      <FormItem>
+                        <FormLabel>Git Provider</FormLabel>
+                        <FormControl>
+                          <RadioGroup
+                            value={field.value?.toString() ?? ''}
+                            onValueChange={(v) => setValue(parseInt(v, 10))}
+                            className="gap-2"
+                          >
+                            {conns.map((conn: ConnectionResponse) => {
+                              const id = `git-conn-${conn.id}`
+                              const checked = field.value === conn.id
+                              return (
+                                <Label
+                                  key={conn.id}
+                                  htmlFor={id}
+                                  className={cn(
+                                    'flex cursor-pointer items-center gap-3 rounded-md border p-3 transition-colors hover:bg-accent/50',
+                                    checked && 'border-primary bg-accent/50'
+                                  )}
+                                >
+                                  <RadioGroupItem id={id} value={conn.id.toString()} />
+                                  <ProviderIcon
+                                    providerType={providerTypeForConnection(conn)}
+                                  />
+                                  <span className="font-medium">{conn.account_name}</span>
+                                  <span className="text-xs text-muted-foreground">
+                                    ({conn.account_type})
+                                  </span>
+                                </Label>
+                              )
+                            })}
+                          </RadioGroup>
+                        </FormControl>
+                        <FormDescription>
+                          A new repository will be created in your selected Git account
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )
+                  }
+
+                  // 5+ connections: fall back to a select dropdown.
+                  return (
+                    <FormItem>
+                      <FormLabel>Git Provider</FormLabel>
+                      <Select
+                        value={field.value?.toString()}
+                        onValueChange={(v) => setValue(parseInt(v, 10))}
+                      >
+                        <FormControl>
+                          <SelectTrigger>
+                            <SelectValue placeholder="Select a Git provider connection" />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          {conns.map((conn: ConnectionResponse) => (
+                            <SelectItem key={conn.id} value={conn.id.toString()}>
+                              <div className="flex items-center gap-2">
+                                <ProviderIcon
+                                  providerType={providerTypeForConnection(conn)}
+                                />
+                                <span>{conn.account_name}</span>
+                                <span className="text-xs text-muted-foreground">
+                                  ({conn.account_type})
+                                </span>
+                              </div>
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <FormDescription>
+                        A new repository will be created in your connected Git account
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )
+                }}
               />
 
               <FormField

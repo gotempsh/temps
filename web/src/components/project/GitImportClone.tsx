@@ -9,6 +9,7 @@ import {
   getPublicBranchesOptions,
   detectPublicPresetsOptions,
   listProjectTemplatesOptions,
+  listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import {
@@ -251,6 +252,25 @@ export function GitImportClone({
   const { data: connections } = useQuery({
     ...listConnectionsOptions(),
   })
+
+  // Providers list lets us pick the right icon per connection (a GitLab
+  // connection should not render the GitHub mark).
+  const { data: gitProviders } = useQuery({
+    ...listGitProvidersOptions(),
+  })
+
+  const providerTypeForConnectionId = (providerId: number): string | undefined =>
+    gitProviders?.find((p) => p.id === providerId)?.provider_type
+
+  const renderProviderIcon = (
+    providerId: number | undefined | null,
+    className = 'h-4 w-4'
+  ) => {
+    const type = providerId != null ? providerTypeForConnectionId(providerId) : undefined
+    if (type === 'github' || type === 'github_app') return <Github className={className} />
+    if (type === 'gitlab') return <Gitlab className={className} />
+    return <GitBranch className={className} />
+  }
 
   useEffect(() => {
     if (
@@ -686,7 +706,7 @@ export function GitImportClone({
                             key={conn.id}
                             className="flex items-center gap-1.5 text-xs text-muted-foreground bg-muted/60 rounded-full px-2.5 py-1"
                           >
-                            <Github className="h-3 w-3" />
+                            {renderProviderIcon(conn.provider_id, 'h-3 w-3')}
                             <span>{conn.account_name}</span>
                           </div>
                         ))}
@@ -755,7 +775,7 @@ export function GitImportClone({
                       )
                       return selectedConn ? (
                         <div className="flex items-center gap-2">
-                          <Github className="h-4 w-4" />
+                          {renderProviderIcon(selectedConn.provider_id)}
                           <span className="font-medium">
                             {selectedConn.account_name}
                           </span>
@@ -776,7 +796,7 @@ export function GitImportClone({
                     value={connection.id.toString()}
                   >
                     <div className="flex items-center gap-2">
-                      <Github className="h-4 w-4" />
+                      {renderProviderIcon(connection.provider_id)}
                       <span className="font-medium">
                         {connection.account_name}
                       </span>
