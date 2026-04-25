@@ -58,6 +58,7 @@ import {
   resolveDeploymentUrlBase,
 } from '@/components/templates/envVarGenerators'
 import { useSettings } from '@/hooks/useSettings'
+import { getErrorMessage } from '@/utils/errorHandling'
 import { cn } from '@/lib/utils'
 import {
   AlertCircle,
@@ -349,7 +350,13 @@ export function TemplateConfigurator({
       navigate(`/projects/${data.project_slug}?new=true`)
     },
     onError: (error) => {
-      toast.error(`Failed to create project: ${error.message}`)
+      // The backend returns RFC 7807 Problem Details, which surface their
+      // message via `detail` / `title` rather than `error.message` (which is
+      // `undefined` and previously rendered as "Failed to create project: undefined").
+      const message = getErrorMessage(error, 'Unknown error')
+      toast.error(`Failed to create project: ${message}`)
+      // eslint-disable-next-line no-console
+      console.error('Template project creation failed:', error)
     },
   })
 
