@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Email tracking — tracked HTML storage**: new `tracked_html_body` column stores the final HTML sent to the provider (with tracking pixel and rewritten links), separate from the original `html_body` to avoid triggering fake opens in dashboard previews
 - **Email tracking — per-link click breakdown**: email detail page now shows each tracked link with its individual click count
 - **Link Project from service detail**: "Link Project" button on the Storage service detail page lets you link a project directly from the Linked Projects section via a searchable combobox
+- **Template env var generators**: `EnvVarTemplate` gains a `default_generator` field with three client-side generators — `app_url` (https://{repo}.{host}), `random_hex_32`, and `random_secret`. Auto-fills required vars on mount, recomputes `app_url`-style values when the repository name changes (only if the user hasn't manually edited the field), and adds a per-field "Generate" button (Sparkles icon). Wired `NEXTAUTH_URL → app_url` and `NEXTAUTH_SECRET → random_hex_32` in the bundled Next.js SaaS Starter
 
 ### Security
 - **Container exec tenant isolation**: `exec_command` and `container_terminal` handlers now verify the container belongs to the requested project/environment before allowing access, preventing cross-tenant container exec
@@ -49,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Audit operation labels**: added human-readable descriptions for the new `SKILL_*`, `MCP_*`, and `SECRET_*` operation types, and a `humanize()` fallback so any future operation type renders as "Something New" instead of "Performed unknown operation"
 
 ### Fixed
+- **Template preview images and Configurator fallback**: bundled Next.js templates pointed to `raw.githubusercontent.com/gotempsh/temps-examples/.../preview.png` URLs that return 404, and `TemplateConfigurator` had no `onError` fallback so users saw a broken `<img>` icon on the create-project page. Removed the dead URLs from `templates.yaml` and introduced a shared `<TemplateImage>` component used by both `TemplateCard` and `TemplateConfigurator` with a 3-step fallback chain (remote image → local preset icon → generic GitBranch).
 - **CLI: `environments vars` subcommands ignored `--project` flag**: `get`, `set`, `delete`, `import`, `export` used `cmd.parent!.parent!.opts().project` (traversing to `environments` command level where `--project` isn't defined) instead of `cmd.parent!.opts().project` (the `vars` command where it is). This caused "Project undefined not found" errors. The `list` subcommand was not affected.
 - **CLI: `services env` crashed with "envVars is not iterable"**: the API endpoint `GET /external-services/{id}/projects/{project_id}/environment` returns `HashMap<String, String>` but the CLI expected `Array<EnvironmentVariableInfo>`. Added handling to convert the object response into the expected array format.
 - Storage "Create" button from empty state navigated to `/storage/create` (404) instead of `/settings/storage/create`
