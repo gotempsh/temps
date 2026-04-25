@@ -6,14 +6,28 @@
  * repository name and (b) render a "Generate" button on the value field.
  */
 
+/**
+ * Resolved deployment-URL parts for a given platform install.
+ *
+ * Kept as a struct (rather than a single string) so non-default ports and
+ * non-https schemes from `external_url` survive end-to-end — e.g. a local
+ * dev install at `http://localhost:8080` should generate
+ * `http://my-app.localhost:8080`, not `https://my-app.localhost`.
+ */
+export type DeploymentUrlBase = {
+  /** `https` or `http`. */
+  scheme: 'http' | 'https'
+  /** Bare host (no port), e.g. `example.com`. */
+  host: string
+  /** Optional port — e.g. `8080`. Only set when non-standard for the scheme. */
+  port?: string
+}
+
 export type GeneratorContext = {
   /** Repository slug entered by the user (e.g. `my-app`). */
   repositoryName: string
-  /**
-   * Base domain used for derived URLs. Falls back to `temps.sh`.
-   * Sourced from `window.location.host` when running against the live console.
-   */
-  baseDomain?: string
+  /** Resolved deployment-URL parts (see `resolveDeploymentUrlBase`). */
+  base?: DeploymentUrlBase
 }
 
 /**
@@ -45,49 +59,6 @@ function randomBase64(byteLength: number): string {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
-/**
- * Resolves the base domain to use when building deployment URLs from a slug.
- *
- * Priority:
- *   1. The platform's configured `preview_domain` setting (e.g. `*.example.com`
- *      → `example.com`). This is the same value the proxy uses to route
- *      `{slug}.{preview_domain}` to deployments — so the URL we generate
- *      will actually resolve.
- *   2. The hostname of `external_url` (used when `preview_domain` is empty).
- *   3. The current browser host, but only when it's a public hostname (not
- *      localhost / IP / port-bound) — covers self-hosted installs that
- *      haven't completed onboarding yet.
- *   4. `temps.sh` as a final fallback for unconfigured local dev.
- */
-export function resolveBaseDomain(opts?: {
-  previewDomain?: string | null
-  externalUrl?: string | null
-}): string {
-  const previewDomain = opts?.previewDomain?.trim()
-  if (previewDomain) {
-    // Strip leading `*.` from wildcard entries like `*.example.com`.
-    return previewDomain.replace(/^\*\./, '')
-  }
-
-  const externalUrl = opts?.externalUrl?.trim()
-  if (externalUrl) {
-    try {
-      const host = new URL(externalUrl).hostname
-      if (host && !isLocalHost(host)) return host
-    } catch {
-      // ignore malformed URLs
-    }
-  }
-
-  if (typeof window !== 'undefined' && window.location?.hostname) {
-    const hostname = window.location.hostname
-    const host = window.location.host
-    if (!isLocalHost(hostname) && !host.includes(':')) return host
-  }
-
-  return 'temps.sh'
-}
-
 function isLocalHost(host: string): boolean {
   return (
     host === 'localhost' ||
@@ -101,23 +72,82 @@ function isLocalHost(host: string): boolean {
 }
 
 /**
- * @deprecated Prefer `resolveBaseDomain({ previewDomain, externalUrl })`.
- * Kept for backwards compatibility with call sites that haven't yet been
- * updated to pass platform settings.
+ * Resolves the deployment-URL base used by the `app_url` generator.
+ *
+ * Priority:
+ *   1. The platform's `preview_domain` (e.g. `*.example.com` → host
+ *      `example.com`). This is the value the proxy uses to route
+ *      `{slug}.{preview_domain}` to deployments — generated URLs match
+ *      the proxy's actual rules. Always paired with `https` and no port,
+ *      since `preview_domain` is a DNS-only concept.
+ *   2. The full URL parts of `external_url` (scheme, host, port). Used
+ *      when `preview_domain` is empty so generated URLs at least reach
+ *      the same origin the user is configured to use.
+ *   3. The current browser location, when it's not localhost — covers
+ *      self-hosted installs that haven't completed onboarding yet.
+ *   4. `https://temps.sh` as a final fallback for unconfigured local dev.
  */
-export function inferBaseDomain(): string {
-  return resolveBaseDomain()
+export function resolveDeploymentUrlBase(opts?: {
+  previewDomain?: string | null
+  externalUrl?: string | null
+}): DeploymentUrlBase {
+  const previewDomain = opts?.previewDomain?.trim()
+  if (previewDomain) {
+    return {
+      scheme: 'https',
+      host: previewDomain.replace(/^\*\./, ''),
+    }
+  }
+
+  const externalUrl = opts?.externalUrl?.trim()
+  if (externalUrl) {
+    try {
+      const url = new URL(externalUrl)
+      const host = url.hostname
+      if (host) {
+        const scheme = url.protocol === 'http:' ? 'http' : 'https'
+        // `URL.port` is empty when the port is the default for the scheme.
+        const port = url.port || undefined
+        return { scheme, host, port }
+      }
+    } catch {
+      // ignore malformed URLs
+    }
+  }
+
+  if (typeof window !== 'undefined' && window.location?.hostname) {
+    const hostname = window.location.hostname
+    if (!isLocalHost(hostname)) {
+      const scheme = window.location.protocol === 'http:' ? 'http' : 'https'
+      const port = window.location.port || undefined
+      return { scheme, host: hostname, port }
+    }
+  }
+
+  return { scheme: 'https', host: 'temps.sh' }
+}
+
+/**
+ * Stringifies a `DeploymentUrlBase` for display (e.g. preview text).
+ */
+export function formatDeploymentUrlBase(base: DeploymentUrlBase): string {
+  const portPart = base.port ? `:${base.port}` : ''
+  return `${base.scheme}://${base.host}${portPart}`
 }
 
 /**
  * Computes the deployment URL for a given repository slug. Returns `null` if
  * the repo name is empty (the URL would be invalid until the user types one).
+ *
+ * Format: `{scheme}://{slug}.{host}[:port]` — port preserved verbatim from
+ * `external_url` so non-default ports (8080, 9000, …) survive the round-trip.
  */
 export function generateAppUrl(ctx: GeneratorContext): string | null {
   const slug = ctx.repositoryName?.trim()
   if (!slug) return null
-  const domain = ctx.baseDomain || inferBaseDomain()
-  return `https://${slug}.${domain}`
+  const base = ctx.base || resolveDeploymentUrlBase()
+  const portPart = base.port ? `:${base.port}` : ''
+  return `${base.scheme}://${slug}.${base.host}${portPart}`
 }
 
 /**
@@ -143,7 +173,8 @@ export function runGenerator(
 
 /**
  * Whether the named generator produces a value that depends on the repository
- * name. Used to decide whether to re-run the generator when the repo changes.
+ * name. Used to decide whether to re-run the generator when the repo or the
+ * resolved deployment-URL base changes.
  */
 export function generatorDependsOnRepoName(generator: string | null | undefined): boolean {
   return generator === 'app_url'
