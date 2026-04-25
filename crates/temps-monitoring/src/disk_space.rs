@@ -140,7 +140,7 @@ impl DiskSpaceMonitor {
         // If we have a specific path and multiple matches, return only the most specific one
         if path.is_some() && disk_infos.len() > 1 {
             // Sort by mount point length (longest = most specific) and take the first
-            disk_infos.sort_by(|a, b| b.mount_point.len().cmp(&a.mount_point.len()));
+            disk_infos.sort_by_key(|d| std::cmp::Reverse(d.mount_point.len()));
             disk_infos.truncate(1);
         }
 
