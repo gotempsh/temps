@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump `aiohttp` ≥3.11 → ≥3.13.5 in Python SDK (10 CVEs: duplicate Host headers, null bytes, response splitting, cookie leaks, memory DoS, multipart bypass, CRLF injection, DNS cache DoS, trailer headers, SSRF)
 - Bump `next` across examples/fixtures to 15.3.3/16.2.2 (5 CVEs: disk cache growth, request smuggling, postponed buffering DoS, null origin CSRF bypass)
 - Bump `testcontainers` 0.27.1 → 0.27.2 / `astral-tokio-tar` 0.5.6 → 0.6.0 (insufficient PAX extension validation, dev-only)
+- Bump `openssl` 0.10.74 → 0.10.78 (5 advisories: PSK callback memory leak, AES key wrap bounds, MdCtxRef overflow, Deriver short-buffer overflow, PEM password OOB read)
+- Bump `rustls-webpki` 0.103.x → 0.103.13 (DoS via panic on malformed CRL BIT STRING)
+- Bump `actix-http` 3.11.2 → 3.12.1 (HTTP/1.1 CL.TE request smuggling, dev-only via nixpacks)
+- Bump `svelte` to ^5.53.5 in `@temps-sdk/svelte-analytics` dev/peer deps; lock now resolves to 5.55.5 (4 SSR XSS / dynamic-element advisories)
+- Pin `protobufjs` ≥7.5.5 via `overrides`/`resolutions` in the `vercel-ai-tracing` example (critical RCE)
+- Bump `next` 16.2.2 → 16.2.3 in `examples/nextjs/basic` (DoS with Server Components)
 
 ### Changed
 - **Audit Logs page redesign**: switched from card-per-row layout to a responsive table matching the rest of the app (filter bar in a card, type badge + icon per category, responsive `hidden md:/lg:table-cell` columns, skeleton loaders, proper empty state, and paginated footer)
