@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useEffect, useState, useCallback } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import {
   listConnectionsOptions,
@@ -43,6 +43,12 @@ import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 
 type ProjectSource = 'templates' | 'browse' | 'git-url' | 'manual'
+
+const SOURCE_VALUES: ProjectSource[] = ['templates', 'browse', 'git-url', 'manual']
+
+function isProjectSource(value: string | null): value is ProjectSource {
+  return value !== null && (SOURCE_VALUES as string[]).includes(value)
+}
 
 /** Parsed git URL info for public repositories */
 interface ParsedGitUrl {
@@ -111,9 +117,43 @@ export function GitImportClone({
   mode = 'navigation',
   onProjectCreated,
 }: GitImportCloneProps) {
-  const [selectedSource, setSelectedSource] = useState<ProjectSource | null>(
-    null
+  // In navigation mode, the chosen source is mirrored to a `?source=` query
+  // param so browser back/forward and link sharing work. Inline mode (used
+  // inside the onboarding flow) keeps the source in plain React state since
+  // it doesn't own the URL.
+  const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [localSource, setLocalSource] = useState<ProjectSource | null>(null)
+
+  const selectedSource: ProjectSource | null =
+    mode === 'navigation'
+      ? isProjectSource(searchParams.get('source'))
+        ? (searchParams.get('source') as ProjectSource)
+        : null
+      : localSource
+
+  const setSelectedSource = useCallback(
+    (next: ProjectSource | null) => {
+      if (mode === 'navigation') {
+        setSearchParams(
+          (prev) => {
+            const params = new URLSearchParams(prev)
+            if (next) {
+              params.set('source', next)
+            } else {
+              params.delete('source')
+            }
+            return params
+          },
+          { replace: false }
+        )
+      } else {
+        setLocalSource(next)
+      }
+    },
+    [mode, setSearchParams]
   )
+
   const [selectedConnection, setSelectedConnection] = useState<
     string | undefined
   >()
@@ -127,8 +167,23 @@ export function GitImportClone({
     null
   )
   const [isValidatingUrl, setIsValidatingUrl] = useState(false)
-  const navigate = useNavigate()
   const [isInitialLoad, setIsInitialLoad] = useState(true)
+
+  // When the URL `source` param changes (e.g. user hits browser back), clear
+  // any local state that belongs to a different source so we land on the
+  // correct sub-screen instead of leaving stale configurators visible.
+  useEffect(() => {
+    if (mode !== 'navigation') return
+    if (selectedSource !== 'templates' && selectedTemplate) {
+      setSelectedTemplate(null)
+    }
+    if (selectedSource !== 'browse' && selectedSource !== 'git-url') {
+      if (selectedRepository) setSelectedRepository(null)
+      if (useGitUrl) setUseGitUrl(false)
+      if (parsedPublicRepo) setParsedPublicRepo(null)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSource, mode])
 
   const { data: connections } = useQuery({
     ...listConnectionsOptions(),
