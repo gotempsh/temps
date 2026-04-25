@@ -27,13 +27,13 @@
 		"access": "public"
 	},
 	"peerDependencies": {
-		"svelte": "^4.0.0 || ^5.0.0"
+		"svelte": "^4.2.20 || >=5.53.5"
 	},
 	"dependencies": {
 		"@temps-sdk/analytics-core": "workspace:*"
 	},
 	"devDependencies": {
-		"svelte": "^4.2.0",
+		"svelte": "^5.53.5",
 		"typescript": "^5.5.4"
 	},
 	"sideEffects": false

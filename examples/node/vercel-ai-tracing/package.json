@@ -19,5 +19,11 @@
     "ai": "^5.0.52",
     "tsx": "^4.19.0",
     "zod": "^3.25.76"
+  },
+  "overrides": {
+    "protobufjs": "^7.5.5"
+  },
+  "resolutions": {
+    "protobufjs": "^7.5.5"
   }
 }
