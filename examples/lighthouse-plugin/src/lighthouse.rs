@@ -262,13 +262,10 @@ fn extract_diagnostics(json: &serde_json::Value) -> Vec<AuditDiagnostic> {
             // Skip passed audits (score == 1.0) and non-applicable (score is null)
             match score {
                 Some(s) if s >= 1.0 => continue,
-                None => {
-                    // Only include if it has an explicit null score AND a display value
-                    if audit.get("scoreDisplayMode").and_then(|m| m.as_str())
-                        == Some("notApplicable")
-                    {
-                        continue;
-                    }
+                None if audit.get("scoreDisplayMode").and_then(|m| m.as_str())
+                    == Some("notApplicable") =>
+                {
+                    continue;
                 }
                 _ => {}
             }

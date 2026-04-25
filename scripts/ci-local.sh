@@ -84,6 +84,17 @@ for target in "${TARGETS[@]}"; do
                 || FAILURES+=("check")
             ;;
         clippy)
+            # Bust ONLY clippy's per-crate fingerprints so we re-lint every
+            # workspace crate — same as a cold CI runner. Compiled rlibs are
+            # preserved so the run is fast (~30s vs minutes for a full clean).
+            #
+            # Without this, clippy reuses cached lint results and silently
+            # skips files whose output was already computed, which is how
+            # PR-only clippy errors slip past local runs.
+            echo -e "${YELLOW}Invalidating clippy fingerprints for fresh lint pass…${NC}"
+            find target -path '*/.fingerprint/*' -name 'clippy-*' -prune \
+                -exec rm -rf {} + 2>/dev/null || true
+
             if [ "$FIX_MODE" -eq 1 ]; then
                 run_step "cargo clippy --fix" \
                     "$CARGO_BIN" clippy --workspace --all-targets --all-features \
