@@ -8,6 +8,7 @@ import {
   createProjectMutation,
   getPublicBranchesOptions,
   detectPublicPresetsOptions,
+  listProjectTemplatesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import {
@@ -143,6 +144,10 @@ export function GitImportClone({
             } else {
               params.delete('source')
             }
+            // Drop sub-keys belonging to the previous source so we never end
+            // up with `?source=git-url&template=foo` style stale state.
+            params.delete('template')
+            params.delete('repo')
             return params
           },
           { replace: false }
@@ -184,6 +189,64 @@ export function GitImportClone({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedSource, mode])
+
+  // Templates fetched at this level so we can resolve `?template=<slug>` from
+  // the URL into a `TemplateResponse` (used to hydrate the configurator on
+  // page load / browser back-forward / shared link).
+  const { data: templatesData } = useQuery({
+    ...listProjectTemplatesOptions(),
+    enabled: mode === 'navigation' && selectedSource === 'templates',
+  })
+
+  const templateSlugFromUrl = mode === 'navigation' ? searchParams.get('template') : null
+  const repoUrlFromUrl = mode === 'navigation' ? searchParams.get('repo') : null
+
+  // Hydrate `selectedTemplate` from the URL slug once templates load. Also
+  // clears selection when the URL slug is removed (browser back).
+  useEffect(() => {
+    if (mode !== 'navigation') return
+    if (!templateSlugFromUrl) {
+      if (selectedTemplate) setSelectedTemplate(null)
+      return
+    }
+    if (selectedTemplate?.slug === templateSlugFromUrl) return
+    const match = templatesData?.templates?.find((t) => t.slug === templateSlugFromUrl)
+    if (match) setSelectedTemplate(match)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [templateSlugFromUrl, templatesData, mode])
+
+  // Helper to push a URL update with both `source` and an optional sub-key.
+  const updateSearchParams = useCallback(
+    (updates: Record<string, string | null>) => {
+      setSearchParams(
+        (prev) => {
+          const params = new URLSearchParams(prev)
+          for (const [key, value] of Object.entries(updates)) {
+            if (value === null || value === '') {
+              params.delete(key)
+            } else {
+              params.set(key, value)
+            }
+          }
+          return params
+        },
+        { replace: false }
+      )
+    },
+    [setSearchParams]
+  )
+
+  // Wrapper that mirrors template selection to the URL in navigation mode.
+  const selectTemplate = useCallback(
+    (template: TemplateResponse | null) => {
+      if (mode === 'navigation') {
+        updateSearchParams({ template: template?.slug ?? null })
+      } else {
+        setSelectedTemplate(template)
+      }
+    },
+    [mode, updateSearchParams]
+  )
 
   const { data: connections } = useQuery({
     ...listConnectionsOptions(),
@@ -315,19 +378,16 @@ export function GitImportClone({
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => {
-              setSelectedTemplate(null)
-              setSelectedSource(null)
-            }}
+            onClick={() => selectTemplate(null)}
           >
             <ChevronLeft className="h-4 w-4 mr-2" />
-            Back to Create Project
+            Back to Templates
           </Button>
         </div>
 
         <TemplateConfigurator
           template={selectedTemplate}
-          onCancel={() => setSelectedTemplate(null)}
+          onCancel={() => selectTemplate(null)}
           onSuccess={onProjectCreated}
         />
       </div>
@@ -341,20 +401,24 @@ export function GitImportClone({
     selectedRepository &&
     ((mode === 'inline' && selectedConnection) || useGitUrl)
   ) {
+    const goBackFromRepo = () => {
+      setSelectedRepository(null)
+      setUseGitUrl(false)
+      setParsedPublicRepo(null)
+      if (mode === 'navigation') {
+        // Drop `?repo=` but keep `?source=git-url` so the user lands on the
+        // URL form, not the picker.
+        updateSearchParams({ repo: null })
+      } else {
+        setSelectedSource(null)
+      }
+    }
     return (
       <div className="space-y-6">
         <div className="flex items-center gap-4">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => {
-              setSelectedRepository(null)
-              setUseGitUrl(false)
-              setSelectedSource(null)
-            }}
-          >
+          <Button variant="ghost" size="sm" onClick={goBackFromRepo}>
             <ChevronLeft className="h-4 w-4 mr-2" />
-            Back to Create Project
+            {useGitUrl ? 'Back to Git URL' : 'Back to Create Project'}
           </Button>
         </div>
 
@@ -425,82 +489,116 @@ export function GitImportClone({
               console.error('Project creation error:', error)
             }
           }}
-          onCancel={() => setSelectedRepository(null)}
+          onCancel={goBackFromRepo}
         />
       </div>
     )
   }
 
-  const handleGitUrlSubmit = async () => {
-    if (!gitUrl.trim()) {
-      toast.error('Please enter a git URL')
-      return
-    }
-
-    // Parse the git URL
-    const parsed = parseGitUrl(gitUrl)
-    if (!parsed) {
-      toast.error(
-        'Invalid git URL. Please use a GitHub or GitLab repository URL.'
-      )
-      return
-    }
-
-    setParsedPublicRepo(parsed)
-    setIsValidatingUrl(true)
-
-    try {
-      // Fetch real repository info from public API
-      const response = await fetch(
-        `/api/git/public/${parsed.provider}/${parsed.owner}/${parsed.repo}`
-      )
-
-      if (!response.ok) {
-        if (response.status === 404) {
-          toast.error('Repository not found or is not public')
-        } else if (response.status === 429) {
-          toast.error('Rate limit exceeded. Please try again later.')
-        } else {
-          toast.error('Failed to fetch repository information')
-        }
-        setParsedPublicRepo(null)
-        setIsValidatingUrl(false)
+  /**
+   * Validates a public git URL and, on success, populates `selectedRepository`
+   * (showing the configurator). Called both from the form's submit button and
+   * from a hydration effect when the page is loaded with `?repo=<url>` in the
+   * search params.
+   *
+   * @param urlOverride – use this URL instead of the form `gitUrl` state
+   *   (lets us hydrate from the URL query param without a `setState` race).
+   * @param options.silent – suppress success toast for hydration paths
+   * @param options.pushToUrl – mirror the validated URL into search params
+   */
+  const validateAndSelectGitUrl = useCallback(
+    async (
+      urlOverride?: string,
+      options: { silent?: boolean; pushToUrl?: boolean } = {}
+    ) => {
+      const url = (urlOverride ?? gitUrl).trim()
+      if (!url) {
+        toast.error('Please enter a git URL')
         return
       }
 
-      const repoInfo = await response.json()
+      const parsed = parseGitUrl(url)
+      if (!parsed) {
+        toast.error(
+          'Invalid git URL. Please use a GitHub or GitLab repository URL.'
+        )
+        return
+      }
 
-      // Create repository object from real data
-      const repoFromApi: RepositoryResponse = {
-        id: 0, // Use 0 for public repos (no database ID)
-        name: repoInfo.name,
-        full_name: repoInfo.full_name,
-        owner: repoInfo.owner,
-        private: false,
-        default_branch: repoInfo.default_branch,
-        description: repoInfo.description,
-        language: repoInfo.language,
-        clone_url: gitUrl,
-        ssh_url: null,
-        created_at: new Date().toISOString(),
-        pushed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        preset: null,
-        // Extra fields for display
-        stars: repoInfo.stars,
-        forks: repoInfo.forks,
-      } as RepositoryResponse & { stars?: number; forks?: number }
+      setParsedPublicRepo(parsed)
+      setIsValidatingUrl(true)
 
-      setSelectedRepository(repoFromApi)
-      setUseGitUrl(true)
-      toast.success(`Found repository: ${repoInfo.full_name}`)
-    } catch (error) {
-      toast.error('Failed to validate repository URL')
-      setParsedPublicRepo(null)
-    } finally {
-      setIsValidatingUrl(false)
-    }
+      try {
+        const response = await fetch(
+          `/api/git/public/${parsed.provider}/${parsed.owner}/${parsed.repo}`
+        )
+
+        if (!response.ok) {
+          if (response.status === 404) {
+            toast.error('Repository not found or is not public')
+          } else if (response.status === 429) {
+            toast.error('Rate limit exceeded. Please try again later.')
+          } else {
+            toast.error('Failed to fetch repository information')
+          }
+          setParsedPublicRepo(null)
+          return
+        }
+
+        const repoInfo = await response.json()
+
+        const repoFromApi: RepositoryResponse = {
+          id: 0,
+          name: repoInfo.name,
+          full_name: repoInfo.full_name,
+          owner: repoInfo.owner,
+          private: false,
+          default_branch: repoInfo.default_branch,
+          description: repoInfo.description,
+          language: repoInfo.language,
+          clone_url: url,
+          ssh_url: null,
+          created_at: new Date().toISOString(),
+          pushed_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          preset: null,
+          stars: repoInfo.stars,
+          forks: repoInfo.forks,
+        } as RepositoryResponse & { stars?: number; forks?: number }
+
+        if (urlOverride) setGitUrl(url)
+        setSelectedRepository(repoFromApi)
+        setUseGitUrl(true)
+        if (!options.silent) {
+          toast.success(`Found repository: ${repoInfo.full_name}`)
+        }
+        if (options.pushToUrl && mode === 'navigation') {
+          updateSearchParams({ repo: url })
+        }
+      } catch (error) {
+        toast.error('Failed to validate repository URL')
+        setParsedPublicRepo(null)
+      } finally {
+        setIsValidatingUrl(false)
+      }
+    },
+    [gitUrl, mode, updateSearchParams]
+  )
+
+  const handleGitUrlSubmit = () => {
+    void validateAndSelectGitUrl(undefined, { pushToUrl: true })
   }
+
+  // Hydrate `selectedRepository` from `?repo=<url>` on mount or browser back.
+  // Skips work when the URL repo already matches the loaded selection.
+  useEffect(() => {
+    if (mode !== 'navigation') return
+    if (selectedSource !== 'git-url') return
+    if (!repoUrlFromUrl) return
+    if (selectedRepository && useGitUrl && gitUrl === repoUrlFromUrl) return
+    void validateAndSelectGitUrl(repoUrlFromUrl, { silent: true })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repoUrlFromUrl, selectedSource, mode])
 
   // Source selection step
   if (!selectedSource) {
@@ -636,7 +734,7 @@ export function GitImportClone({
       <CardContent className="space-y-3">
         {selectedSource === 'templates' && (
           <TemplateList
-            onTemplateSelect={setSelectedTemplate}
+            onTemplateSelect={selectTemplate}
             selectedTemplate={selectedTemplate}
             showFeaturedFirst={true}
           />
