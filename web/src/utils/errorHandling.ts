@@ -48,21 +48,38 @@ export function getExpiredTokenMessage(
 }
 
 /**
- * Extract ProblemDetails from an error
+ * Extract ProblemDetails from an error.
+ *
+ * The hey-api openapi-ts client (with `throwOnError: true`) throws the parsed
+ * response body directly, so `error` is typically the `ProblemDetails` object
+ * itself. Older fetch-style errors may nest it under `body`. RFC 7807 uses
+ * `type` (not `type_url`), so we identify a ProblemDetails by the presence
+ * of a `title` string plus at least one of the canonical fields.
  */
 export function extractProblemDetails(error: unknown): ProblemDetails | null {
   if (!error || typeof error !== 'object') return null
 
-  const err = error as any
-
-  // Check if error has a body property (from fetch API)
-  if (err.body && typeof err.body === 'object') {
-    return err.body as ProblemDetails
+  const looksLikeProblem = (val: unknown): val is ProblemDetails => {
+    if (!val || typeof val !== 'object') return false
+    const v = val as Record<string, unknown>
+    return (
+      typeof v.title === 'string' &&
+      ('detail' in v || 'type' in v || 'status' in v || 'extensions' in v)
+    )
   }
 
-  // Check if error itself is ProblemDetails
-  if ('title' in err && 'type_url' in err) {
-    return err as ProblemDetails
+  const err = error as Record<string, unknown>
+
+  // Some clients nest the parsed body under `body`, `error`, or `data`.
+  for (const key of ['body', 'error', 'data'] as const) {
+    if (looksLikeProblem(err[key])) {
+      return err[key] as ProblemDetails
+    }
+  }
+
+  // Default case: the thrown value IS the ProblemDetails.
+  if (looksLikeProblem(err)) {
+    return err
   }
 
   return null

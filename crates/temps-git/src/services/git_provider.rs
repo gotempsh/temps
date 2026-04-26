@@ -23,6 +23,9 @@ pub enum GitProviderError {
     #[error("API error: {0}")]
     ApiError(String),
 
+    #[error("A repository named '{name}' already exists on this account")]
+    RepositoryAlreadyExists { name: String },
+
     #[error("Not implemented for this provider")]
     NotImplemented,
 

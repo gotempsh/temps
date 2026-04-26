@@ -1245,12 +1245,9 @@ pub async fn create_project_from_template(
         .await
         .map_err(|e| {
             error!("Failed to create repository from template: {:?}", e);
-            problemdetails::new(http::StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Repository Creation Failed")
-                .with_detail(format!(
-                    "Failed to create repository and push template code: {}",
-                    e
-                ))
+            // Forward the typed Problem (e.g. 409 for "name already exists",
+            // 401 for auth failures) instead of flattening everything to 500.
+            Problem::from(e)
         })?;
 
     info!(

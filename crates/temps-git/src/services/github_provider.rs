@@ -1457,6 +1457,35 @@ impl GitProviderService for GitHubProvider {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
             error!("Failed to create repository: {} - {}", status, error_text);
+
+            // Detect GitHub's "name already exists" 422 and surface as a typed
+            // variant so handlers can return 409 Conflict with a clean message.
+            if status.as_u16() == 422 {
+                #[derive(Deserialize)]
+                struct GhFieldError {
+                    field: Option<String>,
+                    message: Option<String>,
+                }
+                #[derive(Deserialize)]
+                struct GhErrorBody {
+                    errors: Option<Vec<GhFieldError>>,
+                }
+                if let Ok(body) = serde_json::from_str::<GhErrorBody>(&error_text) {
+                    let name_taken = body.errors.iter().flatten().any(|e| {
+                        e.field.as_deref() == Some("name")
+                            && e.message
+                                .as_deref()
+                                .map(|m| m.contains("already exists"))
+                                .unwrap_or(false)
+                    });
+                    if name_taken {
+                        return Err(GitProviderError::RepositoryAlreadyExists {
+                            name: name.to_string(),
+                        });
+                    }
+                }
+            }
+
             return Err(GitProviderError::ApiError(format!(
                 "Failed to create repository: {} - {}",
                 status, error_text

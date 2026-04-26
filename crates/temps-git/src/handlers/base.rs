@@ -52,9 +52,7 @@ impl From<GitProviderManagerError> for Problem {
                     .with_title("Database Error")
                     .with_detail(e.to_string())
             }
-            GitProviderManagerError::ProviderError(e) => problem_new(StatusCode::BAD_REQUEST)
-                .with_title("Provider Error")
-                .with_detail(e.to_string()),
+            GitProviderManagerError::ProviderError(e) => Problem::from(e),
             GitProviderManagerError::ProviderNotFound(msg) => problem_new(StatusCode::NOT_FOUND)
                 .with_title("Provider Not Found")
                 .with_detail(msg),
@@ -130,6 +128,15 @@ impl From<GitProviderError> for Problem {
                 .with_type("https://docs.temps.sh/errors/api_error")
                 .with_title("API Error")
                 .with_detail(msg),
+            GitProviderError::RepositoryAlreadyExists { ref name } => {
+                problem_new(StatusCode::CONFLICT)
+                    .with_type("https://docs.temps.sh/errors/repository_already_exists")
+                    .with_title("Repository Already Exists")
+                    .with_detail(format!(
+                        "A repository named '{}' already exists in the target account. Choose a different name.",
+                        name
+                    ))
+            }
             GitProviderError::NotImplemented => problem_new(StatusCode::NOT_IMPLEMENTED)
                 .with_type("https://docs.temps.sh/errors/not_implemented")
                 .with_title("Not Implemented")
