@@ -505,6 +505,22 @@ async fn register_node(
 
     info!(node_id = node.id, name = %node.name, "Node registered successfully");
 
+    // ── Multi-host networking: best-effort overlay setup ──
+    //
+    // Persist the node's reachable underlay address (private_address is what
+    // other nodes will tunnel to via VXLAN), then ask the allocator to
+    // assign a compute_cidr from the cluster pool. Both are best-effort —
+    // failures here MUST NOT break the join flow. The agent's network_sync
+    // loop polls /network/peers indefinitely and will pick up the
+    // allocation as soon as it lands, so a transient failure self-heals.
+    persist_underlay_address(
+        app_state.db.as_ref(),
+        node.id,
+        node.private_address.as_str(),
+    )
+    .await;
+    allocate_overlay_cidr(app_state.db.clone(), node.id).await;
+
     Ok((
         StatusCode::CREATED,
         Json(RegisterNodeResponse {
@@ -514,6 +530,62 @@ async fn register_node(
             message: "Node registered successfully. Send heartbeats to stay active.".to_string(),
         }),
     ))
+}
+
+/// Set `nodes.underlay_address` to the value other nodes will use to reach
+/// this one over the overlay. Best-effort: failures are logged and
+/// swallowed because the operator can fix manually and the agent will
+/// pick up the change on its next poll.
+async fn persist_underlay_address(db: &sea_orm::DatabaseConnection, node_id: i32, underlay: &str) {
+    use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter};
+    use temps_entities::nodes;
+
+    let result = nodes::Entity::update_many()
+        .col_expr(
+            nodes::Column::UnderlayAddress,
+            Expr::value(Some(underlay.to_string())),
+        )
+        .filter(nodes::Column::Id.eq(node_id))
+        .exec(db)
+        .await;
+    match result {
+        Ok(_) => info!(node_id, underlay, "underlay_address set"),
+        Err(e) => warn!(
+            node_id,
+            "failed to set underlay_address (overlay may be delayed): {}", e
+        ),
+    }
+}
+
+/// Ask the allocator for a compute_cidr. Treat AlreadyAllocated as success
+/// (re-registration after a restart). Treat any other error as a
+/// non-fatal warning — the join flow stays successful so the operator
+/// isn't blocked from running deployments while overlay networking
+/// converges in the background.
+async fn allocate_overlay_cidr(db: std::sync::Arc<sea_orm::DatabaseConnection>, node_id: i32) {
+    use temps_network::allocator::{AllocatorError, ComputeNetworkAllocator, PostgresAllocator};
+
+    let allocator = PostgresAllocator::new(db);
+    match allocator.allocate_for_node(node_id).await {
+        Ok(alloc) => info!(
+            node_id,
+            cidr = %alloc.compute_cidr,
+            "compute_cidr auto-allocated on join"
+        ),
+        Err(AllocatorError::AlreadyAllocated { existing, .. }) => {
+            info!(node_id, %existing, "compute_cidr already present (re-registration)");
+        }
+        Err(AllocatorError::UnderlayMissing { .. }) => {
+            warn!(
+                node_id,
+                "underlay_address missing during allocation; agent sync will retry"
+            );
+        }
+        Err(e) => warn!(
+            node_id,
+            "failed to allocate compute_cidr (overlay deferred to next agent poll): {}", e
+        ),
+    }
 }
 
 /// Receive a heartbeat from a worker node
