@@ -43,6 +43,22 @@ volumes:
     name: temps-dev-postgres-data
   cargo-cache:
     name: temps-dev-cargo-cache
+  # Shared workspace `target/` directory. CRITICAL: this MUST be a named
+  # Docker volume (not part of the /workspace bind mount), because:
+  #   1. The bind mount serves macOS source files into the container
+  #      via gRPC FUSE / VirtioFS, which has loose mtime semantics that
+  #      defeat cargo's fingerprint cache.
+  #   2. The host already has a `target/` from native macOS builds
+  #      (Mach-O binaries). Mixing those with Linux ELF artifacts in
+  #      the same directory tree confuses cargo and causes spurious
+  #      full rebuilds.
+  # By mounting this named volume *over* /workspace/target inside the
+  # container, the source tree is still hot-reloadable from the host
+  # while target/ is a clean Linux-native directory shared across all
+  # 4 dind containers via Docker's storage backend. Result: cargo's
+  # fingerprint cache works correctly and rebuilds noop in < 1s.
+  workspace-target:
+    name: temps-dev-workspace-target
   # Shared per-container Docker image storage. Each worker gets its own
   # so we don't trip Docker's "can't share /var/lib/docker" rule, but
   # they're named so they survive `down` for fast restarts.
@@ -99,6 +115,7 @@ services:
       ROLE: control-plane
     volumes:
       - ../../:/workspace:rw
+      - workspace-target:/workspace/target
       - cargo-cache:/usr/local/cargo/registry
       - control-docker:/var/lib/docker
     depends_on:
@@ -144,6 +161,7 @@ services:
       TEMPS_AGENT_ADDRESS: 0.0.0.0:3100
     volumes:
       - ../../:/workspace:rw
+      - workspace-target:/workspace/target
       - cargo-cache:/usr/local/cargo/registry
       - worker1-docker:/var/lib/docker
     depends_on:
@@ -169,6 +187,7 @@ services:
       TEMPS_AGENT_ADDRESS: 0.0.0.0:3100
     volumes:
       - ../../:/workspace:rw
+      - workspace-target:/workspace/target
       - cargo-cache:/usr/local/cargo/registry
       - worker2-docker:/var/lib/docker
 
@@ -190,5 +209,6 @@ services:
       TEMPS_AGENT_ADDRESS: 0.0.0.0:3100
     volumes:
       - ../../:/workspace:rw
+      - workspace-target:/workspace/target
       - cargo-cache:/usr/local/cargo/registry
       - worker3-docker:/var/lib/docker
