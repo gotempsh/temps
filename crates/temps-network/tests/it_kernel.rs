@@ -57,7 +57,7 @@ impl Env {
     fn config(&self) -> NetworkConfig {
         NetworkConfig {
             bridge_name: "br-temps0".into(),
-            docker_network_name: "temps0".into(),
+            docker_network_name: "temps-overlay".into(),
             transport: Transport::Vxlan {
                 vni: 42,
                 port: 4789,
@@ -187,7 +187,7 @@ async fn docker_network_exists(name: &str) -> bool {
 async fn cleanup_all() {
     // Best-effort tear-down of anything a previous test may have left.
     let _ = Command::new("docker")
-        .args(["network", "rm", "temps0"])
+        .args(["network", "rm", "temps-overlay"])
         .output()
         .await;
     let _ = Command::new("nft")
@@ -398,7 +398,7 @@ async fn bootstrap_creates_docker_network() {
         .await
         .expect("ensure docker network");
     assert!(!id.is_empty());
-    assert!(docker_network_exists("temps0").await);
+    assert!(docker_network_exists("temps-overlay").await);
 
     // Idempotent: a second call with the same args returns the same id.
     let id2 = temps_network::docker::ensure_network(&docker, &cfg, &alloc)

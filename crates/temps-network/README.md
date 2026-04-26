@@ -9,22 +9,69 @@ Foundational — Phase 1+3 of the multi-host networking plan. Compiles on
 Linux and macOS; kernel data-plane is Linux-only. Not wired into
 `temps-agent` yet (next branch).
 
+## Two-network model (zero-downtime upgrade)
+
+This crate creates a **second** Docker network, `temps-overlay`, alongside
+the existing `temps-app-network` that all current Temps containers run on.
+Existing containers are never moved or restarted — they keep using
+`temps-app-network` exactly as they always did.
+
+When multi-host networking is enabled on a node:
+
+- Containers attach to **both** networks. Each container ends up with two
+  veth interfaces and two IPs:
+  - **eth0** on `temps-app-network` (existing behavior, default route,
+    same-node service discovery via Docker's embedded DNS)
+  - **eth1** on `temps-overlay` (new, used for cross-node traffic over
+    the VXLAN tunnel managed by this crate)
+- Same-node container-to-container traffic continues to flow through
+  `temps-app-network` unchanged.
+- Cross-node traffic uses `temps-overlay`. The kernel's routing table
+  decides per-packet, based on destination CIDR.
+
+This is the same pattern Docker Swarm uses for service containers
+(ingress overlay + bridge). It's additive: nothing about
+`temps-app-network`, `DEPLOYMENT_MODE`, or existing container lifecycle
+changes. Single-host clusters never see `temps-overlay` at all.
+
 ## What it does
 
+Each container ends up with two interfaces:
+
 ```
-┌─────────── Node A (10.0.0.1) ──────────┐    ┌─────────── Node B (10.0.0.2) ──────────┐
-│  container 172.20.1.10                 │    │  container 172.20.2.10                 │
-│      │ veth                            │    │      │ veth                            │
-│  br-temps0 (172.20.1.1/24)             │    │  br-temps0 (172.20.2.1/24)             │
-│      │ enslaved                        │    │      │ enslaved                        │
-│  vxlan-temps0 (vni 42, port 4789)      │    │  vxlan-temps0 (vni 42, port 4789)      │
-│      │ underlay                        │    │      │ underlay                        │
-│  eth0 ─────────────────────────────────┼────┼─► eth0                                 │
-│                                        │    │                                        │
-│  Routes: 172.20.2.0/24 dev vxlan-...   │    │  Routes: 172.20.1.0/24 dev vxlan-...   │
-│  FDB: dst 10.0.0.2                     │    │  FDB: dst 10.0.0.1                     │
-└────────────────────────────────────────┘    └────────────────────────────────────────┘
+┌─────────────────── Node A (underlay 10.0.0.1) ───────────────────┐
+│                                                                  │
+│   container "api"                                                │
+│     ├─ eth0 → temps-app-network (172.18.0.5)  ← unchanged        │
+│     └─ eth1 → temps-overlay     (172.20.1.10) ← managed by us    │
+│                       │                                          │
+│                  (this crate owns everything below)              │
+│                       │                                          │
+│   br-temps0 (172.20.1.1/24)  ◄── docker network "temps-overlay"  │
+│       │                          pinned via bridge.name driver opt
+│   vxlan-temps0 (vni 42, port 4789, nolearning)                   │
+│       │ FDB: 00:00:00:00:00:00 → 10.0.0.2                        │
+│       │ MTU: 1450  (underlay 1500 - VXLAN 50)                    │
+│   eth0 (underlay) ───────────────────┐                           │
+└──────────────────────────────────────┼───────────────────────────┘
+                                       │ UDP/4789
+┌──────────────────────────────────────┼───────────────────────────┐
+│   eth0 (underlay 10.0.0.2) ◄─────────┘                           │
+│   vxlan-temps0 (same vni, same port) ─┐                          │
+│   br-temps0 (172.20.2.1/24)  ◄────────┴── docker net temps-overlay
+│     ├─ eth1 → temps-overlay     (172.20.2.10)                    │
+│     └─ eth0 → temps-app-network (172.18.0.7) ← unchanged         │
+│   container "worker"                                             │
+└──────────────────────────────────────────────────────────────────┘
 ```
+
+Routes installed by `bootstrap`:
+- on A: `172.20.2.0/24 dev vxlan-temps0`  (peer's compute_cidr)
+- on B: `172.20.1.0/24 dev vxlan-temps0`
+
+The Docker network `temps-app-network` is left entirely alone. Existing
+containers see no behavior change. New containers that opt into the
+overlay get an additional `eth1`.
 
 ## Components
 
@@ -141,8 +188,8 @@ sudo PEER_UNDERLAY=10.0.0.1 PEER_CIDR=172.20.1.0/24 \
      scripts/network-poc/node-up.sh
 
 # Verify:
-docker run -d --rm --network temps0 --ip 172.20.1.10 nginx:alpine     # host A
-docker run --rm --network temps0 --ip 172.20.2.10 alpine \
+docker run -d --rm --network temps-overlay --ip 172.20.1.10 nginx:alpine     # host A
+docker run --rm --network temps-overlay --ip 172.20.2.10 alpine \
     sh -c "ping -c3 172.20.1.10"                                       # host B
 ```
 
@@ -155,7 +202,8 @@ will add:
 - Control-plane allocator (`ComputeNetworkAllocator`)
 - Server endpoint that broadcasts the peer list
 - `temps-agent` startup hook calling `NetworkManager::bootstrap`
-- `temps-deployer` attaching containers to the `temps0` network
+- `temps-deployer` **also** attaching new containers to `temps-overlay`
+  (additive — existing `temps-app-network` attachment stays as primary)
 - `temps network status / peers / diag` CLI subcommands
 
 ## Design notes

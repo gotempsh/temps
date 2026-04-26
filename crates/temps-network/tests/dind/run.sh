@@ -154,8 +154,8 @@ docker exec \
 
 log "both nodes bootstrapped — running container ping"
 
-docker exec "$NODE_A" docker run -d --rm --name nginx-a --network temps0 --ip 172.20.1.10 nginx:alpine >/dev/null
-docker exec "$NODE_B" docker run --rm --network temps0 --ip 172.20.2.10 alpine sh -c \
+docker exec "$NODE_A" docker run -d --rm --name nginx-a --network temps-overlay --ip 172.20.1.10 nginx:alpine >/dev/null
+docker exec "$NODE_B" docker run --rm --network temps-overlay --ip 172.20.2.10 alpine sh -c \
     'apk add --no-cache curl >/dev/null && curl -sf -m 5 http://172.20.1.10/ | head -c 100' \
     || fail "node-b -> node-a HTTP failed"
 
