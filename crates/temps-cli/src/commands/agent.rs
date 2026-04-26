@@ -48,14 +48,23 @@ impl AgentCommand {
                 .map_err(|e| anyhow::anyhow!("Failed to connect to Docker: {}", e))?;
 
             let network_name = temps_core::NETWORK_NAME.clone();
-            let docker_runtime = Arc::new(
-                temps_deployer::docker::DockerRuntime::new(
-                    Arc::new(docker.clone()),
-                    true,
-                    network_name,
-                )
-                .with_host_bind_address("0.0.0.0".to_string()),
-            );
+            // Overlay network is always opted into on agents — the runtime
+            // silently skips the dual-attach when the overlay isn't yet
+            // bootstrapped (single-host clusters, or before the network
+            // sync loop has run for the first time). Operators who really
+            // need to disable can override via TEMPS_OVERLAY_NETWORK="".
+            let overlay_network = std::env::var("TEMPS_OVERLAY_NETWORK")
+                .unwrap_or_else(|_| "temps-overlay".to_string());
+            let mut runtime_builder = temps_deployer::docker::DockerRuntime::new(
+                Arc::new(docker.clone()),
+                true,
+                network_name,
+            )
+            .with_host_bind_address("0.0.0.0".to_string());
+            if !overlay_network.is_empty() {
+                runtime_builder = runtime_builder.with_overlay_network(overlay_network);
+            }
+            let docker_runtime = Arc::new(runtime_builder);
 
             let deployer: Arc<dyn temps_deployer::ContainerDeployer> = docker_runtime.clone();
             let builder: Arc<dyn temps_deployer::ImageBuilder> = docker_runtime;

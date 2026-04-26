@@ -29,6 +29,12 @@ pub struct DockerRuntime {
     network_name: String,
     /// Address to bind host ports to (e.g. "127.0.0.1" for local, "0.0.0.0" for remote agents)
     host_bind_address: String,
+    /// Optional secondary network for multi-host overlay (e.g. "temps-overlay").
+    /// When set, every container is additionally connected to this network
+    /// after creation. Skipped silently when the network doesn't exist —
+    /// that's the legitimate "overlay not yet bootstrapped on this node"
+    /// state, not an error. Set via [`Self::with_overlay_network`].
+    overlay_network: Option<String>,
 }
 
 impl DockerRuntime {
@@ -96,6 +102,7 @@ impl DockerRuntime {
             use_buildkit,
             network_name,
             host_bind_address: "127.0.0.1".to_string(),
+            overlay_network: None,
         }
     }
 
@@ -104,6 +111,74 @@ impl DockerRuntime {
     pub fn with_host_bind_address(mut self, address: String) -> Self {
         self.host_bind_address = address;
         self
+    }
+
+    /// Configure a secondary multi-host overlay network. When set, every
+    /// new container is additionally connected to this network *after*
+    /// creation, so it ends up with two interfaces:
+    ///   eth0 → primary `network_name` (existing behavior, unchanged)
+    ///   eth1 → `overlay_network` (cross-node traffic via VXLAN)
+    ///
+    /// If the overlay network does not exist on this host (the agent's
+    /// `network_sync` loop has not bootstrapped it yet, or this node has
+    /// no `compute_cidr` allocated), the dual-attach is skipped silently
+    /// — the container still boots normally on the primary network.
+    pub fn with_overlay_network(mut self, name: impl Into<String>) -> Self {
+        self.overlay_network = Some(name.into());
+        self
+    }
+
+    /// Best-effort additional attachment to the overlay network. Logs and
+    /// returns `Ok(())` when the overlay isn't configured or doesn't
+    /// exist; only true bollard errors propagate.
+    async fn maybe_attach_overlay(&self, container_id: &str) -> Result<(), DeployerError> {
+        let Some(overlay) = self.overlay_network.as_deref() else {
+            return Ok(());
+        };
+
+        // Cheap existence probe: list_networks once. If the overlay
+        // doesn't exist yet, skip (sync loop hasn't bootstrapped it).
+        let networks = self
+            .docker
+            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
+            .await
+            .map_err(|e| DeployerError::NetworkError(format!("list_networks: {}", e)))?;
+        let exists = networks.iter().any(|n| n.name.as_deref() == Some(overlay));
+        if !exists {
+            tracing::debug!(
+                container = %container_id,
+                overlay,
+                "overlay network not present; skipping dual-attach"
+            );
+            return Ok(());
+        }
+
+        let req = bollard::models::NetworkConnectRequest {
+            container: container_id.to_string(),
+            ..Default::default()
+        };
+        match self.docker.connect_network(overlay, req).await {
+            Ok(()) => {
+                tracing::info!(container = %container_id, overlay, "attached to overlay");
+                Ok(())
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 403, ..
+            }) => {
+                // 403 from /networks/<id>/connect typically means "already
+                // connected" — that's a no-op for our purposes.
+                tracing::debug!(
+                    container = %container_id,
+                    overlay,
+                    "container already connected to overlay (403)"
+                );
+                Ok(())
+            }
+            Err(e) => Err(DeployerError::NetworkError(format!(
+                "connect_network({}): {}",
+                overlay, e
+            ))),
+        }
     }
 
     pub async fn ensure_network_exists(&self) -> Result<(), DeployerError> {
@@ -1107,6 +1182,13 @@ impl ContainerDeployer for DockerRuntime {
                 DeployerError::DeploymentFailed(format!("Failed to create container: {}", e))
             })?;
 
+        // Multi-host overlay: best-effort additional attach to `temps-overlay`
+        // (or whatever the operator configured). Containers always boot with
+        // their primary network interface (`temps-app-network`); the overlay
+        // attachment is purely additive and silently no-ops when the overlay
+        // network isn't present yet on this node.
+        self.maybe_attach_overlay(&container.id).await?;
+
         // Start container
         self.docker
             .start_container(&container.id, None::<StartContainerOptions>)
@@ -1899,6 +1981,74 @@ mod docker_tests {
                     "🔧 Docker not available (expected in some test environments): {}",
                     e
                 );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_overlay_network_default_unset() {
+        match create_test_docker_runtime().await {
+            Ok(runtime) => {
+                assert!(
+                    runtime.overlay_network.is_none(),
+                    "overlay_network must default to None for backwards compatibility"
+                );
+            }
+            Err(e) => {
+                println!("🔧 Docker not available: {}", e);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_with_overlay_network_sets_field() {
+        match create_test_docker_runtime().await {
+            Ok(runtime) => {
+                let runtime = runtime.with_overlay_network("temps-overlay".to_string());
+                assert_eq!(runtime.overlay_network.as_deref(), Some("temps-overlay"));
+            }
+            Err(e) => {
+                println!("🔧 Docker not available: {}", e);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_maybe_attach_overlay_noop_when_unset() {
+        // When `overlay_network` is None, the function returns Ok(()) without
+        // ever calling Docker. We can prove that by passing a runtime to a
+        // bogus container_id — Docker would 404 if we tried to attach, but
+        // we never call it.
+        match create_test_docker_runtime().await {
+            Ok(runtime) => {
+                let r = runtime.maybe_attach_overlay("non-existent-container").await;
+                assert!(r.is_ok(), "must be Ok(()) when overlay_network is None");
+            }
+            Err(e) => {
+                println!("🔧 Docker not available: {}", e);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_maybe_attach_overlay_skips_when_network_missing() {
+        // When the overlay network does not exist on the host, the function
+        // logs and returns Ok(()) — it does NOT propagate an error. This is
+        // the "agent started before sync_loop bootstrapped the overlay"
+        // case.
+        match create_test_docker_runtime().await {
+            Ok(runtime) => {
+                let runtime =
+                    runtime.with_overlay_network("temps-overlay-does-not-exist-xyz".to_string());
+                let r = runtime.maybe_attach_overlay("non-existent-container").await;
+                assert!(
+                    r.is_ok(),
+                    "must skip silently when overlay network missing, got {:?}",
+                    r
+                );
+            }
+            Err(e) => {
+                println!("🔧 Docker not available: {}", e);
             }
         }
     }
