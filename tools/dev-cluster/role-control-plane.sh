@@ -68,14 +68,21 @@ if [[ ! -f "$MARKER" ]]; then
   # internet and we don't need that here.
   ADMIN_PASSWORD="$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 16)"
 
-  # --wildcard-domain set explicitly so --auto skips its public-IP probe
-  # (which would slow boot or fail in air-gapped runs). Value doesn't
-  # matter — --auto implies --skip-ssl and --skip-dns-records.
+  # --wildcard-domain + --external-url set explicitly so --auto skips its
+  # public-IP probe (which would slow boot or fail in air-gapped runs)
+  # AND so the proxy doesn't fall back to localho.st defaults that
+  # cause http://localhost:8080 to redirect to localhost:80 over a
+  # self-signed *.localho.st cert.
+  #
+  # external_url is the canonical address operators hit from the host —
+  # http://localhost:8080 because compose forwards :8080 → 8080 in the
+  # container. Wildcard domain stays cosmetic (we don't use SSL).
   TEMPS_ADMIN_PASSWORD="$ADMIN_PASSWORD" "$BIN" setup \
     --auto \
     --admin-email "admin@local" \
     --server-ip "10.42.0.10" \
     --wildcard-domain "*.dev-cluster.local" \
+    --external-url "http://localhost:8080" \
     --database-url "$TEMPS_DATABASE_URL" \
     --data-dir "$TEMPS_DATA_DIR" \
     --skip-geolite2-download \
