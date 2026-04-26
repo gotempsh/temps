@@ -33,30 +33,74 @@ require_docker() {
 cmd_up() {
   require_docker
   mkdir -p "$STATE_DIR"
-  log "building images (first run only — cached after that)"
+  log "building dind image (first run only — cached after that)"
   "${COMPOSE[@]}" build
+
+  # Pre-warm the workspace target/ + cargo registry cache by running
+  # one cargo build inside a one-shot container that shares the named
+  # volumes. This trades 5–10 min of silent wait inside the
+  # control-plane healthcheck for 5–10 min of visible cargo output the
+  # user can actually monitor. Subsequent `up` runs noop in <2s.
+  if [[ "${SKIP_PREBUILD:-0}" != "1" ]]; then
+    log "pre-warming cargo cache (set SKIP_PREBUILD=1 to skip)"
+    log "  ↳ first run takes 5–10 min; rebuilds are seconds"
+    "${COMPOSE[@]}" run --rm --entrypoint='' control-plane \
+      bash -c 'cd /workspace && cargo build --bin temps' \
+      || fail "prebuild failed (see error above). \
+fix the build error, then re-run \`./dev-cluster up\` (or run with SKIP_PREBUILD=1 to defer the build until each container starts)."
+  fi
 
   log "starting cluster"
   "${COMPOSE[@]}" up -d
 
+  # First boot has to compile the temps workspace inside the container
+  # (5–10 min on a clean target/). Cap at 20 min so the user knows
+  # something is wrong if it really did hang. We also tail the
+  # control-plane logs in the background so they can see progress.
   log "waiting for control plane (TCP listen on 127.0.0.1:8080)"
-  for _ in $(seq 1 120); do
-    if (echo > /dev/tcp/127.0.0.1/8080) 2>/dev/null; then break; fi
-    sleep 1
+  log "first boot compiles the workspace inside the container — ~5-10 min on a clean cache."
+  log "follow progress: ./dev-cluster logs control-plane"
+  local elapsed=0
+  while ! (echo > /dev/tcp/127.0.0.1/8080) 2>/dev/null; do
+    if (( elapsed >= 1200 )); then
+      log "$(red 'control plane never came up after 20 min — dumping last 80 log lines:')"
+      "${COMPOSE[@]}" logs --tail=80 control-plane >&2 || true
+      fail "give up; check the logs above for the build error"
+    fi
+    if (( elapsed % 30 == 0 )) && (( elapsed > 0 )); then
+      log "still waiting (${elapsed}s elapsed, build typically takes 300-600s on first run)"
+    fi
+    sleep 5
+    elapsed=$((elapsed + 5))
   done
+  log "control plane is listening"
 
-  log "waiting for workers to register"
-  for _ in $(seq 1 120); do
-    n=$(worker_registered_count)
-    if [[ "$n" == "3" ]]; then break; fi
-    sleep 2
+  # Workers each (re)build the binary too, but they share the cargo
+  # cache + target/ volume with the control plane, so once the control
+  # plane finishes its build the workers' builds are near-instant.
+  log "waiting for all 3 workers to register"
+  elapsed=0
+  while [[ "$(worker_registered_count)" != "3" ]]; do
+    if (( elapsed >= 600 )); then
+      local n
+      n="$(worker_registered_count)"
+      log "$(red "only $n/3 workers registered after 10 min")"
+      "${COMPOSE[@]}" logs --tail=40 worker-1 worker-2 worker-3 >&2 || true
+      fail "give up; check the logs above"
+    fi
+    sleep 3
+    elapsed=$((elapsed + 3))
   done
 
   log "waiting for compute_cidr allocation on every worker"
-  for _ in $(seq 1 60); do
-    n=$(workers_with_cidr_count)
-    if [[ "$n" == "3" ]]; then break; fi
+  elapsed=0
+  while [[ "$(workers_with_cidr_count)" != "3" ]]; do
+    if (( elapsed >= 120 )); then
+      log "$(red 'allocator never assigned cidrs to all workers after 2 min')"
+      fail "check ./dev-cluster logs control-plane for allocator errors"
+    fi
     sleep 2
+    elapsed=$((elapsed + 2))
   done
 
   echo

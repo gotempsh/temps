@@ -111,13 +111,16 @@ services:
     # The serve loop blocks; healthcheck just probes it.
     healthcheck:
       # Temps' admin API requires auth on every endpoint; we just probe TCP
-      # to know the listener is up. The seed script does the proper
-      # "is the API actually responding" check after this passes.
+      # to know the listener is up. The first boot has to compile the
+      # workspace inside the container, which takes 5–10 min on a clean
+      # target dir. We give it 15 min via start_period so compose doesn't
+      # mark the container unhealthy and starve the workers (which
+      # depend_on this service).
       test: ["CMD-SHELL", "(echo > /dev/tcp/127.0.0.1/8080) 2>/dev/null"]
-      interval: 3s
+      interval: 5s
       timeout: 2s
       retries: 60
-      start_period: 60s
+      start_period: 900s
 
   worker-1: &worker-template
     build:
