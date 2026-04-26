@@ -20,7 +20,11 @@ RUN apt-get update \
         e2fsprogs xfsprogs xz-utils \
         libssl3 libgcc-s1 \
         # Build deps for cargo (compile temps inside the container).
+        # cmake + perl pulled in by libz-ng-sys (transitive via reqwest etc.);
+        # protobuf-compiler by tonic/prost build scripts in some crates;
+        # libpq-dev by pq-sys / sqlx for postgres bindings.
         build-essential pkg-config libssl-dev \
+        cmake perl protobuf-compiler libpq-dev \
         git \
         # psql for direct settings injection during setup
         postgresql-client \
