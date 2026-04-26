@@ -38,6 +38,14 @@ underlay IPs above. Within-node traffic uses the unchanged
 - ~3 GB free RAM (postgres + control plane + 3 workers ≈ 2 GB working set).
 - ~5 GB free disk for the compiled `temps` binary cache + 4 worker
   Docker volumes + a TimescaleDB volume.
+- A copy of the MaxMind GeoLite2 City database at the repo root:
+
+  ```bash
+  cp ~/.temps/GeoLite2-City.mmdb ./GeoLite2-City.mmdb   # if you've run temps setup before
+  # or download from https://dev.maxmind.com/geoip/geolite2-free-geolocation-data
+  ```
+
+  The proxy plugin refuses to start without it. The file is gitignored.
 
 ## Caveat: web UI
 
