@@ -75,7 +75,7 @@ impl NetworkManager {
     /// changed args returns [`NetworkError::InterfaceConflict`] rather than
     /// silently mutating state — operators should explicitly tear down
     /// first.
-    #[instrument(level = "info", skip_all, fields(node = %alloc.node_id, cidr = %alloc.pod_cidr))]
+    #[instrument(level = "info", skip_all, fields(node = %alloc.node_id, cidr = %alloc.compute_cidr))]
     pub async fn bootstrap(&self, alloc: NodeAlloc, peers: Vec<Peer>) -> crate::Result<()> {
         self.inner.config.validate_with(&alloc, &peers)?;
 
@@ -183,7 +183,7 @@ mod tests {
         let m = NetworkManager::new(NetworkConfig::default()).unwrap();
         let alloc = NodeAlloc {
             node_id: Uuid::nil(),
-            pod_cidr: Ipv4Net::from_str("172.20.5.0/24").unwrap(),
+            compute_cidr: Ipv4Net::from_str("172.20.5.0/24").unwrap(),
             bridge_address: IpAddr::V4(Ipv4Addr::new(172, 20, 5, 1)),
             underlay_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         };

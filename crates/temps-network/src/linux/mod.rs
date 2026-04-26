@@ -51,14 +51,14 @@ pub async fn bootstrap(
         }
     }
 
-    // Routes for each peer's pod CIDR.
+    // Routes for each peer's compute CIDR.
     for peer in peers {
         match config.transport {
             Transport::Vxlan { .. } => {
-                route::add_via_dev(&handle, peer.pod_cidr, &config.vxlan_dev_name).await?;
+                route::add_via_dev(&handle, peer.compute_cidr, &config.vxlan_dev_name).await?;
             }
             Transport::Native => {
-                route::add_via_gateway(&handle, peer.pod_cidr, peer.underlay_address).await?;
+                route::add_via_gateway(&handle, peer.compute_cidr, peer.underlay_address).await?;
             }
         }
     }
@@ -67,7 +67,7 @@ pub async fn bootstrap(
 
     info!(
         bridge = %config.bridge_name,
-        cidr = %alloc.pod_cidr,
+        cidr = %alloc.compute_cidr,
         peers = peers.len(),
         "linux network bootstrap complete"
     );
@@ -121,7 +121,7 @@ pub async fn reconcile_peers(
             Transport::Native => {
                 let gateway = desired
                     .iter()
-                    .find(|p| p.pod_cidr == *cidr)
+                    .find(|p| p.compute_cidr == *cidr)
                     .map(|p| p.underlay_address)
                     .ok_or(NetworkError::InvalidConfig {
                         reason: format!("route diff added cidr {} with no matching peer", cidr),

@@ -21,7 +21,7 @@ pub struct PeerDiff {
     /// their FDB entries must be removed. We key by underlay because the
     /// kernel's FDB doesn't carry node-id metadata.
     pub fdb_to_remove: Vec<IpAddr>,
-    /// Peers whose pod_cidr or underlay changed and therefore need a
+    /// Peers whose compute_cidr or underlay changed and therefore need a
     /// remove-then-add. Kept separate so callers can apply the order
     /// safely.
     pub to_replace: Vec<(Peer, Peer)>,
@@ -92,12 +92,12 @@ impl RouteDiff {
         let mut to_remove: HashSet<Ipv4Net> = HashSet::new();
 
         for p in &diff.to_add {
-            to_add.insert(p.pod_cidr);
+            to_add.insert(p.compute_cidr);
         }
         for (have, want) in &diff.to_replace {
-            if have.pod_cidr != want.pod_cidr {
-                to_remove.insert(have.pod_cidr);
-                to_add.insert(want.pod_cidr);
+            if have.compute_cidr != want.compute_cidr {
+                to_remove.insert(have.compute_cidr);
+                to_add.insert(want.compute_cidr);
             }
         }
         // FDB-only removals (peer gone) — we need the CIDR as well. The peer
@@ -116,8 +116,8 @@ impl RouteDiff {
     /// have both lists handy — it's simpler than threading a partial
     /// `fdb_to_remove` through.
     pub fn compute(current: &[Peer], desired: &[Peer]) -> Self {
-        let cur: HashSet<Ipv4Net> = current.iter().map(|p| p.pod_cidr).collect();
-        let want: HashSet<Ipv4Net> = desired.iter().map(|p| p.pod_cidr).collect();
+        let cur: HashSet<Ipv4Net> = current.iter().map(|p| p.compute_cidr).collect();
+        let want: HashSet<Ipv4Net> = desired.iter().map(|p| p.compute_cidr).collect();
 
         let mut to_add: Vec<_> = want.difference(&cur).copied().collect();
         let mut to_remove: Vec<_> = cur.difference(&want).copied().collect();
@@ -141,7 +141,7 @@ mod tests {
     fn peer(id: u128, cidr: &str, underlay: &str) -> Peer {
         Peer {
             node_id: Uuid::from_u128(id),
-            pod_cidr: Ipv4Net::from_str(cidr).unwrap(),
+            compute_cidr: Ipv4Net::from_str(cidr).unwrap(),
             underlay_address: IpAddr::V4(Ipv4Addr::from_str(underlay).unwrap()),
         }
     }
@@ -210,7 +210,7 @@ mod tests {
         let c = peer(3, "172.20.3.0/24", "10.0.0.3");
         // current: a,b — desired: b,c → add c, remove a
         let d = RouteDiff::compute(&[a.clone(), b.clone()], &[b, c.clone()]);
-        assert_eq!(d.to_add, vec![c.pod_cidr]);
-        assert_eq!(d.to_remove, vec![a.pod_cidr]);
+        assert_eq!(d.to_add, vec![c.compute_cidr]);
+        assert_eq!(d.to_remove, vec![a.compute_cidr]);
     }
 }

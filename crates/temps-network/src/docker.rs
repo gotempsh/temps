@@ -51,9 +51,9 @@ pub async fn ensure_network(
         }
 
         for cidr in &cidrs {
-            if cidr == &alloc.pod_cidr.to_string() {
+            if cidr == &alloc.compute_cidr.to_string() {
                 return Err(NetworkError::DockerCidrCollision {
-                    cidr: alloc.pod_cidr,
+                    cidr: alloc.compute_cidr,
                     existing_network: name,
                     desired_network: config.docker_network_name.clone(),
                 });
@@ -72,7 +72,7 @@ pub async fn ensure_network(
                 reason: e.to_string(),
             })?;
 
-        let want_subnet = alloc.pod_cidr.to_string();
+        let want_subnet = alloc.compute_cidr.to_string();
         let got_subnet = inspect
             .ipam
             .as_ref()
@@ -119,7 +119,7 @@ pub async fn ensure_network(
         ipam: Some(Ipam {
             driver: Some("default".into()),
             config: Some(vec![IpamConfig {
-                subnet: Some(alloc.pod_cidr.to_string()),
+                subnet: Some(alloc.compute_cidr.to_string()),
                 gateway: Some(alloc.bridge_address.to_string()),
                 ..Default::default()
             }]),
@@ -142,7 +142,7 @@ pub async fn ensure_network(
     info!(
         network = %config.docker_network_name,
         id = %id,
-        cidr = %alloc.pod_cidr,
+        cidr = %alloc.compute_cidr,
         "created docker bridge network"
     );
     Ok(id)

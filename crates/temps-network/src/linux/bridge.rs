@@ -59,7 +59,7 @@ pub async fn ensure(
         })?;
 
     // Address.
-    let prefix_len = alloc.pod_cidr.prefix_len();
+    let prefix_len = alloc.compute_cidr.prefix_len();
     ensure_addr(handle, index, alloc.bridge_address, prefix_len, name).await?;
 
     // Bring up.

@@ -73,4 +73,4 @@ following the project's "tests skip gracefully" convention. CI sets
 | 5 | reconcile_peers removes peer | Removing a peer cleans up FDB + route |
 | 6 | teardown is idempotent | Calling teardown twice doesn't error |
 | 7 | Docker network CIDR collision | Pre-creating a Docker network on the same CIDR causes `bootstrap` to return `DockerCidrCollision` rather than corrupting state |
-| 8 | Subnet validation | Calling `bootstrap` with a bridge address outside the pod CIDR returns `InvalidConfig` |
+| 8 | Subnet validation | Calling `bootstrap` with a bridge address outside the compute CIDR returns `InvalidConfig` |

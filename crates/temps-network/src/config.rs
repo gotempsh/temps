@@ -27,8 +27,8 @@ pub enum Transport {
         port: u16,
     },
 
-    /// No encapsulation — kernel routes pod CIDRs natively over the underlay.
-    /// Only works when every node has a route to every other node's pod CIDR
+    /// No encapsulation — kernel routes compute CIDRs natively over the underlay.
+    /// Only works when every node has a route to every other node's compute CIDR
     /// (typically: same L2 segment or a cloud private network where you
     /// disable source/dest checks).
     Native,
@@ -57,9 +57,9 @@ pub struct NodeAlloc {
     pub node_id: Uuid,
     /// CIDR this node uses for container IPs. Other nodes route this CIDR
     /// to us via the transport.
-    pub pod_cidr: Ipv4Net,
+    pub compute_cidr: Ipv4Net,
     /// Address the node should assign to its bridge — typically the first
-    /// usable host in `pod_cidr`. Provided explicitly rather than derived so
+    /// usable host in `compute_cidr`. Provided explicitly rather than derived so
     /// that the allocator stays the single source of truth.
     pub bridge_address: IpAddr,
     /// Address other nodes use to reach this one over the underlay. For
@@ -72,7 +72,7 @@ pub struct NodeAlloc {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peer {
     pub node_id: Uuid,
-    pub pod_cidr: Ipv4Net,
+    pub compute_cidr: Ipv4Net,
     pub underlay_address: IpAddr,
 }
 
@@ -175,7 +175,7 @@ impl NetworkConfig {
     pub fn validate_with(&self, alloc: &NodeAlloc, peers: &[Peer]) -> crate::Result<()> {
         self.validate()?;
 
-        // The bridge address must live inside the node's own pod CIDR, otherwise
+        // The bridge address must live inside the node's own compute CIDR, otherwise
         // containers won't be able to reach their default gateway.
         let bridge_v4 = match alloc.bridge_address {
             IpAddr::V4(v4) => v4,
@@ -185,23 +185,23 @@ impl NetworkConfig {
                 })
             }
         };
-        if !alloc.pod_cidr.contains(&bridge_v4) {
+        if !alloc.compute_cidr.contains(&bridge_v4) {
             return Err(NetworkError::InvalidConfig {
                 reason: format!(
-                    "bridge_address {} is not inside pod_cidr {}",
-                    alloc.bridge_address, alloc.pod_cidr
+                    "bridge_address {} is not inside compute_cidr {}",
+                    alloc.bridge_address, alloc.compute_cidr
                 ),
             });
         }
 
         // No peer may overlap our own CIDR.
         for peer in peers {
-            if cidrs_overlap(&peer.pod_cidr, &alloc.pod_cidr) {
+            if cidrs_overlap(&peer.compute_cidr, &alloc.compute_cidr) {
                 return Err(NetworkError::InvalidPeer {
                     node_id: peer.node_id,
                     reason: format!(
-                        "peer pod_cidr {} overlaps local pod_cidr {}",
-                        peer.pod_cidr, alloc.pod_cidr
+                        "peer compute_cidr {} overlaps local compute_cidr {}",
+                        peer.compute_cidr, alloc.compute_cidr
                     ),
                 });
             }
@@ -216,12 +216,12 @@ impl NetworkConfig {
         // No two peers may share a CIDR.
         for (i, a) in peers.iter().enumerate() {
             for b in &peers[i + 1..] {
-                if cidrs_overlap(&a.pod_cidr, &b.pod_cidr) {
+                if cidrs_overlap(&a.compute_cidr, &b.compute_cidr) {
                     return Err(NetworkError::InvalidPeer {
                         node_id: b.node_id,
                         reason: format!(
-                            "peer pod_cidr {} overlaps another peer's pod_cidr {}",
-                            b.pod_cidr, a.pod_cidr
+                            "peer compute_cidr {} overlaps another peer's compute_cidr {}",
+                            b.compute_cidr, a.compute_cidr
                         ),
                     });
                 }
@@ -246,7 +246,7 @@ mod tests {
     fn alloc(cidr: &str, bridge: &str) -> NodeAlloc {
         NodeAlloc {
             node_id: Uuid::nil(),
-            pod_cidr: Ipv4Net::from_str(cidr).unwrap(),
+            compute_cidr: Ipv4Net::from_str(cidr).unwrap(),
             bridge_address: IpAddr::V4(Ipv4Addr::from_str(bridge).unwrap()),
             underlay_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         }
@@ -255,7 +255,7 @@ mod tests {
     fn peer(node_id: u128, cidr: &str, underlay: &str) -> Peer {
         Peer {
             node_id: Uuid::from_u128(node_id),
-            pod_cidr: Ipv4Net::from_str(cidr).unwrap(),
+            compute_cidr: Ipv4Net::from_str(cidr).unwrap(),
             underlay_address: IpAddr::V4(Ipv4Addr::from_str(underlay).unwrap()),
         }
     }

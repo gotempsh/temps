@@ -3,10 +3,10 @@
 # Bring a single node onto the multi-host overlay.
 #
 # Required env vars:
-#   LOCAL_CIDR         e.g. 172.20.1.0/24      — this node's pod CIDR
+#   LOCAL_CIDR         e.g. 172.20.1.0/24      — this node's compute CIDR
 #   LOCAL_BRIDGE_IP    e.g. 172.20.1.1         — bridge gateway address
 #   PEER_UNDERLAY      e.g. 10.0.0.2           — other node's underlay IP
-#   PEER_CIDR          e.g. 172.20.2.0/24      — other node's pod CIDR
+#   PEER_CIDR          e.g. 172.20.2.0/24      — other node's compute CIDR
 #
 # Optional env vars (defaults match crates/temps-network):
 #   BRIDGE_NAME        default: br-temps0
@@ -78,7 +78,7 @@ if ! bridge fdb show dev "$VXLAN_NAME" | grep -q "dst $PEER_UNDERLAY "; then
   bridge fdb append 00:00:00:00:00:00 dev "$VXLAN_NAME" dst "$PEER_UNDERLAY"
 fi
 
-# 5. Route to the peer's pod CIDR.
+# 5. Route to the peer's compute CIDR.
 if ! ip -4 route show "$PEER_CIDR" | grep -q "dev $VXLAN_NAME"; then
   log "adding route $PEER_CIDR dev $VXLAN_NAME"
   ip route replace "$PEER_CIDR" dev "$VXLAN_NAME"

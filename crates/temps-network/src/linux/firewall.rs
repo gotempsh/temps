@@ -9,7 +9,7 @@
 //!   Docker's default-DROP `forward` chain so it takes effect even when
 //!   Docker is installed alongside us.
 //! * `postrouting` (priority 100, type nat, hook postrouting) — masquerades
-//!   pod CIDR traffic that egresses on a non-bridge interface. This is what
+//!   compute CIDR traffic that egresses on a non-bridge interface. This is what
 //!   lets containers reach the internet.
 //!
 //! We shell out to `nft` because it is the canonical tool, every modern
@@ -36,7 +36,7 @@ pub async fn install_baseline(config: &NetworkConfig, alloc: &NodeAlloc) -> crat
             table: TABLE.into(),
             reason,
         })?;
-    info!(table = TABLE, bridge = %config.bridge_name, cidr = %alloc.pod_cidr, "nftables baseline installed");
+    info!(table = TABLE, bridge = %config.bridge_name, cidr = %alloc.compute_cidr, "nftables baseline installed");
     Ok(())
 }
 
@@ -59,7 +59,7 @@ pub async fn remove_baseline(_config: &NetworkConfig) -> crate::Result<()> {
 
 fn render_baseline(config: &NetworkConfig, alloc: &NodeAlloc) -> String {
     let bridge = &config.bridge_name;
-    let cidr = alloc.pod_cidr;
+    let cidr = alloc.compute_cidr;
     format!(
         "
 # Idempotent install: drop the table if it exists, recreate from scratch.
@@ -125,7 +125,7 @@ mod tests {
         let cfg = NetworkConfig::default();
         let alloc = NodeAlloc {
             node_id: Uuid::nil(),
-            pod_cidr: Ipv4Net::from_str("172.20.5.0/24").unwrap(),
+            compute_cidr: Ipv4Net::from_str("172.20.5.0/24").unwrap(),
             bridge_address: IpAddr::V4(Ipv4Addr::new(172, 20, 5, 1)),
             underlay_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         };

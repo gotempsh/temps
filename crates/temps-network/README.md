@@ -39,11 +39,12 @@ Linux and macOS; kernel data-plane is Linux-only. Not wired into
 
 ## Transports
 
-- **`Transport::Vxlan { vni, port }`** — recommended default. Encapsulates pod
-  traffic in UDP, works through cloud firewalls, costs ~50 bytes per packet.
+- **`Transport::Vxlan { vni, port }`** — recommended default. Encapsulates
+  inter-container traffic in UDP, works through cloud firewalls, costs
+  ~50 bytes per packet.
 - **`Transport::Native`** — no encapsulation. Use only when nodes share an
   L2 segment or a cloud private network where you can install host routes
-  for each peer's pod CIDR. Zero overhead.
+  for each peer's compute CIDR. Zero overhead.
 
 ## Usage sketch
 
@@ -150,8 +151,8 @@ docker run --rm --network temps0 --ip 172.20.2.10 alpine \
 This branch lands the standalone crate + tests + PoC. Subsequent branches
 will add:
 
-- Schema migration (`pod_cidr`, `underlay_address` columns on `nodes`)
-- Control-plane allocator (`PodNetworkAllocator`)
+- Schema migration (`compute_cidr`, `underlay_address` columns on `nodes`)
+- Control-plane allocator (`ComputeNetworkAllocator`)
 - Server endpoint that broadcasts the peer list
 - `temps-agent` startup hook calling `NetworkManager::bootstrap`
 - `temps-deployer` attaching containers to the `temps0` network

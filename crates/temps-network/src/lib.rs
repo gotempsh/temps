@@ -4,7 +4,7 @@
 //! so containers on different hosts can reach each other by IP. The high-level
 //! flow:
 //!
-//! 1. Control plane allocates a per-node `pod_cidr` (e.g. `172.20.5.0/24`) from
+//! 1. Control plane allocates a per-node `compute_cidr` (e.g. `172.20.5.0/24`) from
 //!    a cluster-wide pool, plus a list of peer nodes with their own CIDRs and
 //!    underlay IPs.
 //! 2. [`NetworkManager::bootstrap`] creates a Linux bridge, attaches a transport

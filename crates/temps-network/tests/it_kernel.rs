@@ -73,7 +73,7 @@ impl Env {
     fn alloc(&self) -> NodeAlloc {
         NodeAlloc {
             node_id: Uuid::new_v4(),
-            pod_cidr: self.local_cidr,
+            compute_cidr: self.local_cidr,
             bridge_address: self.local_bridge_ip,
             underlay_address: self.local_underlay,
         }
@@ -82,7 +82,7 @@ impl Env {
     fn peer(&self) -> Peer {
         Peer {
             node_id: Uuid::new_v4(),
-            pod_cidr: self.peer_cidr,
+            compute_cidr: self.peer_cidr,
             underlay_address: self.peer_underlay,
         }
     }
@@ -294,7 +294,7 @@ async fn reconcile_peers_adds_new_peer() {
 
     let extra = Peer {
         node_id: Uuid::new_v4(),
-        pod_cidr: Ipv4Net::from_str("172.20.99.0/24").unwrap(),
+        compute_cidr: Ipv4Net::from_str("172.20.99.0/24").unwrap(),
         underlay_address: IpAddr::V4(Ipv4Addr::new(10, 123, 0, 99)),
     };
     let changed = mgr
@@ -303,7 +303,7 @@ async fn reconcile_peers_adds_new_peer() {
         .expect("reconcile add");
     assert!(changed);
     assert!(fdb_has_entry("vxlan-temps0", &extra.underlay_address.to_string()).await);
-    assert!(route_exists(&extra.pod_cidr.to_string()).await);
+    assert!(route_exists(&extra.compute_cidr.to_string()).await);
 
     // Original peer untouched.
     assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
@@ -316,7 +316,7 @@ async fn reconcile_peers_removes_peer() {
     let peer1 = env.peer();
     let peer2 = Peer {
         node_id: Uuid::new_v4(),
-        pod_cidr: Ipv4Net::from_str("172.20.99.0/24").unwrap(),
+        compute_cidr: Ipv4Net::from_str("172.20.99.0/24").unwrap(),
         underlay_address: IpAddr::V4(Ipv4Addr::new(10, 123, 0, 99)),
     };
     mgr.bootstrap(env.alloc(), vec![peer1.clone(), peer2.clone()])
@@ -334,7 +334,7 @@ async fn reconcile_peers_removes_peer() {
         "peer2 fdb entry should be gone"
     );
     assert!(
-        !route_exists(&peer2.pod_cidr.to_string()).await,
+        !route_exists(&peer2.compute_cidr.to_string()).await,
         "peer2 route should be gone"
     );
 
