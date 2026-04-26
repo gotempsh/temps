@@ -378,13 +378,11 @@ export function DomainDetail() {
     domain.status === 'pending'
 
 
-  // Renew is only meaningful for ACME flows we can automate.
-  // DNS-01 renewals require the user to re-add TXT records, so we expose
-  // it as "Start renewal" instead of "Renew".
-  const canRenew =
-    canManageCertificates &&
-    (domain.verification_method === 'dns-01' ||
-      domain.verification_method === 'http-01')
+  // Renew is meaningful for any ACME-issued certificate. DNS-01 renewals
+  // require the user to re-add TXT records, so we expose it as "Start renewal"
+  // instead of "Renew". Legacy/unknown values (e.g. "acme") are treated as
+  // auto-renewable since the backend resolves the challenge type.
+  const canRenew = canManageCertificates && !!domain.verification_method
   const renewLabel =
     domain.verification_method === 'dns-01' ? 'Start renewal' : 'Renew certificate'
 
