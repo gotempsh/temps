@@ -141,7 +141,12 @@ services:
       # target dir. We give it 15 min via start_period so compose doesn't
       # mark the container unhealthy and starve the workers (which
       # depend_on this service).
-      test: ["CMD-SHELL", "(echo > /dev/tcp/127.0.0.1/8080) 2>/dev/null"]
+      # CMD-SHELL runs through dash on this image, which lacks bash's
+      # /dev/tcp builtin — that bug caused the check to fail forever
+      # silently. Invoke bash explicitly via the array form so the
+      # /dev/tcp probe works as intended. Connect-only, ignore HTTP
+      # status: we care that the listener accepts a TCP connection.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
       interval: 5s
       timeout: 2s
       retries: 60
