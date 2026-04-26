@@ -1,0 +1,57 @@
+# Privileged Docker-in-Docker image for the local dev cluster.
+#
+# Each container plays the role of a single node (control plane or worker).
+# The temps source tree is bind-mounted at /workspace; the image installs
+# a Rust toolchain so the binary can be (re)built inside the container,
+# producing a Linux-native ELF that matches the container's kernel + glibc.
+#
+# This is heavier than a "build on host, mount the binary" approach but
+# (a) on macOS the host build is a Mach-O which won't run in Linux at
+# all, and (b) cargo's incremental build + a /workspace/target volume
+# means rebuilds are seconds, not minutes.
+
+FROM debian:trixie-slim
+
+# Runtime tools the kernel data plane + dockerd need.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg jq bash \
+        iproute2 nftables bridge-utils iputils-ping \
+        e2fsprogs xfsprogs xz-utils \
+        libssl3 libgcc-s1 \
+        # Build deps for cargo (compile temps inside the container).
+        build-essential pkg-config libssl-dev \
+        git \
+        # psql for direct settings injection during setup
+        postgresql-client \
+        # xxd for join-token random hex
+        xxd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Docker engine (mirrors a real Hetzner box).
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && chmod a+r /etc/apt/keyrings/docker.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian trixie stable" \
+       > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust stable. Pinning to "stable" (not a specific version) so workspace
+# MSRV bumps don't break the dev cluster — same call we now make in the
+# tests/dind/run-single.sh script.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path \
+    && rustup --version && cargo --version && rustc --version
+
+RUN install -d -m 0755 /var/lib/temps /var/log/temps
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["bash"]

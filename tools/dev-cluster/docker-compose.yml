@@ -1,0 +1,191 @@
+# Local 3-worker Temps cluster for distributed dev.
+#
+# Topology:
+#
+#   ┌──────────────── temps-underlay (10.42.0.0/24, this is the "VPC") ────────────────┐
+#   │                                                                                  │
+#   │  ┌── postgres ──────────┐  ┌── control-plane ─────────┐                          │
+#   │  │ TimescaleDB pg18     │  │ DinD + temps serve       │                          │
+#   │  │ 10.42.0.5            │  │ 10.42.0.10               │                          │
+#   │  │ port 5432 (internal) │  │ host port 8080 → 8080    │                          │
+#   │  └──────────────────────┘  └──────────────────────────┘                          │
+#   │                                                                                  │
+#   │  ┌── worker-1 ──────────┐  ┌── worker-2 ──────────┐  ┌── worker-3 ──────────┐    │
+#   │  │ DinD + temps agent   │  │ DinD + temps agent   │  │ DinD + temps agent   │    │
+#   │  │ 10.42.0.21           │  │ 10.42.0.22           │  │ 10.42.0.23           │    │
+#   │  └──────────────────────┘  └──────────────────────┘  └──────────────────────┘    │
+#   │                                                                                  │
+#   └──────────────────────────────────────────────────────────────────────────────────┘
+#
+# Each worker is a privileged container running its own dockerd + the
+# Temps agent. The compute_cidr allocator carves out 172.20.x.0/24 from
+# the configured pool, one slice per worker. Cross-node traffic flows
+# over a VXLAN tunnel pinned to the underlay IPs above.
+#
+# The temps source tree is mounted read-write at /workspace in every
+# DinD container so all containers share the same target/ cache. After a
+# `cargo build --bin temps` inside any container the new binary is
+# instantly visible everywhere.
+
+name: temps-dev-cluster
+
+networks:
+  underlay:
+    name: temps-underlay
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.42.0.0/24
+
+volumes:
+  postgres-data:
+    name: temps-dev-postgres-data
+  cargo-cache:
+    name: temps-dev-cargo-cache
+  # Shared per-container Docker image storage. Each worker gets its own
+  # so we don't trip Docker's "can't share /var/lib/docker" rule, but
+  # they're named so they survive `down` for fast restarts.
+  worker1-docker:
+    name: temps-dev-w1-docker
+  worker2-docker:
+    name: temps-dev-w2-docker
+  worker3-docker:
+    name: temps-dev-w3-docker
+  control-docker:
+    name: temps-dev-cp-docker
+
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg18
+    container_name: temps-dev-postgres
+    networks:
+      underlay:
+        ipv4_address: 10.42.0.5
+    environment:
+      POSTGRES_DB: temps
+      POSTGRES_USER: temps
+      POSTGRES_PASSWORD: temps
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - postgres-data:/home/postgres/pgdata
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "temps", "-d", "temps"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile.dind-temps
+    image: temps-dev-cluster/dind-temps:latest
+    container_name: temps-dev-control-plane
+    privileged: true
+    hostname: control-plane
+    networks:
+      underlay:
+        ipv4_address: 10.42.0.10
+    ports:
+      # Expose the web UI on the Mac host so you can hit
+      # http://localhost:8080 in your browser.
+      - "8080:8080"
+    environment:
+      TEMPS_DATABASE_URL: postgres://temps:temps@10.42.0.5:5432/temps
+      TEMPS_ADDRESS: 0.0.0.0:8080
+      TEMPS_DATA_DIR: /var/lib/temps
+      TEMPS_LOG_LEVEL: info
+      TEMPS_NETWORK_NAME: temps-app-network
+      ROLE: control-plane
+    volumes:
+      - ../../:/workspace:rw
+      - cargo-cache:/usr/local/cargo/registry
+      - control-docker:/var/lib/docker
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Start dockerd → build temps if missing → setup --auto → run serve.
+    # Everything happens via /workspace/tools/dev-cluster/role-control-plane.sh
+    # so we can iterate on the role logic without rebuilding the image.
+    command: ["bash", "/workspace/tools/dev-cluster/role-control-plane.sh"]
+    # The serve loop blocks; healthcheck just probes it.
+    healthcheck:
+      # Temps' admin API requires auth on every endpoint; we just probe TCP
+      # to know the listener is up. The seed script does the proper
+      # "is the API actually responding" check after this passes.
+      test: ["CMD-SHELL", "(echo > /dev/tcp/127.0.0.1/8080) 2>/dev/null"]
+      interval: 3s
+      timeout: 2s
+      retries: 60
+      start_period: 60s
+
+  worker-1: &worker-template
+    build:
+      context: .
+      dockerfile: Dockerfile.dind-temps
+    image: temps-dev-cluster/dind-temps:latest
+    container_name: temps-dev-worker-1
+    privileged: true
+    hostname: worker-1
+    networks:
+      underlay:
+        ipv4_address: 10.42.0.21
+    environment:
+      ROLE: worker
+      WORKER_NAME: worker-1
+      WORKER_UNDERLAY_IP: 10.42.0.21
+      CONTROL_PLANE_URL: http://10.42.0.10:8080
+      TEMPS_LOG_LEVEL: info
+      TEMPS_NETWORK_NAME: temps-app-network
+      TEMPS_OVERLAY_NETWORK: temps-overlay
+      TEMPS_AGENT_ADDRESS: 0.0.0.0:3100
+    volumes:
+      - ../../:/workspace:rw
+      - cargo-cache:/usr/local/cargo/registry
+      - worker1-docker:/var/lib/docker
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    command: ["bash", "/workspace/tools/dev-cluster/role-worker.sh"]
+
+  worker-2:
+    <<: *worker-template
+    container_name: temps-dev-worker-2
+    hostname: worker-2
+    networks:
+      underlay:
+        ipv4_address: 10.42.0.22
+    environment:
+      ROLE: worker
+      WORKER_NAME: worker-2
+      WORKER_UNDERLAY_IP: 10.42.0.22
+      CONTROL_PLANE_URL: http://10.42.0.10:8080
+      TEMPS_LOG_LEVEL: info
+      TEMPS_NETWORK_NAME: temps-app-network
+      TEMPS_OVERLAY_NETWORK: temps-overlay
+      TEMPS_AGENT_ADDRESS: 0.0.0.0:3100
+    volumes:
+      - ../../:/workspace:rw
+      - cargo-cache:/usr/local/cargo/registry
+      - worker2-docker:/var/lib/docker
+
+  worker-3:
+    <<: *worker-template
+    container_name: temps-dev-worker-3
+    hostname: worker-3
+    networks:
+      underlay:
+        ipv4_address: 10.42.0.23
+    environment:
+      ROLE: worker
+      WORKER_NAME: worker-3
+      WORKER_UNDERLAY_IP: 10.42.0.23
+      CONTROL_PLANE_URL: http://10.42.0.10:8080
+      TEMPS_LOG_LEVEL: info
+      TEMPS_NETWORK_NAME: temps-app-network
+      TEMPS_OVERLAY_NETWORK: temps-overlay
+      TEMPS_AGENT_ADDRESS: 0.0.0.0:3100
+    volumes:
+      - ../../:/workspace:rw
+      - cargo-cache:/usr/local/cargo/registry
+      - worker3-docker:/var/lib/docker

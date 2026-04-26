@@ -1,0 +1,4 @@
+# Ephemeral runtime state created by `dev-cluster up`. Contains the
+# generated admin password (admin.txt) and the cluster's join token
+# (join_token.txt). Never commit these.
+.state/
