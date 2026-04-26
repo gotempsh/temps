@@ -405,6 +405,8 @@ async fn verify_tables_exist(db: &DatabaseConnection) -> anyhow::Result<()> {
         "project_dsns",
         "error_attachments",
         "error_user_feedback",
+        // m20260427_000001_add_compute_network
+        "network_config",
     ];
 
     for table in tables {
@@ -549,4 +551,149 @@ async fn verify_unique_constraints(db: &DatabaseConnection) -> anyhow::Result<()
 
     println!("✅ Unique constraints verified");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Compute-network migration (m20260427_000001) coverage.
+//
+// We verify the migration end-to-end: columns exist on `nodes`, the
+// singleton `network_config` table is created with the default row, the
+// CHECK constraints behave correctly (transport must be vxlan/native, id
+// must equal 1), and the partial-unique index on nodes.compute_cidr lets
+// multiple NULLs coexist while rejecting duplicate non-NULL values.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_compute_network_migration() -> anyhow::Result<()> {
+    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+        println!("⏭️  Skipping test_compute_network_migration: external database in use");
+        return Ok(());
+    }
+
+    let container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .start()
+        .await
+        .expect("Failed to start TimescaleDB container");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{}/postgres", port);
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    let db = connect_with_retries(&db_url).await?;
+    Migrator::up(&db, None).await?;
+
+    // ----- nodes.compute_cidr + underlay_address columns exist -----
+    for col in ["compute_cidr", "underlay_address"] {
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+                     WHERE table_name = 'nodes' AND column_name = '{}')",
+                    col
+                ),
+            ))
+            .await?
+            .expect("query returns one row");
+        let exists: bool = row.try_get("", "exists")?;
+        assert!(exists, "nodes.{} must exist after migration", col);
+    }
+
+    // ----- partial-unique index lets multiple NULLs coexist, but not duplicates -----
+    db.execute_unprepared(
+        "INSERT INTO nodes (name, token_hash, address, private_address, role, status, \
+         labels, capacity, compute_cidr) \
+         VALUES \
+            ('a', 'h1', '127.0.0.1', '10.0.0.1', 'worker', 'pending', '{}', '{}', NULL), \
+            ('b', 'h2', '127.0.0.2', '10.0.0.2', 'worker', 'pending', '{}', '{}', NULL), \
+            ('c', 'h3', '127.0.0.3', '10.0.0.3', 'worker', 'pending', '{}', '{}', '172.20.5.0/24')",
+    )
+    .await?;
+    let dup = db
+        .execute_unprepared(
+            "INSERT INTO nodes (name, token_hash, address, private_address, role, status, \
+             labels, capacity, compute_cidr) VALUES \
+             ('d', 'h4', '127.0.0.4', '10.0.0.4', 'worker', 'pending', '{}', '{}', '172.20.5.0/24')",
+        )
+        .await;
+    assert!(
+        dup.is_err(),
+        "duplicate compute_cidr must be rejected, got {:?}",
+        dup
+    );
+
+    // ----- network_config singleton row exists with defaults -----
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id, compute_pool_cidr, subnet_prefix_len, transport, vxlan_vni, \
+             vxlan_port, underlay_mtu FROM network_config"
+                .to_string(),
+        ))
+        .await?
+        .expect("network_config singleton row must be present");
+    let id: i32 = row.try_get("", "id")?;
+    let pool: String = row.try_get("", "compute_pool_cidr")?;
+    let prefix: i32 = row.try_get("", "subnet_prefix_len")?;
+    let transport: String = row.try_get("", "transport")?;
+    let vni: i32 = row.try_get("", "vxlan_vni")?;
+    let port: i32 = row.try_get("", "vxlan_port")?;
+    let mtu: i32 = row.try_get("", "underlay_mtu")?;
+    assert_eq!(id, 1);
+    assert_eq!(pool, "172.20.0.0/16");
+    assert_eq!(prefix, 24);
+    assert_eq!(transport, "vxlan");
+    assert_eq!(vni, 42);
+    assert_eq!(port, 4789);
+    assert_eq!(mtu, 1500);
+
+    // ----- CHECK (id = 1) prevents inserting a second row -----
+    let second = db
+        .execute_unprepared(
+            "INSERT INTO network_config (id, compute_pool_cidr, subnet_prefix_len, \
+             transport, vxlan_vni, vxlan_port, underlay_mtu) \
+             VALUES (2, '10.0.0.0/16', 24, 'vxlan', 42, 4789, 1500)",
+        )
+        .await;
+    assert!(
+        second.is_err(),
+        "network_config must be a singleton (id = 1), got {:?}",
+        second
+    );
+
+    // ----- CHECK on transport rejects unknown values -----
+    let bad_transport = db
+        .execute_unprepared("UPDATE network_config SET transport = 'gre' WHERE id = 1")
+        .await;
+    assert!(
+        bad_transport.is_err(),
+        "transport must be one of (vxlan, native), got {:?}",
+        bad_transport
+    );
+
+    // ----- valid transport update succeeds -----
+    db.execute_unprepared("UPDATE network_config SET transport = 'native' WHERE id = 1")
+        .await?;
+
+    println!("✅ compute network migration verified");
+    Ok(())
+}
+
+async fn connect_with_retries(db_url: &str) -> anyhow::Result<DatabaseConnection> {
+    let mut retries = 5;
+    loop {
+        match Database::connect(db_url).await {
+            Ok(db) => return Ok(db),
+            Err(e) if retries > 0 => {
+                retries -= 1;
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                if retries == 0 {
+                    return Err(anyhow::Error::from(e));
+                }
+            }
+            Err(e) => return Err(anyhow::Error::from(e)),
+        }
+    }
 }

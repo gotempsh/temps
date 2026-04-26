@@ -33,6 +33,16 @@ pub struct Model {
     pub last_heartbeat: Option<DBDateTime>,
     /// X25519 public key for edge nodes (base64-encoded, used for ECIES cert encryption)
     pub edge_public_key: Option<String>,
+    /// Per-node CIDR for the multi-host overlay (e.g. "172.20.5.0/24"). Other
+    /// nodes route this CIDR to us via the configured transport. Allocated by
+    /// the control-plane `ComputeNetworkAllocator` when the node joins.
+    /// Stored as text to mirror `private_address` / `public_endpoint`; parsed
+    /// to `ipnet::Ipv4Net` at the application boundary.
+    pub compute_cidr: Option<String>,
+    /// Address other nodes use to reach this one over the underlay. Cloud
+    /// private IP for same-DC clusters, public IP for cross-DC. Parsed to
+    /// `std::net::IpAddr` at the application boundary.
+    pub underlay_address: Option<String>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

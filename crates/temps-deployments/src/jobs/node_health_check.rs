@@ -209,6 +209,8 @@ mod tests {
                 chrono::Utc::now() - chrono::Duration::seconds(heartbeat_age_secs),
             ),
             edge_public_key: None,
+            compute_cidr: None,
+            underlay_address: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
