@@ -274,11 +274,16 @@ async fn bootstrap_creates_all_kernel_state() {
 #[tokio::test]
 async fn bootstrap_is_idempotent() {
     let (env, mgr, _cleanup) = fixture().await;
-    mgr.bootstrap(env.alloc(), vec![env.peer()])
+    // Reuse the same alloc + peer across both calls — env.alloc() and
+    // env.peer() each mint a fresh Uuid::new_v4(), and the manager treats
+    // a different node_id as a different peer.
+    let alloc = env.alloc();
+    let peer = env.peer();
+    mgr.bootstrap(alloc.clone(), vec![peer.clone()])
         .await
         .expect("first bootstrap");
     // Second call must not error and must leave kernel state intact.
-    mgr.bootstrap(env.alloc(), vec![env.peer()])
+    mgr.bootstrap(alloc, vec![peer])
         .await
         .expect("second bootstrap");
     assert!(link_exists("br-temps0").await);
@@ -288,7 +293,11 @@ async fn bootstrap_is_idempotent() {
 #[tokio::test]
 async fn reconcile_peers_adds_new_peer() {
     let (env, mgr, _cleanup) = fixture().await;
-    mgr.bootstrap(env.alloc(), vec![env.peer()])
+    // Original peer must be the SAME object across bootstrap + reconcile so
+    // the diff sees only the `extra` addition, not a remove+add of the
+    // original.
+    let original = env.peer();
+    mgr.bootstrap(env.alloc(), vec![original.clone()])
         .await
         .expect("bootstrap");
 
@@ -298,7 +307,7 @@ async fn reconcile_peers_adds_new_peer() {
         underlay_address: IpAddr::V4(Ipv4Addr::new(10, 123, 0, 99)),
     };
     let changed = mgr
-        .reconcile_peers(vec![env.peer(), extra.clone()])
+        .reconcile_peers(vec![original, extra.clone()])
         .await
         .expect("reconcile add");
     assert!(changed);
@@ -345,14 +354,15 @@ async fn reconcile_peers_removes_peer() {
 #[tokio::test]
 async fn reconcile_peers_noop_on_unchanged() {
     let (env, mgr, _cleanup) = fixture().await;
-    mgr.bootstrap(env.alloc(), vec![env.peer()])
+    // Build the peer ONCE — env.peer() generates a fresh Uuid::new_v4() each
+    // call, so calling it twice would feed reconcile two peers with
+    // different node_ids and look like "remove + add", not a no-op.
+    let p = env.peer();
+    mgr.bootstrap(env.alloc(), vec![p.clone()])
         .await
         .expect("bootstrap");
 
-    let changed = mgr
-        .reconcile_peers(vec![env.peer()])
-        .await
-        .expect("reconcile noop");
+    let changed = mgr.reconcile_peers(vec![p]).await.expect("reconcile noop");
     assert!(
         !changed,
         "reconcile with identical peer list must be a no-op"
