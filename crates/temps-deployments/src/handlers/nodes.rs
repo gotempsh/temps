@@ -236,6 +236,7 @@ pub struct S3CredentialsResponse {
         register_node,
         node_heartbeat,
         get_s3_credentials,
+        crate::handlers::network::list_peers,
         admin_list_nodes,
         admin_get_node,
         admin_list_node_containers,
@@ -250,6 +251,9 @@ pub struct S3CredentialsResponse {
         HeartbeatApiRequest,
         HeartbeatResponse,
         S3CredentialsResponse,
+        crate::handlers::network::PeerEntry,
+        crate::handlers::network::AllocEntry,
+        crate::handlers::network::PeerListResponse,
         NodeInfoResponse,
         NodeListResponse,
         NodeContainerResponse,
@@ -276,6 +280,10 @@ pub fn configure_routes() -> Router<Arc<NodeAppState>> {
         .route(
             "/internal/nodes/{node_id}/s3-credentials/{s3_source_id}",
             get(get_s3_credentials),
+        )
+        .route(
+            "/internal/nodes/{node_id}/network/peers",
+            get(crate::handlers::network::list_peers),
         )
         .route("/internal/edge/routes", get(edge_routes))
 }
