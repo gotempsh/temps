@@ -27,6 +27,7 @@ members = [
     "crates/temps-backup",
     "crates/temps-notifications",
     "crates/temps-monitoring",
+    "crates/temps-network",
     "crates/temps-mcp",
     "crates/temps-analytics",
     "crates/temps-audit",

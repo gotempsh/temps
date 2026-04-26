@@ -1,0 +1,53 @@
+name: Network Kernel Tests
+
+# Privileged kernel + DinD tests for crates/temps-network. Runs only when
+# explicitly requested (manual trigger, PR label, or change to the crate)
+# because the job needs a privileged runner-on-runner Docker setup that
+# costs more time than the regular unit suite.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/temps-network/**"
+      - "scripts/network-poc/**"
+      - ".github/workflows/network-kernel-tests.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  unit:
+    name: Unit tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: temps-network-unit
+      - name: Run unit tests
+        run: cargo test -p temps-network --lib
+
+  single-node-kernel:
+    name: Single-node kernel integration
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Docker is available
+        run: docker version
+      - name: Run single-node DinD harness
+        run: ./crates/temps-network/tests/dind/run-single.sh
+
+  two-node-kernel:
+    name: Two-node cross-host integration
+    runs-on: ubuntu-latest
+    needs: single-node-kernel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Docker is available
+        run: docker version
+      - name: Run two-node DinD harness
+        run: ./crates/temps-network/tests/dind/run.sh

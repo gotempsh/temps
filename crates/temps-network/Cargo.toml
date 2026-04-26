@@ -1,0 +1,43 @@
+[package]
+name = "temps-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+bollard = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
+
+# CIDR math — small, dependency-free, ubiquitous in the Rust networking ecosystem.
+ipnet = { version = "2.10", features = ["serde"] }
+
+# Linux-only kernel data-plane control. We gate every use behind cfg(target_os = "linux")
+# so the crate still compiles on macOS/Windows for type-checking and shared logic tests.
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = "0.14"
+netlink-packet-route = "0.19"
+netlink-packet-core = "0.7"
+nix = { version = "0.29", features = ["net", "sched", "fs"] }
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+mockall = "0.13"
+tempfile = "3"
+
+[features]
+# Enable kernel-touching integration tests. These require privileged Linux
+# (ability to create bridges, vxlan devices, modify routing tables, install
+# nftables rules) and an inner Docker daemon, so they are gated off by
+# default. The DinD harness in tests/dind/run.sh sets this feature.
+integration_kernel = []
