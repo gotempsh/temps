@@ -43,6 +43,13 @@ volumes:
     name: temps-dev-postgres-data
   cargo-cache:
     name: temps-dev-cargo-cache
+  # Cargo's git-dep cache (cloned source for `git = ...` Cargo.toml deps
+  # like cloudflare-rs and getsentry/relay). Without a persistent mount
+  # here, cargo re-clones every git dep — including submodules in the
+  # Sentry relay repo — on every `cargo build` run from a fresh
+  # container, which can take minutes.
+  cargo-git:
+    name: temps-dev-cargo-git
   # Shared workspace `target/` directory. CRITICAL: this MUST be a named
   # Docker volume (not part of the /workspace bind mount), because:
   #   1. The bind mount serves macOS source files into the container
@@ -117,6 +124,7 @@ services:
       - ../../:/workspace:rw
       - workspace-target:/workspace/target
       - cargo-cache:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
       - control-docker:/var/lib/docker
     depends_on:
       postgres:
@@ -163,6 +171,7 @@ services:
       - ../../:/workspace:rw
       - workspace-target:/workspace/target
       - cargo-cache:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
       - worker1-docker:/var/lib/docker
     depends_on:
       control-plane:
@@ -189,6 +198,7 @@ services:
       - ../../:/workspace:rw
       - workspace-target:/workspace/target
       - cargo-cache:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
       - worker2-docker:/var/lib/docker
 
   worker-3:
@@ -211,4 +221,5 @@ services:
       - ../../:/workspace:rw
       - workspace-target:/workspace/target
       - cargo-cache:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
       - worker3-docker:/var/lib/docker
