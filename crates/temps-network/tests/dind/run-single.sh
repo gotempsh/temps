@@ -65,7 +65,11 @@ docker exec "$NODE" sh -c '
   set -e
   if ! command -v cargo >/dev/null; then
     apk add --no-cache build-base curl pkgconfig openssl-dev nftables iproute2 bridge >/dev/null
-    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.85.0 --profile minimal >/dev/null
+    # Install latest stable rather than pinning a version — workspace deps
+    # bump their MSRV regularly (etcetera, home, testcontainers, time all
+    # need 1.88+ as of late Apr 2026), and pinning here means the harness
+    # breaks every time a transitive crate updates.
+    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal >/dev/null
   fi
 '
 
