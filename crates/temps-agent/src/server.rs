@@ -324,6 +324,13 @@ pub async fn start_agent_server(
     // Start heartbeat background loop (with deployer for container inventory on first beat)
     spawn_heartbeat_loop(&config, container_deployer);
 
+    // Start the multi-host network sync loop. Failures here NEVER stop the
+    // agent — when this node has no compute_cidr allocated (single-host
+    // cluster, or simply not yet allocated), the loop is a no-op. When a
+    // compute_cidr is allocated, the loop bootstraps the overlay and keeps
+    // peers reconciled. `temps join` semantics are unchanged either way.
+    crate::network_sync::spawn(&config);
+
     let listener = tokio::net::TcpListener::bind(&config.listen_address)
         .await
         .map_err(|e| {

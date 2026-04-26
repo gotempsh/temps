@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod handlers;
+pub mod network_sync;
 pub mod server;
 pub mod service_handlers;
 
