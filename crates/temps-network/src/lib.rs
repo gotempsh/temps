@@ -36,6 +36,12 @@ pub mod manager;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+/// Control-plane CIDR allocator + peer-list helpers. Gated behind the
+/// `control_plane` feature so worker-only consumers (the agent) don't pull
+/// sea-orm into their build.
+#[cfg(feature = "control_plane")]
+pub mod allocator;
+
 pub use config::{NetworkConfig, NodeAlloc, Peer, Transport};
 pub use diff::{PeerDiff, RouteDiff};
 pub use error::NetworkError;
