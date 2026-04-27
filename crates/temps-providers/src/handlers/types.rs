@@ -199,6 +199,39 @@ pub struct ServiceMemberInfo {
     pub port: Option<i32>,
     pub status: String,
     pub ordinal: i32,
+    /// Container's IP on the `temps-overlay` multi-host network. Populated
+    /// by the lifecycle hook (ADR-011 Phase 3); `None` on single-host
+    /// clusters where the overlay isn't attached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compute_ip: Option<String>,
+}
+
+impl From<crate::services::ServiceMemberInfo> for ServiceMemberInfo {
+    fn from(m: crate::services::ServiceMemberInfo) -> Self {
+        Self {
+            id: m.id,
+            role: m.role,
+            node_id: m.node_id,
+            container_name: m.container_name,
+            hostname: m.hostname,
+            port: m.port,
+            status: m.status,
+            ordinal: m.ordinal,
+            compute_ip: m.compute_ip,
+        }
+    }
+}
+
+/// Request body for adding a single member to a running cluster.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AddClusterMemberRequest {
+    /// Member role. Currently only `replica` is accepted at runtime —
+    /// monitor is a singleton, primary is elected by pg_auto_failover.
+    #[schema(example = "replica")]
+    pub role: String,
+    /// Target worker node ID. Omit or null to run on the control plane.
+    #[serde(default)]
+    pub node_id: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

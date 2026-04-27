@@ -3170,6 +3170,567 @@ impl ExternalServiceManager {
         self.get_service_info(service_id).await
     }
 
+    /// Add a single new member (currently only `replica` is supported) to a
+    /// running Postgres cluster. The new container is provisioned on the
+    /// requested node, registered with the existing pg_auto_failover monitor,
+    /// inserted into `service_members`, and given a Tier-2 DNS A record so
+    /// the role reconciler will pick it up on its next tick.
+    ///
+    /// Returns `ServiceMemberInfo` for the newly created member.
+    ///
+    /// Refuses to add `monitor` (singletons — created once at init) or
+    /// `primary` (elected by pg_auto_failover, never declared by the user).
+    pub async fn add_cluster_member(
+        &self,
+        service_id: i32,
+        role: &str,
+        node_id: Option<i32>,
+    ) -> Result<ServiceMemberInfo, ExternalServiceError> {
+        info!(
+            service_id,
+            role,
+            node_id = ?node_id,
+            "Adding cluster member"
+        );
+
+        let service = self.get_service(service_id).await?;
+
+        if service.topology != "cluster" {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: "add_cluster_member is only valid for cluster topology services"
+                    .to_string(),
+            });
+        }
+        if service.status != "running" {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "Cluster must be in 'running' status to add a member, current: '{}'",
+                    service.status
+                ),
+            });
+        }
+
+        // Currently only `replica` can be added at runtime. Monitor and
+        // primary are created once during init: monitor is a singleton,
+        // primary is elected by pg_auto_failover.
+        if role != "replica" {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "Only 'replica' members can be added at runtime (got '{}'). \
+                     Monitor is a singleton; primary is elected by pg_auto_failover.",
+                    role
+                ),
+            });
+        }
+
+        let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
+            ExternalServiceError::InvalidServiceType {
+                id: service_id,
+                service_type: service.service_type.clone(),
+            }
+        })?;
+
+        // Only Postgres is wired today; future engines hook in here.
+        let pg_cluster = match service_type {
+            ServiceType::Postgres => {
+                PostgresClusterService::new(service.name.clone(), self.docker.clone())
+            }
+            _ => {
+                return Err(ExternalServiceError::ParameterValidationFailed {
+                    service_id,
+                    reason: format!(
+                        "add_cluster_member is only supported for Postgres clusters (got '{}')",
+                        service.service_type
+                    ),
+                });
+            }
+        };
+
+        // Find the existing monitor — required so the new replica can
+        // register with it. If the monitor is missing, the cluster is
+        // broken and we shouldn't paper over that here.
+        let existing_members = service_members::Entity::find()
+            .filter(service_members::Column::ServiceId.eq(service_id))
+            .order_by_asc(service_members::Column::Ordinal)
+            .all(self.db.as_ref())
+            .await?;
+
+        let monitor = existing_members
+            .iter()
+            .find(|m| m.role == "monitor")
+            .ok_or(ExternalServiceError::InitializationFailed {
+                id: service_id,
+                reason: "Cannot add member: cluster has no monitor".to_string(),
+            })?;
+
+        // The monitor's hostname is what the new node will pass to
+        // `pg_autoctl create postgres --monitor=...`. Prefer the FQDN
+        // recorded in service_members (set during init), falling back to
+        // the underlay private_address of the monitor's node, then to
+        // the monitor's container name for single-host setups.
+        let monitor_hostname: String = if let Some(h) = monitor.hostname.as_deref() {
+            h.to_string()
+        } else if let Some(node_id) = monitor.node_id {
+            let node = nodes::Entity::find_by_id(node_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ExternalServiceError::InternalError {
+                    reason: format!("Monitor's node {} not found", node_id),
+                })?;
+            node.private_address.clone()
+        } else {
+            format!("postgres-{}-monitor", service.name)
+        };
+        let monitor_port = monitor
+            .port
+            .ok_or(ExternalServiceError::InitializationFailed {
+                id: service_id,
+                reason: "Monitor has no host port recorded".to_string(),
+            })? as u16;
+
+        // Pick the next ordinal — pg_auto_failover doesn't care about gaps,
+        // but we want a stable, deterministic name (`postgres-<svc>-<n>`).
+        let next_ordinal = existing_members
+            .iter()
+            .map(|m| m.ordinal)
+            .max()
+            .unwrap_or(-1)
+            + 1;
+
+        // Resolve the new member's hostname for inter-member traffic.
+        // Same rules as initialize_cluster: remote → node.private_address,
+        // local → control plane's own private IP (when there are remote
+        // members) so the monitor and other replicas can reach it.
+        let has_any_remote =
+            existing_members.iter().any(|m| m.node_id.is_some()) || node_id.is_some();
+        let local_private_ip: Option<String> = if has_any_remote && node_id.is_none() {
+            Some(Self::get_local_private_ip().map_err(|e| {
+                ExternalServiceError::InitializationFailed {
+                    id: service_id,
+                    reason: format!(
+                        "Cluster has remote members but could not determine local private IP: {}",
+                        e
+                    ),
+                }
+            })?)
+        } else {
+            None
+        };
+
+        let hostname: Option<String> = if let Some(nid) = node_id {
+            let node = nodes::Entity::find_by_id(nid)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ExternalServiceError::InternalError {
+                    reason: format!("Node {} not found", nid),
+                })?;
+            Some(node.private_address.clone())
+        } else {
+            local_private_ip
+        };
+
+        let spec = ClusterMemberSpec {
+            role: role.to_string(),
+            node_id,
+            ordinal: next_ordinal,
+            hostname: hostname.clone(),
+        };
+
+        // Pull the parsed cluster config so build_member_params has
+        // database/username/password/etc.
+        let parameters = self.get_service_parameters(service_id).await?;
+        let service_config = ServiceConfig {
+            name: service.name.clone(),
+            service_type,
+            version: service.version.clone(),
+            parameters: serde_json::to_value(&parameters).map_err(|e| {
+                ExternalServiceError::InternalError {
+                    reason: format!("Failed to serialize parameters: {}", e),
+                }
+            })?,
+        };
+        let cluster_config: crate::externalsvc::postgres_cluster::PostgresClusterConfig =
+            serde_json::from_value(service_config.parameters.clone()).map_err(|e| {
+                ExternalServiceError::InternalError {
+                    reason: format!("Failed to parse cluster config: {}", e),
+                }
+            })?;
+
+        // Same port-allocation rule as initialize_cluster:
+        //   base_port = 6000 + service_id*10, monitor=base, data=base+ordinal
+        let base_port = 6000u16 + (service_id as u16 * 10);
+        let member_port = base_port + spec.ordinal as u16;
+
+        let member_params = pg_cluster.build_member_params(
+            &spec,
+            &cluster_config,
+            &monitor_hostname,
+            monitor_port,
+            member_port,
+        );
+        let container_name = member_params.container_name.clone();
+
+        // Insert "creating" row first so the UI can track the new member
+        // even if container creation hangs.
+        let member_record = service_members::ActiveModel {
+            service_id: Set(service_id),
+            node_id: Set(spec.node_id),
+            role: Set(spec.role.clone()),
+            container_id: Set(None),
+            container_name: Set(container_name.clone()),
+            hostname: Set(spec.hostname.clone()),
+            port: Set(None),
+            status: Set("creating".to_string()),
+            ordinal: Set(spec.ordinal),
+            config: Set(None),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let member_model = member_record.insert(self.db.as_ref()).await?;
+        let member_id = member_model.id;
+
+        // Create the container — local or remote — and capture its
+        // overlay IP so the role reconciler can publish a DNS record.
+        let create_outcome: Result<(String, Option<i32>, Option<String>), ExternalServiceError> =
+            if let Some(nid) = spec.node_id {
+                let client = self.get_remote_client(nid).await?;
+                let volume_name = format!("{}_data", container_name);
+                let remote_params = RemoteServiceCreateParams {
+                    name: container_name.clone(),
+                    service_type: "postgres".to_string(),
+                    image: member_params.image.clone(),
+                    environment: member_params.environment.clone(),
+                    port_mappings: vec![RemotePortMapping {
+                        host_port: member_params.container_port,
+                        container_port: member_params.container_port,
+                    }],
+                    volumes: HashMap::from([(volume_name, member_params.volume_path.clone())]),
+                    network: Some(temps_core::NETWORK_NAME.to_string()),
+                    command: member_params.command.clone(),
+                };
+                client
+                    .create_service(remote_params)
+                    .await
+                    .map(|r| (r.container_id, Some(r.host_port as i32), r.compute_ip))
+                    .map_err(|e| ExternalServiceError::InitializationFailed {
+                        id: service_id,
+                        reason: format!(
+                            "Failed to create cluster member '{}' on node {}: {}",
+                            container_name, nid, e
+                        ),
+                    })
+            } else {
+                self.create_local_cluster_member(&container_name, &member_params)
+                    .await
+                    .map_err(|e| ExternalServiceError::InitializationFailed {
+                        id: service_id,
+                        reason: format!(
+                            "Failed to create local cluster member '{}': {}",
+                            container_name, e
+                        ),
+                    })
+            };
+
+        let (container_id, host_port, compute_ip) = match create_outcome {
+            Ok(t) => t,
+            Err(e) => {
+                // Roll back the half-inserted row so the cluster's member
+                // list stays consistent with reality.
+                let _ = service_members::Entity::delete_by_id(member_id)
+                    .exec(self.db.as_ref())
+                    .await;
+                return Err(e);
+            }
+        };
+
+        // Compute the canonical FQDN (matches initialize_cluster's scheme).
+        let member_fqdn = format!(
+            "{}-{}.{}.temps.local",
+            service.name, spec.ordinal, service.name
+        );
+
+        // Promote "creating" → "running" with full container metadata.
+        let mut member_update: service_members::ActiveModel = member_model.into();
+        member_update.container_id = Set(Some(container_id));
+        member_update.port = Set(host_port);
+        member_update.status = Set("running".to_string());
+        member_update.hostname = Set(Some(member_fqdn.clone()));
+        member_update.compute_ip = Set(compute_ip.clone());
+        member_update.updated_at = Set(Utc::now());
+        let updated = member_update.update(self.db.as_ref()).await?;
+
+        // Register Tier-2 DNS A record (best-effort — same fallback policy
+        // as initialize_cluster: log loudly, don't fail the add).
+        if let Some(ip) = compute_ip.clone() {
+            let draft = temps_dns::EndpointDraft {
+                fqdn: member_fqdn.clone(),
+                record_type: temps_dns::InternalRecordType::A,
+                target_ip: Some(ip.clone()),
+                target_port: Some(member_port as i32),
+                ttl: 30,
+                owner_kind: temps_dns::InternalOwnerKind::ServiceMember,
+                owner_id: member_id as i64,
+                node_id: spec.node_id,
+            };
+            if let Err(e) = self
+                .dns_registry
+                .replace_endpoints_for_owner(
+                    temps_dns::InternalOwnerKind::ServiceMember,
+                    member_id as i64,
+                    &[draft],
+                )
+                .await
+            {
+                warn!(
+                    service_id,
+                    member_id,
+                    fqdn = %member_fqdn,
+                    ip = %ip,
+                    error = %e,
+                    "Failed to register DNS record for added cluster member"
+                );
+            } else {
+                info!(
+                    service_id,
+                    member_id,
+                    fqdn = %member_fqdn,
+                    ip = %ip,
+                    "Registered DNS A record for added cluster member"
+                );
+            }
+        }
+
+        info!(
+            service_id,
+            member_id,
+            ordinal = spec.ordinal,
+            "Cluster member added; reconciler will refresh role records on next tick"
+        );
+
+        Ok(ServiceMemberInfo {
+            id: updated.id,
+            role: updated.role,
+            node_id: updated.node_id,
+            container_name: updated.container_name,
+            hostname: updated.hostname,
+            port: updated.port,
+            status: updated.status,
+            ordinal: updated.ordinal,
+            compute_ip: updated.compute_ip,
+        })
+    }
+
+    /// Remove a single member from a running cluster.
+    ///
+    /// Safety guarantees (this function refuses to proceed unless they hold):
+    ///   * The member must belong to the named service.
+    ///   * The member must not be the `monitor` (singleton — would orphan
+    ///     every data node).
+    ///   * The member must not be the current `primary` (caller must
+    ///     trigger a failover via pg_auto_failover first; we never
+    ///     forcibly demote a writable primary).
+    ///   * The remaining data members (excluding the monitor) must still
+    ///     have at least 2 entries — anything fewer drops below quorum
+    ///     and the cluster loses HA.
+    ///
+    /// Steps:
+    ///   1. Stop + remove the container (local Docker or remote agent).
+    ///   2. Delete the `service_members` row.
+    ///   3. Drop the Tier-2 DNS A record for the member (best-effort).
+    ///   4. Reconciler will refresh role records on its next tick.
+    ///
+    /// **Note:** this does *not* run `pg_autoctl drop node` against the
+    /// monitor. Doing so safely requires shelling into the monitor
+    /// container (the user has rejected `docker exec` for state-changing
+    /// operations). The orphan monitor row is harmless — pg_auto_failover
+    /// will mark the missing node as `unreachable` and stop assigning it
+    /// reads. If you need a fully-clean monitor view, run
+    /// `pg_autoctl drop node --formation default --name <node-N>`
+    /// manually from the monitor.
+    pub async fn remove_cluster_member(
+        &self,
+        service_id: i32,
+        member_id: i32,
+    ) -> Result<(), ExternalServiceError> {
+        info!(service_id, member_id, "Removing cluster member");
+
+        let service = self.get_service(service_id).await?;
+
+        if service.topology != "cluster" {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: "remove_cluster_member is only valid for cluster topology services"
+                    .to_string(),
+            });
+        }
+
+        let member = service_members::Entity::find_by_id(member_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ExternalServiceError::InitializationFailed {
+                id: service_id,
+                reason: format!("Cluster member {} not found", member_id),
+            })?;
+
+        if member.service_id != service_id {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "Member {} does not belong to service {} (it belongs to service {})",
+                    member_id, service_id, member.service_id
+                ),
+            });
+        }
+
+        if member.role == "monitor" {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: "Cannot remove the monitor — it is required for cluster operation"
+                    .to_string(),
+            });
+        }
+        if member.role == "primary" {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: "Cannot remove the current primary. \
+                         Trigger a failover first (pg_autoctl perform failover) \
+                         so a replica is promoted, then remove this node once it has \
+                         been demoted to a replica or has gone offline."
+                    .to_string(),
+            });
+        }
+
+        // Quorum check: pg_auto_failover needs at least 2 data members
+        // (one primary + one replica) to keep HA. Removing this member
+        // must not leave fewer than 2.
+        let all_members = service_members::Entity::find()
+            .filter(service_members::Column::ServiceId.eq(service_id))
+            .all(self.db.as_ref())
+            .await?;
+        let data_member_count = all_members.iter().filter(|m| m.role != "monitor").count();
+        if data_member_count <= 2 {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "Refusing to remove member: cluster has only {} data member(s); \
+                     removing this one would drop the cluster below the 2-member \
+                     quorum required for HA. Add a replica first, then remove.",
+                    data_member_count
+                ),
+            });
+        }
+
+        // 1. Stop and remove the container.
+        if let Some(node_id) = member.node_id {
+            // Remote: dispatch to the worker's agent.
+            match self.get_remote_client(node_id).await {
+                Ok(client) => {
+                    if let Err(e) = client.remove_service(&member.container_name).await {
+                        // Log loudly but keep going — the row + DNS still
+                        // need to disappear so the cluster's view is
+                        // consistent. The container may already be gone.
+                        warn!(
+                            service_id,
+                            member_id,
+                            node_id,
+                            container = %member.container_name,
+                            error = %e,
+                            "Failed to remove remote cluster member container; continuing with row + DNS cleanup"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        service_id,
+                        member_id,
+                        node_id,
+                        error = %e,
+                        "Could not reach worker node to remove container; continuing with row + DNS cleanup"
+                    );
+                }
+            }
+        } else {
+            // Local container.
+            if let Err(e) = self
+                .docker
+                .remove_container(
+                    &member.container_name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                warn!(
+                    service_id,
+                    member_id,
+                    container = %member.container_name,
+                    error = %e,
+                    "Failed to remove local cluster member container; continuing with row + DNS cleanup"
+                );
+            }
+
+            let volume_name = format!("{}_data", member.container_name);
+            if let Err(e) = self
+                .docker
+                .remove_volume(
+                    &volume_name,
+                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                )
+                .await
+            {
+                // Volume removal failures are common (in-use, missing) and
+                // not fatal — log at debug.
+                debug!(
+                    service_id,
+                    member_id,
+                    volume = %volume_name,
+                    error = %e,
+                    "Volume cleanup skipped"
+                );
+            }
+        }
+
+        // 2. Delete the service_members row.
+        service_members::Entity::delete_by_id(member_id)
+            .exec(self.db.as_ref())
+            .await?;
+
+        // 3. Drop the Tier-2 DNS record (best-effort — same policy as
+        //    delete_service: a stuck DNS plane shouldn't block removal).
+        if let Err(e) = self
+            .dns_registry
+            .delete_by_owner(
+                temps_dns::InternalOwnerKind::ServiceMember,
+                member_id as i64,
+            )
+            .await
+        {
+            warn!(
+                service_id,
+                member_id,
+                error = %e,
+                "Failed to drop DNS records for removed cluster member"
+            );
+        }
+
+        info!(
+            service_id,
+            member_id,
+            role = %member.role,
+            ordinal = member.ordinal,
+            "Cluster member removed; reconciler will refresh role records on next tick. \
+             Run `pg_autoctl drop node` on the monitor to fully clean pg_auto_failover state."
+        );
+
+        Ok(())
+    }
+
     /// Create a cluster member container on the local Docker daemon.
     ///
     /// Returns `(container_id, host_port, compute_ip)`:
@@ -6917,6 +7478,417 @@ mod tests {
             matches!(err, ExternalServiceError::ParameterValidationFailed { .. }),
             "Expected ParameterValidationFailed for missing members, got: {:?}",
             err
+        );
+    }
+
+    // ── add_cluster_member validation ──────────────────────────────────
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_add_cluster_member_not_found() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let result = manager.add_cluster_member(99999, "replica", None).await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ExternalServiceError::ServiceNotFound { id: 99999 }
+        ));
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_add_cluster_member_rejects_standalone() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_id = insert_test_service(
+            manager.db.as_ref(),
+            "test-add-standalone",
+            "postgres",
+            "standalone",
+            "running",
+        )
+        .await;
+
+        let result = manager
+            .add_cluster_member(service_id, "replica", None)
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            ExternalServiceError::ParameterValidationFailed { .. }
+        ));
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_add_cluster_member_rejects_non_running_status() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_id = insert_test_service(
+            manager.db.as_ref(),
+            "test-add-failed",
+            "postgres",
+            "cluster",
+            "failed",
+        )
+        .await;
+
+        let result = manager
+            .add_cluster_member(service_id, "replica", None)
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            ExternalServiceError::ParameterValidationFailed { .. }
+        ));
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_add_cluster_member_rejects_monitor_role() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_id = insert_test_service(
+            manager.db.as_ref(),
+            "test-add-monitor",
+            "postgres",
+            "cluster",
+            "running",
+        )
+        .await;
+
+        let result = manager
+            .add_cluster_member(service_id, "monitor", None)
+            .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ExternalServiceError::ParameterValidationFailed { .. }),
+            "monitor must be rejected at runtime: {:?}",
+            err
+        );
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_add_cluster_member_rejects_primary_role() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_id = insert_test_service(
+            manager.db.as_ref(),
+            "test-add-primary",
+            "postgres",
+            "cluster",
+            "running",
+        )
+        .await;
+
+        let result = manager
+            .add_cluster_member(service_id, "primary", None)
+            .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ExternalServiceError::ParameterValidationFailed { .. }),
+            "primary is elected, must be rejected at runtime: {:?}",
+            err
+        );
+    }
+
+    // ── remove_cluster_member validation ───────────────────────────────
+
+    #[cfg(feature = "docker-tests")]
+    async fn insert_test_member(
+        db: &DatabaseConnection,
+        service_id: i32,
+        role: &str,
+        ordinal: i32,
+        container_name: &str,
+    ) -> i32 {
+        use sea_orm::ActiveValue::Set;
+        let model = service_members::ActiveModel {
+            service_id: Set(service_id),
+            node_id: Set(None),
+            role: Set(role.to_string()),
+            container_id: Set(None),
+            container_name: Set(container_name.to_string()),
+            hostname: Set(None),
+            port: Set(None),
+            status: Set("running".to_string()),
+            ordinal: Set(ordinal),
+            config: Set(None),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        model.insert(db).await.unwrap().id
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_remove_cluster_member_rejects_standalone() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_id = insert_test_service(
+            manager.db.as_ref(),
+            "test-rm-standalone",
+            "postgres",
+            "standalone",
+            "running",
+        )
+        .await;
+
+        let err = manager
+            .remove_cluster_member(service_id, 12345)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExternalServiceError::ParameterValidationFailed { .. }
+        ));
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_remove_cluster_member_not_found() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_id = insert_test_service(
+            manager.db.as_ref(),
+            "test-rm-missing",
+            "postgres",
+            "cluster",
+            "running",
+        )
+        .await;
+
+        // No service_members rows — member 99999 doesn't exist.
+        let err = manager
+            .remove_cluster_member(service_id, 99999)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExternalServiceError::InitializationFailed { .. }
+        ));
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_remove_cluster_member_rejects_monitor() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_id = insert_test_service(
+            manager.db.as_ref(),
+            "test-rm-monitor",
+            "postgres",
+            "cluster",
+            "running",
+        )
+        .await;
+        let monitor_id = insert_test_member(
+            manager.db.as_ref(),
+            service_id,
+            "monitor",
+            0,
+            "postgres-test-rm-monitor-monitor",
+        )
+        .await;
+        // Quorum-satisfying data nodes so the monitor branch is the one we trip.
+        insert_test_member(
+            manager.db.as_ref(),
+            service_id,
+            "primary",
+            1,
+            "postgres-test-rm-monitor-1",
+        )
+        .await;
+        insert_test_member(
+            manager.db.as_ref(),
+            service_id,
+            "replica",
+            2,
+            "postgres-test-rm-monitor-2",
+        )
+        .await;
+        insert_test_member(
+            manager.db.as_ref(),
+            service_id,
+            "replica",
+            3,
+            "postgres-test-rm-monitor-3",
+        )
+        .await;
+
+        let err = manager
+            .remove_cluster_member(service_id, monitor_id)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ExternalServiceError::ParameterValidationFailed { .. })
+                && msg.contains("monitor"),
+            "monitor must be rejected: {}",
+            msg
+        );
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_remove_cluster_member_rejects_primary() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_id = insert_test_service(
+            manager.db.as_ref(),
+            "test-rm-primary",
+            "postgres",
+            "cluster",
+            "running",
+        )
+        .await;
+        insert_test_member(
+            manager.db.as_ref(),
+            service_id,
+            "monitor",
+            0,
+            "postgres-test-rm-primary-monitor",
+        )
+        .await;
+        let primary_id = insert_test_member(
+            manager.db.as_ref(),
+            service_id,
+            "primary",
+            1,
+            "postgres-test-rm-primary-1",
+        )
+        .await;
+        insert_test_member(
+            manager.db.as_ref(),
+            service_id,
+            "replica",
+            2,
+            "postgres-test-rm-primary-2",
+        )
+        .await;
+        insert_test_member(
+            manager.db.as_ref(),
+            service_id,
+            "replica",
+            3,
+            "postgres-test-rm-primary-3",
+        )
+        .await;
+
+        let err = manager
+            .remove_cluster_member(service_id, primary_id)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ExternalServiceError::ParameterValidationFailed { .. })
+                && msg.contains("primary"),
+            "primary must be rejected: {}",
+            msg
+        );
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_remove_cluster_member_rejects_quorum_drop() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_id = insert_test_service(
+            manager.db.as_ref(),
+            "test-rm-quorum",
+            "postgres",
+            "cluster",
+            "running",
+        )
+        .await;
+        insert_test_member(
+            manager.db.as_ref(),
+            service_id,
+            "monitor",
+            0,
+            "postgres-test-rm-quorum-monitor",
+        )
+        .await;
+        insert_test_member(
+            manager.db.as_ref(),
+            service_id,
+            "primary",
+            1,
+            "postgres-test-rm-quorum-1",
+        )
+        .await;
+        // Only 2 data members total; removing one drops below quorum.
+        let replica_id = insert_test_member(
+            manager.db.as_ref(),
+            service_id,
+            "replica",
+            2,
+            "postgres-test-rm-quorum-2",
+        )
+        .await;
+
+        let err = manager
+            .remove_cluster_member(service_id, replica_id)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ExternalServiceError::ParameterValidationFailed { .. })
+                && msg.contains("quorum"),
+            "quorum violation must be rejected: {}",
+            msg
+        );
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_remove_cluster_member_rejects_wrong_service() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_a = insert_test_service(
+            manager.db.as_ref(),
+            "test-rm-svc-a",
+            "postgres",
+            "cluster",
+            "running",
+        )
+        .await;
+        let service_b = insert_test_service(
+            manager.db.as_ref(),
+            "test-rm-svc-b",
+            "postgres",
+            "cluster",
+            "running",
+        )
+        .await;
+
+        // Insert a member into service_b
+        let stray_id = insert_test_member(
+            manager.db.as_ref(),
+            service_b,
+            "replica",
+            1,
+            "postgres-test-rm-svc-b-1",
+        )
+        .await;
+
+        // Try to remove it from service_a — must refuse.
+        let err = manager
+            .remove_cluster_member(service_a, stray_id)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ExternalServiceError::ParameterValidationFailed { .. })
+                && msg.contains("does not belong"),
+            "cross-service removal must be rejected: {}",
+            msg
         );
     }
 }
