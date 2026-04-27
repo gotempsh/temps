@@ -3978,6 +3978,234 @@ impl ExternalServiceManager {
         Ok(())
     }
 
+    /// Promote a replica to primary by running `pg_autoctl perform
+    /// promotion` inside its container. The monitor coordinates the
+    /// failover: it demotes the current primary and the new replica
+    /// transitions through `wait_primary` → `single` → `primary`. The
+    /// role reconciler refreshes the role-aliased VIPs on its next tick.
+    ///
+    /// Refuses:
+    ///   * member doesn't belong to this service
+    ///   * member is the monitor (singletons can't be promoted)
+    ///   * member is already the primary
+    ///   * member is not running
+    ///   * service isn't a cluster
+    ///
+    /// The command is bounded and takes no user input beyond the
+    /// pre-validated `member_id` — same risk profile as the existing
+    /// `service_exec` endpoint, much lower than password-reset which
+    /// would have crossed user-supplied secrets.
+    pub async fn promote_cluster_member(
+        &self,
+        service_id: i32,
+        member_id: i32,
+    ) -> Result<(), ExternalServiceError> {
+        info!(service_id, member_id, "Promoting cluster member to primary");
+
+        let service = self.get_service(service_id).await?;
+        if service.topology != "cluster" {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: "promote_cluster_member is only valid for cluster topology services"
+                    .to_string(),
+            });
+        }
+        if service.service_type != "postgres" {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "promote_cluster_member is only supported for Postgres clusters (got '{}')",
+                    service.service_type
+                ),
+            });
+        }
+
+        let member = service_members::Entity::find_by_id(member_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ExternalServiceError::InitializationFailed {
+                id: service_id,
+                reason: format!("Cluster member {} not found", member_id),
+            })?;
+
+        if member.service_id != service_id {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "Member {} does not belong to service {} (it belongs to {})",
+                    member_id, service_id, member.service_id
+                ),
+            });
+        }
+
+        if member.role == "monitor" {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: "Cannot promote the monitor — it is not a data node".to_string(),
+            });
+        }
+        if member.role == "primary" {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "Member {} is already the primary; nothing to do",
+                    member.container_name
+                ),
+            });
+        }
+        if member.status != "running" {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "Member {} is not running (status: {}); start it before promoting",
+                    member.container_name, member.status
+                ),
+            });
+        }
+
+        // The standalone postgres image and the HA `postgres-ha` image
+        // both put pgdata under /var/lib/postgresql/pgdata. We pin it
+        // here rather than discovering at runtime — every cluster member
+        // we provision uses the same path (see PostgresClusterService).
+        let cmd = vec![
+            "pg_autoctl".to_string(),
+            "perform".to_string(),
+            "promotion".to_string(),
+            "--pgdata".to_string(),
+            "/var/lib/postgresql/pgdata".to_string(),
+        ];
+
+        let (exit_code, stdout, stderr) = if let Some(node_id) = member.node_id {
+            let client = self.get_remote_client(node_id).await?;
+            let result = client
+                .exec_in_service(crate::remote_service_client::RemoteExecParams {
+                    container_name: member.container_name.clone(),
+                    command: cmd,
+                    environment: HashMap::new(),
+                    user: Some("postgres".to_string()),
+                    detach: false,
+                })
+                .await
+                .map_err(|e| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to promote member '{}' on node {}: {}",
+                        member.container_name, node_id, e
+                    ),
+                })?;
+            (result.exit_code, result.stdout, result.stderr)
+        } else {
+            self.exec_in_local_container(&member.container_name, &cmd, Some("postgres"))
+                .await?
+        };
+
+        if exit_code != 0 {
+            // Surface stderr first because pg_autoctl writes its real
+            // error there; stdout is just the progress chatter.
+            let detail = if !stderr.is_empty() { stderr } else { stdout };
+            return Err(ExternalServiceError::InternalError {
+                reason: format!(
+                    "pg_autoctl perform promotion failed (exit {}): {}",
+                    exit_code,
+                    detail.trim()
+                ),
+            });
+        }
+
+        info!(
+            service_id,
+            member_id,
+            container = %member.container_name,
+            "Promotion command accepted by monitor; reconciler will flip role records on next tick"
+        );
+
+        Ok(())
+    }
+
+    /// Run a command inside a locally-managed container. Mirrors the
+    /// agent's `service_exec` for the control-plane half of bipartite
+    /// cluster operations. Returns `(exit_code, stdout, stderr)`.
+    async fn exec_in_local_container(
+        &self,
+        container_name: &str,
+        cmd: &[String],
+        user: Option<&str>,
+    ) -> Result<(i64, String, String), ExternalServiceError> {
+        use bollard::exec::{CreateExecOptions, StartExecOptions};
+        use futures::StreamExt;
+
+        let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        let exec = self
+            .docker
+            .create_exec(
+                container_name,
+                CreateExecOptions {
+                    cmd: Some(cmd_refs),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    user,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| ExternalServiceError::DockerError {
+                id: 0,
+                reason: format!("Failed to create exec in '{}': {}", container_name, e),
+            })?;
+
+        let output = self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(StartExecOptions {
+                    detach: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|e| ExternalServiceError::DockerError {
+                id: 0,
+                reason: format!("Failed to start exec in '{}': {}", container_name, e),
+            })?;
+
+        // Capture stdout + stderr separately so the caller can decide
+        // which to surface in error messages.
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
+            while let Some(chunk) = output.next().await {
+                match chunk {
+                    Ok(bollard::container::LogOutput::StdOut { message }) => {
+                        stdout.push_str(&String::from_utf8_lossy(&message));
+                    }
+                    Ok(bollard::container::LogOutput::StdErr { message }) => {
+                        stderr.push_str(&String::from_utf8_lossy(&message));
+                    }
+                    Ok(other) => {
+                        // Console / StdIn never appear here, but include
+                        // them in stdout for completeness rather than
+                        // dropping silently.
+                        stdout.push_str(&other.to_string());
+                    }
+                    Err(e) => {
+                        return Err(ExternalServiceError::DockerError {
+                            id: 0,
+                            reason: format!("Exec stream error: {}", e),
+                        });
+                    }
+                }
+            }
+        }
+
+        let inspect = self.docker.inspect_exec(&exec.id).await.map_err(|e| {
+            ExternalServiceError::DockerError {
+                id: 0,
+                reason: format!("Failed to inspect exec result: {}", e),
+            }
+        })?;
+        let exit_code = inspect.exit_code.unwrap_or(-1);
+        Ok((exit_code, stdout, stderr))
+    }
+
     /// Resolve a fallback `(ip, port)` for a cluster member that doesn't
     /// have an overlay IP. Used by the DNS registration path so the
     /// member's FQDN still points *somewhere* — even when the overlay
@@ -8232,6 +8460,238 @@ mod tests {
             matches!(err, ExternalServiceError::ParameterValidationFailed { .. })
                 && msg.contains("does not belong"),
             "cross-service removal must be rejected: {}",
+            msg
+        );
+    }
+
+    // ── promote_cluster_member validation ─────────────────────────────
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_promote_cluster_member_rejects_standalone() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_id = insert_test_service(
+            manager.db.as_ref(),
+            "test-promote-standalone",
+            "postgres",
+            "standalone",
+            "running",
+        )
+        .await;
+
+        let err = manager
+            .promote_cluster_member(service_id, 12345)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExternalServiceError::ParameterValidationFailed { .. }
+        ));
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_promote_cluster_member_rejects_non_postgres() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_id = insert_test_service(
+            manager.db.as_ref(),
+            "test-promote-redis",
+            "redis",
+            "cluster",
+            "running",
+        )
+        .await;
+
+        let err = manager
+            .promote_cluster_member(service_id, 12345)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExternalServiceError::ParameterValidationFailed { .. }
+        ));
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_promote_cluster_member_not_found() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_id = insert_test_service(
+            manager.db.as_ref(),
+            "test-promote-missing",
+            "postgres",
+            "cluster",
+            "running",
+        )
+        .await;
+
+        let err = manager
+            .promote_cluster_member(service_id, 99999)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExternalServiceError::InitializationFailed { .. }
+        ));
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_promote_cluster_member_rejects_monitor() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_id = insert_test_service(
+            manager.db.as_ref(),
+            "test-promote-monitor",
+            "postgres",
+            "cluster",
+            "running",
+        )
+        .await;
+        let monitor_id = insert_test_member(
+            manager.db.as_ref(),
+            service_id,
+            "monitor",
+            0,
+            "postgres-test-promote-monitor-monitor",
+        )
+        .await;
+
+        let err = manager
+            .promote_cluster_member(service_id, monitor_id)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ExternalServiceError::ParameterValidationFailed { .. })
+                && msg.contains("monitor"),
+            "monitor must be rejected: {}",
+            msg
+        );
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_promote_cluster_member_rejects_already_primary() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_id = insert_test_service(
+            manager.db.as_ref(),
+            "test-promote-already",
+            "postgres",
+            "cluster",
+            "running",
+        )
+        .await;
+        let primary_id = insert_test_member(
+            manager.db.as_ref(),
+            service_id,
+            "primary",
+            1,
+            "postgres-test-promote-already-1",
+        )
+        .await;
+
+        let err = manager
+            .promote_cluster_member(service_id, primary_id)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ExternalServiceError::ParameterValidationFailed { .. })
+                && msg.contains("already the primary"),
+            "already-primary must be rejected: {}",
+            msg
+        );
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_promote_cluster_member_rejects_wrong_service() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_a = insert_test_service(
+            manager.db.as_ref(),
+            "test-promote-svc-a",
+            "postgres",
+            "cluster",
+            "running",
+        )
+        .await;
+        let service_b = insert_test_service(
+            manager.db.as_ref(),
+            "test-promote-svc-b",
+            "postgres",
+            "cluster",
+            "running",
+        )
+        .await;
+        let stray_id = insert_test_member(
+            manager.db.as_ref(),
+            service_b,
+            "replica",
+            1,
+            "postgres-test-promote-svc-b-1",
+        )
+        .await;
+
+        let err = manager
+            .promote_cluster_member(service_a, stray_id)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ExternalServiceError::ParameterValidationFailed { .. })
+                && msg.contains("does not belong"),
+            "cross-service promotion must be rejected: {}",
+            msg
+        );
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_promote_cluster_member_rejects_not_running() {
+        let (manager, _test_db) = setup_test_manager().await;
+
+        let service_id = insert_test_service(
+            manager.db.as_ref(),
+            "test-promote-stopped",
+            "postgres",
+            "cluster",
+            "running",
+        )
+        .await;
+        // Insert a stopped replica.
+        use sea_orm::ActiveValue::Set;
+        let stopped = service_members::ActiveModel {
+            service_id: Set(service_id),
+            node_id: Set(None),
+            role: Set("replica".to_string()),
+            container_id: Set(None),
+            container_name: Set("postgres-test-promote-stopped-1".to_string()),
+            hostname: Set(None),
+            port: Set(None),
+            status: Set("stopped".to_string()),
+            ordinal: Set(1),
+            config: Set(None),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let stopped_id = stopped.insert(manager.db.as_ref()).await.unwrap().id;
+
+        let err = manager
+            .promote_cluster_member(service_id, stopped_id)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ExternalServiceError::ParameterValidationFailed { .. })
+                && msg.contains("not running"),
+            "stopped member must be rejected: {}",
             msg
         );
     }

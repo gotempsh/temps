@@ -19,9 +19,10 @@ use tracing::{error, info};
 use utoipa::OpenApi;
 
 use super::audit::{
-    ExternalServiceClusterMemberAddedAudit, ExternalServiceClusterMemberRemovedAudit,
-    ExternalServiceCreatedAudit, ExternalServiceDeletedAudit, ExternalServiceStatusChangedAudit,
-    ExternalServiceUpdatedAudit, ServiceHealthChecked,
+    ExternalServiceClusterMemberAddedAudit, ExternalServiceClusterMemberPromotedAudit,
+    ExternalServiceClusterMemberRemovedAudit, ExternalServiceCreatedAudit,
+    ExternalServiceDeletedAudit, ExternalServiceStatusChangedAudit, ExternalServiceUpdatedAudit,
+    ServiceHealthChecked,
 };
 use crate::handlers::types::{
     AddClusterMemberRequest, AvailableContainerInfo, ClusterHealthReportResponse,
@@ -266,6 +267,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/external-services/{id}/members/{member_id}",
             get(get_cluster_member).delete(remove_cluster_member),
+        )
+        .route(
+            "/external-services/{id}/members/{member_id}/promote",
+            post(promote_cluster_member),
         )
         .route("/external-services/{id}/upgrade", post(upgrade_service))
         .route(
@@ -1377,6 +1382,96 @@ async fn remove_cluster_member(
     }
 }
 
+/// Promote a replica to primary by triggering a pg_auto_failover
+/// failover. The monitor demotes the current primary and the chosen
+/// replica transitions to primary; the role reconciler then refreshes
+/// the role-aliased VIPs (≤30s).
+#[utoipa::path(
+    post,
+    path = "/external-services/{id}/members/{member_id}/promote",
+    tag = "External Services",
+    responses(
+        (status = 202, description = "Promotion initiated"),
+        (status = 400, description = "Validation failed (monitor, already primary, not running, etc.)"),
+        (status = 404, description = "Service or member not found"),
+        (status = 500, description = "pg_autoctl perform promotion failed")
+    ),
+    params(
+        ("id" = i32, Path, description = "External service ID"),
+        ("member_id" = i32, Path, description = "Cluster member ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn promote_cluster_member(
+    State(app_state): State<Arc<AppState>>,
+    Path((id, member_id)): Path<(i32, i32)>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesWrite);
+
+    match app_state
+        .external_service_manager
+        .promote_cluster_member(id, member_id)
+        .await
+    {
+        Ok(()) => {
+            // Pull the member name for the audit log; failure here is
+            // non-fatal (we already promoted, the audit row just won't
+            // include the container name).
+            let (service_name, container_name) = match (
+                app_state.external_service_manager.get_service(id).await,
+                app_state
+                    .external_service_manager
+                    .get_cluster_member(id, member_id)
+                    .await,
+            ) {
+                (Ok(svc), Ok(m)) => (svc.name, m.container_name),
+                _ => (String::new(), String::new()),
+            };
+
+            let audit = ExternalServiceClusterMemberPromotedAudit {
+                context: AuditContext {
+                    user_id: auth.user_id(),
+                    ip_address: Some(metadata.ip_address.clone()),
+                    user_agent: metadata.user_agent.clone(),
+                },
+                service_id: id,
+                service_name,
+                member_id,
+                container_name,
+            };
+            if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+                error!("Failed to create audit log: {}", e);
+            }
+
+            Ok(StatusCode::ACCEPTED)
+        }
+        Err(e) => {
+            error!(
+                "Failed to promote cluster member {} on service {}: {}",
+                member_id, id, e
+            );
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                Err(not_found().detail(msg).build())
+            } else if msg.contains("only valid for")
+                || msg.contains("only supported for")
+                || msg.contains("does not belong")
+                || msg.contains("Cannot promote")
+                || msg.contains("already the primary")
+                || msg.contains("not running")
+            {
+                Err(bad_request().detail(msg).build())
+            } else {
+                Err(internal_server_error()
+                    .detail(format!("Failed to promote cluster member: {}", e))
+                    .build())
+            }
+        }
+    }
+}
+
 /// Stop an external service
 #[utoipa::path(
     post,
@@ -1893,6 +1988,7 @@ async fn get_service_preview_environment_variables_masked(
         add_cluster_member,
         get_cluster_member,
         remove_cluster_member,
+        promote_cluster_member,
         link_service_to_project,
         unlink_service_from_project,
         list_service_projects,

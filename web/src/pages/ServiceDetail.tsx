@@ -113,6 +113,10 @@ export function ServiceDetail() {
     container_name: string
     role: string
   } | null>(null)
+  const [memberToPromote, setMemberToPromote] = useState<{
+    id: number
+    container_name: string
+  } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [prevStatus, setPrevStatus] = useState<string | undefined>(undefined)
   const [visibleParameters, setVisibleParameters] = useState<Set<string>>(
@@ -380,6 +384,42 @@ export function ServiceDetail() {
     },
     onError: (error: Error) => {
       toast.error('Failed to remove cluster member', {
+        description: error.message,
+      })
+    },
+  })
+
+  // Promote a replica to primary by triggering a pg_auto_failover
+  // failover. The backend runs `pg_autoctl perform promotion` inside
+  // the chosen container; the monitor demotes the current primary and
+  // the role reconciler refreshes role-aliased VIPs on its next tick.
+  const promoteMember = useMutation({
+    mutationFn: async (options: {
+      serviceId: number
+      memberId: number
+    }) => {
+      const response = await fetch(
+        `/api/external-services/${options.serviceId}/members/${options.memberId}/promote`,
+        {
+          method: 'POST',
+          credentials: 'include',
+        }
+      )
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}))
+        throw new Error(err.detail || 'Failed to promote member')
+      }
+    },
+    onSuccess: () => {
+      toast.success('Promotion initiated', {
+        description:
+          'pg_auto_failover will demote the current primary and promote this replica. The role reconciler refreshes DNS within ~30s.',
+      })
+      setMemberToPromote(null)
+      refetch()
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to promote cluster member', {
         description: error.message,
       })
     },
@@ -829,6 +869,14 @@ export function ServiceDetail() {
                         member.role !== 'primary' &&
                         !wouldBreakQuorum &&
                         service.service.status === 'running'
+                      // Promote: any running data member that isn't
+                      // already the primary or the monitor. Backend
+                      // re-validates so this is purely UI courtesy.
+                      const promotable =
+                        member.role !== 'monitor' &&
+                        member.role !== 'primary' &&
+                        member.status === 'running' &&
+                        service.service.status === 'running'
                       return (
                         <div
                           key={member.id}
@@ -887,6 +935,23 @@ export function ServiceDetail() {
                               )}
                               {member.status}
                             </Badge>
+                            {promotable && (
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                                aria-label={`Promote ${member.container_name} to primary`}
+                                title="Promote to primary"
+                                onClick={() =>
+                                  setMemberToPromote({
+                                    id: member.id,
+                                    container_name: member.container_name,
+                                  })
+                                }
+                              >
+                                <ArrowUpCircle className="h-4 w-4" />
+                              </Button>
+                            )}
                             {removable && (
                               <Button
                                 variant="ghost"
@@ -1412,6 +1477,55 @@ export function ServiceDetail() {
                 <Loader2 className="h-4 w-4 mr-2 animate-spin" />
               )}
               Remove Member
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={!!memberToPromote}
+        onOpenChange={(open) => {
+          if (!open) setMemberToPromote(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Promote to Primary</DialogTitle>
+            <DialogDescription>
+              Trigger a pg_auto_failover failover so{' '}
+              <span className="font-mono text-foreground">
+                {memberToPromote?.container_name}
+              </span>{' '}
+              becomes the new primary. The current primary will be
+              demoted to a replica. Brief write unavailability is
+              expected during the transition (typically a few seconds).
+              The role reconciler refreshes the role-aliased VIP DNS
+              records on its next tick (≤30s) so app connections that
+              use the FQDN follow without restart.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setMemberToPromote(null)}
+              disabled={promoteMember.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() =>
+                memberToPromote &&
+                promoteMember.mutate({
+                  serviceId: parseInt(id!),
+                  memberId: memberToPromote.id,
+                })
+              }
+              disabled={promoteMember.isPending}
+            >
+              {promoteMember.isPending && (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              )}
+              Promote
             </Button>
           </DialogFooter>
         </DialogContent>
