@@ -74,6 +74,7 @@ mod m20260424_000001_create_secrets;
 mod m20260427_000001_add_compute_network;
 mod m20260427_000002_add_dns_service_endpoints;
 mod m20260427_000003_add_compute_ip_to_service_members;
+mod m20260427_000004_add_provisioning_to_service_members;
 
 pub struct Migrator;
 
@@ -151,6 +152,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260427_000001_add_compute_network::Migration),
             Box::new(m20260427_000002_add_dns_service_endpoints::Migration),
             Box::new(m20260427_000003_add_compute_ip_to_service_members::Migration),
+            Box::new(m20260427_000004_add_provisioning_to_service_members::Migration),
         ]
     }
 }

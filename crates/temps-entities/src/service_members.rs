@@ -34,6 +34,14 @@ pub struct Model {
     pub ordinal: i32,
     /// Encrypted member-specific config overrides
     pub config: Option<String>,
+    /// Last-attempted phase of the async `add_cluster_member` background
+    /// task (e.g. `validating`, `provisioning_container`, `done`). NULL
+    /// for members that didn't go through that path. The frontend uses
+    /// this to render a live timeline while the new replica spins up.
+    pub provisioning_step: Option<String>,
+    /// Most recent error seen by the background provisioning task. Set
+    /// only when `status = 'failed'` so the UI can surface why.
+    pub provisioning_error: Option<String>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

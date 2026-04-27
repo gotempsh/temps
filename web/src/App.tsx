@@ -69,6 +69,11 @@ const MajorUpgradeDetail = lazy(() =>
     default: m.MajorUpgradeDetail,
   }))
 )
+const AddClusterMember = lazy(() =>
+  import('./pages/AddClusterMember').then((m) => ({
+    default: m.AddClusterMember,
+  }))
+)
 const Users = lazy(() =>
   import('./pages/Users').then((m) => ({ default: m.Users }))
 )
@@ -375,6 +380,7 @@ const FullAppRoutes = () => {
                 <Route path="/storage/:id/browse" element={<ServiceDataBrowser />} />
                 <Route path="/storage/:id/restore" element={<ServiceRestore />} />
                 <Route path="/storage/:id/upgrades/:upgradeId" element={<MajorUpgradeDetail />} />
+                <Route path="/storage/:id/members/add" element={<AddClusterMember />} />
                 <Route path="/email" element={<Email />} />
                 <Route path="/email/domains/:id" element={<EmailDomainDetail />} />
                 <Route path="/email/:id" element={<EmailDetail />} />

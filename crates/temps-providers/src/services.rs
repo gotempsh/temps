@@ -348,6 +348,54 @@ pub struct ServiceMemberInfo {
     /// prefers this over `hostname` because it's the only path that
     /// reliably reaches the container from any node.
     pub compute_ip: Option<String>,
+    /// Most recent phase of the background add-member provisioning task,
+    /// when applicable. See `MemberProvisioningStep` for the canonical
+    /// step names. NULL for members not created through that flow.
+    pub provisioning_step: Option<String>,
+    pub provisioning_error: Option<String>,
+}
+
+/// Validated, fully-resolved input for the background member-creation
+/// task. Built once by `plan_add_cluster_member` and handed off to the
+/// spawned task; nothing inside it requires a DB lookup, so the task
+/// never has to revalidate.
+#[derive(Clone)]
+struct AddMemberPlan {
+    service_id: i32,
+    #[allow(dead_code)]
+    service_name: String,
+    spec: ClusterMemberSpec,
+    container_name: String,
+    member_fqdn: String,
+    member_port: u16,
+    member_params: crate::externalsvc::postgres_cluster::ClusterMemberCreateParams,
+}
+
+/// Phases of the async `add_cluster_member` task. The strings here are
+/// what gets written to `service_members.provisioning_step`; the
+/// frontend renders them as a checklist.
+///
+/// Ordering: each step starts when the previous one finishes, so a
+/// member at `provisioning_container` has already passed `validating`
+/// and `inserting_row`. `done` and `failed` are terminal.
+pub mod member_provisioning_step {
+    pub const VALIDATING: &str = "validating";
+    pub const RESOLVING_MONITOR: &str = "resolving_monitor";
+    pub const INSERTING_ROW: &str = "inserting_row";
+    pub const PROVISIONING_CONTAINER: &str = "provisioning_container";
+    pub const REGISTERING_DNS: &str = "registering_dns";
+    pub const DONE: &str = "done";
+    pub const FAILED: &str = "failed";
+
+    /// Ordered list, used by the frontend timeline.
+    pub const ORDER: &[&str] = &[
+        VALIDATING,
+        RESOLVING_MONITOR,
+        INSERTING_ROW,
+        PROVISIONING_CONTAINER,
+        REGISTERING_DNS,
+        DONE,
+    ];
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1608,6 +1656,8 @@ impl ExternalServiceManager {
                 status: m.status,
                 ordinal: m.ordinal,
                 compute_ip: m.compute_ip,
+                provisioning_step: m.provisioning_step,
+                provisioning_error: m.provisioning_error,
             })
             .collect())
     }
@@ -3170,27 +3220,101 @@ impl ExternalServiceManager {
         self.get_service_info(service_id).await
     }
 
-    /// Add a single new member (currently only `replica` is supported) to a
-    /// running Postgres cluster. The new container is provisioned on the
-    /// requested node, registered with the existing pg_auto_failover monitor,
-    /// inserted into `service_members`, and given a Tier-2 DNS A record so
-    /// the role reconciler will pick it up on its next tick.
+    /// Begin adding a single new member (currently only `replica`) to a
+    /// running Postgres cluster.
     ///
-    /// Returns `ServiceMemberInfo` for the newly created member.
+    /// **Returns immediately** after validating the request, resolving the
+    /// existing monitor, and inserting a `service_members` row with
+    /// `status='creating'` and `provisioning_step='inserting_row'`. The
+    /// long-running container provisioning + DNS registration runs in a
+    /// background tokio task that updates `provisioning_step` (and
+    /// eventually `status='running'` / `status='failed'` +
+    /// `provisioning_error`) so the UI can render a live timeline by
+    /// polling the member row.
     ///
-    /// Refuses to add `monitor` (singletons — created once at init) or
+    /// Refuses `monitor` (singleton — created once at init) and
     /// `primary` (elected by pg_auto_failover, never declared by the user).
     pub async fn add_cluster_member(
-        &self,
+        self: &Arc<Self>,
         service_id: i32,
         role: &str,
         node_id: Option<i32>,
     ) -> Result<ServiceMemberInfo, ExternalServiceError> {
+        let plan = self
+            .plan_add_cluster_member(service_id, role, node_id)
+            .await?;
+
+        // Insert the placeholder row up front — the UI starts polling on
+        // it as soon as the response lands. We mark the step explicitly
+        // so a quick poll catches the right state even if the spawn task
+        // hasn't gotten a slice of CPU yet.
+        let now = Utc::now();
+        let member_record = service_members::ActiveModel {
+            service_id: Set(service_id),
+            node_id: Set(plan.spec.node_id),
+            role: Set(plan.spec.role.clone()),
+            container_id: Set(None),
+            container_name: Set(plan.container_name.clone()),
+            hostname: Set(plan.spec.hostname.clone()),
+            port: Set(None),
+            status: Set("creating".to_string()),
+            ordinal: Set(plan.spec.ordinal),
+            config: Set(None),
+            provisioning_step: Set(Some(member_provisioning_step::INSERTING_ROW.to_string())),
+            provisioning_error: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        let member_model = member_record.insert(self.db.as_ref()).await?;
+        let member_id = member_model.id;
+
+        // Spawn the long-running provisioning task. It owns its own Arc
+        // clone of the manager so it can run independently of the request.
+        let manager = self.clone();
+        let plan_for_task = plan.clone();
+        tokio::spawn(async move {
+            manager
+                .complete_add_cluster_member(member_id, plan_for_task)
+                .await;
+        });
+
+        info!(
+            service_id,
+            member_id,
+            ordinal = plan.spec.ordinal,
+            "Cluster member provisioning started — see member.provisioning_step for live status"
+        );
+
+        Ok(ServiceMemberInfo {
+            id: member_model.id,
+            role: member_model.role,
+            node_id: member_model.node_id,
+            container_name: member_model.container_name,
+            hostname: member_model.hostname,
+            port: member_model.port,
+            status: member_model.status,
+            ordinal: member_model.ordinal,
+            compute_ip: member_model.compute_ip,
+            provisioning_step: member_model.provisioning_step,
+            provisioning_error: member_model.provisioning_error,
+        })
+    }
+
+    /// Validate the add-member request and resolve everything needed by
+    /// the background provisioner. Anything that should fail synchronously
+    /// (returning a 400 to the user) belongs here.
+    async fn plan_add_cluster_member(
+        &self,
+        service_id: i32,
+        role: &str,
+        node_id: Option<i32>,
+    ) -> Result<AddMemberPlan, ExternalServiceError> {
         info!(
             service_id,
             role,
             node_id = ?node_id,
-            "Adding cluster member"
+            "Adding cluster member (validating)"
         );
 
         let service = self.get_service(service_id).await?;
@@ -3212,9 +3336,6 @@ impl ExternalServiceManager {
             });
         }
 
-        // Currently only `replica` can be added at runtime. Monitor and
-        // primary are created once during init: monitor is a singleton,
-        // primary is elected by pg_auto_failover.
         if role != "replica" {
             return Err(ExternalServiceError::ParameterValidationFailed {
                 service_id,
@@ -3233,7 +3354,6 @@ impl ExternalServiceManager {
             }
         })?;
 
-        // Only Postgres is wired today; future engines hook in here.
         let pg_cluster = match service_type {
             ServiceType::Postgres => {
                 PostgresClusterService::new(service.name.clone(), self.docker.clone())
@@ -3249,9 +3369,6 @@ impl ExternalServiceManager {
             }
         };
 
-        // Find the existing monitor — required so the new replica can
-        // register with it. If the monitor is missing, the cluster is
-        // broken and we shouldn't paper over that here.
         let existing_members = service_members::Entity::find()
             .filter(service_members::Column::ServiceId.eq(service_id))
             .order_by_asc(service_members::Column::Ordinal)
@@ -3266,19 +3383,14 @@ impl ExternalServiceManager {
                 reason: "Cannot add member: cluster has no monitor".to_string(),
             })?;
 
-        // The monitor's hostname is what the new node will pass to
-        // `pg_autoctl create postgres --monitor=...`. Prefer the FQDN
-        // recorded in service_members (set during init), falling back to
-        // the underlay private_address of the monitor's node, then to
-        // the monitor's container name for single-host setups.
         let monitor_hostname: String = if let Some(h) = monitor.hostname.as_deref() {
             h.to_string()
-        } else if let Some(node_id) = monitor.node_id {
-            let node = nodes::Entity::find_by_id(node_id)
+        } else if let Some(nid) = monitor.node_id {
+            let node = nodes::Entity::find_by_id(nid)
                 .one(self.db.as_ref())
                 .await?
                 .ok_or(ExternalServiceError::InternalError {
-                    reason: format!("Monitor's node {} not found", node_id),
+                    reason: format!("Monitor's node {} not found", nid),
                 })?;
             node.private_address.clone()
         } else {
@@ -3291,8 +3403,6 @@ impl ExternalServiceManager {
                 reason: "Monitor has no host port recorded".to_string(),
             })? as u16;
 
-        // Pick the next ordinal — pg_auto_failover doesn't care about gaps,
-        // but we want a stable, deterministic name (`postgres-<svc>-<n>`).
         let next_ordinal = existing_members
             .iter()
             .map(|m| m.ordinal)
@@ -3300,10 +3410,6 @@ impl ExternalServiceManager {
             .unwrap_or(-1)
             + 1;
 
-        // Resolve the new member's hostname for inter-member traffic.
-        // Same rules as initialize_cluster: remote → node.private_address,
-        // local → control plane's own private IP (when there are remote
-        // members) so the monitor and other replicas can reach it.
         let has_any_remote =
             existing_members.iter().any(|m| m.node_id.is_some()) || node_id.is_some();
         let local_private_ip: Option<String> = if has_any_remote && node_id.is_none() {
@@ -3336,11 +3442,9 @@ impl ExternalServiceManager {
             role: role.to_string(),
             node_id,
             ordinal: next_ordinal,
-            hostname: hostname.clone(),
+            hostname,
         };
 
-        // Pull the parsed cluster config so build_member_params has
-        // database/username/password/etc.
         let parameters = self.get_service_parameters(service_id).await?;
         let service_config = ServiceConfig {
             name: service.name.clone(),
@@ -3359,8 +3463,6 @@ impl ExternalServiceManager {
                 }
             })?;
 
-        // Same port-allocation rule as initialize_cluster:
-        //   base_port = 6000 + service_id*10, monitor=base, data=base+ordinal
         let base_port = 6000u16 + (service_id as u16 * 10);
         let member_port = base_port + spec.ordinal as u16;
 
@@ -3372,45 +3474,69 @@ impl ExternalServiceManager {
             member_port,
         );
         let container_name = member_params.container_name.clone();
+        let member_fqdn = format!(
+            "{}-{}.{}.temps.local",
+            service.name, spec.ordinal, service.name
+        );
 
-        // Insert "creating" row first so the UI can track the new member
-        // even if container creation hangs.
-        let member_record = service_members::ActiveModel {
-            service_id: Set(service_id),
-            node_id: Set(spec.node_id),
-            role: Set(spec.role.clone()),
-            container_id: Set(None),
-            container_name: Set(container_name.clone()),
-            hostname: Set(spec.hostname.clone()),
-            port: Set(None),
-            status: Set("creating".to_string()),
-            ordinal: Set(spec.ordinal),
-            config: Set(None),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let member_model = member_record.insert(self.db.as_ref()).await?;
-        let member_id = member_model.id;
+        Ok(AddMemberPlan {
+            service_id,
+            service_name: service.name.clone(),
+            spec,
+            container_name,
+            member_fqdn,
+            member_port,
+            member_params,
+        })
+    }
 
-        // Create the container — local or remote — and capture its
-        // overlay IP so the role reconciler can publish a DNS record.
+    /// Background half of `add_cluster_member`. Owns the long-running
+    /// container creation + DNS registration. Updates the row's
+    /// `provisioning_step` after each phase so the UI's polling loop
+    /// can render progress.
+    async fn complete_add_cluster_member(self: Arc<Self>, member_id: i32, plan: AddMemberPlan) {
+        let service_id = plan.service_id;
+        let ordinal = plan.spec.ordinal;
+
+        info!(
+            service_id,
+            member_id,
+            ordinal,
+            container = %plan.container_name,
+            "Provisioning replica container"
+        );
+        self.set_provisioning_step(member_id, member_provisioning_step::PROVISIONING_CONTAINER)
+            .await;
+
         let create_outcome: Result<(String, Option<i32>, Option<String>), ExternalServiceError> =
-            if let Some(nid) = spec.node_id {
-                let client = self.get_remote_client(nid).await?;
-                let volume_name = format!("{}_data", container_name);
+            if let Some(nid) = plan.spec.node_id {
+                let client = match self.get_remote_client(nid).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.fail_member(
+                            member_id,
+                            format!(
+                                "Could not reach worker node {} to provision container: {}",
+                                nid, e
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let volume_name = format!("{}_data", plan.container_name);
                 let remote_params = RemoteServiceCreateParams {
-                    name: container_name.clone(),
+                    name: plan.container_name.clone(),
                     service_type: "postgres".to_string(),
-                    image: member_params.image.clone(),
-                    environment: member_params.environment.clone(),
+                    image: plan.member_params.image.clone(),
+                    environment: plan.member_params.environment.clone(),
                     port_mappings: vec![RemotePortMapping {
-                        host_port: member_params.container_port,
-                        container_port: member_params.container_port,
+                        host_port: plan.member_params.container_port,
+                        container_port: plan.member_params.container_port,
                     }],
-                    volumes: HashMap::from([(volume_name, member_params.volume_path.clone())]),
+                    volumes: HashMap::from([(volume_name, plan.member_params.volume_path.clone())]),
                     network: Some(temps_core::NETWORK_NAME.to_string()),
-                    command: member_params.command.clone(),
+                    command: plan.member_params.command.clone(),
                 };
                 client
                     .create_service(remote_params)
@@ -3420,17 +3546,17 @@ impl ExternalServiceManager {
                         id: service_id,
                         reason: format!(
                             "Failed to create cluster member '{}' on node {}: {}",
-                            container_name, nid, e
+                            plan.container_name, nid, e
                         ),
                     })
             } else {
-                self.create_local_cluster_member(&container_name, &member_params)
+                self.create_local_cluster_member(&plan.container_name, &plan.member_params)
                     .await
                     .map_err(|e| ExternalServiceError::InitializationFailed {
                         id: service_id,
                         reason: format!(
                             "Failed to create local cluster member '{}': {}",
-                            container_name, e
+                            plan.container_name, e
                         ),
                     })
             };
@@ -3438,43 +3564,59 @@ impl ExternalServiceManager {
         let (container_id, host_port, compute_ip) = match create_outcome {
             Ok(t) => t,
             Err(e) => {
-                // Roll back the half-inserted row so the cluster's member
-                // list stays consistent with reality.
-                let _ = service_members::Entity::delete_by_id(member_id)
-                    .exec(self.db.as_ref())
-                    .await;
-                return Err(e);
+                self.fail_member(member_id, e.to_string()).await;
+                return;
             }
         };
 
-        // Compute the canonical FQDN (matches initialize_cluster's scheme).
-        let member_fqdn = format!(
-            "{}-{}.{}.temps.local",
-            service.name, spec.ordinal, service.name
-        );
+        // Promote the row to "running" with the live container metadata.
+        let updated_at = Utc::now();
+        let update_result = service_members::Entity::update_many()
+            .col_expr(
+                service_members::Column::ContainerId,
+                Expr::value(container_id),
+            )
+            .col_expr(service_members::Column::Port, Expr::value(host_port))
+            .col_expr(service_members::Column::Status, Expr::value("running"))
+            .col_expr(
+                service_members::Column::Hostname,
+                Expr::value(plan.member_fqdn.clone()),
+            )
+            .col_expr(
+                service_members::Column::ComputeIp,
+                Expr::value(compute_ip.clone()),
+            )
+            .col_expr(
+                service_members::Column::ProvisioningStep,
+                Expr::value(member_provisioning_step::REGISTERING_DNS),
+            )
+            .col_expr(service_members::Column::UpdatedAt, Expr::value(updated_at))
+            .filter(service_members::Column::Id.eq(member_id))
+            .exec(self.db.as_ref())
+            .await;
+        if let Err(e) = update_result {
+            self.fail_member(
+                member_id,
+                format!("Container created but DB update failed: {}", e),
+            )
+            .await;
+            return;
+        }
 
-        // Promote "creating" → "running" with full container metadata.
-        let mut member_update: service_members::ActiveModel = member_model.into();
-        member_update.container_id = Set(Some(container_id));
-        member_update.port = Set(host_port);
-        member_update.status = Set("running".to_string());
-        member_update.hostname = Set(Some(member_fqdn.clone()));
-        member_update.compute_ip = Set(compute_ip.clone());
-        member_update.updated_at = Set(Utc::now());
-        let updated = member_update.update(self.db.as_ref()).await?;
-
-        // Register Tier-2 DNS A record (best-effort — same fallback policy
-        // as initialize_cluster: log loudly, don't fail the add).
+        // Register Tier-2 DNS A record. Same best-effort policy as
+        // `initialize_cluster`: a failed registration logs loudly but
+        // doesn't mark the member as failed — the role reconciler will
+        // try again on its next tick.
         if let Some(ip) = compute_ip.clone() {
             let draft = temps_dns::EndpointDraft {
-                fqdn: member_fqdn.clone(),
+                fqdn: plan.member_fqdn.clone(),
                 record_type: temps_dns::InternalRecordType::A,
                 target_ip: Some(ip.clone()),
-                target_port: Some(member_port as i32),
+                target_port: Some(plan.member_port as i32),
                 ttl: 30,
                 owner_kind: temps_dns::InternalOwnerKind::ServiceMember,
                 owner_id: member_id as i64,
-                node_id: spec.node_id,
+                node_id: plan.spec.node_id,
             };
             if let Err(e) = self
                 .dns_registry
@@ -3488,7 +3630,7 @@ impl ExternalServiceManager {
                 warn!(
                     service_id,
                     member_id,
-                    fqdn = %member_fqdn,
+                    fqdn = %plan.member_fqdn,
                     ip = %ip,
                     error = %e,
                     "Failed to register DNS record for added cluster member"
@@ -3497,30 +3639,100 @@ impl ExternalServiceManager {
                 info!(
                     service_id,
                     member_id,
-                    fqdn = %member_fqdn,
+                    fqdn = %plan.member_fqdn,
                     ip = %ip,
                     "Registered DNS A record for added cluster member"
                 );
             }
         }
 
+        self.set_provisioning_step(member_id, member_provisioning_step::DONE)
+            .await;
         info!(
             service_id,
             member_id,
-            ordinal = spec.ordinal,
+            ordinal,
             "Cluster member added; reconciler will refresh role records on next tick"
         );
+    }
+
+    /// Update the member row's `provisioning_step` field. Used by the
+    /// background provisioning task at each phase boundary so the
+    /// frontend's polling loop can render progress.
+    async fn set_provisioning_step(&self, member_id: i32, step: &str) {
+        let result = service_members::Entity::update_many()
+            .col_expr(service_members::Column::ProvisioningStep, Expr::value(step))
+            .col_expr(service_members::Column::UpdatedAt, Expr::value(Utc::now()))
+            .filter(service_members::Column::Id.eq(member_id))
+            .exec(self.db.as_ref())
+            .await;
+        if let Err(e) = result {
+            warn!(
+                member_id,
+                step,
+                error = %e,
+                "Failed to write provisioning_step"
+            );
+        }
+    }
+
+    /// Mark the member as failed and stash the error message so the UI
+    /// can render it. Best-effort: a DB write failure here is logged but
+    /// can't be recovered from.
+    async fn fail_member(&self, member_id: i32, error_message: String) {
+        warn!(
+            member_id,
+            error = %error_message,
+            "Cluster member provisioning failed"
+        );
+        let result = service_members::Entity::update_many()
+            .col_expr(service_members::Column::Status, Expr::value("failed"))
+            .col_expr(
+                service_members::Column::ProvisioningStep,
+                Expr::value(member_provisioning_step::FAILED),
+            )
+            .col_expr(
+                service_members::Column::ProvisioningError,
+                Expr::value(error_message),
+            )
+            .col_expr(service_members::Column::UpdatedAt, Expr::value(Utc::now()))
+            .filter(service_members::Column::Id.eq(member_id))
+            .exec(self.db.as_ref())
+            .await;
+        if let Err(e) = result {
+            warn!(member_id, error = %e, "Failed to mark member as failed");
+        }
+    }
+
+    /// Look up a single cluster member. Returns `NotFound` if the row
+    /// doesn't belong to the named service so callers can return a 404
+    /// without leaking the existence of unrelated members.
+    pub async fn get_cluster_member(
+        &self,
+        service_id: i32,
+        member_id: i32,
+    ) -> Result<ServiceMemberInfo, ExternalServiceError> {
+        let member = service_members::Entity::find_by_id(member_id)
+            .one(self.db.as_ref())
+            .await?
+            .filter(|m| m.service_id == service_id)
+            .ok_or(ExternalServiceError::InitializationFailed {
+                id: service_id,
+                reason: format!("Cluster member {} not found", member_id),
+            })?;
 
         Ok(ServiceMemberInfo {
-            id: updated.id,
-            role: updated.role,
-            node_id: updated.node_id,
-            container_name: updated.container_name,
-            hostname: updated.hostname,
-            port: updated.port,
-            status: updated.status,
-            ordinal: updated.ordinal,
-            compute_ip: updated.compute_ip,
+            id: member.id,
+            role: member.role,
+            node_id: member.node_id,
+            container_name: member.container_name,
+            hostname: member.hostname,
+            port: member.port,
+            status: member.status,
+            ordinal: member.ordinal,
+            compute_ip: member.compute_ip,
+            provisioning_step: member.provisioning_step,
+            provisioning_error: member.provisioning_error,
         })
     }
 
@@ -5533,7 +5745,7 @@ mod tests {
             .port()
     }
     #[cfg(feature = "docker-tests")]
-    async fn setup_test_manager() -> (ExternalServiceManager, TestDatabase) {
+    async fn setup_test_manager() -> (Arc<ExternalServiceManager>, TestDatabase) {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.db.clone();
 
@@ -5542,8 +5754,12 @@ mod tests {
         let docker = Arc::new(Docker::connect_with_local_defaults().ok().unwrap());
 
         let dns_registry = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
-        let manager =
-            ExternalServiceManager::new(db, encryption_service, docker.clone(), dns_registry);
+        let manager = Arc::new(ExternalServiceManager::new(
+            db,
+            encryption_service,
+            docker.clone(),
+            dns_registry,
+        ));
         (manager, test_db)
     }
 

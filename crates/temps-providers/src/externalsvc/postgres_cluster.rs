@@ -584,6 +584,7 @@ impl ExternalService for PostgresClusterService {
 /// Build `RemoteServiceCreateParams`-compatible data for a cluster member.
 /// This is called by `ExternalServiceManager` when dispatching member creation
 /// to remote worker nodes via the agent API.
+#[derive(Clone)]
 pub struct ClusterMemberCreateParams {
     pub container_name: String,
     pub image: String,

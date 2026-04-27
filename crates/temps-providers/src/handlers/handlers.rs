@@ -265,7 +265,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/external-services/{id}/members", post(add_cluster_member))
         .route(
             "/external-services/{id}/members/{member_id}",
-            delete(remove_cluster_member),
+            get(get_cluster_member).delete(remove_cluster_member),
         )
         .route("/external-services/{id}/upgrade", post(upgrade_service))
         .route(
@@ -1158,20 +1158,21 @@ async fn retry_cluster(
     }
 }
 
-/// Add a single new member to a running cluster.
+/// Begin adding a single new member to a running cluster.
 ///
-/// Currently only `replica` members can be added at runtime. The new
-/// container is provisioned on the requested node, registered with the
-/// cluster's existing pg_auto_failover monitor, and given a Tier-2 DNS
-/// A record. The role reconciler will refresh the role-aliased VIP records
-/// on its next tick (≤30s).
+/// Currently only `replica` members can be added at runtime. The
+/// response is **202 Accepted** as soon as the validation passes and
+/// the placeholder `service_members` row is inserted. The actual
+/// container provisioning + DNS registration runs in the background;
+/// poll `GET /external-services/{id}/members/{member_id}` to watch
+/// `provisioning_step` advance through the phases.
 #[utoipa::path(
     post,
     path = "/external-services/{id}/members",
     tag = "External Services",
     request_body = AddClusterMemberRequest,
     responses(
-        (status = 201, description = "Cluster member added", body = ServiceMemberInfo),
+        (status = 202, description = "Cluster member provisioning started", body = ServiceMemberInfo),
         (status = 400, description = "Validation failed (wrong topology, status, or role)"),
         (status = 404, description = "Service not found"),
         (status = 500, description = "Internal server error")
@@ -1220,7 +1221,7 @@ async fn add_cluster_member(
             }
 
             let wire: ServiceMemberInfo = member.into();
-            Ok((StatusCode::CREATED, Json(wire)))
+            Ok((StatusCode::ACCEPTED, Json(wire)))
         }
         Err(e) => {
             error!("Failed to add cluster member to service {}: {}", id, e);
@@ -1239,6 +1240,57 @@ async fn add_cluster_member(
             } else {
                 Err(internal_server_error()
                     .detail(format!("Failed to add cluster member: {}", e))
+                    .build())
+            }
+        }
+    }
+}
+
+/// Get a single cluster member's current state.
+///
+/// Used by the add-member page to poll the row every second while the
+/// background provisioning task walks through its phases. The
+/// `provisioning_step` field advances through `inserting_row` →
+/// `provisioning_container` → `registering_dns` → `done` (or `failed`
+/// with `provisioning_error` set).
+#[utoipa::path(
+    get,
+    path = "/external-services/{id}/members/{member_id}",
+    tag = "External Services",
+    responses(
+        (status = 200, description = "Cluster member details", body = ServiceMemberInfo),
+        (status = 404, description = "Service or member not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "External service ID"),
+        ("member_id" = i32, Path, description = "Cluster member ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_cluster_member(
+    State(app_state): State<Arc<AppState>>,
+    Path((id, member_id)): Path<(i32, i32)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+
+    match app_state
+        .external_service_manager
+        .get_cluster_member(id, member_id)
+        .await
+    {
+        Ok(member) => {
+            let wire: ServiceMemberInfo = member.into();
+            Ok((StatusCode::OK, Json(wire)))
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                Err(not_found().detail(msg).build())
+            } else {
+                Err(internal_server_error()
+                    .detail(format!("Failed to load cluster member: {}", e))
                     .build())
             }
         }
@@ -1839,6 +1891,7 @@ async fn get_service_preview_environment_variables_masked(
         stop_service,
         retry_cluster,
         add_cluster_member,
+        get_cluster_member,
         remove_cluster_member,
         link_service_to_project,
         unlink_service_from_project,

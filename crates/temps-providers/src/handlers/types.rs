@@ -204,6 +204,17 @@ pub struct ServiceMemberInfo {
     /// clusters where the overlay isn't attached.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compute_ip: Option<String>,
+    /// Last-attempted phase of the async `add_cluster_member` background
+    /// task (e.g. `validating`, `provisioning_container`, `done`,
+    /// `failed`). `None` for members not created through that flow —
+    /// the UI falls back to the `status` column for those.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provisioning_step: Option<String>,
+    /// Most recent provisioning failure message, when `status='failed'`.
+    /// Set by the background task so the UI can show *why* the new
+    /// replica didn't come up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provisioning_error: Option<String>,
 }
 
 impl From<crate::services::ServiceMemberInfo> for ServiceMemberInfo {
@@ -218,6 +229,8 @@ impl From<crate::services::ServiceMemberInfo> for ServiceMemberInfo {
             status: m.status,
             ordinal: m.ordinal,
             compute_ip: m.compute_ip,
+            provisioning_step: m.provisioning_step,
+            provisioning_error: m.provisioning_error,
         }
     }
 }
