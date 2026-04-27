@@ -2836,18 +2836,33 @@ impl ExternalServiceManager {
                 member_update.update(self.db.as_ref()).await?;
 
                 // Register the per-member A record (ADR-011, Tier 2).
-                // `compute_ip` is `None` only on the monitor (which doesn't
-                // need a DNS record — it's not part of any VIP) or on
-                // single-host clusters where the overlay isn't attached.
-                if let Some(ip) = compute_ip {
+                //
+                // Prefer the overlay IP when the container is on
+                // `temps0` — that points other containers straight at
+                // each other on the multi-host bridge. If the overlay
+                // isn't attached (single-host setups, or the monitor on
+                // a control plane that's not in the allocator), fall
+                // back to the underlay address + the published host
+                // port so dialing through Docker's port forward still
+                // works. This is what makes `MONITOR_URI=<fqdn>:<port>`
+                // resolve from inside any container.
+                let (record_ip, record_port) = match compute_ip.clone() {
+                    Some(ip) => (Some(ip), member_port as i32),
+                    None => match self
+                        .resolve_member_underlay(spec.node_id, host_port, member_port)
+                        .await
+                    {
+                        Some((ip, port)) => (Some(ip), port),
+                        None => (None, member_port as i32),
+                    },
+                };
+
+                if let Some(ip) = record_ip {
                     let draft = temps_dns::EndpointDraft {
                         fqdn: member_fqdn.clone(),
                         record_type: temps_dns::InternalRecordType::A,
                         target_ip: Some(ip.clone()),
-                        target_port: Some(member_port as i32),
-                        // Per-member A records get the same short TTL as
-                        // role records — a member can be restarted with a
-                        // fresh IP at any time.
+                        target_port: Some(record_port),
                         ttl: 30,
                         owner_kind: temps_dns::InternalOwnerKind::ServiceMember,
                         owner_id: member_id as i64,
@@ -2862,10 +2877,6 @@ impl ExternalServiceManager {
                         )
                         .await
                     {
-                        // Non-fatal — apps that resolve via DNS will fall
-                        // back to NXDOMAIN for this member, but the member
-                        // is otherwise healthy. Logged loudly so ops can
-                        // catch a stuck DNS plane.
                         warn!(
                             service_id,
                             member_id,
@@ -2880,6 +2891,7 @@ impl ExternalServiceManager {
                             member_id,
                             fqdn = %member_fqdn,
                             ip = %ip,
+                            port = record_port,
                             "Registered DNS A record for cluster member"
                         );
                     }
@@ -3383,16 +3395,19 @@ impl ExternalServiceManager {
                 reason: "Cannot add member: cluster has no monitor".to_string(),
             })?;
 
-        // The monitor address has to be reachable *from inside the new
-        // container* via Docker's embedded DNS (127.0.0.11). That means
-        // an underlay IP, NOT an FQDN — the temps DNS registry isn't
-        // wired into containers' resolvers, only into the per-host
-        // Hickory resolver that the proxy + apps use. The FQDN stored
-        // in `monitor.hostname` would just NXDOMAIN inside the new
-        // container's pg_autoctl. This mirrors what `initialize_cluster`
-        // does for the original 3 members: remote monitor → its node's
-        // private_address, local monitor → control plane's local IP.
-        let monitor_hostname: String = if let Some(nid) = monitor.node_id {
+        // Prefer the monitor's FQDN — every container we provision now
+        // gets the per-host Hickory resolver wired into resolv.conf
+        // (`HostConfig.dns`), so `postgres-<svc>-0.<svc>.temps.local`
+        // resolves natively from inside the new container.
+        //
+        // Fallbacks (in order) keep older clusters working:
+        //   1. monitor.hostname (FQDN, set by the lifecycle hook)
+        //   2. monitor's node private_address (underlay IP, when remote)
+        //   3. control plane's local IP (when monitor is on this host)
+        //   4. monitor container name (single-host bridge DNS resolves it)
+        let monitor_hostname: String = if let Some(h) = monitor.hostname.as_deref() {
+            h.to_string()
+        } else if let Some(nid) = monitor.node_id {
             let node = nodes::Entity::find_by_id(nid)
                 .one(self.db.as_ref())
                 .await?
@@ -3401,10 +3416,6 @@ impl ExternalServiceManager {
                 })?;
             node.private_address.clone()
         } else {
-            // Monitor lives on the control plane. Use our local IP so
-            // remote workers can reach it; fall back to the container
-            // name for single-host setups where Docker's bridge DNS
-            // resolves it.
             Self::get_local_private_ip()
                 .unwrap_or_else(|_| format!("postgres-{}-monitor", service.name))
         };
@@ -3615,16 +3626,27 @@ impl ExternalServiceManager {
             return;
         }
 
-        // Register Tier-2 DNS A record. Same best-effort policy as
-        // `initialize_cluster`: a failed registration logs loudly but
-        // doesn't mark the member as failed — the role reconciler will
-        // try again on its next tick.
-        if let Some(ip) = compute_ip.clone() {
+        // Register Tier-2 DNS A record. Prefer the overlay IP; fall
+        // back to (node_underlay, host_port) so the FQDN still works
+        // when the overlay isn't attached. Best-effort: a failed
+        // registration logs loudly but doesn't mark the member as
+        // failed — the role reconciler will try again on its next tick.
+        let (record_ip, record_port) = match compute_ip.clone() {
+            Some(ip) => (Some(ip), plan.member_port as i32),
+            None => match self
+                .resolve_member_underlay(plan.spec.node_id, host_port, plan.member_port)
+                .await
+            {
+                Some((ip, port)) => (Some(ip), port),
+                None => (None, plan.member_port as i32),
+            },
+        };
+        if let Some(ip) = record_ip {
             let draft = temps_dns::EndpointDraft {
                 fqdn: plan.member_fqdn.clone(),
                 record_type: temps_dns::InternalRecordType::A,
                 target_ip: Some(ip.clone()),
-                target_port: Some(plan.member_port as i32),
+                target_port: Some(record_port),
                 ttl: 30,
                 owner_kind: temps_dns::InternalOwnerKind::ServiceMember,
                 owner_id: member_id as i64,
@@ -3653,6 +3675,7 @@ impl ExternalServiceManager {
                     member_id,
                     fqdn = %plan.member_fqdn,
                     ip = %ip,
+                    port = record_port,
                     "Registered DNS A record for added cluster member"
                 );
             }
@@ -3955,6 +3978,89 @@ impl ExternalServiceManager {
         Ok(())
     }
 
+    /// Resolve a fallback `(ip, port)` for a cluster member that doesn't
+    /// have an overlay IP. Used by the DNS registration path so the
+    /// member's FQDN still points *somewhere* — even when the overlay
+    /// isn't attached. Returns `(node.private_address, host_port)`
+    /// because that's the address+port docker-proxy listens on for the
+    /// container. Returns `None` if we can't determine either piece.
+    async fn resolve_member_underlay(
+        &self,
+        node_id: Option<i32>,
+        host_port: Option<i32>,
+        container_port: u16,
+    ) -> Option<(String, i32)> {
+        // Without a host port we have nothing useful to publish — the
+        // FQDN can't point at the container's internal port without an
+        // overlay IP.
+        let port = host_port.unwrap_or(container_port as i32);
+
+        let ip = if let Some(nid) = node_id {
+            nodes::Entity::find_by_id(nid)
+                .one(self.db.as_ref())
+                .await
+                .ok()
+                .flatten()
+                .map(|n| n.private_address)
+        } else {
+            // Local member (control plane). Use the same probe the
+            // initialize_cluster path uses to learn this node's IP.
+            Self::get_local_private_ip().ok()
+        }?;
+
+        Some((ip, port))
+    }
+
+    /// Look up the gateway IP of the multi-host overlay docker network
+    /// (`temps0`). The per-host Hickory resolver listens there on :53 —
+    /// every container we create gets it as `--dns` so they can resolve
+    /// `*.temps.local` natively (ADR-011).
+    ///
+    /// Returns `None` when the overlay isn't bootstrapped on this host
+    /// (single-host setups). Callers fall back to Docker's default DNS
+    /// in that case.
+    async fn lookup_overlay_bridge_gateway(&self) -> Option<Vec<String>> {
+        // The overlay docker network name is fixed in temps-network's
+        // Config::default (`temps0`). We don't take a hard dep on
+        // temps-network just for this constant — if it ever changes,
+        // the fallback (None → no DNS) keeps clusters functional, just
+        // without FQDN resolution inside containers.
+        const OVERLAY_NETWORK: &str = "temps0";
+
+        let inspected = match self
+            .docker
+            .inspect_network(
+                OVERLAY_NETWORK,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    network = OVERLAY_NETWORK,
+                    "Overlay docker network not present; skipping DNS injection"
+                );
+                return None;
+            }
+        };
+
+        // The IPAM config has the gateway we set when creating the
+        // network in `temps-network/src/docker.rs`.
+        let gateway = inspected
+            .ipam
+            .as_ref()
+            .and_then(|ipam| ipam.config.as_ref())
+            .and_then(|configs| {
+                configs
+                    .iter()
+                    .find_map(|c| c.gateway.as_deref().filter(|s| !s.is_empty()))
+            });
+
+        gateway.map(|gw| vec![gw.to_string()])
+    }
+
     /// Create a cluster member container on the local Docker daemon.
     ///
     /// Returns `(container_id, host_port, compute_ip)`:
@@ -4028,6 +4134,15 @@ impl ExternalServiceManager {
             }]),
         );
 
+        // Wire the per-host Hickory resolver into the container's
+        // resolv.conf so it can resolve `*.temps.local` natively
+        // (ADR-011). The resolver listens on the bridge gateway IP of
+        // the multi-host overlay (`temps0`); we look that up by
+        // inspecting the network. Fails open: if the overlay isn't up
+        // yet (single-host setups) we just don't set `dns` and fall
+        // back to Docker's default resolver.
+        let dns_servers = self.lookup_overlay_bridge_gateway().await;
+
         // Create container
         let container_config = ContainerCreateBody {
             image: Some(params.image.clone()),
@@ -4036,6 +4151,7 @@ impl ExternalServiceManager {
             host_config: Some(HostConfig {
                 binds: Some(vec![format!("{}:{}", volume_name, params.volume_path)]),
                 port_bindings: Some(port_bindings),
+                dns: dns_servers,
                 restart_policy: Some(RestartPolicy {
                     name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                     maximum_retry_count: None,

@@ -142,10 +142,29 @@ pub async fn create_service(
         .map(|(k, v)| format!("{}={}", k, v))
         .collect();
 
+    // Wire the per-node Hickory resolver into the container's resolv.conf
+    // so it can resolve `*.temps.local` natively (ADR-011). Falls back to
+    // Docker's default DNS when the overlay isn't bootstrapped yet
+    // (single-host setups). Read from the agent's shared slot — published
+    // by `network_sync` once the bridge gateway is up.
+    let dns_servers: Option<Vec<String>> = state
+        .overlay_bridge_address
+        .read()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|ip| vec![ip.to_string()]));
+    if let Some(ref dns) = dns_servers {
+        tracing::debug!(
+            container = %container_name,
+            dns = ?dns,
+            "Wiring temps DNS into container resolv.conf"
+        );
+    }
+
     let host_config = bollard::models::HostConfig {
         binds: Some(binds),
         port_bindings: Some(port_bindings),
         network_mode: request.network.clone(),
+        dns: dns_servers,
         restart_policy: Some(bollard::models::RestartPolicy {
             name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
             maximum_retry_count: None,

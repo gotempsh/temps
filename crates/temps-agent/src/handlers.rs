@@ -31,6 +31,15 @@ pub struct AgentState {
     /// Direct Docker client for service operations (create/exec/backup).
     /// None if Docker is not available (shouldn't happen on a real agent).
     pub docker: Option<bollard::Docker>,
+    /// Bridge gateway IP for the multi-host overlay (`br-temps0`). The
+    /// per-node Hickory DNS resolver listens on this address:53; we
+    /// inject it as `--dns` into every container we create so they can
+    /// resolve `*.temps.local` natively.
+    ///
+    /// Populated by `network_sync` once the overlay is bootstrapped.
+    /// `None` on single-host setups (the overlay never came up); the
+    /// container-create path falls back to Docker's default DNS.
+    pub overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
 }
 
 /// Response wrapper for consistent agent API responses.

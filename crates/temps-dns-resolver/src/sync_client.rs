@@ -1,15 +1,16 @@
 //! Long-poll sync loop against the control plane's
-//! `GET /internal/nodes/{id}/dns/changes` and `POST .../dns/ack` endpoints.
+//! `GET /api/internal/nodes/{id}/dns/changes` and `POST .../dns/ack`
+//! endpoints.
 //!
 //! Runs as a Tokio task. Owns the control-plane HTTP client and writes to
 //! a shared [`ZoneStore`].
 //!
 //! ## Flow per tick
 //!
-//! 1. `GET /internal/nodes/{id}/dns/changes?since={zone.generation()}`.
+//! 1. `GET /api/internal/nodes/{id}/dns/changes?since={zone.generation()}`.
 //! 2. If `full_snapshot: true`, call `ZoneStore::replace`. Else
 //!    `ZoneStore::apply_diff` with `records` (upserts) and `removed_ids`.
-//! 3. `POST /internal/nodes/{id}/dns/ack { applied_generation: response.generation }`.
+//! 3. `POST /api/internal/nodes/{id}/dns/ack { applied_generation: response.generation }`.
 //! 4. Sleep `poll_interval`. On any HTTP error, exponential backoff up to
 //!    `max_backoff`. The zone keeps serving the last successful state.
 
@@ -104,8 +105,10 @@ impl SyncClient {
     /// calls [`Self::run`].
     pub async fn tick_once(&self) -> Result<(), ResolverError> {
         let since = self.zone.generation();
+        // Mounted under /api by the plugin runtime — same as every other
+        // agent → control-plane RPC (heartbeat, peers, etc.).
         let url = format!(
-            "{}/internal/nodes/{}/dns/changes?since={}",
+            "{}/api/internal/nodes/{}/dns/changes?since={}",
             self.config.control_plane_url.trim_end_matches('/'),
             self.config.node_id,
             since
@@ -160,7 +163,7 @@ impl SyncClient {
 
         // ACK back the new generation.
         let ack_url = format!(
-            "{}/internal/nodes/{}/dns/ack",
+            "{}/api/internal/nodes/{}/dns/ack",
             self.config.control_plane_url.trim_end_matches('/'),
             self.config.node_id,
         );
@@ -241,7 +244,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/internal/nodes/1/dns/changes"))
+            .and(path("/api/internal/nodes/1/dns/changes"))
             .and(query_param("since", "0"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "generation": 5,
@@ -254,7 +257,7 @@ mod tests {
             .await;
 
         Mock::given(method("POST"))
-            .and(path("/internal/nodes/1/dns/ack"))
+            .and(path("/api/internal/nodes/1/dns/ack"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "node_id": 1,
                 "applied_generation": 5,
@@ -283,7 +286,7 @@ mod tests {
         zone.replace(3, vec![make_record(1, "a.temps.local", "1.1.1.1", 3)]);
 
         Mock::given(method("GET"))
-            .and(path("/internal/nodes/1/dns/changes"))
+            .and(path("/api/internal/nodes/1/dns/changes"))
             .and(query_param("since", "3"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "generation": 7,
@@ -298,7 +301,7 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/internal/nodes/1/dns/ack"))
+            .and(path("/api/internal/nodes/1/dns/ack"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "node_id": 1, "applied_generation": 7, "server_generation": 7
             })))
@@ -326,7 +329,7 @@ mod tests {
         zone.replace(9, vec![make_record(1, "a.temps.local", "1.1.1.1", 9)]);
 
         Mock::given(method("GET"))
-            .and(path("/internal/nodes/1/dns/changes"))
+            .and(path("/api/internal/nodes/1/dns/changes"))
             .and(query_param("since", "9"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "generation": 9,
@@ -339,7 +342,7 @@ mod tests {
             .await;
         // Ack endpoint should NOT be called when there's nothing new.
         Mock::given(method("POST"))
-            .and(path("/internal/nodes/1/dns/ack"))
+            .and(path("/api/internal/nodes/1/dns/ack"))
             .respond_with(ResponseTemplate::new(500))
             .expect(0)
             .mount(&server)
@@ -356,7 +359,7 @@ mod tests {
     async fn tick_returns_error_on_5xx() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/internal/nodes/1/dns/changes"))
+            .and(path("/api/internal/nodes/1/dns/changes"))
             .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;

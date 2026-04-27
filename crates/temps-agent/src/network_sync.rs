@@ -14,6 +14,7 @@
 
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bollard::Docker;
@@ -66,10 +67,15 @@ const BACKOFF_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Spawn the network-sync background task. Returns immediately; the task
 /// owns its own retry loop and never blocks server startup.
-pub fn spawn(config: &AgentConfig) {
+///
+/// `overlay_bridge_address` is published into once the overlay
+/// bootstraps. The container-create path (`service_handlers.rs`) reads
+/// it to set `--dns=<bridge_ip>` on every container so they can resolve
+/// `*.temps.local` natively via the per-node Hickory resolver.
+pub fn spawn(config: &AgentConfig, overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>) {
     let cfg = config.clone();
     tokio::spawn(async move {
-        if let Err(e) = run(cfg).await {
+        if let Err(e) = run(cfg, overlay_bridge_address).await {
             // The loop is designed to retry forever; reaching this branch
             // means the loop itself unwound, which only happens on
             // unrecoverable invariant violations.
@@ -78,7 +84,10 @@ pub fn spawn(config: &AgentConfig) {
     });
 }
 
-async fn run(config: AgentConfig) -> Result<(), SyncError> {
+async fn run(
+    config: AgentConfig,
+    overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>,
+) -> Result<(), SyncError> {
     info!(
         node_id = config.node_id,
         control_plane = %config.control_plane_url,
@@ -122,6 +131,7 @@ async fn run(config: AgentConfig) -> Result<(), SyncError> {
                     &mut bootstrapped,
                     &mut _resolver_handle,
                     &config,
+                    &overlay_bridge_address,
                 )
                 .await
                 {
@@ -180,6 +190,7 @@ async fn apply(
     bootstrapped: &mut bool,
     resolver: &mut Option<DnsResolverHandle>,
     config: &AgentConfig,
+    overlay_bridge_address: &Arc<std::sync::RwLock<Option<IpAddr>>>,
 ) -> Result<(), SyncError> {
     let Some(alloc_wire) = payload.alloc else {
         return Ok(());
@@ -224,6 +235,14 @@ async fn apply(
         // resolution on this node, but everything else (heartbeats,
         // deployments, proxy) keeps working.
         spawn_resolver(config, bridge_address, resolver).await;
+
+        // Publish the bridge address so `service_handlers::create_service`
+        // can wire it into every container's `--dns`. Done right after the
+        // resolver is up so the slot is never advertised before the
+        // resolver is actually accepting queries.
+        if let Ok(mut slot) = overlay_bridge_address.write() {
+            *slot = Some(bridge_address);
+        }
     } else {
         let changed = manager
             .reconcile_peers(peers)
