@@ -1266,18 +1266,36 @@ async fn run_restore_inner(
 
     let new_service_parameters = match mode {
         RestoreRequestMode::InPlace => {
-            instance
-                .restore_from_s3(
-                    &s3_client,
-                    &s3_credentials,
+            // Cluster topology routes through the manager: in-place
+            // restore tears down every member, pre-seeds the primary's
+            // pgdata from the WAL-G prefix, then rebuilds the cluster
+            // around it. The trait-level restore_from_s3 doesn't have
+            // access to service_members or the agent protocol so it
+            // can't handle clusters — same carve-out as backup.
+            if target_service.topology == "cluster" && target_service.service_type == "postgres" {
+                mgr.restore_postgres_cluster(
+                    &target_service,
                     &backup_model.s3_location,
-                    &s3_source_plain,
-                    source_config.clone(),
+                    &s3_credentials,
                 )
                 .await
                 .map_err(|e| RestoreError::ExternalService {
-                    reason: format!("in-place restore failed: {}", e),
+                    reason: format!("cluster in-place restore failed: {}", e),
                 })?;
+            } else {
+                instance
+                    .restore_from_s3(
+                        &s3_client,
+                        &s3_credentials,
+                        &backup_model.s3_location,
+                        &s3_source_plain,
+                        source_config.clone(),
+                    )
+                    .await
+                    .map_err(|e| RestoreError::ExternalService {
+                        reason: format!("in-place restore failed: {}", e),
+                    })?;
+            }
             None
         }
         RestoreRequestMode::NewService {

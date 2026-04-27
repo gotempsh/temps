@@ -2626,6 +2626,442 @@ impl ExternalServiceManager {
         }
     }
 
+    /// Restore a Postgres HA cluster from a WAL-G backup.
+    ///
+    /// **In-place destructive** restore: every existing data node is
+    /// torn down (containers + volumes + DNS + service_members rows).
+    /// The same monitor + member topology is rebuilt with the primary's
+    /// pgdata pre-seeded from S3. Replicas come up via the standard
+    /// pg_auto_failover basebackup-from-primary path.
+    ///
+    /// MVP scope:
+    ///   * Single-host clusters only (every member's `node_id IS NULL`).
+    ///     Multi-host needs the agent to spin up the pre-seeding helper
+    ///     container on the right worker — wired in a follow-up.
+    ///   * Plain restore-to-latest (no point-in-time target). The
+    ///     `recovery_target` argument is reserved but ignored today.
+    ///
+    /// Caller flow (e.g. `BackupService::restore_external_service`):
+    ///   1. Look up the backup's S3 source + walg_prefix.
+    ///   2. Call this with `(service, walg_prefix, s3_credentials)`.
+    ///   3. Returns once the cluster is back at `status='running'`
+    ///      and the primary has fully recovered.
+    pub async fn restore_postgres_cluster(
+        &self,
+        service: &external_services::Model,
+        walg_s3_prefix: &str,
+        s3_credentials: &crate::S3Credentials,
+    ) -> Result<(), ExternalServiceError> {
+        info!(
+            service_id = service.id,
+            service_name = %service.name,
+            walg_s3_prefix,
+            "Starting in-place restore of Postgres HA cluster"
+        );
+
+        if service.topology != "cluster" || service.service_type != "postgres" {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id: service.id,
+                reason: format!(
+                    "restore_postgres_cluster requires topology='cluster' and service_type='postgres' (got {}/{})",
+                    service.topology, service.service_type,
+                ),
+            });
+        }
+
+        // Snapshot the current member topology before tearing it down.
+        // We rebuild with the same names/ordinals/node assignments so
+        // downstream consumers (DNS reconciler, app conn strings) see
+        // continuity across the restore.
+        let members = service_members::Entity::find()
+            .filter(service_members::Column::ServiceId.eq(service.id))
+            .order_by_asc(service_members::Column::Ordinal)
+            .all(self.db.as_ref())
+            .await?;
+        if members.is_empty() {
+            return Err(ExternalServiceError::InitializationFailed {
+                id: service.id,
+                reason: "Cannot restore: cluster has no members on record".to_string(),
+            });
+        }
+
+        // MVP gate: refuse multi-host. The pre-seeding helper has to
+        // run on the same Docker daemon as the primary's volume; that
+        // works for local members via bollard, but remote members
+        // need an agent-side "create + run helper container" RPC we
+        // don't have yet.
+        if members.iter().any(|m| m.node_id.is_some()) {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id: service.id,
+                reason: "MVP: cluster restore is single-host only (no remote members yet). \
+                         Move all members to the control plane or wait for the multi-host \
+                         restore path."
+                    .to_string(),
+            });
+        }
+
+        // Find the primary in the snapshot. After failover the role
+        // labels in service_members reflect reality (kept fresh by the
+        // reconciler) so this is the node that *currently* holds the
+        // writable copy of the data.
+        let original_primary = members.iter().find(|m| m.role == "primary").ok_or(
+            ExternalServiceError::InitializationFailed {
+                id: service.id,
+                reason: "Cannot restore: cluster has no primary on record".to_string(),
+            },
+        )?;
+        let primary_container_name = original_primary.container_name.clone();
+        let primary_volume_name = format!("{}_data", primary_container_name);
+
+        // Reconstruct the member spec list (role + node_id) so we can
+        // re-run initialize_cluster after teardown. Filter the monitor
+        // out — initialize_cluster expects you to pass the monitor as
+        // its own member spec, which is fine.
+        let member_specs: Vec<ClusterMemberRequest> = members
+            .iter()
+            .map(|m| ClusterMemberRequest {
+                role: m.role.clone(),
+                node_id: m.node_id,
+            })
+            .collect();
+
+        // ---- Phase 1: tear down everything pg_auto_failover-managed ----
+        info!(
+            service_id = service.id,
+            "Restore phase 1: tearing down current cluster members"
+        );
+        self.stop_role_reconciler(service.id).await;
+
+        for m in &members {
+            // Drop DNS first so consumers see NXDOMAIN instead of a
+            // stale IP for the duration of the rebuild.
+            let _ = self
+                .dns_registry
+                .delete_by_owner(temps_dns::InternalOwnerKind::ServiceMember, m.id as i64)
+                .await;
+
+            // Stop + remove the container. Best-effort; container may
+            // have died on its own already.
+            let _ = self
+                .docker
+                .remove_container(
+                    &m.container_name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+
+            // Remove the data volume too — full reset. The primary's
+            // volume gets recreated below with restored pgdata; the
+            // monitor and replicas get fresh ones.
+            let volume_name = format!("{}_data", m.container_name);
+            let _ = self
+                .docker
+                .remove_volume(
+                    &volume_name,
+                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                )
+                .await;
+        }
+
+        // Drop role/VIP records (Tier 3) once.
+        let _ = self
+            .dns_registry
+            .delete_by_owner(temps_dns::InternalOwnerKind::ServiceRole, service.id as i64)
+            .await;
+
+        // Drop the service_members rows. We keep the external_services
+        // row in place so the URL/credentials/UI bookmarks survive the
+        // restore.
+        service_members::Entity::delete_many()
+            .filter(service_members::Column::ServiceId.eq(service.id))
+            .exec(self.db.as_ref())
+            .await?;
+
+        // Mark the parent service back to creating so the UI shows
+        // progress + retry_cluster won't be confused if this aborts.
+        let mut svc_update: external_services::ActiveModel = service.clone().into();
+        svc_update.status = Set("creating".to_string());
+        svc_update.updated_at = Set(Utc::now());
+        let _ = svc_update.update(self.db.as_ref()).await;
+
+        // ---- Phase 2: pre-seed the primary's pgdata from S3 ----
+        info!(
+            service_id = service.id,
+            walg_s3_prefix,
+            primary_volume = %primary_volume_name,
+            "Restore phase 2: pre-seeding primary pgdata via wal-g backup-fetch"
+        );
+        if let Err(e) = self
+            .preseed_primary_pgdata(
+                service,
+                &primary_volume_name,
+                walg_s3_prefix,
+                s3_credentials,
+            )
+            .await
+        {
+            // Pre-seed failed — leave the service in `creating` so the
+            // operator can retry, but surface the real reason.
+            return Err(ExternalServiceError::InitializationFailed {
+                id: service.id,
+                reason: format!("Pre-seed of primary pgdata failed: {}", e),
+            });
+        }
+
+        // ---- Phase 3: rebuild cluster on top of the restored data ----
+        info!(
+            service_id = service.id,
+            "Restore phase 3: rebuilding cluster on top of restored pgdata"
+        );
+        // Wrap in Arc::new(self.clone())? No — we already are &Arc<Self>
+        // for the reconciler. initialize_cluster takes &self, that's
+        // fine. The primary's container will start, see existing
+        // pgdata, postgres will recover-from-WAL up to consistency,
+        // then pg_autoctl create will register it as the new primary.
+        // Replicas pull a fresh basebackup from the new primary as
+        // part of their own pg_autoctl create.
+        if let Err(e) = self.initialize_cluster(service.id, &member_specs).await {
+            return Err(ExternalServiceError::InitializationFailed {
+                id: service.id,
+                reason: format!("Cluster rebuild after restore failed: {}", e),
+            });
+        }
+
+        info!(
+            service_id = service.id,
+            "Cluster restore complete; service is back at status='running'"
+        );
+        Ok(())
+    }
+
+    /// Run a one-shot helper container that fetches `wal-g backup-fetch
+    /// LATEST` into the named volume that the new primary will attach.
+    /// Also writes `recovery.signal` + `restore_command` so the primary
+    /// container's first postgres boot replays WAL up to consistency
+    /// before pg_autoctl takes over.
+    async fn preseed_primary_pgdata(
+        &self,
+        service: &external_services::Model,
+        primary_volume_name: &str,
+        walg_s3_prefix: &str,
+        s3_credentials: &crate::S3Credentials,
+    ) -> Result<(), ExternalServiceError> {
+        use bollard::models::{ContainerCreateBody, HostConfig};
+        use bollard::query_parameters::CreateContainerOptionsBuilder;
+        use futures::StreamExt;
+
+        // Make sure the volume exists. Docker is happy to (re)create
+        // it; this also covers the case where teardown removed it.
+        let _ = self
+            .docker
+            .create_volume(bollard::models::VolumeCreateRequest {
+                name: Some(primary_volume_name.to_string()),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| ExternalServiceError::DockerError {
+                id: service.id,
+                reason: format!(
+                    "Failed to create primary volume '{}': {}",
+                    primary_volume_name, e
+                ),
+            })?;
+
+        // Resolve S3 endpoint relative to the helper. Helper runs on
+        // the same host as the future primary, so endpoint resolution
+        // can use the same temps-overlay heuristics. There's no live
+        // primary container to inspect yet, so probe the postgres-ha
+        // image's network membership instead — actually we don't have
+        // a container at all, so just pass the endpoint through; the
+        // resolve helper bails to None for non-localhost endpoints
+        // anyway.
+        let resolved_endpoint = s3_credentials.endpoint.clone();
+        let walg_env = build_walg_env(s3_credentials, walg_s3_prefix, resolved_endpoint.as_deref());
+
+        // The helper script:
+        //   1. Fetch the latest WAL-G basebackup into pgdata.
+        //   2. Drop a recovery.signal so postgres enters recovery mode
+        //      on first boot.
+        //   3. Write postgresql.auto.conf with restore_command so
+        //      postgres can pull WAL segments from S3 to roll forward
+        //      to consistency. Disable archive_mode/archive_command so
+        //      the recovering primary doesn't re-push WAL into the
+        //      source's prefix mid-recovery.
+        //   4. chown to postgres:999 (postgres user uid in the
+        //      official image) so postgres can read its own data.
+        let env_lines = walg_env.join("\n");
+        let script = format!(
+            r#"set -eu
+PGDATA=/var/lib/postgresql/pgdata
+mkdir -p "$PGDATA"
+chown -R postgres:postgres /var/lib/postgresql
+
+# Stash the env file the recovery + future archiver will source.
+umask 077
+cat > /var/lib/postgresql/walg-restore.env <<'WALG_RESTORE_EOF'
+{env_lines}
+WALG_RESTORE_EOF
+chown postgres:postgres /var/lib/postgresql/walg-restore.env
+chmod 0600 /var/lib/postgresql/walg-restore.env
+
+echo "[restore] Fetching latest WAL-G basebackup into $PGDATA..."
+gosu postgres sh -c '. /var/lib/postgresql/walg-restore.env && wal-g backup-fetch "$PGDATA" LATEST'
+
+echo "[restore] Writing recovery.signal + restore_command"
+touch "$PGDATA/recovery.signal"
+chown postgres:postgres "$PGDATA/recovery.signal"
+
+cat > "$PGDATA/postgresql.auto.conf" <<'PG_AUTO_EOF'
+# Written by Temps cluster restore. Overwrites any source-side settings.
+restore_command = '. /var/lib/postgresql/walg-restore.env && wal-g wal-fetch %f %p'
+recovery_target = 'immediate'
+recovery_target_action = 'promote'
+archive_mode = 'off'
+archive_command = '/bin/true'
+PG_AUTO_EOF
+chown postgres:postgres "$PGDATA/postgresql.auto.conf"
+chmod 0600 "$PGDATA/postgresql.auto.conf"
+
+echo "[restore] Pre-seed complete"
+"#,
+            env_lines = env_lines,
+        );
+
+        let helper_name = format!(
+            "temps-restore-helper-{}-{}",
+            service.id,
+            Utc::now().timestamp()
+        );
+        let helper_config = ContainerCreateBody {
+            // postgres-ha has both wal-g and gosu, so no extra image
+            // shopping. Pin to the same image the cluster uses.
+            image: Some("gotempsh/postgres-ha:18-bookworm".to_string()),
+            cmd: Some(vec!["sh".to_string(), "-c".to_string(), script]),
+            host_config: Some(HostConfig {
+                binds: Some(vec![format!("{}:/var/lib/postgresql", primary_volume_name)]),
+                ..Default::default()
+            }),
+            // Run as root so the chown calls land — the helper drops
+            // to postgres internally for the wal-g call.
+            user: Some("root".to_string()),
+            ..Default::default()
+        };
+
+        let helper = self
+            .docker
+            .create_container(
+                Some(
+                    CreateContainerOptionsBuilder::new()
+                        .name(&helper_name)
+                        .build(),
+                ),
+                helper_config,
+            )
+            .await
+            .map_err(|e| ExternalServiceError::DockerError {
+                id: service.id,
+                reason: format!("Failed to create restore helper container: {}", e),
+            })?;
+
+        // Pull the image first if it's missing (debug builds skip web,
+        // but they don't pre-pull our images either).
+        if let Err(e) = self
+            .docker
+            .start_container(
+                &helper.id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+        {
+            // Clean up the half-created helper before bubbling out.
+            let _ = self
+                .docker
+                .remove_container(
+                    &helper.id,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        v: false,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Err(ExternalServiceError::DockerError {
+                id: service.id,
+                reason: format!("Failed to start restore helper container: {}", e),
+            });
+        }
+
+        // Wait for the helper to finish.
+        let wait_result = self
+            .docker
+            .wait_container(
+                &helper.id,
+                None::<bollard::query_parameters::WaitContainerOptions>,
+            )
+            .next()
+            .await;
+
+        // Capture logs before removing — useful for surfacing the real
+        // reason a wal-g fetch failed.
+        let logs = self
+            .docker
+            .logs(
+                &helper.id,
+                Some(bollard::query_parameters::LogsOptions {
+                    stdout: true,
+                    stderr: true,
+                    tail: "200".to_string(),
+                    ..Default::default()
+                }),
+            )
+            .map(|chunk| match chunk {
+                Ok(c) => c.to_string(),
+                Err(e) => format!("[log read error: {}]", e),
+            })
+            .collect::<Vec<_>>()
+            .await
+            .join("");
+
+        let _ = self
+            .docker
+            .remove_container(
+                &helper.id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: false,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        match wait_result {
+            Some(Ok(resp)) if resp.status_code == 0 => {
+                info!(
+                    service_id = service.id,
+                    "Restore helper completed successfully"
+                );
+                Ok(())
+            }
+            Some(Ok(resp)) => Err(ExternalServiceError::InternalError {
+                reason: format!(
+                    "Restore helper exited with status {}.\nLast log lines:\n{}",
+                    resp.status_code,
+                    logs.trim_end()
+                ),
+            }),
+            Some(Err(e)) => Err(ExternalServiceError::DockerError {
+                id: service.id,
+                reason: format!("Restore helper wait failed: {}", e),
+            }),
+            None => Err(ExternalServiceError::InternalError {
+                reason: "Restore helper finished but no status code was returned".to_string(),
+            }),
+        }
+    }
+
     /// Get the primary data node's connection address for a cluster service.
     ///
     /// Returns `Some((host, port))` if the service is a cluster with a running primary.
