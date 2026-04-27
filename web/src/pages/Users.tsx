@@ -14,6 +14,7 @@ export function Users() {
     name: string
     email: string
   } | null>(null)
+  const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
 
   const {
     data: users,
@@ -31,10 +32,9 @@ export function Users() {
     setBreadcrumbs([{ label: 'Users' }])
   }, [setBreadcrumbs])
 
-  // Keyboard shortcut: N to create new user
   useKeyboardShortcut({
     key: 'n',
-    callback: () => setSelectedUser({ id: 0, name: '', email: '' }),
+    callback: () => setIsCreateDialogOpen(true),
   })
 
   usePageTitle('Users')
@@ -47,6 +47,8 @@ export function Users() {
           isLoading={isLoading}
           reloadUsers={refetch}
           onEditUser={setSelectedUser}
+          isCreateDialogOpen={isCreateDialogOpen}
+          onCreateDialogOpenChange={setIsCreateDialogOpen}
         />
       </div>
       {selectedUser && (

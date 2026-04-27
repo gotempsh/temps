@@ -1,7 +1,7 @@
 use crate::externalsvc::{
     mongodb::MongodbService, postgres::PostgresService, postgres_cluster::PostgresClusterService,
     redis::RedisService, rustfs::RustfsService, s3::S3Service, AvailableContainer,
-    ClusterMemberSpec, ExternalService, ServiceConfig, ServiceType,
+    ClusterMemberSpec, ExternalService, HealthProbeStatus, ServiceConfig, ServiceType,
 };
 use crate::parameter_strategies;
 use crate::remote_service_client::{
@@ -23,7 +23,7 @@ use temps_entities::{
     project_services, projects, service_members,
 };
 use thiserror::Error;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 // use crate::routes::types::external_services::EnvironmentVariableInfo;
 use temps_core::EncryptionService;
 // Add these constants at the top of the file proper key management
@@ -232,6 +232,106 @@ pub struct ExternalServiceInfo {
     pub error_message: Option<String>,
 }
 
+/// Format a `tokio_postgres::Error` (or any `std::error::Error`) by
+/// walking its `source()` chain. `tokio_postgres::Error::Display` only
+/// emits a brief tag like `db error` and hides the actual cause —
+/// callers are expected to walk the chain themselves. This helper does
+/// it so probe error messages surface the *real* failure (pg_hba miss,
+/// auth failure, TLS rejection, etc.) instead of the useless tag.
+fn format_pg_error<E: std::error::Error>(err: &E) -> String {
+    let mut out = err.to_string();
+    let mut cause: Option<&dyn std::error::Error> = err.source();
+    while let Some(c) = cause {
+        let s = c.to_string();
+        if !s.is_empty() {
+            out.push_str(": ");
+            out.push_str(&s);
+        }
+        cause = c.source();
+    }
+    out
+}
+
+/// Aggregate health-probe result for a cluster service. Returned by
+/// [`ExternalServiceManager::probe_cluster`] and consumed by the
+/// background health monitor.
+#[derive(Debug, Clone)]
+pub struct ClusterProbeResult {
+    pub status: HealthProbeStatus,
+    /// Average response time across reachable members (ms).
+    pub response_time_ms: Option<i32>,
+    /// Per-member failure detail when status is Degraded or Down.
+    pub error_message: Option<String>,
+}
+
+impl ClusterProbeResult {
+    fn down(reason: String) -> Self {
+        Self {
+            status: HealthProbeStatus::Down,
+            response_time_ms: None,
+            error_message: Some(reason),
+        }
+    }
+}
+
+/// Per-member health snapshot returned by
+/// [`ExternalServiceManager::cluster_health`]. Renders the row in the
+/// cluster-detail UI's Members table.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterMemberHealth {
+    /// pg_auto_failover's `nodename` for this member (e.g. `node-1`).
+    pub nodename: String,
+    /// `nodehost` reported by pg_auto_failover.
+    pub nodehost: String,
+    /// `nodeport` reported by pg_auto_failover.
+    pub nodeport: i32,
+    /// `pgautofailover.node.reportedstate` — what the node *last told the
+    /// monitor* it was. Doesn't change when the node stops phoning home;
+    /// use `health` + `seconds_since_report` to detect that.
+    pub reported_state: String,
+    /// `pgautofailover.node.goalstate` — what the monitor wants this node
+    /// to become. When `goalstate != reported_state`, the cluster is in
+    /// the middle of a transition (failover, demotion, etc.) and the UI
+    /// should render an arrow.
+    pub goal_state: String,
+    /// `pgautofailover.node.health`: `1` healthy, `0` unknown (no recent
+    /// report), `-1` unhealthy (monitor probe failed). The single most
+    /// reliable signal that a node is reachable RIGHT NOW.
+    pub health: i32,
+    /// Wall-clock seconds since pg_auto_failover last received a status
+    /// report from this node. Computed server-side as
+    /// `EXTRACT(EPOCH FROM now() - reporttime)`.
+    pub seconds_since_report: i64,
+    /// `pgautofailover.node.candidatepriority` — 0 means "never promote".
+    pub candidate_priority: i32,
+    /// `pgautofailover.node.replicationquorum` — t/f.
+    pub replication_quorum: bool,
+    /// From `pg_stat_replication.sync_state` on the primary, joined by
+    /// `application_name = nodename`. `Some("sync"|"quorum"|"async")` for
+    /// secondaries, `None` for the primary itself.
+    pub sync_state: Option<String>,
+    /// `replay_lag` from `pg_stat_replication`, in milliseconds. `None`
+    /// for the primary or when no streaming row exists yet.
+    pub replay_lag_ms: Option<i64>,
+}
+
+/// Health report for a cluster — what the UI needs to render the
+/// per-member table. Returned by [`ExternalServiceManager::cluster_health`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterHealthReport {
+    /// Wall-clock time the report was generated. Useful for the UI to
+    /// display "X seconds ago".
+    pub checked_at: chrono::DateTime<chrono::Utc>,
+    /// Total round-trip to read `pgautofailover.node` from the monitor (ms).
+    pub monitor_response_ms: i64,
+    /// One row per registered data member in `pgautofailover.node`.
+    /// Monitor itself is excluded because it has no `reportedstate` row.
+    pub members: Vec<ClusterMemberHealth>,
+    /// Set when the monitor itself was unreachable. UI should show a
+    /// banner instead of (or above) the table in this case.
+    pub monitor_error: Option<String>,
+}
+
 /// Public info about a cluster member.
 #[derive(Debug, Clone, Serialize)]
 pub struct ServiceMemberInfo {
@@ -243,6 +343,11 @@ pub struct ServiceMemberInfo {
     pub port: Option<i32>,
     pub status: String,
     pub ordinal: i32,
+    /// Container's overlay IP from `temps-overlay`, when known. Populated
+    /// by the lifecycle hook (ADR-011 Phase 3). The cluster health probe
+    /// prefers this over `hostname` because it's the only path that
+    /// reliably reaches the container from any node.
+    pub compute_ip: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -329,18 +434,43 @@ pub struct ExternalServiceManager {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<EncryptionService>,
     docker: Arc<Docker>,
+    /// Internal DNS registry (ADR-011). Required, not optional — making it
+    /// optional led to silent no-ops where one constructor wired it and
+    /// another didn't, so cluster members that *should* have DNS records
+    /// never got them. The registry is a stateless wrapper over the
+    /// shared `DatabaseConnection`, so every constructor can produce one
+    /// trivially.
+    dns_registry: Arc<temps_dns::DnsRegistry>,
+    /// Per-cluster role reconciler shutdown handles, keyed by service_id.
+    /// Notify-then-await pattern: `delete_service` fires the notifier and
+    /// the task observes it on its next select. Held inside a tokio mutex
+    /// because the reconciler-spawn path is async and we want a Send
+    /// MutexGuard across awaits.
+    reconciler_shutdowns: Arc<tokio::sync::Mutex<HashMap<i32, Arc<tokio::sync::Notify>>>>,
 }
 
 impl ExternalServiceManager {
+    /// Construct with all required dependencies. The `DnsRegistry` is
+    /// required (not optional) so cluster lifecycle hooks always have a
+    /// place to write A records — the historical `Option<DnsRegistry>` +
+    /// `with_dns_registry` setter caused silent no-ops when one
+    /// constructor wired the registry and another didn't.
+    ///
+    /// Callers that don't have a `DnsRegistry` in scope can build one
+    /// trivially: `Arc::new(temps_dns::DnsRegistry::new(db.clone()))`.
+    /// The registry is a stateless wrapper over the same `db` handle.
     pub fn new(
         db: Arc<DatabaseConnection>,
         encryption_service: Arc<EncryptionService>,
         docker: Arc<Docker>,
+        dns_registry: Arc<temps_dns::DnsRegistry>,
     ) -> Self {
         Self {
             db,
             encryption_service,
             docker,
+            dns_registry,
+            reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -786,11 +916,17 @@ impl ExternalServiceManager {
             let db = self.db.clone();
             let docker = self.docker.clone();
             let encryption_service = self.encryption_service.clone();
+            let dns_registry = self.dns_registry.clone();
             let service_id = service.id;
             let members = request.members.clone();
 
             tokio::spawn(async move {
-                let manager = ExternalServiceManager::new(db.clone(), encryption_service, docker);
+                let manager = ExternalServiceManager::new(
+                    db.clone(),
+                    encryption_service,
+                    docker,
+                    dns_registry,
+                );
                 let result = manager.initialize_cluster(service_id, &members).await;
 
                 match result {
@@ -1179,6 +1315,44 @@ impl ExternalServiceManager {
             .await
             .map_err(ExternalServiceError::from)?;
 
+        // Stop the per-cluster role reconciler before dropping its records,
+        // otherwise a tick mid-deletion could re-write what we just removed.
+        self.stop_role_reconciler(service_id).await;
+
+        // Drop DNS records that pointed at this service's members (ADR-011).
+        // Best-effort, post-DB-commit: the rows that owned the records are
+        // already gone, so the worst case is a stale record served until
+        // the next janitor pass. We ignore registry errors so a stuck DNS
+        // plane doesn't fail an otherwise successful service deletion.
+        // Per-member records (Tier 2).
+        for member in &members {
+            let owner_id = member.id as i64;
+            if let Err(e) = self
+                .dns_registry
+                .delete_by_owner(temps_dns::InternalOwnerKind::ServiceMember, owner_id)
+                .await
+            {
+                warn!(
+                    service_id,
+                    member_id = member.id,
+                    error = %e,
+                    "Failed to drop DNS records for deleted cluster member"
+                );
+            }
+        }
+        // Role/VIP records (Tier 3) — owner_id == service_id.
+        if let Err(e) = self
+            .dns_registry
+            .delete_by_owner(temps_dns::InternalOwnerKind::ServiceRole, service_id as i64)
+            .await
+        {
+            warn!(
+                service_id,
+                error = %e,
+                "Failed to drop role/VIP DNS records for deleted cluster"
+            );
+        }
+
         // Remove containers
         if is_cluster {
             // Cluster: remove each member container (best-effort, log failures)
@@ -1364,7 +1538,10 @@ impl ExternalServiceManager {
     }
 
     // Helper methods
-    async fn get_service(
+    /// Read a single `external_services` row by id. Public so handlers can
+    /// branch on per-service fields (e.g. `topology`) without redoing the
+    /// existence check.
+    pub async fn get_service(
         &self,
         service_id: i32,
     ) -> Result<external_services::Model, ExternalServiceError> {
@@ -1430,8 +1607,493 @@ impl ExternalServiceManager {
                 port: m.port,
                 status: m.status,
                 ordinal: m.ordinal,
+                compute_ip: m.compute_ip,
             })
             .collect())
+    }
+
+    /// Health-probe a cluster service by fanning out to:
+    ///   1. The pg_auto_failover monitor (proves the cluster's control plane
+    ///      is alive and we can read state from it).
+    ///   2. Each data member's `pgautofailover.node` reported state, read
+    ///      *through* the monitor (no per-member network call needed).
+    ///
+    /// Why not direct `tokio_postgres::connect(member, password)`:
+    /// pg_auto_failover's pg_hba.conf only trusts its own infrastructure
+    /// users (`autoctl_node`, `pgautofailover_replicator`) globally. The
+    /// application user the cluster was created with has *certificate*
+    /// auth, not password — so a control-plane-side password probe always
+    /// fails with `no pg_hba.conf entry for host ..., user ..., (SSL|no)
+    /// encryption`. The monitor, by contrast, accepts `autoctl_node` from
+    /// `0.0.0.0/0 trust` — the same path the data nodes themselves use to
+    /// register, so we know it works.
+    ///
+    /// Aggregation rules:
+    /// - Monitor reachable + every reported data node in a healthy state
+    ///   → `Operational`.
+    /// - Monitor reachable + at least one data node not healthy
+    ///   → `Degraded` (with per-member states listed).
+    /// - Monitor unreachable → `Down` (with full error chain).
+    /// - No monitor row at all → `Down` ("no monitor in cluster").
+    pub async fn probe_cluster(&self, service: &external_services::Model) -> ClusterProbeResult {
+        use std::time::{Duration, Instant};
+
+        const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let members = match self.get_service_members(service.id).await {
+            Ok(m) => m,
+            Err(e) => {
+                return ClusterProbeResult::down(format!(
+                    "Failed to load cluster members for service {}: {}",
+                    service.id, e
+                ));
+            }
+        };
+
+        let monitor = members.iter().find(|m| m.role == "monitor");
+        let monitor = match monitor {
+            Some(m) => m,
+            None => {
+                return ClusterProbeResult::down(format!(
+                    "Cluster service {} has no monitor member",
+                    service.id
+                ));
+            }
+        };
+
+        // Resolve the monitor host: prefer overlay IP, fall back to the
+        // node's underlay address, then localhost. The monitor's host port
+        // is `service_id * 10 + 6000` for the dev cluster; in general
+        // `monitor.port` is what the lifecycle hook stored.
+        let monitor_host: String = if let Some(ip) = monitor.compute_ip.as_deref() {
+            ip.to_string()
+        } else if let Some(node_id) = monitor.node_id {
+            match nodes::Entity::find_by_id(node_id)
+                .one(self.db.as_ref())
+                .await
+            {
+                Ok(Some(n)) => n.private_address,
+                _ => {
+                    return ClusterProbeResult::down(format!(
+                        "Monitor's node {} not found in nodes table",
+                        node_id
+                    ))
+                }
+            }
+        } else {
+            "localhost".to_string()
+        };
+        let monitor_port = monitor.port.unwrap_or(5432);
+
+        // pg_auto_failover requires SSL for the autoctl_node user (the
+        // hba rule is `hostssl ... trust`). We use PostgresSource which
+        // tries TLS-with-self-signed-accept first, then falls back to
+        // plain. Empty password is correct: autoctl_node is trust-auth'd
+        // from 0.0.0.0/0 once SSL is established.
+        let conn_str = format!(
+            "host={monitor_host} port={monitor_port} user=autoctl_node \
+             dbname=pg_auto_failover sslmode=require connect_timeout=3"
+        );
+
+        let start = Instant::now();
+        let connect = tokio::time::timeout(
+            PROBE_TIMEOUT,
+            temps_query_postgres::connect_with_self_signed_tls(&conn_str),
+        )
+        .await;
+
+        let client = match connect {
+            Err(_) => {
+                return ClusterProbeResult::down(format!(
+                    "Monitor probe to {monitor_host}:{monitor_port} timed out after {}s",
+                    PROBE_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(Err(e)) => {
+                return ClusterProbeResult::down(format!(
+                    "Monitor connect to {monitor_host}:{monitor_port} failed: {}",
+                    format_pg_error(&e)
+                ));
+            }
+            Ok(Ok(client)) => client,
+        };
+
+        // Read per-data-node reportedstate from the monitor. The monitor's
+        // pgautofailover.node table holds one row per registered data node.
+        let rows_result = tokio::time::timeout(
+            PROBE_TIMEOUT,
+            client.query(
+                "SELECT nodename::text, nodehost::text, reportedstate::text \
+                 FROM pgautofailover.node",
+                &[],
+            ),
+        )
+        .await;
+
+        // Drop the client to close the connection cleanly. The driver task
+        // is owned by `connect_with_self_signed_tls` and exits when the
+        // client handle is dropped.
+        drop(client);
+
+        let rows = match rows_result {
+            Err(_) => {
+                return ClusterProbeResult::down(format!(
+                    "Monitor query to {monitor_host}:{monitor_port} timed out after {}s",
+                    PROBE_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(Err(e)) => {
+                return ClusterProbeResult::down(format!(
+                    "Monitor query failed at {monitor_host}:{monitor_port}: {}",
+                    format_pg_error(&e)
+                ));
+            }
+            Ok(Ok(r)) => r,
+        };
+
+        let elapsed_ms = start.elapsed().as_millis();
+        let response_time_ms = i32::try_from(elapsed_ms).ok();
+
+        let healthy_states = ["primary", "single", "secondary"];
+        let mut unhealthy: Vec<String> = Vec::new();
+        for row in &rows {
+            let nodename: &str = row.get(0);
+            let state: &str = row.get(2);
+            if !healthy_states.contains(&state) {
+                unhealthy.push(format!("{nodename}={state}"));
+            }
+        }
+
+        if rows.is_empty() {
+            // Monitor reachable but no data nodes registered — cluster is
+            // half-built. Treat as Down so it's visibly broken.
+            return ClusterProbeResult::down(format!(
+                "Monitor at {monitor_host}:{monitor_port} reports zero data nodes"
+            ));
+        }
+
+        if unhealthy.is_empty() {
+            ClusterProbeResult {
+                status: HealthProbeStatus::Operational,
+                response_time_ms,
+                error_message: None,
+            }
+        } else {
+            ClusterProbeResult {
+                status: HealthProbeStatus::Degraded,
+                response_time_ms,
+                error_message: Some(format!(
+                    "{}/{} data node(s) not in a healthy state: {}",
+                    unhealthy.len(),
+                    rows.len(),
+                    unhealthy.join(", ")
+                )),
+            }
+        }
+    }
+
+    /// Read per-member health for a cluster from the monitor + the current
+    /// primary. Used by the UI's Members table — gives one row per data
+    /// node with role, reported state, replication sync state, and
+    /// replay lag in ms.
+    ///
+    /// Two queries:
+    /// 1. `pgautofailover.node` from the monitor (TLS, autoctl_node) —
+    ///    authoritative for `reportedstate` / `candidatepriority` /
+    ///    `replicationquorum`.
+    /// 2. `pg_stat_replication` from the current primary (TLS,
+    ///    autoctl_node) — gives `sync_state` and `replay_lag` per
+    ///    streaming replica, joined to step 1 by `application_name = nodename`.
+    ///
+    /// Best-effort on (2): if the primary is briefly unreachable mid-failover,
+    /// the per-member sync_state/replay_lag fields are left `None` and the
+    /// caller can still render the topology view.
+    pub async fn cluster_health(&self, service: &external_services::Model) -> ClusterHealthReport {
+        use std::time::{Duration, Instant};
+        const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+        // ---- locate the monitor ----
+        let members = match self.get_service_members(service.id).await {
+            Ok(m) => m,
+            Err(e) => {
+                return ClusterHealthReport {
+                    checked_at: chrono::Utc::now(),
+                    monitor_response_ms: 0,
+                    members: vec![],
+                    monitor_error: Some(format!(
+                        "Failed to load cluster members for service {}: {}",
+                        service.id, e
+                    )),
+                };
+            }
+        };
+        let monitor = match members.iter().find(|m| m.role == "monitor") {
+            Some(m) => m,
+            None => {
+                return ClusterHealthReport {
+                    checked_at: chrono::Utc::now(),
+                    monitor_response_ms: 0,
+                    members: vec![],
+                    monitor_error: Some(format!(
+                        "Cluster service {} has no monitor member",
+                        service.id
+                    )),
+                };
+            }
+        };
+
+        let monitor_host: String = if let Some(ip) = monitor.compute_ip.as_deref() {
+            ip.to_string()
+        } else if let Some(node_id) = monitor.node_id {
+            match nodes::Entity::find_by_id(node_id)
+                .one(self.db.as_ref())
+                .await
+            {
+                Ok(Some(n)) => n.private_address,
+                _ => {
+                    return ClusterHealthReport {
+                        checked_at: chrono::Utc::now(),
+                        monitor_response_ms: 0,
+                        members: vec![],
+                        monitor_error: Some(format!(
+                            "Monitor's node {} not found in nodes table",
+                            node_id
+                        )),
+                    };
+                }
+            }
+        } else {
+            "localhost".to_string()
+        };
+        let monitor_port = monitor.port.unwrap_or(5432);
+
+        let monitor_conn_str = format!(
+            "host={monitor_host} port={monitor_port} user=autoctl_node \
+             dbname=pg_auto_failover sslmode=require connect_timeout=3"
+        );
+
+        let start = Instant::now();
+        let monitor_client = match tokio::time::timeout(
+            PROBE_TIMEOUT,
+            temps_query_postgres::connect_with_self_signed_tls(&monitor_conn_str),
+        )
+        .await
+        {
+            Err(_) => {
+                return ClusterHealthReport {
+                    checked_at: chrono::Utc::now(),
+                    monitor_response_ms: PROBE_TIMEOUT.as_millis() as i64,
+                    members: vec![],
+                    monitor_error: Some(format!(
+                        "Monitor probe to {monitor_host}:{monitor_port} timed out after {}s",
+                        PROBE_TIMEOUT.as_secs()
+                    )),
+                };
+            }
+            Ok(Err(e)) => {
+                return ClusterHealthReport {
+                    checked_at: chrono::Utc::now(),
+                    monitor_response_ms: 0,
+                    members: vec![],
+                    monitor_error: Some(format!(
+                        "Monitor connect to {monitor_host}:{monitor_port} failed: {}",
+                        format_pg_error(&e)
+                    )),
+                };
+            }
+            Ok(Ok(client)) => client,
+        };
+
+        let nodes_rows = match tokio::time::timeout(
+            PROBE_TIMEOUT,
+            monitor_client.query(
+                "SELECT nodename::text, nodehost::text, nodeport::int4, \
+                        reportedstate::text, goalstate::text, \
+                        health::int4, \
+                        EXTRACT(EPOCH FROM (now() - reporttime))::int8 AS sec_since_report, \
+                        candidatepriority::int4, \
+                        replicationquorum::bool \
+                 FROM pgautofailover.node",
+                &[],
+            ),
+        )
+        .await
+        {
+            Err(_) => {
+                return ClusterHealthReport {
+                    checked_at: chrono::Utc::now(),
+                    monitor_response_ms: start.elapsed().as_millis() as i64,
+                    members: vec![],
+                    monitor_error: Some(format!(
+                        "Monitor query to {monitor_host}:{monitor_port} timed out"
+                    )),
+                };
+            }
+            Ok(Err(e)) => {
+                return ClusterHealthReport {
+                    checked_at: chrono::Utc::now(),
+                    monitor_response_ms: start.elapsed().as_millis() as i64,
+                    members: vec![],
+                    monitor_error: Some(format!(
+                        "Monitor query failed at {monitor_host}:{monitor_port}: {}",
+                        format_pg_error(&e)
+                    )),
+                };
+            }
+            Ok(Ok(rows)) => rows,
+        };
+        drop(monitor_client);
+
+        let monitor_response_ms = start.elapsed().as_millis() as i64;
+
+        // Build the per-member view from monitor rows. We'll fill
+        // sync_state / replay_lag_ms in the next step from the primary.
+        let mut by_name: std::collections::HashMap<String, ClusterMemberHealth> =
+            std::collections::HashMap::new();
+        let mut primary_endpoint: Option<(String, i32)> = None;
+        for row in &nodes_rows {
+            let nodename: String = row.get(0);
+            let nodehost: String = row.get(1);
+            let nodeport: i32 = row.get(2);
+            let reported_state: String = row.get(3);
+            let goal_state: String = row.get(4);
+            let health: i32 = row.get(5);
+            let seconds_since_report: i64 = row.get(6);
+            let candidate_priority: i32 = row.get(7);
+            let replication_quorum: bool = row.get(8);
+
+            // Only treat a node as primary for the pg_stat_replication
+            // join if pg_auto_failover *currently* believes it's primary
+            // AND the node is healthy. A stale ghost-primary
+            // (`reportedstate='primary'` but `health<=0`) would otherwise
+            // route us to a dead host and the panel would lose sync data.
+            if matches!(reported_state.as_str(), "primary" | "single")
+                && health == 1
+                && seconds_since_report < 30
+            {
+                primary_endpoint = Some((nodehost.clone(), nodeport));
+            }
+
+            by_name.insert(
+                nodename.clone(),
+                ClusterMemberHealth {
+                    nodename,
+                    nodehost,
+                    nodeport,
+                    reported_state,
+                    goal_state,
+                    health,
+                    seconds_since_report,
+                    candidate_priority,
+                    replication_quorum,
+                    sync_state: None,
+                    replay_lag_ms: None,
+                },
+            );
+        }
+
+        // ---- replication state from the primary, best-effort ----
+        //
+        // We connect as the cluster's *application* user (whose hba was
+        // opened by the node startup script in A1) — `autoctl_node` only
+        // has hba access against the monitor's `pg_auto_failover` DB, not
+        // the data nodes' `postgres` DB.
+        //
+        // The join key is `client_addr`, not `application_name`:
+        // pg_auto_failover sets application_name to
+        // `pgautofailover_standby_<nodeid>`, which doesn't match our
+        // friendly `node-1`/`node-2` names. `client_addr` matches
+        // `pgautofailover.node.nodehost`, which we already have.
+        if let Some((primary_host, primary_port)) = primary_endpoint {
+            let app_creds = self
+                .get_service_parameters(service.id)
+                .await
+                .ok()
+                .map(|params| {
+                    let user = params
+                        .get("username")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("postgres")
+                        .to_string();
+                    let password = params
+                        .get("password")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let database = params
+                        .get("database")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("postgres")
+                        .to_string();
+                    (user, password, database)
+                });
+
+            if let Some((user, password, database)) = app_creds {
+                let primary_conn_str = format!(
+                    "host={primary_host} port={primary_port} user={user} password={password} \
+                     dbname={database} sslmode=require connect_timeout=3"
+                );
+                if let Ok(Ok(primary_client)) = tokio::time::timeout(
+                    PROBE_TIMEOUT,
+                    temps_query_postgres::connect_with_self_signed_tls(&primary_conn_str),
+                )
+                .await
+                {
+                    if let Ok(Ok(rep_rows)) = tokio::time::timeout(
+                        PROBE_TIMEOUT,
+                        primary_client.query(
+                            "SELECT host(client_addr)::text AS client_host, \
+                                    sync_state::text, \
+                                    EXTRACT(EPOCH FROM replay_lag)::float8 * 1000.0 AS replay_lag_ms \
+                             FROM pg_stat_replication \
+                             WHERE client_addr IS NOT NULL",
+                            &[],
+                        ),
+                    )
+                    .await
+                    {
+                        // Build a host->member-name lookup from the monitor
+                        // rows we already have. pg_auto_failover's
+                        // `nodehost` matches `pg_stat_replication.client_addr`
+                        // for the standby connection.
+                        let mut name_by_host: std::collections::HashMap<String, String> =
+                            std::collections::HashMap::new();
+                        for member in by_name.values() {
+                            name_by_host
+                                .insert(member.nodehost.clone(), member.nodename.clone());
+                        }
+                        for row in &rep_rows {
+                            let client_host: String = row.get(0);
+                            let sync_state: String = row.get(1);
+                            let replay_ms: Option<f64> = row.try_get(2).ok();
+                            if let Some(member_name) = name_by_host.get(&client_host) {
+                                if let Some(member) = by_name.get_mut(member_name) {
+                                    member.sync_state = Some(sync_state);
+                                    member.replay_lag_ms = replay_ms.map(|v| v as i64);
+                                }
+                            }
+                        }
+                    }
+                    drop(primary_client);
+                }
+            }
+        }
+
+        // Stable-order output: by candidate_priority desc, then nodename
+        // ascending so the UI doesn't reshuffle on every poll.
+        let mut members: Vec<ClusterMemberHealth> = by_name.into_values().collect();
+        members.sort_by(|a, b| {
+            b.candidate_priority
+                .cmp(&a.candidate_priority)
+                .then(a.nodename.cmp(&b.nodename))
+        });
+
+        ClusterHealthReport {
+            checked_at: chrono::Utc::now(),
+            monitor_response_ms,
+            members,
+            monitor_error: None,
+        }
     }
 
     /// Get the primary data node's connection address for a cluster service.
@@ -1999,7 +2661,7 @@ impl ExternalServiceManager {
                     base_port + spec.ordinal as u16
                 };
 
-                let (container_id, host_port) = if let Some(node_id) = spec.node_id {
+                let (container_id, host_port, compute_ip) = if let Some(node_id) = spec.node_id {
                     // Remote: dispatch to agent
                     let client = self.get_remote_client(node_id).await?;
 
@@ -2046,7 +2708,11 @@ impl ExternalServiceManager {
                         }
                     })?;
 
-                    (response.container_id, Some(response.host_port as i32))
+                    (
+                        response.container_id,
+                        Some(response.host_port as i32),
+                        response.compute_ip,
+                    )
                 } else {
                     // Local: create container directly via Docker
                     // For now, use the agent-style approach via local Docker
@@ -2098,13 +2764,76 @@ impl ExternalServiceManager {
                         })?;
                 }
 
-                // Update member record with container info and "running" status
+                // Compute the FQDN for this member. Always populated post
+                // ADR-011 — overrides whatever placeholder hostname (IP or
+                // container name) the spec carried. Apps will resolve this
+                // via the per-node DNS resolver.
+                let member_fqdn = format!(
+                    "{}-{}.{}.temps.local",
+                    service.name, spec.ordinal, service.name
+                );
+
+                // Update member record with container info and "running" status,
+                // plus the FQDN hostname and overlay IP (if any).
+                let member_id = member_model.id;
                 let mut member_update: service_members::ActiveModel = member_model.into();
                 member_update.container_id = Set(Some(container_id));
                 member_update.port = Set(host_port);
                 member_update.status = Set("running".to_string());
+                member_update.hostname = Set(Some(member_fqdn.clone()));
+                member_update.compute_ip = Set(compute_ip.clone());
                 member_update.updated_at = Set(Utc::now());
                 member_update.update(self.db.as_ref()).await?;
+
+                // Register the per-member A record (ADR-011, Tier 2).
+                // `compute_ip` is `None` only on the monitor (which doesn't
+                // need a DNS record — it's not part of any VIP) or on
+                // single-host clusters where the overlay isn't attached.
+                if let Some(ip) = compute_ip {
+                    let draft = temps_dns::EndpointDraft {
+                        fqdn: member_fqdn.clone(),
+                        record_type: temps_dns::InternalRecordType::A,
+                        target_ip: Some(ip.clone()),
+                        target_port: Some(member_port as i32),
+                        // Per-member A records get the same short TTL as
+                        // role records — a member can be restarted with a
+                        // fresh IP at any time.
+                        ttl: 30,
+                        owner_kind: temps_dns::InternalOwnerKind::ServiceMember,
+                        owner_id: member_id as i64,
+                        node_id: spec.node_id,
+                    };
+                    if let Err(e) = self
+                        .dns_registry
+                        .replace_endpoints_for_owner(
+                            temps_dns::InternalOwnerKind::ServiceMember,
+                            member_id as i64,
+                            &[draft],
+                        )
+                        .await
+                    {
+                        // Non-fatal — apps that resolve via DNS will fall
+                        // back to NXDOMAIN for this member, but the member
+                        // is otherwise healthy. Logged loudly so ops can
+                        // catch a stuck DNS plane.
+                        warn!(
+                            service_id,
+                            member_id,
+                            fqdn = %member_fqdn,
+                            ip = %ip,
+                            error = %e,
+                            "Failed to register DNS record for cluster member"
+                        );
+                    } else {
+                        info!(
+                            service_id,
+                            member_id,
+                            fqdn = %member_fqdn,
+                            ip = %ip,
+                            "Registered DNS A record for cluster member"
+                        );
+                    }
+                }
             }
             Ok(())
         }
@@ -2203,14 +2932,61 @@ impl ExternalServiceManager {
             return Err(e);
         }
 
+        // Capture name before we move `service` into the ActiveModel below.
+        let service_name = service.name.clone();
+
         // Update parent service status
         let mut service_update: external_services::ActiveModel = service.into();
         service_update.status = Set("running".to_string());
         service_update.updated_at = Set(Utc::now());
         service_update.update(self.db.as_ref()).await?;
 
+        // Start the per-cluster role reconciler (ADR-011 Phase 4). Best-effort:
+        // skipped if no DnsRegistry is wired (legacy plugin) or if a reconciler
+        // is already running for this service_id (idempotent retry).
+        self.spawn_role_reconciler(service_id, service_name).await;
+
         info!("Cluster service {} initialized successfully", service_id);
         Ok(())
+    }
+
+    /// Spawn the per-cluster Postgres role reconciler. Idempotent — if one is
+    /// already running for `service_id`, returns immediately.
+    async fn spawn_role_reconciler(&self, service_id: i32, service_name: String) {
+        let registry = self.dns_registry.clone();
+
+        let mut shutdowns = self.reconciler_shutdowns.lock().await;
+        if shutdowns.contains_key(&service_id) {
+            debug!(service_id, "role reconciler already running");
+            return;
+        }
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        shutdowns.insert(service_id, shutdown.clone());
+        drop(shutdowns);
+
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            crate::externalsvc::postgres_role_reconciler::run(
+                db,
+                registry,
+                service_id,
+                service_name,
+                shutdown,
+            )
+            .await;
+        });
+    }
+
+    /// Stop the per-cluster role reconciler if one is running. Called from
+    /// `delete_service` after the DB tx commits — paired with
+    /// `DnsRegistry::delete_by_owner` so role records get dropped after the
+    /// reconciler has stopped writing them.
+    async fn stop_role_reconciler(&self, service_id: i32) {
+        let mut shutdowns = self.reconciler_shutdowns.lock().await;
+        if let Some(notifier) = shutdowns.remove(&service_id) {
+            notifier.notify_waiters();
+            debug!(service_id, "role reconciler shutdown signalled");
+        }
     }
 
     /// Retry a failed cluster service initialization.
@@ -2343,10 +3119,12 @@ impl ExternalServiceManager {
         let db = self.db.clone();
         let docker = self.docker.clone();
         let encryption_service = self.encryption_service.clone();
+        let dns_registry = self.dns_registry.clone();
         let members = effective_members;
 
         tokio::spawn(async move {
-            let manager = ExternalServiceManager::new(db.clone(), encryption_service, docker);
+            let manager =
+                ExternalServiceManager::new(db.clone(), encryption_service, docker, dns_registry);
             let result = manager.initialize_cluster(service_id, &members).await;
 
             match result {
@@ -2393,11 +3171,19 @@ impl ExternalServiceManager {
     }
 
     /// Create a cluster member container on the local Docker daemon.
+    ///
+    /// Returns `(container_id, host_port, compute_ip)`:
+    /// - `container_id` — Docker's internal id for the new container.
+    /// - `host_port` — the host port the member's port maps to.
+    /// - `compute_ip` — the container's IP on the multi-host overlay
+    ///   (`temps-overlay`), or `None` on single-host clusters where the
+    ///   overlay isn't attached. Read by the caller into
+    ///   `service_members.compute_ip` and the DNS registry (ADR-011).
     async fn create_local_cluster_member(
         &self,
         container_name: &str,
         params: &crate::externalsvc::postgres_cluster::ClusterMemberCreateParams,
-    ) -> Result<(String, Option<i32>), ExternalServiceError> {
+    ) -> Result<(String, Option<i32>, Option<String>), ExternalServiceError> {
         use bollard::models::*;
         use bollard::query_parameters::*;
         use futures::TryStreamExt;
@@ -2503,6 +3289,62 @@ impl ExternalServiceManager {
                 reason: format!("Failed to create container {}: {}", container_name, e),
             })?;
 
+        // Best-effort dual-attach to the multi-host overlay (ADR-011).
+        // The container was created on temps-app-network for legacy
+        // routing; this also attaches it to temps-overlay so it has a
+        // routable cross-node IP and the DNS registry can write A
+        // records pointing at it. Skipped silently when the overlay
+        // isn't bootstrapped on this host (single-host mode).
+        let overlay_name = temps_network::NetworkConfig::default().docker_network_name;
+        match self
+            .docker
+            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
+            .await
+        {
+            Ok(networks)
+                if networks
+                    .iter()
+                    .any(|n| n.name.as_deref() == Some(overlay_name.as_str())) =>
+            {
+                let req = bollard::models::NetworkConnectRequest {
+                    container: response.id.clone(),
+                    ..Default::default()
+                };
+                match self.docker.connect_network(&overlay_name, req).await {
+                    Ok(()) => {
+                        info!(
+                            container = container_name,
+                            overlay = %overlay_name,
+                            "attached cluster member to overlay"
+                        );
+                    }
+                    // 403 = already connected — no-op.
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 403,
+                        ..
+                    }) => {}
+                    Err(e) => {
+                        warn!(
+                            container = container_name,
+                            overlay = %overlay_name,
+                            error = %e,
+                            "Failed to attach cluster member to overlay; continuing single-host"
+                        );
+                    }
+                }
+            }
+            Ok(_) => {
+                debug!(
+                    container = container_name,
+                    overlay = %overlay_name,
+                    "overlay not present on this host; skipping attach"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "list_networks failed during overlay-attach probe");
+            }
+        }
+
         // Start container
         self.docker
             .start_container(container_name, None::<StartContainerOptions>)
@@ -2515,7 +3357,36 @@ impl ExternalServiceManager {
         // Each member uses a unique port — container_port == host_port
         let host_port = Some(params.container_port as i32);
 
-        Ok((response.id, host_port))
+        // Best-effort overlay-IP discovery for the DNS registry (ADR-011).
+        // Failure here is non-fatal — the member still starts; the DNS
+        // record is just not written for this generation.
+        let compute_ip = match self
+            .docker
+            .inspect_container(container_name, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(info) => {
+                let overlay_name = temps_network::NetworkConfig::default().docker_network_name;
+                info.network_settings
+                    .as_ref()
+                    .and_then(|ns| ns.networks.as_ref())
+                    .and_then(|nets| nets.get(&overlay_name))
+                    .and_then(|ep| ep.ip_address.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            }
+            Err(e) => {
+                warn!(
+                    container = %container_name,
+                    "Failed to inspect new cluster member for overlay IP: {}",
+                    e
+                );
+                None
+            }
+        };
+
+        Ok((response.id, host_port, compute_ip))
     }
 
     /// Wait for a container to become healthy (Docker health check).
@@ -4109,7 +4980,9 @@ mod tests {
         let encryption_service = Arc::new(EncryptionService::new(encryption_key).unwrap());
         let docker = Arc::new(Docker::connect_with_local_defaults().ok().unwrap());
 
-        let manager = ExternalServiceManager::new(db, encryption_service, docker.clone());
+        let dns_registry = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
+        let manager =
+            ExternalServiceManager::new(db, encryption_service, docker.clone(), dns_registry);
         (manager, test_db)
     }
 
@@ -5322,7 +6195,13 @@ mod tests {
         let encryption_key = "test_encryption_key_1234567890ab";
         let encryption_service = Arc::new(EncryptionService::new(encryption_key).unwrap());
         let docker = Arc::new(Docker::connect_with_local_defaults().ok().unwrap());
-        let manager = ExternalServiceManager::new(test_db.db.clone(), encryption_service, docker);
+        let dns_registry = Arc::new(temps_dns::DnsRegistry::new(test_db.db.clone()));
+        let manager = ExternalServiceManager::new(
+            test_db.db.clone(),
+            encryption_service,
+            docker,
+            dns_registry,
+        );
 
         // Link first PostgreSQL service to project
         let result_link1 = manager

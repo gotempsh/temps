@@ -95,6 +95,41 @@ pub async fn exec_command(
 
     let timeout = std::cmp::min(request.timeout_seconds.unwrap_or(30), 300);
 
+    // Route to the worker that owns this container. Local containers
+    // (`node_id IS NULL`) run on the CP's own dockerd — keep the inline
+    // bollard path. Remote containers go through the agent's
+    // `/agent/containers/{id}/exec` endpoint, which runs identical bollard
+    // logic on the worker.
+    if let Some(node_id) = container_record.node_id {
+        let result = state
+            .deployment_service
+            .exec_command_remote(
+                node_id,
+                verified_container_id,
+                request.command.clone(),
+                Some(timeout),
+            )
+            .await
+            .map_err(|e| {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Exec Failed")
+                    .with_detail(e.to_string())
+            })?;
+
+        info!(
+            container_id = %container_id,
+            node_id,
+            exit_code = ?result.exit_code,
+            "Remote container exec completed"
+        );
+
+        return Ok(Json(ExecResponse {
+            exit_code: result.exit_code,
+            stdout: result.stdout,
+            stderr: result.stderr,
+        }));
+    }
+
     let docker = &state.docker;
 
     // Create exec instance
@@ -218,16 +253,126 @@ pub async fn container_terminal(
 
     // Use the verified container ID from the database record
     let verified_container_id = container_record.container_id;
-
-    let docker = state.docker.clone();
+    let node_id = container_record.node_id;
 
     info!(
         container_id = %verified_container_id,
         user = %auth.user_id(),
+        node_id = ?node_id,
         "Terminal session requested"
     );
 
+    // Remote container — proxy bytes 1:1 between the browser WS and the
+    // agent WS. Resolve URL+token before the upgrade so we can fail fast
+    // with a Problem instead of a half-open WebSocket.
+    if let Some(nid) = node_id {
+        let remote = state
+            .deployment_service
+            .resolve_remote_terminal(nid, &verified_container_id)
+            .await
+            .map_err(|e| {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Terminal Setup Failed")
+                    .with_detail(e.to_string())
+            })?;
+        return Ok(ws.on_upgrade(move |socket| {
+            handle_remote_terminal_proxy(socket, remote.ws_url, remote.token)
+        }));
+    }
+
+    let docker = state.docker.clone();
     Ok(ws.on_upgrade(move |socket| handle_terminal_session(socket, docker, verified_container_id)))
+}
+
+/// Bidirectionally proxy a browser WebSocket to a worker agent's terminal
+/// WebSocket. Each side forwards binary, text, and close frames verbatim.
+/// The agent speaks the same xterm.js-friendly protocol the browser
+/// expects, so no translation happens here.
+async fn handle_remote_terminal_proxy(
+    mut browser_socket: WebSocket,
+    agent_ws_url: String,
+    agent_token: String,
+) {
+    use futures::SinkExt as _;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+    use tokio_tungstenite::tungstenite::protocol::Message as TMessage;
+
+    let mut req = match agent_ws_url.as_str().into_client_request() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(url = %agent_ws_url, "Invalid agent terminal URL: {}", e);
+            let _ = browser_socket.close().await;
+            return;
+        }
+    };
+    req.headers_mut().insert(
+        AUTHORIZATION,
+        match format!("Bearer {}", agent_token).parse() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("Invalid agent token header: {}", e);
+                let _ = browser_socket.close().await;
+                return;
+            }
+        },
+    );
+
+    let (agent_stream, _resp) = match tokio_tungstenite::connect_async(req).await {
+        Ok(ok) => ok,
+        Err(e) => {
+            tracing::error!(url = %agent_ws_url, "Agent terminal connect failed: {}", e);
+            let _ = browser_socket.close().await;
+            return;
+        }
+    };
+
+    let (mut agent_tx, mut agent_rx) = agent_stream.split();
+    let (mut browser_tx, mut browser_rx) = browser_socket.split();
+
+    // browser -> agent
+    let b2a = tokio::spawn(async move {
+        while let Some(Ok(msg)) = browser_rx.next().await {
+            let out = match msg {
+                Message::Binary(b) => TMessage::Binary(b.to_vec()),
+                Message::Text(t) => TMessage::Text(t.to_string()),
+                Message::Close(_) => TMessage::Close(None),
+                Message::Ping(p) => TMessage::Ping(p.to_vec()),
+                Message::Pong(p) => TMessage::Pong(p.to_vec()),
+            };
+            if agent_tx.send(out).await.is_err() {
+                break;
+            }
+        }
+        let _ = agent_tx.close().await;
+    });
+
+    // agent -> browser
+    let a2b = tokio::spawn(async move {
+        while let Some(Ok(msg)) = agent_rx.next().await {
+            let out = match msg {
+                TMessage::Binary(b) => Message::Binary(b.to_vec().into()),
+                TMessage::Text(t) => Message::Text(t.to_string().into()),
+                TMessage::Close(_) => {
+                    let _ = browser_tx.close().await;
+                    return;
+                }
+                TMessage::Ping(p) => Message::Ping(p.to_vec().into()),
+                TMessage::Pong(p) => Message::Pong(p.to_vec().into()),
+                TMessage::Frame(_) => continue,
+            };
+            if browser_tx.send(out).await.is_err() {
+                break;
+            }
+        }
+        let _ = browser_tx.close().await;
+    });
+
+    // First side that finishes ends the session.
+    tokio::select! {
+        _ = b2a => {}
+        _ = a2b => {}
+    }
 }
 
 /// Handle a persistent terminal WebSocket session

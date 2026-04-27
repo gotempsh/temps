@@ -44,11 +44,16 @@ impl TempsPlugin for ProvidersPlugin {
             // AuditService should already be registered by the audit plugin
             let docker = context.require_service::<bollard::Docker>();
 
-            // Create ExternalServiceManager
+            // Create ExternalServiceManager. The DnsRegistry is constructed
+            // here (not pulled from the registry) because it's a thin wrapper
+            // over the same DatabaseConnection — going through the registry
+            // would force a plugin-init ordering constraint with no benefit.
+            let dns_registry = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
             let external_service_manager = Arc::new(ExternalServiceManager::new(
                 db.clone(),
                 encryption_service.clone(),
                 docker,
+                dns_registry,
             ));
             context.register_service(external_service_manager.clone());
 

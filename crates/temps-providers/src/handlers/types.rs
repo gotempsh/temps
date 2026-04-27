@@ -503,3 +503,70 @@ pub struct EnvironmentVariableInfo {
     #[schema(example = false)]
     pub sensitive: bool,
 }
+
+/// One row in the cluster Members table — see `GET /external-services/{id}/cluster-health`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ClusterMemberHealthResponse {
+    pub nodename: String,
+    pub nodehost: String,
+    pub nodeport: i32,
+    /// What the node *last told the monitor* it was. Stale during outages.
+    pub reported_state: String,
+    /// What the monitor *wants* the node to be. Differs from
+    /// `reported_state` mid-transition (failover, demotion, etc.).
+    pub goal_state: String,
+    /// pg_auto_failover liveness signal: `1` healthy, `0` unknown
+    /// (no recent report), `-1` unhealthy.
+    pub health: i32,
+    /// Wall-clock seconds since the node last reported in.
+    pub seconds_since_report: i64,
+    pub candidate_priority: i32,
+    pub replication_quorum: bool,
+    /// `sync` / `quorum` / `async` for secondaries; `null` for the primary.
+    pub sync_state: Option<String>,
+    /// `replay_lag` from `pg_stat_replication`, in milliseconds.
+    pub replay_lag_ms: Option<i64>,
+}
+
+impl From<crate::services::ClusterMemberHealth> for ClusterMemberHealthResponse {
+    fn from(m: crate::services::ClusterMemberHealth) -> Self {
+        Self {
+            nodename: m.nodename,
+            nodehost: m.nodehost,
+            nodeport: m.nodeport,
+            reported_state: m.reported_state,
+            goal_state: m.goal_state,
+            health: m.health,
+            seconds_since_report: m.seconds_since_report,
+            candidate_priority: m.candidate_priority,
+            replication_quorum: m.replication_quorum,
+            sync_state: m.sync_state,
+            replay_lag_ms: m.replay_lag_ms,
+        }
+    }
+}
+
+/// Response body for `GET /external-services/{id}/cluster-health`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ClusterHealthReportResponse {
+    /// ISO-8601 wall-clock when the report was generated.
+    #[schema(example = "2025-10-12T12:15:47.609192Z")]
+    pub checked_at: String,
+    /// Round-trip to query the monitor (ms).
+    pub monitor_response_ms: i64,
+    pub members: Vec<ClusterMemberHealthResponse>,
+    /// Set when the monitor itself was unreachable. UI shows a banner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor_error: Option<String>,
+}
+
+impl From<crate::services::ClusterHealthReport> for ClusterHealthReportResponse {
+    fn from(r: crate::services::ClusterHealthReport) -> Self {
+        Self {
+            checked_at: r.checked_at.to_rfc3339(),
+            monitor_response_ms: r.monitor_response_ms,
+            members: r.members.into_iter().map(Into::into).collect(),
+            monitor_error: r.monitor_error,
+        }
+    }
+}

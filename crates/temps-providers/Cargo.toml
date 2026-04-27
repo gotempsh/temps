@@ -18,6 +18,8 @@ temps-query-postgres = { path = "../temps-query-postgres" }
 temps-query-s3 = { path = "../temps-query-s3" }
 temps-query-redis = { path = "../temps-query-redis" }
 temps-query-mongodb = { path = "../temps-query-mongodb" }
+temps-dns = { path = "../temps-dns" }
+temps-network = { path = "../temps-network" }
 serde = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
@@ -57,3 +59,4 @@ docker-tests = []
 tokio-test = "0.4"
 testcontainers = { workspace = true }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
+temps-migrations = { path = "../temps-migrations" }

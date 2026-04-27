@@ -51,6 +51,7 @@ members = [
     "crates/temps-email",
     "crates/temps-email-tracking",
     "crates/temps-dns",
+    "crates/temps-dns-resolver",
     "crates/temps-vulnerability-scanner",
     "crates/temps-kv",
     "crates/temps-blob",
@@ -264,6 +265,7 @@ clap = { version = "4.4", features = ["derive", "env"] }
 # ============================================================================
 bytes = "1.11.1"
 libc = "0.2"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rand = "0.8"
 sysinfo = "0.29.0"
 tempfile = "3.12.0"

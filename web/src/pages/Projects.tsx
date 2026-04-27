@@ -80,6 +80,23 @@ function formatTrendChange(trendPercentage: number | null | undefined): {
 
 const ITEMS_PER_PAGE = 8
 
+// Mirrors the storage key used by ImprovedOnboardingDashboard. When the
+// dashboard reaches its 'complete' step it persists the state here; we
+// read it on Projects mount so that finishing the wizard doesn't leave
+// the user stuck on the 100%-progress screen with no project list.
+const ONBOARDING_STATE_KEY = 'temps_onboarding_state'
+
+function isOnboardingComplete(): boolean {
+  try {
+    const raw = localStorage.getItem(ONBOARDING_STATE_KEY)
+    if (!raw) return false
+    const state = JSON.parse(raw) as { currentStep?: string }
+    return state.currentStep === 'complete'
+  } catch {
+    return false
+  }
+}
+
 export function Projects() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
@@ -219,7 +236,13 @@ export function Projects() {
           className: 'text-xs text-muted-foreground flex items-center mt-1',
         })
 
-  if (!isLoading && !hasProjects) {
+  // Show the onboarding flow only when the user hasn't finished it AND
+  // there are no projects. Once onboarding is marked `complete` (stored
+  // in localStorage by ImprovedOnboardingDashboard), fall through to
+  // the regular Projects page — which has its own empty state with
+  // "Create new project" / "Import project" CTAs. That keeps the
+  // 100%-progress screen from being a dead end.
+  if (!isLoading && !hasProjects && !isOnboardingComplete()) {
     return (
       <div className="sm:p-8">
         <ImprovedOnboardingDashboard />

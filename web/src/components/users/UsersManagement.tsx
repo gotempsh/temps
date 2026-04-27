@@ -96,6 +96,8 @@ interface UsersManagementProps {
   isLoading: boolean
   reloadUsers: () => void
   onEditUser: (user: { id: number; name: string; email: string }) => void
+  isCreateDialogOpen: boolean
+  onCreateDialogOpenChange: (open: boolean) => void
 }
 
 export function UsersManagement({
@@ -103,8 +105,9 @@ export function UsersManagement({
   isLoading,
   reloadUsers,
   onEditUser,
+  isCreateDialogOpen,
+  onCreateDialogOpenChange,
 }: UsersManagementProps) {
-  const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [userToDelete, setUserToDelete] = useState<number | null>(null)
   const [userToManageRoles, setUserToManageRoles] =
     useState<RouteUserWithRoles | null>(null)
@@ -132,7 +135,7 @@ export function UsersManagement({
       // Roles are already assigned in the body during creation
       // No need to assign them again here - that would create duplicates
       toast.success('User created successfully')
-      setIsCreateDialogOpen(false)
+      onCreateDialogOpenChange(false)
       form.reset()
       reloadUsers()
     },
@@ -268,11 +271,11 @@ export function UsersManagement({
           </p>
         </div>
         <CreateActionButton
-          onClick={() => setIsCreateDialogOpen(true)}
+          onClick={() => onCreateDialogOpenChange(true)}
           label="Add User"
           icon={<UserPlus className="h-4 w-4" />}
         />
-        <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
+        <Dialog open={isCreateDialogOpen} onOpenChange={onCreateDialogOpenChange}>
           <DialogContent className="sm:max-w-[425px]">
             <DialogHeader>
               <DialogTitle>Create New User</DialogTitle>
@@ -538,7 +541,7 @@ export function UsersManagement({
           title="No users found"
           description="Get started by creating a new user"
           action={
-            <Button onClick={() => setIsCreateDialogOpen(true)}>
+            <Button onClick={() => onCreateDialogOpenChange(true)}>
               <Plus className="mr-2 h-4 w-4" />
               Add User
             </Button>

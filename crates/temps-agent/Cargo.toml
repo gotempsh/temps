@@ -27,7 +27,9 @@ sysinfo = { workspace = true }
 uuid = { workspace = true }
 http-body-util = "0.1"
 bollard = { workspace = true }
+bytes = { workspace = true }
 temps-core = { path = "../temps-core" }
 temps-deployer = { path = "../temps-deployer" }
 temps-network = { path = "../temps-network" }
+temps-dns-resolver = { path = "../temps-dns-resolver" }
 ipnet = "2.10"

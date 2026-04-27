@@ -225,10 +225,66 @@ impl PostgresClusterService {
                 "        echo 'host all pgautofailover_replicator ::/0 trust' >> \"$HBA\"",
                 "        gosu postgres pg_ctl reload -D \"$PGDATA\" 2>/dev/null || true",
                 "      fi",
+                // Application-user access (ADR-011 follow-up): pg_auto_failover
+                // only auto-generates a pg_hba entry that lets a node connect
+                // to *itself* as the configured user. That blocks every other
+                // path: control-plane health probes, app containers on the
+                // overlay, the Browse Data UI, even sibling cluster members.
+                // We add explicit md5 rules for $POSTGRES_USER so the
+                // application user is reachable from anywhere on the trust
+                // boundary (the cluster's networks). SSL preferred (hostssl
+                // first); plain host as fallback for legacy clients.
+                "      if ! grep -q \"^hostssl all .${POSTGRES_USER}. 0\\.0\\.0\\.0/0 md5\" \"$HBA\" 2>/dev/null; then",
+                "        echo \"hostssl all \\\"${POSTGRES_USER}\\\" 0.0.0.0/0 md5\" >> \"$HBA\"",
+                "        echo \"hostssl all \\\"${POSTGRES_USER}\\\" ::/0 md5\" >> \"$HBA\"",
+                "        echo \"host all \\\"${POSTGRES_USER}\\\" 0.0.0.0/0 md5\" >> \"$HBA\"",
+                "        echo \"host all \\\"${POSTGRES_USER}\\\" ::/0 md5\" >> \"$HBA\"",
+                "        gosu postgres pg_ctl reload -D \"$PGDATA\" 2>/dev/null || true",
+                "      fi",
                 "      break",
                 "    fi",
                 "    sleep 0.5",
                 "  done",
+                ") &",
+                // Separate background loop: ensure the configured app user
+                // exists with the configured password, idempotently.
+                //
+                // Why a separate loop: pg_auto_failover invokes initdb with
+                // `--auth trust` which leaves the superuser without a
+                // password, so external md5 auth always fails until we
+                // ALTER it. We can't run this synchronously at script
+                // top because Postgres isn't listening yet; we can't
+                // batch it with the HBA patcher (which exits on first
+                // patch) because Postgres might come up *after* the HBA
+                // patcher finishes. So this is its own loop that retries
+                // every 2s until the ALTER succeeds, then exits.
+                //
+                // The script writes the SQL to a tempfile rather than
+                // -c'ing it inline so embedded $$ and quotes don't need
+                // round-trip escaping through the bash heredoc.
+                "(",
+                "  SQL_FILE=$(mktemp /tmp/temps-app-user-XXXX.sql)",
+                "  cat > \"$SQL_FILE\" <<SQL_EOF",
+                "DO \\$\\$",
+                "BEGIN",
+                "  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${POSTGRES_USER}') THEN",
+                "    CREATE ROLE \"${POSTGRES_USER}\" LOGIN SUPERUSER PASSWORD '${POSTGRES_PASSWORD}';",
+                "  ELSE",
+                "    ALTER ROLE \"${POSTGRES_USER}\" WITH LOGIN SUPERUSER PASSWORD '${POSTGRES_PASSWORD}';",
+                "  END IF;",
+                "END",
+                "\\$\\$;",
+                "SELECT 'CREATE DATABASE \"${POSTGRES_DB}\" OWNER \"${POSTGRES_USER}\"'",
+                "WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '${POSTGRES_DB}')\\gexec",
+                "SQL_EOF",
+                "  for _ in $(seq 1 60); do",
+                "    if gosu postgres psql -p \"$NODE_PORT\" -d postgres -v ON_ERROR_STOP=1 -f \"$SQL_FILE\" >/dev/null 2>&1; then",
+                "      rm -f \"$SQL_FILE\"",
+                "      exit 0",
+                "    fi",
+                "    sleep 2",
+                "  done",
+                "  rm -f \"$SQL_FILE\"",
                 ") &",
                 "if [ ! -f \"$PGDATA/pg_autoctl.cfg\" ]; then",
                 "  gosu postgres pg_autoctl create postgres \\",
@@ -464,8 +520,6 @@ impl ExternalService for PostgresClusterService {
     ) -> Result<String> {
         let cluster_config = Self::parse_config(config)?;
 
-        // Build multi-host libpq connection string
-        // Only include data nodes (not monitor) in the connection string
         let data_nodes: Vec<&ClusterMemberInfo> = members
             .iter()
             .filter(|m| m.role != "monitor" && m.status == "running")
@@ -475,22 +529,49 @@ impl ExternalService for PostgresClusterService {
             return Err(anyhow::anyhow!("No running data nodes in cluster"));
         }
 
-        let hosts: Vec<String> = data_nodes
-            .iter()
-            .map(|n| format!("{}:{}", n.hostname, n.port))
-            .collect();
-
         let password = cluster_config.password.unwrap_or_default();
         let encoded_password = urlencoding::encode(&password);
 
-        // Multi-host connection string with target_session_attrs for failover
-        let connection_string = format!(
-            "postgresql://{}:{}@{}/{}?target_session_attrs=read-write",
-            cluster_config.username,
-            encoded_password,
-            hosts.join(","),
-            cluster_config.database,
-        );
+        // ADR-011: when every data node carries an FQDN that resolves via
+        // the per-node DNS resolver (`*.temps.local`), collapse the multi-host
+        // libpq workaround into a single VIP. Failover then becomes
+        // a DNS-records flip — apps' next connection (or libpq's automatic
+        // retry) lands on whatever the current primary is, with no
+        // redeploy. The records are owned by the per-cluster reconciler
+        // (Phase 4) and refreshed every few seconds.
+        let all_fqdn = data_nodes
+            .iter()
+            .all(|m| m.hostname.ends_with(".temps.local"));
+
+        let connection_string = if all_fqdn {
+            // Use the per-service VIP. Picks any healthy data node by
+            // multi-A round-robin; libpq + target_session_attrs lands
+            // writes on the primary.
+            //
+            // Port: every data node listens on the same container port, so
+            // we read it off the first member.
+            let port = data_nodes[0].port;
+            format!(
+                "postgresql://{}:{}@{}.temps.local:{}/{}?target_session_attrs=read-write",
+                cluster_config.username, encoded_password, self.name, port, cluster_config.database,
+            )
+        } else {
+            // Legacy / single-host fallback: emit the explicit multi-host
+            // libpq string. Used when DNS isn't wired (no `temps.local`
+            // suffix on member hostnames) — typically integration tests
+            // or pre-DNS deployments.
+            let hosts: Vec<String> = data_nodes
+                .iter()
+                .map(|n| format!("{}:{}", n.hostname, n.port))
+                .collect();
+            format!(
+                "postgresql://{}:{}@{}/{}?target_session_attrs=read-write",
+                cluster_config.username,
+                encoded_password,
+                hosts.join(","),
+                cluster_config.database,
+            )
+        };
 
         Ok(connection_string)
     }

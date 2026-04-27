@@ -3,12 +3,25 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
 };
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use temps_entities::{
     deployment_containers, deployment_domains, deployments, environments, projects,
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
+
+/// Boxed log stream so local-Docker and remote-agent paths share one return type.
+pub type ContainerLogStream =
+    Pin<Box<dyn Stream<Item = Result<String, std::io::Error>> + Send + 'static>>;
+
+/// Connection details the CP terminal handler needs to dial a worker's
+/// agent WebSocket.
+#[derive(Debug, Clone)]
+pub struct RemoteTerminalTarget {
+    pub ws_url: String,
+    pub token: String,
+}
 
 use crate::services::types::{
     Deployment, DeploymentDomain, DeploymentEnvironment, DeploymentListResponse,
@@ -103,7 +116,7 @@ impl DeploymentService {
         environment_id: i32,
         container_name: Option<String>,
         params: ContainerLogParams,
-    ) -> Result<impl Stream<Item = Result<String, std::io::Error>>, DeploymentError> {
+    ) -> Result<ContainerLogStream, DeploymentError> {
         use temps_entities::{deployment_containers, projects};
         let project = projects::Entity::find_by_id(project_id)
             .one(self.db.as_ref())
@@ -149,41 +162,28 @@ impl DeploymentService {
         })?;
 
         let container_id = container.container_id;
-        let stream_result = self
-            .docker_log_service
-            .get_container_logs(
-                &container_id,
-                temps_logs::docker_logs::ContainerLogOptions {
-                    start_date: params.start_date.map(|ts| {
-                        chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
-                    }),
-                    end_date: params.end_date.map(|ts| {
-                        chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
-                    }),
-                    tail: params.tail,
-                    timestamps: params.timestamps,
-                    follow: params.follow,
-                },
-            )
-            .await
-            .map_err(|e| DeploymentError::Other(e.to_string()))?;
-
-        // Map ContainerError to std::io::Error to maintain API compatibility
-        let mapped_stream = futures_util::stream::StreamExt::map(stream_result, |item| {
-            item.map_err(|container_err| std::io::Error::other(container_err.to_string()))
-        });
-
-        Ok(mapped_stream)
+        match container.node_id {
+            None => self.local_container_log_stream(&container_id, params).await,
+            Some(node_id) => {
+                self.remote_container_log_stream(node_id, &container_id, params)
+                    .await
+            }
+        }
     }
 
-    /// Get logs for a specific container by container ID
+    /// Get logs for a specific container by container ID.
+    ///
+    /// Routes by `deployment_containers.node_id`: when `None` (local
+    /// container) we hit the in-process `DockerLogService`; when `Some`,
+    /// we proxy a chunked HTTP stream from the agent on that node so the
+    /// caller never needs to know the container is remote.
     pub async fn get_container_logs_by_id(
         &self,
         project_id: i32,
         environment_id: i32,
         container_id: String,
         params: ContainerLogParams,
-    ) -> Result<impl Stream<Item = Result<String, std::io::Error>>, DeploymentError> {
+    ) -> Result<ContainerLogStream, DeploymentError> {
         use temps_entities::{deployment_containers, projects};
 
         // Verify project exists and is a server-type project
@@ -209,8 +209,8 @@ impl DeploymentService {
             .current_deployment_id
             .ok_or_else(|| DeploymentError::NotFound("No active deployment found".to_string()))?;
 
-        // Verify the container belongs to this deployment
-        let _container = deployment_containers::Entity::find()
+        // Verify the container belongs to this deployment and pick up its node placement.
+        let container = deployment_containers::Entity::find()
             .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
             .filter(deployment_containers::Column::ContainerId.eq(&container_id))
             .filter(deployment_containers::Column::DeletedAt.is_null())
@@ -223,11 +223,139 @@ impl DeploymentService {
                 ))
             })?;
 
-        // Get logs from the Docker log service
+        match container.node_id {
+            None => self.local_container_log_stream(&container_id, params).await,
+            Some(node_id) => {
+                self.remote_container_log_stream(node_id, &container_id, params)
+                    .await
+            }
+        }
+    }
+
+    /// Return the right `ContainerDeployer` for a container based on where it
+    /// runs: `None` → the local CP dockerd; `Some(node_id)` → a fresh
+    /// `RemoteNodeDeployer` pointing at that worker's agent.
+    ///
+    /// We construct the remote deployer per call (cheap — it's just a
+    /// reqwest Client + URL + token) so we don't have to keep a long-lived
+    /// per-node cache that would have to invalidate on token rotation or
+    /// node deletion.
+    async fn deployer_for_node(
+        &self,
+        node_id: Option<i32>,
+    ) -> Result<Arc<dyn temps_deployer::ContainerDeployer>, DeploymentError> {
+        let Some(nid) = node_id else {
+            return Ok(self.deployer.clone());
+        };
+        let remote = self.remote_deployer_for_node(nid).await?;
+        Ok(Arc::new(remote))
+    }
+
+    /// Build a concrete `RemoteNodeDeployer` for a node — needed for
+    /// methods that aren't on the `ContainerDeployer` trait (e.g. exec).
+    async fn remote_deployer_for_node(
+        &self,
+        node_id: i32,
+    ) -> Result<temps_deployer::remote::RemoteNodeDeployer, DeploymentError> {
+        use temps_entities::nodes;
+        let node = nodes::Entity::find_by_id(node_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound(format!("Node {} not found", node_id)))?;
+
+        let encrypted_token = node.token_encrypted.as_ref().ok_or_else(|| {
+            DeploymentError::Other(format!(
+                "Node {} has no agent token; cannot reach remote agent",
+                node_id
+            ))
+        })?;
+        let token_bytes = self
+            .encryption_service
+            .decrypt(encrypted_token)
+            .map_err(|e| {
+                DeploymentError::Other(format!(
+                    "Failed to decrypt agent token for node {}: {}",
+                    node_id, e
+                ))
+            })?;
+        let token = String::from_utf8(token_bytes).map_err(|e| {
+            DeploymentError::Other(format!(
+                "Decrypted agent token for node {} is not valid utf-8: {}",
+                node_id, e
+            ))
+        })?;
+
+        temps_deployer::remote::RemoteNodeDeployer::new(
+            node.address.clone(),
+            token,
+            node.name.clone(),
+        )
+        .map_err(|e| {
+            DeploymentError::Other(format!(
+                "Failed to build remote deployer for node {}: {}",
+                node_id, e
+            ))
+        })
+    }
+
+    /// Resolve the WebSocket URL + bearer token for a worker agent's
+    /// terminal endpoint. The handler dials this WS and pipes frames
+    /// 1:1 between the browser and the agent.
+    pub async fn resolve_remote_terminal(
+        &self,
+        node_id: i32,
+        container_id: &str,
+    ) -> Result<RemoteTerminalTarget, DeploymentError> {
+        let remote = self.remote_deployer_for_node(node_id).await?;
+        let base = remote.agent_url().trim_end_matches('/').to_string();
+        // Map the agent's HTTP scheme to the WS scheme. The agent uses
+        // `http://` on the underlay or `https://` if TLS-fronted, so the
+        // ws scheme tracks it directly.
+        let ws_base = if let Some(rest) = base.strip_prefix("https://") {
+            format!("wss://{}", rest)
+        } else if let Some(rest) = base.strip_prefix("http://") {
+            format!("ws://{}", rest)
+        } else {
+            return Err(DeploymentError::Other(format!(
+                "Node {} agent URL has an unsupported scheme: {}",
+                node_id, base
+            )));
+        };
+        Ok(RemoteTerminalTarget {
+            ws_url: format!("{}/agent/containers/{}/terminal", ws_base, container_id),
+            token: remote.token().to_string(),
+        })
+    }
+
+    /// Run a one-shot exec on a remote worker. The container's `node_id`
+    /// must be `Some(_)` — local-CP exec stays in the handler so we don't
+    /// duplicate bollard plumbing here.
+    pub async fn exec_command_remote(
+        &self,
+        node_id: i32,
+        container_id: &str,
+        command: Vec<String>,
+        timeout_seconds: Option<u64>,
+    ) -> Result<temps_deployer::remote::RemoteExecResult, DeploymentError> {
+        let remote = self.remote_deployer_for_node(node_id).await?;
+        remote
+            .exec_command(container_id, command, timeout_seconds)
+            .await
+            .map_err(|e| {
+                DeploymentError::Other(format!("Remote exec on node {} failed: {}", node_id, e))
+            })
+    }
+
+    /// Stream logs from the locally-running dockerd via `DockerLogService`.
+    async fn local_container_log_stream(
+        &self,
+        container_id: &str,
+        params: ContainerLogParams,
+    ) -> Result<ContainerLogStream, DeploymentError> {
         let stream_result = self
             .docker_log_service
             .get_container_logs(
-                &container_id,
+                container_id,
                 temps_logs::docker_logs::ContainerLogOptions {
                     start_date: params.start_date.map(|ts| {
                         chrono::DateTime::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now)
@@ -243,12 +371,149 @@ impl DeploymentService {
             .await
             .map_err(|e| DeploymentError::Other(e.to_string()))?;
 
-        // Map ContainerError to std::io::Error to maintain API compatibility
-        let mapped_stream = futures_util::stream::StreamExt::map(stream_result, |item| {
+        let mapped = futures_util::stream::StreamExt::map(stream_result, |item| {
             item.map_err(|container_err| std::io::Error::other(container_err.to_string()))
         });
+        Ok(Box::pin(mapped))
+    }
 
-        Ok(mapped_stream)
+    /// Stream logs from a remote agent's chunked HTTP endpoint.
+    ///
+    /// The agent endpoint at `/agent/containers/{id}/logs/stream` emits the
+    /// same byte stream the local `docker logs` would have produced, so each
+    /// chunk maps 1:1 to a `String` log line for the WebSocket client. Auth
+    /// uses the per-node token we issued at `temps join`, decrypted here from
+    /// `nodes.token_encrypted`.
+    async fn remote_container_log_stream(
+        &self,
+        node_id: i32,
+        container_id: &str,
+        params: ContainerLogParams,
+    ) -> Result<ContainerLogStream, DeploymentError> {
+        use futures_util::StreamExt as _;
+        use temps_entities::nodes;
+
+        let node = nodes::Entity::find_by_id(node_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "Node {} for container {} not found",
+                    node_id, container_id
+                ))
+            })?;
+
+        let encrypted_token = node.token_encrypted.as_ref().ok_or_else(|| {
+            DeploymentError::Other(format!(
+                "Node {} has no agent token; cannot stream remote logs",
+                node_id
+            ))
+        })?;
+        let token_bytes = self
+            .encryption_service
+            .decrypt(encrypted_token)
+            .map_err(|e| {
+                DeploymentError::Other(format!(
+                    "Failed to decrypt agent token for node {}: {}",
+                    node_id, e
+                ))
+            })?;
+        let token = String::from_utf8(token_bytes).map_err(|e| {
+            DeploymentError::Other(format!(
+                "Decrypted agent token for node {} is not valid utf-8: {}",
+                node_id, e
+            ))
+        })?;
+
+        let mut url = format!(
+            "{}/agent/containers/{}/logs/stream",
+            node.address.trim_end_matches('/'),
+            container_id,
+        );
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(s) = params.start_date {
+            query.push(("start_date", s.to_string()));
+        }
+        if let Some(s) = params.end_date {
+            query.push(("end_date", s.to_string()));
+        }
+        if let Some(t) = &params.tail {
+            query.push(("tail", t.clone()));
+        }
+        query.push(("timestamps", params.timestamps.to_string()));
+        query.push(("follow", params.follow.to_string()));
+        if !query.is_empty() {
+            let qs = query
+                .into_iter()
+                .map(|(k, v)| format!("{}={}", k, urlencoding::encode(&v)))
+                .collect::<Vec<_>>()
+                .join("&");
+            url.push('?');
+            url.push_str(&qs);
+        }
+
+        // Strict TLS by default; opt-in via the same `insecure_tls` toggle
+        // that the rest of the CP→agent traffic uses, so dev clusters with
+        // self-signed agent certs work without a global escape hatch.
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(temps_core::tls::insecure_tls_enabled())
+            // No top-level timeout — log streams are long-lived by design.
+            .build()
+            .map_err(|e| {
+                DeploymentError::Other(format!(
+                    "Failed to build HTTP client for node {}: {}",
+                    node_id, e
+                ))
+            })?;
+
+        let resp = client
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| {
+                DeploymentError::Other(format!(
+                    "Failed to reach agent on node {} at {}: {}",
+                    node.name, url, e
+                ))
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(DeploymentError::Other(format!(
+                "Agent on node {} returned {} for log stream: {}",
+                node.name, status, body
+            )));
+        }
+
+        // The agent interleaves NUL bytes as keepalives to keep the
+        // chunked HTTP body alive across idle periods. Drop them here so
+        // the WebSocket client only sees real log bytes. The control plane
+        // emits its own WebSocket Ping frames upstream of this stream
+        // (see `handle_container_logs_socket`) so the browser side stays
+        // alive too.
+        let bytes_stream = resp
+            .bytes_stream()
+            .map(|chunk| match chunk {
+                Ok(b) => {
+                    let filtered: Vec<u8> = b.iter().copied().filter(|&c| c != 0).collect();
+                    Ok(filtered)
+                }
+                Err(e) => Err(std::io::Error::other(format!(
+                    "Remote log stream error: {}",
+                    e
+                ))),
+            })
+            .filter_map(|res| async move {
+                match res {
+                    Ok(v) if v.is_empty() => None,
+                    Ok(v) => Some(Ok(String::from_utf8_lossy(&v).to_string())),
+                    Err(e) => Some(Err(e)),
+                }
+            });
+
+        Ok(Box::pin(bytes_stream))
     }
 
     /// List all containers for a specific environment.
@@ -297,21 +562,36 @@ impl DeploymentService {
             return Ok(Vec::new());
         }
 
-        // Get container info from the deployer for each container
+        // Get container info from the deployer for each container, routing
+        // by `node_id`. Containers placed on a worker node need to be
+        // inspected via that worker's agent — calling the local dockerd for
+        // them would hit a 404 and silently drop the row from the response
+        // (which is exactly the bug this routing fixes).
         let mut container_infos = Vec::new();
         for db_container in db_containers {
             let node_id = db_container.node_id;
             let service_name = db_container.service_name.clone();
-            match self
-                .deployer
+
+            let deployer = match self.deployer_for_node(node_id).await {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        "Failed to resolve deployer for container {} on node {:?}: {}",
+                        db_container.container_id, node_id, e
+                    );
+                    continue;
+                }
+            };
+
+            match deployer
                 .get_container_info(&db_container.container_id)
                 .await
             {
                 Ok(info) => container_infos.push((info, node_id, service_name)),
                 Err(e) => {
                     warn!(
-                        "Failed to get info for container {}: {}",
-                        db_container.container_id, e
+                        "Failed to get info for container {} on node {:?}: {}",
+                        db_container.container_id, node_id, e
                     );
                     // Continue with other containers
                 }
@@ -2619,8 +2899,11 @@ impl DeploymentService {
             .get_container_detail(project_id, environment_id, container_id.clone())
             .await?;
 
-        // Stop the container via Docker
-        self.deployer
+        // Route to the worker that owns this container — calling the local
+        // CP dockerd for a remote container would 404 silently, leaving the
+        // container running while the UI thinks it stopped.
+        let deployer = self.deployer_for_node(container.node_id).await?;
+        deployer
             .stop_container(&container.container_id)
             .await
             .map_err(|e| DeploymentError::Other(format!("Failed to stop container: {}", e)))?;
@@ -2645,8 +2928,8 @@ impl DeploymentService {
             .get_container_detail(project_id, environment_id, container_id.clone())
             .await?;
 
-        // Start the container via Docker
-        self.deployer
+        let deployer = self.deployer_for_node(container.node_id).await?;
+        deployer
             .start_container(&container.container_id)
             .await
             .map_err(|e| DeploymentError::Other(format!("Failed to start container: {}", e)))?;
@@ -2671,14 +2954,13 @@ impl DeploymentService {
             .get_container_detail(project_id, environment_id, container_id.clone())
             .await?;
 
-        // Stop the container via Docker
-        self.deployer
+        let deployer = self.deployer_for_node(container.node_id).await?;
+        deployer
             .stop_container(&container.container_id)
             .await
             .map_err(|e| DeploymentError::Other(format!("Failed to stop container: {}", e)))?;
 
-        // Start the container via Docker
-        self.deployer
+        deployer
             .start_container(&container.container_id)
             .await
             .map_err(|e| DeploymentError::Other(format!("Failed to start container: {}", e)))?;
@@ -2703,9 +2985,8 @@ impl DeploymentService {
             .get_container_detail(project_id, environment_id, container_id.clone())
             .await?;
 
-        // Get container info from Docker which includes environment variables
-        let container_info = self
-            .deployer
+        let deployer = self.deployer_for_node(container.node_id).await?;
+        let container_info = deployer
             .get_container_info(&container.container_id)
             .await
             .map_err(|e| DeploymentError::Other(format!("Failed to get container info: {}", e)))?;
@@ -2838,9 +3119,11 @@ impl DeploymentService {
             .get_container_detail(project_id, environment_id, container_id.clone())
             .await?;
 
-        // Get container stats from Docker
-        let stats = self
-            .deployer
+        // Route to the worker that owns this container so remote stats
+        // come back via the agent's `/agent/containers/{id}/stats` endpoint
+        // instead of hitting the CP's local dockerd.
+        let deployer = self.deployer_for_node(container.node_id).await?;
+        let stats = deployer
             .get_container_stats(&container.container_id)
             .await
             .map_err(|e| DeploymentError::Other(format!("Failed to get container stats: {}", e)))?;
@@ -3023,10 +3306,12 @@ mod tests {
     ) -> Arc<temps_providers::ExternalServiceManager> {
         let encryption_service = create_test_encryption_service();
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().ok().unwrap());
+        let dns_registry = Arc::new(temps_providers::DnsRegistry::new(db.clone()));
         Arc::new(temps_providers::ExternalServiceManager::new(
             db,
             encryption_service,
             docker,
+            dns_registry,
         ))
     }
 

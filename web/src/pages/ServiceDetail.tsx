@@ -11,6 +11,7 @@ import {
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { SourceBackupEntry } from '@/api/client/types.gen'
+import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
 import {
@@ -817,6 +818,12 @@ export function ServiceDetail() {
                   </div>
                 </CardContent>
               </Card>
+            )}
+
+          {/* Per-cluster live health panel — reads from pg_auto_failover monitor */}
+          {service.service.topology === 'cluster' &&
+            service.service.service_type === 'postgres' && (
+              <ClusterHealthPanel serviceId={service.service.id} />
             )}
 
           {/* Service Configuration Section */}

@@ -39,10 +39,30 @@ pub fn build_router(
             "/agent/containers/{id}/stop",
             post(handlers::stop_container),
         )
+        .route(
+            "/agent/containers/{id}/start",
+            post(handlers::start_container),
+        )
+        .route(
+            "/agent/containers/{id}/exec",
+            post(handlers::exec_container),
+        )
+        .route(
+            "/agent/containers/{id}/terminal",
+            get(handlers::terminal_container),
+        )
         .route("/agent/containers/{id}", delete(handlers::remove_container))
         .route(
             "/agent/containers/{id}/logs",
             get(handlers::get_container_logs),
+        )
+        .route(
+            "/agent/containers/{id}/logs/stream",
+            get(handlers::stream_container_logs),
+        )
+        .route(
+            "/agent/containers/{id}/stats",
+            get(handlers::get_container_stats),
         )
         .route(
             "/agent/containers/{id}/info",

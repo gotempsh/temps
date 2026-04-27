@@ -1922,10 +1922,12 @@ mod tests {
     ) -> Arc<temps_providers::ExternalServiceManager> {
         let encryption_service = create_test_encryption_service();
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().ok().unwrap());
+        let dns_registry = Arc::new(temps_providers::DnsRegistry::new(db.clone()));
         Arc::new(temps_providers::ExternalServiceManager::new(
             db,
             encryption_service,
             docker,
+            dns_registry,
         ))
     }
 

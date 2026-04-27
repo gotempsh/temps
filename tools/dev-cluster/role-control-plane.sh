@@ -68,21 +68,17 @@ if [[ ! -f "$MARKER" ]]; then
   # internet and we don't need that here.
   ADMIN_PASSWORD="$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 16)"
 
-  # --wildcard-domain + --external-url set explicitly so --auto skips its
-  # public-IP probe (which would slow boot or fail in air-gapped runs)
-  # AND so the proxy doesn't fall back to localho.st defaults that
-  # cause http://localhost:8080 to redirect to localhost:80 over a
-  # self-signed *.localho.st cert.
-  #
-  # external_url is the canonical address operators hit from the host —
-  # http://localhost:8080 because compose forwards :8080 → 8080 in the
-  # container. Wildcard domain stays cosmetic (we don't use SSL).
+  # --wildcard-domain + --external-url match the localho.st cert that
+  # tools/dev-cluster/import-localhost-cert.sh imports from the local
+  # temps_development DB. Setup writes them into settings.data; the
+  # cert import script overwrites them again afterward but having them
+  # set here means setup doesn't probe the public internet for an IP.
   TEMPS_ADMIN_PASSWORD="$ADMIN_PASSWORD" "$BIN" setup \
     --auto \
-    --admin-email "admin@local" \
-    --server-ip "10.42.0.10" \
-    --wildcard-domain "*.dev-cluster.local" \
-    --external-url "http://localhost:8080" \
+    --admin-email "admin@local.dev" \
+    --server-ip "127.0.0.1" \
+    --wildcard-domain "*.localho.st" \
+    --external-url "https://app.localho.st" \
     --database-url "$TEMPS_DATABASE_URL" \
     --data-dir "$TEMPS_DATA_DIR" \
     --skip-geolite2-download \
@@ -91,7 +87,7 @@ if [[ ! -f "$MARKER" ]]; then
     exit 1
   }
 
-  printf 'admin@local\n%s\n' "$ADMIN_PASSWORD" > "$ADMIN_PASSWORD_FILE"
+  printf 'admin@local.dev\n%s\n' "$ADMIN_PASSWORD" > "$ADMIN_PASSWORD_FILE"
   chmod 600 "$ADMIN_PASSWORD_FILE"
 
   # Generate a join token for the workers. Writing to network_config /
@@ -127,5 +123,5 @@ fi
 # 4. Run the API server. This is the long-running command compose
 #    keeps alive.
 # ---------------------------------------------------------------------------
-log "starting temps serve on $TEMPS_ADDRESS"
+log "starting temps serve on $TEMPS_ADDRESS (TLS on $TEMPS_TLS_ADDRESS)"
 exec "$BIN" serve

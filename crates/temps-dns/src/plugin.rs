@@ -16,8 +16,8 @@ use tracing::debug;
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
-use crate::handlers::{self, DnsApiDoc, DnsAppState};
-use crate::services::{DnsProviderService, DnsRecordService};
+use crate::handlers::{self, dns_sync::DnsSyncAppState, DnsApiDoc, DnsAppState};
+use crate::services::{DnsProviderService, DnsRecordService, DnsRegistry};
 
 /// DNS Plugin for managing DNS providers and automatic DNS record configuration
 pub struct DnsPlugin;
@@ -66,19 +66,33 @@ impl TempsPlugin for DnsPlugin {
             });
             context.register_service(app_state);
 
+            // Internal DNS registry (ADR-011) — separate state, separate
+            // auth model, separate consumer (per-node agents).
+            let registry = Arc::new(DnsRegistry::new(db.clone()));
+            context.register_service(registry.clone());
+            let sync_state = Arc::new(DnsSyncAppState {
+                registry,
+                db: db.clone(),
+            });
+            context.register_service(sync_state);
+
             debug!("DNS plugin services registered successfully");
             Ok(())
         })
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        // Get the DnsAppState
+        // User-facing routes
         let app_state = context.require_service::<DnsAppState>();
-
-        // Configure routes
         let dns_routes = handlers::configure_routes().with_state(app_state);
 
-        Some(PluginRoutes { router: dns_routes })
+        // Internal sync routes (per-node agent → control plane)
+        let sync_state = context.require_service::<DnsSyncAppState>();
+        let sync_routes = handlers::configure_internal_routes().with_state(sync_state);
+
+        Some(PluginRoutes {
+            router: dns_routes.merge(sync_routes),
+        })
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {

@@ -288,6 +288,7 @@ async fn test_workflow_execution_service_with_real_jobs() {
         db.clone(),
         encryption_service.clone(),
         Arc::new(docker.clone()),
+        Arc::new(temps_providers::DnsRegistry::new(db.clone())),
     ));
 
     // Create jobs using WorkflowPlanner

@@ -791,6 +791,7 @@ impl BackupCommand {
             db.clone(),
             encryption_service.clone(),
             docker,
+            std::sync::Arc::new(temps_providers::DnsRegistry::new(db.clone())),
         );
 
         // Query all external services from the restored database
@@ -1122,8 +1123,14 @@ impl BackupCommand {
                 .map_err(|e| anyhow::anyhow!("Failed to connect to Docker: {}", e))?,
         );
 
-        let manager =
-            temps_providers::ExternalServiceManager::new(Arc::new(db), encryption_service, docker);
+        let db_arc = Arc::new(db);
+        let dns_registry = Arc::new(temps_providers::DnsRegistry::new(db_arc.clone()));
+        let manager = temps_providers::ExternalServiceManager::new(
+            db_arc,
+            encryption_service,
+            docker,
+            dns_registry,
+        );
 
         // Restore using the ExternalService trait method
         println!();

@@ -171,6 +171,7 @@ impl JoinCommand {
             control_plane_url: self.target.clone(),
             node_id: register_response.id,
             labels: labels.clone(),
+            dns_data_dir: crate::commands::agent::agent_data_dir().join("dns"),
         };
         self.save_agent_config(&config)?;
 
@@ -326,6 +327,7 @@ impl JoinCommand {
             control_plane_url: relay_response.control_plane_url,
             node_id,
             labels: labels.clone(),
+            dns_data_dir: crate::commands::agent::agent_data_dir().join("dns"),
         };
         self.save_agent_config(&config)?;
 

@@ -139,23 +139,40 @@ impl PostgresSource {
     /// Attempt a TLS connection using rustls configured to accept self-signed certificates.
     /// Returns the Client after spawning the connection task.
     async fn connect_with_tls(config: &str) -> std::result::Result<Client, tokio_postgres::Error> {
-        let rustls_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAllVerifier))
-            .with_no_client_auth();
-
-        let tls = MakeRustlsConnect::new(rustls_config);
-        let (client, connection) = tokio_postgres::connect(config, tls).await?;
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                error!("PostgreSQL TLS connection error: {}", e);
-            }
-        });
-
-        Ok(client)
+        connect_with_self_signed_tls(config).await
     }
+}
 
+/// Open a `tokio_postgres::Client` against a libpq-style connection string,
+/// negotiating TLS with rustls + a verifier that accepts any server cert
+/// (self-signed included). The spawned connection task is detached and
+/// runs until the returned `Client` is dropped.
+///
+/// Public so probes (cluster health-checks, `pg_auto_failover` monitor
+/// reads, etc.) outside this crate can reuse the same TLS posture without
+/// re-implementing the verifier or wrestling with `MakeRustlsConnect`
+/// directly.
+pub async fn connect_with_self_signed_tls(
+    config: &str,
+) -> std::result::Result<Client, tokio_postgres::Error> {
+    let rustls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAllVerifier))
+        .with_no_client_auth();
+
+    let tls = MakeRustlsConnect::new(rustls_config);
+    let (client, connection) = tokio_postgres::connect(config, tls).await?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            error!("PostgreSQL TLS connection error: {}", e);
+        }
+    });
+
+    Ok(client)
+}
+
+impl PostgresSource {
     /// Strip SQL string literals to avoid false positives when scanning for dangerous patterns.
     /// Replaces content inside single-quoted strings with empty strings.
     fn strip_sql_string_literals(sql: &str) -> String {

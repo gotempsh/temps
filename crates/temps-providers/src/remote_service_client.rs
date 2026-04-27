@@ -54,6 +54,12 @@ pub struct RemoteServiceCreateResponse {
     pub container_id: String,
     pub container_name: String,
     pub host_port: u16,
+    /// Container's `temps-overlay` IP, when the container is attached to
+    /// it. `None` from single-host clusters and from agents that haven't
+    /// been upgraded yet (the field is `serde(default)`-able so older
+    /// servers' responses still parse). See ADR-011.
+    #[serde(default)]
+    pub compute_ip: Option<String>,
 }
 
 /// Status of a service on a remote node.

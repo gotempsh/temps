@@ -16,8 +16,12 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::Duration;
 
+use bollard::Docker;
 use ipnet::Ipv4Net;
 use serde::Deserialize;
+use temps_dns_resolver::{
+    ResolverConfig as DnsResolverConfig, ResolverHandle as DnsResolverHandle,
+};
 use temps_network::{NetworkConfig, NetworkManager, NodeAlloc, Peer};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -105,11 +109,22 @@ async fn run(config: AgentConfig) -> Result<(), SyncError> {
     };
 
     let mut bootstrapped = false;
+    // Started after first successful bootstrap. Held here (not dropped)
+    // so the resolver tasks stay alive for the lifetime of the agent.
+    let mut _resolver_handle: Option<DnsResolverHandle> = None;
 
     loop {
         match poll_once(&client, &url, &config.token).await {
             Ok(Some(payload)) => {
-                if let Err(e) = apply(&manager, payload, &mut bootstrapped).await {
+                if let Err(e) = apply(
+                    &manager,
+                    payload,
+                    &mut bootstrapped,
+                    &mut _resolver_handle,
+                    &config,
+                )
+                .await
+                {
                     warn!(error = %e, "network sync apply failed; will retry");
                     tokio::time::sleep(BACKOFF_INTERVAL).await;
                     continue;
@@ -163,6 +178,8 @@ async fn apply(
     manager: &NetworkManager,
     payload: WirePeerListResponse,
     bootstrapped: &mut bool,
+    resolver: &mut Option<DnsResolverHandle>,
+    config: &AgentConfig,
 ) -> Result<(), SyncError> {
     let Some(alloc_wire) = payload.alloc else {
         return Ok(());
@@ -177,11 +194,36 @@ async fn apply(
             peers = peers.len(),
             "bringing up multi-host overlay"
         );
+        let bridge_address = alloc.bridge_address;
+        // Clone before bootstrap consumes alloc — we need it for the
+        // Docker network creation step right after.
+        let alloc_for_docker = alloc.clone();
         manager
             .bootstrap(alloc, peers)
             .await
             .map_err(|e| SyncError::Bootstrap(e.to_string()))?;
         *bootstrapped = true;
+
+        // Create the Docker bridge network pinned to the kernel bridge
+        // we just brought up. `temps-network::linux::bootstrap` only
+        // creates kernel-level primitives (br-temps0, vxlan-temps0,
+        // routes, nftables); the corresponding Docker network has to be
+        // created here so the deployer + service handlers can attach
+        // containers to it. Without this, `compute_ip` is always None
+        // and the DNS registry never gets per-container records.
+        if let Err(e) = ensure_overlay_docker_network(&alloc_for_docker).await {
+            warn!(
+                error = %e,
+                "Failed to create overlay Docker network; containers \
+                 won't have cross-node IPs (continuing single-host)"
+            );
+        }
+
+        // Bring up the per-node DNS resolver (ADR-011) on the bridge gateway.
+        // Failure here is non-fatal — apps that resolve cluster FQDNs lose
+        // resolution on this node, but everything else (heartbeats,
+        // deployments, proxy) keeps working.
+        spawn_resolver(config, bridge_address, resolver).await;
     } else {
         let changed = manager
             .reconcile_peers(peers)
@@ -191,6 +233,74 @@ async fn apply(
             info!("multi-host peer list updated");
         }
     }
+    Ok(())
+}
+
+/// Boot the per-node DNS resolver after the overlay is up. Idempotent:
+/// once `resolver` is `Some`, this is a no-op (the resolver runs for the
+/// lifetime of the agent process).
+async fn spawn_resolver(
+    config: &AgentConfig,
+    bridge_address: IpAddr,
+    resolver: &mut Option<DnsResolverHandle>,
+) {
+    if resolver.is_some() {
+        return;
+    }
+    let dns_cfg = DnsResolverConfig::new(
+        config.node_id,
+        config.token.clone(),
+        config.control_plane_url.clone(),
+        bridge_address,
+        config.dns_data_dir.clone(),
+    );
+    let snapshot_path = dns_cfg.snapshot_path();
+    match DnsResolverHandle::start(dns_cfg).await {
+        Ok(handle) => {
+            info!(
+                snapshot = %snapshot_path.display(),
+                bridge = %bridge_address,
+                "DNS resolver started"
+            );
+            *resolver = Some(handle);
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                bridge = %bridge_address,
+                "DNS resolver failed to start; this node has no in-cluster DNS \
+                 (heartbeats / deployments / proxy continue to work)"
+            );
+            // Leave `resolver` as None — next bootstrap (e.g. on agent
+            // restart) will retry. We do NOT retry mid-loop because the
+            // typical failure (port 53 already bound) won't fix itself
+            // by retrying.
+        }
+    }
+}
+
+/// Create the Docker bridge network that sits on top of the kernel
+/// `br-temps0` bridge that `temps-network::linux::bootstrap` brought up.
+/// Idempotent — the helper short-circuits when the network already exists
+/// with a matching subnet.
+///
+/// `temps-network::docker::ensure_network` does the actual work; we just
+/// open the local Docker socket and forward to it. The reason this lives
+/// in the agent and not in `linux::bootstrap` itself: keeping the
+/// kernel-level bootstrap pure of bollard means the integration tests in
+/// `temps-network/tests/it_kernel.rs` don't need a real Docker daemon.
+async fn ensure_overlay_docker_network(alloc: &NodeAlloc) -> Result<(), SyncError> {
+    let docker = Docker::connect_with_local_defaults()
+        .map_err(|e| SyncError::DockerConnect(e.to_string()))?;
+    let cfg = NetworkConfig::default();
+    temps_network::docker::ensure_network(&docker, &cfg, alloc)
+        .await
+        .map_err(|e| SyncError::Bootstrap(format!("docker network: {}", e)))?;
+    info!(
+        network = %cfg.docker_network_name,
+        cidr = %alloc.compute_cidr,
+        "overlay Docker network ready"
+    );
     Ok(())
 }
 
@@ -246,6 +356,9 @@ enum SyncError {
 
     #[error("reconcile failed: {0}")]
     Reconcile(String),
+
+    #[error("failed to connect to local Docker daemon: {0}")]
+    DockerConnect(String),
 }
 
 #[cfg(test)]

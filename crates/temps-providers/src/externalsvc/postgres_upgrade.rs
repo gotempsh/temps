@@ -2844,10 +2844,12 @@ mod tests {
                     panic!("Docker daemon required but not responding");
                 }
 
+                let dns_registry = Arc::new(crate::DnsRegistry::new(db.clone()));
                 let manager = Arc::new(ExternalServiceManager::new(
                     db.clone(),
                     encryption_service.clone(),
                     docker.clone(),
+                    dns_registry,
                 ));
                 let lifecycle_adapter = Arc::new(PostgresLifecycleAdapter::new(
                     db.clone(),

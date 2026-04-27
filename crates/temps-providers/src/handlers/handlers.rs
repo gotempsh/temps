@@ -23,12 +23,13 @@ use super::audit::{
     ExternalServiceUpdatedAudit, ServiceHealthChecked,
 };
 use crate::handlers::types::{
-    AvailableContainerInfo, CreateExternalServiceRequest, EnvironmentVariableInfo,
-    ExternalServiceDetails, ExternalServiceInfo, HealthCheckEntryResponse,
-    ImportExternalServiceRequest, LinkServiceRequest, ProjectServiceInfo, ProviderMetadata,
-    RetryClusterRequest, ServiceHealthResponse, ServiceHealthStatusBatchResponse,
-    ServiceHealthStatusEntryResponse, ServiceParameter, ServiceTypeInfo, ServiceTypeRoute,
-    UpdateExternalServiceRequest, UpgradeExternalServiceRequest,
+    AvailableContainerInfo, ClusterHealthReportResponse, ClusterMemberHealthResponse,
+    CreateExternalServiceRequest, EnvironmentVariableInfo, ExternalServiceDetails,
+    ExternalServiceInfo, HealthCheckEntryResponse, ImportExternalServiceRequest,
+    LinkServiceRequest, ProjectServiceInfo, ProviderMetadata, RetryClusterRequest,
+    ServiceHealthResponse, ServiceHealthStatusBatchResponse, ServiceHealthStatusEntryResponse,
+    ServiceParameter, ServiceTypeInfo, ServiceTypeRoute, UpdateExternalServiceRequest,
+    UpgradeExternalServiceRequest,
 };
 use crate::services::EnvironmentVariableOptions;
 use temps_core::AuditContext;
@@ -241,6 +242,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/external-services/{id}", put(update_service))
         .route("/external-services/{id}", delete(delete_service))
         .route("/external-services/{id}/health", get(check_health))
+        .route(
+            "/external-services/{id}/cluster-health",
+            get(get_cluster_health),
+        )
         .route(
             "/external-services/{id}/health-status",
             get(get_service_health_status),
@@ -739,6 +744,74 @@ async fn check_health(
                 .build()),
         },
     }
+}
+
+/// Per-member health for a Postgres HA cluster.
+///
+/// Reads pg_auto_failover's `pgautofailover.node` table from the cluster's
+/// monitor (TLS, autoctl_node) and joins each member with its
+/// `pg_stat_replication` row from the current primary. Returns one row per
+/// data member with role/state, sync state, and replay lag.
+///
+/// Returns `200` with `monitor_error` set when the monitor is briefly
+/// unreachable (UI surfaces it as a banner above the table); the table
+/// itself is empty in that case. Returns `400` for non-cluster services.
+#[utoipa::path(
+    get,
+    path = "/external-services/{id}/cluster-health",
+    tag = "External Services",
+    responses(
+        (status = 200, description = "Per-member cluster health report", body = ClusterHealthReportResponse),
+        (status = 400, description = "Service is not a cluster"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Service not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("id" = i32, Path, description = "External service ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_cluster_health(
+    State(app_state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+
+    // Fetch the underlying row to (a) confirm existence, (b) check topology.
+    let service = match app_state.external_service_manager.get_service(id).await {
+        Ok(s) => s,
+        Err(e) => match e.to_string().as_str() {
+            "Service not found" => {
+                return Err(not_found()
+                    .detail(format!("External service {} not found", id))
+                    .build())
+            }
+            _ => {
+                return Err(internal_server_error()
+                    .detail(format!("Failed to load service {}: {}", id, e))
+                    .build())
+            }
+        },
+    };
+
+    if service.topology != "cluster" {
+        return Err(bad_request()
+            .detail(format!(
+                "Service {} is not a cluster (topology = {:?}); cluster-health is only \
+                 defined for HA clusters",
+                id, service.topology
+            ))
+            .build());
+    }
+
+    let report = app_state
+        .external_service_manager
+        .cluster_health(&service)
+        .await;
+    let body: ClusterHealthReportResponse = report.into();
+    Ok((StatusCode::OK, Json(body)))
 }
 
 /// Persisted health status for an external service
@@ -1605,6 +1678,7 @@ async fn get_service_preview_environment_variables_masked(
         get_service_health_status,
         trigger_service_health_check,
         list_service_health_statuses,
+        get_cluster_health,
         super::query_handlers::check_explorer_support,
         super::query_handlers::list_root_containers,
         super::query_handlers::list_containers_at_path,
@@ -1634,6 +1708,8 @@ async fn get_service_preview_environment_variables_masked(
         HealthCheckEntryResponse,
         ServiceHealthStatusBatchResponse,
         ServiceHealthStatusEntryResponse,
+        ClusterHealthReportResponse,
+        ClusterMemberHealthResponse,
         super::query_handlers::ExplorerSupportResponse,
         super::query_handlers::ContainerResponse,
         super::query_handlers::EntityResponse,

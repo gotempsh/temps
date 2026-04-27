@@ -4,14 +4,22 @@
 //! exposing them over HTTP for remote control from the control plane.
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
+    body::Body,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
-use serde::Serialize;
+use bollard::exec::StartExecResults;
+use bollard::query_parameters::LogsOptions;
+use futures::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_deployer::{ContainerDeployer, DeployRequest, ImageBuilder};
+use tokio::io::AsyncWriteExt;
 use utoipa::{OpenApi, ToSchema};
 
 use crate::NodeHealthReport;
@@ -61,8 +69,10 @@ fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
     paths(
         deploy_container,
         stop_container,
+        start_container,
         remove_container,
         get_container_logs,
+        exec_container,
         get_container_info,
         list_containers,
         image_exists,
@@ -89,6 +99,9 @@ fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
         AgentResponse<crate::ServiceStatus>,
         AgentResponse<Vec<crate::ServiceStatus>>,
         AgentResponse<crate::ServiceBackupResponse>,
+        AgentResponse<AgentExecResponse>,
+        AgentExecRequest,
+        AgentExecResponse,
         NodeHealthReport,
         temps_deployer::DeployRequest,
         temps_deployer::DeployResult,
@@ -226,6 +239,51 @@ pub async fn stop_container(
     }
 }
 
+/// Start a stopped container.
+///
+/// Used by the control plane when the user clicks Start on a container
+/// running on this worker. Returns the same `AgentResponse<String>`
+/// envelope as `stop_container` so `RemoteNodeDeployer` can decode it
+/// uniformly.
+#[utoipa::path(
+    tag = "Containers",
+    post,
+    path = "/agent/containers/{id}/start",
+    params(
+        ("id" = String, Path, description = "Container ID or name")
+    ),
+    responses(
+        (status = 200, description = "Container started", body = AgentResponse<String>),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Start failed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn start_container(
+    State(state): State<Arc<AgentState>>,
+    Path(container_id): Path<String>,
+) -> impl IntoResponse {
+    tracing::info!(container_id = %container_id, "Starting container");
+    match state
+        .container_deployer
+        .start_container(&container_id)
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(container_id = %container_id, "Container started");
+            AgentResponse::ok("started".to_string()).into_response()
+        }
+        Err(e) => {
+            tracing::error!(container_id = %container_id, "Start failed: {}", e);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Start failed for container {}: {}", container_id, e),
+            )
+            .into_response()
+        }
+    }
+}
+
 /// Remove a container
 #[utoipa::path(
     tag = "Containers",
@@ -301,6 +359,494 @@ pub async fn get_container_logs(
             .into_response()
         }
     }
+}
+
+/// One-shot container stats (CPU%, memory, network counters).
+///
+/// The control plane calls this when the user opens the metrics tab for a
+/// container that runs on this node, and on every poll of the SSE stream
+/// (the agent itself doesn't stream — the CP polls at its own interval).
+///
+/// Not registered in the agent OpenAPI doc because `ContainerStats` does
+/// not derive `ToSchema` and is only ever read by the control plane via
+/// `RemoteNodeDeployer`.
+pub async fn get_container_stats(
+    State(state): State<Arc<AgentState>>,
+    Path(container_id): Path<String>,
+) -> impl IntoResponse {
+    tracing::debug!(container_id = %container_id, "Fetching container stats");
+    match state
+        .container_deployer
+        .get_container_stats(&container_id)
+        .await
+    {
+        Ok(stats) => AgentResponse::ok(stats).into_response(),
+        Err(e) => {
+            tracing::error!(container_id = %container_id, "Failed to get stats: {}", e);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to get stats for container {}: {}", container_id, e),
+            )
+            .into_response()
+        }
+    }
+}
+
+/// One-shot exec request from the control plane.
+///
+/// Wire-compatible with the CP's existing `ExecRequest` struct so the
+/// remote-deployer client can serialize a single shape regardless of
+/// where the container runs.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AgentExecRequest {
+    pub command: Vec<String>,
+    pub timeout_seconds: Option<u64>,
+}
+
+/// Result of a one-shot exec. Mirrors the CP's `ExecResponse`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AgentExecResponse {
+    pub exit_code: Option<i64>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Run a one-shot command inside a container on this worker.
+///
+/// Container exec is timeout-bounded (default 30s, max 300s) so a hung
+/// process can't pin an agent worker thread forever. Output is captured
+/// to memory; the caller gets a single JSON response, not a stream — for
+/// interactive sessions use the (separate) terminal WebSocket.
+#[utoipa::path(
+    tag = "Containers",
+    post,
+    path = "/agent/containers/{id}/exec",
+    params(
+        ("id" = String, Path, description = "Container ID or name")
+    ),
+    request_body = AgentExecRequest,
+    responses(
+        (status = 200, description = "Exec result", body = AgentResponse<AgentExecResponse>),
+        (status = 400, description = "Invalid command"),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Exec failed"),
+        (status = 504, description = "Exec timed out")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn exec_container(
+    State(state): State<Arc<AgentState>>,
+    Path(container_id): Path<String>,
+    Json(request): Json<AgentExecRequest>,
+) -> impl IntoResponse {
+    if request.command.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "Command cannot be empty".into())
+            .into_response();
+    }
+
+    let Some(docker) = state.docker.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Docker is not available on this agent".into(),
+        )
+        .into_response();
+    };
+
+    let timeout_secs = std::cmp::min(request.timeout_seconds.unwrap_or(30), 300);
+
+    tracing::info!(
+        container_id = %container_id,
+        timeout_secs,
+        cmd_argc = request.command.len(),
+        "Executing one-shot command"
+    );
+
+    let exec_config = bollard::models::ExecConfig {
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        cmd: Some(request.command.clone()),
+        ..Default::default()
+    };
+
+    let exec = match docker.create_exec(&container_id, exec_config).await {
+        Ok(e) => e,
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("Container {} not found", container_id),
+            )
+            .into_response();
+        }
+        Err(e) => {
+            tracing::error!(container_id = %container_id, "Failed to create exec: {}", e);
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create exec: {}", e),
+            )
+            .into_response();
+        }
+    };
+
+    let start_config = bollard::exec::StartExecOptions {
+        detach: false,
+        ..Default::default()
+    };
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+        let output = docker.start_exec(&exec.id, Some(start_config)).await?;
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
+            while let Some(Ok(msg)) = output.next().await {
+                match msg {
+                    bollard::container::LogOutput::StdOut { message } => {
+                        stdout.push_str(&String::from_utf8_lossy(&message));
+                    }
+                    bollard::container::LogOutput::StdErr { message } => {
+                        stderr.push_str(&String::from_utf8_lossy(&message));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok::<_, bollard::errors::Error>((stdout, stderr))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((stdout, stderr))) => {
+            let exit_code = docker
+                .inspect_exec(&exec.id)
+                .await
+                .ok()
+                .and_then(|i| i.exit_code);
+            tracing::info!(
+                container_id = %container_id,
+                exit_code = ?exit_code,
+                "Exec completed"
+            );
+            AgentResponse::ok(AgentExecResponse {
+                exit_code,
+                stdout,
+                stderr,
+            })
+            .into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::error!(container_id = %container_id, "Exec error: {}", e);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Exec error: {}", e),
+            )
+            .into_response()
+        }
+        Err(_) => {
+            tracing::warn!(container_id = %container_id, timeout_secs, "Exec timed out");
+            error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("Command timed out after {}s", timeout_secs),
+            )
+            .into_response()
+        }
+    }
+}
+
+/// Persistent terminal session via WebSocket on the worker.
+///
+/// Speaks the same protocol the browser-facing CP terminal speaks:
+///   - client binary frames -> container PTY stdin
+///   - container PTY output -> server binary frames (xterm.js renders these)
+///   - client text frame `{"type":"resize","cols":N,"rows":N}` -> resize PTY
+///   - client text frame `{"type":"input","data":"..."}` -> stdin (legacy)
+///   - server text frame `{"type":"exit","code":N}` when exec ends
+///
+/// The control plane's terminal handler proxies bytes 1:1 between the
+/// browser WS and this WS, so exactly the same xterm.js client works
+/// against a remote container. No protocol translation in the middle.
+pub async fn terminal_container(
+    State(state): State<Arc<AgentState>>,
+    Path(container_id): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let Some(docker) = state.docker.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Docker is not available on this agent".into(),
+        )
+        .into_response();
+    };
+
+    ws.on_upgrade(move |socket| handle_terminal_session(socket, docker, container_id))
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct TerminalControl {
+    r#type: String,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    data: Option<String>,
+}
+
+async fn handle_terminal_session(socket: WebSocket, docker: bollard::Docker, container_id: String) {
+    tracing::debug!(container_id = %container_id, "Agent terminal session started");
+
+    // Try bash, fall back to sh — same shape as the CP-local terminal so
+    // remote sessions feel identical.
+    let exec_config = bollard::models::ExecConfig {
+        attach_stdin: Some(true),
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        tty: Some(true),
+        cmd: Some(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi".to_string(),
+        ]),
+        ..Default::default()
+    };
+
+    let exec = match docker.create_exec(&container_id, exec_config).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(error = %e, container_id = %container_id, "Failed to create exec for terminal");
+            return;
+        }
+    };
+    let exec_id = exec.id.clone();
+
+    let start_config = bollard::exec::StartExecOptions {
+        detach: false,
+        tty: true,
+        ..Default::default()
+    };
+
+    let (mut docker_output, mut docker_input) = match docker
+        .start_exec(&exec_id, Some(start_config))
+        .await
+    {
+        Ok(StartExecResults::Attached { output, input }) => (output, input),
+        Ok(StartExecResults::Detached) => {
+            tracing::error!("Exec started in detached mode unexpectedly");
+            return;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, container_id = %container_id, "Failed to start exec for terminal");
+            return;
+        }
+    };
+
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+
+    // PTY -> WS
+    let exec_id_for_output = exec_id.clone();
+    let docker_for_output = docker.clone();
+    let output_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = docker_output.next().await {
+            let bytes: bytes::Bytes = match msg {
+                bollard::container::LogOutput::StdOut { message } => message,
+                bollard::container::LogOutput::StdErr { message } => message,
+                bollard::container::LogOutput::Console { message } => message,
+                _ => continue,
+            };
+            if ws_sender
+                .send(Message::Binary(bytes.to_vec().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        let exit_code = docker_for_output
+            .inspect_exec(&exec_id_for_output)
+            .await
+            .ok()
+            .and_then(|i| i.exit_code)
+            .unwrap_or(-1);
+        let exit_msg = format!(r#"{{"type":"exit","code":{}}}"#, exit_code);
+        let _ = ws_sender.send(Message::Text(exit_msg.into())).await;
+        let _ = ws_sender.close().await;
+    });
+
+    // WS -> PTY
+    let idle_timeout = std::time::Duration::from_secs(15 * 60);
+    loop {
+        let next = tokio::time::timeout(idle_timeout, ws_receiver.next()).await;
+        match next {
+            Ok(Some(Ok(Message::Binary(data)))) => {
+                if docker_input.write_all(&data).await.is_err() {
+                    break;
+                }
+                if docker_input.flush().await.is_err() {
+                    break;
+                }
+            }
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(ctrl) = serde_json::from_str::<TerminalControl>(&text) {
+                    match ctrl.r#type.as_str() {
+                        "resize" => {
+                            if let (Some(cols), Some(rows)) = (ctrl.cols, ctrl.rows) {
+                                let resize_opts = bollard::exec::ResizeExecOptions {
+                                    width: cols,
+                                    height: rows,
+                                };
+                                if let Err(e) = docker.resize_exec(&exec_id, resize_opts).await {
+                                    tracing::warn!(error = %e, "Failed to resize terminal");
+                                }
+                            }
+                        }
+                        "input" => {
+                            if let Some(data) = ctrl.data {
+                                if docker_input.write_all(data.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                let _ = docker_input.flush().await;
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if docker_input.write_all(text.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
+                tracing::debug!(container_id = %container_id, "Agent terminal closed by client");
+                break;
+            }
+            Err(_) => {
+                tracing::info!(container_id = %container_id, "Agent terminal idle 15m, closing");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    output_task.abort();
+    tracing::info!(container_id = %container_id, "Agent terminal session ended");
+}
+
+/// Query parameters for the streaming logs endpoint. Mirrors the control
+/// plane's `ContainerLogsQuery` so the proxy can pass them through verbatim.
+#[derive(Debug, Deserialize)]
+pub struct ContainerLogsStreamQuery {
+    /// Unix timestamp (seconds). `0` or absent = beginning.
+    pub start_date: Option<i64>,
+    /// Unix timestamp (seconds). `0` or absent = no upper bound.
+    pub end_date: Option<i64>,
+    /// `"all"` or a number of trailing lines.
+    pub tail: Option<String>,
+    /// Prefix every line with the Docker timestamp.
+    #[serde(default)]
+    pub timestamps: bool,
+    /// `true` to stream new lines as they arrive (default), `false` to dump
+    /// the existing logs and close.
+    #[serde(default = "default_true")]
+    pub follow: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Stream container logs over a chunked HTTP body.
+///
+/// The control plane proxies each chunk to the browser as a WebSocket
+/// Text frame, so callers see exactly what they would see if they hit the
+/// existing in-process log path on a single-host cluster.
+pub async fn stream_container_logs(
+    State(state): State<Arc<AgentState>>,
+    Path(container_id): Path<String>,
+    Query(params): Query<ContainerLogsStreamQuery>,
+) -> Response {
+    let Some(docker) = state.docker.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Docker is not available on this agent".into(),
+        )
+        .into_response();
+    };
+
+    // Inspect first so we can return a clean 404 instead of a half-open
+    // chunked body that errors mid-stream.
+    if let Err(e) = docker
+        .inspect_container(
+            &container_id,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+    {
+        return match e {
+            bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            } => error_response(
+                StatusCode::NOT_FOUND,
+                format!("Container {} not found", container_id),
+            )
+            .into_response(),
+            other => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to inspect container {}: {}", container_id, other),
+            )
+            .into_response(),
+        };
+    }
+
+    let log_options = LogsOptions {
+        follow: params.follow,
+        stdout: true,
+        stderr: true,
+        timestamps: params.timestamps,
+        tail: params.tail.unwrap_or_else(|| "all".into()),
+        since: params.start_date.unwrap_or(0) as i32,
+        until: params.end_date.unwrap_or(0) as i32,
+    };
+
+    tracing::debug!(
+        container_id = %container_id,
+        follow = params.follow,
+        timestamps = params.timestamps,
+        "Streaming container logs"
+    );
+
+    let logs = docker.logs(&container_id, Some(log_options));
+    let log_stream = logs.map(|chunk| match chunk {
+        Ok(out) => {
+            let bytes: bytes::Bytes = out.into_bytes();
+            Ok::<_, std::io::Error>(bytes)
+        }
+        Err(e) => Err(std::io::Error::other(format!("docker logs error: {}", e))),
+    });
+
+    // Interleave a NUL keepalive every 25s when the container is silent so
+    // intermediate proxies (Pingora's 60s body read timeout, idle TCP
+    // gateways) don't drop the long-lived stream. The control plane filters
+    // these out before forwarding to the WebSocket client.
+    let keepalive = futures::stream::unfold((), |_| async move {
+        tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+        Some((
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"\0")),
+            (),
+        ))
+    });
+    let body_stream = futures::stream::select(log_stream, keepalive);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        // Disable proxy buffering so log lines flush as they arrive.
+        .header("X-Accel-Buffering", "no")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(body_stream))
+        .unwrap_or_else(|_| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to construct log stream response".into(),
+            )
+            .into_response()
+        })
 }
 
 /// Get container info (status, ports, environment)

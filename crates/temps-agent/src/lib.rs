@@ -80,6 +80,16 @@ pub struct AgentConfig {
     /// Sent in every heartbeat so the control plane has up-to-date label info.
     #[serde(default)]
     pub labels: serde_json::Value,
+    /// Directory for the per-node DNS resolver's zone snapshot
+    /// (`<dir>/zone.json`, ADR-011). Defaults to `/var/lib/temps/dns` on
+    /// Linux. The resolver tolerates missing/unreadable snapshots — start-up
+    /// proceeds with an empty zone in that case.
+    #[serde(default = "default_dns_data_dir")]
+    pub dns_data_dir: std::path::PathBuf,
+}
+
+fn default_dns_data_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("/var/lib/temps/dns")
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +132,14 @@ pub struct ServiceCreateResponse {
     pub container_id: String,
     pub container_name: String,
     pub host_port: u16,
+    /// Container's IP on the `temps-overlay` network, when the container
+    /// is attached to it (multi-host deployments only). NULL on
+    /// single-host clusters and when the inspect call fails — callers
+    /// treat NULL as "fall back to legacy single-host routing".
+    /// Used by the control plane to populate `service_members.compute_ip`
+    /// and the DNS registry's A record (ADR-011).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute_ip: Option<String>,
 }
 
 /// Request to execute a command inside a service container (for backups, etc.).
@@ -320,6 +338,7 @@ mod tests {
             control_plane_url: "https://control:3000".to_string(),
             node_id: 1,
             labels: serde_json::json!({}),
+            dns_data_dir: default_dns_data_dir(),
         };
 
         let json = serde_json::to_string(&config).unwrap();

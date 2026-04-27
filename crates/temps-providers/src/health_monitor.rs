@@ -243,6 +243,15 @@ impl ExternalServiceHealthMonitor {
             }
         };
 
+        // Cluster services need a fan-out probe — the standalone
+        // ExternalService::health_probe path can't reach a multi-host
+        // cluster (it falls through to localhost:5432). Route through the
+        // manager's cluster-aware probe instead.
+        if service.topology == "cluster" {
+            let result = self.manager.probe_cluster(service).await;
+            return (result.status, result.response_time_ms, result.error_message);
+        }
+
         let service_config = match self.manager.get_service_config(service.id).await {
             Ok(cfg) => cfg,
             Err(e) => {

@@ -978,24 +978,42 @@ async fn handle_container_logs_socket(
     // Pin the stream for iteration
     tokio::pin!(log_stream);
 
-    // Stream logs to WebSocket client (raw text, not JSON)
-    while let Some(log_result) = log_stream.next().await {
-        match log_result {
-            Ok(line) => {
-                // Send raw log line as-is
-                if let Err(e) = socket.send(Message::Text(line.into())).await {
-                    warn!("Failed to send log message over WebSocket: {}", e);
+    // Periodic Ping keeps the WS healthy across intermediate proxies
+    // (Pingora's 60s body-read timeout is the immediate motivation) when a
+    // container has long quiet stretches. Browsers handle Ping/Pong
+    // transparently — no frontend change needed.
+    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(25));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // First tick fires immediately; consume it so we don't ping at t=0.
+    ping_interval.tick().await;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = ping_interval.tick() => {
+                if let Err(e) = socket.send(Message::Ping(Vec::new().into())).await {
+                    debug!("WebSocket ping failed (client likely gone): {}", e);
                     break;
                 }
             }
-            Err(e) => {
-                error!("Error reading log line: {}", e);
-                // Send error as plain text
-                let error_msg = format!("ERROR: {}", e);
-                if let Err(e) = socket.send(Message::Text(error_msg.into())).await {
-                    error!("Failed to send error message over WebSocket: {}", e);
+            maybe_line = log_stream.next() => {
+                let Some(log_result) = maybe_line else { break };
+                match log_result {
+                    Ok(line) => {
+                        if let Err(e) = socket.send(Message::Text(line.into())).await {
+                            warn!("Failed to send log message over WebSocket: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error reading log line: {}", e);
+                        let error_msg = format!("ERROR: {}", e);
+                        if let Err(e) = socket.send(Message::Text(error_msg.into())).await {
+                            error!("Failed to send error message over WebSocket: {}", e);
+                        }
+                        break;
+                    }
                 }
-                break;
             }
         }
     }
@@ -2957,6 +2975,7 @@ mod tests {
             db.clone(),
             encryption_service.clone(),
             docker.clone(),
+            Arc::new(temps_providers::DnsRegistry::new(db.clone())),
         ));
 
         let dsn_service = Arc::new(temps_error_tracking::DSNService::new(db.clone()));

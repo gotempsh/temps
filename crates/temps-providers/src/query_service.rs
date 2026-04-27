@@ -170,9 +170,25 @@ impl QueryService {
                         ))
                     })?;
 
-                // For cluster services, resolve the primary data node's address
-                // instead of using the stored config host/port (which may point to
-                // the monitor or use default values).
+                // For cluster services, route directly via the primary's
+                // underlay address + host-mapped port — NOT via the FQDN
+                // VIP. Reasoning:
+                //   - The control plane is not on the multi-host overlay
+                //     (`temps0`), so it can't reach members by their
+                //     overlay IP (`172.20.x.x`).
+                //   - The control plane doesn't run a per-node Hickory
+                //     resolver (the resolver is per-worker), so
+                //     `<svc>.temps.local` doesn't resolve here either.
+                //   - The underlay address (worker's `private_address`)
+                //     plus the container's host-mapped port IS reachable
+                //     from the control plane and goes through the same
+                //     pg_hba `md5 0.0.0.0/0` rule we open for the app
+                //     user during cluster init.
+                //
+                // Apps deployed *into* the cluster keep using
+                // `<svc>.temps.local` because they run on the overlay and
+                // resolve via the local Hickory listener — but that's the
+                // app's path, not ours.
                 let (host, port) = match self
                     .external_service_manager
                     .get_cluster_primary_address(service_id)

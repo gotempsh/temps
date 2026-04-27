@@ -4,7 +4,21 @@
 //! CLI flags and environment variables override the saved config.
 
 use clap::Args;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Resolve the agent data directory (`TEMPS_DATA_DIR` env var, or
+/// `~/.temps`, or `./` as a last resort). Used for the saved agent
+/// config and the per-node DNS resolver snapshot (`<dir>/dns/zone.json`).
+pub fn agent_data_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("TEMPS_DATA_DIR") {
+        return PathBuf::from(p);
+    }
+    if let Some(home) = dirs::home_dir() {
+        return home.join(".temps");
+    }
+    PathBuf::from(".temps")
+}
 
 /// Run the worker node agent server
 #[derive(Args)]
@@ -154,6 +168,10 @@ impl AgentCommand {
             control_plane_url,
             node_id,
             labels,
+            // Use the same data dir hierarchy the rest of the CLI uses
+            // (`~/.temps` by default, overridable by TEMPS_DATA_DIR), so
+            // the resolver snapshot lives next to other agent state.
+            dns_data_dir: agent_data_dir().join("dns"),
         })
     }
 

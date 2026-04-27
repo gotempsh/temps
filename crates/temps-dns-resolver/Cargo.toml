@@ -1,0 +1,42 @@
+[package]
+name = "temps-dns-resolver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+# Hickory DNS — embedded server for the internal *.temps.local zone.
+# Pinned to 0.25 to match the resolver versions used elsewhere in the
+# workspace (`temps-domains`). 0.26 has alpha-only client/proto bundles
+# at the time of writing.
+hickory-server = { version = "0.25", default-features = false }
+hickory-proto = { version = "0.25", default-features = false }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization (zone snapshot, sync wire format)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# HTTP client for the sync long-poll
+reqwest = { workspace = true }
+
+# Error handling & logging
+thiserror = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+# Misc
+chrono = { workspace = true }
+
+[dev-dependencies]
+hickory-resolver = "0.25"
+hickory-client = "0.25"
+tokio-test = "0.4"
+wiremock = "0.6"
+tempfile = "3"

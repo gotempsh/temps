@@ -173,6 +173,67 @@ mod tests {
     }
 
     #[test]
+    fn test_cluster_connection_string_uses_fqdn_vip_when_all_members_are_fqdn() {
+        // ADR-011: when every data node carries an FQDN under .temps.local,
+        // emit the per-service VIP form so apps' next connection lands on
+        // whatever the current primary is via the per-node DNS resolver.
+        let docker = Docker::connect_with_defaults()
+            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
+        let service = PostgresClusterService::new("orders".to_string(), Arc::new(docker));
+
+        let members = vec![
+            ClusterMemberInfo {
+                role: "monitor".to_string(),
+                hostname: "orders-0.orders.temps.local".to_string(),
+                port: 6000,
+                status: "running".to_string(),
+            },
+            ClusterMemberInfo {
+                role: "primary".to_string(),
+                hostname: "orders-1.orders.temps.local".to_string(),
+                port: 6001,
+                status: "running".to_string(),
+            },
+            ClusterMemberInfo {
+                role: "replica".to_string(),
+                hostname: "orders-2.orders.temps.local".to_string(),
+                port: 6001,
+                status: "running".to_string(),
+            },
+        ];
+
+        let config = ServiceConfig {
+            name: "orders".to_string(),
+            service_type: ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({
+                "database": "shop",
+                "username": "app",
+                "password": "secret"
+            }),
+        };
+
+        let conn = service
+            .cluster_connection_string(&members, &config)
+            .unwrap();
+
+        // Single VIP host, no comma-separated multi-host fallback.
+        assert!(
+            !conn.contains(','),
+            "FQDN branch must collapse to single host, got: {conn}"
+        );
+        assert!(
+            conn.contains("@orders.temps.local:6001/shop"),
+            "expected VIP with member port, got: {conn}"
+        );
+        assert!(conn.contains("target_session_attrs=read-write"));
+        assert!(
+            !conn.contains("orders-0"),
+            "Monitor's FQDN must not leak into the connection string"
+        );
+    }
+
+    #[test]
     fn test_cluster_connection_string_no_running_nodes() {
         let docker = Docker::connect_with_defaults()
             .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());

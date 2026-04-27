@@ -2,6 +2,13 @@
 //!
 //! This module contains the API endpoints for managing DNS providers,
 //! managed domains, and DNS records.
+//!
+//! The `dns_sync` submodule contains a separate, internal-only API
+//! consumed by per-node DNS resolvers (ADR-011) — it has a different auth
+//! model, a different consumer, and lives behind its own
+//! [`dns_sync::DnsSyncAppState`].
+
+pub mod dns_sync;
 
 use axum::{
     extract::{Path, State},
@@ -793,6 +800,23 @@ pub fn configure_routes() -> Router<Arc<DnsAppState>> {
         )
 }
 
+/// Configure internal DNS sync routes (ADR-011).
+///
+/// These are *not* user-facing — they're polled by the per-node Hickory
+/// resolver running inside `temps-agent`. Auth is per-node bearer token,
+/// not the user JWT used by [`configure_routes`].
+pub fn configure_internal_routes() -> Router<Arc<dns_sync::DnsSyncAppState>> {
+    Router::new()
+        .route(
+            "/internal/nodes/{node_id}/dns/changes",
+            get(dns_sync::get_dns_changes),
+        )
+        .route(
+            "/internal/nodes/{node_id}/dns/ack",
+            post(dns_sync::post_dns_ack),
+        )
+}
+
 // ========================================
 // OpenAPI Documentation
 // ========================================
@@ -811,6 +835,8 @@ pub fn configure_routes() -> Router<Arc<DnsAppState>> {
         list_managed_domains,
         remove_managed_domain,
         verify_managed_domain,
+        dns_sync::get_dns_changes,
+        dns_sync::post_dns_ack,
     ),
     components(
         schemas(
@@ -826,10 +852,15 @@ pub fn configure_routes() -> Router<Arc<DnsAppState>> {
             DnsProviderType,
             DnsZone,
             DnsRecord,
+            dns_sync::EndpointDto,
+            dns_sync::DnsChangesResponse,
+            dns_sync::DnsAckRequest,
+            dns_sync::DnsAckResponse,
         )
     ),
     tags(
-        (name = "DNS Providers", description = "DNS provider management endpoints")
+        (name = "DNS Providers", description = "DNS provider management endpoints"),
+        (name = "Internal DNS", description = "Per-node DNS resolver sync (ADR-011)"),
     )
 )]
 pub struct DnsApiDoc;

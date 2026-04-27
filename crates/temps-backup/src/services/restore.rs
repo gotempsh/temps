@@ -2068,10 +2068,12 @@ mod tests {
             Docker::connect_with_local_defaults()
                 .expect("Docker socket required to construct ExternalServiceManager in tests"),
         );
+        let dns_registry = Arc::new(temps_providers::DnsRegistry::new(db.clone()));
         let mgr = Arc::new(temps_providers::ExternalServiceManager::new(
             db.clone(),
             enc.clone(),
             docker,
+            dns_registry,
         ));
         RestoreService::new(db, mgr, enc)
     }

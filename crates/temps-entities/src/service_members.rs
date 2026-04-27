@@ -16,9 +16,19 @@ pub struct Model {
     pub role: String,
     pub container_id: Option<String>,
     pub container_name: String,
-    /// WireGuard IP or DNS name for inter-member communication
+    /// FQDN for inter-member communication, in the form
+    /// `<svc>-<ordinal>.<svc>.temps.local`. Resolves via the per-node DNS
+    /// resolver (ADR-011). Populated by the lifecycle hook on container
+    /// start; never an IP, always an FQDN.
     pub hostname: Option<String>,
     pub port: Option<i32>,
+    /// Per-container overlay IP from `temps-overlay` (e.g. `172.20.5.42`).
+    /// Set by the post-create lifecycle hook (`docker inspect` output).
+    /// NULL on single-host clusters and on members from before the
+    /// multi-host overlay was enabled. Read by the proxy's route table
+    /// for cross-node routing and by the DNS registry as the A record
+    /// target.
+    pub compute_ip: Option<String>,
     pub status: String,
     /// Stable member identity (member-0, member-1, etc.)
     pub ordinal: i32,

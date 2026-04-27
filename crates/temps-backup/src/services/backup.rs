@@ -4700,10 +4700,12 @@ mod tests {
         // Create Docker connection
         let docker = Docker::connect_with_local_defaults().unwrap();
 
+        let dns_registry = Arc::new(temps_providers::DnsRegistry::new(db.clone()));
         Arc::new(temps_providers::ExternalServiceManager::new(
             db,
             encryption_service,
             Arc::new(docker),
+            dns_registry,
         ))
     }
 

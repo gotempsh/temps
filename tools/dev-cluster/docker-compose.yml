@@ -77,6 +77,32 @@ volumes:
     name: temps-dev-w3-docker
   control-docker:
     name: temps-dev-cp-docker
+  # Per-container TEMPS_DATA_DIR (/var/lib/temps). Without a named
+  # volume here the container's writable layer is wiped on every
+  # `force-recreate` — that means:
+  #   - control-plane: fresh encryption_key (invalidates imported
+  #     localho.st cert), fresh setup-done marker (re-runs setup, mints
+  #     a NEW admin password)
+  #   - workers: fresh join-done marker (rejoins cluster as a new node
+  #     id, leaks orphan rows into the nodes table)
+  # With these volumes everything survives recreates cleanly.
+  control-data:
+    name: temps-dev-cp-data
+  worker1-data:
+    name: temps-dev-w1-data
+  worker2-data:
+    name: temps-dev-w2-data
+  worker3-data:
+    name: temps-dev-w3-data
+  # Workers' /root (/root/.temps holds the agent.json that `temps join`
+  # writes; without it the agent has no token after a restart and the
+  # container exits in a tight loop).
+  worker1-home:
+    name: temps-dev-w1-home
+  worker2-home:
+    name: temps-dev-w2-home
+  worker3-home:
+    name: temps-dev-w3-home
 
 services:
   postgres:
@@ -106,19 +132,31 @@ services:
     container_name: temps-dev-control-plane
     privileged: true
     hostname: control-plane
+    # Same cgroupv2 nesting fix as the workers — see worker-1 below.
+    cgroup: private
     networks:
       underlay:
         ipv4_address: 10.42.0.10
     ports:
-      # Expose the web UI on the Mac host so you can hit
-      # http://localhost:8080 in your browser.
-      - "8080:8080"
+      # Standard ports — production-shaped layout. The localho.st cert
+      # imported via tools/dev-cluster/import-localhost-cert.sh covers
+      # *.localho.st on port 443; HTTP on :80 redirects to HTTPS as it
+      # would in production. Hit https://app.localho.st in a browser.
+      - "80:80"
+      - "443:443"
     environment:
       TEMPS_DATABASE_URL: postgres://temps:temps@10.42.0.5:5432/temps
-      TEMPS_ADDRESS: 0.0.0.0:8080
+      TEMPS_ADDRESS: 0.0.0.0:80
+      TEMPS_TLS_ADDRESS: 0.0.0.0:443
       TEMPS_DATA_DIR: /var/lib/temps
       TEMPS_LOG_LEVEL: info
       TEMPS_NETWORK_NAME: temps-app-network
+      # Dev cluster serves both HTTP and HTTPS but does NOT redirect
+      # HTTP→HTTPS — that lets you hit http://app.localho.st directly
+      # (no cert dance) AND still use https://app.localho.st when you
+      # want to test cert flows. Once the *.localho.st cert is verified
+      # working, you can flip this off to mirror prod behavior.
+      TEMPS_DISABLE_HTTPS_REDIRECT: "true"
       ROLE: control-plane
     volumes:
       - ../../:/workspace:rw
@@ -126,6 +164,7 @@ services:
       - cargo-cache:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
       - control-docker:/var/lib/docker
+      - control-data:/var/lib/temps
     depends_on:
       postgres:
         condition: service_healthy
@@ -146,7 +185,7 @@ services:
       # silently. Invoke bash explicitly via the array form so the
       # /dev/tcp probe works as intended. Connect-only, ignore HTTP
       # status: we care that the listener accepts a TCP connection.
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/80"]
       interval: 5s
       timeout: 2s
       retries: 60
@@ -160,6 +199,17 @@ services:
     container_name: temps-dev-worker-1
     privileged: true
     hostname: worker-1
+    # Workers can hit transient failures during boot (control plane
+    # mid-startup, postgres still migrating). on-failure makes compose
+    # retry instead of leaving the container in `Exited` state forever.
+    restart: on-failure:5
+    # Give each worker its own cgroup namespace. Required for the
+    # inner dockerd (DinD) to manage child cgroups on a cgroupv2 host
+    # like Docker Desktop. Without this, every user container deploy
+    # fails with:
+    #   "cannot enter cgroupv2 /sys/fs/cgroup/docker with domain
+    #    controllers -- it is in an invalid state"
+    cgroup: private
     networks:
       underlay:
         ipv4_address: 10.42.0.21
@@ -167,7 +217,10 @@ services:
       ROLE: worker
       WORKER_NAME: worker-1
       WORKER_UNDERLAY_IP: 10.42.0.21
-      CONTROL_PLANE_URL: http://10.42.0.10:8080
+      # Workers reach the control plane over the underlay docker network.
+      # Plain HTTP on :80 inside the cluster — no point doing TLS for an
+      # internal hop where the proxy already trusts these IPs.
+      CONTROL_PLANE_URL: http://10.42.0.10:80
       TEMPS_LOG_LEVEL: info
       TEMPS_NETWORK_NAME: temps-app-network
       TEMPS_OVERLAY_NETWORK: temps-overlay
@@ -178,6 +231,8 @@ services:
       - cargo-cache:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
       - worker1-docker:/var/lib/docker
+      - worker1-data:/var/lib/temps
+      - worker1-home:/root
     depends_on:
       control-plane:
         condition: service_healthy
@@ -194,7 +249,10 @@ services:
       ROLE: worker
       WORKER_NAME: worker-2
       WORKER_UNDERLAY_IP: 10.42.0.22
-      CONTROL_PLANE_URL: http://10.42.0.10:8080
+      # Workers reach the control plane over the underlay docker network.
+      # Plain HTTP on :80 inside the cluster — no point doing TLS for an
+      # internal hop where the proxy already trusts these IPs.
+      CONTROL_PLANE_URL: http://10.42.0.10:80
       TEMPS_LOG_LEVEL: info
       TEMPS_NETWORK_NAME: temps-app-network
       TEMPS_OVERLAY_NETWORK: temps-overlay
@@ -205,6 +263,8 @@ services:
       - cargo-cache:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
       - worker2-docker:/var/lib/docker
+      - worker2-data:/var/lib/temps
+      - worker2-home:/root
 
   worker-3:
     <<: *worker-template
@@ -217,7 +277,10 @@ services:
       ROLE: worker
       WORKER_NAME: worker-3
       WORKER_UNDERLAY_IP: 10.42.0.23
-      CONTROL_PLANE_URL: http://10.42.0.10:8080
+      # Workers reach the control plane over the underlay docker network.
+      # Plain HTTP on :80 inside the cluster — no point doing TLS for an
+      # internal hop where the proxy already trusts these IPs.
+      CONTROL_PLANE_URL: http://10.42.0.10:80
       TEMPS_LOG_LEVEL: info
       TEMPS_NETWORK_NAME: temps-app-network
       TEMPS_OVERLAY_NETWORK: temps-overlay
@@ -228,3 +291,5 @@ services:
       - cargo-cache:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
       - worker3-docker:/var/lib/docker
+      - worker3-data:/var/lib/temps
+      - worker3-home:/root

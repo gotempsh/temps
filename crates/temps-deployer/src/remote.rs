@@ -193,6 +193,41 @@ impl RemoteNodeDeployer {
     pub fn agent_url(&self) -> &str {
         &self.agent_url
     }
+
+    /// The bearer token used to authenticate with the agent. Exposed so
+    /// the control plane can build a `Sec-WebSocket` upgrade request that
+    /// matches the rest of the agent API auth.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Run a one-shot command in a container on the remote node and
+    /// collect stdout/stderr + exit code. Mirrors the CP's local
+    /// `exec_command` handler so the CP can pick the right path by
+    /// `node_id` without a behavior change for callers.
+    pub async fn exec_command(
+        &self,
+        container_id: &str,
+        command: Vec<String>,
+        timeout_seconds: Option<u64>,
+    ) -> Result<RemoteExecResult, DeployerError> {
+        let body = serde_json::json!({
+            "command": command,
+            "timeout_seconds": timeout_seconds,
+        });
+        self.agent_post(&format!("/agent/containers/{}/exec", container_id), &body)
+            .await
+    }
+}
+
+/// Wire-compatible mirror of the agent's `AgentExecResponse`. Lives in the
+/// deployer crate so the CP service layer can depend on it without pulling
+/// in `temps-agent`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RemoteExecResult {
+    pub exit_code: Option<i64>,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 #[async_trait]
@@ -248,11 +283,10 @@ impl ContainerDeployer for RemoteNodeDeployer {
 
     async fn get_container_stats(
         &self,
-        _container_id: &str,
+        container_id: &str,
     ) -> Result<ContainerStats, DeployerError> {
-        Err(DeployerError::Other(
-            "Stats not yet supported on remote nodes".into(),
-        ))
+        self.agent_get(&format!("/agent/containers/{}/stats", container_id))
+            .await
     }
 
     async fn list_containers(&self) -> Result<Vec<ContainerInfo>, DeployerError> {
@@ -460,7 +494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_container_stats_not_supported() {
+    async fn test_get_container_stats_returns_network_error_for_unreachable_agent() {
         let deployer = RemoteNodeDeployer::new(
             "https://10.100.0.2:3100".to_string(),
             "token".to_string(),
@@ -468,7 +502,14 @@ mod tests {
         )
         .unwrap();
         let result = deployer.get_container_stats("test-container").await;
-        assert!(result.is_err());
+        // Stats now hit the real `/agent/containers/{id}/stats` endpoint.
+        // With an unreachable address the call must surface a network error
+        // (used to be a hard-coded "not supported" before the endpoint
+        // existed).
+        assert!(matches!(
+            result.unwrap_err(),
+            DeployerError::NetworkError(_)
+        ));
     }
 
     #[tokio::test]

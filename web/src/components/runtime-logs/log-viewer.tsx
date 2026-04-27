@@ -1,6 +1,6 @@
 'use client'
 
-import { ProjectResponse } from '@/api/client'
+import { ContainerInfoResponse, ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
   listContainersOptions,
@@ -24,6 +24,28 @@ import { AlertCircle, ChevronDown, ChevronUp, Search } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { FilterBar } from './filter-bar'
 import { LogLine } from './log-line'
+
+function SelectedContainerLabel({
+  container,
+  containerId,
+}: {
+  container: ContainerInfoResponse | undefined
+  containerId: string
+}) {
+  return (
+    <div className="flex items-center gap-2 text-left">
+      <span className="truncate">{container?.container_name}</span>
+      {container?.node_name && (
+        <span className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded shrink-0">
+          {container.node_name}
+        </span>
+      )}
+      <span className="text-xs text-muted-foreground shrink-0">
+        {containerId.substring(0, 12)}
+      </span>
+    </div>
+  )
+}
 
 function estimateLineHeight(content: string, containerWidth: number) {
   // Assuming average character width of 8px in monospace font
@@ -544,19 +566,13 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
             >
               <SelectTrigger className="w-full sm:w-auto sm:max-w-[400px] text-left">
                 <SelectValue placeholder="Select container">
-                  {selectedContainer && containersData?.containers && (
-                    <div className="flex items-center gap-2 text-left">
-                      <span className="truncate">
-                        {
-                          containersData.containers.find(
-                            (c) => c.container_id === selectedContainer
-                          )?.container_name
-                        }
-                      </span>
-                      <span className="text-xs text-muted-foreground shrink-0">
-                        {selectedContainer.substring(0, 12)}
-                      </span>
-                    </div>
+                  {selectedContainer && (
+                    <SelectedContainerLabel
+                      container={containersData?.containers?.find(
+                        (x) => x.container_id === selectedContainer
+                      )}
+                      containerId={selectedContainer}
+                    />
                   )}
                 </SelectValue>
               </SelectTrigger>
@@ -567,9 +583,14 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
                     value={container.container_id}
                   >
                     <div className="flex flex-col items-start text-left">
-                      <span>
-                        {container.container_name}
-                      </span>
+                      <div className="flex items-center gap-2">
+                        <span>{container.container_name}</span>
+                        {container.node_name && (
+                          <span className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+                            {container.node_name}
+                          </span>
+                        )}
+                      </div>
                       <span className="text-xs text-muted-foreground">
                         {container.container_id.substring(0, 12)}
                       </span>

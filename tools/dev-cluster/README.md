@@ -187,3 +187,35 @@ errors include enough context to identify the failure.
 
 **"docker daemon is not running"**. Start Docker Desktop. The script
 checks `docker version` before doing anything destructive.
+
+## Testing the HA DNS path (ADR-011)
+
+The `test-ha-dns.sh` script validates the internal DNS layer end-to-end
+against the running dev cluster:
+
+```bash
+./tools/dev-cluster/test-ha-dns.sh
+```
+
+What it checks:
+
+1. The DNS schema (`service_endpoints`, `node_dns_state`,
+   `dns_generation`) is in place on the control plane.
+2. Each worker has registered a `node_dns_state` row.
+3. After inserting a synthetic 3-member Postgres-cluster shape into
+   `external_services` + `service_members` + `service_endpoints`, the
+   cluster-wide generation advances and VIP records appear.
+4. A worker container can resolve `<svc>.temps.local` against its
+   per-node Hickory resolver.
+5. Deleting the parent `external_services` row leaves orphan DNS records
+   that the janitor's NOT EXISTS query reaps.
+
+The script uses synthetic DB inserts rather than the full
+`bunx @temps-sdk/cli` flow so it stays self-contained — it doesn't need
+to know admin credentials or the current CLI argument shape. To test
+the real end-to-end path (control-plane manager → DnsRegistry →
+resolver), create a Postgres HA cluster through the web UI and watch
+`service_endpoints` populate as the lifecycle hooks fire.
+
+Exit codes: `0` ok, `2` cluster not running (skipped), anything else =
+a check failed (read the log).

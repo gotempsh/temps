@@ -50,16 +50,24 @@ JOIN_TOKEN="$(cat "$JOIN_TOKEN_FILE")"
 
 # 4. join (idempotent: skip on subsequent boots)
 if [[ ! -f "$JOIN_MARKER" ]]; then
-  # Wait until the control plane's HTTP listener is actually accepting
-  # connections. Compose's depends_on ensures the container started but
-  # not that `temps serve` finished migrations.
-  log "waiting for control plane at $CONTROL_PLANE_URL"
-  for _ in $(seq 1 60); do
-    if curl -fsS -o /dev/null --max-time 2 "$CONTROL_PLANE_URL/api/health" 2>/dev/null \
-       || curl -fsS -o /dev/null --max-time 2 "$CONTROL_PLANE_URL/" 2>/dev/null; then
+  # Wait until the control plane's HTTP listener actually accepts a
+  # connection. Compose's depends_on (service_healthy) gives us
+  # *listener up*, but in race conditions the worker still wins the
+  # boot race. We use a simple TCP probe via bash /dev/tcp because
+  # curl on `Connection refused` returns in <1ms — without an
+  # explicit sleep AFTER the failure, the loop burns 60 iterations in
+  # microseconds and we proceed to `temps join` against a closed port.
+  CP_HOST="${CONTROL_PLANE_URL#http://}"; CP_HOST="${CP_HOST%%/*}"
+  CP_PROBE_HOST="${CP_HOST%:*}"
+  CP_PROBE_PORT="${CP_HOST#*:}"
+  [[ "$CP_PROBE_PORT" == "$CP_HOST" ]] && CP_PROBE_PORT=80
+  log "waiting for control plane at $CP_PROBE_HOST:$CP_PROBE_PORT"
+  for _ in $(seq 1 90); do
+    if (exec 3<>/dev/tcp/"$CP_PROBE_HOST"/"$CP_PROBE_PORT") 2>/dev/null; then
+      exec 3<&-; exec 3>&-
       break
     fi
-    sleep 1
+    sleep 2
   done
 
   log "joining cluster as $WORKER_NAME ($WORKER_UNDERLAY_IP)"
