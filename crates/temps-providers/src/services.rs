@@ -3383,9 +3383,16 @@ impl ExternalServiceManager {
                 reason: "Cannot add member: cluster has no monitor".to_string(),
             })?;
 
-        let monitor_hostname: String = if let Some(h) = monitor.hostname.as_deref() {
-            h.to_string()
-        } else if let Some(nid) = monitor.node_id {
+        // The monitor address has to be reachable *from inside the new
+        // container* via Docker's embedded DNS (127.0.0.11). That means
+        // an underlay IP, NOT an FQDN — the temps DNS registry isn't
+        // wired into containers' resolvers, only into the per-host
+        // Hickory resolver that the proxy + apps use. The FQDN stored
+        // in `monitor.hostname` would just NXDOMAIN inside the new
+        // container's pg_autoctl. This mirrors what `initialize_cluster`
+        // does for the original 3 members: remote monitor → its node's
+        // private_address, local monitor → control plane's local IP.
+        let monitor_hostname: String = if let Some(nid) = monitor.node_id {
             let node = nodes::Entity::find_by_id(nid)
                 .one(self.db.as_ref())
                 .await?
@@ -3394,7 +3401,12 @@ impl ExternalServiceManager {
                 })?;
             node.private_address.clone()
         } else {
-            format!("postgres-{}-monitor", service.name)
+            // Monitor lives on the control plane. Use our local IP so
+            // remote workers can reach it; fall back to the container
+            // name for single-host setups where Docker's bridge DNS
+            // resolves it.
+            Self::get_local_private_ip()
+                .unwrap_or_else(|_| format!("postgres-{}-monitor", service.name))
         };
         let monitor_port = monitor
             .port
