@@ -541,9 +541,9 @@ export function CreateService() {
                 <p className="text-sm text-muted-foreground">
                   Docker image will be set to{' '}
                   <code className="font-mono text-xs bg-muted px-1 py-0.5 rounded">
-                    gotempsh/postgres-ha:18-bookworm
+                    gotempsh/postgres-ha:18-bookworm-walg
                   </code>{' '}
-                  automatically (includes pg_auto_failover).
+                  automatically (includes pg_auto_failover and WAL-G for backups).
                 </p>
                 <ClusterMemberConfig
                   members={clusterMembers}
@@ -621,7 +621,11 @@ function ServicePreviewCard({
   const displayName = serviceName.trim() || `<unnamed>`
   let dockerImage: string | null
   if (topology === 'cluster' && serviceType === 'postgres') {
-    dockerImage = 'gotempsh/postgres-ha:18-bookworm'
+    // Must match DEFAULT_CLUSTER_IMAGE in
+    // crates/temps-providers/src/externalsvc/postgres_cluster.rs.
+    // Backend ignores this string — it's preview-only — but keep it
+    // in sync so operators see what'll actually run.
+    dockerImage = 'gotempsh/postgres-ha:18-bookworm-walg'
   } else if (presetOwnsImage) {
     // Preset owns the field — show what it resolved to, or a placeholder.
     dockerImage = dockerImageOverride || 'Custom (not set)'
