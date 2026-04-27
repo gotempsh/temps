@@ -2937,8 +2937,10 @@ echo "[restore] Pre-seed complete"
         );
         let helper_config = ContainerCreateBody {
             // postgres-ha has both wal-g and gosu, so no extra image
-            // shopping. Pin to the same image the cluster uses.
-            image: Some("gotempsh/postgres-ha:18-bookworm".to_string()),
+            // shopping. Pin to the same -walg-bundled tag the cluster
+            // uses (DEFAULT_CLUSTER_IMAGE) — both wal-g binary and the
+            // image version need to match the primary's pgdata layout.
+            image: Some(crate::externalsvc::postgres_cluster::DEFAULT_CLUSTER_IMAGE.to_string()),
             cmd: Some(vec!["sh".to_string(), "-c".to_string(), script]),
             host_config: Some(HostConfig {
                 binds: Some(vec![format!("{}:/var/lib/postgresql", primary_volume_name)]),

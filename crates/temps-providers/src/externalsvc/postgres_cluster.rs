@@ -13,7 +13,7 @@ use super::{
 };
 
 /// Default Docker image for pg_auto_failover cluster nodes.
-const DEFAULT_CLUSTER_IMAGE: &str = "gotempsh/postgres-ha:18-bookworm";
+pub(crate) const DEFAULT_CLUSTER_IMAGE: &str = "gotempsh/postgres-ha:18-bookworm-walg";
 
 /// PostgreSQL HA cluster service using pg_auto_failover.
 ///
