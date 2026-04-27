@@ -3014,6 +3014,43 @@ impl ExternalServiceManager {
 
     /// Spawn the per-cluster Postgres role reconciler. Idempotent — if one is
     /// already running for `service_id`, returns immediately.
+    /// Discover every running cluster service in the DB and spawn a role
+    /// reconciler for each. Idempotent — calling multiple times leaves
+    /// existing reconcilers alone (the inner `spawn_role_reconciler`
+    /// guards on `reconciler_shutdowns`). Called once during plugin
+    /// startup so reconcilers exist after every restart, not just for
+    /// clusters created in this process's lifetime.
+    pub async fn spawn_reconcilers_for_existing_clusters(&self) {
+        let candidates = match external_services::Entity::find()
+            .filter(external_services::Column::Topology.eq("cluster"))
+            .filter(external_services::Column::Status.eq("running"))
+            .filter(external_services::Column::ServiceType.eq("postgres"))
+            .all(self.db.as_ref())
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to load running clusters at startup; reconcilers won't run \
+                     until a member is added or the cluster is recreated"
+                );
+                return;
+            }
+        };
+        if candidates.is_empty() {
+            debug!("No running cluster services found at startup");
+            return;
+        }
+        info!(
+            count = candidates.len(),
+            "Spawning role reconcilers for existing clusters"
+        );
+        for svc in candidates {
+            self.spawn_role_reconciler(svc.id, svc.name).await;
+        }
+    }
+
     async fn spawn_role_reconciler(&self, service_id: i32, service_name: String) {
         let registry = self.dns_registry.clone();
 

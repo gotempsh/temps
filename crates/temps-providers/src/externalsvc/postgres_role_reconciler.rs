@@ -307,6 +307,19 @@ pub async fn reconcile_once(
         "reconciler observed monitor state"
     );
 
+    // ---- 2a. Sync service_members.role to match the monitor ----
+    //
+    // `service_members.role` is what the UI reads, but until now we
+    // only wrote it at create time. After a failover, pg_auto_failover
+    // updates its own state but our table stays stale. Sync each row
+    // here so the Cluster Members table reflects reality on the next
+    // tick (≤5s after a failover).
+    //
+    // We map monitor nodes → service_members rows by `nodehost` (which
+    // is the worker's underlay IP) → `node.private_address`. Same join
+    // we already do for the IP map below.
+    sync_member_roles(db, service_id, &members, &monitor_nodes).await;
+
     // ---- 3. Compute desired records + apply ----
     let drafts = drafts_for_snapshot(service_id, service_name, &monitor_nodes, &ip_by_hostname);
 
@@ -331,6 +344,104 @@ pub async fn reconcile_once(
     );
 
     Ok(())
+}
+
+/// Bring `service_members.role` in line with what the monitor reports.
+/// pg_auto_failover is the source of truth for who's primary; this
+/// function keeps our row labels consistent so the UI's Cluster Members
+/// table doesn't go stale after a failover.
+///
+/// Mapping rules (in priority order):
+///   1. monitor's `nodehost` matches `node.private_address` → that
+///      member is the one
+///   2. monitor's `nodehost` matches the member's stored `hostname`
+///      (FQDN fallback for any future setup that registers FQDNs in
+///      pg_auto_failover)
+///
+/// We translate pg_auto_failover's `reportedstate` to our role
+/// vocabulary:
+///   - `primary` / `wait_primary` / `single` → `primary`
+///   - `secondary` / `wait_secondary` / `catchingup` / `report_lsn` /
+///     `apply_settings` → `replica`
+///   - everything else → leave the row alone (transient states like
+///     `draining`, `demote_timeout` shouldn't flip the user-facing label)
+async fn sync_member_roles(
+    db: &DatabaseConnection,
+    service_id: i32,
+    members: &[temps_entities::service_members::Model],
+    monitor_nodes: &[MonitorNode],
+) {
+    use sea_orm::ActiveModelTrait;
+    use sea_orm::ActiveValue::Set;
+
+    // Build {underlay_or_fqdn → desired role} from the monitor view.
+    let mut desired_role_by_host: HashMap<String, &'static str> = HashMap::new();
+    for node in monitor_nodes {
+        let role = match node.reported_state.as_str() {
+            "primary" | "wait_primary" | "single" => "primary",
+            "secondary" | "wait_secondary" | "catchingup" | "report_lsn" | "apply_settings" => {
+                "replica"
+            }
+            // Transient/unknown states: keep whatever role we already
+            // had so the UI doesn't flicker on every monitor poll.
+            _ => continue,
+        };
+        desired_role_by_host.insert(node.nodehost.clone(), role);
+    }
+
+    if desired_role_by_host.is_empty() {
+        return;
+    }
+
+    for m in members {
+        if m.role == "monitor" {
+            continue;
+        }
+
+        // Find this member in the monitor view by underlay IP first,
+        // then FQDN fallback. Either may be set depending on how the
+        // member was originally registered.
+        let mut desired: Option<&'static str> = None;
+        if let Some(node_id) = m.node_id {
+            if let Ok(Some(n)) = temps_entities::nodes::Entity::find_by_id(node_id)
+                .one(db)
+                .await
+            {
+                desired = desired_role_by_host.get(&n.private_address).copied();
+            }
+        }
+        if desired.is_none() {
+            if let Some(host) = m.hostname.as_deref() {
+                desired = desired_role_by_host.get(host).copied();
+            }
+        }
+
+        let Some(new_role) = desired else { continue };
+        if m.role == new_role {
+            continue;
+        }
+
+        info!(
+            service_id,
+            member_id = m.id,
+            container = %m.container_name,
+            old_role = %m.role,
+            new_role,
+            "Syncing member role from pg_auto_failover monitor"
+        );
+
+        let mut active: temps_entities::service_members::ActiveModel = m.clone().into();
+        active.role = Set(new_role.to_string());
+        active.updated_at = Set(chrono::Utc::now());
+        if let Err(e) = active.update(db).await {
+            warn!(
+                service_id,
+                member_id = m.id,
+                error = %e,
+                "Failed to write synced role; will retry next tick"
+            );
+        }
+    }
 }
 
 /// Walk an error's `source()` chain and concatenate. `tokio_postgres::Error`

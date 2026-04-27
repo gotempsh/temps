@@ -61,9 +61,20 @@ impl TempsPlugin for ProvidersPlugin {
             // plugin can assemble the resolved (manual + integration) env-var view
             // without depending on this crate.
             let env_vars_provider: Arc<dyn temps_core::ProjectEnvVarsProvider> = Arc::new(
-                ExternalServicesEnvProvider::new(external_service_manager, db.clone()),
+                ExternalServicesEnvProvider::new(external_service_manager.clone(), db.clone()),
             );
             context.register_service(env_vars_provider);
+
+            // Spawn role reconcilers for every cluster that's already
+            // running. Without this, after a control-plane restart no
+            // reconciler exists for any pre-existing cluster and the
+            // role records + service_members.role drift from reality.
+            let manager_for_startup = external_service_manager.clone();
+            tokio::spawn(async move {
+                manager_for_startup
+                    .spawn_reconcilers_for_existing_clusters()
+                    .await;
+            });
 
             tracing::debug!("Providers plugin services registered successfully");
             Ok(())
