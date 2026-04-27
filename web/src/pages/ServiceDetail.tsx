@@ -1,4 +1,5 @@
 import {
+  adminListNodesOptions,
   deleteServiceMutation,
   getProjectsOptions,
   getServiceOptions,
@@ -10,7 +11,10 @@ import {
   startServiceMutation,
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import type { SourceBackupEntry } from '@/api/client/types.gen'
+import type {
+  NodeInfoResponse,
+  SourceBackupEntry,
+} from '@/api/client/types.gen'
 import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
@@ -47,11 +51,19 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Label } from '@/components/ui/label'
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { CopyButton } from '@/components/ui/copy-button'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
 import { ServiceLogo } from '@/components/ui/service-logo'
@@ -108,6 +120,16 @@ export function ServiceDetail() {
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
   const [isBackupDialogOpen, setIsBackupDialogOpen] = useState(false)
   const [isStopDialogOpen, setIsStopDialogOpen] = useState(false)
+  const [isAddMemberDialogOpen, setIsAddMemberDialogOpen] = useState(false)
+  const [addMemberRole, setAddMemberRole] = useState<string>('replica')
+  const [addMemberNodeId, setAddMemberNodeId] = useState<string>(
+    'control-plane'
+  )
+  const [memberToRemove, setMemberToRemove] = useState<{
+    id: number
+    container_name: string
+    role: string
+  } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [prevStatus, setPrevStatus] = useState<string | undefined>(undefined)
   const [visibleParameters, setVisibleParameters] = useState<Set<string>>(
@@ -145,6 +167,21 @@ export function ServiceDetail() {
       return rows.some((u) => !isTerminal(u.status)) ? 3000 : false
     },
   })
+
+  // Worker nodes (for the "add cluster member" node selector). Only fetched
+  // for Postgres clusters — no point hitting the admin endpoint otherwise.
+  const isCluster = service?.service?.topology === 'cluster'
+  const { data: nodesResponse } = useQuery({
+    ...adminListNodesOptions(),
+    enabled: !!id && isPostgres && isCluster,
+  })
+  const activeNodes = useMemo(
+    () =>
+      (nodesResponse?.nodes ?? []).filter(
+        (n: NodeInfoResponse) => n.status === 'active'
+      ),
+    [nodesResponse]
+  )
 
   // Query for environment variables
   const {
@@ -342,6 +379,83 @@ export function ServiceDetail() {
     },
     onError: (error: Error) => {
       toast.error('Failed to retry cluster', {
+        description: error.message,
+      })
+    },
+  })
+
+  // Add a single new member (currently only `replica`) to a running cluster.
+  // Hits POST /external-services/{id}/members directly because the OpenAPI
+  // codegen hasn't been regenerated yet — this is identical to how
+  // retryCluster above already operates.
+  const addMember = useMutation({
+    mutationFn: async (options: {
+      serviceId: number
+      role: string
+      nodeId: number | null
+    }) => {
+      const response = await fetch(
+        `/api/external-services/${options.serviceId}/members`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({
+            role: options.role,
+            node_id: options.nodeId,
+          }),
+        }
+      )
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}))
+        throw new Error(err.detail || 'Failed to add member')
+      }
+      return response.json()
+    },
+    onSuccess: () => {
+      toast.success('Cluster member added', {
+        description:
+          'Reconciler will publish updated DNS records on its next tick.',
+      })
+      setIsAddMemberDialogOpen(false)
+      setAddMemberRole('replica')
+      setAddMemberNodeId('control-plane')
+      refetch()
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to add cluster member', {
+        description: error.message,
+      })
+    },
+  })
+
+  // Remove a single member from a running cluster. The backend refuses
+  // monitor / current primary / quorum-violating removals — surface the
+  // detail message verbatim when that happens.
+  const removeMember = useMutation({
+    mutationFn: async (options: {
+      serviceId: number
+      memberId: number
+    }) => {
+      const response = await fetch(
+        `/api/external-services/${options.serviceId}/members/${options.memberId}`,
+        {
+          method: 'DELETE',
+          credentials: 'include',
+        }
+      )
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}))
+        throw new Error(err.detail || 'Failed to remove member')
+      }
+    },
+    onSuccess: () => {
+      toast.success('Cluster member removed')
+      setMemberToRemove(null)
+      refetch()
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to remove cluster member', {
         description: error.message,
       })
     },
@@ -744,77 +858,134 @@ export function ServiceDetail() {
             service.service.members.length > 0 && (
               <Card>
                 <CardHeader>
-                  <CardTitle className="flex items-center gap-2">
-                    <span>Cluster Members</span>
-                    <Badge variant="outline">
-                      {service.service.members.length}
-                    </Badge>
-                  </CardTitle>
-                  <CardDescription>
-                    pg_auto_failover cluster nodes
-                  </CardDescription>
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <CardTitle className="flex items-center gap-2">
+                        <span>Cluster Members</span>
+                        <Badge variant="outline">
+                          {service.service.members.length}
+                        </Badge>
+                      </CardTitle>
+                      <CardDescription>
+                        pg_auto_failover cluster nodes
+                      </CardDescription>
+                    </div>
+                    {/* Scaling is only safe while the cluster is healthy and
+                        a monitor exists. Hide the button entirely otherwise
+                        rather than opening a dialog that will fail. */}
+                    {service.service.status === 'running' &&
+                      service.service.service_type === 'postgres' &&
+                      service.service.members.some(
+                        (m) => m.role === 'monitor'
+                      ) && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setIsAddMemberDialogOpen(true)}
+                        >
+                          <Plus className="h-4 w-4 mr-1" />
+                          Add Replica
+                        </Button>
+                      )}
+                  </div>
                 </CardHeader>
                 <CardContent>
                   <div className="space-y-2">
-                    {service.service.members.map((member) => (
-                      <div
-                        key={member.id}
-                        className="flex items-center justify-between p-3 rounded-md border border-border"
-                      >
-                        <div className="flex items-center gap-3">
-                          {member.status === 'creating' ? (
-                            <Loader2 className="h-4 w-4 animate-spin text-muted-foreground flex-shrink-0" />
-                          ) : (
-                            <Server className="h-4 w-4 text-muted-foreground flex-shrink-0" />
-                          )}
-                          <div className="flex flex-col">
-                            <div className="flex items-center gap-2">
-                              <span className="font-mono text-sm">
-                                {member.container_name}
-                              </span>
-                              <Badge
-                                variant={
-                                  member.role === 'primary'
-                                    ? 'default'
-                                    : 'secondary'
-                                }
-                                className="capitalize text-xs"
-                              >
-                                {member.role}
-                              </Badge>
-                            </div>
-                            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                              {member.hostname && (
-                                <span>{member.hostname}</span>
-                              )}
-                              {member.port && <span>:{member.port}</span>}
-                              {member.node_id && (
-                                <span className="ml-1">
-                                  (node {member.node_id})
+                    {service.service.members.map((member) => {
+                      // The backend rejects removal of monitor + current
+                      // primary + members below quorum; mirror those rules
+                      // here so the UI doesn't show a button that will
+                      // 400. Quorum check uses the wire-side member list:
+                      // 2 data members minimum to keep HA.
+                      const dataMembers = (
+                        service.service.members ?? []
+                      ).filter((m) => m.role !== 'monitor')
+                      const wouldBreakQuorum =
+                        member.role !== 'monitor' && dataMembers.length <= 2
+                      const removable =
+                        member.role !== 'monitor' &&
+                        member.role !== 'primary' &&
+                        !wouldBreakQuorum &&
+                        service.service.status === 'running'
+                      return (
+                        <div
+                          key={member.id}
+                          className="flex items-center justify-between gap-2 p-3 rounded-md border border-border"
+                        >
+                          <div className="flex items-center gap-3 min-w-0">
+                            {member.status === 'creating' ? (
+                              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground flex-shrink-0" />
+                            ) : (
+                              <Server className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                            )}
+                            <div className="flex flex-col min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span className="font-mono text-sm truncate">
+                                  {member.container_name}
                                 </span>
-                              )}
+                                <Badge
+                                  variant={
+                                    member.role === 'primary'
+                                      ? 'default'
+                                      : 'secondary'
+                                  }
+                                  className="capitalize text-xs"
+                                >
+                                  {member.role}
+                                </Badge>
+                              </div>
+                              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                                {member.hostname && (
+                                  <span>{member.hostname}</span>
+                                )}
+                                {member.port && <span>:{member.port}</span>}
+                                {member.node_id && (
+                                  <span className="ml-1">
+                                    (node {member.node_id})
+                                  </span>
+                                )}
+                              </div>
                             </div>
                           </div>
+                          <div className="flex items-center gap-2 flex-shrink-0">
+                            <Badge
+                              variant={
+                                member.status === 'running'
+                                  ? 'default'
+                                  : member.status === 'failed'
+                                    ? 'destructive'
+                                    : member.status === 'creating'
+                                      ? 'outline'
+                                      : 'secondary'
+                              }
+                              className="capitalize"
+                            >
+                              {member.status === 'creating' && (
+                                <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                              )}
+                              {member.status}
+                            </Badge>
+                            {removable && (
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                                aria-label={`Remove ${member.container_name}`}
+                                onClick={() =>
+                                  setMemberToRemove({
+                                    id: member.id,
+                                    container_name: member.container_name,
+                                    role: member.role,
+                                  })
+                                }
+                              >
+                                <Trash2 className="h-4 w-4" />
+                              </Button>
+                            )}
+                          </div>
                         </div>
-                        <Badge
-                          variant={
-                            member.status === 'running'
-                              ? 'default'
-                              : member.status === 'failed'
-                                ? 'destructive'
-                                : member.status === 'creating'
-                                  ? 'outline'
-                                  : 'secondary'
-                          }
-                          className="capitalize"
-                        >
-                          {member.status === 'creating' && (
-                            <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                          )}
-                          {member.status}
-                        </Badge>
-                      </div>
-                    ))}
+                      )
+                    })}
                   </div>
                 </CardContent>
               </Card>
@@ -1270,6 +1441,155 @@ export function ServiceDetail() {
                 <Loader2 className="h-4 w-4 mr-2 animate-spin" />
               )}
               Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={isAddMemberDialogOpen}
+        onOpenChange={(open) => {
+          setIsAddMemberDialogOpen(open)
+          if (!open) {
+            setAddMemberRole('replica')
+            setAddMemberNodeId('control-plane')
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Add Cluster Member</DialogTitle>
+            <DialogDescription>
+              Provision a new replica and register it with the existing
+              pg_auto_failover monitor. The role reconciler will publish DNS
+              records on its next tick (≤30s).
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <div className="space-y-1.5">
+              <Label className="text-xs">Role</Label>
+              <Select value={addMemberRole} onValueChange={setAddMemberRole}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="replica">Replica</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                Only replicas can be added at runtime. The monitor is a
+                singleton; the primary is elected by pg_auto_failover.
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Node</Label>
+              <Select
+                value={addMemberNodeId}
+                onValueChange={setAddMemberNodeId}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select node..." />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="control-plane">
+                    <div className="flex items-center gap-2">
+                      <Server className="h-3 w-3" />
+                      Control Plane
+                    </div>
+                  </SelectItem>
+                  {activeNodes.map((node) => (
+                    <SelectItem key={node.id} value={String(node.id)}>
+                      <div className="flex items-center gap-2">
+                        <Server className="h-3 w-3" />
+                        {node.name}
+                        <span className="text-muted-foreground text-xs">
+                          ({node.private_address})
+                        </span>
+                      </div>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                For true high availability, place the new replica on a
+                different node than the current primary.
+              </p>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setIsAddMemberDialogOpen(false)}
+              disabled={addMember.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={() =>
+                addMember.mutate({
+                  serviceId: parseInt(id!),
+                  role: addMemberRole,
+                  nodeId:
+                    addMemberNodeId === 'control-plane'
+                      ? null
+                      : Number(addMemberNodeId),
+                })
+              }
+              disabled={addMember.isPending}
+            >
+              {addMember.isPending && (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              )}
+              Add Replica
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={!!memberToRemove}
+        onOpenChange={(open) => {
+          if (!open) setMemberToRemove(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Remove Cluster Member</DialogTitle>
+            <DialogDescription>
+              Stop and remove{' '}
+              <span className="font-mono text-foreground">
+                {memberToRemove?.container_name}
+              </span>{' '}
+              from this cluster. The container, its data volume, and the
+              member's DNS record will be deleted. The pg_auto_failover
+              monitor will mark the node as unreachable; run{' '}
+              <span className="font-mono">pg_autoctl drop node</span>{' '}
+              manually if you want a fully-clean monitor view.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setMemberToRemove(null)}
+              disabled={removeMember.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() =>
+                memberToRemove &&
+                removeMember.mutate({
+                  serviceId: parseInt(id!),
+                  memberId: memberToRemove.id,
+                })
+              }
+              disabled={removeMember.isPending}
+            >
+              {removeMember.isPending && (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              )}
+              Remove Member
             </Button>
           </DialogFooter>
         </DialogContent>
