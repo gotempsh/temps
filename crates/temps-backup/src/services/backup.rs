@@ -4230,27 +4230,47 @@ impl BackupService {
             .await
             .map_err(|e| BackupError::ExternalService(e.to_string()))?;
 
-        // Perform the backup
-        let backup_location = service_instance
-            .backup_to_s3(
-                &s3_client,
-                &s3_credentials,
-                backup.clone(),
-                &s3_source,
-                &subpath,
-                &subpath_root,
-                &self.db,
-                service,
-                service_config,
-            )
-            .await
-            .map_err(|e| {
-                error!(
-                    "External service backup failed for service '{}' (type={}, id={}): {}",
-                    service.name, service.service_type, service.id, e
-                );
-                BackupError::ExternalService(e.to_string())
-            })?;
+        // Cluster topology: route through the manager which knows how
+        // to find the current primary and dispatch exec to it (local
+        // bollard or remote agent). The trait method on
+        // PostgresClusterService doesn't have access to the agent
+        // protocol so it can't handle multi-host clusters; this is
+        // the deliberate carve-out.
+        let backup_location = if service.topology == "cluster" && service.service_type == "postgres"
+        {
+            self.external_service_manager
+                .backup_postgres_cluster(service, &s3_credentials, &subpath_root, backup.id)
+                .await
+                .map_err(|e| {
+                    error!(
+                        "Cluster WAL-G backup failed for service '{}' (id={}): {}",
+                        service.name, service.id, e
+                    );
+                    BackupError::ExternalService(e.to_string())
+                })?
+        } else {
+            // Standalone: use the per-engine trait impl as before.
+            service_instance
+                .backup_to_s3(
+                    &s3_client,
+                    &s3_credentials,
+                    backup.clone(),
+                    &s3_source,
+                    &subpath,
+                    &subpath_root,
+                    &self.db,
+                    service,
+                    service_config,
+                )
+                .await
+                .map_err(|e| {
+                    error!(
+                        "External service backup failed for service '{}' (type={}, id={}): {}",
+                        service.name, service.service_type, service.id, e
+                    );
+                    BackupError::ExternalService(e.to_string())
+                })?
+        };
         info!("Backup created at location: {}", backup_location);
 
         // Mark the parent `backups` row as completed. Without this the row

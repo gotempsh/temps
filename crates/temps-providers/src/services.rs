@@ -478,6 +478,34 @@ fn compute_uptime_percent(entries: &[HealthCheckEntry], window_hours: i64) -> Op
     }
 }
 
+/// Build the env-file lines that WAL-G needs for both `backup-push`
+/// and `wal-push`. Same shape used by the standalone postgres path —
+/// kept here so the cluster path produces an identical file (any
+/// post-failover archiver that sources it works the same way).
+fn build_walg_env(
+    creds: &crate::S3Credentials,
+    walg_s3_prefix: &str,
+    resolved_endpoint: Option<&str>,
+) -> Vec<String> {
+    let mut env = vec![
+        format!("export WALG_S3_PREFIX='{}'", walg_s3_prefix),
+        format!("export AWS_ACCESS_KEY_ID='{}'", creds.access_key_id),
+        format!("export AWS_SECRET_ACCESS_KEY='{}'", creds.secret_key),
+        format!("export AWS_REGION='{}'", creds.region),
+        // Pin the WAL segment compression to lz4 — fast, low CPU,
+        // matches the standalone path. Operators who want zstd can
+        // override via service parameters in a follow-up.
+        "export WALG_COMPRESSION_METHOD='lz4'".to_string(),
+    ];
+    if let Some(endpoint) = resolved_endpoint {
+        env.push(format!("export AWS_ENDPOINT='{}'", endpoint));
+    }
+    if creds.force_path_style {
+        env.push("export AWS_S3_FORCE_PATH_STYLE='true'".to_string());
+    }
+    env
+}
+
 pub struct ExternalServiceManager {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<EncryptionService>,
@@ -2143,6 +2171,458 @@ impl ExternalServiceManager {
             monitor_response_ms,
             members,
             monitor_error: None,
+        }
+    }
+
+    /// Run a WAL-G basebackup against a Postgres HA cluster.
+    ///
+    /// Routes the backup to the **current primary** (resolved from
+    /// `service_members` — kept fresh by the role reconciler). Writes
+    /// the WAL-G env file to **every running data member** so failover
+    /// doesn't break continuous WAL archiving — the new primary picks
+    /// up the same env file and `archive_command` (which lives in
+    /// `postgresql.auto.conf`, replicated through streaming).
+    ///
+    /// Writes an `external_service_backups` row tied to `backup_id`,
+    /// transitioning it through `running` → `completed`/`failed` so
+    /// the standard backup listing/restore flow works for clusters
+    /// without further special-casing.
+    ///
+    /// Returns the WAL-G S3 prefix on success — same shape as the
+    /// standalone postgres path so the rest of `temps-backup` doesn't
+    /// have to special-case clusters.
+    ///
+    /// Designed to be called from `BackupService::backup_external_service`
+    /// when `service.topology == "cluster"`.
+    pub async fn backup_postgres_cluster(
+        &self,
+        service: &external_services::Model,
+        s3_credentials: &crate::S3Credentials,
+        subpath_root: &str,
+        backup_id: i32,
+    ) -> Result<String, ExternalServiceError> {
+        info!(
+            service_id = service.id,
+            service_name = %service.name,
+            "Starting WAL-G basebackup for cluster"
+        );
+
+        if service.topology != "cluster" || service.service_type != "postgres" {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id: service.id,
+                reason: format!(
+                    "backup_postgres_cluster requires topology='cluster' and service_type='postgres' (got {}/{})",
+                    service.topology, service.service_type,
+                ),
+            });
+        }
+
+        let members = self.get_service_members(service.id).await?;
+        let primary = members
+            .iter()
+            .find(|m| m.role == "primary" && m.status == "running")
+            .ok_or(ExternalServiceError::InitializationFailed {
+                id: service.id,
+                reason: "Cannot run backup: cluster has no running primary".to_string(),
+            })?;
+
+        // Write the external_service_backups row up front so the UI's
+        // backup listing reflects an in-progress backup. Updated to
+        // completed/failed at the end.
+        let metadata = serde_json::json!({
+            "service_type": "postgres",
+            "service_name": service.name,
+            "topology": "cluster",
+            "backup_tool": "wal-g",
+            "primary_member_id": primary.id,
+            "primary_container": primary.container_name,
+        });
+        let backup_record = external_service_backups::ActiveModel {
+            service_id: Set(service.id),
+            backup_id: Set(backup_id),
+            backup_type: Set("full".to_string()),
+            state: Set("running".to_string()),
+            started_at: Set(Utc::now()),
+            s3_location: Set(String::new()),
+            metadata: Set(metadata),
+            compression_type: Set("lz4".to_string()),
+            created_by: Set(0),
+            ..Default::default()
+        }
+        .insert(self.db.as_ref())
+        .await?;
+
+        // Single stable WAL-G prefix per cluster. WAL-G needs every
+        // basebackup + WAL segment under the same prefix so
+        // backup-fetch + wal-fetch can find each other.
+        let walg_prefix = format!(
+            "s3://{}/{}/walg",
+            s3_credentials.bucket_name,
+            subpath_root.trim_matches('/'),
+        );
+
+        // Resolve the S3 endpoint relative to the primary's container.
+        // Important for self-hosted MinIO setups where the endpoint
+        // looks like `localhost:9000` from the host but needs to be
+        // a Docker-routable address from inside the container.
+        let resolved_endpoint = if primary.node_id.is_none() {
+            s3_credentials
+                .resolve_endpoint_for_container(&self.docker, &primary.container_name)
+                .await
+        } else {
+            // Remote primary — we can't introspect the worker's docker
+            // from here. Use the configured endpoint as-is; the agent
+            // sees the same network the user supplied.
+            s3_credentials.endpoint.clone()
+        };
+
+        let walg_env = build_walg_env(s3_credentials, &walg_prefix, resolved_endpoint.as_deref());
+
+        // Write walg.env to every running data member. Cheap (kilobytes
+        // per file) and means failover doesn't lose archiving — the
+        // new primary already has the credentials. This also covers
+        // our case where ALTER SYSTEM is replicated via the data
+        // directory (postgresql.auto.conf) but the env file isn't.
+        for m in members
+            .iter()
+            .filter(|m| m.role != "monitor" && m.status == "running")
+        {
+            if let Err(e) = self.write_walg_env_file(m, &walg_env).await {
+                // Don't fail the backup over an env file on a non-primary;
+                // the primary's the one that matters now. Failover would
+                // lose archiving on this node, but the next backup will
+                // re-write it.
+                warn!(
+                    service_id = service.id,
+                    member_id = m.id,
+                    node_id = ?m.node_id,
+                    error = %e,
+                    "Failed to write walg.env to cluster member; continuing"
+                );
+            }
+        }
+
+        // Run the basebackup against the primary.
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            // Source the env file so wal-g picks up the credentials.
+            // Same script the standalone enable_wal_archiving uses for
+            // archive_command — keeps backup and archive pointing at
+            // the same prefix.
+            ". /var/lib/postgresql/walg.env && wal-g backup-push /var/lib/postgresql/pgdata"
+                .to_string(),
+        ];
+
+        info!(
+            service_id = service.id,
+            primary_container = %primary.container_name,
+            primary_node_id = ?primary.node_id,
+            walg_prefix,
+            "Running wal-g backup-push on primary"
+        );
+
+        let (exit_code, stdout, stderr) =
+            self.exec_in_member(primary, cmd, Some("postgres")).await?;
+
+        if exit_code != 0 {
+            let detail = if !stderr.is_empty() { stderr } else { stdout };
+            let err_msg = format!(
+                "wal-g backup-push failed on '{}' (exit {}): {}",
+                primary.container_name,
+                exit_code,
+                detail.trim()
+            );
+            // Mark the row failed before returning so the UI shows it.
+            let mut update: external_service_backups::ActiveModel = backup_record.into();
+            update.state = Set("failed".to_string());
+            update.error_message = Set(Some(err_msg.clone()));
+            update.finished_at = Set(Some(Utc::now()));
+            let _ = update.update(self.db.as_ref()).await;
+            return Err(ExternalServiceError::InternalError { reason: err_msg });
+        }
+
+        info!(
+            service_id = service.id,
+            walg_prefix, "wal-g basebackup completed; enabling continuous WAL archiving"
+        );
+
+        // Enable archive_command via ALTER SYSTEM. Idempotent — if it's
+        // already set to the same value, postgres just rewrites the
+        // line. The setting lives in postgresql.auto.conf which IS
+        // streamed to replicas, so a future failover doesn't need this
+        // step repeated.
+        if let Err(e) = self.enable_cluster_wal_archiving(primary, service).await {
+            // Don't fail the backup — the basebackup is on S3. WAL
+            // archiving will be off until the next backup retries it.
+            warn!(
+                service_id = service.id,
+                error = %e,
+                "Basebackup succeeded but enabling continuous WAL archiving failed"
+            );
+        }
+
+        // Success — mark the row completed with the prefix.
+        let mut update: external_service_backups::ActiveModel = backup_record.into();
+        update.state = Set("completed".to_string());
+        update.s3_location = Set(walg_prefix.clone());
+        update.finished_at = Set(Some(Utc::now()));
+        if let Err(e) = update.update(self.db.as_ref()).await {
+            warn!(
+                service_id = service.id,
+                error = %e,
+                "Backup succeeded but failed to mark external_service_backups row as completed"
+            );
+        }
+
+        Ok(walg_prefix)
+    }
+
+    /// Write `/var/lib/postgresql/walg.env` to a single cluster member.
+    /// The file is sourced by both `archive_command` (every WAL
+    /// segment) and `backup-push` (basebackups), so both paths use
+    /// identical credentials without needing them in the postgres
+    /// process environment (which would leak into pg_dump output).
+    async fn write_walg_env_file(
+        &self,
+        member: &ServiceMemberInfo,
+        env_lines: &[String],
+    ) -> Result<(), ExternalServiceError> {
+        // chmod 0600 — credentials. Owned by postgres because that's the
+        // user the archiver + backup commands run as.
+        let env_body = env_lines.join("\n");
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "umask 077 && cat > /var/lib/postgresql/walg.env <<'WALG_ENV_EOF'\n{}\nWALG_ENV_EOF\n\
+                 chown postgres:postgres /var/lib/postgresql/walg.env && \
+                 chmod 0600 /var/lib/postgresql/walg.env",
+                env_body
+            ),
+        ];
+
+        // Run as root because the file may not exist yet and chown
+        // requires it. The file ends up owned by postgres regardless.
+        let (exit_code, _stdout, stderr) = self.exec_in_member(member, cmd, None).await?;
+        if exit_code != 0 {
+            return Err(ExternalServiceError::InternalError {
+                reason: format!(
+                    "Failed to write walg.env on '{}' (exit {}): {}",
+                    member.container_name,
+                    exit_code,
+                    stderr.trim()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Run `ALTER SYSTEM SET archive_command` on the cluster's primary.
+    /// `postgresql.auto.conf` is part of pgdata and gets streamed to
+    /// replicas, so this only needs to run once per cluster (not per
+    /// failover). Re-running is harmless.
+    async fn enable_cluster_wal_archiving(
+        &self,
+        primary: &ServiceMemberInfo,
+        service: &external_services::Model,
+    ) -> Result<(), ExternalServiceError> {
+        // Pull the app-user credentials so psql can authenticate. We
+        // keep them in cluster parameters under `username` / `password`.
+        let parameters = self.get_service_parameters(service.id).await?;
+        let username = parameters
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or("postgres")
+            .to_string();
+        let password = parameters
+            .get("password")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let database = parameters
+            .get("database")
+            .and_then(|v| v.as_str())
+            .unwrap_or("postgres")
+            .to_string();
+
+        // Source the env file before running wal-g — same shape as the
+        // standalone path. Single-quote the archive_command string so
+        // the SQL parser sees the literal; the shell still expands $p
+        // because postgres treats %p as its own placeholder.
+        let archive_command = ". /var/lib/postgresql/walg.env && wal-g wal-push %p";
+        let alter_sql = format!(
+            "ALTER SYSTEM SET archive_command = '{}'",
+            archive_command.replace('\'', "''")
+        );
+        // Need archive_mode too — defaults to off. archive_mode is a
+        // POSTMASTER setting (requires restart). pg_auto_failover
+        // tolerates a server restart cleanly, so we set it and rely on
+        // the next pg_autoctl-driven restart to pick it up. Until
+        // restart, archive_command runs but archiver isn't enabled —
+        // which means WAL accumulates locally without being shipped.
+        // Acceptable for the first basebackup; operators can manually
+        // restart the primary to start streaming, or wait for the next
+        // pg_auto_failover-initiated restart.
+        let psql_cmd = vec![
+            "psql".to_string(),
+            "-U".to_string(),
+            username,
+            "-d".to_string(),
+            database,
+            "-c".to_string(),
+            alter_sql,
+            "-c".to_string(),
+            "ALTER SYSTEM SET archive_mode = 'on'".to_string(),
+            "-c".to_string(),
+            "ALTER SYSTEM SET wal_level = 'replica'".to_string(),
+            "-c".to_string(),
+            "SELECT pg_reload_conf()".to_string(),
+        ];
+
+        // psql needs PGPASSWORD; pass it through env, NOT the command
+        // line, so it doesn't show up in `ps`.
+        let mut envs = std::collections::HashMap::new();
+        envs.insert("PGPASSWORD".to_string(), password);
+
+        let (exit_code, _stdout, stderr) = self
+            .exec_in_member_with_env(primary, psql_cmd, Some("postgres"), envs)
+            .await?;
+        if exit_code != 0 {
+            return Err(ExternalServiceError::InternalError {
+                reason: format!(
+                    "ALTER SYSTEM SET archive_command failed (exit {}): {}",
+                    exit_code,
+                    stderr.trim()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Run a command inside a cluster member's container, regardless of
+    /// whether it's local (control-plane bollard) or remote (agent).
+    /// Returns `(exit_code, stdout, stderr)`. Same signature as the
+    /// existing `exec_in_local_container` so callers can reuse error
+    /// handling.
+    async fn exec_in_member(
+        &self,
+        member: &ServiceMemberInfo,
+        cmd: Vec<String>,
+        user: Option<&str>,
+    ) -> Result<(i64, String, String), ExternalServiceError> {
+        self.exec_in_member_with_env(member, cmd, user, std::collections::HashMap::new())
+            .await
+    }
+
+    async fn exec_in_member_with_env(
+        &self,
+        member: &ServiceMemberInfo,
+        cmd: Vec<String>,
+        user: Option<&str>,
+        env: std::collections::HashMap<String, String>,
+    ) -> Result<(i64, String, String), ExternalServiceError> {
+        if let Some(node_id) = member.node_id {
+            let client = self.get_remote_client(node_id).await?;
+            let result = client
+                .exec_in_service(crate::remote_service_client::RemoteExecParams {
+                    container_name: member.container_name.clone(),
+                    command: cmd,
+                    environment: env,
+                    user: user.map(|s| s.to_string()),
+                    detach: false,
+                })
+                .await
+                .map_err(|e| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Remote exec failed on member '{}' (node {}): {}",
+                        member.container_name, node_id, e
+                    ),
+                })?;
+            Ok((result.exit_code, result.stdout, result.stderr))
+        } else {
+            // Local path — augment exec_in_local_container with env
+            // support. Until we extend that helper, fall back to a
+            // bollard call here.
+            use bollard::exec::{CreateExecOptions, StartExecOptions};
+            use futures::StreamExt;
+
+            let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+            let env_strings: Vec<String> =
+                env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+            let env_refs: Option<Vec<&str>> = if env_strings.is_empty() {
+                None
+            } else {
+                Some(env_strings.iter().map(|s| s.as_str()).collect())
+            };
+
+            let exec = self
+                .docker
+                .create_exec(
+                    &member.container_name,
+                    CreateExecOptions {
+                        cmd: Some(cmd_refs),
+                        env: env_refs,
+                        user,
+                        attach_stdout: Some(true),
+                        attach_stderr: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| ExternalServiceError::DockerError {
+                    id: 0,
+                    reason: format!(
+                        "Failed to create exec in '{}': {}",
+                        member.container_name, e
+                    ),
+                })?;
+
+            let output = self
+                .docker
+                .start_exec(
+                    &exec.id,
+                    Some(StartExecOptions {
+                        detach: false,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(|e| ExternalServiceError::DockerError {
+                    id: 0,
+                    reason: format!("Failed to start exec in '{}': {}", member.container_name, e),
+                })?;
+
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
+                while let Some(chunk) = output.next().await {
+                    match chunk {
+                        Ok(bollard::container::LogOutput::StdOut { message }) => {
+                            stdout.push_str(&String::from_utf8_lossy(&message));
+                        }
+                        Ok(bollard::container::LogOutput::StdErr { message }) => {
+                            stderr.push_str(&String::from_utf8_lossy(&message));
+                        }
+                        Ok(other) => stdout.push_str(&other.to_string()),
+                        Err(e) => {
+                            return Err(ExternalServiceError::DockerError {
+                                id: 0,
+                                reason: format!("Exec stream error: {}", e),
+                            });
+                        }
+                    }
+                }
+            }
+
+            let inspect = self.docker.inspect_exec(&exec.id).await.map_err(|e| {
+                ExternalServiceError::DockerError {
+                    id: 0,
+                    reason: format!("Failed to inspect exec result: {}", e),
+                }
+            })?;
+            let exit_code = inspect.exit_code.unwrap_or(-1);
+            Ok((exit_code, stdout, stderr))
         }
     }
 
