@@ -381,6 +381,9 @@ export function ServiceDetail() {
       toast.success('Cluster member removed')
       setMemberToRemove(null)
       refetch()
+      queryClient.invalidateQueries({
+        queryKey: ['cluster-health', parseInt(id!)],
+      })
     },
     onError: (error: Error) => {
       toast.error('Failed to remove cluster member', {
@@ -413,10 +416,25 @@ export function ServiceDetail() {
     onSuccess: () => {
       toast.success('Promotion initiated', {
         description:
-          'pg_auto_failover will demote the current primary and promote this replica. The role reconciler refreshes DNS within ~30s.',
+          'pg_auto_failover is demoting the current primary; the table will update as roles flip.',
       })
       setMemberToPromote(null)
-      refetch()
+
+      // Refetch immediately so the dialog closes onto fresh data,
+      // then poll a few more times because pg_auto_failover's FSM
+      // takes a beat to transition (wait_primary → primary) and the
+      // reconciler runs every 5s. After ~10s either the table reflects
+      // reality or the promotion failed silently and the existing 5s
+      // poll will catch the next steady state.
+      const ping = () => {
+        refetch()
+        queryClient.invalidateQueries({
+          queryKey: ['cluster-health', parseInt(id!)],
+        })
+      }
+      ping()
+      const delays = [1500, 3500, 6500, 10000]
+      delays.forEach((ms) => setTimeout(ping, ms))
     },
     onError: (error: Error) => {
       toast.error('Failed to promote cluster member', {
