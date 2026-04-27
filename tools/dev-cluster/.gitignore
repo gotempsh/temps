@@ -2,3 +2,8 @@
 # generated admin password (admin.txt) and the cluster's join token
 # (join_token.txt). Never commit these.
 .state/
+
+# Stray output captures from `./dev-cluster up >out.txt` etc. — these
+# are transient log dumps, not source. They've leaked into the repo
+# before; ignore by name so it doesn't happen again.
+out.txt
