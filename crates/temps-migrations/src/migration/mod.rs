@@ -75,6 +75,7 @@ mod m20260427_000001_add_compute_network;
 mod m20260427_000002_add_dns_service_endpoints;
 mod m20260427_000003_add_compute_ip_to_service_members;
 mod m20260427_000004_add_provisioning_to_service_members;
+mod m20260428_000001_unique_member_ordinal;
 
 pub struct Migrator;
 
@@ -153,6 +154,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260427_000002_add_dns_service_endpoints::Migration),
             Box::new(m20260427_000003_add_compute_ip_to_service_members::Migration),
             Box::new(m20260427_000004_add_provisioning_to_service_members::Migration),
+            Box::new(m20260428_000001_unique_member_ordinal::Migration),
         ]
     }
 }

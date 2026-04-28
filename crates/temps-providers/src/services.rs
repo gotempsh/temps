@@ -523,6 +523,21 @@ fn compute_uptime_percent(entries: &[HealthCheckEntry], window_hours: i64) -> Op
     }
 }
 
+/// Detect a Postgres unique-constraint violation by inspecting the
+/// error chain. Sea-ORM wraps `SqlxError`, which wraps the libpq
+/// `SQLSTATE`. The reliable signal is `SQLSTATE 23505` ("unique
+/// violation"). We match on substring rather than parsing the full
+/// error chain because `tokio_postgres::Error::source()` is hidden
+/// inside Sea-ORM's wrapper and there's no stable accessor.
+///
+/// False positives would only happen if the error message text
+/// contains "23505" by accident, which a postgres protocol error
+/// won't.
+fn is_unique_violation(e: &sea_orm::DbErr) -> bool {
+    let s = e.to_string();
+    s.contains("23505") || s.contains("duplicate key value")
+}
+
 /// Build the env-file lines that WAL-G needs for both `backup-push`
 /// and `wal-push`. Same shape used by the standalone postgres path —
 /// kept here so the cluster path produces an identical file (any
@@ -4252,33 +4267,80 @@ echo "[restore] Pre-seed complete"
         role: &str,
         node_id: Option<i32>,
     ) -> Result<ServiceMemberInfo, ExternalServiceError> {
-        let plan = self
-            .plan_add_cluster_member(service_id, role, node_id)
-            .await?;
-
-        // Insert the placeholder row up front — the UI starts polling on
-        // it as soon as the response lands. We mark the step explicitly
-        // so a quick poll catches the right state even if the spawn task
-        // hasn't gotten a slice of CPU yet.
-        let now = Utc::now();
-        let member_record = service_members::ActiveModel {
-            service_id: Set(service_id),
-            node_id: Set(plan.spec.node_id),
-            role: Set(plan.spec.role.clone()),
-            container_id: Set(None),
-            container_name: Set(plan.container_name.clone()),
-            hostname: Set(plan.spec.hostname.clone()),
-            port: Set(None),
-            status: Set("creating".to_string()),
-            ordinal: Set(plan.spec.ordinal),
-            config: Set(None),
-            provisioning_step: Set(Some(member_provisioning_step::INSERTING_ROW.to_string())),
-            provisioning_error: Set(None),
-            created_at: Set(now),
-            updated_at: Set(now),
-            ..Default::default()
+        // Race-resilient insert. Two concurrent `add_cluster_member`
+        // calls that observe the same `MAX(ordinal)` would each compute
+        // the same next ordinal and try to insert the same
+        // `(service_id, ordinal)` row. The unique constraint added in
+        // m20260428_000001 makes the second insert fail; we recompute
+        // the plan (which re-derives container_name + port + FQDN from
+        // the new ordinal) and try again. Bounded at 8 attempts because
+        // an explosion past that means something else is wrong.
+        const MAX_ORDINAL_RETRIES: usize = 8;
+        let (plan, member_model) = {
+            let mut last_err = None;
+            let mut chosen_plan: Option<AddMemberPlan> = None;
+            let mut chosen_model: Option<service_members::Model> = None;
+            for attempt in 0..MAX_ORDINAL_RETRIES {
+                let plan = self
+                    .plan_add_cluster_member(service_id, role, node_id)
+                    .await?;
+                let now = Utc::now();
+                let member_record = service_members::ActiveModel {
+                    service_id: Set(service_id),
+                    node_id: Set(plan.spec.node_id),
+                    role: Set(plan.spec.role.clone()),
+                    container_id: Set(None),
+                    container_name: Set(plan.container_name.clone()),
+                    hostname: Set(plan.spec.hostname.clone()),
+                    port: Set(None),
+                    status: Set("creating".to_string()),
+                    ordinal: Set(plan.spec.ordinal),
+                    config: Set(None),
+                    provisioning_step: Set(Some(
+                        member_provisioning_step::INSERTING_ROW.to_string(),
+                    )),
+                    provisioning_error: Set(None),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                    ..Default::default()
+                };
+                match member_record.insert(self.db.as_ref()).await {
+                    Ok(model) => {
+                        chosen_plan = Some(plan);
+                        chosen_model = Some(model);
+                        break;
+                    }
+                    Err(e) if is_unique_violation(&e) => {
+                        // Another `add_cluster_member` won this ordinal.
+                        // Loop and recompute against the now-larger
+                        // member set.
+                        warn!(
+                            service_id,
+                            attempted_ordinal = plan.spec.ordinal,
+                            attempt = attempt + 1,
+                            "Ordinal collision on cluster member insert; retrying with next free ordinal"
+                        );
+                        last_err = Some(e);
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            match (chosen_plan, chosen_model) {
+                (Some(p), Some(m)) => (p, m),
+                _ => {
+                    return Err(ExternalServiceError::InternalError {
+                        reason: format!(
+                            "Failed to allocate a unique cluster member ordinal after {} attempts: {}",
+                            MAX_ORDINAL_RETRIES,
+                            last_err
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "no error captured".to_string())
+                        ),
+                    });
+                }
+            }
         };
-        let member_model = member_record.insert(self.db.as_ref()).await?;
         let member_id = member_model.id;
 
         // Spawn the long-running provisioning task. It owns its own Arc
