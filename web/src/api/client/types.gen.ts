@@ -177,6 +177,21 @@ export type ActivityGraphResponse = {
     total_count: number;
 };
 
+/**
+ * Request body for adding a single member to a running cluster.
+ */
+export type AddClusterMemberRequest = {
+    /**
+     * Target worker node ID. Omit or null to run on the control plane.
+     */
+    node_id?: number | null;
+    /**
+     * Member role. Currently only `replica` is accepted at runtime —
+     * monitor is a singleton, primary is elected by pg_auto_failover.
+     */
+    role: string;
+};
+
 export type AddContextRequest = {
     message: string;
 };
@@ -517,6 +532,21 @@ export type AlertRuleResponse = {
     trigger_config: unknown;
     trigger_type: string;
     updated_at: string;
+};
+
+/**
+ * Wire-format allocation. `null` in the JSON when the node hasn't been
+ * allocated yet — workers should treat that as "single-host mode, do
+ * not bring up the overlay".
+ */
+export type AllocEntry = {
+    bridge_address: string;
+    compute_cidr: string;
+    /**
+     * Stable v5 UUID derived from the database node id.
+     */
+    node_id: string;
+    underlay_address: string;
 };
 
 export type AnalyticsMetrics = {
@@ -1044,6 +1074,62 @@ export type ChatMessage = {
 export type CliLoginRequest = {
     password: string;
     username: string;
+};
+
+/**
+ * Response body for `GET /external-services/{id}/cluster-health`.
+ */
+export type ClusterHealthReportResponse = {
+    /**
+     * ISO-8601 wall-clock when the report was generated.
+     */
+    checked_at: string;
+    members: Array<ClusterMemberHealthResponse>;
+    /**
+     * Set when the monitor itself was unreachable. UI shows a banner.
+     */
+    monitor_error?: string | null;
+    /**
+     * Round-trip to query the monitor (ms).
+     */
+    monitor_response_ms: number;
+};
+
+/**
+ * One row in the cluster Members table — see `GET /external-services/{id}/cluster-health`.
+ */
+export type ClusterMemberHealthResponse = {
+    candidate_priority: number;
+    /**
+     * What the monitor *wants* the node to be. Differs from
+     * `reported_state` mid-transition (failover, demotion, etc.).
+     */
+    goal_state: string;
+    /**
+     * pg_auto_failover liveness signal: `1` healthy, `0` unknown
+     * (no recent report), `-1` unhealthy.
+     */
+    health: number;
+    nodehost: string;
+    nodename: string;
+    nodeport: number;
+    /**
+     * `replay_lag` from `pg_stat_replication`, in milliseconds.
+     */
+    replay_lag_ms?: number | null;
+    replication_quorum: boolean;
+    /**
+     * What the node *last told the monitor* it was. Stale during outages.
+     */
+    reported_state: string;
+    /**
+     * Wall-clock seconds since the node last reported in.
+     */
+    seconds_since_report: number;
+    /**
+     * `sync` / `quorum` / `async` for secondaries; `null` for the primary.
+     */
+    sync_state?: string | null;
 };
 
 /**
@@ -2832,6 +2918,19 @@ export type DiskSpaceAlertSettings = {
     threshold_percent?: number;
 };
 
+export type DnsAckRequest = {
+    /**
+     * Highest generation the agent has actually applied locally.
+     */
+    applied_generation: number;
+};
+
+export type DnsAckResponse = {
+    applied_generation: number;
+    node_id: number;
+    server_generation: number;
+};
+
 /**
  * Result of a single DNS TXT record creation for ACME challenge
  */
@@ -2852,6 +2951,26 @@ export type DnsChallengeRecordResult = {
      * TXT record value (the ACME challenge token)
      */
     value: string;
+};
+
+export type DnsChangesResponse = {
+    /**
+     * `true` ⇒ replace the local zone with `records`. `false` ⇒ merge
+     * `records` into the existing zone (and remove `removed_ids`).
+     */
+    full_snapshot: boolean;
+    /**
+     * Highest generation included in this response. Agent ACKs this back.
+     */
+    generation: number;
+    records: Array<EndpointDto>;
+    /**
+     * IDs the agent should remove from its zone. Always empty in the v1
+     * protocol — the resolver reconciles by name on snapshot mode. Kept
+     * in the wire format so a future tombstone-based protocol doesn't
+     * require a breaking change.
+     */
+    removed_ids: Array<number>;
 };
 
 export type DnsCompletionResponse = {
@@ -3576,6 +3695,24 @@ export type EnableKvResponse = {
      * Whether the service was successfully enabled
      */
     success: boolean;
+};
+
+/**
+ * One DNS record on the wire. Mirrors `service_endpoints::Model` but
+ * keeps the API stable across entity evolution. `target_ip` is a string
+ * (v4 or v6 literal, or CNAME target hostname) parsed by the resolver.
+ */
+export type EndpointDto = {
+    fqdn: string;
+    generation: number;
+    id: number;
+    node_id?: number | null;
+    owner_id: number;
+    owner_kind: string;
+    record_type: string;
+    target_ip?: string | null;
+    target_port?: number | null;
+    ttl: number;
 };
 
 export type EnrichVisitorRequest = {
@@ -7646,6 +7783,40 @@ export type PathVisitorsResponse = {
     results: Array<PathVisitors>;
 };
 
+/**
+ * Wire-format peer entry. Matches `temps_network::config::Peer` but
+ * uses strings on the wire to keep the API stable across underlying
+ * type evolution.
+ */
+export type PeerEntry = {
+    /**
+     * Per-node CIDR (e.g. `"172.20.5.0/24"`).
+     */
+    compute_cidr: string;
+    /**
+     * Stable v5 UUID derived from the database node id. Workers use
+     * this as the kernel-layer identifier when calling
+     * `NetworkManager::reconcile_peers`.
+     */
+    node_id: string;
+    /**
+     * Address the local node should use to reach this peer over the
+     * underlay (private VPC IP for same-DC, public IP for cross-DC).
+     */
+    underlay_address: string;
+};
+
+/**
+ * Response body for `GET /internal/nodes/{node_id}/network/peers`.
+ */
+export type PeerListResponse = {
+    alloc?: null | AllocEntry;
+    /**
+     * All other nodes with a `compute_cidr` set, excluding the caller.
+     */
+    peers: Array<PeerEntry>;
+};
+
 export type PerformanceMetricsQuery = {
     deployment_id?: number | null;
     /**
@@ -9985,12 +10156,46 @@ export type ServiceHealthStatusEntryResponse = {
  * Public info about a cluster member.
  */
 export type ServiceMemberInfo = {
+    /**
+     * Container's IP on the `temps-overlay` multi-host network. Populated
+     * by the lifecycle hook (ADR-011 Phase 3); `None` on single-host
+     * clusters where the overlay isn't attached.
+     */
+    compute_ip?: string | null;
     container_name: string;
     hostname?: string | null;
     id: number;
+    /**
+     * Live FSM state from the pg_auto_failover monitor (`primary`,
+     * `secondary`, `catchingup`, `report_lsn`, …). `None` when the
+     * monitor is unreachable, the service is not a cluster, or the row
+     * is the monitor itself.
+     *
+     * **The UI must render the role badge from this field**, falling
+     * back to `role` only when `live_state` is null. `role` is now
+     * config-only (`monitor` or `replica`); flipping the badge to
+     * "primary" when the monitor elects a new one used to require a
+     * reconciler that lagged ~5s behind real failovers — and during
+     * that window the UI showed two primaries. `live_state` is read
+     * directly from the monitor on every list, so it can never lag.
+     */
+    live_state?: string | null;
     node_id?: number | null;
     ordinal: number;
     port?: number | null;
+    /**
+     * Most recent provisioning failure message, when `status='failed'`.
+     * Set by the background task so the UI can show *why* the new
+     * replica didn't come up.
+     */
+    provisioning_error?: string | null;
+    /**
+     * Last-attempted phase of the async `add_cluster_member` background
+     * task (e.g. `validating`, `provisioning_container`, `done`,
+     * `failed`). `None` for members not created through that flow —
+     * the UI falls back to the `status` column for those.
+     */
+    provisioning_step?: string | null;
     role: string;
     status: string;
 };
@@ -19347,6 +19552,46 @@ export type UpdateServiceResponses = {
 
 export type UpdateServiceResponse = UpdateServiceResponses[keyof UpdateServiceResponses];
 
+export type GetClusterHealthData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/cluster-health';
+};
+
+export type GetClusterHealthErrors = {
+    /**
+     * Service is not a cluster
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetClusterHealthResponses = {
+    /**
+     * Per-member cluster health report
+     */
+    200: ClusterHealthReportResponse;
+};
+
+export type GetClusterHealthResponse = GetClusterHealthResponses[keyof GetClusterHealthResponses];
+
 export type TriggerServiceHealthCheckData = {
     body?: never;
     path: {
@@ -19419,6 +19664,156 @@ export type GetServiceHealthStatusResponses = {
 };
 
 export type GetServiceHealthStatusResponse = GetServiceHealthStatusResponses[keyof GetServiceHealthStatusResponses];
+
+export type AddClusterMemberData = {
+    body: AddClusterMemberRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/members';
+};
+
+export type AddClusterMemberErrors = {
+    /**
+     * Validation failed (wrong topology, status, or role)
+     */
+    400: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type AddClusterMemberResponses = {
+    /**
+     * Cluster member provisioning started
+     */
+    202: ServiceMemberInfo;
+};
+
+export type AddClusterMemberResponse = AddClusterMemberResponses[keyof AddClusterMemberResponses];
+
+export type RemoveClusterMemberData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Cluster member ID
+         */
+        member_id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/members/{member_id}';
+};
+
+export type RemoveClusterMemberErrors = {
+    /**
+     * Validation failed (monitor, primary, or quorum violation)
+     */
+    400: unknown;
+    /**
+     * Service or member not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RemoveClusterMemberResponses = {
+    /**
+     * Cluster member removed
+     */
+    204: void;
+};
+
+export type RemoveClusterMemberResponse = RemoveClusterMemberResponses[keyof RemoveClusterMemberResponses];
+
+export type GetClusterMemberData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Cluster member ID
+         */
+        member_id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/members/{member_id}';
+};
+
+export type GetClusterMemberErrors = {
+    /**
+     * Service or member not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetClusterMemberResponses = {
+    /**
+     * Cluster member details
+     */
+    200: ServiceMemberInfo;
+};
+
+export type GetClusterMemberResponse = GetClusterMemberResponses[keyof GetClusterMemberResponses];
+
+export type PromoteClusterMemberData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Cluster member ID
+         */
+        member_id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/members/{member_id}/promote';
+};
+
+export type PromoteClusterMemberErrors = {
+    /**
+     * Validation failed (monitor, already primary, not running, etc.)
+     */
+    400: unknown;
+    /**
+     * Service or member not found
+     */
+    404: unknown;
+    /**
+     * pg_autoctl perform promotion failed
+     */
+    500: unknown;
+};
+
+export type PromoteClusterMemberResponses = {
+    /**
+     * Promotion initiated
+     */
+    202: unknown;
+};
 
 export type GetServicePreviewEnvironmentVariablesMaskedData = {
     body?: never;
@@ -22068,6 +22463,88 @@ export type AdminListNodeContainersResponses = {
 
 export type AdminListNodeContainersResponse = AdminListNodeContainersResponses[keyof AdminListNodeContainersResponses];
 
+export type PostDnsAckData = {
+    body: DnsAckRequest;
+    path: {
+        /**
+         * Node id, must match the bearer token's node
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/dns/ack';
+};
+
+export type PostDnsAckErrors = {
+    /**
+     * ACK higher than server generation
+     */
+    400: unknown;
+    /**
+     * Missing or invalid bearer token
+     */
+    401: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type PostDnsAckResponses = {
+    /**
+     * ACK accepted
+     */
+    200: DnsAckResponse;
+};
+
+export type PostDnsAckResponse = PostDnsAckResponses[keyof PostDnsAckResponses];
+
+export type GetDnsChangesData = {
+    body?: never;
+    path: {
+        /**
+         * Node id, must match the bearer token's node
+         */
+        node_id: number;
+    };
+    query?: {
+        /**
+         * Highest generation the agent has already applied. Pass `0` to
+         * request a full zone snapshot. Defaults to `0` if omitted.
+         */
+        since?: number;
+    };
+    url: '/internal/nodes/{node_id}/dns/changes';
+};
+
+export type GetDnsChangesErrors = {
+    /**
+     * Missing or invalid bearer token
+     */
+    401: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetDnsChangesResponses = {
+    /**
+     * Diff or full snapshot
+     */
+    200: DnsChangesResponse;
+};
+
+export type GetDnsChangesResponse = GetDnsChangesResponses[keyof GetDnsChangesResponses];
+
 export type AdminUndrainNodeData = {
     body?: never;
     path: {
@@ -22211,6 +22688,42 @@ export type NodeHeartbeatResponses = {
 };
 
 export type NodeHeartbeatResponse = NodeHeartbeatResponses[keyof NodeHeartbeatResponses];
+
+export type ListPeersData = {
+    body?: never;
+    path: {
+        /**
+         * Node id, must match the bearer token's node
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/network/peers';
+};
+
+export type ListPeersErrors = {
+    /**
+     * Missing or invalid bearer token
+     */
+    401: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListPeersResponses = {
+    /**
+     * Peer list and self-allocation
+     */
+    200: PeerListResponse;
+};
+
+export type ListPeersResponse = ListPeersResponses[keyof ListPeersResponses];
 
 export type GetS3CredentialsData = {
     body?: never;

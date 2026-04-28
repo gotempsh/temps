@@ -97,6 +97,35 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'sonner'
 
+/**
+ * Pick the role label to render for a cluster member.
+ *
+ * `live_state` (from the pg_auto_failover monitor) is the source of
+ * truth for "primary" — it flips the moment failover or a manual
+ * promotion lands. `role` (from `service_members.role`) is config
+ * state: `monitor` for the orchestrator, `replica` for every data
+ * node. Showing the stored `role` for primaries was the bug behind
+ * "two primaries" displayed after a failover.
+ *
+ * Rules:
+ *   - monitor row → "monitor" (no live_state ever)
+ *   - live_state in {primary, single} → "primary"
+ *   - live_state set to anything else (secondary, catchingup, …) → "replica"
+ *   - live_state missing (monitor unreachable, just-created) → fall back
+ *     to stored `role` so the UI doesn't suddenly say "replica" for
+ *     every node when the monitor blips
+ */
+function memberDisplayRole(member: {
+  role: string
+  live_state?: string | null
+}): string {
+  if (member.role === 'monitor') return 'monitor'
+  const live = member.live_state
+  if (live === 'primary' || live === 'single') return 'primary'
+  if (live) return 'replica'
+  return member.role
+}
+
 export function ServiceDetail() {
   const { id } = useParams<{ id: string }>()
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -882,9 +911,14 @@ export function ServiceDetail() {
                       ).filter((m) => m.role !== 'monitor')
                       const wouldBreakQuorum =
                         member.role !== 'monitor' && dataMembers.length <= 2
+                      // "Is this currently the primary?" is a runtime
+                      // question — read live_state, not the stored role
+                      // (which is now `replica` for every data node).
+                      const isLivePrimary =
+                        memberDisplayRole(member) === 'primary'
                       const removable =
                         member.role !== 'monitor' &&
-                        member.role !== 'primary' &&
+                        !isLivePrimary &&
                         !wouldBreakQuorum &&
                         service.service.status === 'running'
                       // Promote: any running data member that isn't
@@ -892,7 +926,7 @@ export function ServiceDetail() {
                       // re-validates so this is purely UI courtesy.
                       const promotable =
                         member.role !== 'monitor' &&
-                        member.role !== 'primary' &&
+                        !isLivePrimary &&
                         member.status === 'running' &&
                         service.service.status === 'running'
                       return (
@@ -913,13 +947,13 @@ export function ServiceDetail() {
                                 </span>
                                 <Badge
                                   variant={
-                                    member.role === 'primary'
+                                    memberDisplayRole(member) === 'primary'
                                       ? 'default'
                                       : 'secondary'
                                   }
                                   className="capitalize text-xs"
                                 >
-                                  {member.role}
+                                  {memberDisplayRole(member)}
                                 </Badge>
                               </div>
                               <div className="flex items-center gap-2 text-xs text-muted-foreground">

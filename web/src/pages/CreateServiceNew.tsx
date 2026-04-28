@@ -36,15 +36,22 @@ const generateId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 4)
 /** Service types that support HA cluster topology */
 const CLUSTER_SERVICE_TYPES: ServiceTypeRoute[] = ['postgres']
 
-/** Default cluster roles for each service type */
+/** Cluster roles the operator chooses at provisioning time.
+ *
+ * "Primary" used to be in this list, but pg_auto_failover *elects* the
+ * primary at runtime — the operator doesn't pick one. Storing one row
+ * as `primary` produced lag bugs after every failover (UI showed two
+ * primaries until the reconciler caught up). The new model: every data
+ * node is a `replica` at config time, and the live primary comes from
+ * the monitor's FSM state (`live_state` on `ServiceMemberInfo`).
+ */
 const DEFAULT_CLUSTER_ROLES: Record<string, string[]> = {
-  postgres: ['monitor', 'primary', 'replica'],
+  postgres: ['monitor', 'replica'],
 }
 
 const ROLE_DESCRIPTIONS: Record<string, string> = {
   monitor: 'pg_auto_failover monitor — coordinates failover',
-  primary: 'Read-write primary node',
-  replica: 'Read-only hot standby',
+  replica: 'Data node — pg_auto_failover elects one as primary at runtime',
 }
 
 function ClusterMemberConfig({
@@ -61,14 +68,10 @@ function ClusterMemberConfig({
   const roles = DEFAULT_CLUSTER_ROLES[serviceType] || []
 
   const addMember = () => {
-    // Default to replica if we already have all required roles
+    // First member is the singleton monitor; everything after is a
+    // replica (one of which pg_auto_failover will elect as primary).
     const hasMonitor = members.some((m) => m.role === 'monitor')
-    const hasPrimary = members.some((m) => m.role === 'primary')
-    const defaultRole = !hasMonitor
-      ? 'monitor'
-      : !hasPrimary
-        ? 'primary'
-        : 'replica'
+    const defaultRole = hasMonitor ? 'replica' : 'monitor'
     onMembersChange([...members, { role: defaultRole, node_id: null }])
   }
 
@@ -93,10 +96,12 @@ function ClusterMemberConfig({
     onMembersChange(updated)
   }
 
-  // Validation: warn about missing required roles
+  // Validation: a viable HA cluster needs the monitor + at least 2
+  // replicas. With only one replica there's nothing for failover to
+  // promote to.
   const hasMonitor = members.some((m) => m.role === 'monitor')
-  const hasPrimary = members.some((m) => m.role === 'primary')
-  const hasReplica = members.some((m) => m.role === 'replica')
+  const replicaCount = members.filter((m) => m.role === 'replica').length
+  const hasEnoughReplicas = replicaCount >= 2
   const allHaveNodes = members.every((m) => m.node_id !== null)
 
   return (
@@ -116,7 +121,8 @@ function ClusterMemberConfig({
 
       {members.length === 0 && (
         <div className="text-sm text-muted-foreground text-center py-4 border border-dashed rounded-md">
-          No members configured. Add at least a monitor, primary, and replica.
+          No members configured. Add a monitor and at least two replicas
+          (pg_auto_failover elects one as primary at runtime).
         </div>
       )}
 
@@ -210,35 +216,28 @@ function ClusterMemberConfig({
         ))}
       </div>
 
-      {members.length > 0 && (!hasMonitor || !hasPrimary || !hasReplica) && (
+      {members.length > 0 && (!hasMonitor || !hasEnoughReplicas) && (
         <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200">
           A PostgreSQL cluster requires at least:{' '}
           <span className={hasMonitor ? 'line-through opacity-50' : 'font-medium'}>
             1 monitor
           </span>
           ,{' '}
-          <span className={hasPrimary ? 'line-through opacity-50' : 'font-medium'}>
-            1 primary
+          <span className={hasEnoughReplicas ? 'line-through opacity-50' : 'font-medium'}>
+            2 replicas
           </span>
-          ,{' '}
-          <span className={hasReplica ? 'line-through opacity-50' : 'font-medium'}>
-            1 replica
-          </span>
+          {' '}(pg_auto_failover elects one as primary at runtime).
         </div>
       )}
 
-      {members.length >= 3 &&
-        hasMonitor &&
-        hasPrimary &&
-        hasReplica &&
-        !allHaveNodes && (
-          <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200">
-            For true high availability, assign each member to a different node.
-            Members on the control plane share the same machine.
-          </div>
-        )}
+      {hasMonitor && hasEnoughReplicas && !allHaveNodes && (
+        <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200">
+          For true high availability, assign each member to a different node.
+          Members on the control plane share the same machine.
+        </div>
+      )}
 
-      {members.length >= 3 && hasMonitor && hasPrimary && hasReplica && allHaveNodes && (
+      {hasMonitor && hasEnoughReplicas && allHaveNodes && (
         <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 p-3 text-sm text-emerald-800 dark:text-emerald-200">
           Cluster configuration looks good. Members will communicate via their
           private addresses.
@@ -297,20 +296,38 @@ export function CreateService() {
     }
   }, [hasWorkerNodes, topology])
 
-  // When switching to cluster topology, pre-populate default members
+  // When switching to cluster topology, pre-populate default members:
+  //   - 1 monitor on the control plane (node_id = null)
+  //   - 1 replica per active worker node, pinned to that node
+  //
+  // Operators can still tweak afterward, but the default lays out a
+  // true-HA cluster with one data member per machine. We require at
+  // least 2 replicas for a viable failover quorum; with 0 or 1 worker
+  // nodes we fall back to the previous single-replica scaffold and
+  // surface the warning blocks below.
   useEffect(() => {
     if (topology === 'cluster' && clusterMembers.length === 0 && serviceType) {
-      const defaultRoles = DEFAULT_CLUSTER_ROLES[serviceType]
-      if (defaultRoles) {
-        setClusterMembers(
-          defaultRoles.map((role) => ({ role, node_id: null }))
-        )
+      if (DEFAULT_CLUSTER_ROLES[serviceType]) {
+        const seeded: ClusterMemberRequest[] = [
+          { role: 'monitor', node_id: null },
+        ]
+        if (nodes.length > 0) {
+          for (const n of nodes) {
+            seeded.push({ role: 'replica', node_id: n.id })
+          }
+        } else {
+          // No worker nodes yet — leave a single empty replica row so
+          // the operator sees what the cluster would look like, with
+          // the warning block prompting them to add more.
+          seeded.push({ role: 'replica', node_id: null })
+        }
+        setClusterMembers(seeded)
       }
     }
     if (topology === 'standalone') {
       setClusterMembers([])
     }
-  }, [topology, serviceType])
+  }, [topology, serviceType, nodes])
 
   useEffect(() => {
     setBreadcrumbs([
