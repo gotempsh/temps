@@ -54,6 +54,7 @@ pub mod ip_access_control;
 pub mod ip_geolocations;
 pub mod network_config;
 pub mod node_dns_state;
+pub mod node_route_state;
 pub mod nodes;
 pub mod notification_preferences;
 pub mod notification_providers;

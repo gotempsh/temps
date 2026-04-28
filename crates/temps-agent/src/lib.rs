@@ -6,7 +6,10 @@
 
 pub mod auth;
 pub mod handlers;
+pub mod internal_proxy;
 pub mod network_sync;
+pub mod route_store;
+pub mod route_sync_client;
 pub mod server;
 pub mod service_handlers;
 

@@ -1186,11 +1186,24 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     // Build the application with all plugin routes and OpenAPI schemas
     debug!("Building application with plugin routes");
+
+    // Internal route-sync endpoint for the worker-side internal edge
+    // proxy (Option 1 in the route-sync design). Workers long-poll
+    // here to mirror the CP's `*.temps.local` route table without
+    // needing direct DB access.
+    let route_sync_state = Arc::new(temps_routes::route_sync::RouteSyncAppState {
+        db: db.clone(),
+        peer_table: route_table.clone(),
+    });
+    let route_sync_routes =
+        temps_routes::route_sync::configure_routes().with_state(route_sync_state);
+
     let app = plugin_manager
         .build_application()
         .map_err(|e| anyhow::anyhow!("Failed to build application: {}", e))?
         .merge(create_swagger_router(&plugin_manager)?)
-        .nest("/api", node_routes);
+        .nest("/api", node_routes)
+        .nest("/api", route_sync_routes);
 
     let app = app.fallback(serve_static_file);
 

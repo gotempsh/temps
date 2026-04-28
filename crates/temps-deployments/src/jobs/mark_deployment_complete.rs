@@ -627,6 +627,42 @@ impl MarkDeploymentCompleteJob {
         self.log("Route table confirmed — new deployment is routable".to_string())
             .await?;
 
+        // ── Phase 2.5: Wait for every worker to apply the new generation ──
+        //
+        // The CP's local route table is updated, but the worker-side
+        // proxy + DNS resolver each long-poll their own generation
+        // counter from the CP. Until every healthy worker has ACKed
+        // the new generation, a curl from a container *might* land on
+        // a worker still proxying the previous backend set.
+        //
+        // We poll `node_route_state.applied_generation` and
+        // `node_dns_state.applied_generation` until they catch up to
+        // the CP's generations, with a bounded timeout. On timeout
+        // we still proceed (don't fail the deploy on the propagation
+        // step) — the route table is correct on the CP and the DNS
+        // records are written; workers will catch up shortly. This
+        // matches the existing tolerance for transient sync drift.
+        const WORKER_APPLY_TIMEOUT_SECS: u64 = 10;
+        if let Err(reason) = Self::wait_for_worker_apply(
+            self.db.as_ref(),
+            std::time::Duration::from_secs(WORKER_APPLY_TIMEOUT_SECS),
+        )
+        .await
+        {
+            tracing::warn!(
+                deployment_id = self.deployment_id,
+                "Worker propagation gate exceeded {WORKER_APPLY_TIMEOUT_SECS}s: {reason} \
+                 — proceeding anyway, workers will converge in the background"
+            );
+            self.log(format!(
+                "Worker propagation incomplete after {WORKER_APPLY_TIMEOUT_SECS}s ({reason}) — proceeding"
+            ))
+            .await?;
+        } else {
+            self.log("All workers acknowledged new route + DNS generations".to_string())
+                .await?;
+        }
+
         // ── Phase 3: Mark deployment as completed ────────────────────────
         let now = chrono::Utc::now();
         active_deployment.state = Set("completed".to_string());
@@ -934,6 +970,103 @@ impl MarkDeploymentCompleteJob {
                 Err(_) => {
                     // timeout_at expired — loop back to check deadline and request reload
                 }
+            }
+        }
+    }
+
+    /// Wait until every active worker node has applied both the
+    /// CP's current route-table generation and the current DNS
+    /// generation.
+    ///
+    /// This is the worker-side half of the consistency barrier — the
+    /// CP-side half is `wait_for_route_ready` above (which only proves
+    /// the CP's *own* route table reflects the change). Without this
+    /// barrier, "completed" can fire while one or more workers still
+    /// proxy to the previous backend set, producing transient 502s
+    /// for clients that read "completed" and immediately curl the URL.
+    ///
+    /// The check is exact for both layers: we read the CP's durable
+    /// `route_generation.current` and `dns_generation.current` and
+    /// require every active node's
+    /// `node_route_state.applied_generation` and
+    /// `node_dns_state.applied_generation` to meet or exceed them.
+    ///
+    /// Only `nodes.status = 'active'` rows are gated — offline nodes
+    /// aren't serving traffic so we don't block on them.
+    async fn wait_for_worker_apply(
+        db: &DbConnection,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        use sea_orm::{FromQueryResult, Statement};
+        use temps_entities::{node_dns_state, node_route_state, nodes};
+
+        #[derive(FromQueryResult)]
+        struct Gen {
+            current: Option<i64>,
+        }
+        let load_singleton = |table: &'static str| async move {
+            Gen::find_by_statement(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!("SELECT current FROM {table} WHERE id = 1"),
+            ))
+            .one(db)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|g| g.current)
+            .unwrap_or(0)
+        };
+        let route_gen: i64 = load_singleton("route_generation").await;
+        let dns_gen: i64 = load_singleton("dns_generation").await;
+
+        let active_nodes: Vec<i32> = nodes::Entity::find()
+            .filter(nodes::Column::Status.eq("active"))
+            .all(db)
+            .await
+            .map_err(|e| format!("listing active nodes: {e}"))?
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+
+        if active_nodes.is_empty() {
+            return Ok(());
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+
+        loop {
+            interval.tick().await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out waiting for {} node(s) to ACK \
+                     (target route_gen={}, dns_gen={})",
+                    active_nodes.len(),
+                    route_gen,
+                    dns_gen
+                ));
+            }
+
+            let route_states = node_route_state::Entity::find()
+                .filter(node_route_state::Column::NodeId.is_in(active_nodes.clone()))
+                .all(db)
+                .await
+                .map_err(|e| format!("reading node_route_state: {e}"))?;
+            let dns_states = node_dns_state::Entity::find()
+                .filter(node_dns_state::Column::NodeId.is_in(active_nodes.clone()))
+                .all(db)
+                .await
+                .map_err(|e| format!("reading node_dns_state: {e}"))?;
+
+            let route_ok = route_states.len() == active_nodes.len()
+                && route_states
+                    .iter()
+                    .all(|s| s.applied_generation >= route_gen);
+            let dns_ok = dns_states.len() == active_nodes.len()
+                && dns_states.iter().all(|s| s.applied_generation >= dns_gen);
+
+            if route_ok && dns_ok {
+                return Ok(());
             }
         }
     }

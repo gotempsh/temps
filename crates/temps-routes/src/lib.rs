@@ -1,4 +1,5 @@
 pub mod project_change_listener;
+pub mod route_sync;
 pub mod route_table;
 pub mod wildcard_matcher;
 

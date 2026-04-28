@@ -30,3 +30,11 @@ tokio = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# HTTP for the internal route-sync endpoint that workers long-poll
+# against. Same wire model as `temps-dns::handlers::dns_sync`.
+axum = { workspace = true }
+http = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }

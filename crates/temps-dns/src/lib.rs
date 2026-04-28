@@ -52,7 +52,8 @@ pub use providers::{
     ManualDnsProvider, NamecheapCredentials, NamecheapProvider, ProviderCredentials,
 };
 pub use services::{
-    ChangeSet, DnsOperationResult, DnsProviderService, DnsRecordService, DnsRegistry,
-    DnsRegistryError, EndpointDraft, ManualDnsInstructions, OwnerKind as InternalOwnerKind,
-    RecordType as InternalRecordType, ResolverHealth, StaleResolver, ZoneSnapshot,
+    ChangeSet, DeploymentDnsPublisher, DnsOperationResult, DnsProviderService, DnsRecordService,
+    DnsRegistry, DnsRegistryError, EndpointDraft, ManualDnsInstructions,
+    OwnerKind as InternalOwnerKind, RecordType as InternalRecordType, ResolverHealth,
+    StaleResolver, ZoneSnapshot,
 };

@@ -96,6 +96,12 @@ pub enum OwnerKind {
     Node,
     /// Opaque static configuration (cluster-wide constants, hand-edited).
     Static,
+    /// `owner_id` is `deployments.id` — the stable per-deployment FQDN
+    /// (`<env-slug>.<project-slug>.temps.local`) that the edge proxy
+    /// resolves to a live container set. Decouples client-side DNS from
+    /// container churn: the record points at the proxy, the proxy
+    /// fans out to whatever is currently running.
+    Deployment,
 }
 
 impl OwnerKind {
@@ -105,6 +111,7 @@ impl OwnerKind {
             OwnerKind::ServiceRole => "service_role",
             OwnerKind::Node => "node",
             OwnerKind::Static => "static",
+            OwnerKind::Deployment => "deployment",
         }
     }
 }
@@ -117,6 +124,7 @@ impl FromStr for OwnerKind {
             "service_role" => Ok(OwnerKind::ServiceRole),
             "node" => Ok(OwnerKind::Node),
             "static" => Ok(OwnerKind::Static),
+            "deployment" => Ok(OwnerKind::Deployment),
             other => Err(DnsRegistryError::Validation {
                 message: format!("unknown owner_kind {:?}", other),
             }),

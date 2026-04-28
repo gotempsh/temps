@@ -12,10 +12,12 @@
 //! is the natural home for both because they share the *DNS* concept, but
 //! consumers should import from the specific submodule they need.
 
+pub mod deployment_publisher;
 pub mod dns_registry;
 pub mod provider_service;
 pub mod record_service;
 
+pub use deployment_publisher::DeploymentDnsPublisher;
 pub use dns_registry::{
     ChangeSet, DnsRegistry, DnsRegistryError, EndpointDraft, OwnerKind, RecordType, ResolverHealth,
     StaleResolver, ZoneSnapshot,

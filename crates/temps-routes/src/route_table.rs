@@ -273,6 +273,17 @@ impl RouteInfo {
 pub type OnSleepingCallback =
     Arc<dyn Fn(Vec<SleepingEnvironmentEntry>, Vec<OnDemandConfigEntry>) + Send + Sync>;
 
+/// Async callback fired after every successful `load_routes()`. Used by
+/// the deployment-DNS publisher to reconcile internal `*.temps.local`
+/// records in lockstep with the L7 route table — same trigger, single
+/// source of truth for "what is the current deployment of each env".
+///
+/// Returns a boxed future so the implementation can await DB work
+/// (`temps-routes` doesn't depend on `temps-dns`; the binary wires the
+/// concrete publisher in here).
+pub type OnReloadCallback =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
 pub struct CachedPeerTable {
     /// Exact hostname -> RouteInfo for HTTP routes (route_type = 'http')
     /// Used for matching on HTTP Host header (Layer 7)
@@ -297,6 +308,25 @@ pub struct CachedPeerTable {
 
     /// Optional callback invoked after each route reload with sleeping environment entries.
     on_sleeping_callback: parking_lot::Mutex<Option<OnSleepingCallback>>,
+
+    /// Optional async callback invoked after each successful reload.
+    /// Used to publish per-deployment internal DNS records (ADR-012-lite)
+    /// in lockstep with the route table.
+    on_reload_callback: parking_lot::Mutex<Option<OnReloadCallback>>,
+
+    /// Monotonically increasing version of the in-memory `routes` map.
+    /// Bumped at the end of every successful `load_routes()`. Workers
+    /// long-poll `GET /internal/.../routes/snapshot?since=N` and the
+    /// handler waits until this counter exceeds `N` (or a timeout)
+    /// before returning the current snapshot. Restart-safe: a CP
+    /// restart resets the counter; agents detect this (current < their
+    /// applied) and re-fetch a fresh snapshot.
+    generation: std::sync::atomic::AtomicU64,
+
+    /// Notify hookup so long-poll handlers can sleep until the next
+    /// generation bump rather than spinning. Awoken on every
+    /// `load_routes()` success.
+    generation_changed: Arc<tokio::sync::Notify>,
 }
 
 impl CachedPeerTable {
@@ -309,12 +339,35 @@ impl CachedPeerTable {
             routes: Arc::new(RwLock::new(HashMap::new())),
             db,
             on_sleeping_callback: parking_lot::Mutex::new(None),
+            on_reload_callback: parking_lot::Mutex::new(None),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            generation_changed: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Current in-memory route table generation. Bumped on every
+    /// successful `load_routes()`. Workers poll this via the sync
+    /// endpoint to know when to refetch.
+    pub fn current_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Subscribe to generation-bump notifications. Each waiter is
+    /// woken on the next successful reload.
+    pub fn generation_notifier(&self) -> Arc<tokio::sync::Notify> {
+        self.generation_changed.clone()
     }
 
     /// Set a callback that fires after each `load_routes()` with the sleeping environment entries.
     pub fn set_on_sleeping_callback(&self, callback: OnSleepingCallback) {
         *self.on_sleeping_callback.lock() = Some(callback);
+    }
+
+    /// Set an async callback fired after every successful `load_routes()`.
+    /// Used by `temps-dns::DeploymentDnsPublisher` to reconcile internal
+    /// FQDN records in lockstep with the route table.
+    pub fn set_on_reload_callback(&self, callback: OnReloadCallback) {
+        *self.on_reload_callback.lock() = Some(callback);
     }
 
     /// Get route by HTTP Host header
@@ -1027,6 +1080,45 @@ impl CachedPeerTable {
                         }
                     }
 
+                    // ADR-012-lite: stable per-deployment FQDN under the
+                    // internal `*.temps.local` zone. Format
+                    // `<env-slug>.<project-slug>.temps.local` resolves to
+                    // the edge proxy and fans out to whatever containers
+                    // are currently `running`+`ready_at IS NOT NULL` for
+                    // this deployment, so client redeploys are invisible
+                    // even when the client caches DNS aggressively.
+                    //
+                    // Skip when either slug is missing or empty; without
+                    // both we can't construct a non-ambiguous label, and
+                    // emitting `..temps.local` would clobber the parent
+                    // zone. Slug uniqueness is enforced at create time
+                    // for environments and projects so collisions inside
+                    // a project are impossible.
+                    if let Some(proj) = project {
+                        let env_slug = env.slug.trim();
+                        let proj_slug = proj.slug.trim();
+                        if !env_slug.is_empty() && !proj_slug.is_empty() {
+                            let internal_fqdn = format!("{}.{}.temps.local", env_slug, proj_slug);
+                            if !routes.contains_key(&internal_fqdn) {
+                                routes.insert(
+                                    internal_fqdn.clone(),
+                                    RouteInfo {
+                                        backend: backend.clone(),
+                                        redirect_to: None,
+                                        status_code: None,
+                                        project: project.cloned(),
+                                        environment: environment.cloned(),
+                                        deployment: Some(Arc::clone(deployment)),
+                                    },
+                                );
+                                debug!(
+                                    "Loaded internal temps.local route: {} (project={}, env={}, deploy={})",
+                                    internal_fqdn, env.project_id, env.id, deployment_id
+                                );
+                            }
+                        }
+                    }
+
                     // Docker Compose: create per-service routes ONLY for explicitly public ports.
                     // All ports are private by default — users must mark ports as public
                     // in the project's preset_config.public_ports.
@@ -1312,6 +1404,40 @@ impl CachedPeerTable {
             callback(sleeping_environments.clone(), on_demand_configs);
         }
 
+        // Fire the async on-reload hook used by the deployment-DNS
+        // publisher. We snapshot the Arc out of the mutex first so the
+        // mutex isn't held across the await.
+        let on_reload = self.on_reload_callback.lock().as_ref().cloned();
+        if let Some(callback) = on_reload {
+            callback().await;
+        }
+
+        // Bump the in-memory generation and wake any long-poll waiters
+        // on the routes-sync endpoint. Order matters: bump first, then
+        // notify, so a wake-up that races with a subsequent fetch
+        // always sees the new value.
+        let new_gen = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        self.generation_changed.notify_waiters();
+
+        // Persist the new generation into the durable singleton so
+        // `mark_deployment_complete` can wait until every active
+        // worker's `node_route_state.applied_generation` reaches it.
+        // Best-effort — a transient DB error here doesn't block the
+        // route table itself, and the next successful reload will
+        // overwrite the stale value.
+        let new_gen_i64: i64 = new_gen.try_into().unwrap_or(i64::MAX);
+        let stmt = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE route_generation SET current = $1, updated_at = now() WHERE id = 1",
+            [new_gen_i64.into()],
+        );
+        if let Err(e) = sea_orm::ConnectionTrait::execute(self.db.as_ref(), stmt).await {
+            tracing::warn!(error = %e, "failed to persist route_generation");
+        }
+
         Ok(sleeping_environments)
     }
 
@@ -1343,6 +1469,23 @@ impl CachedPeerTable {
                 .as_ref()
                 .is_some_and(|d| d.id == deployment_id)
         })
+    }
+
+    /// Snapshot of every `*.temps.local` route currently in the table.
+    /// Returned as a flat `(host, RouteInfo)` vector cloned out of the
+    /// `routes` map under a single read lock. Used by the internal
+    /// route-sync endpoint to fan out the worker-side proxy table.
+    ///
+    /// Filters to the internal zone only. Custom-domain and preview
+    /// routes are not part of this contract — workers don't need them
+    /// (only the public edge proxy does).
+    pub fn snapshot_internal_routes(&self) -> Vec<(String, RouteInfo)> {
+        let routes = self.routes.read();
+        routes
+            .iter()
+            .filter(|(host, _)| host.ends_with(".temps.local"))
+            .map(|(h, r)| (h.clone(), r.clone()))
+            .collect()
     }
 }
 

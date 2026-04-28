@@ -108,6 +108,89 @@ impl AgentCommand {
 
             tracing::info!("Starting temps agent (node_id={})...", config.node_id);
 
+            // Internal-zone route store (Option 1 sync). Hydrated from
+            // disk so the agent serves correctly across restarts even
+            // when the CP is briefly unreachable. The sync client below
+            // long-polls the CP and applies snapshots into this store;
+            // the internal edge proxy reads from it on every request.
+            let route_snapshot_path = agent_data_dir().join("routes").join("snapshot.json");
+            let route_store = Arc::new(temps_agent::route_store::RouteStore::new(
+                route_snapshot_path,
+            ));
+            route_store.load_from_disk();
+
+            // Spawn the long-poll sync client. Shutdown is wired to the
+            // global notifier passed below; if the agent server exits,
+            // the client stops on the next round.
+            let route_sync_shutdown = Arc::new(tokio::sync::Notify::new());
+            match temps_agent::route_sync_client::RouteSyncClient::new(
+                config.control_plane_url.clone(),
+                config.node_id,
+                config.token.clone(),
+                route_store.clone(),
+                route_sync_shutdown.clone(),
+            ) {
+                Ok(client) => {
+                    tokio::spawn(async move {
+                        client.run().await;
+                    });
+                    tracing::info!("route sync client started");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to start route sync client; internal proxy will return 503"
+                    );
+                }
+            }
+
+            // Internal edge proxy bound to the overlay bridge gateway.
+            // Watches two sources for the bridge IP, taking whichever
+            // appears first:
+            //   1. `overlay_bridge_address` — populated by network_sync
+            //      after the CP returns this node's compute_cidr.
+            //   2. The kernel directly (`br-temps0` interface) — works
+            //      across CP-outage cold starts, because the bridge is
+            //      preserved by the kernel even when the agent restarts
+            //      with CP unreachable.
+            // Without (2) the proxy would refuse to bind whenever the
+            // agent reboots while the CP is down, which is exactly when
+            // serving stale-but-correct routes from disk matters most.
+            {
+                let bridge_slot = overlay_bridge_address.clone();
+                let store = route_store.clone();
+                let proxy_shutdown = route_sync_shutdown.clone();
+                tokio::spawn(async move {
+                    let bridge_ip = loop {
+                        if let Some(ip) = *bridge_slot.read().expect("bridge slot poisoned") {
+                            break ip;
+                        }
+                        // Fallback path: the bridge IP is also visible
+                        // in the kernel as the `br-temps0` interface
+                        // address. Read it directly so the proxy can
+                        // bind without waiting for CP to confirm the
+                        // allocation.
+                        if let Some(ip) = read_bridge_ip_from_kernel("br-temps0").await {
+                            tracing::info!(
+                                bridge = %ip,
+                                "using kernel-derived bridge IP (CP slot not yet populated)"
+                            );
+                            break ip;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    };
+                    if let Err(e) =
+                        temps_agent::internal_proxy::spawn(bridge_ip, 80, store, proxy_shutdown)
+                            .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "internal edge proxy failed to bind; internal HTTP routing disabled"
+                        );
+                    }
+                });
+            }
+
             temps_agent::server::start_agent_server(
                 deployer,
                 builder,
@@ -119,6 +202,8 @@ impl AgentCommand {
             .await
             .map_err(|e| anyhow::anyhow!("Agent server error: {}", e))?;
 
+            // Best-effort shutdown of the sync client on agent exit.
+            route_sync_shutdown.notify_waiters();
             Ok(())
         })
     }
@@ -221,4 +306,40 @@ impl AgentCommand {
             }
         }
     }
+}
+
+/// Read the IPv4 address of an interface directly from the kernel.
+/// Used as a fallback for cold-start: when the agent restarts while
+/// the CP is unreachable, network_sync can't fetch the alloc, but the
+/// kernel still has the bridge from the previous run. Returns None if
+/// the interface doesn't exist, has no v4 address, or `ip` isn't on
+/// PATH (single-host dev mode).
+async fn read_bridge_ip_from_kernel(iface: &str) -> Option<std::net::IpAddr> {
+    use tokio::process::Command;
+    let out = Command::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", iface])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // `ip -4 -o addr show dev br-temps0` produces:
+    //   12: br-temps0    inet 172.20.0.1/24 brd ... scope global br-temps0\
+    // We want the first `inet X.Y.Z.W/...` token's address part.
+    for token in text.split_whitespace() {
+        if let Some(addr) = token.strip_suffix(|c: char| c == '/' || c == ' ') {
+            if let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() {
+                return Some(std::net::IpAddr::V4(ip));
+            }
+        }
+        // Fall back: handle the "172.20.0.1/24" form directly.
+        if let Some((addr_part, _)) = token.split_once('/') {
+            if let Ok(ip) = addr_part.parse::<std::net::Ipv4Addr>() {
+                return Some(std::net::IpAddr::V4(ip));
+            }
+        }
+    }
+    None
 }

@@ -121,6 +121,30 @@ impl ServeCommand {
 
         // Create shared route table instance (used by both console API and proxy)
         let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
+
+        // ADR-012-lite: every successful route_table reload also
+        // reconciles internal `<env>.<project>.temps.local` A records,
+        // so the L7 routes and the internal DNS zone share one trigger
+        // and one source of truth.
+        {
+            let publisher = Arc::new(temps_dns::DeploymentDnsPublisher::new(
+                db.clone(),
+                Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+            ));
+            route_table.set_on_reload_callback(Arc::new(move || {
+                let publisher = publisher.clone();
+                Box::pin(async move {
+                    if let Err(e) = publisher.reconcile_all().await {
+                        tracing::warn!(
+                            error = %e,
+                            "deployment DNS publisher failed; routes are live but \
+                             internal *.temps.local records may be stale"
+                        );
+                    }
+                })
+            }));
+        }
+
         let route_table_listener = Arc::new(temps_routes::RouteTableListener::new(
             route_table.clone(),
             self.database_url.clone(),

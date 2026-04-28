@@ -111,6 +111,17 @@ impl RequestHandler for ZoneAuthority {
         }
 
         let snapshot = self.zone.snapshot();
+        // First check whether the name exists at all in our zone, then
+        // narrow to the requested qtype. The two failure modes have
+        // different DNS semantics:
+        //   - name exists, no records of this type → NoError, empty
+        //     answer (NODATA). Critical for AAAA queries on names that
+        //     are A-only — busybox + glibc getaddrinfo treat NXDOMAIN
+        //     on either A or AAAA as "host doesn't exist" and refuse
+        //     the connection, so returning NXDOMAIN here breaks every
+        //     IPv4-only internal name.
+        //   - name doesn't exist at all → NXDOMAIN.
+        let any_match = snapshot.lookup(&qname_str).next().is_some();
         let matches: Vec<&ZoneRecord> = snapshot
             .lookup(&qname_str)
             .filter(|r| matches_qtype(r, qtype))
@@ -120,12 +131,17 @@ impl RequestHandler for ZoneAuthority {
             qname = %qname_str,
             qtype = ?qtype,
             answers = matches.len(),
+            any_match,
             "DNS query"
         );
 
         if matches.is_empty() {
-            // In-zone but unknown: this is genuinely NXDOMAIN. We are
-            // authoritative for `*.temps.local`, so don't forward.
+            if any_match {
+                // NODATA: name exists, just not for this qtype. Reply
+                // NoError with no answer rrs and the AA bit set.
+                return reply_nodata(request, &mut response_handle, info.header).await;
+            }
+            // Genuine NXDOMAIN.
             return reply_error(request, &mut response_handle, ResponseCode::NXDomain).await;
         }
 
@@ -225,6 +241,37 @@ async fn reply_error<R: ResponseHandler>(
         Err(e) => {
             warn!(error = %e, "failed to send DNS error response");
             error_info(request, code)
+        }
+    }
+}
+
+/// Reply NODATA — name exists in the zone, but no records of the
+/// requested type. Status is NoError, AA is set, answer/authority/
+/// additional sections are empty. Resolvers and stub libraries
+/// (glibc getaddrinfo, busybox) treat this as "try the other type"
+/// instead of giving up on the name entirely.
+async fn reply_nodata<R: ResponseHandler>(
+    request: &Request,
+    response_handle: &mut R,
+    request_header: &Header,
+) -> ResponseInfo {
+    let mut header = Header::response_from_request(request_header);
+    header.set_authoritative(true);
+    header.set_response_code(ResponseCode::NoError);
+
+    let builder = MessageResponseBuilder::from_message_request(request);
+    let resp = builder.build(
+        header,
+        std::iter::empty::<&Record>(),
+        std::iter::empty::<&Record>(),
+        std::iter::empty::<&Record>(),
+        std::iter::empty::<&Record>(),
+    );
+    match response_handle.send_response(resp).await {
+        Ok(info) => info,
+        Err(e) => {
+            warn!(error = %e, "failed to send DNS NODATA response");
+            error_info(request, ResponseCode::NoError)
         }
     }
 }
