@@ -13,6 +13,8 @@ pub use services::*;
 pub mod plugin;
 mod types;
 mod utils;
+pub use externalsvc::ClusterRole;
+pub use externalsvc::PgAutoFailoverState;
 pub use externalsvc::S3Credentials;
 pub use externalsvc::ServiceType;
 pub use query_service::QueryService;

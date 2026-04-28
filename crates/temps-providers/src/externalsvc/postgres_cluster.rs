@@ -432,7 +432,13 @@ impl ExternalService for PostgresClusterService {
     }
 
     fn valid_cluster_roles(&self) -> Vec<&'static str> {
-        vec!["monitor", "primary", "replica"]
+        // Source of truth: the ClusterRole enum. Order matches insertion
+        // order callers expect (monitor first, then data nodes).
+        vec![
+            super::ClusterRole::Monitor.as_str(),
+            super::ClusterRole::Primary.as_str(),
+            super::ClusterRole::Replica.as_str(),
+        ]
     }
 
     async fn init_cluster(
@@ -610,8 +616,13 @@ impl PostgresClusterService {
         monitor_port: u16,
         member_port: u16,
     ) -> ClusterMemberCreateParams {
-        match member.role.as_str() {
-            "monitor" => ClusterMemberCreateParams {
+        use std::str::FromStr;
+        // Unknown roles fall through the wildcard arm (treated as a data
+        // node) — matches old behaviour. Validation at the create-service
+        // boundary is what actually rejects garbage roles.
+        let role = super::ClusterRole::from_str(&member.role).ok();
+        match role {
+            Some(super::ClusterRole::Monitor) => ClusterMemberCreateParams {
                 container_name: self.monitor_container_name(),
                 // Always use the HA image — parameter_strategies may fill in the
                 // standalone postgres-walg image which lacks pg_autoctl.
@@ -621,8 +632,9 @@ impl PostgresClusterService {
                 container_port: member_port,
                 volume_path: "/var/lib/postgresql".to_string(),
             },
+            // primary | replica | unknown → data-node setup; pg_auto_failover
+            // elects which is which at runtime, so we only need one branch.
             _ => {
-                // primary or replica — same setup, pg_auto_failover assigns roles
                 let fallback_hostname = self.node_container_name(member.ordinal);
                 let node_hostname = member.hostname.as_deref().unwrap_or(&fallback_hostname);
                 let node_name = format!("node-{}", member.ordinal);

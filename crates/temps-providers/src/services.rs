@@ -355,6 +355,51 @@ pub struct ServiceMemberInfo {
     pub provisioning_error: Option<String>,
 }
 
+impl ServiceMemberInfo {
+    /// Typed view of `role`. Returns `None` for any unrecognised string —
+    /// callers that only care about `is_monitor()`/`is_data_member()` should
+    /// use those helpers instead.
+    pub fn cluster_role(&self) -> Option<crate::ClusterRole> {
+        role_from_str(&self.role)
+    }
+
+    pub fn is_monitor(&self) -> bool {
+        is_role_monitor(&self.role)
+    }
+
+    pub fn is_primary(&self) -> bool {
+        is_role_primary(&self.role)
+    }
+
+    pub fn is_data_member(&self) -> bool {
+        is_role_data_member(&self.role)
+    }
+}
+
+/// Parse a raw role string (TEXT column / spec) into the typed enum.
+/// Returns `None` for unknown values; callers should use the
+/// classification helpers below for `is_monitor()` / `is_data_member()`
+/// semantics, not direct equality.
+fn role_from_str(s: &str) -> Option<crate::ClusterRole> {
+    use std::str::FromStr;
+    crate::ClusterRole::from_str(s).ok()
+}
+
+fn is_role_monitor(s: &str) -> bool {
+    role_from_str(s) == Some(crate::ClusterRole::Monitor)
+}
+
+fn is_role_primary(s: &str) -> bool {
+    role_from_str(s) == Some(crate::ClusterRole::Primary)
+}
+
+/// `true` for any role that holds data — primary, replica, or any
+/// future data role we add. Matches the historical `role != "monitor"`
+/// check exactly: unknown roles are treated as data members.
+fn is_role_data_member(s: &str) -> bool {
+    role_from_str(s).map(|r| r.is_data_member()).unwrap_or(true)
+}
+
 /// Validated, fully-resolved input for the background member-creation
 /// task. Built once by `plan_add_cluster_member` and handed off to the
 /// spawned task; nothing inside it requires a DB lookup, so the task
@@ -1728,7 +1773,7 @@ impl ExternalServiceManager {
             }
         };
 
-        let monitor = members.iter().find(|m| m.role == "monitor");
+        let monitor = members.iter().find(|m| is_role_monitor(&m.role));
         let monitor = match monitor {
             Some(m) => m,
             None => {
@@ -1905,7 +1950,7 @@ impl ExternalServiceManager {
                 };
             }
         };
-        let monitor = match members.iter().find(|m| m.role == "monitor") {
+        let monitor = match members.iter().find(|m| is_role_monitor(&m.role)) {
             Some(m) => m,
             None => {
                 return ClusterHealthReport {
@@ -2220,7 +2265,7 @@ impl ExternalServiceManager {
         let members = self.get_service_members(service.id).await?;
         let primary = members
             .iter()
-            .find(|m| m.role == "primary" && m.status == "running")
+            .find(|m| is_role_primary(&m.role) && m.status == "running")
             .ok_or(ExternalServiceError::InitializationFailed {
                 id: service.id,
                 reason: "Cannot run backup: cluster has no running primary".to_string(),
@@ -2285,7 +2330,7 @@ impl ExternalServiceManager {
         // directory (postgresql.auto.conf) but the env file isn't.
         for m in members
             .iter()
-            .filter(|m| m.role != "monitor" && m.status == "running")
+            .filter(|m| !is_role_monitor(&m.role) && m.status == "running")
         {
             if let Err(e) = self.write_walg_env_file(m, &walg_env).await {
                 // Don't fail the backup over an env file on a non-primary;
@@ -2704,7 +2749,7 @@ impl ExternalServiceManager {
         // labels in service_members reflect reality (kept fresh by the
         // reconciler) so this is the node that *currently* holds the
         // writable copy of the data.
-        let original_primary = members.iter().find(|m| m.role == "primary").ok_or(
+        let original_primary = members.iter().find(|m| is_role_primary(&m.role)).ok_or(
             ExternalServiceError::InitializationFailed {
                 id: service.id,
                 reason: "Cannot restore: cluster has no primary on record".to_string(),
@@ -3085,7 +3130,7 @@ echo "[restore] Pre-seed complete"
         // Find the primary data node (not monitor, not replica)
         let primary = members
             .iter()
-            .find(|m| m.role == "primary" && m.status == "running");
+            .find(|m| is_role_primary(&m.role) && m.status == "running");
 
         if let Some(primary) = primary {
             let port = primary.port.unwrap_or(5432) as u16;
@@ -3156,7 +3201,7 @@ echo "[restore] Pre-seed complete"
         // Build multi-host connection string from running data nodes (not monitor)
         let data_nodes: Vec<&ServiceMemberInfo> = members
             .iter()
-            .filter(|m| m.role != "monitor" && m.status == "running")
+            .filter(|m| !is_role_monitor(&m.role) && m.status == "running")
             .collect();
 
         let mut env_vars = HashMap::new();
@@ -3568,7 +3613,7 @@ echo "[restore] Pre-seed complete"
         // Find the monitor hostname for data node configuration.
         // For remote workers, use the node's private/WireGuard address.
         // For local (no node_id), use the monitor container name so Docker DNS resolves it.
-        let monitor_spec = member_specs.iter().find(|m| m.role == "monitor");
+        let monitor_spec = member_specs.iter().find(|m| is_role_monitor(&m.role));
         let pg_cluster_name = service.name.clone();
         let monitor_container_fallback = format!("postgres-{}-monitor", pg_cluster_name);
         let monitor_hostname = monitor_spec
@@ -3623,7 +3668,7 @@ echo "[restore] Pre-seed complete"
                 let member_model = member_record.insert(self.db.as_ref()).await?;
 
                 // Assign port: monitor gets base_port, data nodes get base + ordinal
-                let member_port = if spec.role == "monitor" {
+                let member_port = if is_role_monitor(&spec.role) {
                     monitor_port
                 } else {
                     base_port + spec.ordinal as u16
@@ -3719,7 +3764,7 @@ echo "[restore] Pre-seed complete"
 
                 // Wait for the member to be healthy before proceeding to the next
                 // This is important: monitor must be healthy before data nodes register
-                if spec.role == "monitor" {
+                if is_role_monitor(&spec.role) {
                     info!(
                         "Waiting for monitor '{}' to become healthy...",
                         result.container_name
@@ -4303,7 +4348,7 @@ echo "[restore] Pre-seed complete"
             });
         }
 
-        if role != "replica" {
+        if role_from_str(role) != Some(crate::ClusterRole::Replica) {
             return Err(ExternalServiceError::ParameterValidationFailed {
                 service_id,
                 reason: format!(
@@ -4344,7 +4389,7 @@ echo "[restore] Pre-seed complete"
 
         let monitor = existing_members
             .iter()
-            .find(|m| m.role == "monitor")
+            .find(|m| is_role_monitor(&m.role))
             .ok_or(ExternalServiceError::InitializationFailed {
                 id: service_id,
                 reason: "Cannot add member: cluster has no monitor".to_string(),
@@ -4788,14 +4833,14 @@ echo "[restore] Pre-seed complete"
             });
         }
 
-        if member.role == "monitor" {
+        if is_role_monitor(&member.role) {
             return Err(ExternalServiceError::ParameterValidationFailed {
                 service_id,
                 reason: "Cannot remove the monitor — it is required for cluster operation"
                     .to_string(),
             });
         }
-        if member.role == "primary" {
+        if is_role_primary(&member.role) {
             return Err(ExternalServiceError::ParameterValidationFailed {
                 service_id,
                 reason: "Cannot remove the current primary. \
@@ -4813,7 +4858,10 @@ echo "[restore] Pre-seed complete"
             .filter(service_members::Column::ServiceId.eq(service_id))
             .all(self.db.as_ref())
             .await?;
-        let data_member_count = all_members.iter().filter(|m| m.role != "monitor").count();
+        let data_member_count = all_members
+            .iter()
+            .filter(|m| !is_role_monitor(&m.role))
+            .count();
         if data_member_count <= 2 {
             return Err(ExternalServiceError::ParameterValidationFailed {
                 service_id,
@@ -4993,13 +5041,13 @@ echo "[restore] Pre-seed complete"
             });
         }
 
-        if member.role == "monitor" {
+        if is_role_monitor(&member.role) {
             return Err(ExternalServiceError::ParameterValidationFailed {
                 service_id,
                 reason: "Cannot promote the monitor — it is not a data node".to_string(),
             });
         }
-        if member.role == "primary" {
+        if is_role_primary(&member.role) {
             return Err(ExternalServiceError::ParameterValidationFailed {
                 service_id,
                 reason: format!(

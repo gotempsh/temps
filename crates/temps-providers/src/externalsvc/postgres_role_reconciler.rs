@@ -29,6 +29,7 @@
 //! cluster code, while `temps-dns` stays engine-agnostic.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,23 +67,23 @@ pub struct MonitorNode {
 }
 
 impl MonitorNode {
+    /// Parsed view of `reported_state`. Always succeeds — unknown values
+    /// land in [`PgAutoFailoverState::Other`] and are correctly treated as
+    /// non-primary, non-secondary.
+    pub fn state(&self) -> super::PgAutoFailoverState {
+        self.reported_state.parse().expect("Infallible")
+    }
+
     fn is_primary(&self) -> bool {
-        // `single` is what pg_auto_failover reports when there's one node
-        // and no replication peer — it accepts writes, so it's our primary.
-        matches!(self.reported_state.as_str(), "primary" | "single")
+        self.state().is_primary()
     }
 
     fn is_secondary(&self) -> bool {
-        matches!(
-            self.reported_state.as_str(),
-            "secondary" | "catchingup" | "apply_settings"
-        )
+        self.state().is_secondary()
     }
 
     fn is_data_member(&self) -> bool {
-        // Any state that means "this node holds data and is part of the
-        // cluster". Excludes draining/demoted/dropped.
-        self.is_primary() || self.is_secondary() || self.reported_state == "wait_primary"
+        self.state().is_data_member()
     }
 }
 
@@ -227,7 +228,7 @@ pub async fn reconcile_once(
 
     let monitor = members
         .iter()
-        .find(|m| m.role == "monitor")
+        .find(|m| super::ClusterRole::from_str(&m.role).ok() == Some(super::ClusterRole::Monitor))
         .ok_or(ReconcilerError::MonitorMissing { service_id })?;
 
     // The monitor must be reachable from the control plane. Resolution
@@ -272,7 +273,7 @@ pub async fn reconcile_once(
     // does report nodehost as FQDN.
     let mut ip_by_hostname: HashMap<String, String> = HashMap::new();
     for m in &members {
-        if m.role == "monitor" {
+        if super::ClusterRole::from_str(&m.role).ok() == Some(super::ClusterRole::Monitor) {
             continue;
         }
         let Some(ip) = &m.compute_ip else { continue };
@@ -371,20 +372,18 @@ async fn sync_member_roles(
     members: &[temps_entities::service_members::Model],
     monitor_nodes: &[MonitorNode],
 ) {
+    use super::cluster_role::ClusterRole;
     use sea_orm::ActiveModelTrait;
     use sea_orm::ActiveValue::Set;
 
     // Build {underlay_or_fqdn → desired role} from the monitor view.
-    let mut desired_role_by_host: HashMap<String, &'static str> = HashMap::new();
+    // PgAutoFailoverState::to_cluster_role centralises the mapping —
+    // unknown / transient states return None and we leave the row alone
+    // (avoids UI flicker on every monitor poll).
+    let mut desired_role_by_host: HashMap<String, ClusterRole> = HashMap::new();
     for node in monitor_nodes {
-        let role = match node.reported_state.as_str() {
-            "primary" | "wait_primary" | "single" => "primary",
-            "secondary" | "wait_secondary" | "catchingup" | "report_lsn" | "apply_settings" => {
-                "replica"
-            }
-            // Transient/unknown states: keep whatever role we already
-            // had so the UI doesn't flicker on every monitor poll.
-            _ => continue,
+        let Some(role) = node.state().to_cluster_role() else {
+            continue;
         };
         desired_role_by_host.insert(node.nodehost.clone(), role);
     }
@@ -394,14 +393,15 @@ async fn sync_member_roles(
     }
 
     for m in members {
-        if m.role == "monitor" {
+        // Skip the monitor — pg_auto_failover doesn't manage its own role.
+        if ClusterRole::from_str(&m.role).ok() == Some(ClusterRole::Monitor) {
             continue;
         }
 
         // Find this member in the monitor view by underlay IP first,
         // then FQDN fallback. Either may be set depending on how the
         // member was originally registered.
-        let mut desired: Option<&'static str> = None;
+        let mut desired: Option<ClusterRole> = None;
         if let Some(node_id) = m.node_id {
             if let Ok(Some(n)) = temps_entities::nodes::Entity::find_by_id(node_id)
                 .one(db)
@@ -417,7 +417,7 @@ async fn sync_member_roles(
         }
 
         let Some(new_role) = desired else { continue };
-        if m.role == new_role {
+        if m.role == new_role.as_str() {
             continue;
         }
 
@@ -426,12 +426,12 @@ async fn sync_member_roles(
             member_id = m.id,
             container = %m.container_name,
             old_role = %m.role,
-            new_role,
+            new_role = %new_role,
             "Syncing member role from pg_auto_failover monitor"
         );
 
         let mut active: temps_entities::service_members::ActiveModel = m.clone().into();
-        active.role = Set(new_role.to_string());
+        active.role = Set(new_role.as_str().to_string());
         active.updated_at = Set(chrono::Utc::now());
         if let Err(e) = active.update(db).await {
             warn!(
