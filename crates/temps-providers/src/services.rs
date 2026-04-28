@@ -4018,14 +4018,90 @@ echo "[restore] Pre-seed complete"
         };
         if candidates.is_empty() {
             debug!("No running cluster services found at startup");
+        } else {
+            info!(
+                count = candidates.len(),
+                "Spawning role reconcilers for existing clusters"
+            );
+            for svc in candidates {
+                self.spawn_role_reconciler(svc.id, svc.name).await;
+            }
+        }
+
+        // Run the stuck-row watchdog after the reconcilers come up so
+        // failed/stuck members appear as `failed` immediately to the
+        // UI, instead of hanging in `creating` forever.
+        self.fail_abandoned_provisioning_rows().await;
+    }
+
+    /// One-shot scan at startup: any `service_members` row whose
+    /// `provisioning_step` is in flight AND whose `updated_at` is
+    /// older than `STUCK_ROW_THRESHOLD` is marked `failed`. This
+    /// happens when the control plane was killed mid-`add_cluster_member`
+    /// — without this, the row would stay at `INSERTING_ROW` /
+    /// `PROVISIONING_CONTAINER` forever and the operator would have
+    /// no way to clean it up except hand-editing the DB.
+    ///
+    /// 15 minutes is generous: a cold-cache image pull on a slow
+    /// connection can take 5+ minutes; doubling that as a timeout
+    /// avoids killing legitimately slow provisions on flaky networks.
+    async fn fail_abandoned_provisioning_rows(&self) {
+        const STUCK_ROW_THRESHOLD: chrono::Duration = chrono::Duration::minutes(15);
+
+        let cutoff = Utc::now() - STUCK_ROW_THRESHOLD;
+        let in_flight = [
+            member_provisioning_step::INSERTING_ROW,
+            member_provisioning_step::PROVISIONING_CONTAINER,
+            member_provisioning_step::REGISTERING_DNS,
+        ];
+
+        let stuck = match service_members::Entity::find()
+            .filter(service_members::Column::Status.eq("creating"))
+            .filter(service_members::Column::ProvisioningStep.is_in(in_flight))
+            .filter(service_members::Column::UpdatedAt.lt(cutoff))
+            .all(self.db.as_ref())
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to scan for stuck cluster member rows at startup; \
+                     any half-provisioned members from a previous run will stay \
+                     in 'creating' until manually fixed"
+                );
+                return;
+            }
+        };
+        if stuck.is_empty() {
             return;
         }
-        info!(
-            count = candidates.len(),
-            "Spawning role reconcilers for existing clusters"
+
+        warn!(
+            count = stuck.len(),
+            threshold_minutes = STUCK_ROW_THRESHOLD.num_minutes(),
+            "Found cluster member rows stuck mid-provisioning across a control \
+             plane restart; marking them failed so the operator can retry"
         );
-        for svc in candidates {
-            self.spawn_role_reconciler(svc.id, svc.name).await;
+        for m in stuck {
+            let member_id = m.id;
+            let last_step = m.provisioning_step.clone().unwrap_or_default();
+            let mut active: service_members::ActiveModel = m.into();
+            active.status = Set("failed".to_string());
+            active.provisioning_step = Set(Some(member_provisioning_step::FAILED.to_string()));
+            active.provisioning_error = Set(Some(format!(
+                "Control plane restart abandoned this provisioning attempt at step '{}'. \
+                 No data was lost; click Add Replica again to retry.",
+                last_step
+            )));
+            active.updated_at = Set(Utc::now());
+            if let Err(e) = active.update(self.db.as_ref()).await {
+                warn!(
+                    member_id,
+                    error = %e,
+                    "Failed to mark abandoned member as failed; will retry next startup"
+                );
+            }
         }
     }
 
@@ -4042,15 +4118,89 @@ echo "[restore] Pre-seed complete"
         drop(shutdowns);
 
         let db = self.db.clone();
+        // Supervised loop: a panic inside `run` (e.g. unexpected enum
+        // value from a future pg_auto_failover release that breaks
+        // `query_monitor`) used to silently kill DNS sync for one
+        // cluster forever. Now we re-spawn after a 30s backoff. Bounded
+        // restart rate (max 6 panics per hour) so a deterministic crash
+        // doesn't become an infinite restart loop hammering the
+        // monitor.
+        const RESTART_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+        const RESTART_WINDOW: std::time::Duration = std::time::Duration::from_secs(3600);
+        const MAX_RESTARTS_PER_WINDOW: usize = 6;
+
         tokio::spawn(async move {
-            crate::externalsvc::postgres_role_reconciler::run(
-                db,
-                registry,
-                service_id,
-                service_name,
-                shutdown,
-            )
-            .await;
+            let mut crash_times: Vec<std::time::Instant> = Vec::new();
+            loop {
+                let task_db = db.clone();
+                let task_registry = registry.clone();
+                let task_name = service_name.clone();
+                let task_shutdown = shutdown.clone();
+                // Wrap the future in AssertUnwindSafe + catch_unwind so
+                // a panic in the reconciler returns Err instead of
+                // killing this supervisor task.
+                use futures::future::FutureExt;
+                let result = std::panic::AssertUnwindSafe(
+                    crate::externalsvc::postgres_role_reconciler::run(
+                        task_db,
+                        task_registry,
+                        service_id,
+                        task_name,
+                        task_shutdown,
+                    ),
+                )
+                .catch_unwind()
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        // Clean exit (shutdown was notified). Don't restart.
+                        debug!(service_id, "role reconciler exited cleanly");
+                        return;
+                    }
+                    Err(panic) => {
+                        let now = std::time::Instant::now();
+                        crash_times.retain(|t| now.duration_since(*t) < RESTART_WINDOW);
+                        crash_times.push(now);
+
+                        let panic_msg = panic
+                            .downcast_ref::<&'static str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+
+                        if crash_times.len() > MAX_RESTARTS_PER_WINDOW {
+                            error!(
+                                service_id,
+                                panic = %panic_msg,
+                                crashes_in_last_hour = crash_times.len(),
+                                "Role reconciler crashed too many times; giving up. \
+                                 DNS records for this cluster will go stale until \
+                                 the control plane is restarted."
+                            );
+                            return;
+                        }
+
+                        error!(
+                            service_id,
+                            panic = %panic_msg,
+                            crashes_in_last_hour = crash_times.len(),
+                            backoff_secs = RESTART_BACKOFF.as_secs(),
+                            "Role reconciler panicked; restarting after backoff"
+                        );
+                    }
+                }
+
+                // Backoff respects shutdown so a delete_service called
+                // mid-backoff doesn't have to wait the full 30s.
+                tokio::select! {
+                    _ = tokio::time::sleep(RESTART_BACKOFF) => {}
+                    _ = shutdown.notified() => {
+                        debug!(service_id, "role reconciler shutdown during restart backoff");
+                        return;
+                    }
+                }
+            }
         });
     }
 
