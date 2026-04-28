@@ -225,20 +225,34 @@ impl PostgresClusterService {
                 "        echo 'host all pgautofailover_replicator ::/0 trust' >> \"$HBA\"",
                 "        gosu postgres pg_ctl reload -D \"$PGDATA\" 2>/dev/null || true",
                 "      fi",
-                // Application-user access (ADR-011 follow-up): pg_auto_failover
-                // only auto-generates a pg_hba entry that lets a node connect
-                // to *itself* as the configured user. That blocks every other
-                // path: control-plane health probes, app containers on the
-                // overlay, the Browse Data UI, even sibling cluster members.
-                // We add explicit md5 rules for $POSTGRES_USER so the
-                // application user is reachable from anywhere on the trust
-                // boundary (the cluster's networks). SSL preferred (hostssl
-                // first); plain host as fallback for legacy clients.
-                "      if ! grep -q \"^hostssl all .${POSTGRES_USER}. 0\\.0\\.0\\.0/0 md5\" \"$HBA\" 2>/dev/null; then",
-                "        echo \"hostssl all \\\"${POSTGRES_USER}\\\" 0.0.0.0/0 md5\" >> \"$HBA\"",
-                "        echo \"hostssl all \\\"${POSTGRES_USER}\\\" ::/0 md5\" >> \"$HBA\"",
-                "        echo \"host all \\\"${POSTGRES_USER}\\\" 0.0.0.0/0 md5\" >> \"$HBA\"",
-                "        echo \"host all \\\"${POSTGRES_USER}\\\" ::/0 md5\" >> \"$HBA\"",
+                // Application + tooling user access (ADR-011 follow-up):
+                // pg_auto_failover only auto-generates pg_hba rules for
+                // its infrastructure users (pgautofailover_replicator,
+                // pgautofailover_monitor) and a `<self>:<self> trust`
+                // line that lets a node connect to itself. Every other
+                // caller — sibling cluster members, control-plane health
+                // probes, the Browse Data UI, app containers on the
+                // overlay, the auto-provisioned `temps_explorer`
+                // read-only user, any future per-tenant role we add —
+                // gets "no pg_hba.conf entry for host X, user Y" until
+                // we open it explicitly.
+                //
+                // We add ONE catch-all md5 rule rather than a per-user
+                // entry so future roles work without a code change.
+                // Auth is still password-protected; the rule just
+                // says "if the role exists and the password matches,
+                // let it in from anywhere on the network the cluster
+                // already trusts".
+                //
+                // Order matters in pg_hba — the trust rules above this
+                // block (replicator + auto-generated monitor) match
+                // first, so infrastructure users skip md5 and keep
+                // their cert/trust auth.
+                "      if ! grep -q '^host all all 0\\.0\\.0\\.0/0 md5' \"$HBA\" 2>/dev/null; then",
+                "        echo 'hostssl all all 0.0.0.0/0 md5' >> \"$HBA\"",
+                "        echo 'hostssl all all ::/0 md5' >> \"$HBA\"",
+                "        echo 'host all all 0.0.0.0/0 md5' >> \"$HBA\"",
+                "        echo 'host all all ::/0 md5' >> \"$HBA\"",
                 "        gosu postgres pg_ctl reload -D \"$PGDATA\" 2>/dev/null || true",
                 "      fi",
                 "      break",
@@ -261,7 +275,13 @@ impl PostgresClusterService {
                 //
                 // The script writes the SQL to a tempfile rather than
                 // -c'ing it inline so embedded $$ and quotes don't need
-                // round-trip escaping through the bash heredoc.
+                // round-trip escaping through the bash heredoc. We
+                // chmod the file 644 so `gosu postgres psql` (which
+                // drops to the postgres user) can read it — without
+                // this it lives as 600 root:root, every retry hits
+                // EACCES, the loop times out and the password never
+                // gets ALTERed, breaking auth for every external
+                // caller including Browse Data.
                 "(",
                 "  SQL_FILE=$(mktemp /tmp/temps-app-user-XXXX.sql)",
                 "  cat > \"$SQL_FILE\" <<SQL_EOF",
@@ -277,6 +297,7 @@ impl PostgresClusterService {
                 "SELECT 'CREATE DATABASE \"${POSTGRES_DB}\" OWNER \"${POSTGRES_USER}\"'",
                 "WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '${POSTGRES_DB}')\\gexec",
                 "SQL_EOF",
+                "  chmod 644 \"$SQL_FILE\"",
                 "  for _ in $(seq 1 60); do",
                 "    if gosu postgres psql -p \"$NODE_PORT\" -d postgres -v ON_ERROR_STOP=1 -f \"$SQL_FILE\" >/dev/null 2>&1; then",
                 "      rm -f \"$SQL_FILE\"",
@@ -637,7 +658,15 @@ impl PostgresClusterService {
             _ => {
                 let fallback_hostname = self.node_container_name(member.ordinal);
                 let node_hostname = member.hostname.as_deref().unwrap_or(&fallback_hostname);
-                let node_name = format!("node-{}", member.ordinal);
+                // Register the pg_autoctl node under the same name as the
+                // docker container, so the Cluster Health view (which is
+                // populated from pg_autoctl) matches the Cluster Members
+                // view (populated from `service_members.container_name`)
+                // line-for-line. The previous `node-{ordinal}` scheme
+                // collided when an ordinal was reused after a delete: the
+                // monitor kept the old "node-2" identity while temps was
+                // already calling the new container "postgres-e3m4-N".
+                let node_name = self.node_container_name(member.ordinal);
 
                 ClusterMemberCreateParams {
                     container_name: self.node_container_name(member.ordinal),

@@ -215,6 +215,20 @@ pub struct ServiceMemberInfo {
     /// replica didn't come up.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provisioning_error: Option<String>,
+    /// Live FSM state from the pg_auto_failover monitor (`primary`,
+    /// `secondary`, `catchingup`, `report_lsn`, …). `None` when the
+    /// monitor is unreachable, the service is not a cluster, or the row
+    /// is the monitor itself.
+    ///
+    /// **The UI must render the role badge from this field**, falling
+    /// back to `role` only when `live_state` is null. `role` is now
+    /// config-only (`monitor` or `replica`); flipping the badge to
+    /// "primary" when the monitor elects a new one used to require a
+    /// reconciler that lagged ~5s behind real failovers — and during
+    /// that window the UI showed two primaries. `live_state` is read
+    /// directly from the monitor on every list, so it can never lag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_state: Option<String>,
 }
 
 impl From<crate::services::ServiceMemberInfo> for ServiceMemberInfo {
@@ -231,6 +245,7 @@ impl From<crate::services::ServiceMemberInfo> for ServiceMemberInfo {
             compute_ip: m.compute_ip,
             provisioning_step: m.provisioning_step,
             provisioning_error: m.provisioning_error,
+            live_state: m.live_state,
         }
     }
 }

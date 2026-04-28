@@ -353,6 +353,17 @@ pub struct ServiceMemberInfo {
     /// step names. NULL for members not created through that flow.
     pub provisioning_step: Option<String>,
     pub provisioning_error: Option<String>,
+    /// Live FSM state from the pg_auto_failover monitor (`primary`,
+    /// `secondary`, `catchingup`, `report_lsn`, …). `None` when the
+    /// monitor is unreachable, not applicable (non-cluster service), or
+    /// the row is the monitor itself.
+    ///
+    /// **This is the source of truth for the "is this node primary?"
+    /// question.** `role` reflects what we wrote at provisioning time and
+    /// can lag behind reality after a failover. UI badges, role checks
+    /// in admin actions, and connection-string builders should prefer
+    /// `live_state` when set.
+    pub live_state: Option<String>,
 }
 
 impl ServiceMemberInfo {
@@ -1693,9 +1704,13 @@ impl ExternalServiceManager {
     ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         let service = self.get_service(service_id).await?;
 
-        // Load cluster members if this is a cluster topology
+        // Load cluster members if this is a cluster topology, and enrich
+        // each one with the monitor's view of its FSM state. The UI uses
+        // `live_state` for the role badge so failovers and promotions
+        // reflect immediately, instead of being gated on the
+        // `service_members.role` reconciler.
         let members = if service.topology == "cluster" {
-            self.get_service_members(service_id).await?
+            self.get_service_members_with_live_state(service_id).await?
         } else {
             Vec::new()
         };
@@ -1746,8 +1761,130 @@ impl ExternalServiceManager {
                 compute_ip: m.compute_ip,
                 provisioning_step: m.provisioning_step,
                 provisioning_error: m.provisioning_error,
+                // Pure DB read — monitor enrichment is the caller's
+                // responsibility via `get_service_members_with_live_state`.
+                // Cheap callers (cluster_health, reconciler) avoid the
+                // extra network round-trip.
+                live_state: None,
             })
             .collect())
+    }
+
+    /// Find the live primary among a cluster's members by asking the
+    /// monitor for the current FSM state.
+    ///
+    /// Returns `Ok(None)` when:
+    ///   - the service isn't a cluster
+    ///   - the monitor is unreachable (callers should treat this as
+    ///     "primary unknown" rather than "no primary")
+    ///   - the monitor knows of no node in `primary | single` state
+    ///
+    /// Replaces the old `members.iter().find(|m| m.role == "primary")`
+    /// pattern, which broke the moment we stopped storing the primary
+    /// designation in `service_members.role`.
+    pub async fn find_live_primary_member<'a>(
+        &self,
+        service: &external_services::Model,
+        members: &'a [temps_entities::service_members::Model],
+    ) -> Result<Option<&'a temps_entities::service_members::Model>, ExternalServiceError> {
+        if service.topology != "cluster" {
+            return Ok(None);
+        }
+        let health = self.cluster_health(service).await;
+        if health.monitor_error.is_some() {
+            return Ok(None);
+        }
+        let primary_name = health
+            .members
+            .iter()
+            .find(|h| matches!(h.reported_state.as_str(), "primary" | "single"))
+            .map(|h| h.nodename.clone());
+        let Some(name) = primary_name else {
+            return Ok(None);
+        };
+        Ok(members.iter().find(|m| m.container_name == name))
+    }
+
+    /// Live primary check: ask the pg_auto_failover monitor whether the
+    /// given member is currently the writable node. Returns `Ok(false)`
+    /// when the monitor is unreachable so admin actions don't get
+    /// blocked by a flaky control plane — callers that need stronger
+    /// guarantees should explicitly probe `cluster_health` first and
+    /// surface `monitor_error` to the user.
+    ///
+    /// Use this for "is this the primary?" gates (e.g. block deletion,
+    /// reject self-promotion). Don't use for the UI label — that path
+    /// reads `ServiceMemberInfo.live_state` and shows the actual
+    /// FSM state including transient ones like `wait_primary`.
+    pub async fn member_is_live_primary(
+        &self,
+        service: &external_services::Model,
+        member: &temps_entities::service_members::Model,
+    ) -> Result<bool, ExternalServiceError> {
+        if service.topology != "cluster" {
+            return Ok(false);
+        }
+        let health = self.cluster_health(service).await;
+        if health.monitor_error.is_some() {
+            return Ok(false);
+        }
+        Ok(health
+            .members
+            .iter()
+            .find(|h| h.nodename == member.container_name)
+            .map(|h| matches!(h.reported_state.as_str(), "primary" | "single"))
+            .unwrap_or(false))
+    }
+
+    /// Same shape as `get_service_members`, but for cluster topologies
+    /// also queries the monitor and fills in `live_state` per member.
+    ///
+    /// Used by UI-facing endpoints. Falls back to the bare DB result if
+    /// the monitor is unreachable so the page still renders — the UI
+    /// then displays the stored `role` as a best-effort label.
+    ///
+    /// Cost: one extra `cluster_health` call (≤5s timeout). Don't use on
+    /// the hot path.
+    pub async fn get_service_members_with_live_state(
+        &self,
+        service_id: i32,
+    ) -> Result<Vec<ServiceMemberInfo>, ExternalServiceError> {
+        let mut members = self.get_service_members(service_id).await?;
+
+        let service = match self.get_service(service_id).await {
+            Ok(s) => s,
+            Err(_) => return Ok(members),
+        };
+        if service.topology != "cluster" {
+            return Ok(members);
+        }
+
+        // Monitor probe — best-effort. `cluster_health` already swallows
+        // monitor errors and returns an empty `members` list, so we just
+        // skip enrichment when that happens.
+        let health = self.cluster_health(&service).await;
+        if health.monitor_error.is_some() || health.members.is_empty() {
+            return Ok(members);
+        }
+
+        // Index live state by container name (== `nodename` in the monitor
+        // since the rename in postgres_cluster.rs::container_params).
+        let live: HashMap<String, String> = health
+            .members
+            .into_iter()
+            .map(|m| (m.nodename, m.reported_state))
+            .collect();
+
+        for member in members.iter_mut() {
+            if member.is_monitor() {
+                continue;
+            }
+            if let Some(state) = live.get(&member.container_name) {
+                member.live_state = Some(state.clone());
+            }
+        }
+
+        Ok(members)
     }
 
     /// Health-probe a cluster service by fanning out to:
@@ -2277,13 +2414,21 @@ impl ExternalServiceManager {
             });
         }
 
-        let members = self.get_service_members(service.id).await?;
+        let members = self.get_service_members_with_live_state(service.id).await?;
+        // `live_state` is the runtime FSM state from pg_auto_failover.
+        // Backup must run against the writable primary; "single" is the
+        // single-node form pg_auto_failover uses before a replica
+        // catches up — also writable. Anything else (secondary,
+        // catchingup, report_lsn, …) is a replica.
         let primary = members
             .iter()
-            .find(|m| is_role_primary(&m.role) && m.status == "running")
+            .find(|m| {
+                m.status == "running"
+                    && matches!(m.live_state.as_deref(), Some("primary") | Some("single"))
+            })
             .ok_or(ExternalServiceError::InitializationFailed {
                 id: service.id,
-                reason: "Cannot run backup: cluster has no running primary".to_string(),
+                reason: "Cannot run backup: cluster has no running primary (monitor unreachable or no node in primary state)".to_string(),
             })?;
 
         // Write the external_service_backups row up front so the UI's
@@ -2760,16 +2905,17 @@ impl ExternalServiceManager {
             });
         }
 
-        // Find the primary in the snapshot. After failover the role
-        // labels in service_members reflect reality (kept fresh by the
-        // reconciler) so this is the node that *currently* holds the
-        // writable copy of the data.
-        let original_primary = members.iter().find(|m| is_role_primary(&m.role)).ok_or(
-            ExternalServiceError::InitializationFailed {
+        // Find the primary in the snapshot — the node that *currently*
+        // holds the writable copy of the data. We can't trust
+        // `service_members.role` here (it's `replica` for every data
+        // node post-rework); ask pg_auto_failover instead.
+        let original_primary = self
+            .find_live_primary_member(service, &members)
+            .await?
+            .ok_or(ExternalServiceError::InitializationFailed {
                 id: service.id,
                 reason: "Cannot restore: cluster has no primary on record".to_string(),
-            },
-        )?;
+            })?;
         let primary_container_name = original_primary.container_name.clone();
         let primary_volume_name = format!("{}_data", primary_container_name);
 
@@ -3140,12 +3286,16 @@ echo "[restore] Pre-seed complete"
             return Ok(None);
         }
 
-        let members = self.get_service_members(service_id).await?;
-
-        // Find the primary data node (not monitor, not replica)
-        let primary = members
-            .iter()
-            .find(|m| is_role_primary(&m.role) && m.status == "running");
+        // The primary is whichever node pg_auto_failover currently calls
+        // primary, not whatever `service_members.role` happens to say.
+        // Using the stored role here would have produced the same lag
+        // bug the UI hit — Browse Data and other callers would dial a
+        // freshly-demoted node post-failover.
+        let members = self.get_service_members_with_live_state(service_id).await?;
+        let primary = members.iter().find(|m| {
+            m.status == "running"
+                && matches!(m.live_state.as_deref(), Some("primary") | Some("single"))
+        });
 
         if let Some(primary) = primary {
             let port = primary.port.unwrap_or(5432) as u16;
@@ -3195,6 +3345,155 @@ echo "[restore] Pre-seed complete"
         service: &external_services::Model,
         parameters: &HashMap<String, serde_json::Value>,
     ) -> Result<Option<HashMap<String, String>>, ExternalServiceError> {
+        self.build_cluster_env_vars_for_resource(service, parameters, None)
+            .await
+    }
+
+    /// Create the per-app database `name` on the cluster's live
+    /// primary if it doesn't already exist. Idempotent — uses
+    /// `pg_database` lookup before issuing CREATE.
+    ///
+    /// Connects to the cluster the same way Browse Data does:
+    /// resolve the primary's host:port via the monitor, dial it
+    /// through the existing `temps-query-postgres` TLS-then-plain
+    /// fallback. The CP can reach worker-mapped ports because they
+    /// bind to the worker's underlay IP.
+    async fn ensure_cluster_app_database(
+        &self,
+        service_id: i32,
+        admin_user: &str,
+        admin_password: &str,
+        db_name: &str,
+    ) -> Result<(), ExternalServiceError> {
+        // Sanity-check the name matches what postgres allows for a
+        // bare-quoted identifier — same rules the standalone path
+        // applies. Strict to keep the CREATE DATABASE parameterless
+        // safe (Postgres doesn't accept bind params for CREATE).
+        if !db_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || db_name.is_empty()
+            || db_name
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
+        {
+            return Err(ExternalServiceError::ParameterValidationFailed {
+                service_id,
+                reason: format!(
+                    "Cluster app DB name '{}' must match [A-Za-z_][A-Za-z0-9_]*",
+                    db_name
+                ),
+            });
+        }
+
+        let (host, port) = match self.get_cluster_primary_address(service_id).await? {
+            Some(hp) => hp,
+            None => {
+                return Err(ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot provision app database '{}' for cluster {}: \
+                         no running primary",
+                        db_name, service_id
+                    ),
+                });
+            }
+        };
+
+        // Dial the primary using the same connection helper as Browse
+        // Data so TLS/plain fallback + chained-error reporting are
+        // shared.
+        let conn_str = format!(
+            "host={} port={} user={} password={} dbname={}",
+            host,
+            port,
+            admin_user,
+            admin_password,
+            // Connect to the cluster's bootstrap DB ("postgres" by
+            // default) to issue CREATE DATABASE — you can't create
+            // a DB while connected to it.
+            "postgres",
+        );
+
+        let client = match temps_query_postgres::connect_with_self_signed_tls(&conn_str).await {
+            Ok(c) => c,
+            Err(tls_err) => {
+                use tokio_postgres::NoTls;
+                tokio_postgres::connect(&conn_str, NoTls)
+                    .await
+                    .map(|(client, conn)| {
+                        tokio::spawn(async move {
+                            if let Err(e) = conn.await {
+                                warn!("Cluster admin connection error: {}", e);
+                            }
+                        });
+                        client
+                    })
+                    .map_err(|plain_err| ExternalServiceError::InternalError {
+                        reason: format!(
+                            "Failed to connect to cluster {} primary at {}:{} \
+                             (TLS error: {}, plain error: {})",
+                            service_id, host, port, tls_err, plain_err
+                        ),
+                    })?
+            }
+        };
+
+        let exists: bool = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
+                &[&db_name],
+            )
+            .await
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to check if database '{}' exists: {}", db_name, e),
+            })?
+            .get(0);
+
+        if exists {
+            debug!(
+                service_id,
+                db_name, "App database already exists on cluster primary; skipping CREATE"
+            );
+            return Ok(());
+        }
+
+        // CREATE DATABASE doesn't accept bind params — the strict
+        // identifier check above keeps this safe.
+        let stmt = format!("CREATE DATABASE \"{}\"", db_name);
+        client.execute(stmt.as_str(), &[]).await.map_err(|e| {
+            ExternalServiceError::InternalError {
+                reason: format!(
+                    "Failed to create database '{}' on cluster {}: {}",
+                    db_name, service_id, e
+                ),
+            }
+        })?;
+        info!(
+            service_id,
+            db_name, "Created app database on cluster primary"
+        );
+        Ok(())
+    }
+
+    /// Build cluster env vars, optionally provisioning a per-tenant
+    /// database on the live primary first. When `resource_name` is
+    /// `Some(name)`:
+    ///   1. Connect to the live primary as the admin user.
+    ///   2. `CREATE DATABASE "<name>" OWNER "<admin>"` if missing.
+    ///   3. Emit env vars whose `POSTGRES_DB` and `POSTGRES_URL` point
+    ///      at that DB (so each project/environment gets its own).
+    ///
+    /// When `resource_name` is `None`, fall back to the cluster's
+    /// configured `database` parameter — kept for the legacy callers
+    /// that want a generic cluster-level view.
+    async fn build_cluster_env_vars_for_resource(
+        &self,
+        service: &external_services::Model,
+        parameters: &HashMap<String, serde_json::Value>,
+        resource_name: Option<&str>,
+    ) -> Result<Option<HashMap<String, String>>, ExternalServiceError> {
         if service.topology != "cluster" {
             return Ok(None);
         }
@@ -3208,10 +3507,22 @@ echo "[restore] Pre-seed complete"
             .cloned()
             .unwrap_or_else(|| "postgres".to_string());
         let password = params_str.get("password").cloned().unwrap_or_default();
-        let database = params_str
+        let admin_database = params_str
             .get("database")
             .cloned()
             .unwrap_or_else(|| "postgres".to_string());
+
+        // Per-tenant database: when the caller passes a resource name
+        // we provision a dedicated DB on the primary so each app gets
+        // its own. Falls back to the cluster's admin DB when no name
+        // is given.
+        let database = if let Some(name) = resource_name {
+            self.ensure_cluster_app_database(service.id, &username, &password, name)
+                .await?;
+            name.to_string()
+        } else {
+            admin_database
+        };
 
         // Build multi-host connection string from running data nodes (not monitor)
         let data_nodes: Vec<&ServiceMemberInfo> = members
@@ -3664,11 +3975,25 @@ echo "[restore] Pre-seed complete"
                     result.container_name, result.role, result.ordinal, spec.node_id
                 );
 
-                // Insert member record with "creating" status so frontend can track progress
+                // `service_members.role` is config-state — `monitor` for the
+                // singleton orchestrator, `replica` for every data node.
+                // "Primary" is a *runtime* fact owned by pg_auto_failover and
+                // is surfaced via `live_state` (see
+                // `get_service_members_with_live_state`). Storing one row as
+                // `primary` would have to be reconciled on every failover,
+                // and the lag between the monitor flipping and our row
+                // catching up was the bug behind the "two primaries"
+                // display. Treating roles as static config eliminates the
+                // class.
+                let stored_role = if is_role_monitor(&result.role) {
+                    "monitor".to_string()
+                } else {
+                    "replica".to_string()
+                };
                 let member_record = service_members::ActiveModel {
                     service_id: Set(service_id),
                     node_id: Set(spec.node_id),
-                    role: Set(result.role.clone()),
+                    role: Set(stored_role),
                     container_id: Set(None),
                     container_name: Set(result.container_name.clone()),
                     hostname: Set(spec.hostname.clone()),
@@ -4435,10 +4760,18 @@ echo "[restore] Pre-seed complete"
                     .plan_add_cluster_member(service_id, role, node_id)
                     .await?;
                 let now = Utc::now();
+                // See note in `initialize_cluster`: data members are stored
+                // as `replica`. Promotion is a runtime concern owned by the
+                // pg_auto_failover monitor and surfaced via `live_state`.
+                let stored_role = if is_role_monitor(&plan.spec.role) {
+                    "monitor".to_string()
+                } else {
+                    "replica".to_string()
+                };
                 let member_record = service_members::ActiveModel {
                     service_id: Set(service_id),
                     node_id: Set(plan.spec.node_id),
-                    role: Set(plan.spec.role.clone()),
+                    role: Set(stored_role),
                     container_id: Set(None),
                     container_name: Set(plan.container_name.clone()),
                     hostname: Set(plan.spec.hostname.clone()),
@@ -4522,6 +4855,9 @@ echo "[restore] Pre-seed complete"
             compute_ip: member_model.compute_ip,
             provisioning_step: member_model.provisioning_step,
             provisioning_error: member_model.provisioning_error,
+            // Just-created members never have an FSM state to report
+            // yet. The next polling cycle picks it up.
+            live_state: None,
         })
     }
 
@@ -4638,12 +4974,19 @@ echo "[restore] Pre-seed complete"
                 reason: "Monitor has no host port recorded".to_string(),
             })? as u16;
 
-        let next_ordinal = existing_members
-            .iter()
-            .map(|m| m.ordinal)
-            .max()
-            .unwrap_or(-1)
-            + 1;
+        // Reuse the lowest free ordinal (≥ 1 — 0 is reserved for the
+        // monitor) so that delete-then-add gives the operator back the
+        // same node identity (e.g. node-2 stays node-2). Falling through
+        // to MAX+1 here meant a removed node-2 would come back as node-4
+        // and pg_auto_failover treated the original :6152 ghost as a new
+        // peer, blocking the FSM. Together with the
+        // `pg_autoctl drop node` call in `remove_cluster_member`, this
+        // makes delete+add idempotent from the cluster's point of view.
+        let used_ordinals: std::collections::BTreeSet<i32> =
+            existing_members.iter().map(|m| m.ordinal).collect();
+        let next_ordinal: i32 = (1..)
+            .find(|n| !used_ordinals.contains(n))
+            .expect("ordinal range is unbounded");
 
         let has_any_remote =
             existing_members.iter().any(|m| m.node_id.is_some()) || node_id.is_some();
@@ -4980,6 +5323,10 @@ echo "[restore] Pre-seed complete"
             compute_ip: member.compute_ip,
             provisioning_step: member.provisioning_step,
             provisioning_error: member.provisioning_error,
+            // Single-member fetch path. Callers that need live state for
+            // a single member should use `member_is_live_primary` or
+            // `get_service_members_with_live_state` instead.
+            live_state: None,
         })
     }
 
@@ -5002,14 +5349,13 @@ echo "[restore] Pre-seed complete"
     ///   3. Drop the Tier-2 DNS A record for the member (best-effort).
     ///   4. Reconciler will refresh role records on its next tick.
     ///
-    /// **Note:** this does *not* run `pg_autoctl drop node` against the
-    /// monitor. Doing so safely requires shelling into the monitor
-    /// container (the user has rejected `docker exec` for state-changing
-    /// operations). The orphan monitor row is harmless — pg_auto_failover
-    /// will mark the missing node as `unreachable` and stop assigning it
-    /// reads. If you need a fully-clean monitor view, run
-    /// `pg_autoctl drop node --formation default --name <node-N>`
-    /// manually from the monitor.
+    /// Also runs `pg_autoctl drop node --formation default --name node-N`
+    /// against the monitor before deleting the row. Skipping that call
+    /// leaves an orphan node registered with the monitor that will be
+    /// asked to participate in quorum decisions (e.g. report_lsn during
+    /// failover) and never respond, which deadlocks the FSM. The drop is
+    /// best-effort — if the monitor is unreachable we still tear down the
+    /// container + DB row, but log loudly so the operator can clean up.
     pub async fn remove_cluster_member(
         &self,
         service_id: i32,
@@ -5052,7 +5398,13 @@ echo "[restore] Pre-seed complete"
                     .to_string(),
             });
         }
-        if is_role_primary(&member.role) {
+        // Block removal of whichever node pg_auto_failover *currently*
+        // calls primary, regardless of what `service_members.role` says
+        // (which is now always `replica` for data members — see the
+        // initialize_cluster comment). If the monitor is unreachable we
+        // allow the delete, since the operator likely needs an escape
+        // hatch in that exact scenario.
+        if self.member_is_live_primary(&service, &member).await? {
             return Err(ExternalServiceError::ParameterValidationFailed {
                 service_id,
                 reason: "Cannot remove the current primary. \
@@ -5086,7 +5438,47 @@ echo "[restore] Pre-seed complete"
             });
         }
 
-        // 1. Stop and remove the container.
+        // 1. Drop the node from pg_auto_failover *first*. If we delete the
+        //    container before this, pg_autoctl on the monitor will treat
+        //    the node as unreachable but still expect it to participate
+        //    in quorum (e.g. report_lsn during a later failover), wedging
+        //    the FSM. Best-effort: a monitor that's down shouldn't block
+        //    user-initiated cleanup, but we want loud logs.
+        //
+        // The pg_autoctl node name is the docker container name (set in
+        // `PostgresClusterService::container_params`), so the monitor's
+        // identifier matches what `service_members.container_name` holds
+        // exactly. Older clusters that registered as `node-{ordinal}`
+        // need the legacy name for backwards compatibility — try the
+        // container name first, fall back to `node-N`.
+        let primary_name = member.container_name.clone();
+        let legacy_name = format!("node-{}", member.ordinal);
+        let drop_result = self.drop_node_from_monitor(service_id, &primary_name).await;
+        let drop_result = match drop_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                debug!(
+                    service_id,
+                    member_id,
+                    primary_name = %primary_name,
+                    error = %e,
+                    "drop_node by container name failed; trying legacy node-N alias"
+                );
+                self.drop_node_from_monitor(service_id, &legacy_name).await
+            }
+        };
+        if let Err(e) = drop_result {
+            warn!(
+                service_id,
+                member_id,
+                primary_name = %primary_name,
+                legacy_name = %legacy_name,
+                error = %e,
+                "Failed to drop node from pg_auto_failover monitor; cluster may need manual `pg_autoctl drop node` after cleanup"
+            );
+        }
+
+        // 2. Stop and remove the container.
         if let Some(node_id) = member.node_id {
             // Remote: dispatch to the worker's agent.
             match self.get_remote_client(node_id).await {
@@ -5158,12 +5550,12 @@ echo "[restore] Pre-seed complete"
             }
         }
 
-        // 2. Delete the service_members row.
+        // 3. Delete the service_members row.
         service_members::Entity::delete_by_id(member_id)
             .exec(self.db.as_ref())
             .await?;
 
-        // 3. Drop the Tier-2 DNS record (best-effort — same policy as
+        // 4. Drop the Tier-2 DNS record (best-effort — same policy as
         //    delete_service: a stuck DNS plane shouldn't block removal).
         if let Err(e) = self
             .dns_registry
@@ -5186,8 +5578,7 @@ echo "[restore] Pre-seed complete"
             member_id,
             role = %member.role,
             ordinal = member.ordinal,
-            "Cluster member removed; reconciler will refresh role records on next tick. \
-             Run `pg_autoctl drop node` on the monitor to fully clean pg_auto_failover state."
+            "Cluster member removed; reconciler will refresh role records on next tick"
         );
 
         Ok(())
@@ -5259,7 +5650,7 @@ echo "[restore] Pre-seed complete"
                 reason: "Cannot promote the monitor — it is not a data node".to_string(),
             });
         }
-        if is_role_primary(&member.role) {
+        if self.member_is_live_primary(&service, &member).await? {
             return Err(ExternalServiceError::ParameterValidationFailed {
                 service_id,
                 reason: format!(
@@ -5339,6 +5730,99 @@ echo "[restore] Pre-seed complete"
     /// Run a command inside a locally-managed container. Mirrors the
     /// agent's `service_exec` for the control-plane half of bipartite
     /// cluster operations. Returns `(exit_code, stdout, stderr)`.
+    /// Run `pg_autoctl drop node --name <node_name>` inside the cluster's
+    /// monitor container. Returns `Ok(())` on success or any explainable
+    /// failure (monitor missing, container gone, exec error) — the caller
+    /// is expected to log loudly and proceed with row + container cleanup
+    /// regardless. The monitor row is the source of truth for
+    /// pg_auto_failover; leaving an orphan there blocks FSM transitions.
+    async fn drop_node_from_monitor(
+        &self,
+        service_id: i32,
+        node_name: &str,
+    ) -> Result<(), ExternalServiceError> {
+        let monitor = service_members::Entity::find()
+            .filter(service_members::Column::ServiceId.eq(service_id))
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .find(|m| is_role_monitor(&m.role))
+            .ok_or_else(|| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Cluster service {} has no monitor member; cannot drop node {} from pg_auto_failover",
+                    service_id, node_name
+                ),
+            })?;
+
+        // The monitor container's pg_autoctl runs out of
+        // `/var/lib/postgresql/monitor` (see `monitor_command` in
+        // `postgres_cluster.rs`), NOT the `/var/lib/postgresql/pgdata`
+        // path the data nodes use. Using the wrong --pgdata makes
+        // pg_autoctl fail with "Expected configuration file does not
+        // exist", which is what the original "harmless orphan" comment
+        // missed.
+        let cmd = vec![
+            "pg_autoctl".to_string(),
+            "drop".to_string(),
+            "node".to_string(),
+            "--formation".to_string(),
+            "default".to_string(),
+            "--name".to_string(),
+            node_name.to_string(),
+            "--pgdata".to_string(),
+            "/var/lib/postgresql/monitor".to_string(),
+        ];
+
+        let (exit_code, stdout, stderr) = if let Some(node_id) = monitor.node_id {
+            let client = self.get_remote_client(node_id).await?;
+            let result = client
+                .exec_in_service(crate::remote_service_client::RemoteExecParams {
+                    container_name: monitor.container_name.clone(),
+                    command: cmd,
+                    environment: HashMap::new(),
+                    user: Some("postgres".to_string()),
+                    detach: false,
+                })
+                .await
+                .map_err(|e| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Failed to drop node {} via monitor on node {}: {}",
+                        node_name, node_id, e
+                    ),
+                })?;
+            (result.exit_code, result.stdout, result.stderr)
+        } else {
+            self.exec_in_local_container(&monitor.container_name, &cmd, Some("postgres"))
+                .await?
+        };
+
+        if exit_code != 0 {
+            // Common benign cases: node already dropped, name not found.
+            // pg_autoctl writes the actual reason to stderr.
+            let detail = if !stderr.is_empty() { stderr } else { stdout };
+            let detail = detail.trim();
+            if detail.contains("not found") || detail.contains("does not exist") {
+                debug!(
+                    service_id,
+                    node_name, "pg_autoctl drop node reported the node was already absent"
+                );
+                return Ok(());
+            }
+            return Err(ExternalServiceError::InternalError {
+                reason: format!(
+                    "pg_autoctl drop node {} failed (exit {}): {}",
+                    node_name, exit_code, detail
+                ),
+            });
+        }
+
+        info!(
+            service_id,
+            node_name, "Dropped node from pg_auto_failover monitor"
+        );
+        Ok(())
+    }
+
     async fn exec_in_local_container(
         &self,
         container_name: &str,
@@ -6126,7 +6610,38 @@ echo "[restore] Pre-seed complete"
 
         let parameters = self.get_service_parameters(service_id_val).await?;
 
-        // Cluster services: build multi-host env vars from service_members
+        // Compute the per-tenant database name once — both paths use
+        // the same `<project_slug>_<env_slug>` convention so an app
+        // gets the same DB whether the upstream service is standalone
+        // or clustered.
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ExternalServiceError::ProjectNotFound { id: project_id })?;
+        let environment = temps_entities::environments::Entity::find_by_id(environment_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ExternalServiceError::InternalError {
+                reason: format!("Environment {} not found", environment_id),
+            })?;
+        let resource_name = crate::externalsvc::postgres::PostgresService::normalize_database_name(
+            &format!("{}_{}", project.slug, environment.slug),
+        );
+
+        // Cluster services: build multi-host env vars from
+        // service_members AND provision the per-tenant database on
+        // the live primary so apps get isolation parity with the
+        // standalone path.
+        if service.topology == "cluster" && service.service_type == "postgres" {
+            if let Some(cluster_vars) = self
+                .build_cluster_env_vars_for_resource(&service, &parameters, Some(&resource_name))
+                .await?
+            {
+                return Ok(cluster_vars);
+            }
+        }
+        // Other cluster types (none today, but keep the door open)
+        // get the legacy non-tenant view.
         if let Some(cluster_vars) = self.build_cluster_env_vars(&service, &parameters).await? {
             return Ok(cluster_vars);
         }
@@ -6152,25 +6667,10 @@ echo "[restore] Pre-seed complete"
                 reason: format!("Failed to initialize service: {}", e),
             })?;
 
-        // Get project and environment slugs
-        let project = projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(ExternalServiceError::ProjectNotFound { id: project_id })?;
-
-        let environment = temps_entities::environments::Entity::find_by_id(environment_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| ExternalServiceError::InternalError {
-                reason: format!("Environment {} not found", environment_id),
-            })?;
-
-        let project_slug = project.slug;
-        let environment_slug = environment.slug;
-
         // Get runtime environment variables (this provisions resources like databases/buckets)
+        // `project` and `environment` were fetched up top — reuse the slugs.
         service_instance
-            .get_runtime_env_vars(service_config, &project_slug, &environment_slug)
+            .get_runtime_env_vars(service_config, &project.slug, &environment.slug)
             .await
             .map_err(|e| ExternalServiceError::InternalError {
                 reason: format!("Failed to get runtime environment variables: {}", e),

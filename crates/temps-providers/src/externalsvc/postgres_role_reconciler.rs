@@ -352,72 +352,32 @@ pub async fn reconcile_once(
 /// function keeps our row labels consistent so the UI's Cluster Members
 /// table doesn't go stale after a failover.
 ///
-/// Mapping rules (in priority order):
-///   1. monitor's `nodehost` matches `node.private_address` → that
-///      member is the one
-///   2. monitor's `nodehost` matches the member's stored `hostname`
-///      (FQDN fallback for any future setup that registers FQDNs in
-///      pg_auto_failover)
+/// Legacy cleanup pass: demote any row that still has
+/// `role = 'primary'` to `replica`.
 ///
-/// We translate pg_auto_failover's `reportedstate` to our role
-/// vocabulary:
-///   - `primary` / `wait_primary` / `single` → `primary`
-///   - `secondary` / `wait_secondary` / `catchingup` / `report_lsn` /
-///     `apply_settings` → `replica`
-///   - everything else → leave the row alone (transient states like
-///     `draining`, `demote_timeout` shouldn't flip the user-facing label)
+/// `service_members.role` is now config state — `monitor` for the
+/// orchestrator, `replica` for every data node. Runtime "is this the
+/// primary?" comes from the monitor via `ServiceMemberInfo.live_state`.
+/// Rows from clusters created before that change carry stale `primary`
+/// values; this function writes them back to `replica` once and is
+/// otherwise a no-op.
+///
+/// `monitor_nodes` is unused now and kept only so the reconciler call
+/// site doesn't need to be reshuffled.
 async fn sync_member_roles(
     db: &DatabaseConnection,
     service_id: i32,
     members: &[temps_entities::service_members::Model],
-    monitor_nodes: &[MonitorNode],
+    _monitor_nodes: &[MonitorNode],
 ) {
-    use super::cluster_role::ClusterRole;
     use sea_orm::ActiveModelTrait;
     use sea_orm::ActiveValue::Set;
 
-    // Build {underlay_or_fqdn → desired role} from the monitor view.
-    // PgAutoFailoverState::to_cluster_role centralises the mapping —
-    // unknown / transient states return None and we leave the row alone
-    // (avoids UI flicker on every monitor poll).
-    let mut desired_role_by_host: HashMap<String, ClusterRole> = HashMap::new();
-    for node in monitor_nodes {
-        let Some(role) = node.state().to_cluster_role() else {
-            continue;
-        };
-        desired_role_by_host.insert(node.nodehost.clone(), role);
-    }
-
-    if desired_role_by_host.is_empty() {
-        return;
-    }
-
     for m in members {
-        // Skip the monitor — pg_auto_failover doesn't manage its own role.
-        if ClusterRole::from_str(&m.role).ok() == Some(ClusterRole::Monitor) {
-            continue;
-        }
-
-        // Find this member in the monitor view by underlay IP first,
-        // then FQDN fallback. Either may be set depending on how the
-        // member was originally registered.
-        let mut desired: Option<ClusterRole> = None;
-        if let Some(node_id) = m.node_id {
-            if let Ok(Some(n)) = temps_entities::nodes::Entity::find_by_id(node_id)
-                .one(db)
-                .await
-            {
-                desired = desired_role_by_host.get(&n.private_address).copied();
-            }
-        }
-        if desired.is_none() {
-            if let Some(host) = m.hostname.as_deref() {
-                desired = desired_role_by_host.get(host).copied();
-            }
-        }
-
-        let Some(new_role) = desired else { continue };
-        if m.role == new_role.as_str() {
+        // Only touch rows that still carry the legacy `primary` value.
+        // Anything else is left alone — `replica`, `monitor`, and any
+        // unknown future role are valid stored states.
+        if m.role != "primary" {
             continue;
         }
 
@@ -425,20 +385,18 @@ async fn sync_member_roles(
             service_id,
             member_id = m.id,
             container = %m.container_name,
-            old_role = %m.role,
-            new_role = %new_role,
-            "Syncing member role from pg_auto_failover monitor"
+            "Demoting legacy 'primary' role to 'replica' — runtime role now lives in live_state"
         );
 
         let mut active: temps_entities::service_members::ActiveModel = m.clone().into();
-        active.role = Set(new_role.as_str().to_string());
+        active.role = Set("replica".to_string());
         active.updated_at = Set(chrono::Utc::now());
         if let Err(e) = active.update(db).await {
             warn!(
                 service_id,
                 member_id = m.id,
                 error = %e,
-                "Failed to write synced role; will retry next tick"
+                "Failed to demote legacy primary; will retry next tick"
             );
         }
     }

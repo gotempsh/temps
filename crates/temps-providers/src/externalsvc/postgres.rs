@@ -909,7 +909,7 @@ impl PostgresService {
         Ok(())
     }
 
-    fn normalize_database_name(name: &str) -> String {
+    pub(crate) fn normalize_database_name(name: &str) -> String {
         let normalized = name
             .to_lowercase()
             .chars()
