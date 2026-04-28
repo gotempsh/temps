@@ -81,48 +81,46 @@ impl TempsPlugin for KvPlugin {
         context: &'a PluginContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            debug!("Initializing KV plugin services...");
+            debug!("Initializing KV plugin services (deferred to background)...");
 
-            // Get the RedisService and ExternalServiceManager from context
+            // Container start is deferred to a background task so plugin
+            // initialization (and thus console API readiness) doesn't block
+            // on Docker pull/start. KV requests will fail until the
+            // container is up — that's identical to the previous behavior,
+            // just surfaced sooner.
             let redis_service = context.require_service::<RedisService>();
             let external_service_manager = context.require_service::<ExternalServiceManager>();
 
-            // Try to load the temps-kv service configuration from the database
-            match external_service_manager
-                .get_service_by_name(KV_REDIS_SERVICE_NAME)
-                .await
-            {
-                Ok(service_model) => {
-                    // Check if service is stopped - don't initialize in that case
-                    if service_model.status == "stopped" {
+            tokio::spawn(async move {
+                match external_service_manager
+                    .get_service_by_name(KV_REDIS_SERVICE_NAME)
+                    .await
+                {
+                    Ok(service_model) => {
+                        if service_model.status == "stopped" {
+                            info!(
+                                "KV service '{}' is stopped, skipping initialization. \
+                                 Enable the service via the API to use it.",
+                                KV_REDIS_SERVICE_NAME
+                            );
+                            return;
+                        }
+
                         info!(
-                            "KV service '{}' is stopped, skipping initialization. \
-                             Enable the service via the API to use it.",
-                            KV_REDIS_SERVICE_NAME
+                            "Found KV service '{}' in database (id: {}, status: {}), loading configuration...",
+                            KV_REDIS_SERVICE_NAME, service_model.id, service_model.status
                         );
-                        return Ok(());
-                    }
 
-                    info!(
-                        "Found KV service '{}' in database (id: {}, status: {}), loading configuration...",
-                        KV_REDIS_SERVICE_NAME, service_model.id, service_model.status
-                    );
-
-                    // Get the full service config (with decrypted parameters)
-                    match external_service_manager
-                        .get_service_config(service_model.id)
-                        .await
-                    {
-                        Ok(service_config) => {
-                            // Initialize the RedisService with the config from database
-                            match redis_service.init(service_config).await {
+                        match external_service_manager
+                            .get_service_config(service_model.id)
+                            .await
+                        {
+                            Ok(service_config) => match redis_service.init(service_config).await {
                                 Ok(_) => {
                                     info!(
                                         "KV Redis service '{}' initialized successfully from database config",
                                         KV_REDIS_SERVICE_NAME
                                     );
-
-                                    // Start the Redis container if not already running
                                     if let Err(e) = redis_service.start().await {
                                         warn!(
                                             "Failed to start KV Redis container (may already be running): {}",
@@ -137,25 +135,25 @@ impl TempsPlugin for KvPlugin {
                                         e
                                     );
                                 }
+                            },
+                            Err(e) => {
+                                warn!(
+                                    "Failed to get KV service config from database: {}. \
+                                     The service may need to be recreated.",
+                                    e
+                                );
                             }
                         }
-                        Err(e) => {
-                            warn!(
-                                "Failed to get KV service config from database: {}. \
-                                 The service may need to be recreated.",
-                                e
-                            );
-                        }
+                    }
+                    Err(_) => {
+                        debug!(
+                            "KV service '{}' not found in database. \
+                             It will be created when first accessed via the API.",
+                            KV_REDIS_SERVICE_NAME
+                        );
                     }
                 }
-                Err(_) => {
-                    debug!(
-                        "KV service '{}' not found in database. \
-                         It will be created when first accessed via the API.",
-                        KV_REDIS_SERVICE_NAME
-                    );
-                }
-            }
+            });
 
             Ok(())
         })

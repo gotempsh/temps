@@ -31,6 +31,70 @@ pub struct ExternalPluginsService {
 }
 
 impl ExternalPluginsService {
+    /// Create a "shell" service with no discovered plugins yet.
+    ///
+    /// This returns immediately — plugin discovery (which can take up to
+    /// `handshake_timeout` per binary) does not run. Call
+    /// [`start_background_discovery`](Self::start_background_discovery) on
+    /// the resulting `Arc<Self>` to populate manifests and the proxy router
+    /// in a background task. Until that task completes, proxied requests
+    /// for `/x/<plugin>/...` will 404, which is the same outcome as the
+    /// plugin never having been started.
+    pub fn new_empty(
+        config: ExternalPluginConfig,
+        queue: Option<Arc<dyn JobQueue>>,
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> Self {
+        let manager = Arc::new(ExternalPluginManager::new(config, db));
+        Self {
+            manager,
+            manifests: RwLock::new(Vec::new()),
+            event_listener: RwLock::new(None),
+            queue,
+            proxy_router: Arc::new(RwLock::new(Router::new())),
+        }
+    }
+
+    /// Spawn a background task that runs initial plugin discovery + start,
+    /// then swaps the resulting proxy router in. Safe to call once on a
+    /// freshly-constructed shell from [`new_empty`](Self::new_empty).
+    pub fn start_background_discovery(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let manifests = self.manager.discover_and_start().await;
+
+            if !manifests.is_empty() {
+                info!(
+                    "Loaded {} external plugin(s) in background: {}",
+                    manifests.len(),
+                    manifests
+                        .iter()
+                        .map(|m| m.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            } else {
+                debug!("No external plugins discovered (background)");
+            }
+
+            let new_listener =
+                Self::start_event_listener(&self.manager, &manifests, self.queue.as_ref()).await;
+            let new_router = Self::build_proxy_router_from(&self.manager, &manifests).await;
+
+            {
+                let mut router = self.proxy_router.write().await;
+                *router = new_router;
+            }
+            {
+                let mut listener = self.event_listener.write().await;
+                *listener = new_listener;
+            }
+            {
+                let mut cached = self.manifests.write().await;
+                *cached = manifests;
+            }
+        });
+    }
+
     /// Create the service and immediately discover + start all plugins.
     ///
     /// If a `JobQueue` is provided and any discovered plugins subscribe to

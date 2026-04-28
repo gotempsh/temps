@@ -176,30 +176,42 @@ impl TempsPlugin for WorkspacePlugin {
             // and loses Claude's on-disk session state (the jsonl). With
             // adoption, containers survive restarts and --continue still
             // works afterward.
+            //
+            // This is deferred to a background task: each adoption issues a
+            // sequential Docker inspect, and N active sessions blocks plugin
+            // init for N round-trips. A reopened session that arrives before
+            // adoption finishes will re-adopt synchronously on first use, so
+            // there is no correctness loss.
             if let Some(session_manager) = context.get_service::<WorkspaceSessionManager>() {
-                match workspace_service.list_active_sessions_with_project().await {
-                    Ok(rows) => {
-                        let mut adopted = 0usize;
-                        for (session_id, project_id) in rows {
-                            match session_manager.adopt_existing(session_id, project_id).await {
-                                Ok(true) => adopted += 1,
-                                Ok(false) => {}
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to adopt sandbox for session {}: {}",
-                                        session_id, e
-                                    );
+                let adopt_workspace = workspace_service.clone();
+                tokio::spawn(async move {
+                    match adopt_workspace.list_active_sessions_with_project().await {
+                        Ok(rows) => {
+                            let mut adopted = 0usize;
+                            for (session_id, project_id) in rows {
+                                match session_manager.adopt_existing(session_id, project_id).await {
+                                    Ok(true) => adopted += 1,
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to adopt sandbox for session {}: {}",
+                                            session_id, e
+                                        );
+                                    }
                                 }
                             }
+                            if adopted > 0 {
+                                info!(
+                                    "Adopted {} existing sandbox containers on startup (background)",
+                                    adopted
+                                );
+                            }
                         }
-                        if adopted > 0 {
-                            info!("Adopted {} existing sandbox containers on startup", adopted);
+                        Err(e) => {
+                            warn!("Failed to list active sessions for adoption: {}", e);
                         }
                     }
-                    Err(e) => {
-                        warn!("Failed to list active sessions for adoption: {}", e);
-                    }
-                }
+                });
             }
 
             // Mark reconciled sessions as dirty so the next message

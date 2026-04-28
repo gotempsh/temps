@@ -75,48 +75,46 @@ impl TempsPlugin for BlobPlugin {
         context: &'a PluginContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
-            debug!("Initializing Blob plugin services...");
+            debug!("Initializing Blob plugin services (deferred to background)...");
 
-            // Get the RustfsService and ExternalServiceManager from context
+            // Container start is deferred to a background task so plugin
+            // initialization (and thus console API readiness) doesn't block
+            // on Docker pull/start. Until the container is up, blob requests
+            // will return errors — that's the same behavior as before, just
+            // surfaced sooner.
             let rustfs_service = context.require_service::<RustfsService>();
             let external_service_manager = context.require_service::<ExternalServiceManager>();
 
-            // Try to load the temps-blob service configuration from the database
-            match external_service_manager
-                .get_service_by_name(BLOB_RUSTFS_SERVICE_NAME)
-                .await
-            {
-                Ok(service_model) => {
-                    // Check if service is stopped - don't initialize in that case
-                    if service_model.status == "stopped" {
+            tokio::spawn(async move {
+                match external_service_manager
+                    .get_service_by_name(BLOB_RUSTFS_SERVICE_NAME)
+                    .await
+                {
+                    Ok(service_model) => {
+                        if service_model.status == "stopped" {
+                            info!(
+                                "Blob service '{}' is stopped, skipping initialization. \
+                                 Enable the service via the API to use it.",
+                                BLOB_RUSTFS_SERVICE_NAME
+                            );
+                            return;
+                        }
+
                         info!(
-                            "Blob service '{}' is stopped, skipping initialization. \
-                             Enable the service via the API to use it.",
-                            BLOB_RUSTFS_SERVICE_NAME
+                            "Found Blob service '{}' in database (id: {}, status: {}), loading configuration...",
+                            BLOB_RUSTFS_SERVICE_NAME, service_model.id, service_model.status
                         );
-                        return Ok(());
-                    }
 
-                    info!(
-                        "Found Blob service '{}' in database (id: {}, status: {}), loading configuration...",
-                        BLOB_RUSTFS_SERVICE_NAME, service_model.id, service_model.status
-                    );
-
-                    // Get the full service config (with decrypted parameters)
-                    match external_service_manager
-                        .get_service_config(service_model.id)
-                        .await
-                    {
-                        Ok(service_config) => {
-                            // Initialize the RustfsService with the config from database
-                            match rustfs_service.init(service_config).await {
+                        match external_service_manager
+                            .get_service_config(service_model.id)
+                            .await
+                        {
+                            Ok(service_config) => match rustfs_service.init(service_config).await {
                                 Ok(_) => {
                                     info!(
                                         "Blob RustFS service '{}' initialized successfully from database config",
                                         BLOB_RUSTFS_SERVICE_NAME
                                     );
-
-                                    // Start the RustFS container if not already running
                                     if let Err(e) = rustfs_service.start().await {
                                         warn!(
                                             "Failed to start Blob RustFS container (may already be running): {}",
@@ -131,25 +129,25 @@ impl TempsPlugin for BlobPlugin {
                                         e
                                     );
                                 }
+                            },
+                            Err(e) => {
+                                warn!(
+                                    "Failed to get Blob service config from database: {}. \
+                                     The service may need to be recreated.",
+                                    e
+                                );
                             }
                         }
-                        Err(e) => {
-                            warn!(
-                                "Failed to get Blob service config from database: {}. \
-                                 The service may need to be recreated.",
-                                e
-                            );
-                        }
+                    }
+                    Err(_) => {
+                        debug!(
+                            "Blob service '{}' not found in database. \
+                             It will be created when first accessed via the API.",
+                            BLOB_RUSTFS_SERVICE_NAME
+                        );
                     }
                 }
-                Err(_) => {
-                    debug!(
-                        "Blob service '{}' not found in database. \
-                         It will be created when first accessed via the API.",
-                        BLOB_RUSTFS_SERVICE_NAME
-                    );
-                }
-            }
+            });
 
             Ok(())
         })

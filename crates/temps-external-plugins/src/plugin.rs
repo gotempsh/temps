@@ -66,14 +66,24 @@ impl TempsPlugin for ExternalPluginsPlugin {
             // Get the database connection for the platform channel.
             let db = context.require_service::<sea_orm::DatabaseConnection>();
 
-            // Create the service — this discovers and starts all external plugins,
-            // and starts the event listener if plugins subscribe to events.
-            let service =
-                Arc::new(ExternalPluginsService::new(self.config.clone(), queue, db).await);
+            // Create an empty service shell — does NOT discover/start plugins.
+            // Discovery is deferred to a background task because the
+            // per-plugin handshake timeout (default 30s) would otherwise
+            // block the console API from coming up.
+            let service = Arc::new(ExternalPluginsService::new_empty(
+                self.config.clone(),
+                queue,
+                db,
+            ));
 
-            // Get the swappable router reference. On reload, the service writes
-            // a new Router into this Arc<RwLock<Router>> and subsequent requests
-            // pick it up immediately.
+            // Kick off discovery + start in the background. When it
+            // completes, the shared proxy router is swapped in and
+            // `/x/<plugin>/...` routes start working.
+            service.clone().start_background_discovery();
+
+            // Get the swappable router reference. The router is empty now
+            // and gets populated in-place once background discovery
+            // finishes — same swap mechanism used by /x/plugins/reload.
             let dynamic_router = service.proxy_router();
 
             // Register the handler app state
@@ -81,12 +91,16 @@ impl TempsPlugin for ExternalPluginsPlugin {
                 service: service.clone(),
             });
 
-            // Cache the OpenAPI schemas synchronously so they are available when
-            // the synchronous openapi_schema() trait method is called later.
-            let schemas = service.manager().openapi_schemas().await;
+            // External plugin OpenAPI schemas would normally be merged into
+            // the unified spec at startup. Since discovery now runs in the
+            // background, no plugin schemas are available yet — the spec
+            // will only include external plugins after a `/x/plugins/reload`
+            // call. This trades a more complete first-render spec for a
+            // dramatically faster boot, which is the right call when the
+            // common case is "no external plugins installed".
             {
                 let mut cache = self.cached_schemas.lock().unwrap();
-                *cache = Some(schemas);
+                *cache = Some(Vec::new());
             }
 
             context.register_service(service);
@@ -95,7 +109,9 @@ impl TempsPlugin for ExternalPluginsPlugin {
                 inner: dynamic_router,
             }));
 
-            tracing::debug!("External plugins services registered successfully");
+            tracing::debug!(
+                "External plugins service registered (discovery running in background)"
+            );
             Ok(())
         })
     }

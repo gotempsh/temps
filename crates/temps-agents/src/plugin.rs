@@ -428,7 +428,13 @@ impl TempsPlugin for AgentsPlugin {
                     .unwrap_or_default()
             };
 
-            // Set up sandbox provider: try Docker first, fall back to local
+            // Set up sandbox provider: try Docker first, fall back to local.
+            //
+            // Image pre-build is intentionally deferred to a background task
+            // so the console API doesn't block on a Docker Hub pull (which
+            // can take minutes on first boot or slow networks). The provider
+            // is fully usable without a pre-built image — it will be built
+            // lazily on the first agent run if the warm-up hasn't finished.
             let sandbox_provider: Arc<dyn SandboxProvider> =
                 match bollard::Docker::connect_with_local_defaults() {
                     Ok(docker) => {
@@ -442,17 +448,23 @@ impl TempsPlugin for AgentsPlugin {
                                     default_memory_limit_mb: global_sandbox.memory_limit_mb,
                                     network_mode: global_sandbox.network_mode.clone(),
                                 };
-                                let provider = DockerSandboxProvider::new(docker, config);
-                                if let Err(e) = provider.ensure_image().await {
-                                    tracing::warn!(
-                                        "Failed to pre-build sandbox image: {} — \
-                                         Docker is available so the provider is still \
-                                         usable; image will be rebuilt on first agent run",
-                                        e
-                                    );
-                                }
-                                tracing::info!("Docker sandbox provider initialized");
-                                Arc::new(provider)
+                                let provider = Arc::new(DockerSandboxProvider::new(docker, config));
+                                let warmup = provider.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = warmup.ensure_image().await {
+                                        tracing::warn!(
+                                            "Background sandbox image warm-up failed: {} — \
+                                             image will be built on first agent run",
+                                            e
+                                        );
+                                    } else {
+                                        tracing::debug!("Sandbox image warm-up complete");
+                                    }
+                                });
+                                tracing::info!(
+                                    "Docker sandbox provider initialized (image warm-up running in background)"
+                                );
+                                provider as Arc<dyn SandboxProvider>
                             }
                             Err(e) => {
                                 tracing::warn!("Docker not responding, using local sandbox: {}", e);
