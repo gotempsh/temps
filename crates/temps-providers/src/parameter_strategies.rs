@@ -1,6 +1,103 @@
 use serde_json::{json, Value as JsonValue};
 use std::collections::HashMap;
 
+// ─────────────────────────────────────────────────────────────────────
+// Credential validators (defense in depth)
+//
+// These guard the boundary between user-supplied input and the bash
+// scripts + psql `-d`/`-U` invocations that postgres_cluster.rs and
+// services.rs build. The actual scripts use parameter binding where
+// they can, but two paths are unsafe by design:
+//
+//   1. `node_command` interpolates `${POSTGRES_USER}` and
+//      `${POSTGRES_PASSWORD}` into a SQL heredoc via shell variable
+//      expansion. A password containing `'` breaks the SQL; a crafted
+//      password ("'; ALTER ROLE postgres SUPERUSER PASSWORD 'pwn'; --")
+//      injects DDL.
+//   2. `enable_cluster_wal_archiving` calls `psql -d <database>`.
+//      libpq treats `-d` values containing `=` as a connstring (not a
+//      database name), so `database = "host=evil.com user=postgres"`
+//      is a connection redirect.
+//
+// The cleanest fix would be parameter binding everywhere. That's a
+// bigger refactor; this validator is the wide net that catches the
+// payloads that exploit those holes today.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Match a Postgres SQL identifier: starts with letter/underscore, then
+/// letters/digits/underscores, max 63 bytes (Postgres `NAMEDATALEN-1`).
+/// Deliberately stricter than what Postgres accepts (no quoting, no
+/// dots, no `=`) so we never have to worry about libpq parsing the
+/// value as a connstring or the bash scripts breaking on edge cases.
+fn is_valid_pg_identifier(s: &str) -> bool {
+    if s.is_empty() || s.len() > 63 {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().expect("non-empty checked above");
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Reject characters that break the bash heredoc + SQL literal that
+/// `node_command` builds:
+///   - `'` and `\\` would terminate the SQL string literal early
+///   - `\0` is rejected by libpq anyway and corrupts shell strings
+///   - newlines could close a heredoc on certain inputs
+///   - `$` triggers shell expansion inside the bash script
+///
+/// We do allow most printable special characters so users can pick
+/// strong passwords (e.g. `!@#%^&*()_+-=[]{}|:,./?`). Auto-generated
+/// passwords stay base64url-safe so they pass trivially.
+fn is_valid_pg_password(s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Err("password cannot be empty".to_string());
+    }
+    if s.len() > 256 {
+        return Err("password too long (max 256 characters)".to_string());
+    }
+    for (i, c) in s.chars().enumerate() {
+        match c {
+            '\'' => return Err(format!("password contains a single quote at position {} — choose a password without ' or \\", i)),
+            '\\' => return Err(format!("password contains a backslash at position {} — choose a password without ' or \\", i)),
+            '\0' => return Err("password contains a null byte".to_string()),
+            '\n' | '\r' => return Err("password contains a newline".to_string()),
+            '$' => return Err(format!("password contains '$' at position {} — disallowed because the cluster startup script uses shell expansion", i)),
+            c if c.is_control() => return Err(format!("password contains control character (U+{:04X}) at position {}", c as u32, i)),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Strict validator for the `username` and `database` params on
+/// Postgres services (standalone and cluster). See module-level
+/// rationale.
+fn validate_postgres_credentials(params: &HashMap<String, JsonValue>) -> Result<(), String> {
+    if let Some(JsonValue::String(user)) = params.get("username") {
+        if !is_valid_pg_identifier(user) {
+            return Err(format!(
+                "invalid 'username' {:?}: must match ^[A-Za-z_][A-Za-z0-9_]{{0,62}}$ (Postgres identifier rules; we deliberately reject quoted/dotted names to keep the cluster startup script and psql -U safe)",
+                user
+            ));
+        }
+    }
+    if let Some(JsonValue::String(db)) = params.get("database") {
+        if !is_valid_pg_identifier(db) {
+            return Err(format!(
+                "invalid 'database' {:?}: must match ^[A-Za-z_][A-Za-z0-9_]{{0,62}}$ — values containing '=' would be parsed by libpq as a connstring, redirecting psql to a different host",
+                db
+            ));
+        }
+    }
+    if let Some(JsonValue::String(pw)) = params.get("password") {
+        is_valid_pg_password(pw).map_err(|reason| format!("invalid 'password': {}", reason))?;
+    }
+    Ok(())
+}
+
 /// Strategy for validating and managing parameters for a specific service type
 pub trait ParameterStrategy: Send + Sync {
     /// Validate parameters for service creation - ensures all required parameters are present
@@ -43,7 +140,10 @@ impl ParameterStrategy for PostgresParameterStrategy {
         if !params.contains_key("username") || is_empty_value(params.get("username")) {
             return Err("'username' is required for PostgreSQL".to_string());
         }
-        // Password is optional - will be auto-generated if not provided
+        // Password is optional - will be auto-generated if not provided.
+        // When supplied, validate it can't break the cluster startup
+        // script or be parsed as a libpq connstring (see module docs).
+        validate_postgres_credentials(params)?;
         Ok(())
     }
 
@@ -1022,5 +1122,131 @@ mod tests {
             existing.get("docker_image").and_then(|v| v.as_str()),
             Some("gotempsh/postgres-walg:18-bookworm")
         );
+    }
+
+    // ─── credential validators ─────────────────────────────────────
+
+    fn pg_params(user: &str, db: &str, password: Option<&str>) -> HashMap<String, JsonValue> {
+        let mut p = HashMap::new();
+        p.insert("username".to_string(), JsonValue::String(user.to_string()));
+        p.insert("database".to_string(), JsonValue::String(db.to_string()));
+        if let Some(pw) = password {
+            p.insert("password".to_string(), JsonValue::String(pw.to_string()));
+        }
+        p
+    }
+
+    #[test]
+    fn pg_identifier_accepts_normal_names() {
+        for ok in ["postgres", "my_app", "Foo", "_underscore", "x", "a1b2c3"] {
+            assert!(is_valid_pg_identifier(ok), "{ok} should be valid");
+        }
+    }
+
+    #[test]
+    fn pg_identifier_rejects_dangerous_chars() {
+        for bad in [
+            "",
+            "1starts_with_digit",
+            "has space",
+            "has-dash",
+            "has.dot",
+            "has=equals", // libpq would parse as connstring
+            "has;semi",
+            "has'quote",
+            "has\"quote",
+            "drop table foo",
+            "host=evil.com user=postgres",
+        ] {
+            assert!(!is_valid_pg_identifier(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn pg_identifier_rejects_too_long() {
+        let too_long = "a".repeat(64);
+        assert!(!is_valid_pg_identifier(&too_long));
+        let just_right = "a".repeat(63);
+        assert!(is_valid_pg_identifier(&just_right));
+    }
+
+    #[test]
+    fn pg_password_accepts_strong_passwords() {
+        for ok in [
+            "p@ssw0rd!",
+            "Tr0ub4dor&3",
+            "correct horse battery staple",
+            "AbCdEf123!@#%^&*()-+=[]{}|:,.<>/?~`",
+            "πιοθβ", // unicode is fine
+        ] {
+            assert!(
+                is_valid_pg_password(ok).is_ok(),
+                "{ok:?} should be accepted, got {:?}",
+                is_valid_pg_password(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn pg_password_rejects_sql_injection_payloads() {
+        for bad in [
+            "",
+            "has'quote",
+            "has\\backslash",
+            "has\nnewline",
+            "has\0null",
+            "has$dollar",
+            "'; DROP TABLE pg_authid; --",
+            "x'; ALTER ROLE postgres SUPERUSER PASSWORD 'pwn'; --",
+        ] {
+            assert!(
+                is_valid_pg_password(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_credentials_accepts_clean_input() {
+        let ok = pg_params("postgres", "myapp", Some("safe_password_123!"));
+        assert!(validate_postgres_credentials(&ok).is_ok());
+    }
+
+    #[test]
+    fn validate_credentials_rejects_libpq_redirect_in_database() {
+        // psql -d "host=evil.com user=postgres" → libpq parses as connstring
+        let bad = pg_params("postgres", "host=evil.com user=postgres", None);
+        let err = validate_postgres_credentials(&bad).unwrap_err();
+        assert!(err.contains("database"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_credentials_rejects_sql_injection_in_password() {
+        let bad = pg_params(
+            "postgres",
+            "myapp",
+            Some("x'; ALTER ROLE postgres SUPERUSER PASSWORD 'pwn'; --"),
+        );
+        let err = validate_postgres_credentials(&bad).unwrap_err();
+        assert!(err.contains("password"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_credentials_rejects_quoted_username() {
+        let bad = pg_params("evil\"user", "myapp", None);
+        let err = validate_postgres_credentials(&bad).unwrap_err();
+        assert!(err.contains("username"), "got: {err}");
+    }
+
+    #[test]
+    fn postgres_strategy_full_creation_validation() {
+        // End-to-end: validate_for_creation must fail on a bad password
+        // even when database+username are otherwise fine.
+        let strategy = PostgresParameterStrategy;
+        let bad = pg_params("postgres", "myapp", Some("with'quote"));
+        assert!(strategy.validate_for_creation(&bad).is_err());
+
+        let ok = pg_params("postgres", "myapp", Some("strong_password_456!"));
+        assert!(strategy.validate_for_creation(&ok).is_ok());
     }
 }
