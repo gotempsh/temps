@@ -35,6 +35,28 @@ pub struct DockerRuntime {
     /// that's the legitimate "overlay not yet bootstrapped on this node"
     /// state, not an error. Set via [`Self::with_overlay_network`].
     overlay_network: Option<String>,
+    /// Static resolvers to write into each new container's
+    /// `/etc/resolv.conf`. Use [`Self::with_dns_servers`] for tests or
+    /// fixed-IP setups; in the live agent we use
+    /// [`Self::with_overlay_dns_slot`] instead, which reads the bridge
+    /// IP dynamically from the network_sync loop's shared slot (the
+    /// bridge IP isn't known until the overlay has bootstrapped).
+    dns_servers: Vec<String>,
+    /// Optional dynamic DNS slot — populated by the agent's
+    /// `network_sync` loop after the overlay bridge is up. Read on
+    /// every `deploy_container` so containers booted after the
+    /// overlay is up get the per-node Hickory resolver wired in. The
+    /// static `dns_servers` field takes precedence when both are set.
+    overlay_dns_slot: Option<Arc<std::sync::RwLock<Option<std::net::IpAddr>>>>,
+    /// Shared snapshot of overlay peers, refreshed by the agent's
+    /// `network_sync` loop. After dual-attaching a container to the
+    /// overlay, we install one route per peer inside the container's
+    /// netns so traffic for *other* workers' overlay /24s leaves
+    /// through the overlay interface (eth1) rather than falling
+    /// through the container's default route on the primary network.
+    /// Wrapped in `Option` so non-overlay deployers (e.g. tests) can
+    /// skip the wiring entirely.
+    overlay_peers: Option<Arc<std::sync::RwLock<Vec<temps_network::Peer>>>>,
 }
 
 impl DockerRuntime {
@@ -103,7 +125,47 @@ impl DockerRuntime {
             network_name,
             host_bind_address: "127.0.0.1".to_string(),
             overlay_network: None,
+            dns_servers: Vec::new(),
+            overlay_dns_slot: None,
+            overlay_peers: None,
         }
+    }
+
+    /// Read the per-node Hickory resolver IP from a shared slot
+    /// populated by the agent's `network_sync` loop after the overlay
+    /// bridge is up. Required for app containers to resolve
+    /// `*.temps.local` (cluster member FQDNs, service VIPs).
+    pub fn with_overlay_dns_slot(
+        mut self,
+        slot: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+    ) -> Self {
+        self.overlay_dns_slot = Some(slot);
+        self
+    }
+
+    /// Wire the agent's shared peer-list snapshot into the deployer.
+    /// Used after `connect_network` to add per-peer routes inside the
+    /// container's netns so cross-worker overlay traffic actually
+    /// flows. Without this, containers can dial peers in their own /24
+    /// but anything in a peer worker's /24 falls through to the
+    /// primary network and gets dropped at iptables.
+    pub fn with_overlay_peers(
+        mut self,
+        peers: Arc<std::sync::RwLock<Vec<temps_network::Peer>>>,
+    ) -> Self {
+        self.overlay_peers = Some(peers);
+        self
+    }
+
+    /// Configure resolvers (typically the per-node Hickory bridge IP) to
+    /// write into every new container's `/etc/resolv.conf`. Without this
+    /// containers default to Docker's embedded DNS at 127.0.0.11, which
+    /// only knows other containers on the same Docker network — it can't
+    /// resolve `*.temps.local` cluster FQDNs. Setting this aligns the
+    /// app-deploy path with the service-deploy path on the agent.
+    pub fn with_dns_servers(mut self, servers: Vec<String>) -> Self {
+        self.dns_servers = servers;
+        self
     }
 
     /// Set the host bind address for container port mappings.
@@ -179,6 +241,77 @@ impl DockerRuntime {
                 overlay, e
             ))),
         }
+    }
+
+    /// Install per-peer routes inside the container's netns. Must be
+    /// called **after** the container is started — `docker inspect`
+    /// only reports a non-zero PID for a running container, and we
+    /// need that PID to `nsenter` into its network namespace.
+    ///
+    /// Best-effort: any failure is logged and swallowed so a flaky
+    /// route install doesn't break the deploy.
+    pub async fn install_overlay_peer_routes(&self, container_id: &str) {
+        let Some(overlay) = self.overlay_network.as_deref() else {
+            return;
+        };
+        if let Err(e) = self
+            .install_overlay_peer_routes_inner(container_id, overlay)
+            .await
+        {
+            tracing::warn!(
+                container = %container_id,
+                overlay,
+                error = %e,
+                "Failed to install overlay peer routes; cross-worker traffic to other CIDRs will fall through the primary network and be dropped"
+            );
+        }
+    }
+
+    async fn install_overlay_peer_routes_inner(
+        &self,
+        container_id: &str,
+        overlay: &str,
+    ) -> Result<(), String> {
+        let Some(shared) = self.overlay_peers.as_ref() else {
+            return Ok(());
+        };
+        let peers = shared.read().map(|guard| guard.clone()).unwrap_or_default();
+        if peers.is_empty() {
+            return Ok(());
+        }
+
+        let inspect = self
+            .docker
+            .inspect_container(
+                container_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+            .map_err(|e| format!("inspect_container: {}", e))?;
+
+        let pid = inspect
+            .state
+            .as_ref()
+            .and_then(|s| s.pid)
+            .filter(|p| *p > 0)
+            .ok_or_else(|| "container PID not yet available".to_string())? as i32;
+
+        let gateway = inspect
+            .network_settings
+            .as_ref()
+            .and_then(|ns| ns.networks.as_ref())
+            .and_then(|nets| nets.get(overlay))
+            .and_then(|net| net.gateway.clone())
+            .filter(|g| !g.is_empty())
+            .ok_or_else(|| format!("no gateway recorded for overlay '{}' on container", overlay))?;
+
+        // Convention: Docker assigns interface names in attach order.
+        // Primary network = eth0, overlay attach = eth1.
+        temps_network::overlay_routes::install_peer_routes_in_container(
+            pid, "eth1", &gateway, &peers,
+        )
+        .await
+        .map_err(|e| e.to_string())
     }
 
     pub async fn ensure_network_exists(&self) -> Result<(), DeployerError> {
@@ -1114,9 +1247,29 @@ impl ContainerDeployer for DockerRuntime {
             Some(format!("{}:/run/secrets:ro", host_dir.display()))
         };
 
+        // Wire the per-node Hickory resolver into the container's resolv.conf
+        // when configured. Without this, containers default to Docker's
+        // embedded DNS at 127.0.0.11, which can resolve names of other
+        // containers on the same Docker network but NOT `*.temps.local`
+        // cluster FQDNs that apps need to dial postgres-cluster members.
+        //
+        // Static `dns_servers` wins when set (test/manual setups);
+        // otherwise read the dynamic slot the agent's network_sync
+        // loop publishes after the overlay bridge is up.
+        let dns_for_container: Option<Vec<String>> = if !self.dns_servers.is_empty() {
+            Some(self.dns_servers.clone())
+        } else if let Some(slot) = self.overlay_dns_slot.as_ref() {
+            slot.read()
+                .ok()
+                .and_then(|guard| guard.map(|ip| vec![ip.to_string()]))
+        } else {
+            None
+        };
+
         let host_config = bollard::models::HostConfig {
             port_bindings: Some(port_bindings),
             network_mode: Some(self.network_name.clone()),
+            dns: dns_for_container,
             restart_policy: Some(bollard::models::RestartPolicy {
                 name: Some(Self::map_restart_policy(&request.restart_policy)),
                 ..Default::default()
@@ -1196,6 +1349,12 @@ impl ContainerDeployer for DockerRuntime {
             .map_err(|e| {
                 DeployerError::DeploymentFailed(format!("Failed to start container: {}", e))
             })?;
+
+        // Install overlay peer routes inside the container's netns.
+        // Must run *after* start_container — `docker inspect` only
+        // reports a non-zero PID for a running container, and route
+        // injection uses `nsenter -t <pid> -n ip route ...`.
+        self.install_overlay_peer_routes(&container.id).await;
 
         // Get the first port mapping for the result
         let (container_port, requested_host_port) = request

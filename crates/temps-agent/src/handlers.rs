@@ -40,6 +40,11 @@ pub struct AgentState {
     /// `None` on single-host setups (the overlay never came up); the
     /// container-create path falls back to Docker's default DNS.
     pub overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+    /// Latest peer list from the control plane, refreshed by
+    /// `network_sync`. Read by overlay-attach handlers to install
+    /// per-peer routes inside each new container's netns. Empty until
+    /// the first successful network/peers poll.
+    pub overlay_peers: crate::network_sync::SharedPeers,
 }
 
 /// Response wrapper for consistent agent API responses.

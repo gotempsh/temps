@@ -223,7 +223,7 @@ services:
       CONTROL_PLANE_URL: http://10.42.0.10:80
       TEMPS_LOG_LEVEL: info
       TEMPS_NETWORK_NAME: temps-app-network
-      TEMPS_OVERLAY_NETWORK: temps-overlay
+      TEMPS_OVERLAY_NETWORK: temps0
       TEMPS_AGENT_ADDRESS: 0.0.0.0:3100
     volumes:
       - ../../:/workspace:rw
@@ -255,7 +255,7 @@ services:
       CONTROL_PLANE_URL: http://10.42.0.10:80
       TEMPS_LOG_LEVEL: info
       TEMPS_NETWORK_NAME: temps-app-network
-      TEMPS_OVERLAY_NETWORK: temps-overlay
+      TEMPS_OVERLAY_NETWORK: temps0
       TEMPS_AGENT_ADDRESS: 0.0.0.0:3100
     volumes:
       - ../../:/workspace:rw
@@ -283,7 +283,7 @@ services:
       CONTROL_PLANE_URL: http://10.42.0.10:80
       TEMPS_LOG_LEVEL: info
       TEMPS_NETWORK_NAME: temps-app-network
-      TEMPS_OVERLAY_NETWORK: temps-overlay
+      TEMPS_OVERLAY_NETWORK: temps0
       TEMPS_AGENT_ADDRESS: 0.0.0.0:3100
     volumes:
       - ../../:/workspace:rw

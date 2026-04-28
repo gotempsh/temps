@@ -36,6 +36,7 @@ temps-database = { path = "../temps-database" }
 temps-deployer = { path = "../temps-deployer" }
 temps-deployments = { path = "../temps-deployments" }
 temps-dns = { path = "../temps-dns" }
+temps-network = { path = "../temps-network" }
 temps-domains = { path = "../temps-domains" }
 temps-email = { path = "../temps-email" }
 temps-entities = { path = "../temps-entities" }

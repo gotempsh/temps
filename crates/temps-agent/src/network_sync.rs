@@ -65,6 +65,13 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// briefly down, etc.).
 const BACKOFF_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Shared snapshot of the peer list, refreshed by the sync loop on
+/// every successful poll. Container-attach paths read it to install
+/// per-peer routes inside the container's netns (without these,
+/// outbound traffic to other workers' overlay /24s falls through the
+/// container's default route on the primary network and gets dropped).
+pub type SharedPeers = Arc<std::sync::RwLock<Vec<Peer>>>;
+
 /// Spawn the network-sync background task. Returns immediately; the task
 /// owns its own retry loop and never blocks server startup.
 ///
@@ -72,10 +79,17 @@ const BACKOFF_INTERVAL: Duration = Duration::from_secs(5);
 /// bootstraps. The container-create path (`service_handlers.rs`) reads
 /// it to set `--dns=<bridge_ip>` on every container so they can resolve
 /// `*.temps.local` natively via the per-node Hickory resolver.
-pub fn spawn(config: &AgentConfig, overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>) {
+///
+/// `peers` is refreshed on every poll. Both shared slots live for the
+/// agent's process lifetime.
+pub fn spawn(
+    config: &AgentConfig,
+    overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>,
+    peers: SharedPeers,
+) {
     let cfg = config.clone();
     tokio::spawn(async move {
-        if let Err(e) = run(cfg, overlay_bridge_address).await {
+        if let Err(e) = run(cfg, overlay_bridge_address, peers).await {
             // The loop is designed to retry forever; reaching this branch
             // means the loop itself unwound, which only happens on
             // unrecoverable invariant violations.
@@ -87,6 +101,7 @@ pub fn spawn(config: &AgentConfig, overlay_bridge_address: Arc<std::sync::RwLock
 async fn run(
     config: AgentConfig,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>,
+    shared_peers: SharedPeers,
 ) -> Result<(), SyncError> {
     info!(
         node_id = config.node_id,
@@ -132,6 +147,7 @@ async fn run(
                     &mut _resolver_handle,
                     &config,
                     &overlay_bridge_address,
+                    &shared_peers,
                 )
                 .await
                 {
@@ -191,6 +207,7 @@ async fn apply(
     resolver: &mut Option<DnsResolverHandle>,
     config: &AgentConfig,
     overlay_bridge_address: &Arc<std::sync::RwLock<Option<IpAddr>>>,
+    shared_peers: &SharedPeers,
 ) -> Result<(), SyncError> {
     let Some(alloc_wire) = payload.alloc else {
         return Ok(());
@@ -198,6 +215,21 @@ async fn apply(
     let alloc = parse_alloc(&alloc_wire)?;
     let peers: Result<Vec<Peer>, _> = payload.peers.iter().map(parse_peer).collect();
     let peers = peers?;
+
+    // Capture the bridge gateway up front — `bootstrap` consumes
+    // `alloc` and the route sweep at the bottom needs the IP after.
+    let bridge_v4 = match alloc.bridge_address {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(_) => return Ok(()),
+    };
+
+    // Publish the latest peer list before driving any kernel changes.
+    // Container-attach handlers read this slot to install per-peer
+    // overlay routes inside the container's netns — they need the
+    // same view the kernel data plane is about to apply.
+    if let Ok(mut slot) = shared_peers.write() {
+        *slot = peers.clone();
+    }
 
     if !*bootstrapped {
         info!(
@@ -209,8 +241,10 @@ async fn apply(
         // Clone before bootstrap consumes alloc — we need it for the
         // Docker network creation step right after.
         let alloc_for_docker = alloc.clone();
+        // Clone peers too — we need them for the per-container route
+        // sweep at the bottom of this function.
         manager
-            .bootstrap(alloc, peers)
+            .bootstrap(alloc, peers.clone())
             .await
             .map_err(|e| SyncError::Bootstrap(e.to_string()))?;
         *bootstrapped = true;
@@ -245,11 +279,119 @@ async fn apply(
         }
     } else {
         let changed = manager
-            .reconcile_peers(peers)
+            .reconcile_peers(peers.clone())
             .await
             .map_err(|e| SyncError::Reconcile(e.to_string()))?;
         if changed {
             info!("multi-host peer list updated");
+        }
+    }
+
+    // Re-inject per-peer routes inside every overlay-attached
+    // container's netns. The routes don't survive a container netns
+    // recreate (Docker auto-restart on crash, worker reboot, image
+    // update), so a sync-loop sweep is the simplest way to heal
+    // automatically. `ip route replace` is idempotent — re-running
+    // when nothing changed is a no-op.
+    if let Err(e) = sweep_overlay_container_routes(&bridge_v4, &peers).await {
+        debug!(
+            error = %e,
+            "Container route sweep skipped (will retry next tick)"
+        );
+    }
+
+    Ok(())
+}
+
+/// Walk every container currently attached to `temps0` and re-install
+/// the per-peer routes inside their netns. Used by the sync loop to
+/// repair routes lost across container restarts.
+///
+/// Best-effort: any container that fails individually is logged and
+/// skipped. The sweep itself only errors when we can't even talk to
+/// the local Docker daemon.
+async fn sweep_overlay_container_routes(
+    bridge_gateway: &str,
+    peers: &[Peer],
+) -> Result<(), String> {
+    use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions};
+
+    if peers.is_empty() {
+        return Ok(());
+    }
+
+    let docker = Docker::connect_with_local_defaults()
+        .map_err(|e| format!("connect_with_local_defaults: {}", e))?;
+
+    // network=temps0 filter narrows the list to containers that are
+    // actually on the overlay. Includes stopped containers (filters
+    // are OR'd on status by default), but `inspect.state.pid > 0` will
+    // skip those before we try to nsenter.
+    let overlay_name = NetworkConfig::default().docker_network_name;
+    let mut filters = std::collections::HashMap::new();
+    filters.insert("network".to_string(), vec![overlay_name.clone()]);
+    let opts = ListContainersOptions {
+        all: false,
+        filters: Some(filters),
+        ..Default::default()
+    };
+
+    let containers = docker
+        .list_containers(Some(opts))
+        .await
+        .map_err(|e| format!("list_containers: {}", e))?;
+
+    for c in containers {
+        let Some(id) = c.id.as_deref() else {
+            continue;
+        };
+        let inspect = match docker
+            .inspect_container(id, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(i) => i,
+            Err(e) => {
+                debug!(container = %id, error = %e, "Inspect failed during route sweep");
+                continue;
+            }
+        };
+        let pid = match inspect
+            .state
+            .as_ref()
+            .and_then(|s| s.pid)
+            .filter(|p| *p > 0)
+        {
+            Some(p) => p as i32,
+            None => continue,
+        };
+        // Only attempt for containers that actually have an overlay
+        // gateway recorded — stopped/half-attached containers may
+        // have a network entry without a gateway IP.
+        let has_overlay_gw = inspect
+            .network_settings
+            .as_ref()
+            .and_then(|ns| ns.networks.as_ref())
+            .and_then(|nets| nets.get(&overlay_name))
+            .and_then(|n| n.gateway.as_deref())
+            .filter(|g| !g.is_empty())
+            .is_some();
+        if !has_overlay_gw {
+            continue;
+        }
+
+        if let Err(e) = temps_network::overlay_routes::install_peer_routes_in_container(
+            pid,
+            "eth1", // hint only; actual iface is discovered by IP match
+            bridge_gateway,
+            peers,
+        )
+        .await
+        {
+            debug!(
+                container = %id,
+                error = %e,
+                "Failed to (re)install overlay peer routes; will retry next tick"
+            );
         }
     }
     Ok(())

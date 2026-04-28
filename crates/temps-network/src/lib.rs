@@ -32,6 +32,7 @@ pub mod diff;
 pub mod docker;
 pub mod error;
 pub mod manager;
+pub mod overlay_routes;
 
 #[cfg(target_os = "linux")]
 pub mod linux;

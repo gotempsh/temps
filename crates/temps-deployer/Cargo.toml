@@ -29,6 +29,7 @@ sysinfo = { workspace = true }
 num_cpus = "1.16"
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
+temps-network = { path = "../temps-network" }
 utoipa = { workspace = true }
 flate2 = { workspace = true }
 reqwest = { workspace = true }

@@ -23,12 +23,14 @@ pub fn build_router(
     docker: Option<bollard::Docker>,
     config: &AgentConfig,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+    overlay_peers: crate::network_sync::SharedPeers,
 ) -> Router {
     let state = Arc::new(AgentState {
         container_deployer,
         image_builder,
         docker,
         overlay_bridge_address,
+        overlay_peers,
     });
 
     let auth = Arc::new(AgentAuth::new(&config.token));
@@ -340,20 +342,16 @@ pub async fn start_agent_server(
     image_builder: Arc<dyn ImageBuilder>,
     docker: Option<bollard::Docker>,
     config: AgentConfig,
+    overlay_peers: crate::network_sync::SharedPeers,
+    overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
 ) -> Result<(), crate::AgentError> {
-    // Shared slot the network sync loop publishes into once the overlay
-    // bridge comes up. The router reads from it inside `create_service`
-    // so every container we provision gets `--dns=<bridge_ip>` and can
-    // resolve `*.temps.local` natively.
-    let overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>> =
-        Arc::new(std::sync::RwLock::new(None));
-
     let router = build_router(
         container_deployer.clone(),
         image_builder,
         docker,
         &config,
         overlay_bridge_address.clone(),
+        overlay_peers.clone(),
     );
 
     // Start heartbeat background loop (with deployer for container inventory on first beat)
@@ -364,7 +362,7 @@ pub async fn start_agent_server(
     // cluster, or simply not yet allocated), the loop is a no-op. When a
     // compute_cidr is allocated, the loop bootstraps the overlay and keeps
     // peers reconciled. `temps join` semantics are unchanged either way.
-    crate::network_sync::spawn(&config, overlay_bridge_address.clone());
+    crate::network_sync::spawn(&config, overlay_bridge_address.clone(), overlay_peers);
 
     let listener = tokio::net::TcpListener::bind(&config.listen_address)
         .await

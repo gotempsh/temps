@@ -51,11 +51,26 @@ pub async fn bootstrap(
         }
     }
 
-    // Routes for each peer's compute CIDR.
+    // Routes for each peer's compute CIDR. We point them at the
+    // *bridge* interface, not the VXLAN device. The bridge has the
+    // L3 address (the gateway IP) so the kernel sources ARP from
+    // there; routing via the VXLAN device directly leaves the kernel
+    // with no IPv4 address on the chosen egress interface and it
+    // falls back to the underlay IP for ARP source — which peer
+    // workers then drop because it's in the wrong subnet.
+    //
+    // Traffic still goes over VXLAN: br-temps0 has vxlan-temps0
+    // enslaved to it, so packets that hit the bridge with no local
+    // veth match egress through the VXLAN device by L2 forwarding.
+    let pref_src_v4 = match alloc.bridge_address {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        std::net::IpAddr::V6(_) => None,
+    };
     for peer in peers {
         match config.transport {
             Transport::Vxlan { .. } => {
-                route::add_via_dev(&handle, peer.compute_cidr, &config.vxlan_dev_name).await?;
+                route::add_via_dev(&handle, peer.compute_cidr, &config.bridge_name, pref_src_v4)
+                    .await?;
             }
             Transport::Native => {
                 route::add_via_gateway(&handle, peer.compute_cidr, peer.underlay_address).await?;
@@ -78,7 +93,7 @@ pub async fn bootstrap(
 /// changed.
 pub async fn reconcile_peers(
     config: &NetworkConfig,
-    _alloc: &NodeAlloc,
+    alloc: &NodeAlloc,
     current: &[Peer],
     desired: &[Peer],
 ) -> crate::Result<bool> {
@@ -113,10 +128,16 @@ pub async fn reconcile_peers(
     for cidr in &route_diff.to_remove {
         route::remove(&handle, *cidr).await?;
     }
+    let pref_src_v4 = match alloc.bridge_address {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        std::net::IpAddr::V6(_) => None,
+    };
     for cidr in &route_diff.to_add {
         match config.transport {
             Transport::Vxlan { .. } => {
-                route::add_via_dev(&handle, *cidr, &config.vxlan_dev_name).await?;
+                // See bootstrap() for why we route via the bridge,
+                // not the VXLAN device directly.
+                route::add_via_dev(&handle, *cidr, &config.bridge_name, pref_src_v4).await?;
             }
             Transport::Native => {
                 let gateway = desired

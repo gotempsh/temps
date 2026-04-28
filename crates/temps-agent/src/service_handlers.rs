@@ -261,6 +261,25 @@ pub async fn create_service(
                 .into_response();
             }
 
+            // Install per-peer overlay routes inside the container's netns
+            // *after* it's running. Without these, traffic destined for
+            // other workers' overlay /24s falls through the container's
+            // default route on the primary network and gets dropped.
+            // Best-effort: failures are logged and don't fail the deploy.
+            if let Err(e) = install_overlay_peer_routes_after_start(
+                docker,
+                &container_name,
+                &state.overlay_peers,
+            )
+            .await
+            {
+                tracing::warn!(
+                    container = %container_name,
+                    error = %e,
+                    "Failed to install overlay peer routes; cross-worker traffic to other CIDRs will fail"
+                );
+            }
+
             // Inspect once to (a) discover an auto-assigned host port if needed,
             // and (b) read the temps-overlay IP for the DNS registry (ADR-011).
             // We always inspect now because the overlay IP is independent of the
@@ -477,17 +496,52 @@ pub async fn remove_service(
     {
         Ok(()) => {
             tracing::info!(service = %name, "Service container removed");
-            ok_response("removed".to_string()).into_response()
         }
         Err(e) => {
             tracing::error!(service = %name, "Failed to remove service: {}", e);
-            error_response(
+            return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to remove service '{}': {}", name, e),
             )
-            .into_response()
+            .into_response();
         }
     }
+
+    // Also remove the named data volume so that re-adding a service at
+    // the same container name doesn't inherit stale state. Without this,
+    // a deleted-then-re-added pg_auto_failover member silently picks up
+    // the previous member's `pg_autoctl.cfg` and masquerades as the old
+    // identity, which deadlocks the monitor's view of the cluster.
+    //
+    // Best-effort: a "volume in use" failure here usually means another
+    // container still mounts it (shouldn't happen, but harmless to log
+    // and continue).
+    let volume_name = format!("{}_data", name);
+    match docker
+        .remove_volume(
+            &volume_name,
+            None::<bollard::query_parameters::RemoveVolumeOptions>,
+        )
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(volume = %volume_name, "Service data volume removed");
+        }
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {
+            tracing::debug!(volume = %volume_name, "Service data volume already absent");
+        }
+        Err(e) => {
+            tracing::warn!(
+                volume = %volume_name,
+                "Failed to remove service data volume; cluster may inherit stale state on re-add: {}",
+                e
+            );
+        }
+    }
+
+    ok_response("removed".to_string()).into_response()
 }
 
 /// Get service container status.
@@ -1260,6 +1314,68 @@ async fn attach_to_overlay_if_present(
         }) => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Install per-peer overlay routes inside the container's netns. Must
+/// be called **after** start_container — `docker inspect` only reports
+/// a non-zero PID for running containers, and `nsenter -t <pid> -n`
+/// needs that PID to enter the netns.
+///
+/// Best-effort: any failure is logged and swallowed.
+async fn install_overlay_peer_routes_after_start(
+    docker: &bollard::Docker,
+    container_id: &str,
+    shared_peers: &crate::network_sync::SharedPeers,
+) -> std::result::Result<(), String> {
+    let peers = shared_peers
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    if peers.is_empty() {
+        // No peers known yet — common on a freshly-started worker before
+        // the first network/peers poll completes. The next reconcile
+        // tick will re-attach via this same path or the route will be
+        // missing until the container is recreated; either way we don't
+        // block.
+        return Ok(());
+    }
+
+    let inspect = docker
+        .inspect_container(
+            container_id,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .map_err(|e| format!("inspect_container: {}", e))?;
+
+    let pid = inspect
+        .state
+        .as_ref()
+        .and_then(|s| s.pid)
+        .filter(|p| *p > 0)
+        .ok_or_else(|| "container PID not yet available".to_string())? as i32;
+
+    let overlay_name = temps_network::NetworkConfig::default().docker_network_name;
+    let gateway = inspect
+        .network_settings
+        .as_ref()
+        .and_then(|ns| ns.networks.as_ref())
+        .and_then(|nets| nets.get(&overlay_name))
+        .and_then(|net| net.gateway.clone())
+        .filter(|g| !g.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "no gateway recorded for overlay '{}' on container",
+                overlay_name
+            )
+        })?;
+
+    // Convention: Docker assigns interface names in attach order,
+    // primary network first. The overlay attach happens last in the
+    // service-create path, so the overlay interface is `eth1`.
+    temps_network::overlay_routes::install_peer_routes_in_container(pid, "eth1", &gateway, &peers)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Pull the container's IP on the multi-host overlay (`temps-overlay`) out

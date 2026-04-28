@@ -13,7 +13,18 @@ use tracing::{debug, warn};
 
 /// Add a route for `cidr` that egresses via `dev`. Idempotent — if the route
 /// already exists, this is a no-op.
-pub async fn add_via_dev(handle: &Handle, cidr: Ipv4Net, dev: &str) -> crate::Result<()> {
+///
+/// `pref_src` (when set) becomes the route's preferred source — the IP
+/// the kernel will use as the ARP source / source IP for traffic that
+/// hits this route. Required for VXLAN routes: without it the kernel
+/// falls back to the underlay IP (eth0), which is in the wrong subnet
+/// and causes peer workers to drop the inner ARP / SYN.
+pub async fn add_via_dev(
+    handle: &Handle,
+    cidr: Ipv4Net,
+    dev: &str,
+    pref_src: Option<Ipv4Addr>,
+) -> crate::Result<()> {
     let dev_idx = link_index_by_name(handle, dev)
         .await?
         .ok_or(NetworkError::Route {
@@ -23,14 +34,16 @@ pub async fn add_via_dev(handle: &Handle, cidr: Ipv4Net, dev: &str) -> crate::Re
             reason: format!("device '{}' not found", dev),
         })?;
 
-    let res = handle
+    let mut req = handle
         .route()
         .add()
         .v4()
         .destination_prefix(cidr.network(), cidr.prefix_len())
-        .output_interface(dev_idx)
-        .execute()
-        .await;
+        .output_interface(dev_idx);
+    if let Some(src) = pref_src {
+        req = req.pref_source(src);
+    }
+    let res = req.execute().await;
 
     handle_route_result(res, "add_via_dev", cidr, dev)
 }

@@ -67,16 +67,39 @@ impl AgentCommand {
             // bootstrapped (single-host clusters, or before the network
             // sync loop has run for the first time). Operators who really
             // need to disable can override via TEMPS_OVERLAY_NETWORK="".
+            //
+            // The default must match the network name `temps-network`
+            // actually creates (`NetworkConfig::default().docker_network_name`),
+            // which is `temps0`. The previous default `temps-overlay`
+            // never matched any real network on the worker so app
+            // containers were silently single-host attached.
             let overlay_network = std::env::var("TEMPS_OVERLAY_NETWORK")
-                .unwrap_or_else(|_| "temps-overlay".to_string());
+                .unwrap_or_else(|_| temps_network::NetworkConfig::default().docker_network_name);
+            // Shared peer-list slot. The agent's network_sync loop
+            // refreshes it on every poll; both the deployer (for app
+            // containers) and the agent's service handlers (for
+            // user-managed services) read it to install per-peer
+            // overlay routes inside each new container's netns.
+            let overlay_peers: temps_agent::network_sync::SharedPeers =
+                Arc::new(std::sync::RwLock::new(Vec::new()));
+            // Shared bridge-IP slot, populated by network_sync once
+            // the overlay bridge is up. The deployer reads it to set
+            // each container's /etc/resolv.conf to the per-node
+            // Hickory resolver, so `*.temps.local` FQDNs resolve.
+            let overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>> =
+                Arc::new(std::sync::RwLock::new(None));
+
             let mut runtime_builder = temps_deployer::docker::DockerRuntime::new(
                 Arc::new(docker.clone()),
                 true,
                 network_name,
             )
-            .with_host_bind_address("0.0.0.0".to_string());
+            .with_host_bind_address("0.0.0.0".to_string())
+            .with_overlay_dns_slot(overlay_bridge_address.clone());
             if !overlay_network.is_empty() {
-                runtime_builder = runtime_builder.with_overlay_network(overlay_network);
+                runtime_builder = runtime_builder
+                    .with_overlay_network(overlay_network)
+                    .with_overlay_peers(overlay_peers.clone());
             }
             let docker_runtime = Arc::new(runtime_builder);
 
@@ -85,9 +108,16 @@ impl AgentCommand {
 
             tracing::info!("Starting temps agent (node_id={})...", config.node_id);
 
-            temps_agent::server::start_agent_server(deployer, builder, Some(docker), config)
-                .await
-                .map_err(|e| anyhow::anyhow!("Agent server error: {}", e))?;
+            temps_agent::server::start_agent_server(
+                deployer,
+                builder,
+                Some(docker),
+                config,
+                overlay_peers,
+                overlay_bridge_address,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Agent server error: {}", e))?;
 
             Ok(())
         })
