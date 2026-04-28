@@ -24,6 +24,7 @@ pub mod error;
 pub mod handle;
 pub mod record;
 pub mod sync_client;
+pub mod upstream;
 pub mod zone_store;
 
 pub use config::ResolverConfig;

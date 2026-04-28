@@ -23,6 +23,7 @@ use crate::authority::ZoneAuthority;
 use crate::config::ResolverConfig;
 use crate::error::ResolverError;
 use crate::sync_client::SyncClient;
+use crate::upstream::UpstreamResolver;
 use crate::zone_store::ZoneStore;
 
 /// TCP idle timeout. Hickory closes idle connections after this. 5 s is the
@@ -51,8 +52,25 @@ impl ResolverHandle {
         let sync_client = SyncClient::new(config.clone(), zone.clone(), shutdown.clone())?;
         let sync_task = tokio::spawn(async move { sync_client.run().await });
 
+        // ----- Upstream forwarder -----
+        // Built once per resolver. `None` means the operator has
+        // configured an empty upstream pool — strict authoritative
+        // mode, where outside-zone queries fall through to NXDOMAIN.
+        let upstream = UpstreamResolver::new(&config.upstream_resolvers).map(Arc::new);
+        if let Some(_u) = &upstream {
+            info!(
+                upstreams = ?config.upstream_resolvers,
+                "DNS recursive forwarder enabled"
+            );
+        } else {
+            info!("DNS recursive forwarder disabled (empty upstream list)");
+        }
+
         // ----- DNS server -----
-        let authority = ZoneAuthority::new(zone.clone());
+        let mut authority = ZoneAuthority::new(zone.clone());
+        if let Some(upstream) = upstream {
+            authority = authority.with_upstream(upstream);
+        }
         let mut server = ServerFuture::new(authority);
 
         for addr in &config.listen_addrs {

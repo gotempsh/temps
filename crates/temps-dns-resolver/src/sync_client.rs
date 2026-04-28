@@ -236,6 +236,7 @@ mod tests {
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(100),
             http_timeout: Duration::from_secs(2),
+            upstream_resolvers: vec![],
         }
     }
 

@@ -2,10 +2,11 @@
 //!
 //! Implements the minimal slice of the DNS protocol we actually serve:
 //! authoritative `A`, `AAAA`, and `CNAME` answers for `*.temps.local`.
-//! Anything else (other QTYPEs, queries outside our zone) returns NXDOMAIN
-//! / NOTIMP — we are NOT a recursive resolver. Containers configure us as
-//! their first nameserver only for `temps.local`, and fall back to the
-//! host's resolver for everything else.
+//! Queries that fall outside the internal zone are forwarded to the
+//! upstream public resolvers configured on the agent (Cloudflare /
+//! Google by default) — without this, any container using us as its
+//! first nameserver would get NXDOMAIN for everything that isn't
+//! `*.temps.local`, breaking package installs and outbound calls.
 //!
 //! ## Why a hand-rolled handler instead of `Catalog` + `InMemoryAuthority`
 //!
@@ -27,16 +28,36 @@ use std::str::FromStr;
 use tracing::{debug, trace, warn};
 
 use crate::record::ZoneRecord;
+use crate::upstream::UpstreamResolver;
 use crate::zone_store::ZoneStore;
+
+/// Suffix that identifies our authoritative zone. Anything matching this
+/// (case-insensitive, with or without trailing dot) is answered from the
+/// `ZoneStore`; everything else is forwarded upstream.
+const TEMPS_ZONE_SUFFIX: &str = "temps.local";
 
 pub struct ZoneAuthority {
     zone: Arc<ZoneStore>,
+    upstream: Option<Arc<UpstreamResolver>>,
 }
 
 impl ZoneAuthority {
     pub fn new(zone: Arc<ZoneStore>) -> Self {
-        Self { zone }
+        Self {
+            zone,
+            upstream: None,
+        }
     }
+
+    pub fn with_upstream(mut self, upstream: Arc<UpstreamResolver>) -> Self {
+        self.upstream = Some(upstream);
+        self
+    }
+}
+
+fn is_internal_zone(qname: &str) -> bool {
+    let trimmed = qname.trim_end_matches('.').to_ascii_lowercase();
+    trimmed == TEMPS_ZONE_SUFFIX || trimmed.ends_with(&format!(".{TEMPS_ZONE_SUFFIX}"))
 }
 
 #[async_trait::async_trait]
@@ -68,9 +89,28 @@ impl RequestHandler for ZoneAuthority {
 
         let qname: Name = info.query.name().into();
         let qtype = info.query.query_type();
-        let snapshot = self.zone.snapshot();
-
         let qname_str = qname.to_utf8();
+        let in_zone = is_internal_zone(&qname_str);
+
+        // Outside-zone queries are forwarded recursively. We are the
+        // *only* nameserver app containers see, so falling through to
+        // NXDOMAIN here would break `apt-get`, `wget`, package installs,
+        // outbound API calls, …
+        if !in_zone {
+            if let Some(upstream) = &self.upstream {
+                trace!(qname = %qname_str, qtype = ?qtype, "forwarding to upstream");
+                return upstream
+                    .forward(request, &mut response_handle)
+                    .await
+                    .unwrap_or_else(|info| info);
+            }
+            // No upstream configured — degrade to NXDOMAIN as the old
+            // behaviour did, which keeps strict authoritative-only
+            // deployments compatible.
+            return reply_error(request, &mut response_handle, ResponseCode::NXDomain).await;
+        }
+
+        let snapshot = self.zone.snapshot();
         let matches: Vec<&ZoneRecord> = snapshot
             .lookup(&qname_str)
             .filter(|r| matches_qtype(r, qtype))
@@ -84,6 +124,8 @@ impl RequestHandler for ZoneAuthority {
         );
 
         if matches.is_empty() {
+            // In-zone but unknown: this is genuinely NXDOMAIN. We are
+            // authoritative for `*.temps.local`, so don't forward.
             return reply_error(request, &mut response_handle, ResponseCode::NXDomain).await;
         }
 

@@ -14,6 +14,11 @@ homepage.workspace = true
 # at the time of writing.
 hickory-server = { version = "0.25", default-features = false }
 hickory-proto = { version = "0.25", default-features = false }
+# Recursive client used to forward non-`temps.local` queries to upstream
+# public resolvers (Cloudflare/Google by default). Without this, app
+# containers using us as their first nameserver get NXDOMAIN for
+# everything outside our internal zone.
+hickory-resolver = "0.25"
 
 # Async runtime
 tokio = { workspace = true }

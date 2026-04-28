@@ -48,6 +48,15 @@ pub struct ResolverConfig {
     /// `poll_interval` once we add server-side long-poll, but for now
     /// keep it short — the control plane returns immediately.
     pub http_timeout: Duration,
+
+    /// Upstream public resolvers used to recursively answer queries that
+    /// fall outside our internal `temps.local` zone. Containers point at
+    /// us as their *first* nameserver, so without this they would get
+    /// NXDOMAIN for everything (e.g. `nslookup google.com` from a worker
+    /// container). Defaults to Cloudflare + Google. Empty disables the
+    /// forwarder (we fall back to NXDOMAIN like a strict authoritative
+    /// server).
+    pub upstream_resolvers: Vec<SocketAddr>,
 }
 
 impl ResolverConfig {
@@ -72,7 +81,22 @@ impl ResolverConfig {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
             http_timeout: Duration::from_secs(10),
+            // Cloudflare 1.1.1.1 / 1.0.0.1 + Google 8.8.8.8. Operators
+            // who need a private upstream (corporate split-horizon) can
+            // override via `with_upstream_resolvers`.
+            upstream_resolvers: vec![
+                SocketAddr::new("1.1.1.1".parse().expect("static ipv4"), 53),
+                SocketAddr::new("1.0.0.1".parse().expect("static ipv4"), 53),
+                SocketAddr::new("8.8.8.8".parse().expect("static ipv4"), 53),
+            ],
         }
+    }
+
+    /// Override the upstream resolver list. Pass an empty `Vec` to
+    /// disable forwarding (strict authoritative-only mode).
+    pub fn with_upstream_resolvers(mut self, upstreams: Vec<SocketAddr>) -> Self {
+        self.upstream_resolvers = upstreams;
+        self
     }
 
     pub fn snapshot_path(&self) -> PathBuf {

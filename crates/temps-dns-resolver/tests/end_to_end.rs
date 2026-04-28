@@ -44,6 +44,9 @@ fn make_resolver_config(
         initial_backoff: Duration::from_millis(50),
         max_backoff: Duration::from_millis(500),
         http_timeout: Duration::from_secs(2),
+        // No upstream forwarder in tests — the integration suite only
+        // exercises in-zone (`*.temps.local`) lookups.
+        upstream_resolvers: vec![],
     };
     (cfg, listen)
 }
