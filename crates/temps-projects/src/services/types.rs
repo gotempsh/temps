@@ -129,6 +129,26 @@ pub enum ProjectError {
     #[error("Slug already exists: {0}")]
     SlugAlreadyExists(String),
 
+    #[error("A project with slug '{slug}' was created concurrently. Please retry.")]
+    SlugConflict { slug: String },
+
+    #[error("Failed to create default environment for project {project_id}: {reason}")]
+    EnvironmentCreationFailed { project_id: i32, reason: String },
+
+    #[error("Failed to create environment variable '{key}' for project {project_id}: {reason}")]
+    EnvVarCreationFailed {
+        project_id: i32,
+        key: String,
+        reason: String,
+    },
+
+    #[error("Failed to link storage service {service_id} to project {project_id}: {reason}")]
+    StorageLinkFailed {
+        project_id: i32,
+        service_id: i32,
+        reason: String,
+    },
+
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
@@ -145,15 +165,29 @@ pub enum ProjectError {
     PipelineError(String),
 }
 
+/// Detect a Postgres unique-violation regardless of the variant Sea-ORM
+/// happens to wrap the underlying error in (Exec, Query, RecordNotInserted,
+/// connection-level errors during insert). We check for SQLSTATE `23505` and
+/// the textual marker `UNIQUE` / `duplicate key` so this works across
+/// sqlx, runtime-tokio-rustls, and the legacy backends.
+pub(crate) fn is_unique_violation(error: &sea_orm::DbErr) -> bool {
+    if matches!(error, sea_orm::DbErr::RecordNotInserted) {
+        return true;
+    }
+    let msg = error.to_string();
+    msg.contains("23505")
+        || msg.contains("duplicate key")
+        || msg.contains("UNIQUE constraint")
+        || msg.contains("UNIQUE violation")
+}
+
 impl From<sea_orm::DbErr> for ProjectError {
     fn from(error: sea_orm::DbErr) -> Self {
         match error {
             sea_orm::DbErr::RecordNotFound(_) => ProjectError::NotFound(error.to_string()),
-            sea_orm::DbErr::Exec(ref err) if err.to_string().contains("UNIQUE") => {
-                ProjectError::DatabaseError {
-                    reason: "A unique constraint was violated".to_string(),
-                }
-            }
+            ref e if is_unique_violation(e) => ProjectError::DatabaseError {
+                reason: format!("Unique constraint violated: {}", error),
+            },
             sea_orm::DbErr::Exec(ref err) if err.to_string().contains("FOREIGN KEY") => {
                 ProjectError::DatabaseError {
                     reason: "A foreign key constraint was violated".to_string(),

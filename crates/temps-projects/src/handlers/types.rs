@@ -787,9 +787,24 @@ impl From<ProjectError> for Problem {
                     .with_detail(reason)
             }
 
-            ProjectError::SlugAlreadyExists(slug) => problemdetails::new(StatusCode::BAD_REQUEST)
+            ProjectError::SlugAlreadyExists(slug) => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Slug Already Exists")
                 .with_detail(format!("A project with slug '{}' already exists", slug)),
+
+            ProjectError::SlugConflict { slug } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Slug Conflict")
+                .with_detail(format!(
+                    "A project with slug '{}' was created concurrently. Please retry.",
+                    slug
+                )),
+
+            err @ (ProjectError::EnvironmentCreationFailed { .. }
+            | ProjectError::EnvVarCreationFailed { .. }
+            | ProjectError::StorageLinkFailed { .. }) => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Project Creation Failed")
+                    .with_detail(err.to_string())
+            }
 
             ProjectError::InvalidInput(msg) => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid Input")
