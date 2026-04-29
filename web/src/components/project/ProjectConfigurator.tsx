@@ -70,7 +70,7 @@ import {
   Upload,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
@@ -346,6 +346,11 @@ export function ProjectConfigurator({
   // State management
   const [_currentStep, _setCurrentStep] = useState<WizardStep>('repo-config')
   const [isSubmitting, setIsSubmitting] = useState(false)
+  // Synchronous re-entry guard: React state updates are async, so a fast
+  // click can fire handleSubmit again before `isSubmitting` flips. A ref
+  // gives us a synchronous gate that prevents duplicate project creates
+  // (root cause of users ending up with 15 identical projects).
+  const isSubmittingRef = useRef(false)
   const [isCreateServiceDialogOpen, setIsCreateServiceDialogOpen] =
     useState(false)
   const [selectedServiceType, setSelectedServiceType] =
@@ -582,6 +587,8 @@ export function ProjectConfigurator({
 
   // Handle form submission
   const handleSubmit = async (data: ProjectFormValues) => {
+    if (isSubmittingRef.current) return
+    isSubmittingRef.current = true
     try {
       setIsSubmitting(true)
 
@@ -639,6 +646,7 @@ export function ProjectConfigurator({
     } catch (error) {
       console.error('Project configuration error:', error)
     } finally {
+      isSubmittingRef.current = false
       setIsSubmitting(false)
     }
   }

@@ -48,7 +48,7 @@ import {
   Upload,
   X,
 } from 'lucide-react'
-import { useCallback, useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
@@ -149,6 +149,9 @@ export function ManualProjectConfigurator({
 
   // State management
   const [isSubmitting, setIsSubmitting] = useState(false)
+  // Synchronous re-entry guard against fast double-clicks (root cause of
+  // users ending up with N duplicate projects from a single intent).
+  const isSubmittingRef = useRef(false)
   const [isCreateServiceDialogOpen, setIsCreateServiceDialogOpen] = useState(false)
   const [selectedServiceType, setSelectedServiceType] = useState<ServiceTypeRoute | null>(null)
   const [showSecrets, setShowSecrets] = useState<{ [key: number]: boolean }>({})
@@ -265,6 +268,8 @@ export function ManualProjectConfigurator({
 
   // Handle form submission
   const handleSubmit = async (data: ManualProjectFormValues) => {
+    if (isSubmittingRef.current) return
+    isSubmittingRef.current = true
     try {
       setIsSubmitting(true)
 
@@ -309,6 +314,7 @@ export function ManualProjectConfigurator({
     } catch (error) {
       console.error('Project configuration error:', error)
     } finally {
+      isSubmittingRef.current = false
       setIsSubmitting(false)
     }
   }

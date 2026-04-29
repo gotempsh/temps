@@ -68,6 +68,7 @@ function useLogWebSocket(
 
     let reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null
     let isCleaningUp = false
+    let reconnectAttempts = 0
 
     const connectWS = () => {
       // Don't reconnect if component is unmounting
@@ -75,21 +76,29 @@ function useLogWebSocket(
 
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
       const wsUrl = `${protocol}//${window.location.host}/api/projects/${project.id}/deployments/${deployment.id}/jobs/${job.job_id}/logs/tail`
-      setLogs([])
 
       wsRef.current = new WebSocket(wsUrl)
       setConnectionStatus('connecting')
 
       wsRef.current.onopen = () => {
         setConnectionStatus('connected')
+        reconnectAttempts = 0
       }
 
       wsRef.current.onmessage = (event) => {
         setLogs((prevLogs) => {
+          // Dedupe by absolute file line number — after reconnect the
+          // backend re-streams the last 1000 lines, which will overlap
+          // with what's already in state.
+          const lastSeenLine =
+            prevLogs.length > 0 ? prevLogs[prevLogs.length - 1].line : 0
           try {
             const data = JSON.parse(event.data) as LogEntry
             // Validate that it's a proper log entry
             if (data.level && data.message && data.line !== undefined) {
+              if (data.line <= lastSeenLine) {
+                return prevLogs
+              }
               // Trim leading and trailing newlines/carriage returns from the message
               const cleanedMessage = data.message.replace(
                 /^[\r\n]+|[\r\n]+$/g,
@@ -110,7 +119,7 @@ function useLogWebSocket(
                 level: 'info',
                 message: data.message?.replace(/^[\r\n]+|[\r\n]+$/g, '') || '',
                 timestamp: new Date().toISOString(),
-                line: prevLogs.length + 1,
+                line: lastSeenLine + 1,
               },
             ]
           } catch {
@@ -123,7 +132,7 @@ function useLogWebSocket(
                 level: 'info',
                 message: message.replace(/^[\r\n]+|[\r\n]+$/g, ''),
                 timestamp: new Date().toISOString(),
-                line: prevLogs.length + 1,
+                line: lastSeenLine + 1,
               },
             ]
           }
@@ -134,16 +143,17 @@ function useLogWebSocket(
         setConnectionStatus('error')
       }
 
-      wsRef.current.onclose = (event) => {
-        // Only reconnect if:
-        // 1. Not a normal closure (code 1000)
-        // 2. Component is not being cleaned up
-        // 3. Connection was previously established or connecting
-        if (!isCleaningUp && event.code !== 1000) {
-          setConnectionStatus('error')
-          // Retry connection after 10 seconds
-          reconnectTimeoutId = setTimeout(connectWS, 10000)
-        }
+      wsRef.current.onclose = () => {
+        // Always reconnect unless the component is being cleaned up.
+        // The backend log tail is an infinite stream, so any closure
+        // (including a normal 1000 from a redeploy churning the log source)
+        // is unexpected from the user's perspective. Use exponential backoff
+        // capped at 10s so we recover quickly from transient drops.
+        if (isCleaningUp) return
+        setConnectionStatus('error')
+        const delay = Math.min(1000 * 2 ** reconnectAttempts, 10000)
+        reconnectAttempts += 1
+        reconnectTimeoutId = setTimeout(connectWS, delay)
       }
     }
 
