@@ -5,6 +5,7 @@ mod apikey_service;
 mod apikey_types;
 mod audit;
 mod auth_service;
+pub mod cli_auth_handler;
 pub mod context;
 mod decorators;
 mod deployment_token_service;

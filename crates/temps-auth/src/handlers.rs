@@ -279,7 +279,9 @@ pub async fn verify_mfa_challenge(
         update_self,
         setup_mfa,
         verify_and_enable_mfa,
-        disable_mfa
+        disable_mfa,
+        crate::cli_auth_handler::cli_login,
+        crate::cli_auth_handler::cli_logout
     ),
     components(
         schemas(
@@ -306,7 +308,9 @@ pub async fn verify_mfa_challenge(
             UpdateSelfRequest,
             VerifyMfaRequest,
             MfaSetupResponse,
-            DisableMfaRequest
+            DisableMfaRequest,
+            crate::cli_auth_handler::CliLoginPasswordRequest,
+            crate::cli_auth_handler::CliLoginResponse
         )
     ),
     info(
@@ -333,6 +337,7 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
     let rate_limited_auth_routes = Router::new()
         .route("/auth/login", post(login))
         .route("/auth/verify-mfa", post(verify_mfa_challenge))
+        .route("/auth/cli/login", post(crate::cli_auth_handler::cli_login))
         .route("/auth/magic-link/request", post(request_magic_link))
         .route("/auth/magic-link/verify", get(verify_magic_link))
         .route("/auth/password-reset/request", post(request_password_reset))
@@ -344,6 +349,10 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
     let authenticated_routes = Router::new()
         .route("/user/me", get(get_current_user))
         .route("/logout", post(logout))
+        .route(
+            "/auth/cli/logout",
+            post(crate::cli_auth_handler::cli_logout),
+        )
         .route("/auth/email-status", get(email_status))
         .route("/auth/verify-email", get(verify_email))
         .route("/users", get(list_users))
