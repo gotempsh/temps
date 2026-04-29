@@ -7,6 +7,7 @@ import { createRequire } from 'module'
 
 // Import command modules
 import { registerAuthCommands } from './commands/auth/index.js'
+import { registerContextCommands } from './commands/context/index.js'
 import { registerConfigureCommand } from './commands/configure.js'
 import { registerProjectsCommands } from './commands/projects/index.js'
 import { registerDeployCommands } from './commands/deploy/index.js'
@@ -108,6 +109,7 @@ export function createProgram(): Command {
 
   // Register all command modules
   registerAuthCommands(program)
+  registerContextCommands(program)
   registerConfigureCommand(program)
   registerProjectsCommands(program)
   registerDeployCommands(program)

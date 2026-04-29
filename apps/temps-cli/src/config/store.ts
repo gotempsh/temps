@@ -3,6 +3,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { colors } from '../ui/output.js'
+import { getActiveContextSync } from './contexts.js'
 
 export interface TempsConfig {
   apiUrl: string
@@ -118,11 +119,19 @@ async function saveSecrets(secrets: Record<string, string>): Promise<void> {
 
 export const config = {
   get<K extends keyof TempsConfig>(key: K): TempsConfig[K] {
-    // Check environment variables first
+    // For apiUrl, the resolution order is:
+    //   1. TEMPS_API_URL env var (CI / one-off override)
+    //   2. The active CLI context (set by `temps login` / `temps context use`)
+    //   3. The legacy single-instance `conf` store (back-compat for users
+    //      who haven't run `temps login` since this feature shipped)
     if (key === 'apiUrl') {
       const envUrl = process.env.TEMPS_API_URL
       if (envUrl) {
         return envUrl as TempsConfig[K]
+      }
+      const ctx = getActiveContextSync()
+      if (ctx?.url) {
+        return ctx.url as TempsConfig[K]
       }
     }
     return configStore.get(key)
@@ -222,9 +231,14 @@ export const credentials = {
   },
 
   async isAuthenticated(): Promise<boolean> {
-    // Check environment variable first (for CI/CD)
-    const envToken = process.env.TEMPS_API_TOKEN || process.env.TEMPS_API_KEY
+    // Resolution order: env vars > active context > legacy single-instance.
+    const envToken =
+      process.env.TEMPS_TOKEN || process.env.TEMPS_API_TOKEN || process.env.TEMPS_API_KEY
     if (envToken) {
+      return true
+    }
+    const ctx = getActiveContextSync()
+    if (ctx?.apiKey) {
       return true
     }
     const secrets = await loadSecrets()
@@ -232,10 +246,15 @@ export const credentials = {
   },
 
   async getApiKey(): Promise<string | undefined> {
-    // Check environment variable first (for CI/CD)
-    const envToken = process.env.TEMPS_TOKEN || process.env.TEMPS_API_TOKEN || process.env.TEMPS_API_KEY
+    // Resolution order: env vars > active context > legacy single-instance.
+    const envToken =
+      process.env.TEMPS_TOKEN || process.env.TEMPS_API_TOKEN || process.env.TEMPS_API_KEY
     if (envToken) {
       return envToken
+    }
+    const ctx = getActiveContextSync()
+    if (ctx?.apiKey) {
+      return ctx.apiKey
     }
     const secrets = await loadSecrets()
     return secrets[SECRET_KEYS.apiKey]
