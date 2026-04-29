@@ -10739,6 +10739,8 @@ dependencies = [
  "futures",
  "http 1.3.1",
  "http-body-util",
+ "hyper 1.7.0",
+ "hyper-util",
  "ipnet",
  "parking_lot",
  "rand 0.8.6",

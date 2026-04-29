@@ -35,6 +35,9 @@ temps-dns-resolver = { path = "../temps-dns-resolver" }
 ipnet = "2.10"
 parking_lot = "0.12"
 rand = { workspace = true }
+# Needed for hyper::upgrade::on in the internal proxy's WS tunnel path.
+hyper = { workspace = true }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"

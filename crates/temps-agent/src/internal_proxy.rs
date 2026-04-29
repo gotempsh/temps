@@ -159,7 +159,269 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         return error_body(StatusCode::SERVICE_UNAVAILABLE, "no live backends");
     }
 
+    // WebSocket / generic protocol upgrade. Reqwest's HTTP client
+    // doesn't tunnel after a 101 response — it returns the response
+    // headers and considers the request done — so we have to take the
+    // upgrade off the wire ourselves: open a raw TCP connection to a
+    // backend, replay the request line + headers exactly, then bridge
+    // bytes between the upgraded client socket and that backend
+    // socket. Works for `Upgrade: websocket`, but also for any other
+    // RFC 7230 Upgrade target (HTTP/2 prior knowledge isn't supported
+    // here — internal traffic is plain HTTP/1.1).
+    if is_upgrade_request(req.headers()) {
+        return proxy_upgrade(&entry, req).await;
+    }
+
     proxy_with_retries(&state, &entry, req).await
+}
+
+/// True if the client requested a protocol upgrade. We check both the
+/// `connection: upgrade` token (per RFC 7230 §6.7) and the presence of
+/// `upgrade:` — the websocket case must satisfy both.
+fn is_upgrade_request(headers: &HeaderMap) -> bool {
+    let conn = headers
+        .get("connection")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let has_upgrade_token = conn.split(',').any(|t| t.trim() == "upgrade");
+    has_upgrade_token && headers.contains_key("upgrade")
+}
+
+/// Tunnel an HTTP/1.1 Upgrade through to a backend. Picks one backend
+/// at random (no retries — upgraded connections are unique to a
+/// specific backend, retrying after a partial handshake would mean
+/// duplicating client bytes). Forwards the original request line and
+/// headers (minus `Host`, which we override so the backend sees the
+/// real downstream host), reads the backend's status line + headers
+/// up to the empty line, and pipes bytes bidirectionally until either
+/// side closes.
+async fn proxy_upgrade(entry: &RouteEntry, req: Request) -> Response {
+    use rand::seq::SliceRandom;
+    let backend = {
+        let mut rng = rand::thread_rng();
+        entry.backends.choose(&mut rng).cloned()
+    };
+    let Some(backend) = backend else {
+        return error_body(StatusCode::SERVICE_UNAVAILABLE, "no live backends");
+    };
+
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/")
+        .to_string();
+    let headers = req.headers().clone();
+    let original_host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Dial backend up front. If this fails the client sees a 502
+    // before its own upgrade attempt is committed, which is the
+    // friendly outcome.
+    let mut backend_sock = match tokio::net::TcpStream::connect(&backend.address).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(backend = %backend.address, error = %e, "ws upgrade backend connect failed");
+            return error_body(
+                StatusCode::BAD_GATEWAY,
+                &format!("upstream {}: {}", backend.address, e),
+            );
+        }
+    };
+
+    // Build the request as raw bytes. Manually so we don't have to
+    // wrestle with hyper's typed encoder for this narrow path.
+    let mut wire = format!("{} {} HTTP/1.1\r\n", method.as_str(), path_and_query).into_bytes();
+    let mut sent_host = false;
+    for (name, value) in headers.iter() {
+        let name_str = name.as_str();
+        // Drop hop-by-hop except `connection` and `upgrade`, which the
+        // upgrade flow needs preserved verbatim per RFC 6455 §4.
+        if matches!(
+            name_str,
+            "proxy-authenticate" | "proxy-authorization" | "te" | "trailers" | "transfer-encoding"
+        ) {
+            continue;
+        }
+        if name_str == "host" {
+            sent_host = true;
+        }
+        wire.extend_from_slice(name_str.as_bytes());
+        wire.extend_from_slice(b": ");
+        wire.extend_from_slice(value.as_bytes());
+        wire.extend_from_slice(b"\r\n");
+    }
+    if !sent_host {
+        if let Some(h) = &original_host {
+            wire.extend_from_slice(format!("host: {}\r\n", h).as_bytes());
+        }
+    }
+    if let Some(deployment_id) = entry.deployment_id {
+        wire.extend_from_slice(format!("x-temps-deployment-id: {}\r\n", deployment_id).as_bytes());
+    }
+    if let Some(h) = &original_host {
+        wire.extend_from_slice(format!("x-forwarded-host: {}\r\n", h).as_bytes());
+    }
+    wire.extend_from_slice(b"x-forwarded-proto: http\r\n\r\n");
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if let Err(e) = backend_sock.write_all(&wire).await {
+        warn!(backend = %backend.address, error = %e, "ws backend write request failed");
+        return error_body(StatusCode::BAD_GATEWAY, "upstream write failed");
+    }
+
+    // Read the backend's response headers. We only need to peek at
+    // the status line — anything in the 100s/200s with the upgrade
+    // sequence completes the tunnel; anything else we relay verbatim
+    // and stop. We hand-parse to avoid pulling in another HTTP
+    // parser; the response shape is "STATUS\r\nHEADER\r\n...\r\n\r\n".
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 1024];
+    let header_end = loop {
+        match backend_sock.read(&mut tmp).await {
+            Ok(0) => {
+                warn!(backend = %backend.address, "backend closed before headers");
+                return error_body(StatusCode::BAD_GATEWAY, "upstream closed early");
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(idx) = find_header_end(&buf) {
+                    break idx;
+                }
+                if buf.len() > 64 * 1024 {
+                    warn!("ws backend headers exceed 64KiB; aborting");
+                    return error_body(StatusCode::BAD_GATEWAY, "upstream header too large");
+                }
+            }
+            Err(e) => {
+                warn!(backend = %backend.address, error = %e, "ws backend read failed");
+                return error_body(StatusCode::BAD_GATEWAY, "upstream read failed");
+            }
+        }
+    };
+    let header_bytes = buf[..header_end].to_vec();
+    let leftover = buf[header_end..].to_vec();
+
+    // Parse status code + parse the header block back into typed
+    // headers we can hand to axum.
+    let (status, headers_out) = match parse_response_head(&header_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "ws backend response parse failed");
+            return error_body(StatusCode::BAD_GATEWAY, "upstream malformed");
+        }
+    };
+
+    // Non-101 ⇒ backend declined the upgrade; relay status+headers
+    // and any leftover body, then close. No bidirectional tunnel.
+    if status != StatusCode::SWITCHING_PROTOCOLS {
+        let mut resp = Response::new(Body::from(leftover));
+        *resp.status_mut() = status;
+        for (name, value) in headers_out.iter() {
+            if HOP_BY_HOP.contains(&name.as_str()) {
+                continue;
+            }
+            resp.headers_mut().insert(name.clone(), value.clone());
+        }
+        return resp;
+    }
+
+    // 101: upgrade the *client* connection so axum hands us the raw
+    // socket, then bridge bytes both ways. The `on_upgrade` future
+    // resolves once axum's response (the 101 we're about to build)
+    // has been written.
+    let on_upgrade = hyper::upgrade::on(req);
+    let response_bytes = headers_out;
+    // Build the 101 response we send to the client. Mirror the
+    // backend's headers verbatim — Sec-WebSocket-Accept comes from
+    // there and must round-trip unchanged.
+    let mut client_resp = Response::new(Body::empty());
+    *client_resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    for (name, value) in response_bytes.iter() {
+        client_resp
+            .headers_mut()
+            .insert(name.clone(), value.clone());
+    }
+
+    // Spawn the bidirectional copy after the response is sent. We
+    // need to detach the futures since axum returns the response
+    // before the tunnel starts.
+    tokio::spawn(async move {
+        let upgraded = match on_upgrade.await {
+            Ok(u) => u,
+            Err(e) => {
+                warn!(error = %e, "ws client upgrade failed");
+                return;
+            }
+        };
+        // hyper::upgrade::Upgraded uses hyper's I/O traits, not
+        // tokio's. Wrap with TokioIo so `copy_bidirectional` and
+        // `write_all` work.
+        let mut client_sock = hyper_util::rt::TokioIo::new(upgraded);
+        // Replay any leftover bytes the backend already sent past the
+        // header terminator (ws frames often arrive in the same
+        // packet as the 101 from the upstream).
+        if !leftover.is_empty() {
+            if let Err(e) = client_sock.write_all(&leftover).await {
+                warn!(error = %e, "ws leftover write to client failed");
+                return;
+            }
+        }
+        match tokio::io::copy_bidirectional(&mut client_sock, &mut backend_sock).await {
+            Ok((up, down)) => {
+                debug!(up_bytes = up, down_bytes = down, "ws tunnel closed");
+            }
+            Err(e) => {
+                debug!(error = %e, "ws tunnel ended with error");
+            }
+        }
+    });
+
+    client_resp
+}
+
+/// Find the position immediately after the first `\r\n\r\n` in `buf`.
+/// Returns `None` if the terminator isn't yet present.
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// Parse a raw HTTP response head (status line + headers) into a
+/// typed `(StatusCode, HeaderMap)`. Strict about CRLF — internal
+/// servers all conform.
+fn parse_response_head(buf: &[u8]) -> Result<(StatusCode, HeaderMap), String> {
+    let text = std::str::from_utf8(buf).map_err(|e| format!("non-utf8: {e}"))?;
+    let mut lines = text.split("\r\n");
+    let status_line = lines.next().ok_or("empty response")?;
+    // "HTTP/1.1 101 Switching Protocols"
+    let mut parts = status_line.splitn(3, ' ');
+    let _version = parts.next().ok_or("missing version")?;
+    let code_str = parts.next().ok_or("missing code")?;
+    let code: u16 = code_str.parse().map_err(|e| format!("bad code: {e}"))?;
+    let status = StatusCode::from_u16(code).map_err(|e| format!("bad status: {e}"))?;
+
+    let mut headers = HeaderMap::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = line.split_once(':').ok_or("malformed header")?;
+        let name_trim = name.trim();
+        let value_trim = value.trim();
+        if name_trim.is_empty() {
+            continue;
+        }
+        let name = HeaderName::from_bytes(name_trim.as_bytes())
+            .map_err(|e| format!("bad header name {name_trim:?}: {e}"))?;
+        let value =
+            HeaderValue::from_str(value_trim).map_err(|e| format!("bad header value: {e}"))?;
+        headers.append(name, value);
+    }
+    Ok((status, headers))
 }
 
 async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request) -> Response {
