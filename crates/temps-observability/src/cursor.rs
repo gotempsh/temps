@@ -72,8 +72,7 @@ mod tests {
 
     #[test]
     fn rejects_valid_base64_but_invalid_json() {
-        let token =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json");
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json");
         let err = Cursor::decode(&token).unwrap_err();
         assert!(matches!(err, ObservabilityError::InvalidCursor { .. }));
     }

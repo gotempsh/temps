@@ -149,11 +149,9 @@ impl From<ObservabilityError> for Problem {
                     .with_title("Project Not Found")
                     .with_detail(error.to_string())
             }
-            ObservabilityError::EventNotFound { .. } => {
-                problemdetails::new(StatusCode::NOT_FOUND)
-                    .with_title("Event Not Found")
-                    .with_detail(error.to_string())
-            }
+            ObservabilityError::EventNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Event Not Found")
+                .with_detail(error.to_string()),
             ObservabilityError::InvalidKindsFilter { .. }
             | ObservabilityError::InvalidCursor { .. }
             | ObservabilityError::InvalidTimeRange { .. } => {
@@ -199,7 +197,10 @@ pub async fn observability_full_event(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, LogsRead);
 
-    let event = state.service.fetch_full(project_id, kind, &event_id).await?;
+    let event = state
+        .service
+        .fetch_full(project_id, kind, &event_id)
+        .await?;
     Ok((StatusCode::OK, Json(event)))
 }
 
@@ -233,9 +234,7 @@ mod tests {
             ObservabilityError::InvalidKindsFilter {
                 value: "bad".into(),
             },
-            ObservabilityError::InvalidCursor {
-                reason: "x".into(),
-            },
+            ObservabilityError::InvalidCursor { reason: "x".into() },
             ObservabilityError::InvalidTimeRange {
                 from: "a".into(),
                 to: "b".into(),

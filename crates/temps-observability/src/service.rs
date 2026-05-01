@@ -211,14 +211,13 @@ impl ObservabilityService {
                 Ok(FullEvent::Revenue(rev))
             }
             EventKind::Span => {
-                let row = self
-                    .find_span_by_id(project_id, id)
-                    .await?
-                    .ok_or_else(|| ObservabilityError::EventNotFound {
+                let row = self.find_span_by_id(project_id, id).await?.ok_or_else(|| {
+                    ObservabilityError::EventNotFound {
                         project_id,
                         kind: "span".into(),
                         event_id: id.into(),
-                    })?;
+                    }
+                })?;
                 let ObservabilityEvent::Span(full) = map_span(row) else {
                     unreachable!("map_span returns Span variant");
                 };
@@ -231,8 +230,8 @@ impl ObservabilityService {
         &self,
         filters: &EventFilters,
     ) -> Result<Vec<ObservabilityEvent>, ObservabilityError> {
-        let mut q = proxy_logs::Entity::find()
-            .filter(proxy_logs::Column::ProjectId.eq(filters.project_id));
+        let mut q =
+            proxy_logs::Entity::find().filter(proxy_logs::Column::ProjectId.eq(filters.project_id));
         if let Some(from) = filters.from {
             q = q.filter(proxy_logs::Column::Timestamp.gte(from));
         }
@@ -352,10 +351,7 @@ impl ObservabilityService {
             values.push(format!("%{}%", s).into());
             next_param += 1;
         }
-        sql.push_str(&format!(
-            " ORDER BY start_time DESC LIMIT ${}",
-            next_param
-        ));
+        sql.push_str(&format!(" ORDER BY start_time DESC LIMIT ${}", next_param));
         values.push(sea_orm::Value::BigInt(Some(filters.limit as i64)));
 
         let stmt = Statement::from_sql_and_values(DatabaseBackend::Postgres, &sql, values);

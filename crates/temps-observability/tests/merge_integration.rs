@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use chrono::{Duration, TimeZone, Utc};
 use sea_orm::{ActiveModelTrait, DatabaseConnection, Set};
-use temps_database::test_utils::TestDatabase;
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+use temps_database::test_utils::TestDatabase;
 use temps_entities::{error_events, error_groups, projects, proxy_logs, revenue_events};
 use temps_observability::{
-    service::FullEvent, EventFilters, EventKind, ObservabilityEvent, ObservabilityError,
+    service::FullEvent, EventFilters, EventKind, ObservabilityError, ObservabilityEvent,
     ObservabilityService,
 };
 use uuid::Uuid;

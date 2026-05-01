@@ -16,17 +16,13 @@ pub enum ObservabilityError {
         event_id: String,
     },
 
-    #[error(
-        "Invalid kinds filter: '{value}'. Valid kinds: log, request, span, error, revenue"
-    )]
+    #[error("Invalid kinds filter: '{value}'. Valid kinds: log, request, span, error, revenue")]
     InvalidKindsFilter { value: String },
 
     #[error("Invalid cursor: {reason}")]
     InvalidCursor { reason: String },
 
-    #[error(
-        "Time range invalid: from={from} is after to={to}; the merge query needs from <= to"
-    )]
+    #[error("Time range invalid: from={from} is after to={to}; the merge query needs from <= to")]
     InvalidTimeRange { from: String, to: String },
 
     #[error("Database error: {0}")]

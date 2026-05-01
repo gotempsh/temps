@@ -50,12 +50,12 @@ use temps_monitoring::{
     OutageDetectionService,
 };
 use temps_notifications::NotificationsPlugin;
+use temps_observability::ObservabilityPlugin;
 use temps_otel::plugin::OtelPlugin;
 use temps_projects::ProjectsPlugin;
 use temps_providers::ProvidersPlugin;
 use temps_proxy::ProxyPlugin;
 use temps_queue::QueuePlugin;
-use temps_observability::ObservabilityPlugin;
 use temps_revenue::RevenuePlugin;
 use temps_sandbox::plugin::SandboxPlugin;
 use temps_screenshots::ScreenshotsPlugin;

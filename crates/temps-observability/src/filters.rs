@@ -82,11 +82,13 @@ pub fn clamp_limit(raw: Option<u64>) -> u64 {
 /// Implemented as a heap-free linear scan over the per-kind cursors since
 /// `EventKind::ALL.len()` is 5; the constant factor beats the heap setup
 /// for any realistic page size.
-pub fn merge_desc_by_ts(streams: Vec<Vec<ObservabilityEvent>>, limit: usize) -> Vec<ObservabilityEvent> {
+pub fn merge_desc_by_ts(
+    streams: Vec<Vec<ObservabilityEvent>>,
+    limit: usize,
+) -> Vec<ObservabilityEvent> {
     let mut cursors: Vec<std::vec::IntoIter<ObservabilityEvent>> =
         streams.into_iter().map(|s| s.into_iter()).collect();
-    let mut heads: Vec<Option<ObservabilityEvent>> =
-        cursors.iter_mut().map(|c| c.next()).collect();
+    let mut heads: Vec<Option<ObservabilityEvent>> = cursors.iter_mut().map(|c| c.next()).collect();
 
     let mut out = Vec::with_capacity(limit);
     while out.len() < limit {
@@ -293,8 +295,7 @@ mod tests {
 
     #[test]
     fn merge_handles_single_empty_stream() {
-        let merged: Vec<ObservabilityEvent> =
-            merge_desc_by_ts(vec![vec![]], 10);
+        let merged: Vec<ObservabilityEvent> = merge_desc_by_ts(vec![vec![]], 10);
         assert!(merged.is_empty());
     }
 

@@ -17,9 +17,7 @@ use super::types::{CreateErrorEventData, ErrorTrackingError};
 fn extract_trace_id_from_data(data: &serde_json::Value) -> Option<String> {
     fn validate(v: &serde_json::Value) -> Option<String> {
         let s = v.as_str()?.trim().to_ascii_lowercase();
-        if s.len() == 32
-            && s.chars().all(|c| c.is_ascii_hexdigit())
-            && s.chars().any(|c| c != '0')
+        if s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit()) && s.chars().any(|c| c != '0')
         {
             Some(s)
         } else {
@@ -681,8 +679,7 @@ mod trace_id_extraction_tests {
         let bad = json!({ "trace": { "trace_id": "deadbeef" } });
         assert_eq!(extract_trace_id_from_data(&bad), None);
 
-        let nonhex =
-            json!({ "trace": { "trace_id": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" } });
+        let nonhex = json!({ "trace": { "trace_id": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" } });
         assert_eq!(extract_trace_id_from_data(&nonhex), None);
     }
 
