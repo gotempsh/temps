@@ -472,6 +472,36 @@ impl LoadBalancer {
         &self.session_manager
     }
 
+    /// Pull the W3C `traceparent` trace_id (the 32-hex-char `<trace-id>` field)
+    /// from a request header map. Returns `None` when the header is missing,
+    /// malformed, or carries the all-zero invalid trace_id reserved by the
+    /// spec. Stamped onto `proxy_logs.trace_id` so the unified Observe view
+    /// can join the request row to its child spans, runtime logs, and any
+    /// captured exceptions.
+    fn extract_traceparent_trace_id(
+        headers: Option<&std::collections::HashMap<String, String>>,
+    ) -> Option<String> {
+        let headers = headers?;
+        let raw = headers
+            .get("traceparent")
+            .or_else(|| headers.get("Traceparent"))
+            .or_else(|| headers.get("TRACEPARENT"))?;
+
+        // traceparent: "<version>-<trace-id>-<parent-id>-<flags>"
+        let mut parts = raw.split('-');
+        let _version = parts.next()?;
+        let trace_id = parts.next()?;
+
+        if trace_id.len() != 32
+            || !trace_id.chars().all(|c| c.is_ascii_hexdigit())
+            || trace_id.chars().all(|c| c == '0')
+        {
+            return None;
+        }
+
+        Some(trace_id.to_ascii_lowercase())
+    }
+
     /// Check if a request should be logged to proxy_logs based on path
     fn should_log_request(path: &str) -> bool {
         if LOG_STATIC_ASSETS {
@@ -1145,6 +1175,8 @@ impl LoadBalancer {
                     .response_headers
                     .as_ref()
                     .and_then(|h| serde_json::to_value(h).ok()),
+                trace_id: Self::extract_traceparent_trace_id(ctx.request_headers.as_ref()),
+                error_group_id: None,
             };
 
             // Send to batch writer with backpressure (blocks briefly if buffer full)
@@ -1265,6 +1297,8 @@ impl LoadBalancer {
                 .as_ref()
                 .and_then(|h| serde_json::to_value(h).ok()),
             response_headers: None,
+            trace_id: Self::extract_traceparent_trace_id(ctx.request_headers.as_ref()),
+            error_group_id: None,
         };
 
         // Send to batch writer (non-blocking, drops if buffer full)
@@ -3935,6 +3969,8 @@ impl ProxyHttp for LoadBalancer {
                     .response_headers
                     .as_ref()
                     .and_then(|h| serde_json::to_value(h).ok()),
+                trace_id: Self::extract_traceparent_trace_id(ctx.request_headers.as_ref()),
+                error_group_id: None,
             };
 
             // Send to batch writer (non-blocking, drops if buffer full)
@@ -5029,6 +5065,73 @@ mod markdown_pipeline_tests {
         assert!(
             resp_no.headers.get("vary").is_none(),
             "Vary must NOT be added when conversion is cancelled"
+        );
+    }
+}
+
+#[cfg(test)]
+mod traceparent_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn headers_with(name: &str, value: &str) -> HashMap<String, String> {
+        let mut h = HashMap::new();
+        h.insert(name.to_string(), value.to_string());
+        h
+    }
+
+    #[test]
+    fn extracts_valid_traceparent_trace_id() {
+        let h = headers_with(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        );
+        assert_eq!(
+            LoadBalancer::extract_traceparent_trace_id(Some(&h)),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_when_header_absent() {
+        let h: HashMap<String, String> = HashMap::new();
+        assert_eq!(LoadBalancer::extract_traceparent_trace_id(Some(&h)), None);
+        assert_eq!(LoadBalancer::extract_traceparent_trace_id(None), None);
+    }
+
+    #[test]
+    fn returns_none_for_all_zero_trace_id() {
+        let h = headers_with(
+            "traceparent",
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+        );
+        assert_eq!(LoadBalancer::extract_traceparent_trace_id(Some(&h)), None);
+    }
+
+    #[test]
+    fn returns_none_for_wrong_length() {
+        let h = headers_with("traceparent", "00-deadbeef-00f067aa0ba902b7-01");
+        assert_eq!(LoadBalancer::extract_traceparent_trace_id(Some(&h)), None);
+    }
+
+    #[test]
+    fn returns_none_for_non_hex_chars() {
+        let h = headers_with(
+            "traceparent",
+            "00-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-00f067aa0ba902b7-01",
+        );
+        assert_eq!(LoadBalancer::extract_traceparent_trace_id(Some(&h)), None);
+    }
+
+    #[test]
+    fn lowercases_uppercase_hex() {
+        let h = headers_with(
+            "traceparent",
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+        );
+        assert_eq!(
+            LoadBalancer::extract_traceparent_trace_id(Some(&h)),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string())
         );
     }
 }

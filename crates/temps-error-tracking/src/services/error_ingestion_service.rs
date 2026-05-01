@@ -10,6 +10,73 @@ use temps_entities::{error_events, error_groups};
 
 use super::types::{CreateErrorEventData, ErrorTrackingError};
 
+/// Pull a 32-hex-char OTel trace_id out of an error event's JSONB `data`
+/// blob. Probes both the Sentry layout (`contexts.trace.trace_id`) and our
+/// internal layout (`trace.trace_id`). Returns `None` when no valid
+/// trace_id is present so the indexed column stays NULL for legacy events.
+fn extract_trace_id_from_data(data: &serde_json::Value) -> Option<String> {
+    fn validate(v: &serde_json::Value) -> Option<String> {
+        let s = v.as_str()?.trim().to_ascii_lowercase();
+        if s.len() == 32
+            && s.chars().all(|c| c.is_ascii_hexdigit())
+            && s.chars().any(|c| c != '0')
+        {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    // Sentry / our internal wrapper: data.sentry.contexts.trace.trace_id
+    if let Some(v) = data.pointer("/sentry/contexts/trace/trace_id") {
+        if let Some(s) = validate(v) {
+            return Some(s);
+        }
+    }
+    // Top-level Sentry payload: data.contexts.trace.trace_id
+    if let Some(v) = data.pointer("/contexts/trace/trace_id") {
+        if let Some(s) = validate(v) {
+            return Some(s);
+        }
+    }
+    // Custom layout via TraceContext: data.trace.trace_id
+    if let Some(v) = data.pointer("/trace/trace_id") {
+        if let Some(s) = validate(v) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Probe a raw Sentry payload for a usable human-readable message.
+///
+/// SDKs that send `captureMessage()` (no exception) put the text in
+/// `logentry.formatted` (the rendered string after parameter
+/// substitution) or `logentry.message` (the template). SDKs sending
+/// `captureException()` put it in `exception.values[0].value`. Some
+/// older SDKs use the deprecated top-level `message`. We probe in
+/// priority order and return the first non-empty hit.
+pub fn extract_message_from_raw(raw: Option<&serde_json::Value>) -> Option<String> {
+    let raw = raw?;
+    let candidates = [
+        "/logentry/formatted",
+        "/logentry/message",
+        "/message",
+        "/exception/values/0/value",
+        "/breadcrumbs/values/0/message",
+        "/extra/message",
+    ];
+    for path in candidates {
+        if let Some(s) = raw.pointer(path).and_then(|v| v.as_str()) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Service for ingesting and processing error events
 pub struct ErrorIngestionService {
     db: Arc<DatabaseConnection>,
@@ -313,34 +380,45 @@ impl ErrorIngestionService {
         error_data: &CreateErrorEventData,
         _fingerprint: &str,
     ) -> Result<i32, ErrorTrackingError> {
-        // Use first exception for title, or fall back to legacy fields
+        // Use first exception for title, or fall back to legacy fields.
+        // When `exception_value` is missing (most `captureMessage` payloads
+        // and Sentry SDKs that send only an event-level message), probe
+        // the raw event for a usable message so the title doesn't render
+        // as the useless literal "Error: Unknown error".
         let (exception_type, exception_value) =
             if let Some(first_exception) = error_data.exceptions.first() {
-                (
-                    first_exception.exception_type.clone(),
-                    first_exception
-                        .exception_value
-                        .clone()
-                        .unwrap_or_else(|| "Unknown error".to_string()),
-                )
+                let value = first_exception
+                    .exception_value
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| extract_message_from_raw(error_data.raw_sentry_event.as_ref()));
+                (first_exception.exception_type.clone(), value)
             } else {
+                let value = error_data
+                    .exception_value
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| extract_message_from_raw(error_data.raw_sentry_event.as_ref()));
                 (
                     error_data
                         .exception_type
                         .clone()
                         .unwrap_or_else(|| "Error".to_string()),
-                    error_data
-                        .exception_value
-                        .clone()
-                        .unwrap_or_else(|| "Unknown error".to_string()),
+                    value,
                 )
             };
 
-        let title = format!(
-            "{}: {}",
-            exception_type,
-            exception_value.chars().take(100).collect::<String>()
-        );
+        let title = match exception_value.as_deref() {
+            Some(v) if !v.trim().is_empty() => format!(
+                "{}: {}",
+                exception_type,
+                v.chars().take(100).collect::<String>()
+            ),
+            _ => exception_type.clone(),
+        };
+        // `exception_value` flows on into the embedding; fall back to the
+        // type so we still get a meaningful similarity vector.
+        let exception_value = exception_value.unwrap_or_else(|| exception_type.clone());
 
         // Create embedding from error message for similarity search (reuse exception_value from above)
         let embedding = self.create_embedding(&exception_value);
@@ -495,6 +573,14 @@ impl ErrorIngestionService {
                 )
             };
 
+        // Promote the OTel trace_id (if any) from the JSONB data blob to the
+        // top-level `trace_id_indexed` column so the unified Observe view can
+        // join error rows to their originating request/span without a JSON
+        // probe. Probes both the Sentry layout (`contexts.trace.trace_id`)
+        // and our internal layout (`trace.trace_id`); validates 32-hex
+        // before persisting.
+        let trace_id_indexed = extract_trace_id_from_data(&data_json);
+
         let new_event = error_events::ActiveModel {
             error_group_id: Set(group_id),
             fingerprint_hash: Set(fingerprint.to_string()),
@@ -508,6 +594,7 @@ impl ErrorIngestionService {
             deployment_id: Set(error_data.deployment_id),
             visitor_id: Set(error_data.visitor_id),
             ip_geolocation_id: Set(error_data.ip_geolocation_id),
+            trace_id_indexed: Set(trace_id_indexed),
             created_at: Set(Utc::now()),
             ..Default::default()
         };
@@ -536,4 +623,85 @@ impl ErrorIngestionService {
 #[cfg(test)]
 mod tests {
     include!("error_ingestion_tests.rs");
+}
+
+#[cfg(test)]
+mod trace_id_extraction_tests {
+    use super::extract_trace_id_from_data;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_from_sentry_wrapped_layout() {
+        let data = json!({
+            "source": "sentry",
+            "sentry": {
+                "contexts": {
+                    "trace": { "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736" }
+                }
+            }
+        });
+        assert_eq!(
+            extract_trace_id_from_data(&data),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_from_top_level_contexts_layout() {
+        let data = json!({
+            "contexts": {
+                "trace": { "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736" }
+            }
+        });
+        assert_eq!(
+            extract_trace_id_from_data(&data),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_from_internal_trace_layout() {
+        let data = json!({
+            "trace": { "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736" }
+        });
+        assert_eq!(
+            extract_trace_id_from_data(&data),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_when_missing() {
+        let data = json!({ "exception": "boom" });
+        assert_eq!(extract_trace_id_from_data(&data), None);
+    }
+
+    #[test]
+    fn rejects_invalid_lengths_and_chars() {
+        let bad = json!({ "trace": { "trace_id": "deadbeef" } });
+        assert_eq!(extract_trace_id_from_data(&bad), None);
+
+        let nonhex =
+            json!({ "trace": { "trace_id": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz" } });
+        assert_eq!(extract_trace_id_from_data(&nonhex), None);
+    }
+
+    #[test]
+    fn rejects_all_zero_invalid_trace_id() {
+        let data = json!({
+            "trace": { "trace_id": "00000000000000000000000000000000" }
+        });
+        assert_eq!(extract_trace_id_from_data(&data), None);
+    }
+
+    #[test]
+    fn lowercases_input() {
+        let data = json!({
+            "trace": { "trace_id": "4BF92F3577B34DA6A3CE929D0E0E4736" }
+        });
+        assert_eq!(
+            extract_trace_id_from_data(&data),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string())
+        );
+    }
 }

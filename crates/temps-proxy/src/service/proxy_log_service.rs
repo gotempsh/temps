@@ -130,6 +130,15 @@ pub struct CreateProxyLogRequest {
     pub cache_status: Option<String>,
     pub request_headers: Option<serde_json::Value>,
     pub response_headers: Option<serde_json::Value>,
+    /// W3C `traceparent` trace_id (32 hex chars) extracted from inbound
+    /// headers. `None` when the client didn't send `traceparent`. Lets the
+    /// unified Observe view join this row with child OTel spans, runtime
+    /// log lines, and any captured exceptions for the same trace.
+    pub trace_id: Option<String>,
+    /// Set by the deployment runtime (or async stamping) when this request
+    /// produced a captured exception. Lets the Observe row deep-link to the
+    /// error group without an extra query.
+    pub error_group_id: Option<i32>,
 }
 
 pub struct ProxyLogService {
@@ -223,6 +232,8 @@ impl ProxyLogService {
             request_headers: Set(request.request_headers),
             response_headers: Set(request.response_headers),
             created_date: Set(created_date),
+            trace_id: Set(request.trace_id),
+            error_group_id: Set(request.error_group_id),
             ..Default::default()
         };
 

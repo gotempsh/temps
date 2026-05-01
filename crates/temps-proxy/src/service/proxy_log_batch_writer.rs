@@ -355,6 +355,8 @@ mod tests {
             cache_status: None,
             request_headers: None,
             response_headers: None,
+            trace_id: None,
+            error_group_id: None,
         };
 
         // Send should succeed
@@ -406,6 +408,8 @@ mod tests {
             cache_status: None,
             request_headers: None,
             response_headers: None,
+            trace_id: None,
+            error_group_id: None,
         };
 
         // try_send should succeed when channel has capacity
@@ -455,6 +459,8 @@ mod tests {
             cache_status: None,
             request_headers: None,
             response_headers: None,
+            trace_id: None,
+            error_group_id: None,
         };
 
         // Send should fail because the writer (receiver) is dropped
@@ -504,6 +510,8 @@ mod tests {
             cache_status: None,
             request_headers: None,
             response_headers: None,
+            trace_id: None,
+            error_group_id: None,
         };
 
         writer.enrich_entry(&mut entry).await;
@@ -557,6 +565,8 @@ mod tests {
             cache_status: None,
             request_headers: None,
             response_headers: None,
+            trace_id: None,
+            error_group_id: None,
         };
 
         writer.enrich_entry(&mut entry).await;

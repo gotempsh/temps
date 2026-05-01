@@ -215,6 +215,12 @@ pub struct Model {
     #[sea_orm(column_type = "JsonBinary")]
     pub data: Option<serde_json::Value>,
 
+    // ===== Indexed correlation =====
+    /// Denormalized copy of `data.trace.trace_id` promoted to a top-level
+    /// indexed column so the Observe merge query can join error rows with
+    /// the originating request/span without a JSON probe.
+    pub trace_id_indexed: Option<String>,
+
     // ===== Metadata =====
     pub created_at: DBDateTime,
 }

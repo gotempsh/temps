@@ -81,6 +81,7 @@ mod m20260428_000003_create_node_route_state;
 mod m20260430_000001_add_deployment_container_exit_info;
 mod m20260430_000002_add_deployment_container_runtime_info;
 mod m20260501_000001_add_gitlab_webhook_to_projects;
+mod m20260502_000001_add_observe_correlation;
 
 pub struct Migrator;
 
@@ -165,6 +166,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260430_000001_add_deployment_container_exit_info::Migration),
             Box::new(m20260430_000002_add_deployment_container_runtime_info::Migration),
             Box::new(m20260501_000001_add_gitlab_webhook_to_projects::Migration),
+            Box::new(m20260502_000001_add_observe_correlation::Migration),
         ]
     }
 }

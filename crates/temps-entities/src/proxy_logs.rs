@@ -113,6 +113,16 @@ pub struct Model {
 
     /// Visitor ID for tracking unique visitors
     pub visitor_id: Option<i32>,
+
+    /// OTel trace_id stamped from the request span when available — lets the
+    /// unified Observe view join request rows with their child spans, runtime
+    /// log lines, and any captured exceptions.
+    pub trace_id: Option<String>,
+
+    /// Set when the request produced a captured exception in
+    /// `temps-error-tracking`; lets the Observe row deep-link to the group
+    /// without an extra query.
+    pub error_group_id: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

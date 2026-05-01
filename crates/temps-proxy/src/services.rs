@@ -319,6 +319,8 @@ impl RequestLogger for RequestLoggerImpl {
             created_date: Set(data.started_at.date_naive()),
             session_id: Set(data.session.as_ref().map(|s| s.session_id_i32)),
             visitor_id: Set(data.visitor.as_ref().map(|v| v.visitor_id_i32)),
+            trace_id: Set(data.trace_id),
+            error_group_id: Set(None),
             ..Default::default()
         };
 
@@ -960,6 +962,7 @@ mod tests {
             visitor: None,
             session: None,
             project_context: Some(context.clone()),
+            trace_id: None,
         };
 
         logger.log_request(log_data).await.unwrap();
@@ -1008,6 +1011,7 @@ mod tests {
             visitor: None,
             session: None,
             project_context: Some(context),
+            trace_id: None,
         };
 
         logger.log_request(log_data).await.unwrap();
@@ -1054,6 +1058,7 @@ mod tests {
             visitor: None,
             session: None,
             project_context: Some(context),
+            trace_id: None,
         };
 
         logger.log_request(log_data).await.unwrap();
@@ -1101,6 +1106,7 @@ mod tests {
             visitor: None,
             session: None,
             project_context: Some(context),
+            trace_id: None,
         };
 
         logger.log_request(log_data).await.unwrap();
@@ -1193,6 +1199,7 @@ mod tests {
             visitor: Some(visitor_data),
             session: Some(session_data),
             project_context: Some(context),
+            trace_id: None,
         };
 
         logger.log_request(log_data).await.unwrap();

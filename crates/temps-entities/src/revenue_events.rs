@@ -30,6 +30,20 @@ pub struct Model {
     pub price_id: Option<String>,
     /// Opaque product reference (Stripe product_id, …). NULL mirrors `price_id`.
     pub product_id: Option<String>,
+
+    /// Deployment that produced this revenue event, when the SDK supplied
+    /// the `X-Temps-Deployment-Id` header. NULL for webhooks delivered
+    /// outside a request context.
+    pub deployment_id: Option<i32>,
+
+    /// Environment that produced this revenue event, when known via the
+    /// SDK header.
+    pub environment_id: Option<i32>,
+
+    /// OTel trace_id from the originating request, when supplied by the
+    /// SDK header. Lets the Observe view link a payment to the request that
+    /// triggered it.
+    pub trace_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

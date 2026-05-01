@@ -49,6 +49,11 @@ pub struct RequestLogData {
     pub visitor: Option<Visitor>,
     pub session: Option<Session>,
     pub project_context: Option<ProjectContext>,
+    /// W3C `traceparent` trace_id (32 hex chars) extracted from the inbound
+    /// request headers when present. Stamped onto `proxy_logs.trace_id` so
+    /// the unified Observe view can correlate this request with its child
+    /// spans, runtime logs, and any captured exceptions.
+    pub trace_id: Option<String>,
 }
 
 /// Cookie configuration for visitor/session tracking
