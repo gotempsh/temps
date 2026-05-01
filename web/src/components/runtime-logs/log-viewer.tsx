@@ -8,6 +8,12 @@ import {
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -20,7 +26,16 @@ import {
 import { cn } from '@/lib/utils'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { AlertCircle, ChevronDown, ChevronUp, Search } from 'lucide-react'
+import {
+  AlertCircle,
+  ChevronDown,
+  ChevronUp,
+  Pause,
+  Play,
+  RefreshCw,
+  Search,
+  Timer,
+} from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { FilterBar } from './filter-bar'
 import { LogLine } from './log-line'
@@ -45,6 +60,64 @@ function SelectedContainerLabel({
       </span>
     </div>
   )
+}
+
+// Visible log cap — same in every mode. The log viewer is a peephole, not a
+// recorder; if you want history, that's the History tab's job. Live/Pause/
+// Interval all just decide *when* you see the most recent N lines.
+const MAX_VISIBLE_LOGS = 5000
+// Cap on the pending buffer between flushes. On a 1500-line/sec firehose at
+// a 30s interval that's ~44k lines a tick — we don't want 44k strings sitting
+// in JS memory waiting to render. Trim to the most recent 1000 and surface
+// the dropped count so the user knows they're sampling, not recording.
+const MAX_PENDING_BUFFER = 1000
+
+const INTERVAL_OPTIONS_MS = [5_000, 30_000, 60_000] as const
+type IntervalMs = (typeof INTERVAL_OPTIONS_MS)[number]
+
+type LogMode =
+  | { kind: 'live' }
+  | { kind: 'pause' }
+  | { kind: 'interval'; ms: IntervalMs }
+
+const DEFAULT_MODE: LogMode = { kind: 'live' }
+const DEFAULT_INTERVAL_MS: IntervalMs = 5_000
+
+function modeStorageKey(projectSlug: string) {
+  return `temps:runtime-logs:mode:${projectSlug}`
+}
+
+function loadPersistedMode(projectSlug: string): LogMode {
+  if (typeof window === 'undefined') return DEFAULT_MODE
+  try {
+    const raw = window.localStorage.getItem(modeStorageKey(projectSlug))
+    if (!raw) return DEFAULT_MODE
+    const parsed = JSON.parse(raw) as LogMode
+    if (parsed.kind === 'live' || parsed.kind === 'pause') return parsed
+    if (
+      parsed.kind === 'interval' &&
+      (INTERVAL_OPTIONS_MS as readonly number[]).includes(parsed.ms)
+    ) {
+      return parsed
+    }
+  } catch {
+    // ignore — corrupt entry
+  }
+  return DEFAULT_MODE
+}
+
+function persistMode(projectSlug: string, mode: LogMode) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(modeStorageKey(projectSlug), JSON.stringify(mode))
+  } catch {
+    // ignore — quota / disabled storage
+  }
+}
+
+function formatIntervalLabel(ms: IntervalMs): string {
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`
+  return `${Math.round(ms / 60_000)}m`
 }
 
 function estimateLineHeight(content: string, containerWidth: number) {
@@ -89,12 +162,48 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
   const [tail, setTail] = useState<number>(1000)
   const [autoScroll, setAutoScroll] = useState(true)
   const [showTimestamps, setShowTimestamps] = useState(false)
+  // Refresh mode: Live (rAF every frame), Pause (never auto-flush), or
+  // Interval (flush every N ms). Persisted per-project so users don't re-pick
+  // it every visit.
+  const [mode, setMode] = useState<LogMode>(() => loadPersistedMode(project.slug))
+  // Last interval the user picked, so toggling "Interval" remembers their
+  // previous duration instead of resetting to 5s every time.
+  const [lastIntervalMs, setLastIntervalMs] = useState<IntervalMs>(() => {
+    const persisted = loadPersistedMode(project.slug)
+    return persisted.kind === 'interval' ? persisted.ms : DEFAULT_INTERVAL_MS
+  })
+  // Visible counter: how many lines are sitting in the pending buffer waiting
+  // for the next flush. We re-render this on a slow cadence so the counter
+  // doesn't cost per-line renders.
+  const [bufferedCount, setBufferedCount] = useState(0)
+  // Lines that arrived while the buffer was already full — never made it into
+  // React state. Surfaced in the status row so users notice they're sampling
+  // and can switch to a shorter interval, Live mode, or the History tab.
+  const [droppedSinceFlush, setDroppedSinceFlush] = useState(0)
+  // Ref mirror so the WS callback (created once) can increment without
+  // depending on the latest setter closure.
+  const droppedSinceFlushRef = useRef(0)
+  // Countdown-to-next-tick state, only meaningful in Interval mode.
+  const [nextTickAt, setNextTickAt] = useState<number | null>(null)
+  const [now, setNow] = useState(() => Date.now())
   const parentRef = useRef<HTMLDivElement>(null)
-  const matchRefs = useRef<HTMLSpanElement[]>([])
   const wsRef = useRef<WebSocket | null>(null)
   const containerWidth = useRef<number>(0)
   const isConnectingRef = useRef(false)
   const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Buffered lines awaiting flush. Drained at different cadences depending on
+  // mode (rAF for live, setInterval for interval, never for pause).
+  const pendingLogsRef = useRef<string[]>([])
+  const rafHandleRef = useRef<number | null>(null)
+  const intervalHandleRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  // Live-mirror of mode/lastInterval so the WS callbacks (created once) can
+  // read the latest value without being re-bound on every change.
+  const modeRef = useRef<LogMode>(mode)
+  // Track whether the previous WS effect run was paused. When it was, the
+  // *next* run is "resuming from pause" and should keep the existing visible
+  // logs instead of wiping them. Genuine source changes (container, env,
+  // dates, tail, timestamps) still wipe.
+  const wasPausedRef = useRef(mode.kind === 'pause')
   const virtualizer = useVirtualizer({
     count: logs.length,
     getScrollElement: () => parentRef.current,
@@ -200,6 +309,109 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     }
   }, [containersData, selectedContainer])
 
+  // Persist mode + keep a ref in sync for WS callbacks.
+  useEffect(() => {
+    modeRef.current = mode
+    persistMode(project.slug, mode)
+  }, [mode, project.slug])
+
+  // Drain pendingLogsRef into the visible logs list, then trim to the visible
+  // cap. Same cap in every mode — the buffer is a peephole, not a recorder.
+  const flushPending = useCallback(() => {
+    const incoming = pendingLogsRef.current
+    pendingLogsRef.current = []
+    setBufferedCount(0)
+    setDroppedSinceFlush(0)
+    droppedSinceFlushRef.current = 0
+    if (incoming.length === 0) return
+    setLogs((prev) => {
+      const merged = [...prev, ...incoming]
+      return merged.length > MAX_VISIBLE_LOGS
+        ? merged.slice(-MAX_VISIBLE_LOGS)
+        : merged
+    })
+  }, [])
+
+  // Enqueue a single line. In Live mode we schedule a rAF flush immediately
+  // so the existing per-frame behavior is preserved. In Pause/Interval modes
+  // the line just sits in the buffer until the corresponding mechanism drains
+  // it — *but* the buffer is capped at MAX_PENDING_BUFFER so a high-volume
+  // stream during a 30s tick can't accumulate megabytes in JS memory. When
+  // the cap is hit we drop the oldest pending line and bump the dropped
+  // counter so the user notices they're sampling.
+  const enqueueLog = useCallback(
+    (line: string) => {
+      const buf = pendingLogsRef.current
+      buf.push(line)
+      if (buf.length > MAX_PENDING_BUFFER) {
+        const overflow = buf.length - MAX_PENDING_BUFFER
+        buf.splice(0, overflow)
+        droppedSinceFlushRef.current += overflow
+      }
+      if (modeRef.current.kind === 'live') {
+        if (rafHandleRef.current != null) return
+        rafHandleRef.current = requestAnimationFrame(() => {
+          rafHandleRef.current = null
+          flushPending()
+        })
+      } else {
+        // For Pause/Interval, keep counters fresh on a slow cadence — the
+        // dedicated effect below ticks `now` once a second.
+        setBufferedCount(buf.length)
+        if (droppedSinceFlushRef.current > 0) {
+          setDroppedSinceFlush(droppedSinceFlushRef.current)
+        }
+      }
+    },
+    [flushPending],
+  )
+
+  // Drive the Interval mode flush + countdown. Also drives the 1Hz "now" tick
+  // so the "Next refresh in 0:03" / buffered counter UIs stay live.
+  useEffect(() => {
+    // Always tick "now" at 1Hz so countdowns + buffered counts update.
+    const nowTimer = setInterval(() => setNow(Date.now()), 1000)
+    if (mode.kind !== 'interval') {
+      setNextTickAt(null)
+      return () => clearInterval(nowTimer)
+    }
+    const ms = mode.ms
+    setNextTickAt(Date.now() + ms)
+    intervalHandleRef.current = setInterval(() => {
+      flushPending()
+      setNextTickAt(Date.now() + ms)
+    }, ms)
+    return () => {
+      clearInterval(nowTimer)
+      if (intervalHandleRef.current != null) {
+        clearInterval(intervalHandleRef.current)
+        intervalHandleRef.current = null
+      }
+    }
+  }, [mode, flushPending])
+
+  // When entering Pause from Live, cancel any pending rAF so the in-flight
+  // batch doesn't surprise-flush after the user just paused. The buffered
+  // counter immediately reflects whatever was already pending.
+  useEffect(() => {
+    if (mode.kind === 'live') return
+    if (rafHandleRef.current != null) {
+      cancelAnimationFrame(rafHandleRef.current)
+      rafHandleRef.current = null
+    }
+    setBufferedCount(pendingLogsRef.current.length)
+  }, [mode])
+
+  // Manual "Resume" / "Refresh now" — flush whatever is buffered into the
+  // visible list immediately. Used by both the Pause-mode resume button and
+  // the Interval-mode "refresh now" button.
+  const flushNow = useCallback(() => {
+    flushPending()
+    if (modeRef.current.kind === 'interval') {
+      setNextTickAt(Date.now() + modeRef.current.ms)
+    }
+  }, [flushPending])
+
   // WebSocket connection effect
   useEffect(() => {
     if (!selectedTarget) return
@@ -207,11 +419,34 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     // Wait for container to be selected - don't connect without a specific container
     if (!selectedContainer) return
 
+    // Pause mode: don't open the WS at all. The cleanup from the previous
+    // effect run (if any) has already closed any existing socket. We keep the
+    // visible logs intact so the user can read what's on screen.
+    if (mode.kind === 'pause') {
+      wasPausedRef.current = true
+      return
+    }
+
+    const resumingFromPause = wasPausedRef.current
+    wasPausedRef.current = false
+
     // Capture the container this effect-instance is tailing. Used by the
     // socket handlers below to reject any late frames from a previous
     // socket whose handlers may still fire while React is unwinding.
     const targetContainer = selectedContainer
-    setLogs([])
+    // Only wipe state when it's a genuine source change (container/env/dates/
+    // tail/timestamps changed). Resuming from Pause keeps what's on screen.
+    if (!resumingFromPause) {
+      setLogs([])
+      pendingLogsRef.current = []
+      setBufferedCount(0)
+      setDroppedSinceFlush(0)
+      droppedSinceFlushRef.current = 0
+    }
+    if (rafHandleRef.current != null) {
+      cancelAnimationFrame(rafHandleRef.current)
+      rafHandleRef.current = null
+    }
     setRetryCount(0)
     setErrorMessage('')
     isConnectingRef.current = false
@@ -238,8 +473,12 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
           Math.floor(endDate.getTime() / 1000).toString()
         )
       }
-      if (tail) {
-        params.append('tail', tail.toString())
+      // On resume-from-Pause, ask for a small backlog so the user sees a
+      // smooth catch-up of recent activity rather than a wall of history or
+      // a confusing dead pause. On a genuine source change, use the full tail.
+      const effectiveTail = resumingFromPause ? Math.min(tail, 200) : tail
+      if (effectiveTail) {
+        params.append('tail', effectiveTail.toString())
       }
       // Add timestamps parameter
       params.append('timestamps', showTimestamps.toString())
@@ -295,29 +534,18 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
             // Try to parse as JSON first
             const parsed = JSON.parse(event.data)
 
-            // If it's an error object with stack, format it nicely
             if (parsed.error && parsed.stack) {
-              const formattedLog = `ERROR: ${parsed.error}\n${parsed.stack}`
-              setLogs((prevLogs) => [...prevLogs, formattedLog])
-            }
-            // If it's a log object with a message field
-            else if (parsed.message) {
-              setLogs((prevLogs) => [...prevLogs, parsed.message])
-            }
-            // If it's a log object with a log field
-            else if (parsed.log) {
-              setLogs((prevLogs) => [...prevLogs, parsed.log])
-            }
-            // Otherwise stringify it
-            else {
-              setLogs((prevLogs) => [
-                ...prevLogs,
-                JSON.stringify(parsed, null, 2),
-              ])
+              enqueueLog(`ERROR: ${parsed.error}\n${parsed.stack}`)
+            } else if (parsed.message) {
+              enqueueLog(parsed.message)
+            } else if (parsed.log) {
+              enqueueLog(parsed.log)
+            } else {
+              enqueueLog(JSON.stringify(parsed, null, 2))
             }
           } catch {
             // If it's not JSON, just use it as-is
-            setLogs((prevLogs) => [...prevLogs, event.data])
+            enqueueLog(event.data)
           }
         }
 
@@ -376,6 +604,13 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
       isCleaningUp = true
       isConnectingRef.current = false
 
+      // Cancel any pending log flush so it can't fire after unmount.
+      if (rafHandleRef.current != null) {
+        cancelAnimationFrame(rafHandleRef.current)
+        rafHandleRef.current = null
+      }
+      pendingLogsRef.current = []
+
       // Clear any pending retry timeout
       if (retryTimeoutRef.current) {
         clearTimeout(retryTimeoutRef.current)
@@ -416,6 +651,10 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     endDate,
     tail,
     showTimestamps,
+    // Re-run when pause is toggled so the cleanup closes / a fresh connection
+    // opens. We watch mode.kind, not the full mode object, so changing the
+    // interval duration in Interval mode doesn't churn the WS.
+    mode.kind,
   ])
 
   // Shared connectWS function for retry
@@ -460,32 +699,18 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
 
       wsRef.current.onmessage = (event) => {
         try {
-          // Try to parse as JSON first
           const parsed = JSON.parse(event.data)
-
-          // If it's an error object with stack, format it nicely
           if (parsed.error && parsed.stack) {
-            const formattedLog = `ERROR: ${parsed.error}\n${parsed.stack}`
-            setLogs((prevLogs) => [...prevLogs, formattedLog])
-          }
-          // If it's a log object with a message field
-          else if (parsed.message) {
-            setLogs((prevLogs) => [...prevLogs, parsed.message])
-          }
-          // If it's a log object with a log field
-          else if (parsed.log) {
-            setLogs((prevLogs) => [...prevLogs, parsed.log])
-          }
-          // Otherwise stringify it
-          else {
-            setLogs((prevLogs) => [
-              ...prevLogs,
-              JSON.stringify(parsed, null, 2),
-            ])
+            enqueueLog(`ERROR: ${parsed.error}\n${parsed.stack}`)
+          } else if (parsed.message) {
+            enqueueLog(parsed.message)
+          } else if (parsed.log) {
+            enqueueLog(parsed.log)
+          } else {
+            enqueueLog(JSON.stringify(parsed, null, 2))
           }
         } catch {
-          // If it's not JSON, just use it as-is
-          setLogs((prevLogs) => [...prevLogs, event.data])
+          enqueueLog(event.data)
         }
       }
 
@@ -529,36 +754,18 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
     endDate,
     tail,
     showTimestamps,
+    enqueueLog,
   ])
 
-  // Update search functionality
-  const scrollToMatch = (index: number, matches: number) => {
-    if (matches === 0) return
-
-    const wrappedIndex = ((index % matches) + matches) % matches
-    setCurrentMatchIndex(wrappedIndex)
-
-    const element = document.getElementById(`search-match-${wrappedIndex}`)
-    element?.scrollIntoView({
-      behavior: 'smooth',
-      block: 'center',
-    })
-  }
-
-  // Update search refs effect
+  // Reset the active match index when the search term changes. We
+  // deliberately do NOT scan the DOM for matches (the previous implementation
+  // ran `document.querySelectorAll('[id^="search-match-"]')` on every new log
+  // line — those ids are never emitted by `LogLine`, so the scan was both
+  // dead code and an O(N) DOM walk per WS frame, which is what crashed the
+  // page on high-volume streams).
   useEffect(() => {
-    if (!searchTerm) {
-      setCurrentMatchIndex(-1)
-      return
-    }
-
-    const elements = document.querySelectorAll('[id^="search-match-"]')
-    matchRefs.current = Array.from(elements) as HTMLSpanElement[]
-
-    if (matchRefs.current.length > 0 && currentMatchIndex === -1) {
-      scrollToMatch(0, matchRefs.current.length)
-    }
-  }, [logs, searchTerm, currentMatchIndex])
+    setCurrentMatchIndex(-1)
+  }, [searchTerm])
 
   useEffect(() => {
     if (autoScroll && parentRef.current) {
@@ -724,20 +931,130 @@ export default function LogViewer({ project }: { project: ProjectResponse }) {
             </div>
           </div>
 
-          <div className="flex items-center justify-between">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setShowAdvanced(!showAdvanced)}
-              className="text-muted-foreground hover:text-foreground"
-            >
-              Advanced Options
-              {showAdvanced ? (
-                <ChevronUp className="ml-2 h-4 w-4" />
-              ) : (
-                <ChevronDown className="ml-2 h-4 w-4" />
+          <div className="flex flex-wrap items-center gap-3">
+            {/* Mode segmented control */}
+            <div className="inline-flex items-center rounded-md border bg-background p-0.5 text-sm">
+              <Button
+                type="button"
+                variant={mode.kind === 'pause' ? 'secondary' : 'ghost'}
+                size="sm"
+                className="h-7 gap-1.5 px-2"
+                onClick={() => setMode({ kind: 'pause' })}
+                aria-pressed={mode.kind === 'pause'}
+              >
+                <Pause className="h-3.5 w-3.5" />
+                Pause
+              </Button>
+              <Button
+                type="button"
+                variant={mode.kind === 'live' ? 'secondary' : 'ghost'}
+                size="sm"
+                className="h-7 gap-1.5 px-2"
+                onClick={() => setMode({ kind: 'live' })}
+                aria-pressed={mode.kind === 'live'}
+              >
+                <Play className="h-3.5 w-3.5" />
+                Live
+              </Button>
+              <div className="inline-flex items-center">
+                <Button
+                  type="button"
+                  variant={mode.kind === 'interval' ? 'secondary' : 'ghost'}
+                  size="sm"
+                  className="h-7 gap-1.5 rounded-r-none px-2"
+                  onClick={() => {
+                    const ms =
+                      mode.kind === 'interval' ? mode.ms : lastIntervalMs
+                    setMode({ kind: 'interval', ms })
+                  }}
+                  aria-pressed={mode.kind === 'interval'}
+                >
+                  <Timer className="h-3.5 w-3.5" />
+                  Every{' '}
+                  {formatIntervalLabel(
+                    mode.kind === 'interval' ? mode.ms : lastIntervalMs,
+                  )}
+                </Button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      type="button"
+                      variant={mode.kind === 'interval' ? 'secondary' : 'ghost'}
+                      size="sm"
+                      className="h-7 rounded-l-none border-l px-1.5"
+                      aria-label="Choose interval"
+                    >
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    {INTERVAL_OPTIONS_MS.map((ms) => (
+                      <DropdownMenuItem
+                        key={ms}
+                        onSelect={() => {
+                          setLastIntervalMs(ms)
+                          setMode({ kind: 'interval', ms })
+                        }}
+                      >
+                        Every {formatIntervalLabel(ms)}
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+            </div>
+
+            {/* Status: buffered count, countdown, manual flush */}
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              {mode.kind === 'pause' && (
+                <span>Paused · stream closed</span>
               )}
-            </Button>
+              {mode.kind === 'live' && (
+                <span>Live · {logs.length.toLocaleString()} lines</span>
+              )}
+              {mode.kind === 'interval' && (
+                <>
+                  <span>
+                    {nextTickAt != null
+                      ? `Next refresh in ${Math.max(
+                          0,
+                          Math.ceil((nextTickAt - now) / 1000),
+                        )}s`
+                      : 'Refreshing…'}
+                    {bufferedCount > 0 &&
+                      ` · +${bufferedCount.toLocaleString()} buffered`}
+                    {droppedSinceFlush > 0 &&
+                      ` · ${droppedSinceFlush.toLocaleString()} dropped`}
+                  </span>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-6 gap-1 px-2 text-xs"
+                    onClick={flushNow}
+                  >
+                    <RefreshCw className="h-3 w-3" />
+                    Refresh now
+                  </Button>
+                </>
+              )}
+            </div>
+
+            <div className="ml-auto">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowAdvanced(!showAdvanced)}
+                className="text-muted-foreground hover:text-foreground"
+              >
+                Advanced Options
+                {showAdvanced ? (
+                  <ChevronUp className="ml-2 h-4 w-4" />
+                ) : (
+                  <ChevronDown className="ml-2 h-4 w-4" />
+                )}
+              </Button>
+            </div>
           </div>
 
           {showAdvanced && (

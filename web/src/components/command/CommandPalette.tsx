@@ -967,7 +967,7 @@ export function CommandPalette() {
       onOpenChange={setOpen}
       contentClassName="sm:max-w-2xl"
     >
-      <Command className="rounded-lg border shadow-md" loop>
+      <Command className="rounded-lg border shadow-md" loop shouldFilter={false}>
         <CommandInput
           placeholder="Type a command or search..."
           value={search}

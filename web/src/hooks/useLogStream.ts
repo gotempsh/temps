@@ -4,7 +4,10 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 export interface UseLogStreamOptions {
   wsUrl: string
   onError?: (error: string) => void
+  maxLogs?: number
 }
+
+const DEFAULT_MAX_LOGS = 5000
 
 export interface UseLogStreamReturn {
   logs: string[]
@@ -50,6 +53,7 @@ function estimateLineHeight(content: string, containerWidth: number) {
 export function useLogStream({
   wsUrl,
   onError,
+  maxLogs = DEFAULT_MAX_LOGS,
 }: UseLogStreamOptions): UseLogStreamReturn {
   const [logs, setLogs] = useState<string[]>([])
   const [connectionStatus, setConnectionStatus] = useState<
@@ -64,6 +68,11 @@ export function useLogStream({
   const wsRef = useRef<WebSocket | null>(null)
   const isConnectingRef = useRef(false)
   const containerWidth = useRef<number>(0)
+  // Buffer incoming WS frames and flush once per animation frame. Without this,
+  // a high-volume log source produces one setState per line, which makes React
+  // re-render the virtualizer for every byte and freezes the tab.
+  const pendingLogsRef = useRef<string[]>([])
+  const flushHandleRef = useRef<number | null>(null)
 
   const filteredLogs = searchTerm
     ? logs.filter((log) => log.toLowerCase().includes(searchTerm.toLowerCase()))
@@ -88,6 +97,29 @@ export function useLogStream({
     setLogs([])
     setErrorMessage('')
     isConnectingRef.current = true
+    pendingLogsRef.current = []
+
+    const scheduleFlush = () => {
+      if (flushHandleRef.current != null) return
+      flushHandleRef.current = requestAnimationFrame(() => {
+        flushHandleRef.current = null
+        const incoming = pendingLogsRef.current
+        if (incoming.length === 0) return
+        pendingLogsRef.current = []
+        setLogs((prev) => {
+          const next =
+            prev.length + incoming.length <= maxLogs
+              ? [...prev, ...incoming]
+              : [...prev, ...incoming].slice(-maxLogs)
+          return next
+        })
+      })
+    }
+
+    const enqueue = (line: string) => {
+      pendingLogsRef.current.push(line)
+      scheduleFlush()
+    }
 
     try {
       // Add timestamps query parameter to request server-side timestamps
@@ -111,19 +143,18 @@ export function useLogStream({
           const parsed = JSON.parse(event.data)
 
           if (parsed.error && parsed.stack) {
-            const formattedLog = `ERROR: ${parsed.error}\n${parsed.stack}`
-            setLogs((prev) => [...prev, formattedLog])
+            enqueue(`ERROR: ${parsed.error}\n${parsed.stack}`)
           } else if (parsed.message) {
-            setLogs((prev) => [...prev, parsed.message])
+            enqueue(parsed.message)
           } else if (parsed.log) {
-            setLogs((prev) => [...prev, parsed.log])
+            enqueue(parsed.log)
           } else {
-            setLogs((prev) => [...prev, JSON.stringify(parsed, null, 2)])
+            enqueue(JSON.stringify(parsed, null, 2))
           }
         } catch {
           const line = event.data.trim()
           if (line) {
-            setLogs((prev) => [...prev, line])
+            enqueue(line)
           }
         }
       }
@@ -153,9 +184,14 @@ export function useLogStream({
       if (wsRef.current) {
         wsRef.current.close()
       }
+      if (flushHandleRef.current != null) {
+        cancelAnimationFrame(flushHandleRef.current)
+        flushHandleRef.current = null
+      }
+      pendingLogsRef.current = []
       isConnectingRef.current = false
     }
-  }, [wsUrl, onError, showTimestamps])
+  }, [wsUrl, onError, showTimestamps, maxLogs])
 
   // Auto-scroll effect with proper timing for virtualizer
   useEffect(() => {
