@@ -39,6 +39,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { DeploymentDetails } from '@/pages/DeploymentDetails'
 import { ErrorEventDetail } from './ErrorEventDetail'
 import { ErrorGroupDetail } from './ErrorGroupDetail'
+import Observe from './Observe'
 import RequestLogs from './RequestLogs'
 import Traces from './Traces'
 import { ProjectAgentActivity } from './AiGateway'
@@ -373,6 +374,10 @@ export function ProjectDetail() {
               <Route
                 path="runtime"
                 element={<ProjectRuntime project={project} />}
+              />
+              <Route
+                path="observe"
+                element={<Observe project={project} />}
               />
               <Route
                 path="settings/*"

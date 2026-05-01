@@ -683,10 +683,12 @@ const projectBaseNav: ProjectNavItem[] = [
     ],
   },
   {
-    title: 'Observability',
-    url: 'monitors',
+    title: 'Observe',
+    url: 'observe',
     icon: Eye,
+    navigateOnClick: true,
     subItems: [
+      { title: 'All events', url: 'observe', icon: Eye },
       { title: 'Uptime', url: 'monitors', icon: Activity },
       { title: 'Metrics', url: 'monitoring', icon: Gauge },
       { title: 'Traces', url: 'traces', icon: Network },

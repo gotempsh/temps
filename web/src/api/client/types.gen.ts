@@ -4132,6 +4132,20 @@ export type ErrorResponse = {
     error: string;
 };
 
+export type ErrorRow = {
+    deployment_id?: number | null;
+    environment_id?: number | null;
+    error_class: string;
+    error_group_id: number;
+    fingerprint: string;
+    id: number;
+    message?: string | null;
+    stacktrace_preview: unknown;
+    stacktrace_truncated: boolean;
+    trace_id?: string | null;
+    ts: string;
+};
+
 export type ErrorTimeSeriesDataResponse = {
     count: number;
     timestamp: string;
@@ -4271,6 +4285,12 @@ export type EventDetailResponse = {
      */
     unique_visitors: number;
 };
+
+/**
+ * Tag enum for filter parameters and routing. Matches the variant
+ * discriminator used by `ObservabilityEvent`.
+ */
+export type EventKind = 'request' | 'span' | 'error' | 'revenue';
 
 export type EventMetricsPayload = {
     /**
@@ -4496,6 +4516,15 @@ export type EventsCountQuery = {
     environment_id?: number | null;
     limit?: number | null;
     start_date: string;
+};
+
+export type EventsResponse = {
+    /**
+     * Echo of the kinds filter actually applied (server-resolved). Useful
+     * for clients that pass `kinds=` empty and want to know what they got.
+     */
+    applied_kinds: Array<EventKind>;
+    events: Array<ObservabilityEvent>;
 };
 
 export type ExecBody = {
@@ -4728,6 +4757,58 @@ export type FieldResponse = {
      * Whether the field is nullable
      */
     nullable: boolean;
+};
+
+export type FullError = {
+    /**
+     * Full JSONB blob from `error_events.data` — stack trace, breadcrumbs,
+     * request context, everything. Schema is documented per source SDK.
+     */
+    data?: unknown;
+    deployment_id?: number | null;
+    environment_id?: number | null;
+    error_class: string;
+    error_group_id: number;
+    fingerprint: string;
+    id: number;
+    message?: string | null;
+    trace_id?: string | null;
+    ts: string;
+};
+
+/**
+ * One un-truncated row, returned by the `/full/{type}/{id}` endpoint when
+ * the user clicks "Show full". Same shape as the list rows, but with the
+ * raw heavy fields restored (no truncation flags) so the side panel can
+ * render the long form.
+ */
+export type FullEvent = (FullRequest & {
+    type: 'request';
+}) | (FullError & {
+    type: 'error';
+}) | (RevenueRow & {
+    type: 'revenue';
+}) | (SpanRow & {
+    type: 'span';
+});
+
+export type FullRequest = {
+    client_ip?: string | null;
+    deployment_id?: number | null;
+    environment_id?: number | null;
+    error_group_id?: number | null;
+    host: string;
+    id: number;
+    latency_ms?: number | null;
+    method: string;
+    path: string;
+    referrer?: string | null;
+    request_headers?: unknown;
+    response_headers?: unknown;
+    status: number;
+    trace_id?: string | null;
+    ts: string;
+    user_agent?: string | null;
 };
 
 export type FunnelMetricsResponse = {
@@ -7245,6 +7326,29 @@ export type NotificationProviderResponse = {
     updated_at: number;
 };
 
+/**
+ * Discriminated union of every row that can appear in the Observe list.
+ *
+ * Serializes to `{ "type": "request" | "span" | ... , ...rest }` so the UI
+ * can switch on `event.type` without ambiguity.
+ *
+ * **No `Log` variant**: runtime stdout/stderr lines live on a dedicated
+ * Logs page rather than Observe. Logs are too high-volume to interleave
+ * with business signals (requests, errors, revenue) without dominating
+ * the timeline, and they have their own retention/storage constraints
+ * (TimescaleDB hypertable + chunked file/S3 store) that don't compose
+ * with the merge service's per-kind LIMIT strategy.
+ */
+export type ObservabilityEvent = (RequestRow & {
+    type: 'request';
+}) | (SpanRow & {
+    type: 'span';
+}) | (ErrorRow & {
+    type: 'error';
+}) | (RevenueRow & {
+    type: 'revenue';
+});
+
 export type OpenAiError = {
     code?: string | null;
     message: string;
@@ -9418,6 +9522,28 @@ export type RepositorySyncStartedResponse = {
     syncing: boolean;
 };
 
+export type RequestRow = {
+    client_ip?: string | null;
+    country?: string | null;
+    deployment_id?: number | null;
+    environment_id?: number | null;
+    error_group_id?: number | null;
+    headers_truncated: boolean;
+    host: string;
+    id: number;
+    latency_ms?: number | null;
+    method: string;
+    path: string;
+    query_string?: string | null;
+    referrer?: string | null;
+    request_headers: unknown;
+    response_headers: unknown;
+    status: number;
+    trace_id?: string | null;
+    ts: string;
+    user_agent?: string | null;
+};
+
 export type ResetPasswordRequest = {
     new_password: string;
     token: string;
@@ -9674,6 +9800,19 @@ export type RetryClusterRequest = {
      * the preserved service_members records.
      */
     members?: Array<ClusterMemberRequest>;
+};
+
+export type RevenueRow = {
+    amount_minor?: number | null;
+    currency?: string | null;
+    customer_ref?: string | null;
+    deployment_id?: number | null;
+    environment_id?: number | null;
+    event_type: string;
+    id: number;
+    provider: string;
+    trace_id?: string | null;
+    ts: string;
 };
 
 /**
@@ -11043,6 +11182,22 @@ export type SpanRecord = {
     status_code: SpanStatusCode;
     status_message: string;
     trace_id: string;
+};
+
+export type SpanRow = {
+    attributes: unknown;
+    attributes_truncated: boolean;
+    deployment_id?: number | null;
+    duration_ms?: number | null;
+    environment_id?: number | null;
+    id: string;
+    operation: string;
+    parent_span_id?: string | null;
+    service: string;
+    span_id: string;
+    status?: string | null;
+    trace_id: string;
+    ts: string;
 };
 
 /**
@@ -31724,6 +31879,123 @@ export type CreateMonitorResponses = {
 };
 
 export type CreateMonitorResponse = CreateMonitorResponses[keyof CreateMonitorResponses];
+
+export type ObservabilityListEventsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: {
+        /**
+         * Comma-separated kinds: `log,request,span,error,revenue`. Empty or
+         * missing returns every kind.
+         */
+        kinds?: string;
+        /**
+         * Inclusive lower bound on event timestamp (ISO 8601, `Z` suffix).
+         */
+        from?: string;
+        /**
+         * Inclusive upper bound on event timestamp.
+         */
+        to?: string;
+        deployment_id?: number;
+        environment_id?: number;
+        /**
+         * Free-text substring matched against per-kind summary fields
+         * (request path / error class / revenue event_type).
+         */
+        search?: string;
+        /**
+         * Page size (default 50, max 200).
+         */
+        limit?: number;
+    };
+    url: '/projects/{project_id}/observe/events';
+};
+
+export type ObservabilityListEventsErrors = {
+    /**
+     * Invalid filter (kinds, time range, …)
+     */
+    400: string;
+    /**
+     * Unauthorized
+     */
+    401: string;
+    /**
+     * Insufficient permissions
+     */
+    403: string;
+    /**
+     * Internal server error
+     */
+    500: string;
+};
+
+export type ObservabilityListEventsError = ObservabilityListEventsErrors[keyof ObservabilityListEventsErrors];
+
+export type ObservabilityListEventsResponses = {
+    /**
+     * Merged event page
+     */
+    200: EventsResponse;
+};
+
+export type ObservabilityListEventsResponse = ObservabilityListEventsResponses[keyof ObservabilityListEventsResponses];
+
+export type ObservabilityFullEventData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Event kind discriminator
+         */
+        kind: EventKind;
+        /**
+         * Per-kind primary key
+         */
+        event_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/observe/events/{kind}/{event_id}/full';
+};
+
+export type ObservabilityFullEventErrors = {
+    /**
+     * Unauthorized
+     */
+    401: string;
+    /**
+     * Insufficient permissions
+     */
+    403: string;
+    /**
+     * Event not found in project
+     */
+    404: string;
+    /**
+     * Internal server error
+     */
+    500: string;
+};
+
+export type ObservabilityFullEventError = ObservabilityFullEventErrors[keyof ObservabilityFullEventErrors];
+
+export type ObservabilityFullEventResponses = {
+    /**
+     * Full row
+     */
+    200: FullEvent;
+};
+
+export type ObservabilityFullEventResponse = ObservabilityFullEventResponses[keyof ObservabilityFullEventResponses];
 
 export type DeleteReleaseSourceMapsData = {
     body?: never;
