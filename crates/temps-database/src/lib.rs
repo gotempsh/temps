@@ -3,7 +3,7 @@
 pub use sea_orm;
 mod connection;
 
-pub use connection::{establish_connection, DbConnection};
+pub use connection::{cleanup_orphaned_migrations, establish_connection, DbConnection};
 
 // Export test utilities for use by other crates in their tests
 pub mod test_utils;
