@@ -5,31 +5,41 @@ use sea_orm_migration::prelude::*;
 /// columns are nullable; old rows simply render without correlation links.
 ///
 /// **Designed to be safely re-runnable on any prior state**, including:
-///   * Fresh installs (no rows exist yet, no extension may be installed)
-///   * Partially-applied prior runs (some columns present, others not — the
-///     v1 of this migration would fail on the second `ALTER` against a
-///     compressed `proxy_logs` chunk and leave the row in the historical
-///     `seaql_migrations` table while the schema was half-done)
-///   * Already-fully-applied installs (re-running is a no-op)
-///   * Installs without the TimescaleDB extension (the proxy_logs
-///     compression dance is skipped)
-///   * Installs where `proxy_logs` was not converted to a hypertable
-///     (`show_chunks` would error — guarded by an extension check)
+///   * Fresh installs (no rows yet, extension may not be installed)
+///   * Partially-applied prior runs (any subset of columns/indexes present)
+///   * Already-fully-applied installs (re-runs are no-ops)
+///   * Installs without TimescaleDB (the proxy_logs compression dance is
+///     skipped via an extension check)
+///   * Installs where `proxy_logs` was never converted to a hypertable
 ///
 /// Strategy: every step uses `IF NOT EXISTS` / `IF EXISTS` and is run via
 /// raw SQL inside a single `DO $$ … $$` block so PostgreSQL handles the
-/// procedural control flow. Sea-ORM's `alter_table` builder doesn't emit
-/// `IF NOT EXISTS` for `ADD COLUMN`, which is why we drop down to raw SQL
-/// here. The `ALTER TABLE … ADD COLUMN IF NOT EXISTS …` form has been
-/// supported since Postgres 9.6 and works on TimescaleDB hypertables.
+/// procedural control flow.
 ///
-/// **TimescaleDB caveat (the original failure mode)**: `proxy_logs` is a
-/// compressed hypertable (7-day policy from
-/// `m20260225_000001_add_proxy_logs_retention`). Once chunks compress,
-/// `ALTER TABLE … ADD COLUMN` against the parent fails with
-/// `chunk not found` because per-chunk schemas can't be rewritten in
-/// place. We pause the policy, decompress all chunks, then re-add the
-/// policy with `if_not_exists`.
+/// **The "chunk not found" failure mode**: `proxy_logs` is a TimescaleDB
+/// hypertable with two background jobs from
+/// `m20260225_000001_add_proxy_logs_retention`:
+///   * a 7-day compression policy
+///   * a 30-day retention policy that DROPS old chunks
+///
+/// The original failure was a race between the migration enumerating chunks
+/// (via `show_chunks()`) and the background retention worker dropping a
+/// chunk that the enumeration just saw. By the time
+/// `decompress_chunk(stale_oid)` ran, the chunk was gone → `chunk not
+/// found`. The same race window exists between any two operations that
+/// touch chunk metadata concurrently.
+///
+/// The fix:
+///   1. **Pause every TimescaleDB job on the hypertable** via
+///      `alter_job(scheduled => false)` — both the compression and
+///      retention policies. Snapshot the job IDs first so we can restore
+///      exactly the set that was active.
+///   2. Take an exclusive lock on `proxy_logs` so no other session can
+///      ALTER, INSERT, or query while we work. Locks block until the
+///      transaction ends, so the `DO` block scopes the lock to this work.
+///   3. Decompress every chunk, run the ALTERs, create the indexes —
+///      now race-free because no background worker can mutate chunks.
+///   4. Re-enable the jobs we paused.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -38,11 +48,6 @@ impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
 
-        // Single PL/pgSQL block so the whole thing is one statement and
-        // we get atomic control flow (the extension check guards every
-        // TimescaleDB call). Each ALTER uses `IF NOT EXISTS`, so a partial
-        // prior run completes cleanly without us tracking which columns
-        // already exist.
         db.execute_unprepared(
             r#"
 DO $$
@@ -51,6 +56,7 @@ DECLARE
         SELECT 1 FROM pg_extension WHERE extname = 'timescaledb'
     );
     proxy_logs_is_hypertable boolean := false;
+    paused_job_ids integer[] := ARRAY[]::integer[];
 BEGIN
     -- ── proxy_logs (potentially compressed hypertable) ──────────────
     IF has_timescaledb THEN
@@ -60,15 +66,27 @@ BEGIN
         ) INTO proxy_logs_is_hypertable;
 
         IF proxy_logs_is_hypertable THEN
-            -- Pause the compression policy. `if_exists` returns NULL when
-            -- the policy isn't present (fresh installs that haven't run
-            -- the retention migration yet, or installs that have already
-            -- removed it via a partial prior run).
-            PERFORM remove_compression_policy('proxy_logs', if_exists => TRUE);
+            -- 1. Pause every active background job on this hypertable
+            --    (compression policy + retention policy). Snapshot the
+            --    list so we restore exactly what was active.
+            SELECT array_agg(job_id::integer) INTO paused_job_ids
+            FROM timescaledb_information.jobs
+            WHERE hypertable_name = 'proxy_logs' AND scheduled = true;
 
-            -- Decompress every chunk so per-chunk ALTERs succeed.
-            -- `if_compressed => TRUE` makes this a no-op for already-
-            -- decompressed chunks.
+            IF paused_job_ids IS NOT NULL THEN
+                PERFORM alter_job(j::integer, scheduled => false)
+                FROM unnest(paused_job_ids) j;
+            END IF;
+
+            -- 2. Take an exclusive lock on the hypertable. Blocks any
+            --    concurrent DDL/DML and waits for any in-flight job
+            --    to finish. The lock is held until this DO block (and
+            --    the surrounding migration transaction) ends.
+            LOCK TABLE proxy_logs IN ACCESS EXCLUSIVE MODE;
+
+            -- 3. Decompress every chunk so per-chunk ALTERs succeed.
+            --    `if_compressed => TRUE` makes this a no-op for already-
+            --    decompressed chunks (idempotent on partial-prior-runs).
             PERFORM decompress_chunk(c, if_compressed => TRUE)
             FROM show_chunks('proxy_logs') c;
         END IF;
@@ -96,13 +114,13 @@ BEGIN
     CREATE INDEX IF NOT EXISTS idx_error_events_project_trace
         ON error_events (project_id, trace_id_indexed);
 
-    -- Restore the proxy_logs compression policy with the original 7-day
-    -- window. `if_not_exists` makes this safe to re-run on installs that
-    -- never had the policy (no-op).
-    IF has_timescaledb AND proxy_logs_is_hypertable THEN
-        PERFORM add_compression_policy(
-            'proxy_logs', INTERVAL '7 days', if_not_exists => TRUE
-        );
+    -- 4. Restore the jobs we paused. Done unconditionally — if the
+    --    array is empty (fresh install / no jobs), unnest produces zero
+    --    rows and PERFORM is a no-op.
+    IF has_timescaledb AND proxy_logs_is_hypertable
+       AND paused_job_ids IS NOT NULL THEN
+        PERFORM alter_job(j::integer, scheduled => true)
+        FROM unnest(paused_job_ids) j;
     END IF;
 END
 $$;
@@ -116,7 +134,6 @@ $$;
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
 
-        // Mirror image: pause compression, drop indexes/columns, restore.
         db.execute_unprepared(
             r#"
 DO $$
@@ -125,6 +142,7 @@ DECLARE
         SELECT 1 FROM pg_extension WHERE extname = 'timescaledb'
     );
     proxy_logs_is_hypertable boolean := false;
+    paused_job_ids integer[] := ARRAY[]::integer[];
 BEGIN
     IF has_timescaledb THEN
         SELECT EXISTS (
@@ -133,7 +151,16 @@ BEGIN
         ) INTO proxy_logs_is_hypertable;
 
         IF proxy_logs_is_hypertable THEN
-            PERFORM remove_compression_policy('proxy_logs', if_exists => TRUE);
+            SELECT array_agg(job_id::integer) INTO paused_job_ids
+            FROM timescaledb_information.jobs
+            WHERE hypertable_name = 'proxy_logs' AND scheduled = true;
+
+            IF paused_job_ids IS NOT NULL THEN
+                PERFORM alter_job(j::integer, scheduled => false)
+                FROM unnest(paused_job_ids) j;
+            END IF;
+
+            LOCK TABLE proxy_logs IN ACCESS EXCLUSIVE MODE;
             PERFORM decompress_chunk(c, if_compressed => TRUE)
             FROM show_chunks('proxy_logs') c;
         END IF;
@@ -152,10 +179,10 @@ BEGIN
     ALTER TABLE proxy_logs     DROP COLUMN IF EXISTS error_group_id;
     ALTER TABLE proxy_logs     DROP COLUMN IF EXISTS trace_id;
 
-    IF has_timescaledb AND proxy_logs_is_hypertable THEN
-        PERFORM add_compression_policy(
-            'proxy_logs', INTERVAL '7 days', if_not_exists => TRUE
-        );
+    IF has_timescaledb AND proxy_logs_is_hypertable
+       AND paused_job_ids IS NOT NULL THEN
+        PERFORM alter_job(j::integer, scheduled => true)
+        FROM unnest(paused_job_ids) j;
     END IF;
 END
 $$;
