@@ -1,8 +1,9 @@
 use sea_orm_migration::prelude::*;
 
-/// Add cross-source correlation columns so the unified Observe page can join
-/// requests / spans / errors / revenue without follow-up queries. All
-/// columns are nullable; old rows simply render without correlation links.
+/// Add cross-source correlation columns + lookup indexes so the unified
+/// Observe page can join requests / spans / errors / revenue without
+/// follow-up queries. All columns are nullable; old rows simply render
+/// without correlation links.
 ///
 /// **Designed to be safely re-runnable on any prior state**, including:
 ///   * Fresh installs (no rows yet, extension may not be installed)
@@ -10,38 +11,24 @@ use sea_orm_migration::prelude::*;
 ///   * Already-fully-applied installs (re-runs are no-ops)
 ///   * Installs without TimescaleDB
 ///
-/// Strategy: every step uses `IF NOT EXISTS` and is run via raw SQL. The
-/// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` form has been supported since
-/// Postgres 9.6 and works correctly on TimescaleDB hypertables — Timescale
-/// propagates the new column to every chunk transparently, no per-chunk
-/// enumeration required from us.
+/// Strategy: every step uses `IF NOT EXISTS` and is run via raw SQL.
+/// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` is propagated to every
+/// hypertable chunk atomically by Timescale; `CREATE INDEX IF NOT EXISTS`
+/// is per-chunk and safe on a healthy hypertable (see operational note
+/// below for the one prod scenario where it isn't).
 ///
-/// **What this deliberately does NOT do**:
-///
-///   * **No `decompress_chunk` loop**. We previously paused the compression
-///     policy and decompressed every chunk before ALTER, on the assumption
-///     that ALTER on a compressed hypertable would fail. In practice the
-///     decompress loop itself raced with the background retention worker
-///     (`drop_chunks` runs daily on `proxy_logs` past 30 days) and produced
-///     `chunk not found` — confirmed in prod logs. `ALTER TABLE ... ADD
-///     COLUMN` against a compressed hypertable works fine in current
-///     Timescale versions; the new column is added to all chunks
-///     atomically.
-///
-///   * **No `CREATE INDEX` on any hypertable** — `proxy_logs`,
-///     `revenue_events`, **and `error_events`** are all hypertables on
-///     prod (`error_events` is hypertable id 3, confirmed in prod logs:
-///     `chunk not found … _hyper_3_1013_chunk` while running
-///     `CREATE INDEX … ON error_events`). `CREATE INDEX` on a hypertable
-///     enumerates every chunk to build per-chunk indexes, which races
-///     with `drop_chunks` from the retention policy. The Observe page
-///     works without these indexes — queries are time-bounded and
-///     Timescale's chunk pruning handles them. Add the indexes later via
-///     a separate operational tool when the cluster is quiet, *not* via
-///     a startup migration that crash-loops the server.
-///
-///   * **No job pausing / `LOCK TABLE`**. With nothing in this migration
-///     enumerating chunks, there's no race surface left to defend.
+/// **Operational note for installs migrated via raw `pg_dump`/`pg_restore`**:
+/// if the source database was migrated to a new server *without* wrapping
+/// the restore in `timescaledb_pre_restore()` / `timescaledb_post_restore()`,
+/// the new database can have orphan chunks — relations attached via
+/// `pg_inherits` but missing from `_timescaledb_catalog.chunk`. `CREATE
+/// INDEX` on the parent hypertable will then fail with `chunk not found`
+/// because Postgres tries to build the per-chunk index on a chunk Timescale
+/// no longer knows about. The fix is operational, not migration-level:
+/// detach + drop the orphan child relations, then re-run. See
+/// `docs/runbooks/timescaledb-orphan-chunks.md` (or git history of this
+/// migration) for the cleanup script. We do not attempt that cleanup from
+/// inside the migration because it would silently delete user data.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -70,10 +57,22 @@ BEGIN
 
     ALTER TABLE error_events   ADD COLUMN IF NOT EXISTS trace_id_indexed text;
 
-    -- No CREATE INDEX statements. `error_events` is a hypertable
-    -- (`_hyper_3_*`), so any CREATE INDEX against it enumerates chunks
-    -- and races with `drop_chunks`. Index creation is deferred to a
-    -- separate operational tool — see header doc comment.
+    -- Lookup indexes for the Observe page's cross-source correlation.
+    -- `IF NOT EXISTS` makes this safe on installs where the index was
+    -- already created manually (e.g. prod, where these were built
+    -- out-of-band after the orphan-chunk cleanup — see header comment).
+    CREATE INDEX IF NOT EXISTS idx_error_events_project_trace
+        ON error_events (project_id, trace_id_indexed);
+
+    CREATE INDEX IF NOT EXISTS idx_proxy_logs_project_trace
+        ON proxy_logs (project_id, trace_id);
+
+    CREATE INDEX IF NOT EXISTS idx_proxy_logs_error_group
+        ON proxy_logs (error_group_id)
+        WHERE error_group_id IS NOT NULL;
+
+    CREATE INDEX IF NOT EXISTS idx_revenue_events_project_occurred
+        ON revenue_events (project_id, occurred_at DESC);
 END
 $$;
 "#,
@@ -86,16 +85,10 @@ $$;
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
 
-        // Mirror image. `DROP INDEX IF EXISTS` for the hypertable indexes
-        // is harmless even on installs that never had them — covers
-        // operators who created them manually.
         db.execute_unprepared(
             r#"
 DO $$
 BEGIN
-    -- `DROP INDEX IF EXISTS` is harmless if the index was never created
-    -- (the up() in this version doesn't create it), but covers operators
-    -- who created it manually or via earlier failed migration runs.
     DROP INDEX IF EXISTS idx_error_events_project_trace;
     ALTER TABLE error_events   DROP COLUMN IF EXISTS trace_id_indexed;
 
