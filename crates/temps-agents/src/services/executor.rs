@@ -4002,6 +4002,7 @@ mod tests {
                     }
                 ]
             })),
+            trace_id_indexed: None,
             created_at: Utc::now(),
         }
     }

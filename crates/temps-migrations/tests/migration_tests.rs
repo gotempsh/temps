@@ -971,8 +971,7 @@ async fn connect_with_retries(db_url: &str) -> anyhow::Result<DatabaseConnection
 // The current migration removes the policy, decompresses every chunk, runs
 // the ALTERs, then restores the policy. This test pins that contract.
 #[tokio::test]
-async fn test_observe_correlation_migration_handles_compressed_proxy_logs(
-) -> anyhow::Result<()> {
+async fn test_observe_correlation_migration_handles_compressed_proxy_logs() -> anyhow::Result<()> {
     if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
         println!(
             "⏭️  Skipping test_observe_correlation_migration_handles_compressed_proxy_logs: \
@@ -1234,8 +1233,7 @@ async fn test_observe_correlation_migration_is_idempotent() -> anyhow::Result<()
 // To verify this test catches the regression, replace the v4 migration's
 // `alter_job(scheduled => false)` with a no-op — the test must then fail.
 #[tokio::test]
-async fn test_observe_correlation_migration_survives_concurrent_retention(
-) -> anyhow::Result<()> {
+async fn test_observe_correlation_migration_survives_concurrent_retention() -> anyhow::Result<()> {
     if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
         println!(
             "⏭️  Skipping test_observe_correlation_migration_survives_concurrent_retention: \
@@ -1334,9 +1332,7 @@ async fn test_observe_correlation_migration_survives_concurrent_retention(
             // fail when the migration has it locked or when the job_id was
             // briefly removed during alter_job. We're only here to maximize
             // the chance of a race.
-            let _ = bg_db
-                .execute_unprepared(&call_sql)
-                .await;
+            let _ = bg_db.execute_unprepared(&call_sql).await;
             tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
         }
         Ok::<(), anyhow::Error>(())
