@@ -308,16 +308,26 @@ impl TempsPlugin for OtelPlugin {
             // ── Background Tasks ────────────────────────────────────
 
             // 1. Retention cleanup task
+            //
+            // `apply_retention` is now a no-op — the OTel hypertables have
+            // a native `add_retention_policy(..., INTERVAL '90 days')`
+            // registered in `m20260225_000001_create_otel_tables`, which
+            // Timescale enforces via `drop_chunks` (atomic, chunk-aware,
+            // race-free). We keep the loop here so any future per-project
+            // retention logic has a hook, but it does no DB work today.
+            //
+            // We also skip the first `tick()` because `tokio::interval`
+            // fires immediately on creation, which would race with anything
+            // else still finishing during startup. Future hooks should
+            // wait one full interval before their first run.
             let retention_storage = storage.clone();
             let retention_days = config.retention_days;
             let retention_interval = config.retention_check_interval_secs;
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(retention_interval));
+                interval.tick().await; // discard the immediate first tick
                 loop {
                     interval.tick().await;
-                    // Query project IDs from the otel_metrics table
-                    // For now, apply retention to all projects by scanning the tables
-                    // This is safe because apply_retention uses WHERE project_id = $1
                     debug!(retention_days, "Running OTel data retention cleanup");
                     if let Err(e) = apply_retention_all(&retention_storage, retention_days).await {
                         error!(error = %e, "OTel retention cleanup failed");

@@ -18,6 +18,14 @@ use crate::types::*;
 pub struct TimescaleDbStorage {
     db: Arc<DatabaseConnection>,
     s3_client: Option<Arc<S3LogArchiver>>,
+    /// Kept on the struct for API/config compatibility with callers and the
+    /// retention task spawned by `temps-otel/plugin.rs`. The actual
+    /// retention is enforced by the native TimescaleDB
+    /// `add_retention_policy(...)` registered in
+    /// `m20260225_000001_create_otel_tables`, so this value isn't read
+    /// inside the storage layer anymore — see `apply_retention()` for the
+    /// rationale.
+    #[allow(dead_code)]
     retention_days: u32,
     quota_bytes_per_project: u64,
 }
@@ -1869,46 +1877,29 @@ impl OtelStorage for TimescaleDbStorage {
             .collect())
     }
 
-    async fn apply_retention(&self, project_id: i32) -> StorageResult<u64> {
-        let days = self.retention_days;
-
-        let sql1 = format!(
-            "DELETE FROM otel_metrics WHERE project_id = $1 AND timestamp < NOW() - INTERVAL '{days} days'"
-        );
-        let r1 = self
-            .db
-            .execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                &sql1,
-                vec![project_id.into()],
-            ))
-            .await?;
-
-        let sql2 = format!(
-            "DELETE FROM otel_spans WHERE project_id = $1 AND start_time < NOW() - INTERVAL '{days} days'"
-        );
-        let r2 = self
-            .db
-            .execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                &sql2,
-                vec![project_id.into()],
-            ))
-            .await?;
-
-        let sql3 = format!(
-            "DELETE FROM otel_log_events WHERE project_id = $1 AND timestamp < NOW() - INTERVAL '{days} days'"
-        );
-        let r3 = self
-            .db
-            .execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                &sql3,
-                vec![project_id.into()],
-            ))
-            .await?;
-
-        Ok(r1.rows_affected() + r2.rows_affected() + r3.rows_affected())
+    async fn apply_retention(&self, _project_id: i32) -> StorageResult<u64> {
+        // No-op. The OTel hypertables (`otel_metrics`, `otel_spans`,
+        // `otel_log_events`) all have a native TimescaleDB
+        // `add_retention_policy(..., INTERVAL '90 days')` registered in
+        // `m20260225_000001_create_otel_tables`. Timescale runs that policy
+        // in the background using `drop_chunks`, which is atomic and
+        // chunk-aware.
+        //
+        // The original implementation issued
+        // `DELETE FROM otel_metrics WHERE timestamp < ...` from this
+        // method on every retention tick. That DELETE races with the
+        // native policy: the planner snapshots a chunk list, the policy
+        // worker drops one of those chunks, the executor reaches it, and
+        // PostgreSQL throws `chunk not found` (observed in prod logs as
+        // `_hyper_15_3617_chunk` already gone). The error then surfaces
+        // as `Failed to run migrations: chunk not found` because the
+        // retention task and migration loader run on overlapping startup
+        // connections.
+        //
+        // We keep the trait method so callers/tests don't break, but it
+        // does nothing — Timescale's policy is the single source of
+        // truth for OTel retention.
+        Ok(0)
     }
 
     async fn get_p95_latency(

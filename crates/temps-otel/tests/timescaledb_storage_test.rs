@@ -499,16 +499,31 @@ async fn test_storage_quota() {
     assert!(!exceeded); // Fresh DB, should not be exceeded
 }
 
-// ── Retention (no old data to delete) ───────────────────────────────
+// ── Retention is a no-op (Timescale's policy is the source of truth) ─
 
 #[tokio::test]
-async fn test_apply_retention_no_old_data() {
+async fn test_apply_retention_is_a_noop() {
+    // `apply_retention` was changed to a no-op. The OTel hypertables
+    // enforce retention via `add_retention_policy(..., INTERVAL '90 days')`
+    // registered in `m20260225_000001_create_otel_tables` — Timescale
+    // calls `drop_chunks` internally, which is atomic and chunk-aware.
+    //
+    // The previous app-level `DELETE FROM otel_metrics WHERE timestamp <
+    // NOW() - …` raced with the native policy: planner snapshots a chunk
+    // list, the policy worker drops one of those chunks, the executor
+    // hits the stale OID → `chunk not found`. That error bubbled up as
+    // a migration failure in prod logs.
+    //
+    // This test pins the contract that `apply_retention` always returns
+    // 0 regardless of how much old data exists. A regression that
+    // re-adds the app-level DELETE would need to delete this test or it
+    // would fail.
     let Some((_db, storage)) = setup_storage().await else {
         return;
     };
 
     let deleted = storage.apply_retention(1).await.unwrap();
-    assert_eq!(deleted, 0);
+    assert_eq!(deleted, 0, "apply_retention must never report deletions");
 }
 
 // ── Project isolation ───────────────────────────────────────────────
