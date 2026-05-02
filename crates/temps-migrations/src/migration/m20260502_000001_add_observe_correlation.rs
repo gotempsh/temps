@@ -28,13 +28,17 @@ use sea_orm_migration::prelude::*;
 ///     Timescale versions; the new column is added to all chunks
 ///     atomically.
 ///
-///   * **No `CREATE INDEX ON proxy_logs / revenue_events`**. `CREATE INDEX`
-///     on a hypertable enumerates every chunk to build per-chunk indexes,
-///     and that enumeration races with `drop_chunks` the same way. The
-///     Observe page works without these indexes (queries are time-bounded
-///     and chunk pruning handles them); they're a pure performance
-///     optimization to be added later via a separate operational tool when
-///     the cluster is quiet.
+///   * **No `CREATE INDEX` on any hypertable** — `proxy_logs`,
+///     `revenue_events`, **and `error_events`** are all hypertables on
+///     prod (`error_events` is hypertable id 3, confirmed in prod logs:
+///     `chunk not found … _hyper_3_1013_chunk` while running
+///     `CREATE INDEX … ON error_events`). `CREATE INDEX` on a hypertable
+///     enumerates every chunk to build per-chunk indexes, which races
+///     with `drop_chunks` from the retention policy. The Observe page
+///     works without these indexes — queries are time-bounded and
+///     Timescale's chunk pruning handles them. Add the indexes later via
+///     a separate operational tool when the cluster is quiet, *not* via
+///     a startup migration that crash-loops the server.
 ///
 ///   * **No job pausing / `LOCK TABLE`**. With nothing in this migration
 ///     enumerating chunks, there's no race surface left to defend.
@@ -66,11 +70,10 @@ BEGIN
 
     ALTER TABLE error_events   ADD COLUMN IF NOT EXISTS trace_id_indexed text;
 
-    -- Index only on the regular table. Hypertable indexes are skipped
-    -- here to avoid racing with TimescaleDB's background retention
-    -- worker (see header doc comment).
-    CREATE INDEX IF NOT EXISTS idx_error_events_project_trace
-        ON error_events (project_id, trace_id_indexed);
+    -- No CREATE INDEX statements. `error_events` is a hypertable
+    -- (`_hyper_3_*`), so any CREATE INDEX against it enumerates chunks
+    -- and races with `drop_chunks`. Index creation is deferred to a
+    -- separate operational tool — see header doc comment.
 END
 $$;
 "#,
@@ -90,6 +93,9 @@ $$;
             r#"
 DO $$
 BEGIN
+    -- `DROP INDEX IF EXISTS` is harmless if the index was never created
+    -- (the up() in this version doesn't create it), but covers operators
+    -- who created it manually or via earlier failed migration runs.
     DROP INDEX IF EXISTS idx_error_events_project_trace;
     ALTER TABLE error_events   DROP COLUMN IF EXISTS trace_id_indexed;
 
