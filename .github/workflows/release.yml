@@ -662,3 +662,157 @@ jobs:
           docker buildx imagetools create -t ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }} \
             ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-linux-amd64 \
             ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-linux-arm64
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Sandbox images and preview gateway
+  #
+  # Published to ghcr.io on every release tag (v*.*.*). The sandbox image
+  # version that the running temps server expects is pinned via
+  # `SANDBOX_IMAGE_VERSION` in crates/temps-agents/src/sandbox/docker.rs —
+  # bumping that constant is what causes hosts to pull a new image, since
+  # `docker inspect` short-circuits cached `:latest` tags. We tag both
+  # `:<SANDBOX_IMAGE_VERSION>` (the immutable tag the runtime pulls) and
+  # `:latest` (operator convenience).
+  # ─────────────────────────────────────────────────────────────────────────
+  build-and-push-sandbox-images:
+    name: Build sandbox image (${{ matrix.runtime }})
+    needs: [create-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [node, bun, python, rust, go, full]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo deps
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: sandbox-image-builder
+
+      - name: Build print_dockerfile helper
+        run: cargo build --example print_dockerfile -p temps-agents
+
+      - name: Extract sandbox image version
+        id: version
+        run: |
+          # Single source of truth: the constant in docker.rs. The runtime
+          # uses this exact tag to pull, so the workflow must publish under
+          # the same string.
+          IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
+            crates/temps-agents/src/sandbox/docker.rs \
+            | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$IMAGE_VERSION" ]; then
+            echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker.rs"
+            exit 1
+          fi
+          echo "version=$IMAGE_VERSION" >> $GITHUB_OUTPUT
+          echo "Sandbox image version: $IMAGE_VERSION"
+
+      - name: Materialize Dockerfile for ${{ matrix.runtime }}
+        run: |
+          mkdir -p build-context
+          ./target/debug/examples/print_dockerfile ${{ matrix.runtime }} \
+            > build-context/Dockerfile
+          echo "Generated Dockerfile (first 30 lines):"
+          head -n 30 build-context/Dockerfile
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push sandbox image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./build-context
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/temps-sandbox-${{ matrix.runtime }}:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/temps-sandbox-${{ matrix.runtime }}:latest
+            ghcr.io/${{ github.repository_owner }}/temps-sandbox-${{ matrix.runtime }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.title=temps-sandbox-${{ matrix.runtime }}
+            org.opencontainers.image.description=Temps workspace sandbox image (${{ matrix.runtime }} runtime)
+          cache-from: type=gha,scope=sandbox-${{ matrix.runtime }}
+          cache-to: type=gha,scope=sandbox-${{ matrix.runtime }},mode=max
+
+  build-and-push-preview-gateway:
+    name: Build preview gateway image
+    needs: [create-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract preview gateway version
+        id: version
+        # The crate's own Cargo.standalone.toml carries the package version
+        # the gateway publishes as. Keep the published tag aligned so the
+        # gateway's image stream is independently versionable from the
+        # main `temps` server (different release cadence is fine).
+        run: |
+          GATEWAY_VERSION=$(grep -E '^version = ' \
+            crates/temps-preview-gateway/Cargo.standalone.toml \
+            | head -n 1 \
+            | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$GATEWAY_VERSION" ]; then
+            echo "::error::Failed to extract preview gateway version"
+            exit 1
+          fi
+          echo "version=$GATEWAY_VERSION" >> $GITHUB_OUTPUT
+          echo "Preview gateway version: $GATEWAY_VERSION"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push preview gateway image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./crates/temps-preview-gateway
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/temps-preview-gateway:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/temps-preview-gateway:latest
+            ghcr.io/${{ github.repository_owner }}/temps-preview-gateway:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.title=temps-preview-gateway
+            org.opencontainers.image.description=Temps preview gateway — routes ws-<sid>-<port> hosts to sandbox containers
+          cache-from: type=gha,scope=preview-gateway
+          cache-to: type=gha,scope=preview-gateway,mode=max

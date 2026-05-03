@@ -276,23 +276,41 @@ fn build_context_tar(dockerfile: &str) -> Result<Vec<u8>, AgentError> {
     Ok(tar_buf)
 }
 
-/// Local image name for a runtime preset.
+/// Pinned version of the published sandbox images. Bumping this constant
+/// causes every host to pull the new image on the next sandbox start
+/// (because the new tag isn't cached locally), which is the only reliable
+/// way to roll a fix out without per-host manual `docker pull`. The CI
+/// release workflow publishes images at this exact tag.
+///
+/// Why pin instead of using `:latest`:
+///   - `inspect_image` returns Ok if a `:latest` is cached locally, so
+///     `ensure_image_for_runtime` short-circuits and never pulls. Once a
+///     host has a stale `:latest`, it stays stale forever.
+///   - Immutable version tags ("0.1.0") cache-bust naturally: when we bump
+///     this constant + ship the corresponding tag, every host re-pulls.
+pub const SANDBOX_IMAGE_VERSION: &str = "0.1.0";
+
+/// Local image name for a runtime preset, pinned to `SANDBOX_IMAGE_VERSION`.
 pub fn image_name_for_runtime(runtime: &str) -> String {
-    match runtime {
-        "node" | "" => "temps-sandbox-node:latest".to_string(),
-        other => format!("temps-sandbox-{other}:latest"),
-    }
+    let name = match runtime {
+        "node" | "" => "temps-sandbox-node",
+        other => return format!("temps-sandbox-{other}:{SANDBOX_IMAGE_VERSION}"),
+    };
+    format!("{name}:{SANDBOX_IMAGE_VERSION}")
 }
 
-/// Docker Hub image name for a runtime preset. Used as a pull-cache:
+/// Registry image name for a runtime preset. Used as a pull-cache:
 /// `ensure_image_for_runtime` tries to pull this first, then falls back
-/// to building locally if the Hub image isn't available.
+/// to building locally if the registry image isn't available.
+///
+/// Pinned to `SANDBOX_IMAGE_VERSION` so a host that already cached the
+/// previous version pulls the new one when we bump the constant.
 fn hub_image_for_runtime(runtime: &str) -> String {
     let name = match runtime {
         "node" | "" => "temps-sandbox-node",
-        other => return format!("gotempsh/temps-sandbox-{other}:latest"),
+        other => return format!("ghcr.io/gotempsh/temps-sandbox-{other}:{SANDBOX_IMAGE_VERSION}"),
     };
-    format!("gotempsh/{name}:latest")
+    format!("ghcr.io/gotempsh/{name}:{SANDBOX_IMAGE_VERSION}")
 }
 
 /// Configuration for the Docker sandbox provider.
@@ -324,7 +342,7 @@ impl Default for DockerSandboxConfig {
 
 impl DockerSandboxConfig {
     /// Resolve the image name for the current configuration.
-    /// For presets, returns `temps-sandbox-{runtime}:latest`.
+    /// For presets, returns `temps-sandbox-{runtime}:{SANDBOX_IMAGE_VERSION}`.
     /// For custom, returns the user-provided image.
     pub fn resolved_image(&self) -> String {
         if self.runtime == "custom" && !self.custom_image.is_empty() {
@@ -870,11 +888,14 @@ impl SandboxProvider for DockerSandboxProvider {
 
         // Ensure the image exists (build for presets, pull for custom)
         if self.docker.inspect_image(image).await.is_err() {
-            // If this is a preset image, build it
+            // If this is a preset image, build it. Strip the version tag
+            // (everything after the last `:`) to recover the runtime name.
+            // Hard-coding `:latest` here would break the moment we pin to a
+            // version tag.
             if image.starts_with("temps-sandbox-") {
                 let runtime = image
                     .strip_prefix("temps-sandbox-")
-                    .and_then(|s| s.strip_suffix(":latest"))
+                    .map(|s| s.split(':').next().unwrap_or(s))
                     .unwrap_or("node");
                 self.ensure_image_for_runtime(runtime).await?;
             }
@@ -1074,6 +1095,50 @@ impl SandboxProvider for DockerSandboxProvider {
                     run_id: config.run_id,
                     provider: "docker".to_string(),
                     reason: format!("Failed to create chown exec: {}", e),
+                })?;
+            let _ = self
+                .docker
+                .start_exec(
+                    &exec.id,
+                    Some(bollard::exec::StartExecOptions {
+                        detach: false,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        }
+
+        // Fix /workspace ownership: the bind-mounted host directory carries
+        // its host-side uid into the container, regardless of the image's
+        // `USER temps` directive. In production the temps server runs as
+        // root, so the host work_dir is created root-owned and `git clone`
+        // (which executes on the host) writes root-owned files. Inside the
+        // container the `temps` user then can't write — TUIs fail, dev
+        // servers can't open lockfiles, etc. Mirror the /home/temps fix:
+        // recursively chown to temps:temps as root, every start.
+        {
+            let exec = self
+                .docker
+                .create_exec(
+                    &container.id,
+                    bollard::models::ExecConfig {
+                        user: Some("0:0".to_string()),
+                        cmd: Some(vec![
+                            "chown".to_string(),
+                            "-R".to_string(),
+                            "temps:temps".to_string(),
+                            CONTAINER_WORK_DIR.to_string(),
+                        ]),
+                        attach_stdout: Some(true),
+                        attach_stderr: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "docker".to_string(),
+                    reason: format!("Failed to create workspace chown exec: {}", e),
                 })?;
             let _ = self
                 .docker
@@ -1814,19 +1879,25 @@ mod tests {
 
     #[test]
     fn test_resolved_image_for_presets() {
+        let v = SANDBOX_IMAGE_VERSION;
         for (runtime, expected) in [
-            ("node", "temps-sandbox-node:latest"),
-            ("python", "temps-sandbox-python:latest"),
-            ("rust", "temps-sandbox-rust:latest"),
-            ("bun", "temps-sandbox-bun:latest"),
-            ("go", "temps-sandbox-go:latest"),
-            ("full", "temps-sandbox-full:latest"),
+            ("node", format!("temps-sandbox-node:{v}")),
+            ("python", format!("temps-sandbox-python:{v}")),
+            ("rust", format!("temps-sandbox-rust:{v}")),
+            ("bun", format!("temps-sandbox-bun:{v}")),
+            ("go", format!("temps-sandbox-go:{v}")),
+            ("full", format!("temps-sandbox-full:{v}")),
         ] {
             let config = DockerSandboxConfig {
                 runtime: runtime.to_string(),
                 ..Default::default()
             };
-            assert_eq!(config.resolved_image(), expected, "runtime={}", runtime);
+            assert_eq!(
+                config.resolved_image(),
+                expected.as_str(),
+                "runtime={}",
+                runtime
+            );
         }
     }
 
@@ -1848,7 +1919,10 @@ mod tests {
             ..Default::default()
         };
         // Falls back to node since custom_image is empty
-        assert_eq!(config.resolved_image(), "temps-sandbox-custom:latest");
+        assert_eq!(
+            config.resolved_image(),
+            format!("temps-sandbox-custom:{SANDBOX_IMAGE_VERSION}")
+        );
     }
 
     #[test]
@@ -1928,11 +2002,18 @@ mod tests {
 
     #[test]
     fn test_image_name_for_runtime() {
-        assert_eq!(image_name_for_runtime("node"), "temps-sandbox-node:latest");
-        assert_eq!(image_name_for_runtime(""), "temps-sandbox-node:latest");
+        let v = SANDBOX_IMAGE_VERSION;
+        assert_eq!(
+            image_name_for_runtime("node"),
+            format!("temps-sandbox-node:{v}")
+        );
+        assert_eq!(
+            image_name_for_runtime(""),
+            format!("temps-sandbox-node:{v}")
+        );
         assert_eq!(
             image_name_for_runtime("python"),
-            "temps-sandbox-python:latest"
+            format!("temps-sandbox-python:{v}")
         );
     }
 
@@ -2107,30 +2188,34 @@ mod tests {
         let provider = DockerSandboxProvider::new(docker, config);
 
         let (_, image_name) = provider.image_status().await.unwrap();
-        assert_eq!(image_name, "temps-sandbox-python:latest");
+        assert_eq!(
+            image_name,
+            format!("temps-sandbox-python:{SANDBOX_IMAGE_VERSION}")
+        );
     }
 
     #[test]
     fn test_hub_image_for_runtime() {
+        let v = SANDBOX_IMAGE_VERSION;
         assert_eq!(
             hub_image_for_runtime("node"),
-            "gotempsh/temps-sandbox-node:latest"
+            format!("ghcr.io/gotempsh/temps-sandbox-node:{v}")
         );
         assert_eq!(
             hub_image_for_runtime(""),
-            "gotempsh/temps-sandbox-node:latest"
+            format!("ghcr.io/gotempsh/temps-sandbox-node:{v}")
         );
         assert_eq!(
             hub_image_for_runtime("python"),
-            "gotempsh/temps-sandbox-python:latest"
+            format!("ghcr.io/gotempsh/temps-sandbox-python:{v}")
         );
         assert_eq!(
             hub_image_for_runtime("bun"),
-            "gotempsh/temps-sandbox-bun:latest"
+            format!("ghcr.io/gotempsh/temps-sandbox-bun:{v}")
         );
         assert_eq!(
             hub_image_for_runtime("full"),
-            "gotempsh/temps-sandbox-full:latest"
+            format!("ghcr.io/gotempsh/temps-sandbox-full:{v}")
         );
     }
 
@@ -2155,18 +2240,21 @@ mod tests {
 
         let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
 
+        let local_image = format!("temps-sandbox-node:{SANDBOX_IMAGE_VERSION}");
+
         // Delete the local image first (if any) so we exercise the
         // pull→fail→build path. Ignore errors if it doesn't exist.
         let _ = docker
             .remove_image(
-                "temps-sandbox-node:latest",
+                &local_image,
                 None::<bollard::query_parameters::RemoveImageOptions>,
                 None,
             )
             .await;
 
-        // This should succeed via fallback build even though
-        // gotempsh/temps-sandbox-node:latest likely doesn't exist on Hub yet.
+        // This should succeed via fallback build even when the registry
+        // image doesn't exist (or rate-limits the pull) — the local build
+        // path is the safety net.
         let result = provider.ensure_image_for_runtime("node").await;
         assert!(
             result.is_ok(),
@@ -2175,10 +2263,7 @@ mod tests {
         );
 
         // Image should now exist locally
-        assert!(docker
-            .inspect_image("temps-sandbox-node:latest")
-            .await
-            .is_ok());
+        assert!(docker.inspect_image(&local_image).await.is_ok());
     }
 
     #[tokio::test]

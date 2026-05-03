@@ -256,7 +256,7 @@ export function RepositoryList({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="updated">Last updated</SelectItem>
+                  <SelectItem value="pushed">Recently pushed</SelectItem>
                   <SelectItem value="created">Recently created</SelectItem>
                   <SelectItem value="name">Name (A-Z)</SelectItem>
                 </SelectContent>
@@ -409,14 +409,14 @@ export function RepositoryList({
                             >
                               <img
                                 src={iconUrl}
-                                alt={presetItem.preset_label}
+                                alt={presetItem.presetLabel}
                                 className="h-2.5 w-2.5 mr-1"
                                 style={{ objectFit: 'contain' }}
                                 onError={(e) => {
                                   e.currentTarget.src = '/presets/custom.svg'
                                 }}
                               />
-                              {presetItem.preset_label}
+                              {presetItem.presetLabel}
                               {presetItem.path !== './' && (
                                 <span className="text-[9px] ml-0.5 opacity-70">
                                   ({presetItem.path})
@@ -448,14 +448,14 @@ export function RepositoryList({
                   )}
 
                   <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-                    {repo.updated_at && (
+                    {repo.pushed_at && (
                       <>
                         <Calendar className="h-2.5 w-2.5" />
-                        <span>Updated </span>
-                        <TimeAgo date={repo.updated_at} className="" />
+                        <span>Pushed </span>
+                        <TimeAgo date={repo.pushed_at} className="" />
                       </>
                     )}
-                    {repo.language && repo.updated_at && (
+                    {repo.language && repo.pushed_at && (
                       <span className="text-muted-foreground/50">•</span>
                     )}
                     {repo.language && (

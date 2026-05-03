@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Build and push all sandbox images to Docker Hub (gotempsh/).
-# Requires: docker buildx, logged in to Docker Hub as gotempsh.
+# Build and push all sandbox images to GHCR (ghcr.io/gotempsh/).
+# Requires: docker buildx, logged in to GHCR (`docker login ghcr.io`).
 # Usage: ./scripts/build-sandbox-images.sh [runtime...]
 # If no runtimes specified, builds all: node bun python rust go full
+#
+# Image version is read from SANDBOX_IMAGE_VERSION in
+# crates/temps-agents/src/sandbox/docker.rs so the script and the runtime
+# stay in lock-step. The release workflow runs the same logic in CI.
 
 set -euo pipefail
 
@@ -14,6 +18,17 @@ if [ $# -eq 0 ]; then
 else
     RUNTIMES=("$@")
 fi
+
+# Extract the pinned image version from the Rust source so we never publish
+# under the wrong tag. Single source of truth for the version string.
+IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
+    "$REPO_ROOT/crates/temps-agents/src/sandbox/docker.rs" \
+    | sed -E 's/.*"([^"]+)".*/\1/')
+if [ -z "$IMAGE_VERSION" ]; then
+    echo "error: failed to extract SANDBOX_IMAGE_VERSION from docker.rs" >&2
+    exit 1
+fi
+echo "Publishing sandbox images at version: $IMAGE_VERSION"
 
 PRINT_DOCKERFILE="$REPO_ROOT/target/debug/examples/print_dockerfile"
 
@@ -41,10 +56,10 @@ TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
 for runtime in "${RUNTIMES[@]}"; do
-    IMAGE="gotempsh/temps-sandbox-${runtime}"
+    IMAGE="ghcr.io/gotempsh/temps-sandbox-${runtime}"
     echo ""
     echo "=========================================="
-    echo "Building and pushing: $IMAGE"
+    echo "Building and pushing: $IMAGE:$IMAGE_VERSION (+ :latest)"
     echo "=========================================="
 
     BUILD_DIR="$TMPDIR/$runtime"
@@ -54,11 +69,12 @@ for runtime in "${RUNTIMES[@]}"; do
 
     docker buildx build \
         --platform linux/amd64,linux/arm64 \
+        --tag "$IMAGE:$IMAGE_VERSION" \
         --tag "$IMAGE:latest" \
         --push \
         "$BUILD_DIR"
 
-    echo "✓ $IMAGE:latest pushed"
+    echo "✓ $IMAGE:$IMAGE_VERSION pushed"
 done
 
 echo ""
