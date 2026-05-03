@@ -40,9 +40,29 @@ pub struct AuthFlavor {
     pub format: CredentialFormat,
     /// Env-var name (used when `format == ApiKey`). Empty for other formats.
     pub env_var: &'static str,
-    /// Absolute path inside the sandbox where the credential file is written
-    /// (used when `format != ApiKey`). Empty for `ApiKey` flavors.
-    pub seed_path: &'static str,
+    /// Path inside the sandbox where the credential file is written, **relative
+    /// to the sandbox user's home dir** (used when `format != ApiKey`). Empty
+    /// for `ApiKey` flavors. Stored relative so a future image with a
+    /// different non-root user only requires editing
+    /// `crate::sandbox::user::SANDBOX_HOME`. Use [`AuthFlavor::seed_path`] to
+    /// resolve to an absolute path at the call site.
+    pub seed_path_rel: &'static str,
+}
+
+impl AuthFlavor {
+    /// Absolute path inside the sandbox where the credential file is written.
+    /// Returns an empty string for `ApiKey` flavors that have no seed path.
+    pub fn seed_path(&self) -> String {
+        if self.seed_path_rel.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{}/{}",
+                crate::sandbox::user::SANDBOX_HOME,
+                self.seed_path_rel
+            )
+        }
+    }
 }
 
 /// Static description of an AI CLI provider — install command, auth options,
@@ -105,7 +125,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
                     "Claude Max/Pro — paste the OAuth token from `claude setup-token`.",
                 format: CredentialFormat::OauthToken,
                 env_var: "",
-                seed_path: "/home/temps/.claude/.credentials.json",
+                seed_path_rel: ".claude/.credentials.json",
             },
             AuthFlavor {
                 id: "api_key",
@@ -113,7 +133,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
                 description: "Pay-per-use Anthropic API key (sk-ant-...).",
                 format: CredentialFormat::ApiKey,
                 env_var: "ANTHROPIC_API_KEY",
-                seed_path: "",
+                seed_path_rel: "",
             },
         ],
         // Model IDs the Claude CLI accepts. Short aliases (`sonnet`/`opus`/
@@ -141,7 +161,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
                     "ChatGPT Plus/Pro/Team/Enterprise — run `codex login` on your host, then paste the contents of `~/.codex/auth.json` here.",
                 format: CredentialFormat::ConfigFile,
                 env_var: "",
-                seed_path: "/home/temps/.codex/auth.json",
+                seed_path_rel: ".codex/auth.json",
             },
             AuthFlavor {
                 id: "api_key",
@@ -149,7 +169,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
                 description: "Pay-per-use OpenAI API key (sk-...).",
                 format: CredentialFormat::ApiKey,
                 env_var: "OPENAI_API_KEY",
-                seed_path: "",
+                seed_path_rel: "",
             },
         ],
         // Model IDs the Codex CLI exposes via its `Select Model and Effort`
@@ -181,7 +201,7 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
                 "Paste the contents of `~/.local/share/opencode/auth.json` from a host where you've already run `opencode auth add`.",
             format: CredentialFormat::ConfigFile,
             env_var: "",
-            seed_path: "/home/temps/.local/share/opencode/auth.json",
+            seed_path_rel: ".local/share/opencode/auth.json",
         }],
         // OpenCode picks its own model from `~/.config/opencode/config.json`
         // (or runtime `--model provider/id`). Leaving this empty tells the
@@ -233,8 +253,8 @@ mod tests {
                     );
                 } else {
                     assert!(
-                        !flavor.seed_path.is_empty(),
-                        "provider {} flavor {} needs a seed_path for non-ApiKey format",
+                        !flavor.seed_path_rel.is_empty(),
+                        "provider {} flavor {} needs a seed_path_rel for non-ApiKey format",
                         entry.id,
                         flavor.id
                     );

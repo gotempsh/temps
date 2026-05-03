@@ -301,7 +301,12 @@ async fn mint_key_and_respond(
         .ok_or(CliAuthError::NoRoleAssigned { user_id: user.id })?;
 
     // Build the api-key request: name = "cli:<device>-<unix_ts>", role inherited.
-    let device = device_name.unwrap_or("cli");
+    //
+    // `device_name` is supplied by the client and surfaced verbatim in the
+    // user's API-key management UI. Sanitize it so a hostile/typo client
+    // can't store HTML/JS or control characters in someone else's key list,
+    // and bound length so the persisted name stays printable.
+    let device = sanitize_device_name(device_name.unwrap_or("cli"));
     let timestamp = chrono::Utc::now().timestamp();
     let key_name = format!("cli:{device}-{timestamp}");
     let expires_at = Some(chrono::Utc::now() + chrono::Duration::days(CLI_KEY_TTL_DAYS));
@@ -333,6 +338,33 @@ async fn mint_key_and_respond(
         key_prefix: created.key_prefix,
         expires_at: created.expires_at,
     }))
+}
+
+/// Sanitize a CLI `device_name` before splicing it into the API-key
+/// `name` field. Keeps `[A-Za-z0-9._-]`, replaces every other byte with
+/// `_`, and clamps length to 64 chars. Falls back to `"cli"` when the
+/// result would be empty.
+///
+/// Rationale: the key name is shown verbatim in the user's API-key
+/// management UI. Without sanitization, a malformed (or hostile) client
+/// could plant HTML, control characters, or extremely long strings into
+/// that surface. Hostnames from `hostname(1)` already fall in the safe
+/// alphabet, so legitimate use is unaffected.
+fn sanitize_device_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(64));
+    for c in raw.chars().take(64) {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches(|c: char| c == '_' || c == '.' || c == '-');
+    if trimmed.is_empty() {
+        "cli".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Pick the user's primary role for CLI-key minting. Prefers admin > user >
@@ -435,6 +467,39 @@ mod tests {
             roles: vec![],
         };
         assert!(pick_primary_role(&uwr).is_none());
+    }
+
+    #[test]
+    fn sanitize_device_name_keeps_safe_chars() {
+        assert_eq!(sanitize_device_name("dviejo-mac.local"), "dviejo-mac.local");
+        assert_eq!(sanitize_device_name("MyHost_42"), "MyHost_42");
+    }
+
+    #[test]
+    fn sanitize_device_name_replaces_unsafe_chars() {
+        // Leading/trailing separators are trimmed after substitution.
+        assert_eq!(
+            sanitize_device_name("<script>alert(1)</script>"),
+            "script_alert_1___script"
+        );
+        assert_eq!(
+            sanitize_device_name("name\nwith\nnewlines"),
+            "name_with_newlines"
+        );
+    }
+
+    #[test]
+    fn sanitize_device_name_clamps_length() {
+        let long = "x".repeat(200);
+        let out = sanitize_device_name(&long);
+        assert!(out.len() <= 64, "got {} chars", out.len());
+    }
+
+    #[test]
+    fn sanitize_device_name_falls_back_for_empty_or_only_separators() {
+        assert_eq!(sanitize_device_name(""), "cli");
+        assert_eq!(sanitize_device_name("---___..."), "cli");
+        assert_eq!(sanitize_device_name("@@@!!!"), "cli");
     }
 
     #[test]

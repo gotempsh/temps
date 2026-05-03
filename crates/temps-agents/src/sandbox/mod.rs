@@ -1,6 +1,9 @@
 pub mod docker;
 pub mod local;
 pub mod pty_agent_bundle;
+pub mod user;
+
+pub use user::{SANDBOX_CHOWN, SANDBOX_GROUP, SANDBOX_HOME, SANDBOX_USER, SANDBOX_WORK_DIR};
 
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -60,7 +63,7 @@ pub struct SandboxHandle {
     pub sandbox_id: String,
     /// Human-readable name for logging (e.g. `temps-sandbox-42`)
     pub sandbox_name: String,
-    /// Path to the repository inside the sandbox (e.g. `/workspace`)
+    /// Path to the repository inside the sandbox. See `sandbox::user::SANDBOX_WORK_DIR`.
     pub work_dir: PathBuf,
 }
 
@@ -81,7 +84,7 @@ pub struct SandboxCreateConfig {
     /// the volume on first use (only if the volume is empty) and is then
     /// ignored — the volume is the source of truth.
     pub host_work_dir: PathBuf,
-    /// When `Some`, mount this Docker named volume at `/workspace` instead
+    /// When `Some`, mount this Docker named volume at the sandbox work dir instead
     /// of bind-mounting `host_work_dir`. The volume is seeded from
     /// `host_work_dir` on first use (detected by checking if it's empty)
     /// and retained on sandbox destroy so a follow-up workspace can mount

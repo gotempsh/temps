@@ -218,8 +218,12 @@ prometheus = "0.14"
 # External Service Integrations
 # ============================================================================
 # Cloud Storage (S3/MinIO)
-aws-sdk-s3 = "1.112.0"
-aws-config = { version = "1.6", features = ["rustls", "rt-tokio"] }
+# default-features = false drops the deprecated `rustls` feature, which transitively
+# enables aws-smithy-runtime/tls-rustls → hyper-rustls 0.24 → rustls 0.21 →
+# rustls-webpki 0.101.7 (RUSTSEC-2026-0098/-0099/-0104). The modern HTTPS path
+# (default-https-client → rustls-aws-lc → rustls 0.23 + aws-lc-rs) is preserved.
+aws-sdk-s3 = { version = "1.112.0", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+aws-config = { version = "1.6", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"] }
 # Caching (Redis)
 redis = { version = "0.28.2", features = ["tokio-comp", "connection-manager"] }
 
@@ -291,6 +295,17 @@ testcontainers =  "0.27.2"
 codegen-units = 1
 opt-level = 3
 
+# Fast non-debug build for local "just run it" workflows. Inherits release
+# semantics but parallelizes codegen, drops debug info, and strips symbols
+# so link time is a fraction of `--release`. Use: `cargo run --profile fast`.
+[profile.fast]
+inherits = "release"
+codegen-units = 16
+debug = false
+strip = "symbols"
+lto = false
+incremental = true
+
 [profile.dev]
 opt-level = 0
 debug = "line-tables-only"
@@ -336,21 +351,17 @@ debug = false
 # - rustls-webpki 0.103.10 (RUSTSEC-2026-0098, -0099, -0104): RESOLVED by cargo update rustls-webpki@0.103 → 0.103.13
 # - rand 0.9.2 (RUSTSEC-2026-0097): RESOLVED by cargo update rand@0.9 → 0.9.4
 # - rand 0.8.5 (RUSTSEC-2026-0097): RESOLVED by cargo update rand@0.8 → 0.8.6
+# - rustls-webpki 0.101.7 (RUSTSEC-2026-0098, -0099, -0104) on rustls 0.21:
+#     RESOLVED by disabling default features on aws-sdk-s3, aws-sdk-sesv2, and
+#     aws-config so the deprecated `rustls` feature (which activates
+#     aws-smithy-runtime/tls-rustls → hyper-rustls 0.24 → rustls 0.21 →
+#     rustls-webpki 0.101.7) is no longer enabled. The modern path
+#     (default-https-client → rustls-aws-lc → rustls 0.23 + aws-lc-rs) is kept.
 #
 # 5. RUSTSEC-2023-0071: rsa 0.9.10 (MEDIUM severity)
 #    - Title: Marvin Attack: potential key recovery through timing sidechannels
 #    - Status: No fixed upgrade available upstream
 #    - Mitigation: RSA used for SSH key operations only, not exposed to network timing attacks
-#
-# 6. RUSTSEC-2026-0098, -0099, -0104: rustls-webpki 0.101.7 (MEDIUM severity)
-#    - Titles: CRL-parsing panic, name-constraint URI bypass, wildcard constraint bypass
-#    - Path: aws-smithy-http-client 1.1.10 → rustls 0.21.12 → rustls-webpki 0.101.7
-#    - Status: Requires aws-smithy-http-client to migrate from rustls 0.21 to rustls 0.23.
-#      No semver-compatible update available (0.101.x series is on the old rustls 0.21).
-#    - Mitigation: This copy of rustls is only used by the AWS SDK's HTTP client, which
-#      talks to AWS endpoints over well-known certificates. CRL-parsing panic and
-#      name-constraint bypasses require attacker control over the certificate chain,
-#      which AWS's pinned endpoints do not provide.
 #
 # All remaining items are transitive dependencies from third-party crates that we
 # cannot directly patch without forking. Monitoring upstream for updates.

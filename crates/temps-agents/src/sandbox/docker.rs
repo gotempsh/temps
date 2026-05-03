@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::user::{SANDBOX_CHOWN, SANDBOX_HOME, SANDBOX_USER, SANDBOX_WORK_DIR};
 use super::{
     ExecStream, OnStreamEventCallback, SandboxCreateConfig, SandboxExecResult, SandboxHandle,
     SandboxProvider,
@@ -31,8 +32,11 @@ fn shell_quote(s: &str) -> String {
 /// `temps-cli/src/commands/serve/preview_gateway.rs::PREVIEW_GATEWAY_NETWORK`.
 const SANDBOX_NETWORK: &str = "temps-sandbox-net";
 
-/// Path inside the container where the repository is mounted.
-const CONTAINER_WORK_DIR: &str = "/workspace";
+/// Path inside the container where the repository is mounted. Aliased to the
+/// shared `SANDBOX_WORK_DIR` constant so a future image with a different
+/// non-root user (and therefore a different home dir) only requires editing
+/// `sandbox::user`.
+const CONTAINER_WORK_DIR: &str = SANDBOX_WORK_DIR;
 
 /// Generate a Dockerfile for a given runtime preset.
 ///
@@ -147,10 +151,15 @@ RUN cargo build --release --bin temps-pty-agent \
     && strip target/release/temps-pty-agent
 "#;
 
+    let user = SANDBOX_USER;
+    let home = SANDBOX_HOME;
+    let chown = SANDBOX_CHOWN;
+    let work_dir = SANDBOX_WORK_DIR;
+
     format!(
         r#"{pty_agent_stage}FROM {base}
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PATH=/home/temps/.local/bin:/usr/local/bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PATH={home}/.local/bin:/usr/local/bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 RUN apt-get update && apt-get install -y --no-install-recommends {extra_packages} wget tmux bubblewrap && rm -rf /var/lib/apt/lists/*
 RUN {extra_run}
 {bun_install}# Install GitHub CLI from official apt repo
@@ -167,32 +176,32 @@ RUN GLAB_ARCH=$(dpkg --print-architecture) \
     && chmod +x /usr/local/bin/glab \
     && rm -rf /tmp/glab.tar.gz /tmp/bin
 RUN EXISTING_USER=$(getent passwd 1000 | cut -d: -f1) \
-    && if [ -n "$EXISTING_USER" ] && [ "$EXISTING_USER" != "temps" ]; then \
+    && if [ -n "$EXISTING_USER" ] && [ "$EXISTING_USER" != "{user}" ]; then \
          (userdel -r "$EXISTING_USER" 2>/dev/null || userdel "$EXISTING_USER" 2>/dev/null || true); \
          (groupdel "$EXISTING_USER" 2>/dev/null || true); \
        fi \
-    && useradd -m -s /bin/bash -u 1000 temps \
-    && echo '# temps sandbox: scoped sudo for package install only.' > /etc/sudoers.d/temps \
-    && echo 'Cmnd_Alias TEMPS_PKG = /usr/bin/apt, /usr/bin/apt-get, /usr/bin/dpkg, /usr/bin/pip, /usr/bin/pip3, /usr/local/bin/uv, /usr/bin/npm, /usr/local/bin/bun' >> /etc/sudoers.d/temps \
-    && echo 'temps ALL=(ALL) NOPASSWD: TEMPS_PKG' >> /etc/sudoers.d/temps \
-    && echo 'Defaults:temps !requiretty, !log_input, !log_output' >> /etc/sudoers.d/temps \
-    && chmod 0440 /etc/sudoers.d/temps \
-    && visudo -c -f /etc/sudoers.d/temps
-RUN mkdir -p /workspace && chown temps:temps /workspace
+    && useradd -m -s /bin/bash -u 1000 {user} \
+    && echo '# temps sandbox: scoped sudo for package install only.' > /etc/sudoers.d/{user} \
+    && echo 'Cmnd_Alias TEMPS_PKG = /usr/bin/apt, /usr/bin/apt-get, /usr/bin/dpkg, /usr/bin/pip, /usr/bin/pip3, /usr/local/bin/uv, /usr/bin/npm, /usr/local/bin/bun' >> /etc/sudoers.d/{user} \
+    && echo '{user} ALL=(ALL) NOPASSWD: TEMPS_PKG' >> /etc/sudoers.d/{user} \
+    && echo 'Defaults:{user} !requiretty, !log_input, !log_output' >> /etc/sudoers.d/{user} \
+    && chmod 0440 /etc/sudoers.d/{user} \
+    && visudo -c -f /etc/sudoers.d/{user}
+RUN mkdir -p {work_dir} && chown {chown} {work_dir}
 # /run/temps-pty holds one Unix socket per terminal tab (one per {{kind,tab}}
 # pair). dtach creates these sockets on first attach; subsequent reconnects
 # find the existing socket and re-attach instead of respawning the CLI. The
 # directory lives in the container's tmpfs, so it's wiped on container
 # restart — which is exactly the "launch once per sandbox lifetime" boundary
 # we want.
-RUN mkdir -p /run/temps-pty && chown temps:temps /run/temps-pty && chmod 0700 /run/temps-pty
-# Install Claude Code via the official native installer, as the temps user.
+RUN mkdir -p /run/temps-pty && chown {chown} /run/temps-pty && chmod 0700 /run/temps-pty
+# Install Claude Code via the official native installer, as the sandbox user.
 # Must run as the target user — the installer drops files in $HOME/.local/bin
 # and refuses to install system-wide. We also seed PATH in ~/.bashrc so
 # interactive shells (e.g. the tmux-wrapped terminal) find the binary even
 # if the parent env wasn't propagated.
-USER temps
-ENV HOME=/home/temps
+USER {user}
+ENV HOME={home}
 # Make every AI CLI bin directory discoverable by all shells — interactive or
 # not. Bashrc alone isn't enough: `docker exec` and the workspace terminal
 # launch non-login shells that don't source it, so commands were silently
@@ -200,15 +209,15 @@ ENV HOME=/home/temps
 #   - claude:   ~/.local/bin/claude (native installer)
 #   - codex:    ~/.bun/bin/codex (bun add -g)
 #   - opencode: ~/.opencode/bin/opencode (curl|bash installer, hardcoded path)
-ENV PATH=/home/temps/.local/bin:/home/temps/.bun/bin:/home/temps/.opencode/bin:$PATH
+ENV PATH={home}/.local/bin:{home}/.bun/bin:{home}/.opencode/bin:$PATH
 RUN curl -fsSL https://claude.ai/install.sh | bash \
-    && /home/temps/.local/bin/claude --version \
-    && echo 'export PATH=/home/temps/.local/bin:/home/temps/.bun/bin:/home/temps/.opencode/bin:$PATH' >> /home/temps/.bashrc
-RUN BUN_INSTALL=/home/temps/.bun bun add -g @openai/codex \
-    && /home/temps/.bun/bin/codex --version
+    && {home}/.local/bin/claude --version \
+    && echo 'export PATH={home}/.local/bin:{home}/.bun/bin:{home}/.opencode/bin:$PATH' >> {home}/.bashrc
+RUN BUN_INSTALL={home}/.bun bun add -g @openai/codex \
+    && {home}/.bun/bin/codex --version
 RUN curl -fsSL https://opencode.ai/install | bash \
-    && /home/temps/.opencode/bin/opencode --version
-# Backup Claude CLI + Codex + OpenCode to a path outside /home/temps so
+    && {home}/.opencode/bin/opencode --version
+# Backup Claude CLI + Codex + OpenCode to a path outside the home dir so
 # named-volume mounts (which overlay the entire home dir) don't mask the
 # binaries. The container start-up hook restores from here when the volume
 # is stale. Each CLI installer picks its own home subdir, so we mirror all
@@ -218,9 +227,9 @@ RUN curl -fsSL https://opencode.ai/install | bash \
 #   - ~/.opencode    → opencode (curl|bash installer, hardcoded INSTALL_DIR)
 USER root
 RUN mkdir -p /opt/claude-backup \
-    && cp -a /home/temps/.local /opt/claude-backup/local \
-    && cp -a /home/temps/.bun /opt/claude-backup/bun \
-    && cp -a /home/temps/.opencode /opt/claude-backup/opencode
+    && cp -a {home}/.local /opt/claude-backup/local \
+    && cp -a {home}/.bun /opt/claude-backup/bun \
+    && cp -a {home}/.opencode /opt/claude-backup/opencode
 USER root
 # In-sandbox PTY agent: a single long-lived process that owns every
 # interactive terminal in this container. See ADR-008 for rationale.
@@ -230,8 +239,8 @@ USER root
 COPY --from=pty-agent-builder /build/target/release/temps-pty-agent /usr/local/bin/temps-pty-agent
 COPY pty-agent/sandbox-entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/temps-pty-agent /usr/local/bin/sandbox-entrypoint.sh
-USER temps
-WORKDIR /workspace
+USER {user}
+WORKDIR {work_dir}
 # The container's CMD is whatever the caller passes (usually `sleep infinity`).
 # The entrypoint starts the agent supervisor and then execs CMD. docker-init
 # (enabled via HostConfig.init=true) reaps any zombies the agent leaves behind.
@@ -998,18 +1007,18 @@ impl SandboxProvider for DockerSandboxProvider {
         // Bind mount: only the work directory. Auth is handled via env vars
         // (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY) — no host config mounting.
         //
-        // Named volume for `/home/temps`: persists the sandbox user's home
-        // directory (claude session jsonl, shell history, ~/.claude/projects,
-        // ~/.config/...) across container recreation. Without this, killing
-        // and recreating the sandbox would lose all conversation continuity
-        // even though the work_dir survives via the bind mount above.
+        // Named volume for the sandbox user's home dir: persists claude
+        // session jsonl, shell history, ~/.claude/projects, ~/.config/...
+        // across container recreation. Without this, killing and recreating
+        // the sandbox would lose all conversation continuity even though the
+        // work_dir survives via the bind mount above.
         //
         // The volume name is keyed on run_id so each session keeps its own
         // home isolated, and the volume is auto-created on first mount.
         let home_volume_name = format!("temps-sandbox-home-{}", config.run_id);
         let binds = vec![
             format!("{}:{}", host_work_dir, CONTAINER_WORK_DIR),
-            format!("{}:/home/temps", home_volume_name),
+            format!("{}:{}", home_volume_name, SANDBOX_HOME),
         ];
 
         // tmpfs mount for secrets — in-memory only, never written to disk
@@ -1037,8 +1046,8 @@ impl SandboxProvider for DockerSandboxProvider {
             memory_swap: Some(memory_limit_mb as i64 * 1024 * 1024),
             // Security hardening
             cap_drop: Some(vec!["ALL".to_string()]),
-            // CHOWN/FOWNER are needed so the post-start chown of /home/temps
-            // (fixing stale named-volume ownership) can run as root.
+            // CHOWN/FOWNER are needed so the post-start chown of the sandbox
+            // home dir (fixing stale named-volume ownership) can run as root.
             cap_add: Some(vec!["CHOWN".to_string(), "FOWNER".to_string()]),
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             pids_limit: Some(config.pids_limit.unwrap_or(512)),
@@ -1108,10 +1117,11 @@ impl SandboxProvider for DockerSandboxProvider {
                 reason: format!("Failed to start container: {}", e),
             })?;
 
-        // Fix /home/temps ownership: the named volume inherits the host's
+        // Fix sandbox home ownership: the named volume inherits the host's
         // anonymous-volume root uid on first mount, and stale volumes from
         // earlier image builds may be owned by a different uid entirely.
-        // Running chown as root (not USER temps) normalizes it every start.
+        // Running chown as root (not USER {sandbox-user}) normalizes it
+        // every start.
         {
             let exec = self
                 .docker
@@ -1122,8 +1132,8 @@ impl SandboxProvider for DockerSandboxProvider {
                         cmd: Some(vec![
                             "chown".to_string(),
                             "-R".to_string(),
-                            "temps:temps".to_string(),
-                            "/home/temps".to_string(),
+                            SANDBOX_CHOWN.to_string(),
+                            SANDBOX_HOME.to_string(),
                         ]),
                         attach_stdout: Some(true),
                         attach_stderr: Some(true),
@@ -1148,14 +1158,14 @@ impl SandboxProvider for DockerSandboxProvider {
                 .await;
         }
 
-        // Fix /workspace ownership: the bind-mounted host directory carries
+        // Fix work-dir ownership: the bind-mounted host directory carries
         // its host-side uid into the container, regardless of the image's
-        // `USER temps` directive. In production the temps server runs as
-        // root, so the host work_dir is created root-owned and `git clone`
-        // (which executes on the host) writes root-owned files. Inside the
-        // container the `temps` user then can't write — TUIs fail, dev
-        // servers can't open lockfiles, etc. Mirror the /home/temps fix:
-        // recursively chown to temps:temps as root, every start.
+        // `USER {sandbox-user}` directive. In production the temps server
+        // runs as root, so the host work_dir is created root-owned and
+        // `git clone` (which executes on the host) writes root-owned files.
+        // Inside the container the sandbox user then can't write — TUIs
+        // fail, dev servers can't open lockfiles, etc. Mirror the home-dir
+        // fix: recursively chown as root, every start.
         {
             let exec = self
                 .docker
@@ -1166,7 +1176,7 @@ impl SandboxProvider for DockerSandboxProvider {
                         cmd: Some(vec![
                             "chown".to_string(),
                             "-R".to_string(),
-                            "temps:temps".to_string(),
+                            SANDBOX_CHOWN.to_string(),
                             CONTAINER_WORK_DIR.to_string(),
                         ]),
                         attach_stdout: Some(true),
@@ -1193,7 +1203,7 @@ impl SandboxProvider for DockerSandboxProvider {
         }
 
         // Ensure AI CLIs are present in the home volume. Named volumes
-        // persist across image rebuilds and mask the image's /home/temps,
+        // persist across image rebuilds and mask the image's home dir,
         // wiping claude/codex/opencode every time the volume gets recycled.
         // Strategy: restore from /opt/claude-backup (local builds always
         // populate it), fall back to re-running the claude installer if
@@ -1202,38 +1212,36 @@ impl SandboxProvider for DockerSandboxProvider {
         // We restore both ~/.local (claude + opencode) and ~/.bun (codex)
         // because bun installs codex into its own global tree, not ~/.local.
         {
+            let restore_script = format!(
+                "need_restore=0; \
+                 [ -x {home}/.local/bin/claude ] || need_restore=1; \
+                 [ -x {home}/.bun/bin/codex ] || need_restore=1; \
+                 [ -x {home}/.opencode/bin/opencode ] || need_restore=1; \
+                 if [ \"$need_restore\" = \"0\" ]; then exit 0; fi; \
+                 echo 'AI CLIs missing in home volume, restoring...'; \
+                 if [ -d /opt/claude-backup/local ]; then \
+                   mkdir -p {home}/.local {home}/.bun {home}/.opencode && \
+                   cp -a /opt/claude-backup/local/. {home}/.local/ && \
+                   cp -a /opt/claude-backup/bun/. {home}/.bun/ && \
+                   cp -a /opt/claude-backup/opencode/. {home}/.opencode/ && \
+                   chown -R {chown} {home}/.local {home}/.bun {home}/.opencode; \
+                 elif [ -d /opt/claude-backup ]; then \
+                   cp -a /opt/claude-backup/. {home}/.local/ && \
+                   chown -R {chown} {home}/.local; \
+                 elif command -v curl >/dev/null 2>&1; then \
+                   su - {user} -c 'curl -fsSL https://claude.ai/install.sh | bash' 2>&1; \
+                 fi",
+                home = SANDBOX_HOME,
+                chown = SANDBOX_CHOWN,
+                user = SANDBOX_USER,
+            );
             let exec = self
                 .docker
                 .create_exec(
                     &container.id,
                     bollard::models::ExecConfig {
                         user: Some("0:0".to_string()),
-                        cmd: Some(vec![
-                            "sh".to_string(),
-                            "-c".to_string(),
-                            concat!(
-                                "need_restore=0; ",
-                                "[ -x /home/temps/.local/bin/claude ] || need_restore=1; ",
-                                "[ -x /home/temps/.bun/bin/codex ] || need_restore=1; ",
-                                "[ -x /home/temps/.opencode/bin/opencode ] || need_restore=1; ",
-                                "if [ \"$need_restore\" = \"0\" ]; then exit 0; fi; ",
-                                "echo 'AI CLIs missing in home volume, restoring...'; ",
-                                "if [ -d /opt/claude-backup/local ]; then ",
-                                "  mkdir -p /home/temps/.local /home/temps/.bun /home/temps/.opencode && ",
-                                "  cp -a /opt/claude-backup/local/. /home/temps/.local/ && ",
-                                "  cp -a /opt/claude-backup/bun/. /home/temps/.bun/ && ",
-                                "  cp -a /opt/claude-backup/opencode/. /home/temps/.opencode/ && ",
-                                "  chown -R temps:temps /home/temps/.local /home/temps/.bun /home/temps/.opencode; ",
-                                "elif [ -d /opt/claude-backup ]; then ",
-                                // Old layout (pre-codex): backup was just the .local tree.
-                                "  cp -a /opt/claude-backup/. /home/temps/.local/ && ",
-                                "  chown -R temps:temps /home/temps/.local; ",
-                                "elif command -v curl >/dev/null 2>&1; then ",
-                                "  su - temps -c 'curl -fsSL https://claude.ai/install.sh | bash' 2>&1; ",
-                                "fi"
-                            )
-                            .to_string(),
-                        ]),
+                        cmd: Some(vec!["sh".to_string(), "-c".to_string(), restore_script]),
                         attach_stdout: Some(true),
                         attach_stderr: Some(true),
                         ..Default::default()
@@ -2137,7 +2145,10 @@ mod tests {
         let result = provider
             .exec(
                 &handle,
-                vec!["cat".to_string(), "/workspace/test.txt".to_string()],
+                vec![
+                    "cat".to_string(),
+                    format!("{}/test.txt", CONTAINER_WORK_DIR),
+                ],
                 HashMap::new(),
                 None,
             )

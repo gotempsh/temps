@@ -63,9 +63,16 @@ impl WorkflowPlanner {
     /// 1. Environment variables from the env_vars table for the specific environment (via env_var_environments junction table)
     /// 2. Runtime environment variables from external services linked to the project
     /// 3. Sentry DSN environment variables - auto-generated per project/environment:
-    ///    - `SENTRY_DSN` is always added
-    ///    - `NEXT_PUBLIC_SENTRY_DSN` is added when preset is Next.js
-    ///    - `VITE_PUBLIC_SENTRY_DSN` is added when preset is Vite
+    ///    - `SENTRY_DSN` is always added (server-side / generic).
+    ///    - A framework-specific public-DSN var is added so client bundlers expose it.
+    ///      The exact name follows each framework's public-prefix convention so
+    ///      `import.meta.env.<VAR>` / `process.env.<VAR>` resolves at build time:
+    ///      Next.js                                       → `NEXT_PUBLIC_SENTRY_DSN`
+    ///      Nuxt                                          → `NUXT_PUBLIC_SENTRY_DSN`
+    ///      Vite, React, Vue, SolidStart, Remix           → `VITE_SENTRY_DSN`
+    ///      SvelteKit, Astro, Rsbuild                     → `PUBLIC_SENTRY_DSN`
+    ///      Docusaurus                                    → `REACT_APP_SENTRY_DSN`
+    ///      Angular and all backend / generic presets     → no extra var (use `SENTRY_DSN`)
     /// 4. Deployment token environment variables (TEMPS_API_URL and TEMPS_API_TOKEN) - for API access from deployed apps
     /// 5. Cron secret (`CRON_SECRET`) - derived from the deployment token, used to authenticate
     ///    cron job HTTP requests via `Authorization: Bearer <CRON_SECRET>` header
@@ -243,17 +250,11 @@ impl WorkflowPlanner {
                         // Always add SENTRY_DSN for server-side usage
                         env_vars_map.insert("SENTRY_DSN".to_string(), project_dsn.dsn.clone());
 
-                        // Add framework-specific public DSN env var based on preset
-                        match project.preset {
-                            temps_entities::preset::Preset::NextJs => {
-                                env_vars_map
-                                    .insert("NEXT_PUBLIC_SENTRY_DSN".to_string(), project_dsn.dsn);
-                            }
-                            temps_entities::preset::Preset::Vite => {
-                                env_vars_map
-                                    .insert("VITE_PUBLIC_SENTRY_DSN".to_string(), project_dsn.dsn);
-                            }
-                            _ => {}
+                        // Add framework-specific public DSN env var based on preset.
+                        // Each client bundler only exposes vars matching its own prefix
+                        // convention to the browser bundle, so we mirror that mapping.
+                        if let Some(public_var) = public_sentry_dsn_var(project.preset) {
+                            env_vars_map.insert(public_var.to_string(), project_dsn.dsn);
                         }
                     }
                     Err(e) => {
@@ -1887,6 +1888,49 @@ impl WorkflowPlanner {
     }
 }
 
+/// Returns the framework-specific public-DSN env var name for a preset, or
+/// `None` if the preset has no client bundler (backend-only) or has no
+/// build-time public-prefix convention (Angular reads from `environment.ts`,
+/// generic Docker/Nixpacks/Static presets don't know the framework).
+///
+/// Each entry follows the bundler's own public-prefix rule — that's the only
+/// prefix the bundler will inline into the browser bundle.
+fn public_sentry_dsn_var(preset: temps_entities::preset::Preset) -> Option<&'static str> {
+    use temps_entities::preset::Preset;
+    match preset {
+        // Next.js: `NEXT_PUBLIC_*` is inlined into the client bundle.
+        Preset::NextJs => Some("NEXT_PUBLIC_SENTRY_DSN"),
+        // Nuxt 3+: `NUXT_PUBLIC_*` is exposed via `useRuntimeConfig().public`.
+        Preset::Nuxt => Some("NUXT_PUBLIC_SENTRY_DSN"),
+        // Vite-based frameworks (Remix uses Vite since v2.5; SolidStart is Vinxi/Vite).
+        Preset::Vite | Preset::React | Preset::Vue | Preset::SolidStart | Preset::Remix => {
+            Some("VITE_SENTRY_DSN")
+        }
+        // SvelteKit / Astro / Rsbuild all use `PUBLIC_*` as their public prefix.
+        Preset::SvelteKit | Preset::Astro | Preset::Rsbuild => Some("PUBLIC_SENTRY_DSN"),
+        // Docusaurus is webpack-based and exposes `REACT_APP_*` via DefinePlugin.
+        Preset::Docusaurus => Some("REACT_APP_SENTRY_DSN"),
+        // Angular has no build-time public prefix; users wire `SENTRY_DSN` into
+        // `environment.ts` themselves. Backend / generic presets only need
+        // server-side `SENTRY_DSN`, which is always added.
+        Preset::Angular
+        | Preset::Python
+        | Preset::FastApi
+        | Preset::Flask
+        | Preset::Django
+        | Preset::Rails
+        | Preset::Go
+        | Preset::Rust
+        | Preset::Java
+        | Preset::Laravel
+        | Preset::NodeJs
+        | Preset::Dockerfile
+        | Preset::DockerCompose
+        | Preset::Nixpacks
+        | Preset::Static => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2412,5 +2456,74 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn public_sentry_dsn_var_maps_each_preset_to_its_public_prefix() {
+        use temps_entities::preset::Preset;
+
+        // Vite-family — every framework that builds with Vite reads `VITE_*`.
+        for preset in [
+            Preset::Vite,
+            Preset::React,
+            Preset::Vue,
+            Preset::SolidStart,
+            Preset::Remix,
+        ] {
+            assert_eq!(
+                public_sentry_dsn_var(preset),
+                Some("VITE_SENTRY_DSN"),
+                "expected VITE_SENTRY_DSN for {:?}",
+                preset
+            );
+        }
+
+        // Frameworks with their own public prefix.
+        assert_eq!(
+            public_sentry_dsn_var(Preset::NextJs),
+            Some("NEXT_PUBLIC_SENTRY_DSN")
+        );
+        assert_eq!(
+            public_sentry_dsn_var(Preset::Nuxt),
+            Some("NUXT_PUBLIC_SENTRY_DSN")
+        );
+        for preset in [Preset::SvelteKit, Preset::Astro, Preset::Rsbuild] {
+            assert_eq!(
+                public_sentry_dsn_var(preset),
+                Some("PUBLIC_SENTRY_DSN"),
+                "expected PUBLIC_SENTRY_DSN for {:?}",
+                preset
+            );
+        }
+        assert_eq!(
+            public_sentry_dsn_var(Preset::Docusaurus),
+            Some("REACT_APP_SENTRY_DSN")
+        );
+
+        // Backend / generic presets get only server-side SENTRY_DSN.
+        for preset in [
+            Preset::Angular,
+            Preset::Python,
+            Preset::FastApi,
+            Preset::Flask,
+            Preset::Django,
+            Preset::Rails,
+            Preset::Go,
+            Preset::Rust,
+            Preset::Java,
+            Preset::Laravel,
+            Preset::NodeJs,
+            Preset::Dockerfile,
+            Preset::DockerCompose,
+            Preset::Nixpacks,
+            Preset::Static,
+        ] {
+            assert_eq!(
+                public_sentry_dsn_var(preset),
+                None,
+                "expected no public DSN var for {:?}",
+                preset
+            );
+        }
     }
 }

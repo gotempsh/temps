@@ -123,6 +123,36 @@ impl WorkspaceService {
             });
         }
 
+        // Allowlist `ai_provider` against the catalog. Without this, the
+        // session manager's `build_chat_cmd` fallback would execute the raw
+        // string as a binary inside the sandbox container.
+        if temps_agents::ai_cli::catalog::find_provider(&request.ai_provider).is_none() {
+            return Err(WorkspaceError::Validation {
+                message: format!(
+                    "ai_provider {:?} is not a known CLI provider",
+                    request.ai_provider
+                ),
+            });
+        }
+
+        // Cap `ai_model` length and reject control characters. The model
+        // string is spliced into a `bash -lc` command (single-quoted, so
+        // metacharacter injection is blocked) for the OpenCode provider, and
+        // passed as a direct argv slot for `claude` and `codex`. Bound the
+        // length so a runaway value can't bloat persisted rows or argv.
+        if let Some(m) = &request.ai_model {
+            if m.len() > 200 {
+                return Err(WorkspaceError::Validation {
+                    message: "ai_model must be 200 characters or less".to_string(),
+                });
+            }
+            if m.chars().any(|c| c.is_control()) {
+                return Err(WorkspaceError::Validation {
+                    message: "ai_model must not contain control characters".to_string(),
+                });
+            }
+        }
+
         // If a base branch is specified, the new branch_name must also be
         // provided — otherwise we'd have nothing to fork into.
         if request.base_branch_name.is_some() && request.branch_name.is_none() {

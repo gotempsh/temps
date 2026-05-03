@@ -284,6 +284,10 @@ impl SandboxService {
 /// Every public FS op takes an absolute path. Relative paths would be
 /// resolved inside the container against an implementation-specific cwd,
 /// making behavior brittle.
+///
+/// Also rejects any `..` (`Component::ParentDir`) component so a request
+/// like `/workspace/../etc/passwd` cannot escape the intended cwd. This is
+/// the central gate used by every FS handler, including the tar extractor.
 fn validate_absolute(path: &str, op: &str) -> Result<(), SandboxError> {
     if path.is_empty() {
         return Err(SandboxError::Validation {
@@ -293,6 +297,17 @@ fn validate_absolute(path: &str, op: &str) -> Result<(), SandboxError> {
     if !path.starts_with('/') {
         return Err(SandboxError::Validation {
             message: format!("fs {} path must be absolute, got '{}'", op, path),
+        });
+    }
+    if std::path::Path::new(path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(SandboxError::Validation {
+            message: format!(
+                "fs {} path must not contain '..' segments, got '{}'",
+                op, path
+            ),
         });
     }
     Ok(())
@@ -333,6 +348,19 @@ mod tests {
     #[test]
     fn validate_absolute_accepts_slash_prefixed() {
         validate_absolute("/workspace/index.ts", "read").unwrap();
+    }
+
+    #[test]
+    fn validate_absolute_rejects_parent_dir_traversal() {
+        let err = validate_absolute("/workspace/../etc/passwd", "write").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(".."), "msg: {}", msg);
+    }
+
+    #[test]
+    fn validate_absolute_rejects_trailing_parent_dir() {
+        let err = validate_absolute("/workspace/..", "stat").unwrap_err();
+        assert!(matches!(err, SandboxError::Validation { .. }));
     }
 
     #[test]

@@ -187,6 +187,11 @@ fn url_contains_credentials(url: &str) -> bool {
 /// sandbox to fetch from internal Docker network services (control
 /// plane API, neighbor sandboxes, cloud metadata), turning sandbox
 /// seeding into an SSRF primitive.
+///
+/// Cheap synchronous gate — IP literal blocklist and scheme check.
+/// Hostname-based SSRF (e.g. `http://internal.local/`) is caught by
+/// `validate_seed_url_async` below, which also resolves DNS and rejects
+/// any name whose resolution lands on a blocked IP.
 fn validate_seed_url(url: &str, kind: &str) -> Result<(), SandboxError> {
     use temps_core::url_validation::{validate_external_url, UrlValidationError};
     validate_external_url(url).map_err(|e| {
@@ -213,9 +218,40 @@ fn validate_seed_url(url: &str, kind: &str) -> Result<(), SandboxError> {
     Ok(())
 }
 
+/// Async SSRF gate: runs the synchronous `validate_seed_url` first, then
+/// — when the URL has a hostname (not an IP literal) — resolves DNS and
+/// rejects any name that points at a blocked IP. Catches `internal.local`,
+/// `metadata.google.internal`, and similar names that bypass the IP-literal
+/// check.
+async fn validate_seed_url_async(url: &str, kind: &str) -> Result<(), SandboxError> {
+    validate_seed_url(url, kind)?;
+
+    // Re-parse to get the host. `validate_seed_url` already accepted it,
+    // so this won't error in practice — but if it does, we surface the
+    // same Validation flavor for consistency.
+    let parsed = url::Url::parse(url).map_err(|e| SandboxError::Validation {
+        message: format!("{kind} source: invalid url: {e}"),
+    })?;
+    if let Some(url::Host::Domain(domain)) = parsed.host() {
+        temps_core::url_validation::validate_domain_async(domain)
+            .await
+            .map_err(|_| SandboxError::Validation {
+                message: format!(
+                    "{kind} source: host resolves to a private, loopback, or metadata address"
+                ),
+            })?;
+    }
+    Ok(())
+}
+
 impl SourceBody {
     /// Validate the body before converting it into the service-layer
     /// `SandboxSource`. Called by handlers that accept a SourceBody.
+    ///
+    /// Synchronous-only checks (scheme, IP literal blocklist, embedded
+    /// credentials, mutually exclusive auth fields). Production handlers
+    /// should call [`Self::validate_async`] instead so DNS-based SSRF is
+    /// also caught.
     pub fn validate(&self) -> Result<(), SandboxError> {
         match self {
             SourceBody::Git {
@@ -259,6 +295,18 @@ impl SourceBody {
                 validate_seed_url(url, "tarball")?;
                 Ok(())
             }
+        }
+    }
+
+    /// Full async validation including DNS resolution. Use from handlers
+    /// to block SSRF via hostnames that resolve to internal/metadata IPs.
+    pub async fn validate_async(&self) -> Result<(), SandboxError> {
+        // Run the cheap sync checks first so we fail fast on obvious errors
+        // and avoid an unnecessary DNS lookup.
+        self.validate()?;
+        match self {
+            SourceBody::Git { url, .. } => validate_seed_url_async(url, "git").await,
+            SourceBody::Tarball { url } => validate_seed_url_async(url, "tarball").await,
         }
     }
 }
@@ -772,7 +820,7 @@ pub async fn create_sandbox(
 ) -> Result<impl IntoResponse, Problem> {
     sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
     if let Some(src) = body.source.as_ref() {
-        src.validate()?;
+        src.validate_async().await?;
     }
     let row = state
         .sandbox_service
@@ -1013,7 +1061,7 @@ pub async fn source_sandbox(
     Json(body): Json<SourceBody>,
 ) -> Result<impl IntoResponse, Problem> {
     sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
-    body.validate()?;
+    body.validate_async().await?;
     let source: SandboxSource = body.into();
     let row = state
         .sandbox_service
@@ -1760,6 +1808,13 @@ struct TarEntry {
 /// Extract a gzipped tar stream into in-memory entries. Bounded by the
 /// request's size limit — callers control that upstream. We skip
 /// directory entries (the sandbox's `write_file` auto-creates parents).
+///
+/// Entry names are validated to reject any `..` ParentDir component or
+/// embedded NUL byte. Without this, a crafted tarball could escape the
+/// caller-supplied `x-cwd` via `../../etc/...` and overwrite host paths
+/// inside the sandbox container — `validate_absolute` is the second
+/// gate, but tar names should never reach the FS layer with traversal
+/// segments to begin with.
 fn extract_tar_gz(body: &[u8]) -> Result<Vec<TarEntry>, String> {
     use std::io::Read;
     let gz = flate2::read::GzDecoder::new(body);
@@ -1776,6 +1831,21 @@ fn extract_tar_gz(body: &[u8]) -> Result<Vec<TarEntry>, String> {
             .map_err(|e| e.to_string())?
             .to_string_lossy()
             .into_owned();
+        if name.is_empty() {
+            return Err("tar entry has empty path".into());
+        }
+        if name.contains('\0') {
+            return Err(format!("tar entry path contains NUL byte: {:?}", name));
+        }
+        if std::path::Path::new(&name)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "tar entry path contains '..' traversal segment: {:?}",
+                name
+            ));
+        }
         let mode = header.mode().map_err(|e| e.to_string())? & 0o7777;
         let mut content = Vec::with_capacity(header.size().unwrap_or(0) as usize);
         entry.read_to_end(&mut content).map_err(|e| e.to_string())?;
@@ -2041,8 +2111,18 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
         .route("/v1/sandboxes/{id}/cmd/{cmd_id}/logs", get(cmd_logs))
         .route("/v1/sandboxes/{id}/{cmd_id}/kill", post(cmd_kill))
         .route("/v1/sandboxes/{id}/fs/read", get(read_file))
-        .route("/v1/sandboxes/{id}/fs/write", post(write_file))
-        .route("/v1/sandboxes/{id}/fs/write-batch", post(write_files))
+        // `/fs/write` accepts JSON (single file, base64) or `application/gzip`
+        // tar uploads from the Vercel SDK. Cap at 64 MiB so a buggy client
+        // (or a malicious one) can't drive control-plane memory exhaustion
+        // — `read_to_end` buffers the whole tar before forwarding to Docker.
+        .route(
+            "/v1/sandboxes/{id}/fs/write",
+            post(write_file).layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/sandboxes/{id}/fs/write-batch",
+            post(write_files).layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
         .route("/v1/sandboxes/{id}/fs/stat", get(stat_path))
         .route("/v1/sandboxes/{id}/fs/mkdir", post(mkdir))
         .route("/v1/sandboxes/{id}/domain", get(domain))

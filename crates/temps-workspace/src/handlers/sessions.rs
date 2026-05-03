@@ -21,6 +21,7 @@ use tokio::io::AsyncWriteExt;
 use utoipa::ToSchema;
 
 use sea_orm::EntityTrait;
+use temps_agents::sandbox::{SANDBOX_HOME, SANDBOX_WORK_DIR};
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, AuditOperation, RequestMetadata};
@@ -1458,11 +1459,17 @@ async fn handle_session_terminal(
     // resume semantics — claude uses a session-id marker, codex has
     // `--last`, opencode has `--continue`. If resume fails (nothing to
     // resume, corrupt state), we fall back to a fresh session.
+    let claude_projects_glob = format!(
+        "{}/.claude/projects/{}/*.jsonl",
+        SANDBOX_HOME,
+        SANDBOX_WORK_DIR.replace('/', "-")
+    );
     let resume_snippet = match cli {
         "claude" => format!(
-            "if [ -f /tmp/.agent-session-id ]; then {cli}{args} --resume \"$(cat /tmp/.agent-session-id)\" || {cli}{args} --continue || {cli}{args}; rm -f /tmp/.agent-session-id; elif ls /home/temps/.claude/projects/-workspace/*.jsonl >/dev/null 2>&1; then {cli}{args} --continue || {cli}{args}; else {cli}{args}; fi",
+            "if [ -f /tmp/.agent-session-id ]; then {cli}{args} --resume \"$(cat /tmp/.agent-session-id)\" || {cli}{args} --continue || {cli}{args}; rm -f /tmp/.agent-session-id; elif ls {projects_glob} >/dev/null 2>&1; then {cli}{args} --continue || {cli}{args}; else {cli}{args}; fi",
             cli = cli,
             args = cli_args,
+            projects_glob = claude_projects_glob,
         ),
         "codex" => format!(
             "{cli} resume --last{args} || {cli}{args}",
@@ -1478,12 +1485,15 @@ async fn handle_session_terminal(
     };
     // Inner command: shell tabs drop into bash, CLI tabs launch the resume
     // chain then fall through to bash on exit.
-    let cli_path_prefix =
-        "/home/temps/.local/bin:/home/temps/.bun/bin:/home/temps/.opencode/bin:/usr/local/bun/bin";
+    let cli_path_prefix = format!(
+        "{home}/.local/bin:{home}/.bun/bin:{home}/.opencode/bin:/usr/local/bun/bin",
+        home = SANDBOX_HOME
+    );
     let inner_cmd = match kind.as_str() {
         "shell" => "exec bash".to_string(),
         _ => format!(
-            "cd /workspace && {resume}; exec bash",
+            "cd {work_dir} && {resume}; exec bash",
+            work_dir = SANDBOX_WORK_DIR,
             resume = resume_snippet
         ),
     };
@@ -1673,14 +1683,14 @@ async fn handle_session_terminal(
         rows: 24,
         replay_bytes,
         label: Some(format!("{}-{}", ai_provider, kind)),
-        cwd: Some("/workspace".to_string()),
+        cwd: Some(SANDBOX_WORK_DIR.to_string()),
         env: Some(vec![
             ("TERM".into(), "xterm-256color".into()),
             (
                 "PATH".into(),
                 format!("{cli_path_prefix}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
             ),
-            ("HOME".into(), "/home/temps".into()),
+            ("HOME".into(), SANDBOX_HOME.to_string()),
         ]),
     };
     if let Err(e) = write_json_frame(&mut pty_input, OP_OPEN, &open_req).await {
@@ -2499,7 +2509,13 @@ async fn inject_agent_run_context(state: &WorkspaceAppState, session_id: i32, ag
         }
     };
 
-    // 3. Ensure the Claude projects directory exists in the sandbox
+    // 3. Ensure the Claude projects directory exists in the sandbox.
+    // Claude encodes the workdir as a filename by replacing '/' with '-'.
+    let claude_projects_dir = format!(
+        "{}/.claude/projects/{}",
+        SANDBOX_HOME,
+        SANDBOX_WORK_DIR.replace('/', "-")
+    );
     let _ = state
         .session_manager
         .exec(
@@ -2507,7 +2523,7 @@ async fn inject_agent_run_context(state: &WorkspaceAppState, session_id: i32, ag
             vec![
                 "mkdir".to_string(),
                 "-p".to_string(),
-                "/home/temps/.claude/projects/-workspace".to_string(),
+                claude_projects_dir.clone(),
             ],
             std::collections::HashMap::new(),
             None,
@@ -2515,10 +2531,7 @@ async fn inject_agent_run_context(state: &WorkspaceAppState, session_id: i32, ag
         .await;
 
     // 4. Write the session .jsonl into the sandbox
-    let sandbox_path = format!(
-        "/home/temps/.claude/projects/-workspace/{}.jsonl",
-        ai_session_id
-    );
+    let sandbox_path = format!("{}/{}.jsonl", claude_projects_dir, ai_session_id);
     if let Err(e) = state
         .session_manager
         .write_file(session_id, &sandbox_path, &session_data, 0o644)
@@ -2761,6 +2774,23 @@ pub async fn workspace_send_message(
     if body.content.trim().is_empty() {
         return Err(WorkspaceError::Validation {
             message: "Message content cannot be empty".to_string(),
+        }
+        .into());
+    }
+
+    // Cap message content size. Without this, the drain loop concatenates
+    // queued messages into a single Claude prompt unbounded — runaway
+    // clients could stall the executor and bloat persisted rows. 256 KiB
+    // is well above any human-typed message and still safely under the
+    // CLI's argv buffer.
+    const MAX_MESSAGE_BYTES: usize = 256 * 1024;
+    if body.content.len() > MAX_MESSAGE_BYTES {
+        return Err(WorkspaceError::Validation {
+            message: format!(
+                "Message content must be {} bytes or less (got {} bytes)",
+                MAX_MESSAGE_BYTES,
+                body.content.len()
+            ),
         }
         .into());
     }

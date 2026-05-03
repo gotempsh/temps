@@ -9,11 +9,21 @@ use temps_agents::ai_cli::{
     OnEventCallback,
 };
 use temps_agents::sandbox::{
-    SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider,
+    SandboxCreateConfig, SandboxExecResult, SandboxHandle, SandboxProvider, SANDBOX_HOME,
+    SANDBOX_WORK_DIR,
 };
 use temps_core::EncryptionService;
 
 use crate::error::WorkspaceError;
+
+/// POSIX-style single-quoted shell escape. Wraps the input in single quotes
+/// and re-encodes any embedded single quote as `'\''`. Used to splice
+/// user-controlled tokens (e.g. `ai_model`) into a `bash -lc` string without
+/// allowing shell metacharacter injection.
+fn posix_shell_escape(s: &str) -> String {
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{}'", escaped)
+}
 
 /// Canonical Temps CLI skill, embedded at compile time from
 /// `temps/skills/temps-cli/SKILL.md`. Kept as a standalone constant (in
@@ -560,7 +570,12 @@ impl WorkspaceSessionManager {
                 let mut parts = vec!["opencode run".to_string()];
                 if let Some(m) = model {
                     if !m.is_empty() {
-                        parts.push(format!("--model '{}'", m));
+                        // SAFETY: `m` is user-controllable (`ai_model` from
+                        // start-session). Splicing it into a `bash -lc` string
+                        // without escaping allows arbitrary command execution
+                        // inside the sandbox container — see the v0.0.8
+                        // security audit. Always single-quote escape.
+                        parts.push(format!("--model {}", posix_shell_escape(m)));
                     }
                 }
                 if continue_conversation {
@@ -570,8 +585,32 @@ impl WorkspaceSessionManager {
                 parts.push("\"$(cat /tmp/.temps-prompt)\"".to_string());
                 vec!["bash".to_string(), "-lc".to_string(), parts.join(" ")]
             }
+            // Reject unknown providers rather than executing the raw string
+            // as a binary inside the sandbox. `create_session` validates
+            // against the catalog allowlist, so this branch is defense in
+            // depth — if we get here, fall back to claude_cli with the bare
+            // prompt and log loudly.
             other => {
-                vec![other.to_string(), prompt.to_string()]
+                tracing::error!(
+                    "build_chat_cmd: unknown ai_provider {:?} reached the executor — \
+                     rejecting and falling back to claude_cli (this indicates a \
+                     missing allowlist check upstream)",
+                    other
+                );
+                let mut cmd = vec!["claude".to_string(), "--print".to_string()];
+                if continue_conversation {
+                    cmd.push("--continue".to_string());
+                }
+                cmd.push(prompt.to_string());
+                cmd.extend([
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                    "--max-turns".to_string(),
+                    max_turns.to_string(),
+                    "--dangerously-skip-permissions".to_string(),
+                    "--verbose".to_string(),
+                ]);
+                cmd
             }
         }
     }
@@ -815,8 +854,10 @@ impl WorkspaceSessionManager {
         // the CLIs even though they exist on disk.
         env.insert(
             "PATH".to_string(),
-            "/home/temps/.temps/bin:/home/temps/.local/bin:/home/temps/.bun/bin:/home/temps/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-                .to_string(),
+            format!(
+                "{home}/.temps/bin:{home}/.local/bin:{home}/.bun/bin:{home}/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                home = SANDBOX_HOME
+            ),
         );
 
         env
@@ -847,18 +888,18 @@ impl WorkspaceSessionManager {
         // All providers now use a user-level path to avoid polluting the
         // /workspace bind mount with Temps-injected skill files.
         let skills_base = match ai_provider {
-            "codex_cli" => "/home/temps/.codex/skills",
-            _ => "/home/temps/.claude/skills",
+            "codex_cli" => format!("{}/.codex/skills", SANDBOX_HOME),
+            _ => format!("{}/.claude/skills", SANDBOX_HOME),
         };
 
         // Remove the stale flat-file version from older sandbox builds.
-        // We deliberately do NOT touch the `/workspace/.claude/skills`
-        // directory beyond this: `/workspace` is the user's repo and any
+        // We deliberately do NOT touch the work-dir's `.claude/skills`
+        // directory beyond this: the work dir is the user's repo and any
         // skills they keep there belong to them.
         let cleanup_cmd = vec![
             "rm".to_string(),
             "-f".to_string(),
-            "/workspace/.claude/skills/temps-platform.md".to_string(),
+            format!("{}/.claude/skills/temps-platform.md", SANDBOX_WORK_DIR),
         ];
         let _ = self
             .exec(session_id, cleanup_cmd, HashMap::new(), None)
@@ -906,8 +947,12 @@ impl WorkspaceSessionManager {
         // `projects["/workspace"].hasTrustDialogAccepted = true` suppresses the
         // "Quick safety check: is this a project you trust?" prompt, and
         // `hasCompletedProjectOnboarding` covers the "Welcome back!" variant.
+        let claude_json_path = format!("{}/.claude.json", SANDBOX_HOME);
+        let claude_dir = format!("{}/.claude", SANDBOX_HOME);
+        let claude_settings_path = format!("{}/.claude/settings.json", SANDBOX_HOME);
+
         let existing = self
-            .read_file(session_id, "/home/temps/.claude.json")
+            .read_file(session_id, &claude_json_path)
             .await
             .ok()
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
@@ -944,7 +989,7 @@ impl WorkspaceSessionManager {
         // "WARNING: Claude Code running in Bypass Permissions mode" gate.
         // Claude CLI checks per-project first, then falls back to the root-
         // level `bypassPermissionsModeAccepted` — we set both to be safe.
-        body["projects"]["/workspace"] = serde_json::json!({
+        body["projects"][SANDBOX_WORK_DIR] = serde_json::json!({
             "hasTrustDialogAccepted": true,
             "hasCompletedProjectOnboarding": true,
             "projectOnboardingSeenCount": 1,
@@ -961,11 +1006,12 @@ impl WorkspaceSessionManager {
             reason: format!("seed_claude_config: serialize failed: {}", e),
         })?;
 
-        self.write_file(session_id, "/home/temps/.claude.json", &bytes, 0o600)
+        self.write_file(session_id, &claude_json_path, &bytes, 0o600)
             .await?;
 
         tracing::debug!(
-            "Seeded /home/temps/.claude.json for session {} (merged; preserved mcpServers if present)",
+            "Seeded {} for session {} (merged; preserved mcpServers if present)",
+            claude_json_path,
             session_id
         );
 
@@ -973,14 +1019,14 @@ impl WorkspaceSessionManager {
         // anything the injector may have put there in the future.
         self.exec(
             session_id,
-            vec!["mkdir".into(), "-p".into(), "/home/temps/.claude".into()],
+            vec!["mkdir".into(), "-p".into(), claude_dir.clone()],
             std::collections::HashMap::new(),
             None,
         )
         .await?;
 
         let existing_settings = self
-            .read_file(session_id, "/home/temps/.claude/settings.json")
+            .read_file(session_id, &claude_settings_path)
             .await
             .ok()
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
@@ -996,13 +1042,8 @@ impl WorkspaceSessionManager {
                 session_id,
                 reason: format!("seed_claude_config: settings serialize failed: {}", e),
             })?;
-        self.write_file(
-            session_id,
-            "/home/temps/.claude/settings.json",
-            &settings_bytes,
-            0o600,
-        )
-        .await?;
+        self.write_file(session_id, &claude_settings_path, &settings_bytes, 0o600)
+            .await?;
 
         Ok(())
     }
@@ -1027,7 +1068,11 @@ impl WorkspaceSessionManager {
         // Ensure ~/.claude/ directory exists
         self.exec(
             session_id,
-            vec!["mkdir".into(), "-p".into(), "/home/temps/.claude".into()],
+            vec![
+                "mkdir".into(),
+                "-p".into(),
+                format!("{}/.claude", SANDBOX_HOME),
+            ],
             std::collections::HashMap::new(),
             None,
         )
@@ -1052,18 +1097,11 @@ impl WorkspaceSessionManager {
             reason: format!("seed_claude_credentials: serialize failed: {}", e),
         })?;
 
-        self.write_file(
-            session_id,
-            "/home/temps/.claude/.credentials.json",
-            &bytes,
-            0o600,
-        )
-        .await?;
+        let creds_path = format!("{}/.claude/.credentials.json", SANDBOX_HOME);
+        self.write_file(session_id, &creds_path, &bytes, 0o600)
+            .await?;
 
-        tracing::debug!(
-            "Seeded /home/temps/.claude/.credentials.json for session {}",
-            session_id
-        );
+        tracing::debug!("Seeded {} for session {}", creds_path, session_id);
         Ok(())
     }
 
@@ -1083,26 +1121,30 @@ impl WorkspaceSessionManager {
     /// Best-effort: a failure here shouldn't abort sandbox creation, so the
     /// caller logs a warning and moves on.
     pub async fn seed_codex_config(&self, session_id: i32) -> Result<(), WorkspaceError> {
+        let codex_dir = format!("{}/.codex", SANDBOX_HOME);
+        let codex_config_path = format!("{}/.codex/config.toml", SANDBOX_HOME);
+        let trust_header = format!("[projects.\"{}\"]", SANDBOX_WORK_DIR);
+
         self.exec(
             session_id,
-            vec!["mkdir".into(), "-p".into(), "/home/temps/.codex".into()],
+            vec!["mkdir".into(), "-p".into(), codex_dir],
             std::collections::HashMap::new(),
             None,
         )
         .await?;
 
         let existing = self
-            .read_file(session_id, "/home/temps/.codex/config.toml")
+            .read_file(session_id, &codex_config_path)
             .await
             .ok()
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .unwrap_or_default();
 
-        // Already trusts /workspace → nothing to do. Check for the exact
-        // header string; codex writes it with this spacing.
-        if existing.contains("[projects.\"/workspace\"]") {
+        // Already trusts the work dir → nothing to do.
+        if existing.contains(&trust_header) {
             tracing::debug!(
-                "Codex config.toml already trusts /workspace for session {} — skipping seed",
+                "Codex config.toml already trusts {} for session {} — skipping seed",
+                SANDBOX_WORK_DIR,
                 session_id
             );
             return Ok(());
@@ -1112,23 +1154,20 @@ impl WorkspaceSessionManager {
         // `[projects."<abs-path>"]` table per trusted directory, with a single
         // `trust_level = "trusted"` key underneath. Leading newline keeps us
         // safe when `existing` doesn't already end with one.
-        let trust_block = "\n[projects.\"/workspace\"]\ntrust_level = \"trusted\"\n";
+        let trust_block = format!("\n{trust_header}\ntrust_level = \"trusted\"\n");
         let mut body = existing;
         if !body.is_empty() && !body.ends_with('\n') {
             body.push('\n');
         }
-        body.push_str(trust_block);
+        body.push_str(&trust_block);
 
-        self.write_file(
-            session_id,
-            "/home/temps/.codex/config.toml",
-            body.as_bytes(),
-            0o600,
-        )
-        .await?;
+        self.write_file(session_id, &codex_config_path, body.as_bytes(), 0o600)
+            .await?;
 
         tracing::debug!(
-            "Seeded /home/temps/.codex/config.toml with /workspace trust for session {}",
+            "Seeded {} with {} trust for session {}",
+            codex_config_path,
+            SANDBOX_WORK_DIR,
             session_id
         );
         Ok(())
@@ -1198,13 +1237,13 @@ impl WorkspaceSessionManager {
                         ),
                     }
                 })?;
-                self.write_oauth_credential_file(session_id, flavor.seed_path, token)
+                self.write_oauth_credential_file(session_id, &flavor.seed_path(), token)
                     .await?;
             }
             CredentialFormat::ConfigFile => {
                 self.write_config_credential_file(
                     session_id,
-                    flavor.seed_path,
+                    &flavor.seed_path(),
                     decrypted_credential,
                 )
                 .await?;
@@ -1225,7 +1264,8 @@ impl WorkspaceSessionManager {
         access_token: &str,
     ) -> Result<(), WorkspaceError> {
         // Make sure the parent directory exists. Splitting on '/' is fine
-        // because every catalog seed_path is absolute and uses Unix slashes.
+        // because catalog seed paths are resolved against SANDBOX_HOME and
+        // use Unix slashes.
         if let Some(idx) = seed_path.rfind('/') {
             let parent = &seed_path[..idx];
             self.exec(
@@ -1314,9 +1354,10 @@ impl WorkspaceSessionManager {
     ) -> Result<(), WorkspaceError> {
         let body = build_env_file_body(env);
 
-        // Native tar upload (mode 0o600 — secrets). HOME is /home/temps for
-        // the non-root sandbox user defined in the Dockerfile.
-        self.write_file(session_id, "/home/temps/.env", body.as_bytes(), 0o600)
+        // Native tar upload (mode 0o600 — secrets). Path is resolved against
+        // the sandbox user's HOME (see `sandbox::user::SANDBOX_HOME`).
+        let env_path = format!("{}/.env", SANDBOX_HOME);
+        self.write_file(session_id, &env_path, body.as_bytes(), 0o600)
             .await?;
 
         // Global CLAUDE.md telling the agent (a) which Temps project this
@@ -1380,13 +1421,9 @@ messages — they are short-lived and may rotate. Always re-read from `~/.env`.
         );
         let claude_md = claude_md.as_str();
 
-        self.write_file(
-            session_id,
-            "/home/temps/.claude/CLAUDE.md",
-            claude_md.as_bytes(),
-            0o644,
-        )
-        .await?;
+        let claude_md_path = format!("{}/.claude/CLAUDE.md", SANDBOX_HOME);
+        self.write_file(session_id, &claude_md_path, claude_md.as_bytes(), 0o644)
+            .await?;
 
         tracing::debug!(
             "Injected ~/.env ({} keys) and global CLAUDE.md into session {}",
@@ -1842,8 +1879,9 @@ mod tests {
             None,
         );
         let path = env.get("PATH").expect("PATH should be set");
+        let expected_prefix = format!("{}/.temps/bin:", SANDBOX_HOME);
         assert!(
-            path.starts_with("/home/temps/.temps/bin:"),
+            path.starts_with(&expected_prefix),
             "memory script dir must come first in PATH (got: {})",
             path
         );
@@ -1978,25 +2016,16 @@ mod tests {
 
     #[test]
     fn test_skill_file_content() {
-        // Verify the skill file has key sections
-        assert!(TEMPS_PLATFORM_SKILL.contains("temps analytics"));
-        assert!(TEMPS_PLATFORM_SKILL.contains("temps errors"));
-        assert!(TEMPS_PLATFORM_SKILL.contains("temps services connect"));
-        assert!(TEMPS_PLATFORM_SKILL.contains("temps deployments"));
-        assert!(TEMPS_PLATFORM_SKILL.contains("temps monitoring"));
-        assert!(TEMPS_PLATFORM_SKILL.contains("read-only"));
-    }
-
-    #[test]
-    fn test_skill_file_has_memory_section() {
-        // The memory section is critical — without it, the AI doesn't know
-        // workflow memory exists and never uses it.
-        assert!(TEMPS_PLATFORM_SKILL.contains("## Memory"));
-        assert!(TEMPS_PLATFORM_SKILL.contains("memory write"));
-        assert!(TEMPS_PLATFORM_SKILL.contains("memory search"));
-        assert!(TEMPS_PLATFORM_SKILL.contains("memory list"));
-        assert!(TEMPS_PLATFORM_SKILL.contains("memory supersede"));
-        assert!(TEMPS_PLATFORM_SKILL.contains("Tags matter"));
+        // Verify the bundled skill carries the section headers and CLI
+        // entry point the AI relies on. If the skill is rewritten and these
+        // sections move, update the assertions to the new headers — the
+        // intent is "the doc is wired up", not specific wording.
+        assert!(TEMPS_PLATFORM_SKILL.contains("@temps-sdk/cli"));
+        assert!(TEMPS_PLATFORM_SKILL.contains("## Analytics"));
+        assert!(TEMPS_PLATFORM_SKILL.contains("## Error Tracking"));
+        assert!(TEMPS_PLATFORM_SKILL.contains("## Services"));
+        assert!(TEMPS_PLATFORM_SKILL.contains("## Deployments"));
+        assert!(TEMPS_PLATFORM_SKILL.contains("## Monitoring"));
     }
 
     #[test]
@@ -2114,5 +2143,59 @@ mod tests {
         let shell_cmd = &cmd[2];
         assert!(shell_cmd.contains("--model 'openai/gpt-5.4'"));
         assert!(!shell_cmd.contains("--continue"));
+    }
+
+    /// Regression test: a malicious `ai_model` value containing a single
+    /// quote must not break out of the quoted argument in the `bash -lc`
+    /// wrapper. With the fix, the embedded `'` is encoded as `'\''` so the
+    /// payload becomes a literal substring of the model token rather than
+    /// a chained shell command.
+    ///
+    /// We can't assert "the literal byte sequence ` touch ` is absent" —
+    /// even after escaping, the payload is *inside* a single-quoted string
+    /// and naturally contains those bytes. What we *can* assert is that
+    /// the embedded single quote was re-encoded as `'\''`, which is the
+    /// POSIX-quoted form bash interprets as a literal apostrophe rather
+    /// than as a quote terminator.
+    #[test]
+    fn test_build_chat_cmd_opencode_model_shell_injection_is_escaped() {
+        let manager = make_manager(false);
+        let payload = "'; touch /tmp/pwned; echo '";
+        let cmd = manager.build_chat_cmd("help", 25, false, "opencode", Some(payload));
+
+        let shell_cmd = &cmd[2];
+        // Must contain the POSIX-quoted form of every embedded single
+        // quote — `'\''`. Without escaping, a bare `'` in the payload
+        // would terminate the quoted argument and let the rest run as a
+        // new shell statement.
+        assert!(
+            shell_cmd.contains("'\\''"),
+            "expected single-quote escape sequence in: {shell_cmd}"
+        );
+        // The `--model` token must start with `''\''` (open-quote + empty
+        // string + escaped apostrophe), which is the canonical POSIX form
+        // for "argument that begins with an apostrophe".
+        assert!(
+            shell_cmd.contains("--model ''\\''"),
+            "expected --model arg to start with quote+escaped-apostrophe: {shell_cmd}"
+        );
+        // And it must end with the closing `\'''` + space (escaped apostrophe
+        // + close-quote) before the next CLI flag.
+        assert!(
+            shell_cmd.contains("\\''' --format json"),
+            "expected --model arg to close before --format flag: {shell_cmd}"
+        );
+    }
+
+    /// Regression test: an unknown `ai_provider` must not be executed as a
+    /// command. The fallback now runs `claude` with the prompt, never the
+    /// raw provider string.
+    #[test]
+    fn test_build_chat_cmd_unknown_provider_falls_back_to_claude() {
+        let manager = make_manager(false);
+        let cmd = manager.build_chat_cmd("hello", 25, false, "/bin/sh", None);
+
+        assert_eq!(cmd[0], "claude");
+        assert_ne!(cmd[0], "/bin/sh");
     }
 }

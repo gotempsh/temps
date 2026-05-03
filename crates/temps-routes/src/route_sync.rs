@@ -309,13 +309,15 @@ fn sha256_hash(input: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Constant-time equality for the SHA-256 token hash check.
+///
+/// Delegates to `subtle::ConstantTimeEq`, which is the same primitive used
+/// by Stripe webhook signature verification in `temps-revenue`. The hand-
+/// rolled XOR loop this replaced returned early on length mismatch — for
+/// fixed-length hashes (always 64 hex chars in our case) the practical
+/// risk was minimal, but the new impl removes the timing channel entirely
+/// and is also auditor-friendly (no DIY crypto).
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }

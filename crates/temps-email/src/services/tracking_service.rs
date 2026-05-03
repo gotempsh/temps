@@ -492,13 +492,25 @@ fn find_href_start(s: &str) -> Option<HrefMatch> {
 }
 
 /// Should this link be rewritten for click tracking?
+///
+/// Beyond the scheme check we run the same synchronous SSRF/private-IP
+/// blocklist used by sandbox seed URLs. Rationale: a tracked URL is
+/// stored verbatim and emitted from `/track/click/{i}` as a 302 redirect.
+/// Without this filter, an authenticated sender could craft an email
+/// whose links cause our domain to redirect recipients to private IPs
+/// or cloud-metadata endpoints — a phishing primitive that abuses our
+/// brand. Links that fail validation are still rendered to the recipient
+/// (we leave the original `<a href>` untouched), they just aren't proxied
+/// through our click-tracking endpoint.
 fn should_track_link(url: &str) -> bool {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return false;
     }
-    // Only track http and https links
-    trimmed.starts_with("http://") || trimmed.starts_with("https://")
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return false;
+    }
+    temps_core::url_validation::validate_external_url(trimmed).is_ok()
 }
 
 #[cfg(test)]
@@ -620,6 +632,24 @@ mod tests {
         assert!(!should_track_link("#section"));
         assert!(!should_track_link("javascript:void(0)"));
         assert!(!should_track_link(""));
+    }
+
+    /// Regression test for the v0.0.8 audit finding: emails could store
+    /// tracking redirects pointing at private/loopback/metadata IPs, turning
+    /// our click endpoint into an open redirect that abuses our brand.
+    #[test]
+    fn test_should_track_link_rejects_private_and_metadata_targets() {
+        // RFC 1918 private
+        assert!(!should_track_link("http://10.0.0.1/admin"));
+        assert!(!should_track_link("http://192.168.1.1/"));
+        // Loopback
+        assert!(!should_track_link("http://127.0.0.1/"));
+        // Cloud metadata
+        assert!(!should_track_link(
+            "http://169.254.169.254/latest/meta-data/"
+        ));
+        // localhost hostname is also blocked synchronously
+        assert!(!should_track_link("http://localhost/x"));
     }
 
     #[test]

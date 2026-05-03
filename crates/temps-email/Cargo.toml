@@ -31,7 +31,7 @@ sea-orm = { workspace = true }
 reqwest = { workspace = true }
 
 # AWS SES
-aws-sdk-sesv2 = "1"
+aws-sdk-sesv2 = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-config = { workspace = true }
 
 # Web framework

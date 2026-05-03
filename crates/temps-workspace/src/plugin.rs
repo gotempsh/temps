@@ -89,6 +89,8 @@ impl TempsPlugin for WorkspacePlugin {
                 let git_provider_manager = context.require_service::<dyn GitProviderManagerTrait>();
                 let deployment_token_service = context.require_service::<DeploymentTokenService>();
                 let external_service_manager = context.require_service::<ExternalServiceManager>();
+                let platform_config_service =
+                    context.require_service::<temps_config::ConfigService>();
                 let mut executor = MessageExecutor::new(
                     db.clone(),
                     workspace_service,
@@ -97,6 +99,7 @@ impl TempsPlugin for WorkspacePlugin {
                     encryption_service,
                     deployment_token_service,
                     external_service_manager,
+                    platform_config_service,
                 )
                 .with_memory_provider(memory_service.clone() as Arc<dyn WorkflowMemoryProvider>);
 

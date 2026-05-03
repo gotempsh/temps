@@ -38,3 +38,7 @@ http = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+
+# Constant-time byte comparison for the per-node bearer-token hash check.
+# Same crate already pulled in by temps-revenue.
+subtle = "2.6"
