@@ -2,3 +2,10 @@
 # Bollard (Docker API client) uses "vertexes" as the field name,
 # matching the upstream Go/BuildKit API naming convention.
 vertexes = "vertexes"
+
+[default.extend-identifiers]
+# W3C traceparent spec example span-id used in test fixtures
+# (crates/temps-proxy/src/proxy.rs `extract_traceparent_trace_id` tests).
+# Hex string contains "ba" which the spell-checker mistakes for "by"/"be".
+"00f067aa0ba902b7" = "00f067aa0ba902b7"
+"deadbeef" = "deadbeef"

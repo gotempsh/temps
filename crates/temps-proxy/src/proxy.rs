@@ -6,8 +6,8 @@ use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
     build_set_cookie, build_set_cookie_sandbox, check_preview_auth, encode_preview_cookie,
     encode_preview_cookie_subject, lookup_preview_session, lookup_sandbox, parse_preview_host,
-    verify_argon2, PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup,
-    PreviewSessionLookup, PreviewTarget, PREVIEW_GATEWAY_PEER,
+    resolve_preview_target, verify_argon2, PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost,
+    PreviewSandboxLookup, PreviewSessionLookup, PreviewTarget, PREVIEW_GATEWAY_PEER,
 };
 use crate::service::challenge_service::ChallengeService;
 use crate::service::ip_access_control_service::IpAccessControlService;
@@ -2110,7 +2110,15 @@ impl ProxyHttp for LoadBalancer {
         // HTTP Basic auth is NOT supported — see `preview_auth.rs` for
         // rationale.
         if let Ok(settings) = self.config_service.get_settings().await {
-            if let Some(preview_host) = parse_preview_host(&ctx.host, &settings.preview_domain) {
+            if let Some(parsed_host) = parse_preview_host(&ctx.host, &settings.preview_domain) {
+                // The parser routes 16-hex labels to `Sandbox` because it
+                // can't distinguish workspace `wss_<hex>` IDs from sandbox
+                // `sbx_<hex>` IDs without a DB lookup. Resolve here so the
+                // rest of this function sees the correct variant — workspace
+                // login/logout/cookie paths only fire when target is
+                // `WorkspaceSession`, so a misclassified host would 404.
+                let preview_host = resolve_preview_target(&self.db, parsed_host).await;
+
                 let client_ip = ctx
                     .ip_address
                     .as_deref()
@@ -2658,9 +2666,12 @@ impl ProxyHttp for LoadBalancer {
                         session
                             .write_response_header(Box::new(response), false)
                             .await?;
+                        // Both workspace and sandbox previews land here. Use a
+                        // generic message — the specific target is logged for
+                        // operators but doesn't help end users.
                         session
                             .write_response_body(
-                                Some(Bytes::from_static(b"Workspace preview not found\n")),
+                                Some(Bytes::from_static(b"Preview not found\n")),
                                 true,
                             )
                             .await?;

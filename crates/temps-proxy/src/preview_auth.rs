@@ -169,6 +169,58 @@ pub fn parse_preview_host(host: &str, preview_domain: &str) -> Option<PreviewHos
     Some(PreviewHost { target, port })
 }
 
+/// Resolve a hex-labelled preview host to its real target by checking the
+/// `workspace_sessions` table first.
+///
+/// Why this exists: `parse_preview_host` is synchronous and can't hit the
+/// DB, so it conservatively routes any 16-hex label to
+/// `PreviewTarget::Sandbox`. But workspace sessions also have a `wss_<hex>`
+/// `public_id` and emit URLs of the same shape (`ws-<hex>-<port>`). Without
+/// this resolution step every workspace preview is misrouted into the
+/// sandboxes table and 404s.
+///
+/// Resolution order:
+///   1. If the target is already `WorkspaceSession(int)` (digit-shaped
+///      label), pass through unchanged — that's the legacy URL form and
+///      it's already typed correctly.
+///   2. If the target is `Sandbox(hex)`, look up `workspace_sessions` by
+///      `public_id = 'wss_<hex>'`. If a row exists, swap to
+///      `WorkspaceSession(row.id)`.
+///   3. Otherwise leave it as `Sandbox(hex)` — the downstream sandbox
+///      lookup will resolve or 404 as before.
+///
+/// This is one extra DB round-trip per request when the target is hex; the
+/// query hits a unique index on `public_id` so latency is negligible.
+pub async fn resolve_preview_target(db: &Arc<DbConnection>, host: PreviewHost) -> PreviewHost {
+    use sea_orm::{ColumnTrait, QueryFilter};
+
+    let hex = match &host.target {
+        PreviewTarget::WorkspaceSession(_) => return host,
+        PreviewTarget::Sandbox(hex) => hex.clone(),
+    };
+
+    let full_public_id = format!("wss_{}", hex);
+    match workspace_sessions::Entity::find()
+        .filter(workspace_sessions::Column::PublicId.eq(full_public_id.clone()))
+        .one(db.as_ref())
+        .await
+    {
+        Ok(Some(row)) => PreviewHost {
+            target: PreviewTarget::WorkspaceSession(row.id),
+            port: host.port,
+        },
+        Ok(None) => host,
+        Err(e) => {
+            warn!(
+                public_id = %full_public_id,
+                error = %e,
+                "preview-auth: failed to resolve workspace session by hex public_id — falling back to sandbox lookup"
+            );
+            host
+        }
+    }
+}
+
 /// Outcome of preview auth processing.
 #[derive(Debug)]
 pub enum PreviewAuthOutcome {
