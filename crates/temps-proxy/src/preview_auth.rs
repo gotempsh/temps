@@ -230,7 +230,12 @@ pub enum PreviewAuthOutcome {
     LoginRequired { host: PreviewHost },
     /// Too many failed attempts — reply with 429.
     RateLimited { host: PreviewHost },
-    /// Session does not exist or has no preview password configured.
+    /// Workspace session exists but has no `preview_password_hash` set. Caller
+    /// surfaces a 409 with copy explaining how to enable preview access.
+    /// Sandbox targets never produce this — they treat "no password" as
+    /// `Allow` (the unguessable hex is the gate).
+    NotConfigured { host: PreviewHost },
+    /// Target row does not exist (or DB lookup failed).
     NotFound { host: PreviewHost },
 }
 
@@ -500,11 +505,22 @@ pub fn verify_argon2(plaintext: &str, hash: &str) -> bool {
 }
 
 /// Result of looking up a workspace session's preview password hash.
+///
+/// Three states matter here because they map to different user-facing
+/// responses:
+///   - `Found`     → normal cookie/login flow.
+///   - `NotConfigured` → session exists, but no password was ever set. We
+///     return a 409 with copy that tells the user how to fix it.
+///   - `NotFound`  → no row at all. Generic 404.
 #[derive(Debug)]
 pub enum PreviewSessionLookup {
     /// Session exists and has a password configured.
     Found { password_hash: String },
-    /// Session doesn't exist, or has no password configured.
+    /// Session exists but has no `preview_password_hash`. Surfaced as a
+    /// distinct state so the caller can render a "preview not configured"
+    /// page instead of a generic 404.
+    NotConfigured,
+    /// Session doesn't exist (or DB read failed — error already logged).
     NotFound,
 }
 
@@ -528,7 +544,7 @@ pub async fn lookup_preview_session(
                     session_id,
                     "preview-auth: session has no preview password configured"
                 );
-                PreviewSessionLookup::NotFound
+                PreviewSessionLookup::NotConfigured
             }
         },
         Ok(None) => PreviewSessionLookup::NotFound,
@@ -652,6 +668,9 @@ pub async fn check_preview_auth(
             }
             let stored_hash = match lookup_preview_session(db, session_id).await {
                 PreviewSessionLookup::Found { password_hash } => password_hash,
+                PreviewSessionLookup::NotConfigured => {
+                    return PreviewAuthOutcome::NotConfigured { host };
+                }
                 PreviewSessionLookup::NotFound => {
                     return PreviewAuthOutcome::NotFound { host };
                 }
@@ -820,5 +839,124 @@ mod tests {
             "limiter grew beyond cap: {}",
             limiter.failures.len()
         );
+    }
+
+    // ── resolve_preview_target ───────────────────────────────────────────────
+    //
+    // Why these tests exist: the parser routes any 16-hex label to
+    // `Sandbox(hex)` because it's synchronous and can't hit the DB. Workspaces
+    // also use 16-hex public_ids (`wss_<hex>`), so without the resolver every
+    // workspace preview was misrouted into the sandboxes table and 404'd in
+    // production. These tests pin the four behaviors that matter:
+    //   1. hex matches a workspace_sessions row → swap to WorkspaceSession(id)
+    //   2. hex doesn't match → leave as Sandbox(hex)
+    //   3. already a WorkspaceSession (legacy digit URL) → pass through
+    //   4. DB error → fall back to Sandbox(hex), never panic
+
+    fn mock_workspace_session(id: i32, public_id: &str) -> workspace_sessions::Model {
+        let now = chrono::Utc::now();
+        workspace_sessions::Model {
+            id,
+            public_id: public_id.to_string(),
+            project_id: 1,
+            user_id: 1,
+            title: None,
+            status: "active".to_string(),
+            sandbox_container_id: None,
+            work_dir: None,
+            branch_name: None,
+            base_branch_name: None,
+            ai_provider: "claude_cli".to_string(),
+            ai_model: None,
+            tokens_input: 0,
+            tokens_output: 0,
+            estimated_cost_cents: 0,
+            files_changed: 0,
+            metadata: None,
+            preview_password_hash: None,
+            preview_password_hint: None,
+            idle_timeout_minutes: None,
+            cpu_milli: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            mcp_servers_config: None,
+            skills_config: None,
+            last_activity_at: now,
+            started_at: now,
+            closed_at: None,
+            created_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_preview_target_hex_matches_workspace_session() {
+        let hex = "0ff07ebda3c06987";
+        let session = mock_workspace_session(42, &format!("wss_{}", hex));
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![session]])
+            .into_connection();
+        let host = PreviewHost {
+            target: PreviewTarget::Sandbox(hex.to_string()),
+            port: 4432,
+        };
+
+        let resolved = resolve_preview_target(&Arc::new(db), host).await;
+        assert_eq!(resolved.target, PreviewTarget::WorkspaceSession(42));
+        assert_eq!(resolved.port, 4432);
+    }
+
+    #[tokio::test]
+    async fn resolve_preview_target_hex_not_workspace_stays_sandbox() {
+        let hex = "0ff07ebda3c06987";
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<workspace_sessions::Model>::new()])
+            .into_connection();
+        let host = PreviewHost {
+            target: PreviewTarget::Sandbox(hex.to_string()),
+            port: 3000,
+        };
+
+        let resolved = resolve_preview_target(&Arc::new(db), host).await;
+        assert_eq!(resolved.target, PreviewTarget::Sandbox(hex.to_string()));
+        assert_eq!(resolved.port, 3000);
+    }
+
+    #[tokio::test]
+    async fn resolve_preview_target_passes_through_workspace_session() {
+        // Already typed as a workspace session (legacy digit URL). The
+        // resolver must NOT issue a DB query — passing an empty mock proves
+        // that. If the resolver tried to query, sea-orm would return
+        // RecordNotFound and the resolver would silently not-fall-through;
+        // the assertion below would still pass. So we also assert the
+        // identity of the returned host (same id, same port).
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let host = PreviewHost {
+            target: PreviewTarget::WorkspaceSession(7),
+            port: 8080,
+        };
+
+        let resolved = resolve_preview_target(&Arc::new(db), host).await;
+        assert_eq!(resolved.target, PreviewTarget::WorkspaceSession(7));
+        assert_eq!(resolved.port, 8080);
+    }
+
+    #[tokio::test]
+    async fn resolve_preview_target_db_error_falls_back_to_sandbox() {
+        // Construct a mock DB that returns an error for the next query.
+        // The resolver must log + degrade to "treat as sandbox" rather than
+        // bubbling the error up — we'd rather a 404 from the sandbox lookup
+        // than the entire preview route exploding.
+        let hex = "deadbeefcafef00d";
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::Custom("simulated".to_string())])
+            .into_connection();
+        let host = PreviewHost {
+            target: PreviewTarget::Sandbox(hex.to_string()),
+            port: 1234,
+        };
+
+        let resolved = resolve_preview_target(&Arc::new(db), host).await;
+        assert_eq!(resolved.target, PreviewTarget::Sandbox(hex.to_string()));
+        assert_eq!(resolved.port, 1234);
     }
 }

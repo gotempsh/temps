@@ -2172,6 +2172,29 @@ impl ProxyHttp for LoadBalancer {
 
                     let stored_hash = match lookup_preview_session(&self.db, session_id).await {
                         PreviewSessionLookup::Found { password_hash } => password_hash,
+                        PreviewSessionLookup::NotConfigured => {
+                            // POST /login on a workspace that doesn't have a
+                            // preview password configured. There's nothing to
+                            // verify against; return 409 with the same copy
+                            // the GET path uses so the user knows what to do.
+                            let mut response = ResponseHeader::build(StatusCode::CONFLICT, None)?;
+                            response.insert_header("Cache-Control", "no-store")?;
+                            response.insert_header("X-Request-ID", &ctx.request_id)?;
+                            response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                            session
+                                .write_response_header(Box::new(response), false)
+                                .await?;
+                            session
+                                .write_response_body(
+                                    Some(Bytes::from_static(
+                                        b"Preview password not configured for this workspace.\n",
+                                    )),
+                                    true,
+                                )
+                                .await?;
+                            ctx.routing_status = "preview_not_configured".to_string();
+                            return Ok(true);
+                        }
                         PreviewSessionLookup::NotFound => {
                             let mut response = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
                             response.insert_header("Cache-Control", "no-store")?;
@@ -2652,6 +2675,43 @@ impl ProxyHttp for LoadBalancer {
                             )
                             .await?;
                         ctx.routing_status = "preview_rate_limited".to_string();
+                        return Ok(true);
+                    }
+                    PreviewAuthOutcome::NotConfigured { host } => {
+                        debug!(
+                            target = %host.target.label(),
+                            "preview-auth: workspace exists but has no preview password"
+                        );
+                        // 409 because the resource exists but cannot serve
+                        // this request in its current state — the user needs
+                        // to set a preview password before the URL works.
+                        // Body is HTML so a browser hitting this directly gets
+                        // a readable explanation; CLI/curl users still see the
+                        // text fallback.
+                        let body = concat!(
+                            "<!doctype html><html><head><meta charset=\"utf-8\">",
+                            "<title>Preview not configured</title>",
+                            "<style>body{font-family:system-ui,sans-serif;max-width:36rem;",
+                            "margin:6rem auto;padding:0 1rem;color:#222;line-height:1.5}",
+                            "code{background:#f4f4f5;padding:.1em .3em;border-radius:.25em}",
+                            "h1{font-size:1.5rem;margin-bottom:.5em}</style></head><body>",
+                            "<h1>Preview not configured</h1>",
+                            "<p>This workspace exists, but no preview password has been set.</p>",
+                            "<p>Open the workspace settings in the Temps console and set a ",
+                            "<strong>preview password</strong> to enable this URL.</p>",
+                            "</body></html>",
+                        );
+                        let mut response = ResponseHeader::build(StatusCode::CONFLICT, None)?;
+                        response.insert_header("Cache-Control", "no-store")?;
+                        response.insert_header("X-Request-ID", &ctx.request_id)?;
+                        response.insert_header("Content-Type", "text/html; charset=utf-8")?;
+                        session
+                            .write_response_header(Box::new(response), false)
+                            .await?;
+                        session
+                            .write_response_body(Some(Bytes::from_static(body.as_bytes())), true)
+                            .await?;
+                        ctx.routing_status = "preview_not_configured".to_string();
                         return Ok(true);
                     }
                     PreviewAuthOutcome::NotFound { host } => {
