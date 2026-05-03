@@ -353,9 +353,32 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      # Single source of truth for "is this a prerelease?" so every downstream
+      # job (server image, sandbox images, manifest merge) makes the same
+      # channel decision. Prereleases are tags containing a `-` (e.g.
+      # `v0.1.0-beta.6`); stable tags look like `v0.1.0`.
+      is_prerelease: ${{ steps.channel.outputs.is_prerelease }}
+      # The floating channel tag stable -> "latest", prerelease -> "beta".
+      # Image jobs append this as an extra tag so operators can pin to a
+      # channel ("ghcr.io/.../temps:beta") instead of an exact version.
+      channel_tag: ${{ steps.channel.outputs.channel_tag }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Determine release channel
+        id: channel
+        run: |
+          if [[ "${{ github.ref_name }}" == *"-"* ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            echo "channel_tag=beta" >> $GITHUB_OUTPUT
+            echo "Channel: beta (prerelease)"
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+            echo "channel_tag=latest" >> $GITHUB_OUTPUT
+            echo "Channel: latest (stable)"
+          fi
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -520,8 +543,7 @@ jobs:
         run: |
           echo "Creating release ${{ github.ref_name }}..."
 
-          # Determine if this is a prerelease
-          if [[ "${{ github.ref_name }}" == *"-"* ]]; then
+          if [[ "${{ steps.channel.outputs.is_prerelease }}" == "true" ]]; then
             PRERELEASE_FLAG="--prerelease"
             echo "This is a pre-release"
           else
@@ -552,7 +574,7 @@ jobs:
 
   build-and-push-docker:
     name: Build and Push Docker Image (${{ matrix.platform }})
-    needs: [build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64]
+    needs: [build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, create-release]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -617,8 +639,12 @@ jobs:
           file: ./Dockerfile.release
           platforms: ${{ matrix.platform }}
           push: true
+          # Per-platform intermediate tags. The manifest-merge job below
+          # combines amd64+arm64 into the final multi-arch refs. Channel tag
+          # (`latest` for stable, `beta` for prereleases) keeps stable users
+          # from being upgraded by a beta release that happens to land later.
           tags: |
-            ghcr.io/${{ github.repository_owner }}/temps:latest-${{ steps.platform_tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/temps:${{ needs.create-release.outputs.channel_tag }}-${{ steps.platform_tag.outputs.tag }}
             ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-${{ steps.platform_tag.outputs.tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -631,7 +657,7 @@ jobs:
 
   create-docker-manifest:
     name: Create Docker Manifest
-    needs: [build-and-push-docker]
+    needs: [build-and-push-docker, create-release]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -651,11 +677,15 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
 
-      - name: Create and push manifest for latest
+      # Merge per-platform tags into a multi-arch manifest under the channel
+      # ref (`:latest` for stable, `:beta` for prereleases). Operators that
+      # pin to `:latest` never receive a prerelease build by accident.
+      - name: Create and push manifest for channel
         run: |
-          docker buildx imagetools create -t ghcr.io/${{ github.repository_owner }}/temps:latest \
-            ghcr.io/${{ github.repository_owner }}/temps:latest-linux-amd64 \
-            ghcr.io/${{ github.repository_owner }}/temps:latest-linux-arm64
+          CHANNEL="${{ needs.create-release.outputs.channel_tag }}"
+          docker buildx imagetools create -t ghcr.io/${{ github.repository_owner }}/temps:$CHANNEL \
+            ghcr.io/${{ github.repository_owner }}/temps:$CHANNEL-linux-amd64 \
+            ghcr.io/${{ github.repository_owner }}/temps:$CHANNEL-linux-arm64
 
       - name: Create and push manifest for version
         run: |
@@ -685,6 +715,11 @@ jobs:
       fail-fast: false
       matrix:
         runtime: [node, bun, python, rust, go, full]
+    env:
+      # Channel decided once in `create-release`; reused here so beta tags
+      # never get pushed to the stable `:latest` ref.
+      CHANNEL_TAG: ${{ needs.create-release.outputs.channel_tag }}
+      IS_PRERELEASE: ${{ needs.create-release.outputs.is_prerelease }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -737,16 +772,54 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Compose channel-aware tag list. Stable releases own the canonical
+      # `:<sandbox_version>` ref + `:latest` + `:stable`; beta releases
+      # publish only suffixed refs (`:<sandbox_version>-beta`, `:beta`) so a
+      # beta Dockerfile change cannot overwrite the stable image at the same
+      # `SANDBOX_IMAGE_VERSION`. The `:<sha>` tag is always pushed for
+      # forensic traceability.
+      - name: Compose tag list
+        id: tags
+        run: |
+          REPO="ghcr.io/${{ github.repository_owner }}/temps-sandbox-${{ matrix.runtime }}"
+          VER="${{ steps.version.outputs.version }}"
+          SHA="${{ github.sha }}"
+          {
+            echo "list<<TAGS_EOF"
+            echo "$REPO:$SHA"
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              echo "$REPO:${VER}-beta"
+              echo "$REPO:beta"
+            else
+              echo "$REPO:$VER"
+              echo "$REPO:${VER}-stable"
+              echo "$REPO:latest"
+              echo "$REPO:stable"
+            fi
+            echo "TAGS_EOF"
+          } >> $GITHUB_OUTPUT
+
+          echo "Channel: $CHANNEL_TAG (prerelease=$IS_PRERELEASE)"
+          echo "Will push:"
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            echo "  $REPO:$SHA"
+            echo "  $REPO:${VER}-beta"
+            echo "  $REPO:beta"
+          else
+            echo "  $REPO:$SHA"
+            echo "  $REPO:$VER"
+            echo "  $REPO:${VER}-stable"
+            echo "  $REPO:latest"
+            echo "  $REPO:stable"
+          fi
+
       - name: Build and push sandbox image
         uses: docker/build-push-action@v5
         with:
           context: ./build-context
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/temps-sandbox-${{ matrix.runtime }}:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/temps-sandbox-${{ matrix.runtime }}:latest
-            ghcr.io/${{ github.repository_owner }}/temps-sandbox-${{ matrix.runtime }}:${{ github.sha }}
+          tags: ${{ steps.tags.outputs.list }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}

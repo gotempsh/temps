@@ -299,18 +299,58 @@ pub fn image_name_for_runtime(runtime: &str) -> String {
     format!("{name}:{SANDBOX_IMAGE_VERSION}")
 }
 
+/// Release channel for sandbox image pulls. Stable temps builds resolve to
+/// the canonical `:<version>` tag; beta builds resolve to `:<version>-beta`.
+/// The two streams never share a tag, so a beta Dockerfile change cannot
+/// poison a stable host running the same `SANDBOX_IMAGE_VERSION`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxChannel {
+    Stable,
+    Beta,
+}
+
+impl SandboxChannel {
+    /// Read the channel from `TEMPS_SANDBOX_CHANNEL`. Default is stable —
+    /// only an explicit `=beta` opts the host into the beta stream.
+    fn from_env() -> Self {
+        match std::env::var("TEMPS_SANDBOX_CHANNEL").as_deref() {
+            Ok("beta") => Self::Beta,
+            _ => Self::Stable,
+        }
+    }
+
+    fn tag_suffix(self) -> &'static str {
+        match self {
+            Self::Stable => "",
+            Self::Beta => "-beta",
+        }
+    }
+}
+
 /// Registry image name for a runtime preset. Used as a pull-cache:
 /// `ensure_image_for_runtime` tries to pull this first, then falls back
 /// to building locally if the registry image isn't available.
 ///
 /// Pinned to `SANDBOX_IMAGE_VERSION` so a host that already cached the
-/// previous version pulls the new one when we bump the constant.
-fn hub_image_for_runtime(runtime: &str) -> String {
+/// previous version pulls the new one when we bump the constant. The
+/// channel argument decides whether we resolve to `:<version>` (stable)
+/// or `:<version>-beta` (beta) — see `SandboxChannel`.
+fn hub_image_for_runtime_in_channel(runtime: &str, channel: SandboxChannel) -> String {
+    let suffix = channel.tag_suffix();
     let name = match runtime {
         "node" | "" => "temps-sandbox-node",
-        other => return format!("ghcr.io/gotempsh/temps-sandbox-{other}:{SANDBOX_IMAGE_VERSION}"),
+        other => {
+            return format!(
+                "ghcr.io/gotempsh/temps-sandbox-{other}:{SANDBOX_IMAGE_VERSION}{suffix}"
+            )
+        }
     };
-    format!("ghcr.io/gotempsh/{name}:{SANDBOX_IMAGE_VERSION}")
+    format!("ghcr.io/gotempsh/{name}:{SANDBOX_IMAGE_VERSION}{suffix}")
+}
+
+/// Convenience wrapper that reads the channel from the environment.
+fn hub_image_for_runtime(runtime: &str) -> String {
+    hub_image_for_runtime_in_channel(runtime, SandboxChannel::from_env())
 }
 
 /// Configuration for the Docker sandbox provider.
@@ -2195,28 +2235,56 @@ mod tests {
     }
 
     #[test]
-    fn test_hub_image_for_runtime() {
+    fn test_hub_image_for_runtime_stable_channel() {
         let v = SANDBOX_IMAGE_VERSION;
+        let stable = SandboxChannel::Stable;
         assert_eq!(
-            hub_image_for_runtime("node"),
+            hub_image_for_runtime_in_channel("node", stable),
             format!("ghcr.io/gotempsh/temps-sandbox-node:{v}")
         );
         assert_eq!(
-            hub_image_for_runtime(""),
+            hub_image_for_runtime_in_channel("", stable),
             format!("ghcr.io/gotempsh/temps-sandbox-node:{v}")
         );
         assert_eq!(
-            hub_image_for_runtime("python"),
+            hub_image_for_runtime_in_channel("python", stable),
             format!("ghcr.io/gotempsh/temps-sandbox-python:{v}")
         );
         assert_eq!(
-            hub_image_for_runtime("bun"),
+            hub_image_for_runtime_in_channel("bun", stable),
             format!("ghcr.io/gotempsh/temps-sandbox-bun:{v}")
         );
         assert_eq!(
-            hub_image_for_runtime("full"),
+            hub_image_for_runtime_in_channel("full", stable),
             format!("ghcr.io/gotempsh/temps-sandbox-full:{v}")
         );
+    }
+
+    #[test]
+    fn test_hub_image_for_runtime_beta_channel() {
+        let v = SANDBOX_IMAGE_VERSION;
+        let beta = SandboxChannel::Beta;
+        assert_eq!(
+            hub_image_for_runtime_in_channel("node", beta),
+            format!("ghcr.io/gotempsh/temps-sandbox-node:{v}-beta")
+        );
+        assert_eq!(
+            hub_image_for_runtime_in_channel("python", beta),
+            format!("ghcr.io/gotempsh/temps-sandbox-python:{v}-beta")
+        );
+        assert_eq!(
+            hub_image_for_runtime_in_channel("full", beta),
+            format!("ghcr.io/gotempsh/temps-sandbox-full:{v}-beta")
+        );
+    }
+
+    #[test]
+    fn test_sandbox_channel_default_is_stable() {
+        // Whatever the developer's env happens to be, an unset / non-`beta`
+        // value must always resolve to stable. The matcher only treats the
+        // exact string "beta" as opt-in.
+        assert_eq!(SandboxChannel::Stable.tag_suffix(), "");
+        assert_eq!(SandboxChannel::Beta.tag_suffix(), "-beta");
     }
 
     #[tokio::test]
