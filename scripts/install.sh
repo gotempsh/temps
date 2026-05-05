@@ -130,29 +130,30 @@ if [[ ${#positional[@]} -eq 0 ]]; then
     #   release. This is GitHub's contract — it's exactly what we want.
     #   404 means there are zero stable releases yet; fall through to a
     #   helpful error.
-    # - beta: GET /releases/latest skips betas, so we have to walk the
-    #   first page of /releases (newest-first) and take the first non-
-    #   draft entry. That's the same logic the Rust CLI uses.
+    # - beta: /releases/latest skips betas, so we walk the first page of
+    #   /releases (newest-first) and take the very first `tag_name`.
+    #
+    # Why "first tag_name" (no draft check):
+    #   We don't ship draft releases publicly — anything visible on the
+    #   API is intended to be installable. Filtering drafts inside a
+    #   shell script is brittle (tag_name and draft fields aren't in a
+    #   guaranteed order across responses; awk pairing them requires a
+    #   real JSON parser). The Rust CLI does check `draft` because it has
+    #   serde; the bash installer trusts that the API only returns
+    #   shipped releases.
     set +e
     if [[ "$channel" = "stable" ]]; then
         temps_tag=$(curl --silent "https://api.github.com/repos/gotempsh/temps/releases/latest" |
                     grep '"tag_name":' |
+                    head -n 1 |
                     sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null)
     else
-        # First non-draft release on the first page. We pick the first
-        # `tag_name` whose nearest preceding `draft` is `false`. The
-        # GitHub default ordering is most-recent-first so this gives us
-        # the newest release of any kind.
+        # GitHub orders releases newest-first, so the first `tag_name`
+        # in the page is the newest release of any kind.
         temps_tag=$(curl --silent "https://api.github.com/repos/gotempsh/temps/releases?per_page=20" |
-                    awk '
-                        /"draft":/ { in_draft=$0; next }
-                        /"tag_name":/ {
-                            if (in_draft ~ /false/) {
-                                gsub(/.*"tag_name": *"|".*/, "")
-                                print
-                                exit
-                            }
-                        }' 2>/dev/null)
+                    grep '"tag_name":' |
+                    head -n 1 |
+                    sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null)
     fi
     set -e
 
