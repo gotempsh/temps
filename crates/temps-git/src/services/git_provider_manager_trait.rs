@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use std::path::Path;
 
 pub use super::git_provider::PullRequest;
+pub use super::git_provider::{ScopedTokenGrant, ScopedTokenOp};
 
 /// Error type for GitProviderManager operations
 #[derive(Debug, thiserror::Error)]
@@ -25,6 +26,10 @@ pub enum GitProviderManagerError {
     CloneError(String),
     #[error("Directory not empty: {0}")]
     DirectoryNotEmpty(String),
+    #[error(
+        "Provider does not support scoped per-op tokens for connection {connection_id}: {reason}"
+    )]
+    ScopedTokensUnsupported { connection_id: i32, reason: String },
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -129,4 +134,23 @@ pub trait GitProviderManagerTrait: Send + Sync {
         pr_title: &str,
         pr_body: &str,
     ) -> Result<PullRequest, GitProviderManagerError>;
+
+    /// Mint a per-operation, single-repo, narrow-permission credential.
+    ///
+    /// Returns a [`ScopedTokenGrant`] suitable for direct use as
+    /// `username:password` in a `git clone`/`git push` URL. The credential
+    /// daemon inside a workspace container calls this for every git
+    /// operation; tokens are not reused across operations and live ≤1 hour.
+    ///
+    /// Connections backed by PAT or OAuth (no scope-down API) return
+    /// [`GitProviderManagerError::ScopedTokensUnsupported`] — the daemon
+    /// must refuse the request rather than fall back to a long-lived
+    /// token.
+    async fn mint_scoped_repo_token(
+        &self,
+        connection_id: i32,
+        owner: &str,
+        repo: &str,
+        operation: ScopedTokenOp,
+    ) -> Result<ScopedTokenGrant, GitProviderManagerError>;
 }

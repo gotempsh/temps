@@ -300,6 +300,7 @@ pub fn create_mock_backup(subpath: &str) -> temps_entities::backups::Model {
         created_by: 1,
         expires_at: None,
         tags: "".to_string(),
+        last_heartbeat_at: None,
     }
 }
 

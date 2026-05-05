@@ -5,6 +5,17 @@ on:
     tags:
       - "v*.*.*"
       - "v*.*.*-*"
+  # Manual dispatch lets us dry-run the pipeline without minting a junk
+  # tag. Useful when iterating on the workflow itself or verifying a fix
+  # before cutting a real release. The artifact tags include the run id
+  # so a manual run can never overwrite a real release artifact.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run: skip pushes, only build to verify the pipeline works"
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -369,8 +380,17 @@ jobs:
 
       - name: Determine release channel
         id: channel
+        # Tag pushes: prerelease iff the tag contains a `-` (e.g. `v0.1.0-beta.6`).
+        # Manual dispatches: always treated as prerelease so a dry-run or test
+        # invocation cannot promote to the stable `:<version>` ref by accident.
+        # If you ever need workflow_dispatch to mint a stable build, pass it as
+        # an explicit input (and add it to the dispatch inputs above).
         run: |
-          if [[ "${{ github.ref_name }}" == *"-"* ]]; then
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            echo "channel_tag=beta" >> $GITHUB_OUTPUT
+            echo "Channel: beta (workflow_dispatch — never promotes to stable)"
+          elif [[ "${{ github.ref_name }}" == *"-"* ]]; then
             echo "is_prerelease=true" >> $GITHUB_OUTPUT
             echo "channel_tag=beta" >> $GITHUB_OUTPUT
             echo "Channel: beta (prerelease)"
@@ -732,8 +752,17 @@ jobs:
         with:
           key: sandbox-image-builder
 
-      - name: Build print_dockerfile helper
-        run: cargo build --example print_dockerfile -p temps-agents
+      - name: Build sandbox-context helpers
+        run: |
+          # `print_dockerfile` emits the per-runtime Dockerfile; `print_bundle`
+          # writes the pty-agent sources + sandbox-entrypoint.sh that the
+          # generated Dockerfile's `COPY pty-agent/...` lines reference. Both
+          # share `pty_agent_bundle::BUNDLE` with the runtime build path, so
+          # CI can't drift from what `temps serve` ships to Docker.
+          cargo build \
+            --example print_dockerfile \
+            --example print_bundle \
+            -p temps-agents
 
       - name: Extract sandbox image version
         id: version
@@ -758,6 +787,16 @@ jobs:
             > build-context/Dockerfile
           echo "Generated Dockerfile (first 30 lines):"
           head -n 30 build-context/Dockerfile
+
+      - name: Materialize pty-agent bundle into build context
+        run: |
+          # The generated Dockerfile copies from `pty-agent/` (sources + the
+          # sandbox-entrypoint.sh script). Those files only exist as
+          # `include_bytes!` constants in the temps-agents crate, so we
+          # materialize them onto disk before docker buildx runs.
+          ./target/debug/examples/print_bundle build-context
+          echo "Build context layout:"
+          find build-context -type f | sort
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -818,7 +857,10 @@ jobs:
         with:
           context: ./build-context
           platforms: linux/amd64,linux/arm64
-          push: true
+          # Dry-run: build but don't push. Used by `workflow_dispatch` with
+          # `dry_run=true` to verify the pipeline works without polluting
+          # the registry. Real tag pushes always push.
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
           tags: ${{ steps.tags.outputs.list }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -836,6 +878,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      IS_PRERELEASE: ${{ needs.create-release.outputs.is_prerelease }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -871,16 +915,38 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Same channel-aware tag composition as the sandbox images: stable
+      # owns canonical refs, beta only suffixed refs. Without this, every
+      # release (including pre-releases) overwrites `:<version>` and
+      # `:latest`, defeating the channel split.
+      - name: Compose tag list
+        id: tags
+        run: |
+          REPO="ghcr.io/${{ github.repository_owner }}/temps-preview-gateway"
+          VER="${{ steps.version.outputs.version }}"
+          SHA="${{ github.sha }}"
+          {
+            echo "list<<TAGS_EOF"
+            echo "$REPO:$SHA"
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              echo "$REPO:${VER}-beta"
+              echo "$REPO:beta"
+            else
+              echo "$REPO:$VER"
+              echo "$REPO:${VER}-stable"
+              echo "$REPO:latest"
+              echo "$REPO:stable"
+            fi
+            echo "TAGS_EOF"
+          } >> $GITHUB_OUTPUT
+
       - name: Build and push preview gateway image
         uses: docker/build-push-action@v5
         with:
           context: ./crates/temps-preview-gateway
           platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/temps-preview-gateway:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/temps-preview-gateway:latest
-            ghcr.io/${{ github.repository_owner }}/temps-preview-gateway:${{ github.sha }}
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+          tags: ${{ steps.tags.outputs.list }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}

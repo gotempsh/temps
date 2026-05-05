@@ -198,7 +198,7 @@ pub struct PlanSourceBackup {
     pub location_was_resolved: bool,
     /// "walg", "pg_dump", "unknown".
     pub format: String,
-    pub size_bytes: Option<i32>,
+    pub size_bytes: Option<i64>,
     pub created_at: Option<String>,
 }
 
@@ -978,6 +978,7 @@ async fn run_restore_inner(
             created_by: run.created_by,
             expires_at: None,
             tags: "[]".to_string(),
+            last_heartbeat_at: None,
         }
     };
 

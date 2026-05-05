@@ -1,3 +1,4 @@
+pub mod git_credential;
 pub mod memory;
 pub mod sessions;
 
@@ -8,6 +9,7 @@ use sea_orm::DatabaseConnection;
 use temps_core::AuditLogger;
 use utoipa::OpenApi;
 
+use crate::services::git_credential_service::GitCredentialService;
 use crate::services::memory_service::WorkflowMemoryService;
 use crate::services::message_executor::MessageExecutor;
 use crate::services::session_manager::WorkspaceSessionManager;
@@ -29,6 +31,11 @@ pub struct WorkspaceAppState {
     /// (e.g. local sandbox provider, non-Docker env), the terminal endpoint
     /// returns 503.
     pub docker: Option<Arc<bollard::Docker>>,
+    /// Mints per-operation, single-repo, narrow-permission git
+    /// credentials for the in-sandbox credential daemon. Optional: only
+    /// present when the git plugin is loaded — otherwise the
+    /// `/workspace/git-credential` endpoint returns 503.
+    pub git_credential_service: Option<Arc<GitCredentialService>>,
 }
 
 /// OpenAPI document for the temps-workspace crate.
@@ -80,6 +87,9 @@ pub struct WorkspaceAppState {
         memory::write_memory,
         memory::supersede_memory,
         memory::drop_memory,
+
+        // Git credential (in-sandbox daemon mint endpoint)
+        git_credential::mint_git_credential,
     ),
     components(schemas(
         // Session DTOs
@@ -105,6 +115,11 @@ pub struct WorkspaceAppState {
         memory::MemoryListResponse,
         memory::WriteMemoryBody,
         memory::SupersedeBody,
+
+        // Git credential DTOs
+        git_credential::MintGitCredentialRequest,
+        git_credential::MintGitCredentialResponse,
+        git_credential::MintOperation,
     )),
     tags(
         (name = "Workspace", description = "Interactive AI workspace sessions with sandbox containers, message streaming, and terminal access."),
@@ -115,5 +130,7 @@ pub struct WorkspaceApiDoc;
 
 /// Configure all workspace routes.
 pub fn configure_routes() -> Router<Arc<WorkspaceAppState>> {
-    sessions::routes().merge(memory::routes())
+    sessions::routes()
+        .merge(memory::routes())
+        .merge(git_credential::routes())
 }

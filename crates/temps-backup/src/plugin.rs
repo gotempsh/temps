@@ -12,7 +12,7 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::{
     handlers::{self, create_backup_app_state, BackupAppState},
-    services::{BackupService, RestoreService},
+    services::{reconcile_orphan_backups, BackupService, RestoreService},
 };
 use temps_providers::externalsvc::postgres_upgrade::{
     PostgresContainerLifecycle, PreUpgradeBackupProvider,
@@ -120,6 +120,18 @@ impl TempsPlugin for BackupPlugin {
         context: &'a PluginContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
+            // Crash recovery for backups: if `temps serve` restarts mid-backup,
+            // the heartbeat task dies with it and the parent + external_service
+            // backup rows would stay in `state='running'` forever. Sweep them
+            // once at boot and mark them failed so the UI surfaces the truth.
+            let db = context.require_service::<sea_orm::DatabaseConnection>();
+            if let Err(e) = reconcile_orphan_backups(db.as_ref()).await {
+                error!(
+                    "Backup orphan reconciliation failed at startup (will not retry until next boot): {}",
+                    e
+                );
+            }
+
             // Crash recovery: if `temps serve` restarts while an upgrade is
             // mid-flight, the tokio task driving it is gone. Rows stay in
             // `pending`/`running` until we re-spawn an orchestrator for each.

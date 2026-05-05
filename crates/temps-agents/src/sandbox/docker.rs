@@ -68,20 +68,29 @@ pub fn dockerfile_for_runtime(runtime: &str) -> String {
     // "claude is launched exactly once per sandbox lifetime" across arbitrary
     // browser refreshes, without losing background-shell state the CLI is
     // tracking internally. See handlers/sessions.rs::handle_session_terminal.
+    // Every base needs Node.js available because the codex CLI ships as a
+    // Node script (`#!/usr/bin/env node`). Without Node on the path, the
+    // post-install `codex --version` check fails with exit 127. We prefer
+    // NodeSource's setup_20 over distro packages on the Ubuntu base because
+    // it's a known-good major version; on Debian-derived slim bases that
+    // don't include a release file curl-friendly source list, we fall back
+    // to the distro `nodejs` package which is sufficient to run the
+    // pre-bundled codex script.
     let (base, extra_packages, extra_run) = match runtime {
         "bun" => (
             "oven/bun:latest",
-            "git ca-certificates curl jq sudo unzip dtach socat",
+            // bun's base is Debian-based; nodejs from apt is fine for codex.
+            "git ca-certificates curl jq sudo unzip dtach socat nodejs",
             "true",
         ),
         "python" => (
             "python:3.12-slim",
-            "git ca-certificates curl jq sudo unzip dtach socat",
+            "git ca-certificates curl jq sudo unzip dtach socat nodejs",
             "curl -LsSf https://astral.sh/uv/install.sh | sh",
         ),
         "rust" => (
             "rust:1-slim",
-            "git ca-certificates curl jq sudo unzip dtach socat",
+            "git ca-certificates curl jq sudo unzip dtach socat nodejs",
             "true",
         ),
         "go" => (
@@ -89,7 +98,7 @@ pub fn dockerfile_for_runtime(runtime: &str) -> String {
             // debian-based tag which is still published. (Slim variants
             // for golang don't exist for 1.23+.)
             "golang:1.23-bookworm",
-            "git ca-certificates curl jq sudo unzip dtach socat",
+            "git ca-certificates curl jq sudo unzip dtach socat nodejs",
             "true",
         ),
         "full" => (
@@ -149,6 +158,24 @@ WORKDIR /build
 COPY pty-agent/ ./
 RUN cargo build --release --bin temps-pty-agent \
     && strip target/release/temps-pty-agent
+
+# Stage: build the in-sandbox git credential helper + daemon. Same
+# rationale as the pty agent — Rust toolchain stays in its own stage so
+# the final image isn't carrying a 1.5 GB compiler.
+#
+# These two binaries are the security boundary of the per-op credential
+# system. The helper runs as the user (uid 1000) and holds no secrets.
+# The daemon runs as a different uid (1001) and holds the workspace's
+# deployment token in its own memory + a 0600 env file the user can't
+# read. See temps-git-credential/src/lib.rs for the full architecture.
+FROM rust:1-slim AS git-credential-builder
+WORKDIR /build
+COPY git-credential/ ./
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN cargo build --release --bin temps-git-credential-helper --bin temps-git-credential-daemon \
+    && strip target/release/temps-git-credential-helper \
+    && strip target/release/temps-git-credential-daemon
 "#;
 
     let user = SANDBOX_USER;
@@ -187,6 +214,23 @@ RUN EXISTING_USER=$(getent passwd 1000 | cut -d: -f1) \
     && echo 'Defaults:{user} !requiretty, !log_input, !log_output' >> /etc/sudoers.d/{user} \
     && chmod 0440 /etc/sudoers.d/{user} \
     && visudo -c -f /etc/sudoers.d/{user}
+# Second user for the credential daemon. Runs as uid 1001 so user code
+# (uid 1000) cannot ptrace it, cannot read its /proc/<pid>/environ, and
+# cannot read the 0600 env file holding the workspace deployment token.
+# `git-users` is the bridging group that owns the IPC socket: the user
+# (`temps`) is added to it so git can connect; the daemon owns the
+# socket file outright so anything stricter than read+connect is
+# rejected at the kernel level.
+RUN groupadd -g 1100 git-users \
+    && groupadd -g 1001 temps-git \
+    && useradd -r -u 1001 -g temps-git -G git-users -s /usr/sbin/nologin -d /nonexistent temps-git \
+    && usermod -aG git-users {user}
+# Daemon is launched by the host-side message_executor via
+# `docker exec --user temps-git -d`, NOT by an in-container supervisor:
+# the sandbox runs with `no-new-privileges:true`, which blocks `sudo`/
+# setuid uid changes from inside the container. The Docker API call
+# bypasses that restriction since the host's docker daemon doesn't
+# inherit the no-new-privileges flag.
 RUN mkdir -p {work_dir} && chown {chown} {work_dir}
 # /run/temps-pty holds one Unix socket per terminal tab (one per {{kind,tab}}
 # pair). dtach creates these sockets on first attach; subsequent reconnects
@@ -213,7 +257,24 @@ ENV PATH={home}/.local/bin:{home}/.bun/bin:{home}/.opencode/bin:$PATH
 RUN curl -fsSL https://claude.ai/install.sh | bash \
     && {home}/.local/bin/claude --version \
     && echo 'export PATH={home}/.local/bin:{home}/.bun/bin:{home}/.opencode/bin:$PATH' >> {home}/.bashrc
-RUN BUN_INSTALL={home}/.bun bun add -g @openai/codex \
+# Codex installs via `bun add -g` into ~/.bun. Two snags worth knowing:
+#
+#  1. `oven/bun:latest` bakes `BUN_INSTALL_BIN=/usr/local/bin` into the
+#     image env. That overrides BUN_INSTALL for the symlink step, so
+#     `bun add -g` (running here as the unprivileged `temps` user) tries
+#     to write its bin shim to /usr/local/bin and fails with EACCES. We
+#     pin both BUN_INSTALL *and* BUN_INSTALL_BIN to the temps-owned tree
+#     so the link lands somewhere we can write.
+#  2. Codex itself ships as a Node script (`#!/usr/bin/env node`), which
+#     is why every base also installs `nodejs` in extra_packages —
+#     without it the post-install `codex --version` check exits 127.
+#
+# We rm -rf first to drop any stale state from base images that pre-seed
+# `~/.bun` with files owned by their own bun user (we userdel'd that user
+# above but the inodes can survive depending on the layer).
+RUN rm -rf {home}/.bun && mkdir -p {home}/.bun/bin \
+    && BUN_INSTALL={home}/.bun BUN_INSTALL_BIN={home}/.bun/bin \
+       bun add -g @openai/codex \
     && {home}/.bun/bin/codex --version
 RUN curl -fsSL https://opencode.ai/install | bash \
     && {home}/.opencode/bin/opencode --version
@@ -239,6 +300,33 @@ USER root
 COPY --from=pty-agent-builder /build/target/release/temps-pty-agent /usr/local/bin/temps-pty-agent
 COPY pty-agent/sandbox-entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/temps-pty-agent /usr/local/bin/sandbox-entrypoint.sh
+# In-sandbox git credential pipeline. Read-only mount the binaries to
+# `/usr/local/bin` (root:root, mode 0755 — they hold no secrets, the
+# whole point of the daemon split is that the helper has nothing
+# sensitive). Provision the socket dir + env-file dir with strict
+# perms: 0750 socket dir owned by `temps-git:git-users` so only the
+# bridging group (which `temps` is in) can traverse it; 0700 env-file
+# dir owned by `temps-git:temps-git` so only the daemon can list/read
+# it. The actual env file (`credential-daemon.env`) is written by the
+# message_executor via `docker exec` at session start, with mode 0600.
+COPY --from=git-credential-builder /build/target/release/temps-git-credential-helper /usr/local/bin/temps-git-credential-helper
+COPY --from=git-credential-builder /build/target/release/temps-git-credential-daemon /usr/local/bin/temps-git-credential-daemon
+RUN chmod 0755 /usr/local/bin/temps-git-credential-helper /usr/local/bin/temps-git-credential-daemon \
+    && mkdir -p /run/temps-git \
+    && chown temps-git:git-users /run/temps-git \
+    && chmod 0750 /run/temps-git \
+    && mkdir -p /etc/temps \
+    && chown temps-git:git-users /etc/temps \
+    && chmod 0710 /etc/temps \
+    && touch /etc/temps/credential-daemon.env \
+    && chown temps-git:temps-git /etc/temps/credential-daemon.env \
+    && chmod 0600 /etc/temps/credential-daemon.env
+# System-wide git config: route every HTTPS git auth request through
+# the credential helper. `useHttpPath=true` is mandatory — without it
+# git omits the `path=` field, and the daemon can't tell what repo is
+# being requested, so per-repo scoping degrades to refusal.
+RUN git config --system credential.helper /usr/local/bin/temps-git-credential-helper \
+    && git config --system credential.useHttpPath true
 USER {user}
 WORKDIR {work_dir}
 # The container's CMD is whatever the caller passes (usually `sleep infinity`).
@@ -280,16 +368,24 @@ fn build_context_tar(dockerfile: &str) -> Result<Vec<u8>, AgentError> {
         super::pty_agent_bundle::append_to_tar(&mut tar_builder)
             .map_err(map_tar_err("append pty-agent bundle"))?;
 
+        super::git_credential_bundle::append_to_tar(&mut tar_builder)
+            .map_err(map_tar_err("append git-credential bundle"))?;
+
         tar_builder.finish().map_err(map_tar_err("finish tar"))?;
     }
     Ok(tar_buf)
 }
 
-/// Pinned version of the published sandbox images. Bumping this constant
-/// causes every host to pull the new image on the next sandbox start
-/// (because the new tag isn't cached locally), which is the only reliable
-/// way to roll a fix out without per-host manual `docker pull`. The CI
-/// release workflow publishes images at this exact tag.
+/// Pinned version of the published sandbox images. Tracks the temps server
+/// version's `major.minor.patch` (Option A coupling) — server `v0.1.0-*`
+/// pairs with sandbox image `:0.1.0`. Pre-release/channel info is carried
+/// by the channel suffix (`:0.1.0-beta`), not by this constant.
+///
+/// Bumping this constant causes every host to pull the new image on the
+/// next sandbox start (because the new tag isn't cached locally), which
+/// is the only reliable way to roll a fix out without per-host manual
+/// `docker pull`. The CI release workflow publishes images at this exact
+/// tag.
 ///
 /// Why pin instead of using `:latest`:
 ///   - `inspect_image` returns Ok if a `:latest` is cached locally, so
@@ -298,15 +394,6 @@ fn build_context_tar(dockerfile: &str) -> Result<Vec<u8>, AgentError> {
 ///   - Immutable version tags ("0.1.0") cache-bust naturally: when we bump
 ///     this constant + ship the corresponding tag, every host re-pulls.
 pub const SANDBOX_IMAGE_VERSION: &str = "0.1.0";
-
-/// Local image name for a runtime preset, pinned to `SANDBOX_IMAGE_VERSION`.
-pub fn image_name_for_runtime(runtime: &str) -> String {
-    let name = match runtime {
-        "node" | "" => "temps-sandbox-node",
-        other => return format!("temps-sandbox-{other}:{SANDBOX_IMAGE_VERSION}"),
-    };
-    format!("{name}:{SANDBOX_IMAGE_VERSION}")
-}
 
 /// Release channel for sandbox image pulls. Stable temps builds resolve to
 /// the canonical `:<version>` tag; beta builds resolve to `:<version>-beta`.
@@ -336,30 +423,40 @@ impl SandboxChannel {
     }
 }
 
-/// Registry image name for a runtime preset. Used as a pull-cache:
-/// `ensure_image_for_runtime` tries to pull this first, then falls back
-/// to building locally if the registry image isn't available.
+/// Prefix every published sandbox image carries on GHCR. Centralised so
+/// runtime extraction (`runtime_from_image_name`) stays in lock-step with
+/// image construction (`image_name_for_runtime_in_channel`).
+const SANDBOX_IMAGE_REGISTRY_PREFIX: &str = "ghcr.io/gotempsh/temps-sandbox-";
+
+/// Fully-qualified image name for a runtime preset. The runtime references
+/// images by this exact string end-to-end — pull, inspect, container
+/// create, recovery — so what you see in `docker ps` matches what was
+/// actually pulled (channel suffix included). No local rename step.
+///
+/// Format: `ghcr.io/gotempsh/temps-sandbox-{runtime}:{version}{channel}`,
+/// e.g. `ghcr.io/gotempsh/temps-sandbox-node:0.1.0-beta`.
 ///
 /// Pinned to `SANDBOX_IMAGE_VERSION` so a host that already cached the
-/// previous version pulls the new one when we bump the constant. The
-/// channel argument decides whether we resolve to `:<version>` (stable)
-/// or `:<version>-beta` (beta) — see `SandboxChannel`.
-fn hub_image_for_runtime_in_channel(runtime: &str, channel: SandboxChannel) -> String {
+/// previous version pulls the new one when we bump the constant.
+fn image_name_for_runtime_in_channel(runtime: &str, channel: SandboxChannel) -> String {
     let suffix = channel.tag_suffix();
-    let name = match runtime {
-        "node" | "" => "temps-sandbox-node",
-        other => {
-            return format!(
-                "ghcr.io/gotempsh/temps-sandbox-{other}:{SANDBOX_IMAGE_VERSION}{suffix}"
-            )
-        }
-    };
-    format!("ghcr.io/gotempsh/{name}:{SANDBOX_IMAGE_VERSION}{suffix}")
+    let runtime = if runtime.is_empty() { "node" } else { runtime };
+    format!("{SANDBOX_IMAGE_REGISTRY_PREFIX}{runtime}:{SANDBOX_IMAGE_VERSION}{suffix}")
 }
 
 /// Convenience wrapper that reads the channel from the environment.
-fn hub_image_for_runtime(runtime: &str) -> String {
-    hub_image_for_runtime_in_channel(runtime, SandboxChannel::from_env())
+pub fn image_name_for_runtime(runtime: &str) -> String {
+    image_name_for_runtime_in_channel(runtime, SandboxChannel::from_env())
+}
+
+/// Inverse of `image_name_for_runtime`: extract the runtime preset name
+/// from a fully-qualified GHCR image string. Returns `None` for anything
+/// that isn't one of our preset images (custom images, garbage). Used by
+/// the recovery path to figure out which Dockerfile to regenerate when
+/// rebuilding a missing image.
+fn runtime_from_image_name(image: &str) -> Option<&str> {
+    let rest = image.strip_prefix(SANDBOX_IMAGE_REGISTRY_PREFIX)?;
+    Some(rest.split(':').next().unwrap_or(rest))
 }
 
 /// Configuration for the Docker sandbox provider.
@@ -470,37 +567,35 @@ impl DockerSandboxProvider {
 
         let image_name = image_name_for_runtime(runtime);
 
-        // Check if image already exists locally
+        // Check if image already exists locally. The image name is the
+        // fully-qualified GHCR string (incl. channel suffix), so this
+        // check correctly distinguishes a cached beta image from a
+        // cached stable one — no rename indirection masking which
+        // channel is loaded.
         if self.docker.inspect_image(&image_name).await.is_ok() {
             tracing::debug!("Sandbox image {} already exists", image_name);
             return Ok(());
         }
 
-        // Try pulling a prebuilt image from Docker Hub first. This is much
+        // Try pulling a prebuilt image from GHCR first. This is much
         // faster than building locally (~seconds vs ~minutes) because the
-        // hub image is a fully baked layer including Claude CLI, bun, gh, etc.
-        // If the pull fails (rate limit, no internet, image not published yet)
-        // we fall back to a local build — fail-safe, never blocks startup.
-        let hub_image = hub_image_for_runtime(runtime);
-        send(format!("Pulling {} from Docker Hub...", hub_image)).await;
-        tracing::info!(
-            "Trying to pull sandbox image {} from Docker Hub...",
-            hub_image
-        );
-        match self.try_pull_and_tag(&hub_image, &image_name).await {
+        // pushed image is a fully baked layer including Claude CLI, bun,
+        // gh, etc. If the pull fails (rate limit, no internet, image not
+        // published yet) we fall back to a local build — fail-safe, never
+        // blocks startup. The local build tags itself with the same GHCR
+        // name so the next inspect_image short-circuits as expected.
+        send(format!("Pulling {} from GHCR...", image_name)).await;
+        tracing::info!("Trying to pull sandbox image {} from GHCR...", image_name);
+        match self.try_pull(&image_name).await {
             Ok(()) => {
-                tracing::info!(
-                    "Pulled {} and tagged as {} — skipping local build",
-                    hub_image,
-                    image_name
-                );
-                send(format!("Pulled {} — done.", hub_image)).await;
+                tracing::info!("Pulled {} — skipping local build", image_name);
+                send(format!("Pulled {} — done.", image_name)).await;
                 return Ok(());
             }
             Err(reason) => {
                 tracing::info!(
                     "Pull of {} failed ({}), falling back to local build",
-                    hub_image,
+                    image_name,
                     reason
                 );
                 send(format!("Pull failed ({}), building locally...", reason)).await;
@@ -637,12 +732,13 @@ impl DockerSandboxProvider {
         Ok(())
     }
 
-    /// Pull `hub_image` from Docker Hub and tag it as `local_name`.
-    /// Returns `Ok(())` on success, `Err(reason)` on any failure — callers
-    /// should treat failure as non-fatal and fall back to a local build.
-    async fn try_pull_and_tag(&self, hub_image: &str, local_name: &str) -> Result<(), String> {
+    /// Pull `image` from its registry (no rename — the image lives under
+    /// its full GHCR name end-to-end). Returns `Ok(())` on success,
+    /// `Err(reason)` on any failure — callers should treat failure as
+    /// non-fatal and fall back to a local build.
+    async fn try_pull(&self, image: &str) -> Result<(), String> {
         let options = bollard::query_parameters::CreateImageOptionsBuilder::new()
-            .from_image(hub_image)
+            .from_image(image)
             .build();
         let mut stream = self.docker.create_image(Some(options), None, None);
         while let Some(result) = stream.next().await {
@@ -650,20 +746,6 @@ impl DockerSandboxProvider {
                 return Err(format!("{}", e));
             }
         }
-
-        // Tag the pulled image with the local name so the rest of the code
-        // can reference it without the registry prefix.
-        self.docker
-            .tag_image(
-                hub_image,
-                Some(bollard::query_parameters::TagImageOptions {
-                    repo: Some(local_name.to_string()),
-                    tag: None,
-                }),
-            )
-            .await
-            .map_err(|e| format!("tag failed: {}", e))?;
-
         Ok(())
     }
 
@@ -767,6 +849,7 @@ impl DockerSandboxProvider {
         cmd: Vec<String>,
         env: HashMap<String, String>,
         on_event: Option<OnStreamEventCallback>,
+        user: Option<String>,
     ) -> Result<SandboxExecResult, AgentError> {
         let env_vars: Vec<String> = env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
 
@@ -780,6 +863,7 @@ impl DockerSandboxProvider {
             } else {
                 Some(env_vars)
             },
+            user,
             ..Default::default()
         };
 
@@ -937,15 +1021,11 @@ impl SandboxProvider for DockerSandboxProvider {
 
         // Ensure the image exists (build for presets, pull for custom)
         if self.docker.inspect_image(image).await.is_err() {
-            // If this is a preset image, build it. Strip the version tag
-            // (everything after the last `:`) to recover the runtime name.
-            // Hard-coding `:latest` here would break the moment we pin to a
-            // version tag.
-            if image.starts_with("temps-sandbox-") {
-                let runtime = image
-                    .strip_prefix("temps-sandbox-")
-                    .map(|s| s.split(':').next().unwrap_or(s))
-                    .unwrap_or("node");
+            // If this is a preset image (full GHCR path), build it. The
+            // helper strips the registry prefix + version tag to recover
+            // the runtime name. Anything that doesn't match the preset
+            // prefix is treated as a user-supplied custom image.
+            if let Some(runtime) = runtime_from_image_name(image) {
                 self.ensure_image_for_runtime(runtime).await?;
             }
             // Otherwise it's a custom image — try to pull
@@ -1305,7 +1385,44 @@ impl SandboxProvider for DockerSandboxProvider {
                 });
             f
         });
-        self.exec_inner(handle, cmd, env, stream_cb).await
+        self.exec_inner(handle, cmd, env, stream_cb, None).await
+    }
+
+    async fn exec_as_root(
+        &self,
+        handle: &SandboxHandle,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        on_output: Option<OnEventCallback>,
+    ) -> Result<SandboxExecResult, AgentError> {
+        self.exec_as_user(handle, "0:0", cmd, env, on_output).await
+    }
+
+    async fn exec_as_user(
+        &self,
+        handle: &SandboxHandle,
+        user: &str,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        on_output: Option<OnEventCallback>,
+    ) -> Result<SandboxExecResult, AgentError> {
+        let stream_cb: Option<OnStreamEventCallback> = on_output.map(|cb| {
+            let cb = cb.clone();
+            let f: OnStreamEventCallback =
+                std::sync::Arc::new(move |stream: ExecStream, line: String| {
+                    let cb = cb.clone();
+                    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+                        Box::pin(async move {
+                            if matches!(stream, ExecStream::Stdout) {
+                                cb(line).await;
+                            }
+                        });
+                    fut
+                });
+            f
+        });
+        self.exec_inner(handle, cmd, env, stream_cb, Some(user.to_string()))
+            .await
     }
 
     async fn exec_streamed(
@@ -1315,7 +1432,7 @@ impl SandboxProvider for DockerSandboxProvider {
         env: HashMap<String, String>,
         on_event: Option<OnStreamEventCallback>,
     ) -> Result<SandboxExecResult, AgentError> {
-        self.exec_inner(handle, cmd, env, on_event).await
+        self.exec_inner(handle, cmd, env, on_event, None).await
     }
 
     async fn is_alive(&self, handle: &SandboxHandle) -> Result<bool, AgentError> {
@@ -1926,23 +2043,25 @@ mod tests {
     }
 
     #[test]
-    fn test_resolved_image_for_presets() {
+    fn test_resolved_image_for_presets_stable_channel() {
         let v = SANDBOX_IMAGE_VERSION;
+        // Test against the channel-explicit helper so the result doesn't
+        // depend on whatever TEMPS_SANDBOX_CHANNEL happens to be set to in
+        // the test runner's environment.
         for (runtime, expected) in [
-            ("node", format!("temps-sandbox-node:{v}")),
-            ("python", format!("temps-sandbox-python:{v}")),
-            ("rust", format!("temps-sandbox-rust:{v}")),
-            ("bun", format!("temps-sandbox-bun:{v}")),
-            ("go", format!("temps-sandbox-go:{v}")),
-            ("full", format!("temps-sandbox-full:{v}")),
+            ("node", format!("ghcr.io/gotempsh/temps-sandbox-node:{v}")),
+            (
+                "python",
+                format!("ghcr.io/gotempsh/temps-sandbox-python:{v}"),
+            ),
+            ("rust", format!("ghcr.io/gotempsh/temps-sandbox-rust:{v}")),
+            ("bun", format!("ghcr.io/gotempsh/temps-sandbox-bun:{v}")),
+            ("go", format!("ghcr.io/gotempsh/temps-sandbox-go:{v}")),
+            ("full", format!("ghcr.io/gotempsh/temps-sandbox-full:{v}")),
         ] {
-            let config = DockerSandboxConfig {
-                runtime: runtime.to_string(),
-                ..Default::default()
-            };
             assert_eq!(
-                config.resolved_image(),
-                expected.as_str(),
+                image_name_for_runtime_in_channel(runtime, SandboxChannel::Stable),
+                expected,
                 "runtime={}",
                 runtime
             );
@@ -1961,15 +2080,14 @@ mod tests {
 
     #[test]
     fn test_resolved_image_custom_empty_falls_back() {
-        let config = DockerSandboxConfig {
-            runtime: "custom".to_string(),
-            custom_image: String::new(),
-            ..Default::default()
-        };
-        // Falls back to node since custom_image is empty
+        // Custom runtime with empty custom_image falls through to the
+        // preset path, producing a "custom" preset name. (The actual
+        // preset list rejects this at create time; the resolver doesn't
+        // validate.) Channel suffix tracks env, so we test the helper
+        // explicitly to avoid env-dependence.
         assert_eq!(
-            config.resolved_image(),
-            format!("temps-sandbox-custom:{SANDBOX_IMAGE_VERSION}")
+            image_name_for_runtime_in_channel("custom", SandboxChannel::Stable),
+            format!("ghcr.io/gotempsh/temps-sandbox-custom:{SANDBOX_IMAGE_VERSION}")
         );
     }
 
@@ -2049,20 +2167,19 @@ mod tests {
     }
 
     #[test]
-    fn test_image_name_for_runtime() {
-        let v = SANDBOX_IMAGE_VERSION;
-        assert_eq!(
-            image_name_for_runtime("node"),
-            format!("temps-sandbox-node:{v}")
-        );
-        assert_eq!(
-            image_name_for_runtime(""),
-            format!("temps-sandbox-node:{v}")
-        );
-        assert_eq!(
-            image_name_for_runtime("python"),
-            format!("temps-sandbox-python:{v}")
-        );
+    fn test_image_name_for_runtime_shape() {
+        // The env-reading wrapper picks a channel at runtime, so we don't
+        // pin the exact tag — just check the structural shape every
+        // returned name MUST have. The channel-explicit variants below
+        // (test_image_name_for_runtime_*_channel) cover the exact strings.
+        for runtime in &["node", "", "python", "bun", "rust", "go", "full"] {
+            let img = image_name_for_runtime(runtime);
+            assert!(
+                img.starts_with("ghcr.io/gotempsh/temps-sandbox-"),
+                "image must be GHCR-qualified: {img}"
+            );
+            assert!(img.contains(':'), "image must carry a tag: {img}");
+        }
     }
 
     #[tokio::test]
@@ -2212,7 +2329,10 @@ mod tests {
         assert!(provider.is_available().await);
 
         let (_, image_name) = provider.image_status().await.unwrap();
-        assert!(image_name.starts_with("temps-sandbox-"));
+        assert!(
+            image_name.starts_with("ghcr.io/gotempsh/temps-sandbox-"),
+            "got: {image_name}"
+        );
     }
 
     #[tokio::test]
@@ -2239,53 +2359,85 @@ mod tests {
         let provider = DockerSandboxProvider::new(docker, config);
 
         let (_, image_name) = provider.image_status().await.unwrap();
-        assert_eq!(
-            image_name,
-            format!("temps-sandbox-python:{SANDBOX_IMAGE_VERSION}")
+        // image_status returns whatever channel the env points at; both
+        // stable and beta are valid targets here, so we check the
+        // structural shape rather than the exact string.
+        assert!(
+            image_name.starts_with("ghcr.io/gotempsh/temps-sandbox-python:"),
+            "got: {image_name}"
         );
     }
 
     #[test]
-    fn test_hub_image_for_runtime_stable_channel() {
+    fn test_image_name_for_runtime_stable_channel() {
         let v = SANDBOX_IMAGE_VERSION;
         let stable = SandboxChannel::Stable;
         assert_eq!(
-            hub_image_for_runtime_in_channel("node", stable),
+            image_name_for_runtime_in_channel("node", stable),
             format!("ghcr.io/gotempsh/temps-sandbox-node:{v}")
         );
         assert_eq!(
-            hub_image_for_runtime_in_channel("", stable),
+            image_name_for_runtime_in_channel("", stable),
             format!("ghcr.io/gotempsh/temps-sandbox-node:{v}")
         );
         assert_eq!(
-            hub_image_for_runtime_in_channel("python", stable),
+            image_name_for_runtime_in_channel("python", stable),
             format!("ghcr.io/gotempsh/temps-sandbox-python:{v}")
         );
         assert_eq!(
-            hub_image_for_runtime_in_channel("bun", stable),
+            image_name_for_runtime_in_channel("bun", stable),
             format!("ghcr.io/gotempsh/temps-sandbox-bun:{v}")
         );
         assert_eq!(
-            hub_image_for_runtime_in_channel("full", stable),
+            image_name_for_runtime_in_channel("full", stable),
             format!("ghcr.io/gotempsh/temps-sandbox-full:{v}")
         );
     }
 
     #[test]
-    fn test_hub_image_for_runtime_beta_channel() {
+    fn test_image_name_for_runtime_beta_channel() {
         let v = SANDBOX_IMAGE_VERSION;
         let beta = SandboxChannel::Beta;
         assert_eq!(
-            hub_image_for_runtime_in_channel("node", beta),
+            image_name_for_runtime_in_channel("node", beta),
             format!("ghcr.io/gotempsh/temps-sandbox-node:{v}-beta")
         );
         assert_eq!(
-            hub_image_for_runtime_in_channel("python", beta),
+            image_name_for_runtime_in_channel("python", beta),
             format!("ghcr.io/gotempsh/temps-sandbox-python:{v}-beta")
         );
         assert_eq!(
-            hub_image_for_runtime_in_channel("full", beta),
+            image_name_for_runtime_in_channel("full", beta),
             format!("ghcr.io/gotempsh/temps-sandbox-full:{v}-beta")
+        );
+    }
+
+    #[test]
+    fn test_runtime_from_image_name() {
+        let v = SANDBOX_IMAGE_VERSION;
+        // Round-trip: every runtime preset should be recoverable from the
+        // image name we'd publish for it. This is what protects the
+        // recovery code path that needs to figure out which Dockerfile to
+        // regenerate when a missing image needs rebuilding.
+        for runtime in &["node", "python", "rust", "bun", "go", "full"] {
+            let stable = image_name_for_runtime_in_channel(runtime, SandboxChannel::Stable);
+            assert_eq!(runtime_from_image_name(&stable), Some(*runtime));
+            let beta = image_name_for_runtime_in_channel(runtime, SandboxChannel::Beta);
+            assert_eq!(runtime_from_image_name(&beta), Some(*runtime));
+        }
+        // Custom images (anything outside our prefix) return None so the
+        // recovery code falls back to a plain `docker pull` instead of
+        // trying to materialize a Dockerfile for an unknown "runtime".
+        assert_eq!(
+            runtime_from_image_name("docker.io/library/alpine:3.19"),
+            None
+        );
+        assert_eq!(runtime_from_image_name("temps-sandbox-node:0.1.0"), None);
+        // Tag is optional in the parser — recovery still works even if
+        // the input lost its tag somehow.
+        assert_eq!(
+            runtime_from_image_name(&format!("ghcr.io/gotempsh/temps-sandbox-node:{v}")),
+            Some("node")
         );
     }
 

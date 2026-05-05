@@ -8,13 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
--
+- **In-sandbox CLI auto-auth**: `MessageExecutor` now materializes the three CLI auth files on workspace session init and on every refresh, so `bunx @temps-sdk/cli` works inside sandboxes without sourcing `~/.env`. Files written: `~/.temps/.contexts.json` (multi-instance store with a single active `workspace` context), `~/.temps/.secrets` (legacy `temps_api_key` / `temps_user_id` / `temps_email`), and `~/.config/temps-cli-nodejs/config.json` (`apiUrl` / `outputFormat` / `colorEnabled`). `apiUrl` resolves from platform `external_url` with a `TEMPS_INTERNAL_API_URL` env override and a `host.docker.internal:3000` fallback for local dev
+- **Centralized sandbox identifiers**: new `crates/temps-agents/src/sandbox/user.rs` module defines `SANDBOX_USER`, `SANDBOX_GROUP`, `SANDBOX_CHOWN`, `SANDBOX_HOME`, and `SANDBOX_WORK_DIR` constants. Every load-bearing `/home/temps`, `temps:temps`, and `/workspace` literal in the Dockerfile generator, mount logic, chown calls, and Claude projects-dir derivation now flows through these constants — single source of truth for the sandbox identity model
 
 ### Changed
--
+- **Workspace mount path moves from `/workspace` to `/home/temps/workspace`**: keeps the working directory under the sandbox user's home, eliminating the cross-tree `chown` and aligning with how AI CLIs (Claude, Codex) resolve project roots. Claude's `claude_projects_dir` now derives from `SANDBOX_WORK_DIR.replace('/', '-')` so resume keys stay consistent with the new path
+- **`AuthFlavor::seed_path` is now `seed_path_rel` + `seed_path()` helper**: paths are stored relative to `SANDBOX_HOME` and joined at use-time, so renaming the home directory is a one-constant change instead of a grep-and-edit across every flavor
+- **`get_temps_api_url` is async**: now reads platform settings to surface the configured `external_url`. `WorkspacePlugin` plumbs `Arc<ConfigService>` into `MessageExecutor` so the resolver is reachable from the session-write path
 
 ### Fixed
--
+- **Stale skill content tests**: updated to match current `temps-cli/SKILL.md` headings so the suite stops failing on docs drift
+
+### Security
+- **Shell-escape user-controllable `--model` flag**: AI CLI invocations now escape the model name before passing it to the shell, preventing argument injection via crafted model strings
+- **Reject unknown `ai_provider` values with logged fallback**: invalid provider names no longer silently coerce to a default; they're rejected and the rejection is audited
+- **CLI auth handler hardening**: tightened input validation and error surfacing on the `cli_login` / `cli_logout` paths
+- **Route sync hardening**: tightened validation on the route sync pipeline to prevent malformed inputs from reaching the proxy config
+- **Sandbox filesystem hardening**: extra guards on sandbox FS handlers to reject path-escape attempts at the handler boundary (defense in depth on top of the existing `FilesystemStorage::resolve_path` check)
+- **Email tracking hardening**: tightened validation on tracking event ingestion to reject malformed payloads
+- **Deployment workflow planner hardening**: tightened input validation on the workflow planner to reject malformed deployment requests at the planning stage
 
 ## [0.1.0-beta.6] - 2026-05-03
 

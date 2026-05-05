@@ -11774,6 +11774,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-git-credential"
+version = "0.1.0-beta.6"
+dependencies = [
+ "chrono",
+ "nix 0.29.0",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "temps-google-indexing-plugin"
 version = "0.1.0"
 dependencies = [

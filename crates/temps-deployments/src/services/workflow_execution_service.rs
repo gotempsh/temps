@@ -2034,6 +2034,17 @@ mod tests {
                 "not implemented in test".into(),
             ))
         }
+        async fn mint_scoped_repo_token(
+            &self,
+            _: i32,
+            _: &str,
+            _: &str,
+            _: temps_git::ScopedTokenOp,
+        ) -> Result<temps_git::ScopedTokenGrant, temps_git::GitProviderManagerError> {
+            Err(temps_git::GitProviderManagerError::Other(
+                "not implemented in test".into(),
+            ))
+        }
     }
 
     struct MockImageBuilder {

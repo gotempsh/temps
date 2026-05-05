@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use utoipa::ToSchema;
 
 pub mod cluster_role;
+pub mod exec_util;
 pub mod mongodb;
 pub mod postgres;
 pub mod postgres_cluster;
@@ -13,6 +14,7 @@ pub mod postgres_upgrade;
 pub mod redis;
 pub mod rustfs;
 pub mod s3;
+pub mod s3_util;
 
 // Test utilities for backup and restore testing
 #[cfg(test)]
@@ -37,6 +39,31 @@ pub use redis::RedisService;
 pub use rustfs::RustfsService;
 pub use s3::S3Service;
 
+/// Result of a successful `backup_to_s3` call.
+///
+/// Engines must always return the final S3 location. They should also return
+/// `size_bytes` whenever it can be determined cheaply (e.g., a known temp
+/// file's length). When the engine can't compute size locally — for example
+/// WAL-G, which streams chunks straight to S3 — it returns `None` and the
+/// service-layer orchestrator falls back to listing the S3 prefix.
+#[derive(Debug, Clone)]
+pub struct BackupOutcome {
+    /// Where the backup landed (S3 URL or relative key, engine-specific).
+    pub location: String,
+    /// Size of the backup in bytes if the engine can determine it without
+    /// a separate S3 list. `None` means "ask S3".
+    pub size_bytes: Option<i64>,
+}
+
+impl BackupOutcome {
+    pub fn new(location: impl Into<String>, size_bytes: Option<i64>) -> Self {
+        Self {
+            location: location.into(),
+            size_bytes,
+        }
+    }
+}
+
 /// Decrypted S3 credentials for services that need to pass them to external tools
 /// (e.g., WAL-G running inside a Docker container via `docker exec`).
 /// The `backup_to_s3` orchestrator decrypts the encrypted credentials from the
@@ -53,6 +80,37 @@ pub struct S3Credentials {
 }
 
 impl S3Credentials {
+    /// Build an `aws_sdk_s3::Client` from already-decrypted credentials.
+    /// Used by post-backup steps (e.g. listing the WAL-G prefix to compute
+    /// size) when we already hold a decrypted credential set and don't
+    /// want to round-trip back through the encryption service.
+    pub async fn build_s3_client(&self) -> aws_sdk_s3::Client {
+        let creds = aws_sdk_s3::config::Credentials::new(
+            self.access_key_id.clone(),
+            self.secret_key.clone(),
+            None,
+            None,
+            "temps-backup",
+        );
+
+        let mut config_builder = aws_sdk_s3::config::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new(self.region.clone()))
+            .force_path_style(self.force_path_style)
+            .credentials_provider(creds);
+
+        if let Some(endpoint) = &self.endpoint {
+            let endpoint_url = if endpoint.starts_with("http") {
+                endpoint.clone()
+            } else {
+                format!("http://{}", endpoint)
+            };
+            config_builder = config_builder.endpoint_url(endpoint_url);
+        }
+
+        aws_sdk_s3::Client::from_conf(config_builder.build())
+    }
+
     /// Resolve the S3 endpoint for use inside a Docker container.
     ///
     /// When WAL-G runs inside a Docker container via `docker exec`, `localhost` in the
@@ -673,7 +731,7 @@ pub trait ExternalService: Send + Sync {
         _pool: &temps_database::DbConnection,
         _external_service: &temps_entities::external_services::Model,
         _service_config: ServiceConfig,
-    ) -> Result<String> {
+    ) -> Result<BackupOutcome> {
         Err(anyhow::anyhow!("Backup not implemented for this service"))
     }
 

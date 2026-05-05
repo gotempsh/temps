@@ -838,12 +838,31 @@ export type BackupResponse = {
     expires_at?: number | null;
     file_count?: number | null;
     id: number;
+    /**
+     * Last time the worker reported progress. Older than ~5 minutes while
+     * `state == "running"` indicates a stalled backup the UI should flag.
+     */
+    last_heartbeat_at?: number | null;
+    /**
+     * Best-effort partial size while a backup is still running, computed
+     * by listing the S3 prefix. Null when the backup is finished
+     * (`size_bytes` is authoritative in that case).
+     */
+    live_size_bytes?: number | null;
     metadata: unknown;
     name: string;
     s3_location: string;
     s3_source_id: number;
     schedule_id?: number | null;
-    size_bytes: number;
+    /**
+     * Final size of the backup once completed. Null while running.
+     */
+    size_bytes?: number | null;
+    /**
+     * True when `state == "running"` but the heartbeat is stale, suggesting
+     * the worker process died mid-backup.
+     */
+    stalled: boolean;
     started_at: number;
     state: string;
     tags: Array<string>;
@@ -7013,6 +7032,57 @@ export type MigrationSummary = {
      */
     unsupported_features?: Array<UnsupportedFeature>;
 };
+
+/**
+ * Request body. Matches the parts of the git credential helper protocol
+ * we care about: `host` and `path` (which we split into `owner` + `repo`
+ * — the helper sends `path=owner/repo`).
+ */
+export type MintGitCredentialRequest = {
+    /**
+     * Git host: `github.com`, `gitlab.com`, etc. The host's allow-list is
+     * enforced server-side; unknown hosts are rejected.
+     */
+    host: string;
+    /**
+     * Operation the credential will be used for. Drives permission
+     * narrowing on the minted token. Defaults to `fetch` so accidental
+     * requests can't escalate to write.
+     */
+    operation?: MintOperation;
+    /**
+     * Repository owner (organization or user) part of `owner/repo`.
+     */
+    owner: string;
+    /**
+     * Repository name part of `owner/repo`.
+     */
+    repo: string;
+};
+
+/**
+ * Response shape. Matches the git credential helper's `get` output:
+ * `username` and `password` are written verbatim into git's stdin so it
+ * uses HTTP Basic. `expires_at` is informational — the daemon doesn't
+ * reuse tokens across operations, so it ignores expiry — but we surface
+ * it for audit log correlation.
+ */
+export type MintGitCredentialResponse = {
+    /**
+     * RFC 3339 expiry timestamp, when the upstream provider reported one.
+     * Daemon should not depend on this — every operation gets a fresh
+     * mint anyway.
+     */
+    expires_at?: string | null;
+    /**
+     * Short-lived (≤1 hour) installation token. Never logged, never
+     * stored on disk by the helper or the daemon.
+     */
+    password: string;
+    username: string;
+};
+
+export type MintOperation = 'fetch' | 'push';
 
 /**
  * Miscellaneous validation result
@@ -38200,6 +38270,41 @@ export type TriggerWeeklyDigestResponses = {
 };
 
 export type TriggerWeeklyDigestResponse = TriggerWeeklyDigestResponses[keyof TriggerWeeklyDigestResponses];
+
+export type MintGitCredentialData = {
+    body: MintGitCredentialRequest;
+    path?: never;
+    query?: never;
+    url: '/workspace/git-credential';
+};
+
+export type MintGitCredentialErrors = {
+    /**
+     * Missing or invalid deployment token
+     */
+    401: unknown;
+    /**
+     * Repo not owned by caller's project, or unknown host
+     */
+    403: unknown;
+    /**
+     * Project has no git provider connection
+     */
+    409: unknown;
+    /**
+     * Upstream mint failed
+     */
+    502: unknown;
+};
+
+export type MintGitCredentialResponses = {
+    /**
+     * Token minted
+     */
+    200: MintGitCredentialResponse;
+};
+
+export type MintGitCredentialResponse2 = MintGitCredentialResponses[keyof MintGitCredentialResponses];
 
 export type ListExternalPluginsData = {
     body?: never;

@@ -39,6 +39,39 @@ pub enum WorkspaceError {
     #[error("Workflow {slug} not found in project {project_id}")]
     WorkflowNotFound { project_id: i32, slug: String },
 
+    /// Caller asked for a credential whose `(host, owner, repo)` doesn't
+    /// match the project's configured repository. Used by the sandbox
+    /// credential daemon's mint endpoint to refuse cross-project token
+    /// requests — the daemon can only ever ask for tokens for its own
+    /// project's repo, regardless of what user code might try to inject.
+    #[error("Project {project_id} cannot request credentials for {requested_host}/{requested_owner}/{requested_repo}: project is configured for {project_repo}")]
+    GitCredentialRepoMismatch {
+        project_id: i32,
+        requested_host: String,
+        requested_owner: String,
+        requested_repo: String,
+        project_repo: String,
+    },
+
+    /// Project has no `git_provider_connection_id` set, so we have nothing
+    /// to mint a token from. Distinct from `ProjectNotFound` — the project
+    /// exists, it just isn't connected to any git provider.
+    #[error("Project {project_id} has no git provider connection configured")]
+    GitCredentialNoConnection { project_id: i32 },
+
+    /// Underlying provider couldn't mint a scoped token. Covers GitHub API
+    /// failures, PAT-backed connections (which can't narrow), and
+    /// installation_id mismatches.
+    #[error(
+        "Failed to mint scoped credential for project {project_id} on {owner}/{repo}: {reason}"
+    )]
+    GitCredentialMintFailed {
+        project_id: i32,
+        owner: String,
+        repo: String,
+        reason: String,
+    },
+
     #[error("Database error: {0}")]
     Database(sea_orm::DbErr),
 

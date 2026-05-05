@@ -1,3 +1,4 @@
+pub mod git_credential_service;
 pub mod memory_script;
 pub mod memory_service;
 pub mod message_executor;

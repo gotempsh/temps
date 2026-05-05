@@ -16,8 +16,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use urlencoding;
+
+/// Bound on a single Redis backup `docker exec` call. Redis backups are
+/// typically small (RDB dumps), so 1 hour is plenty; larger setups can
+/// extend this in the future.
+const REDIS_BACKUP_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Input configuration for creating a Redis service
 /// This is what users provide when creating the service
@@ -553,6 +558,73 @@ impl RedisService {
 }
 
 impl RedisService {
+    /// Build wal-g env and run `wal-g backup-push` via the resilient exec
+    /// helper.
+    async fn run_walg_backup_push(
+        &self,
+        container_name: &str,
+        walg_s3_prefix: &str,
+        s3_credentials: &super::S3Credentials,
+        service_config: ServiceConfig,
+    ) -> anyhow::Result<()> {
+        let redis_password = self
+            .get_redis_config(service_config)
+            .map(|c| c.password.clone())
+            .unwrap_or_default();
+
+        // redis-cli --rdb writes the RDB snapshot to a file. We can't use
+        // /dev/stdout directly because redis-cli tries to ftruncate() and
+        // fsync() the output file, which fail on /dev/stdout (exit code 1).
+        // Instead, write to a temp file and cat it to stdout for WAL-G to
+        // capture the stream.
+        let stream_create_cmd = if redis_password.is_empty() {
+            "redis-cli --rdb /tmp/redis_backup.rdb && cat /tmp/redis_backup.rdb".to_string()
+        } else {
+            format!(
+                "redis-cli -a '{}' --rdb /tmp/redis_backup.rdb && cat /tmp/redis_backup.rdb",
+                redis_password
+            )
+        };
+
+        let mut walg_env: Vec<String> = vec![
+            format!("WALG_S3_PREFIX={}", walg_s3_prefix),
+            format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
+            format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
+            format!("AWS_REGION={}", s3_credentials.region),
+            format!("WALG_STREAM_CREATE_COMMAND={}", stream_create_cmd),
+            "WALG_STREAM_RESTORE_COMMAND=cat > /data/dump.rdb".to_string(),
+        ];
+
+        if !redis_password.is_empty() {
+            walg_env.push(format!("WALG_REDIS_PASSWORD={}", redis_password));
+        }
+
+        if let Some(resolved_endpoint) = s3_credentials
+            .resolve_endpoint_for_container(&self.docker, container_name)
+            .await
+        {
+            walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
+        }
+        if s3_credentials.force_path_style {
+            walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
+        }
+
+        info!(
+            "Running wal-g backup-push in container '{}' (S3 prefix: {})",
+            container_name, walg_s3_prefix
+        );
+
+        super::exec_util::run_exec(
+            &self.docker,
+            container_name,
+            vec!["sh".into(), "-c".into(), "wal-g backup-push 2>&1".into()],
+            Some(walg_env),
+            REDIS_BACKUP_EXEC_TIMEOUT,
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Restore from a WAL-G backup stored in S3.
     ///
     /// WAL-G restore requires stopping Redis, fetching the backup (which writes
@@ -938,7 +1010,7 @@ impl RedisService {
         subpath: &str,
         pool: &temps_database::DbConnection,
         external_service: &temps_entities::external_services::Model,
-    ) -> Result<String> {
+    ) -> Result<super::BackupOutcome> {
         use chrono::Utc;
         use sea_orm::*;
         use std::io::Write;
@@ -1049,7 +1121,7 @@ impl RedisService {
             timestamp
         );
 
-        let size_bytes = std::fs::metadata(&tar_path)?.len() as i32;
+        let size_bytes = std::fs::metadata(&tar_path)?.len() as i64;
 
         if size_bytes == 0 {
             let mut backup_update: temps_entities::external_service_backups::ActiveModel =
@@ -1082,7 +1154,7 @@ impl RedisService {
         backup_update.update(pool).await?;
 
         info!("Redis legacy backup completed successfully: {}", backup_key);
-        Ok(backup_key)
+        Ok(super::BackupOutcome::new(backup_key, Some(size_bytes)))
     }
 }
 
@@ -1595,8 +1667,7 @@ impl ExternalService for RedisService {
         pool: &temps_database::DbConnection,
         external_service: &temps_entities::external_services::Model,
         service_config: ServiceConfig,
-    ) -> Result<String> {
-        use bollard::exec::CreateExecOptions;
+    ) -> Result<super::BackupOutcome> {
         use chrono::Utc;
         use sea_orm::*;
 
@@ -1652,142 +1723,64 @@ impl ExternalService for RedisService {
             s3_credentials.bucket_name,
             subpath_root.trim_matches('/')
         );
+        let s3_list_prefix = format!("{}/walg/", subpath_root.trim_matches('/'));
 
-        // Get Redis password from the service config (database), NOT from in-memory config.
-        // The in-memory config may be None after a server restart if init() wasn't called.
-        let redis_password = self
-            .get_redis_config(service_config)
-            .map(|c| c.password.clone())
-            .unwrap_or_default();
-
-        // Build WAL-G environment variables for docker exec.
-        // WALG_STREAM_CREATE_COMMAND tells WAL-G how to create the backup stream.
-        //
-        // redis-cli --rdb writes the RDB snapshot to a file. We can't use /dev/stdout
-        // directly because redis-cli tries to ftruncate() and fsync() the output file,
-        // which fail on /dev/stdout (exit code 1). Instead, we write to a temp file
-        // and cat it to stdout for WAL-G to capture the stream.
-        let stream_create_cmd = if redis_password.is_empty() {
-            "redis-cli --rdb /tmp/redis_backup.rdb && cat /tmp/redis_backup.rdb".to_string()
-        } else {
-            format!(
-                "redis-cli -a '{}' --rdb /tmp/redis_backup.rdb && cat /tmp/redis_backup.rdb",
-                redis_password
-            )
-        };
-
-        let mut walg_env: Vec<String> = vec![
-            format!("WALG_S3_PREFIX={}", walg_s3_prefix),
-            format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
-            format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
-            format!("AWS_REGION={}", s3_credentials.region),
-            format!("WALG_STREAM_CREATE_COMMAND={}", stream_create_cmd),
-            format!("WALG_STREAM_RESTORE_COMMAND=cat > /data/dump.rdb"),
-        ];
-
-        if !redis_password.is_empty() {
-            walg_env.push(format!("WALG_REDIS_PASSWORD={}", redis_password));
-        }
-
-        // Resolve S3 endpoint for use inside the Docker container.
-        if let Some(resolved_endpoint) = s3_credentials
-            .resolve_endpoint_for_container(&self.docker, &container_name)
-            .await
-        {
-            walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
-        }
-        if s3_credentials.force_path_style {
-            walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
-        }
-
-        // Run wal-g backup-push inside the running Redis container
-        let walg_cmd = vec!["sh", "-c", "wal-g backup-push 2>&1"];
-        let walg_env_refs: Vec<&str> = walg_env.iter().map(|s| s.as_str()).collect();
-
-        info!(
-            "Running wal-g backup-push in container '{}' (S3 prefix: {})",
-            container_name, walg_s3_prefix
-        );
-
-        let exec = self
-            .docker
-            .create_exec(
+        let result = self
+            .run_walg_backup_push(
                 &container_name,
-                CreateExecOptions {
-                    cmd: Some(walg_cmd),
-                    attach_stdout: Some(false),
-                    attach_stderr: Some(false),
-                    env: Some(walg_env_refs),
-                    ..Default::default()
-                },
+                &walg_s3_prefix,
+                s3_credentials,
+                service_config,
             )
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to create wal-g exec in container {}: {}",
-                    container_name,
-                    e
+            .await;
+
+        match result {
+            Ok(()) => {
+                let size_bytes = match super::s3_util::list_total_size(
+                    s3_client,
+                    &s3_credentials.bucket_name,
+                    &s3_list_prefix,
                 )
-            })?;
+                .await
+                {
+                    Ok(n) => Some(n),
+                    Err(e) => {
+                        warn!(
+                            "Redis WAL-G backup succeeded but failed to compute size from S3: {}",
+                            e
+                        );
+                        None
+                    }
+                };
 
-        // Start WAL-G in detached mode — no data flows through the Temps process
-        use bollard::exec::StartExecOptions;
-        self.docker
-            .start_exec(
-                &exec.id,
-                Some(StartExecOptions {
-                    detach: true,
-                    ..Default::default()
-                }),
-            )
-            .await?;
+                let mut backup_update: temps_entities::external_service_backups::ActiveModel =
+                    backup_record.clone().into();
+                backup_update.state = Set("completed".to_string());
+                backup_update.finished_at = Set(Some(Utc::now()));
+                backup_update.s3_location = Set(walg_s3_prefix.clone());
+                backup_update.size_bytes = Set(size_bytes);
+                backup_update.update(pool).await?;
 
-        // Poll for completion
-        loop {
-            let inspect = self.docker.inspect_exec(&exec.id).await?;
-            if let Some(running) = inspect.running {
-                if !running {
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-
-        // Check WAL-G exit code
-        let exec_inspect = self.docker.inspect_exec(&exec.id).await?;
-        if let Some(exit_code) = exec_inspect.exit_code {
-            if exit_code != 0 {
-                let error_msg = format!(
-                    "wal-g backup-push failed with exit code {} in container '{}'",
-                    exit_code, container_name
+                info!(
+                    "Redis WAL-G backup completed successfully (prefix: {}, size: {:?})",
+                    walg_s3_prefix, size_bytes
                 );
+                Ok(super::BackupOutcome::new(walg_s3_prefix, size_bytes))
+            }
+            Err(e) => {
+                let error_msg = format!("Redis WAL-G backup failed: {}", e);
                 error!("{}", error_msg);
                 let mut backup_update: temps_entities::external_service_backups::ActiveModel =
                     backup_record.clone().into();
                 backup_update.state = Set("failed".to_string());
                 backup_update.error_message = Set(Some(error_msg.clone()));
                 backup_update.finished_at = Set(Some(Utc::now()));
-                let _ = backup_update.update(pool).await;
-                return Err(anyhow::anyhow!("{}", error_msg));
+                if let Err(update_err) = backup_update.update(pool).await {
+                    error!("Failed to mark Redis backup row as failed: {}", update_err);
+                }
+                Err(e)
             }
         }
-
-        // The backup location is the WAL-G S3 prefix
-        let backup_location = walg_s3_prefix.clone();
-
-        // Update backup record with success
-        let mut backup_update: temps_entities::external_service_backups::ActiveModel =
-            backup_record.clone().into();
-        backup_update.state = Set("completed".to_string());
-        backup_update.finished_at = Set(Some(Utc::now()));
-        backup_update.s3_location = Set(backup_location.clone());
-        backup_update.update(pool).await?;
-
-        info!(
-            "Redis WAL-G backup completed successfully (prefix: {})",
-            walg_s3_prefix
-        );
-        Ok(backup_location)
     }
 
     /// Restore Redis data from S3 using WAL-G or legacy format
@@ -2460,9 +2453,12 @@ mod tests {
             )
             .await
         {
-            Ok(location) => {
-                println!("✓ Backup completed to: {}", location);
-                location
+            Ok(outcome) => {
+                println!(
+                    "✓ Backup completed to: {} ({:?} bytes)",
+                    outcome.location, outcome.size_bytes
+                );
+                outcome.location
             }
             Err(e) => {
                 println!("Backup failed: {}. Skipping test", e);

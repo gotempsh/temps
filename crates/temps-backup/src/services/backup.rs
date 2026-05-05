@@ -563,7 +563,7 @@ impl BackupService {
                         .as_file()
                         .metadata()
                         .map_err(BackupError::Io)?
-                        .len() as i32;
+                        .len() as i64;
 
                     if size_bytes == 0 {
                         return Err(BackupError::Validation(
@@ -614,6 +614,7 @@ impl BackupService {
             error_message: sea_orm::Set(None),
             expires_at: sea_orm::Set(None),
             checksum: sea_orm::Set(None),
+            last_heartbeat_at: sea_orm::Set(None),
             metadata: sea_orm::Set(
                 serde_json::json!({
                     "size_bytes": size_bytes,
@@ -840,7 +841,7 @@ impl BackupService {
         &self,
         s3_source: &S3Source,
         _backup_id: &str,
-    ) -> Result<(String, i32), BackupError> {
+    ) -> Result<(String, i64), BackupError> {
         use bollard::exec::{CreateExecOptions, StartExecOptions};
         use bollard::Docker;
 
@@ -1087,7 +1088,7 @@ impl BackupService {
             );
         }
 
-        Ok((walg_s3_prefix, total_size as i32))
+        Ok((walg_s3_prefix, total_size))
     }
 
     /// Write WAL-G credentials to an env file on the shared volume and enable
@@ -4109,6 +4110,92 @@ impl BackupService {
         Ok(model)
     }
 
+    /// Best-effort progress size for a running backup.
+    ///
+    /// Computed by listing the backup's S3 location and summing the
+    /// reported sizes. Returns `None` for non-running backups (their
+    /// `size_bytes` is authoritative once finished) and for backups
+    /// whose `s3_location` isn't usable yet (engine still warming up).
+    /// Errors talking to S3 are downgraded to `None` and logged — the
+    /// detail page is best-effort.
+    pub async fn compute_live_size(&self, backup: &Backup) -> Option<i64> {
+        if backup.state != "running" {
+            return None;
+        }
+        if backup.s3_location.is_empty() {
+            return None;
+        }
+
+        let s3_source = match temps_entities::s3_sources::Entity::find_by_id(backup.s3_source_id)
+            .one(self.db.as_ref())
+            .await
+        {
+            Ok(Some(src)) => src,
+            Ok(None) => return None,
+            Err(e) => {
+                warn!(
+                    "Failed to load s3_source {} for live size: {}",
+                    backup.s3_source_id, e
+                );
+                return None;
+            }
+        };
+
+        let s3_client = match self.create_s3_client(&s3_source).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "Failed to build S3 client for live-size lookup on backup {}: {}",
+                    backup.id, e
+                );
+                return None;
+            }
+        };
+
+        // The location can be either an `s3://bucket/key` URL (WAL-G,
+        // cluster) or a bucket-relative key (pg_dump, mongodump). Try the
+        // URL form first; fall back to treating the value as a key.
+        let bucket = &s3_source.bucket_name;
+        let key = if let Some((url_bucket, url_key)) =
+            temps_providers::externalsvc::s3_util::parse_s3_url(&backup.s3_location)
+        {
+            // Sanity: only list inside our configured bucket. WAL-G's
+            // prefix should always live in this same bucket.
+            if &url_bucket != bucket {
+                debug!(
+                    "live size: s3:// bucket {} != configured bucket {}, listing anyway",
+                    url_bucket, bucket
+                );
+            }
+            url_key
+        } else {
+            backup.s3_location.trim_start_matches('/').to_string()
+        };
+
+        // Append a trailing slash if the key looks like a prefix (no file
+        // extension). list_objects_v2 doesn't care, but this matches what
+        // the engines pass elsewhere.
+        let prefix = if key.ends_with('/') || key.contains('.') {
+            key
+        } else {
+            format!("{}/", key)
+        };
+
+        match temps_providers::externalsvc::s3_util::list_total_size(&s3_client, bucket, &prefix)
+            .await
+        {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(e) => {
+                debug!(
+                    "live size lookup failed for backup {} ({}): {}",
+                    backup.id, prefix, e
+                );
+                None
+            }
+        }
+    }
+
     /// Get an external service by ID
     pub async fn get_external_service(
         &self,
@@ -4174,7 +4261,10 @@ impl BackupService {
         // Generate unique backup ID
         let backup_id = Uuid::new_v4().to_string();
 
-        // Create backup record
+        // Create backup record. The heartbeat starts at now() so the row
+        // appears alive from the moment it's created — the worker task
+        // refreshes it periodically while the engine runs.
+        let now = chrono::Utc::now();
         let backup = temps_entities::backups::ActiveModel {
             id: sea_orm::NotSet,
             name: sea_orm::Set(format!("Backup {}", backup_id)),
@@ -4182,7 +4272,7 @@ impl BackupService {
             schedule_id: sea_orm::Set(None),
             backup_type: sea_orm::Set(backup_type.to_string()),
             state: sea_orm::Set("running".to_string()),
-            started_at: sea_orm::Set(chrono::Utc::now()),
+            started_at: sea_orm::Set(now),
             finished_at: sea_orm::Set(None),
             s3_source_id: sea_orm::Set(s3_source_id),
             s3_location: sea_orm::Set("".to_string()), // Will be updated by the service
@@ -4197,15 +4287,23 @@ impl BackupService {
                     "service_id": service_id,
                     "service_type": service.service_type,
                     "service_name": service.name,
-                    "timestamp": Utc::now().to_rfc3339()
+                    "timestamp": now.to_rfc3339()
                 })
                 .to_string(),
             ),
             checksum: sea_orm::Set(None),
             expires_at: sea_orm::Set(None),
+            last_heartbeat_at: sea_orm::Set(Some(now)),
         };
 
         let backup = backup.insert(self.db.as_ref()).await?;
+
+        // Spawn a heartbeat task. Dropped at function end (or any early
+        // return), which aborts the task. While alive it keeps
+        // `last_heartbeat_at` fresh; the UI uses staleness > 5min as a
+        // "stalled" signal, and startup reconciliation covers the case
+        // where the worker dies before drop runs.
+        let _heartbeat = crate::services::HeartbeatGuard::spawn(self.db.clone(), backup.id);
 
         // Generate backup path
         let subpath = format!(
@@ -4236,7 +4334,7 @@ impl BackupService {
         // PostgresClusterService doesn't have access to the agent
         // protocol so it can't handle multi-host clusters; this is
         // the deliberate carve-out.
-        let backup_location = if service.topology == "cluster" && service.service_type == "postgres"
+        let backup_outcome = if service.topology == "cluster" && service.service_type == "postgres"
         {
             self.external_service_manager
                 .backup_postgres_cluster(service, &s3_credentials, &subpath_root, backup.id)
@@ -4271,15 +4369,53 @@ impl BackupService {
                     BackupError::ExternalService(e.to_string())
                 })?
         };
-        info!("Backup created at location: {}", backup_location);
+        info!(
+            "Backup created at location: {} ({} bytes)",
+            backup_outcome.location,
+            backup_outcome
+                .size_bytes
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+
+        // If the engine couldn't determine size locally, fall back to
+        // listing the S3 prefix. Best-effort: a missing size is annoying
+        // but doesn't block the backup from being marked completed.
+        let final_size_bytes = match backup_outcome.size_bytes {
+            Some(n) => Some(n),
+            None => {
+                // Strip the "s3://bucket/" prefix to get a list-able key.
+                let bucket = &s3_source.bucket_name;
+                let prefix = backup_outcome
+                    .location
+                    .strip_prefix(&format!("s3://{}/", bucket))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| backup_outcome.location.trim_start_matches('/').to_string());
+                match temps_providers::externalsvc::s3_util::list_total_size(
+                    &s3_client, bucket, &prefix,
+                )
+                .await
+                {
+                    Ok(n) => Some(n),
+                    Err(e) => {
+                        warn!(
+                            "Could not compute size by listing s3://{}/{}: {}",
+                            bucket, prefix, e
+                        );
+                        None
+                    }
+                }
+            }
+        };
 
         // Mark the parent `backups` row as completed. Without this the row
         // stays in state='running' forever, which breaks listing/filtering
         // and makes the restore UI skip the backup.
         let mut backup_update: temps_entities::backups::ActiveModel = backup.clone().into();
         backup_update.state = sea_orm::Set("completed".to_string());
-        backup_update.s3_location = sea_orm::Set(backup_location.clone());
+        backup_update.s3_location = sea_orm::Set(backup_outcome.location.clone());
         backup_update.finished_at = sea_orm::Set(Some(Utc::now()));
+        backup_update.size_bytes = sea_orm::Set(final_size_bytes);
         if let Err(e) = backup_update.update(self.db.as_ref()).await {
             // Don't fail the caller — the backup itself succeeded. Log and
             // continue; the row will be reconciled next time.
@@ -5599,6 +5735,7 @@ mod tests {
             expires_at: Set(backup_result.expires_at),
             checksum: Set(backup_result.checksum.clone()),
             metadata: Set(backup_result.metadata.clone()),
+            last_heartbeat_at: Set(None),
         };
 
         target_backup

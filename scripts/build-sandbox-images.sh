@@ -50,15 +50,21 @@ fi
 echo "Publishing sandbox images at version: $IMAGE_VERSION"
 
 PRINT_DOCKERFILE="$REPO_ROOT/target/debug/examples/print_dockerfile"
+PRINT_BUNDLE="$REPO_ROOT/target/debug/examples/print_bundle"
 
-# Always rebuild the helper so Dockerfile changes in temps-agents land in
-# the pushed images. Cargo short-circuits if nothing changed, so the cost
-# is just a stat-check on incremental builds.
-echo "Building print_dockerfile helper..."
+# Always rebuild the helpers so Dockerfile and bundle changes in
+# temps-agents land in the pushed images. Cargo short-circuits if nothing
+# changed, so the cost is just a stat-check on incremental builds.
+echo "Building print_dockerfile + print_bundle helpers..."
 cargo build --example print_dockerfile -p temps-agents --manifest-path "$REPO_ROOT/Cargo.toml"
+cargo build --example print_bundle -p temps-agents --manifest-path "$REPO_ROOT/Cargo.toml"
 
 if [ ! -x "$PRINT_DOCKERFILE" ]; then
     echo "error: print_dockerfile binary not found at $PRINT_DOCKERFILE after build" >&2
+    exit 1
+fi
+if [ ! -x "$PRINT_BUNDLE" ]; then
+    echo "error: print_bundle binary not found at $PRINT_BUNDLE after build" >&2
     exit 1
 fi
 
@@ -80,6 +86,13 @@ for runtime in "${RUNTIMES[@]}"; do
     mkdir -p "$BUILD_DIR"
 
     "$PRINT_DOCKERFILE" "$runtime" > "$BUILD_DIR/Dockerfile"
+
+    # Materialize the bundles the generated Dockerfile expects. The
+    # in-process build path (`build_context_tar`) packs these into a tar
+    # at runtime; this is the on-disk equivalent for `docker buildx build`.
+    # Without it the COPY pty-agent/ and COPY git-credential/ stages fail
+    # with "not found" before any apt-get can run.
+    "$PRINT_BUNDLE" "$BUILD_DIR" > /dev/null
 
     # Stable owns the canonical `:<ver>` ref; beta only publishes suffixed
     # refs so it can never overwrite a stable image at the same version.

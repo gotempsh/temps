@@ -3832,6 +3832,16 @@ mod tests {
                 head_sha: Some("abc123def456".to_string()),
             })
         }
+
+        async fn mint_scoped_repo_token(
+            &self,
+            _: i32,
+            _: &str,
+            _: &str,
+            _: temps_git::ScopedTokenOp,
+        ) -> Result<temps_git::ScopedTokenGrant, GitProviderManagerError> {
+            Err(GitProviderManagerError::Other("not used in test".into()))
+        }
     }
 
     /// Fake job queue that records sent jobs.

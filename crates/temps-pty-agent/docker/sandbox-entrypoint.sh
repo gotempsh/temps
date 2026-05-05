@@ -59,8 +59,21 @@ supervise_agent() {
     done
 }
 
-# Background the supervisor, then run the container's own command in the
-# foreground so docker-init can signal it on container stop.
+# Note: the git credential daemon is NOT supervised by this entrypoint.
+# `no-new-privileges:true` is enabled on the sandbox container (per the
+# bollard host config in temps-agents/src/sandbox/docker.rs), which
+# blocks `sudo`/setuid uid changes. The entrypoint itself runs as uid
+# 1000 (`temps`) and so cannot launch the daemon as uid 1001
+# (`temps-git`) from inside the container.
+#
+# Instead, the daemon is launched by the host-side message_executor via
+# `docker exec --user temps-git -d` when it writes the daemon's env
+# file at session start. `docker exec` bypasses no-new-privileges
+# because it's a Docker API call, not an in-container setuid attempt.
+# See `start_credential_daemon` in temps-workspace/services/message_executor.rs.
+
+# Background the pty-agent supervisor and run the container's command
+# in the foreground so docker-init can signal it on container stop.
 supervise_agent &
 SUPERVISOR_PID=$!
 

@@ -14,10 +14,17 @@ use std::time::Duration;
 use temps_entities::external_service_backups;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use urlencoding;
 
 use crate::utils::ensure_network_exists;
+
+/// Hard ceiling for a single backup `docker exec`. Hit this and we give up,
+/// surface the captured output, and mark the backup row as failed. Six hours
+/// covers very large WAL-G + pg_dumpall runs while still bounding stuck-exec
+/// blast radius — without this, a hung exec would keep the row in `running`
+/// indefinitely.
+const BACKUP_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
 use super::{ExternalService, HealthProbeResult, RuntimeEnvVar, ServiceConfig, ServiceType};
 
@@ -1891,16 +1898,17 @@ impl PostgresService {
     /// 1. Writes WAL-G S3 credentials to `/var/lib/postgresql/walg.env` on the shared volume
     /// 2. Enables continuous WAL archiving via `ALTER SYSTEM SET archive_command`
     /// 3. Calls `pg_reload_conf()` so PostgreSQL picks up the change without restart
+    #[allow(clippy::too_many_arguments)]
     async fn backup_to_s3_walg(
         &self,
+        s3_client: &aws_sdk_s3::Client,
         s3_credentials: &super::S3Credentials,
         backup: temps_entities::backups::Model,
         subpath_root: &str,
         pool: &temps_database::DbConnection,
         external_service: &temps_entities::external_services::Model,
         service_config: ServiceConfig,
-    ) -> anyhow::Result<String> {
-        use bollard::exec::CreateExecOptions;
+    ) -> anyhow::Result<super::BackupOutcome> {
         use chrono::Utc;
         use sea_orm::*;
 
@@ -1934,7 +1942,97 @@ impl PostgresService {
             s3_credentials.bucket_name,
             subpath_root.trim_matches('/')
         );
+        // Bucket-relative prefix used to list backup objects after success.
+        let s3_list_prefix = format!("{}/walg/", subpath_root.trim_matches('/'));
 
+        // Run the backup, then either persist success or mark failure. Any
+        // `?` propagation in the inner block lands in the failure branch.
+        let result = self
+            .run_walg_backup_push(
+                &container_name,
+                &walg_s3_prefix,
+                s3_credentials,
+                &postgres_config,
+            )
+            .await;
+
+        match result {
+            Ok(walg_env) => {
+                // Compute size by listing S3. WAL-G streams chunks; we
+                // don't see them locally.
+                let size_bytes = match super::s3_util::list_total_size(
+                    s3_client,
+                    &s3_credentials.bucket_name,
+                    &s3_list_prefix,
+                )
+                .await
+                {
+                    Ok(n) => Some(n),
+                    Err(e) => {
+                        warn!(
+                            "WAL-G backup succeeded but failed to compute size for s3://{}/{}: {}",
+                            s3_credentials.bucket_name, s3_list_prefix, e
+                        );
+                        None
+                    }
+                };
+
+                let mut backup_update: external_service_backups::ActiveModel =
+                    backup_record.clone().into();
+                backup_update.state = Set("completed".to_string());
+                backup_update.finished_at = Set(Some(Utc::now()));
+                backup_update.s3_location = Set(walg_s3_prefix.clone());
+                backup_update.size_bytes = Set(size_bytes);
+                backup_update.update(pool).await?;
+
+                info!(
+                    "PostgreSQL WAL-G backup completed successfully (prefix: {}, size: {:?})",
+                    walg_s3_prefix, size_bytes
+                );
+
+                // Enable continuous WAL archiving.
+                // Failures here are logged but do NOT fail the backup.
+                if let Err(e) = self
+                    .enable_wal_archiving(&container_name, &walg_env, &postgres_config)
+                    .await
+                {
+                    error!(
+                        "Failed to enable WAL archiving in container '{}': {}. \
+                         Base backup succeeded but continuous WAL archiving is not active.",
+                        container_name, e
+                    );
+                }
+
+                Ok(super::BackupOutcome::new(walg_s3_prefix, size_bytes))
+            }
+            Err(e) => {
+                let error_msg = format!("WAL-G backup failed: {}", e);
+                error!("{}", error_msg);
+                let mut backup_update: external_service_backups::ActiveModel =
+                    backup_record.clone().into();
+                backup_update.state = Set("failed".to_string());
+                backup_update.error_message = Set(Some(error_msg.clone()));
+                backup_update.finished_at = Set(Some(Utc::now()));
+                if let Err(update_err) = backup_update.update(pool).await {
+                    error!(
+                        "Failed to mark external_service_backups row {} as failed: {}",
+                        backup_record.id, update_err
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Build the wal-g env, run `wal-g backup-push` via `docker exec`, and
+    /// return the env vector so the caller can also wire up WAL archiving.
+    async fn run_walg_backup_push(
+        &self,
+        container_name: &str,
+        walg_s3_prefix: &str,
+        s3_credentials: &super::S3Credentials,
+        postgres_config: &PostgresConfig,
+    ) -> anyhow::Result<Vec<String>> {
         let mut walg_env: Vec<String> = vec![
             format!("WALG_S3_PREFIX={}", walg_s3_prefix),
             format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
@@ -1948,7 +2046,7 @@ impl PostgresService {
         ];
 
         if let Some(resolved_endpoint) = s3_credentials
-            .resolve_endpoint_for_container(&self.docker, &container_name)
+            .resolve_endpoint_for_container(&self.docker, container_name)
             .await
         {
             walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
@@ -1957,101 +2055,25 @@ impl PostgresService {
             walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
 
-        let walg_cmd = vec!["sh", "-c", "wal-g backup-push $PGDATA 2>&1"];
-        let walg_env_refs: Vec<&str> = walg_env.iter().map(|s| s.as_str()).collect();
-
         info!(
             "Running wal-g backup-push in container '{}' (S3 prefix: {})",
             container_name, walg_s3_prefix
         );
 
-        let exec = self
-            .docker
-            .create_exec(
-                &container_name,
-                CreateExecOptions {
-                    cmd: Some(walg_cmd),
-                    attach_stdout: Some(false),
-                    attach_stderr: Some(false),
-                    env: Some(walg_env_refs),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to create wal-g exec in container {}: {}",
-                    container_name,
-                    e
-                )
-            })?;
+        super::exec_util::run_exec(
+            &self.docker,
+            container_name,
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "wal-g backup-push $PGDATA 2>&1".into(),
+            ],
+            Some(walg_env.clone()),
+            BACKUP_EXEC_TIMEOUT,
+        )
+        .await?;
 
-        use bollard::exec::StartExecOptions;
-        self.docker
-            .start_exec(
-                &exec.id,
-                Some(StartExecOptions {
-                    detach: true,
-                    ..Default::default()
-                }),
-            )
-            .await?;
-
-        loop {
-            let inspect = self.docker.inspect_exec(&exec.id).await?;
-            if let Some(running) = inspect.running {
-                if !running {
-                    break;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-
-        let exec_inspect = self.docker.inspect_exec(&exec.id).await?;
-        if let Some(exit_code) = exec_inspect.exit_code {
-            if exit_code != 0 {
-                let error_msg = format!(
-                    "wal-g backup-push failed with exit code {} in container '{}'",
-                    exit_code, container_name
-                );
-                error!("{}", error_msg);
-                let mut backup_update: external_service_backups::ActiveModel =
-                    backup_record.clone().into();
-                backup_update.state = Set("failed".to_string());
-                backup_update.error_message = Set(Some(error_msg.clone()));
-                backup_update.finished_at = Set(Some(Utc::now()));
-                let _ = backup_update.update(pool).await;
-                return Err(anyhow::anyhow!("{}", error_msg));
-            }
-        }
-
-        let backup_location = walg_s3_prefix.clone();
-
-        let mut backup_update: external_service_backups::ActiveModel = backup_record.clone().into();
-        backup_update.state = Set("completed".to_string());
-        backup_update.finished_at = Set(Some(Utc::now()));
-        backup_update.s3_location = Set(backup_location.clone());
-        backup_update.update(pool).await?;
-
-        info!(
-            "PostgreSQL WAL-G backup completed successfully (prefix: {})",
-            walg_s3_prefix
-        );
-
-        // Enable continuous WAL archiving.
-        // Failures here are logged but do NOT fail the backup.
-        if let Err(e) = self
-            .enable_wal_archiving(&container_name, &walg_env, &postgres_config)
-            .await
-        {
-            error!(
-                "Failed to enable WAL archiving in container '{}': {}. \
-                 Base backup succeeded but continuous WAL archiving is not active.",
-                container_name, e
-            );
-        }
-
-        Ok(backup_location)
+        Ok(walg_env)
     }
 
     /// Backup PostgreSQL data to S3 using pg_dump via a sidecar container.
@@ -2069,10 +2091,7 @@ impl PostgresService {
         pool: &temps_database::DbConnection,
         external_service: &temps_entities::external_services::Model,
         service_config: ServiceConfig,
-    ) -> anyhow::Result<String> {
-        use bollard::exec::{CreateExecOptions, StartExecOptions};
-        use bollard::models::ContainerCreateBody as Config;
-        use bollard::query_parameters::RemoveContainerOptions;
+    ) -> anyhow::Result<super::BackupOutcome> {
         use chrono::Utc;
         use sea_orm::*;
 
@@ -2100,6 +2119,57 @@ impl PostgresService {
         }
         .insert(pool)
         .await?;
+
+        let outcome = self
+            .run_pg_dumpall_to_s3(s3_client, s3_source, subpath, &postgres_config)
+            .await;
+
+        match outcome {
+            Ok((backup_key, size_bytes)) => {
+                let mut backup_update: external_service_backups::ActiveModel =
+                    backup_record.clone().into();
+                backup_update.state = Set("completed".to_string());
+                backup_update.finished_at = Set(Some(Utc::now()));
+                backup_update.size_bytes = Set(Some(size_bytes));
+                backup_update.s3_location = Set(backup_key.clone());
+                backup_update.update(pool).await?;
+                Ok(super::BackupOutcome::new(backup_key, Some(size_bytes)))
+            }
+            Err(e) => {
+                let error_msg = format!("pg_dumpall backup failed: {}", e);
+                error!("{}", error_msg);
+                let mut backup_update: external_service_backups::ActiveModel =
+                    backup_record.clone().into();
+                backup_update.state = Set("failed".to_string());
+                backup_update.error_message = Set(Some(error_msg.clone()));
+                backup_update.finished_at = Set(Some(Utc::now()));
+                if let Err(update_err) = backup_update.update(pool).await {
+                    error!(
+                        "Failed to mark external_service_backups row {} as failed: {}",
+                        backup_record.id, update_err
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Pull image, spin up the sidecar, run `pg_dumpall | gzip` to a bind
+    /// mount, upload to S3, clean up. Returns `(backup_key, size_bytes)`.
+    ///
+    /// All cleanup (sidecar removal, temp file deletion) is best-effort and
+    /// runs regardless of which step failed — so the caller only has to
+    /// decide whether to mark the DB row as completed or failed.
+    async fn run_pg_dumpall_to_s3(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        s3_source: &temps_entities::s3_sources::Model,
+        subpath: &str,
+        postgres_config: &PostgresConfig,
+    ) -> anyhow::Result<(String, i64)> {
+        use bollard::models::ContainerCreateBody as Config;
+        use bollard::query_parameters::RemoveContainerOptions;
+        use chrono::Utc;
 
         let db_container_name = self.get_container_name();
         let sidecar_image = postgres_config.docker_image.clone();
@@ -2133,10 +2203,8 @@ impl PostgresService {
         let sidecar_name = format!("temps-pg-backup-{}", uuid::Uuid::new_v4());
         let password_env = format!("PGPASSWORD={}", postgres_config.password);
 
-        // Create a host directory for the bind mount so pg_dump writes directly to disk,
-        // bypassing the Temps process entirely. Previous approach streamed pg_dump output
-        // through Bollard's exec HTTP stream (attach_stdout: true), which caused unbounded
-        // memory growth because hyper/Bollard buffers the chunked HTTP response internally.
+        // Create a host directory for the bind mount so pg_dump writes
+        // directly to disk, bypassing the Temps process entirely.
         let backup_dir = std::env::temp_dir().join("temps-extpg-backup");
         tokio::fs::create_dir_all(&backup_dir).await.map_err(|e| {
             anyhow::anyhow!(
@@ -2148,6 +2216,12 @@ impl PostgresService {
         let backup_filename = format!("{}.sql.gz", uuid::Uuid::new_v4());
         let host_backup_path = backup_dir.join(&backup_filename);
         let container_backup_path = format!("/backup/{}", backup_filename);
+        let stderr_path_in_container = format!("/backup/{}.stderr", uuid::Uuid::new_v4());
+        let host_stderr_path = backup_dir.join(
+            std::path::Path::new(&stderr_path_in_container)
+                .file_name()
+                .unwrap(),
+        );
 
         let sidecar_config = Config {
             image: Some(sidecar_image.clone()),
@@ -2191,103 +2265,105 @@ impl PostgresService {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to start pg_dump sidecar container: {}", e))?;
 
-        let remove_sidecar = |docker: std::sync::Arc<bollard::Docker>, name: String| async move {
-            let _ = docker
-                .remove_container(
-                    &name,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
+        // Cleanup runs regardless of success/failure. We capture clones so
+        // the closure outlives the function-level `?` boundary.
+        let cleanup = || {
+            let docker = self.docker.clone();
+            let sidecar = sidecar_name.clone();
+            let host_backup = host_backup_path.clone();
+            let host_stderr = host_stderr_path.clone();
+            async move {
+                let _ = docker
+                    .remove_container(
+                        &sidecar,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                let _ = tokio::fs::remove_file(&host_backup).await;
+                let _ = tokio::fs::remove_file(&host_stderr).await;
+            }
         };
 
         let port_str = POSTGRES_INTERNAL_PORT.to_string();
 
         info!(
-            "Running pg_dump sidecar for service '{}' (host={}, bind-mount mode)",
+            "Running pg_dumpall sidecar for service '{}' (host={}, bind-mount mode)",
             self.name, db_container_name
         );
 
-        // Run pg_dumpall | gzip inside the sidecar, writing directly to the bind-mounted
-        // host filesystem. This keeps the Temps process memory flat regardless of DB size.
-        // pg_dumpall dumps the entire cluster (all databases, roles, tablespaces) instead
-        // of a single database. `--database` is only the bootstrap connection target.
-        let stderr_path = format!("/backup/{}.stderr", uuid::Uuid::new_v4());
+        // Run pg_dumpall | gzip inside the sidecar, writing directly to the
+        // bind-mounted host filesystem. pg_dumpall dumps the entire cluster
+        // (all DBs, roles, tablespaces); `--database` is just the bootstrap
+        // connection target.
         let pg_dump_shell_cmd = format!(
             "pg_dumpall --clean --if-exists --no-password --host={} --port={} --username={} --database={} 2>{} | gzip > {}",
-            shell_escape(&db_container_name), shell_escape(&port_str), shell_escape(&postgres_config.username), shell_escape(&postgres_config.database),
-            stderr_path, container_backup_path
+            shell_escape(&db_container_name),
+            shell_escape(&port_str),
+            shell_escape(&postgres_config.username),
+            shell_escape(&postgres_config.database),
+            stderr_path_in_container,
+            container_backup_path,
         );
 
-        let exec = self
-            .docker
-            .create_exec(
-                &sidecar_name,
-                CreateExecOptions {
-                    cmd: Some(vec!["sh", "-c", &pg_dump_shell_cmd]),
-                    attach_stdout: Some(false),
-                    attach_stderr: Some(false),
-                    env: Some(vec![password_env.as_str()]),
-                    ..Default::default()
-                },
-            )
+        let exec_result = super::exec_util::run_exec(
+            &self.docker,
+            &sidecar_name,
+            vec!["sh".into(), "-c".into(), pg_dump_shell_cmd],
+            Some(vec![password_env.clone()]),
+            BACKUP_EXEC_TIMEOUT,
+        )
+        .await;
+
+        // Read sidecar-side stderr (pg_dumpall writes to it via 2>) for
+        // diagnostics. Best-effort; missing file is fine.
+        let stderr_from_file = tokio::fs::read(&host_stderr_path)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create pg_dump exec: {}", e))?;
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
 
-        // Start the exec in detached mode — no HTTP stream through the Temps process
-        self.docker
-            .start_exec(
-                &exec.id,
-                Some(StartExecOptions {
-                    detach: true,
-                    ..Default::default()
-                }),
-            )
-            .await?;
-
-        // Poll for completion instead of streaming
-        loop {
-            let inspect = self.docker.inspect_exec(&exec.id).await?;
-            if let Some(running) = inspect.running {
-                if !running {
-                    break;
+        if let Err(e) = exec_result {
+            cleanup().await;
+            return Err(anyhow::anyhow!(
+                "pg_dumpall exec failed: {}{}",
+                e,
+                if stderr_from_file.is_empty() {
+                    String::new()
+                } else {
+                    format!("\npg_dumpall stderr:\n{}", stderr_from_file)
                 }
+            ));
+        }
+
+        if !stderr_from_file.is_empty() {
+            tracing::debug!(
+                "pg_dumpall stderr for service '{}': {}",
+                self.name,
+                stderr_from_file
+            );
+        }
+
+        let size_bytes = match tokio::fs::metadata(&host_backup_path).await {
+            Ok(m) => m.len() as i64,
+            Err(e) => {
+                cleanup().await;
+                return Err(anyhow::anyhow!(
+                    "Failed to stat backup file {}: {}",
+                    host_backup_path.display(),
+                    e
+                ));
             }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        };
+
+        if size_bytes == 0 {
+            cleanup().await;
+            return Err(anyhow::anyhow!(
+                "PostgreSQL backup failed: backup file has zero size (pg_dumpall produced no output)"
+            ));
         }
-
-        // Read stderr from the file inside the container (via bind mount on host)
-        let host_stderr_path =
-            backup_dir.join(std::path::Path::new(&stderr_path).file_name().unwrap());
-        let stderr_data = tokio::fs::read(&host_stderr_path).await.unwrap_or_default();
-        let _ = tokio::fs::remove_file(&host_stderr_path).await;
-
-        // Check if command was successful
-        let exec_inspect = self.docker.inspect_exec(&exec.id).await?;
-        if let Some(exit_code) = exec_inspect.exit_code {
-            if exit_code != 0 {
-                let stderr = String::from_utf8_lossy(&stderr_data);
-                remove_sidecar(self.docker.clone(), sidecar_name.clone()).await;
-                let _ = tokio::fs::remove_file(&host_backup_path).await;
-                let error_msg = format!("pg_dump failed with exit code {}: {}", exit_code, stderr);
-                let mut backup_update: external_service_backups::ActiveModel =
-                    backup_record.clone().into();
-                backup_update.state = Set("failed".to_string());
-                backup_update.error_message = Set(Some(error_msg.clone()));
-                backup_update.finished_at = Set(Some(Utc::now()));
-                backup_update.update(pool).await?;
-                return Err(anyhow::anyhow!("{}", error_msg));
-            }
-        }
-
-        if !stderr_data.is_empty() {
-            let stderr = String::from_utf8_lossy(&stderr_data);
-            tracing::debug!("pg_dump stderr for service '{}': {}", self.name, stderr);
-        }
-
-        remove_sidecar(self.docker.clone(), sidecar_name).await;
 
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
         let backup_key = format!(
@@ -2296,61 +2372,43 @@ impl PostgresService {
             timestamp
         );
 
-        let size_bytes = tokio::fs::metadata(&host_backup_path)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to stat backup file {}: {}",
+        let body = match aws_sdk_s3::primitives::ByteStream::from_path(&host_backup_path).await {
+            Ok(b) => b,
+            Err(e) => {
+                cleanup().await;
+                return Err(anyhow::anyhow!(
+                    "Failed to open backup file {} for upload: {}",
                     host_backup_path.display(),
                     e
-                )
-            })?
-            .len() as i32;
+                ));
+            }
+        };
 
-        if size_bytes == 0 {
-            let _ = tokio::fs::remove_file(&host_backup_path).await;
-            let mut backup_update: external_service_backups::ActiveModel =
-                backup_record.clone().into();
-            backup_update.state = Set("failed".to_string());
-            backup_update.finished_at = Set(Some(Utc::now()));
-            backup_update.error_message =
-                Set(Some("Backup failed: backup file has zero size".to_string()));
-            backup_update.update(pool).await?;
-            return Err(anyhow::anyhow!(
-                "PostgreSQL backup failed: backup file has zero size"
-            ));
-        }
-
-        s3_client
+        if let Err(e) = s3_client
             .put_object()
             .bucket(&s3_source.bucket_name)
             .key(&backup_key)
-            .body(aws_sdk_s3::primitives::ByteStream::from_path(&host_backup_path).await?)
+            .body(body)
             .content_type("application/x-gzip")
             .send()
             .await
-            .map_err(|e| {
-                error!(
-                    "Failed to upload backup to S3: {:?} - Message: {}",
-                    e,
-                    e.to_string()
-                );
-                anyhow::anyhow!("Failed to upload backup to S3: {}", e)
-            })?;
+        {
+            cleanup().await;
+            return Err(anyhow::anyhow!(
+                "Failed to upload backup to s3://{}/{}: {}",
+                s3_source.bucket_name,
+                backup_key,
+                e
+            ));
+        }
 
-        // Clean up the bind-mount backup file
-        let _ = tokio::fs::remove_file(&host_backup_path).await;
+        cleanup().await;
+        info!(
+            "Successfully uploaded pg_dumpall backup to s3://{}/{} ({} bytes)",
+            s3_source.bucket_name, backup_key, size_bytes
+        );
 
-        info!("Successfully uploaded pg_dump backup to S3: {}", backup_key);
-
-        let mut backup_update: external_service_backups::ActiveModel = backup_record.clone().into();
-        backup_update.state = Set("completed".to_string());
-        backup_update.finished_at = Set(Some(Utc::now()));
-        backup_update.size_bytes = Set(Some(size_bytes));
-        backup_update.s3_location = Set(backup_key.clone());
-        backup_update.update(pool).await?;
-
-        Ok(backup_key)
+        Ok((backup_key, size_bytes))
     }
 }
 
@@ -2405,7 +2463,7 @@ impl ExternalService for PostgresService {
         pool: &temps_database::DbConnection,
         external_service: &temps_entities::external_services::Model,
         service_config: ServiceConfig,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<super::BackupOutcome> {
         let container_name = self.get_container_name();
 
         if self.container_has_walg(&container_name).await {
@@ -2414,6 +2472,7 @@ impl ExternalService for PostgresService {
                 container_name
             );
             self.backup_to_s3_walg(
+                s3_client,
                 s3_credentials,
                 backup,
                 subpath_root,
@@ -4363,9 +4422,12 @@ mod tests {
             )
             .await
         {
-            Ok(location) => {
-                println!("✓ Backup completed to: {}", location);
-                location
+            Ok(outcome) => {
+                println!(
+                    "✓ Backup completed to: {} ({:?} bytes)",
+                    outcome.location, outcome.size_bytes
+                );
+                outcome.location
             }
             Err(e) => {
                 println!("Backup failed: {}. Skipping test", e);
@@ -4842,6 +4904,7 @@ mod tests {
             created_by: 1,
             expires_at: None,
             tags: "".into(),
+            last_heartbeat_at: None,
         };
         let source_service = temps_entities::external_services::Model {
             id: 1,

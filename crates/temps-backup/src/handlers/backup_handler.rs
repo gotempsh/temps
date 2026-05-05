@@ -190,7 +190,7 @@ pub struct ExternalServiceBackupResponse {
     pub started_at: String,
     #[schema(example = "2025-01-15T14:35:00.456Z")]
     pub finished_at: Option<String>,
-    pub size_bytes: Option<i32>,
+    pub size_bytes: Option<i64>,
     pub s3_location: String,
     pub error_message: Option<String>,
     pub metadata: serde_json::Value,
@@ -282,7 +282,12 @@ pub struct BackupResponse {
     pub state: String,
     pub started_at: i64,
     pub completed_at: Option<i64>,
-    pub size_bytes: i64,
+    /// Final size of the backup once completed. Null while running.
+    pub size_bytes: Option<i64>,
+    /// Best-effort partial size while a backup is still running, computed
+    /// by listing the S3 prefix. Null when the backup is finished
+    /// (`size_bytes` is authoritative in that case).
+    pub live_size_bytes: Option<i64>,
     pub file_count: Option<i32>,
     pub s3_source_id: i32,
     pub s3_location: String,
@@ -293,6 +298,12 @@ pub struct BackupResponse {
     pub created_by: i32,
     pub expires_at: Option<i64>,
     pub tags: Vec<String>,
+    /// Last time the worker reported progress. Older than ~5 minutes while
+    /// `state == "running"` indicates a stalled backup the UI should flag.
+    pub last_heartbeat_at: Option<i64>,
+    /// True when `state == "running"` but the heartbeat is stale, suggesting
+    /// the worker process died mid-backup.
+    pub stalled: bool,
 }
 
 /// Response type for source backup index
@@ -329,7 +340,7 @@ pub struct SourceBackupEntry {
     pub created_at: String,
     /// Size of the backup in bytes, if known.
     #[schema(example = 1024000)]
-    pub size_bytes: Option<i32>,
+    pub size_bytes: Option<i64>,
     /// Raw S3 URL / key where the backup sits. For Postgres WAL-G backups
     /// this starts with `s3://`; for pg_dump-style backups it's the
     /// relative object key.
@@ -402,8 +413,21 @@ impl From<temps_entities::backup_schedules::Model> for BackupScheduleResponse {
     }
 }
 
+/// Heartbeat older than this while state=running marks the row as stalled.
+pub const BACKUP_STALL_THRESHOLD_SECS: i64 = 300;
+
 impl From<temps_entities::backups::Model> for BackupResponse {
     fn from(backup: temps_entities::backups::Model) -> Self {
+        let stalled = backup.state == "running"
+            && backup
+                .last_heartbeat_at
+                .map(|hb| (chrono::Utc::now() - hb).num_seconds() > BACKUP_STALL_THRESHOLD_SECS)
+                .unwrap_or_else(|| {
+                    // No heartbeat yet AND started long enough ago.
+                    (chrono::Utc::now() - backup.started_at).num_seconds()
+                        > BACKUP_STALL_THRESHOLD_SECS
+                });
+
         Self {
             id: backup.id,
             name: backup.name,
@@ -413,7 +437,8 @@ impl From<temps_entities::backups::Model> for BackupResponse {
             state: backup.state,
             started_at: backup.started_at.timestamp_millis(),
             completed_at: backup.finished_at.map(|dt| dt.timestamp_millis()),
-            size_bytes: backup.size_bytes.unwrap_or(0) as i64,
+            size_bytes: backup.size_bytes,
+            live_size_bytes: None,
             file_count: backup.file_count,
             s3_source_id: backup.s3_source_id,
             s3_location: backup.s3_location,
@@ -424,6 +449,8 @@ impl From<temps_entities::backups::Model> for BackupResponse {
             created_by: backup.created_by,
             expires_at: backup.expires_at.map(|dt| dt.timestamp_millis()),
             tags: serde_json::from_str(&backup.tags).unwrap_or_default(),
+            last_heartbeat_at: backup.last_heartbeat_at.map(|dt| dt.timestamp_millis()),
+            stalled,
         }
     }
 }
@@ -445,7 +472,7 @@ struct S3BackupEntry {
     backup_type: String,
     created_at: String,
     #[serde(default)]
-    size_bytes: Option<i32>,
+    size_bytes: Option<i64>,
     #[serde(default)]
     location: String,
     #[serde(default)]
@@ -1116,14 +1143,20 @@ async fn get_backup(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
 
-    let backup = app_state.backup_service.get_backup(&id).await?;
-    if backup.is_none() {
+    let Some(backup) = app_state.backup_service.get_backup(&id).await? else {
         return Err(temps_core::error_builder::not_found()
             .title("Backup Not Found")
             .detail(format!("Backup with ID {} not found", id))
             .build());
-    }
-    Ok(Json(BackupResponse::from(backup.unwrap())))
+    };
+
+    // Compute partial size while the backup is still running. Best-effort
+    // and capped to one S3 list call per request — `compute_live_size`
+    // returns None for finished or unresolvable backups.
+    let live_size = app_state.backup_service.compute_live_size(&backup).await;
+    let mut response = BackupResponse::from(backup);
+    response.live_size_bytes = live_size;
+    Ok(Json(response))
 }
 
 /// Disable a backup schedule

@@ -13,7 +13,7 @@ pub struct Model {
     pub state: String,
     pub started_at: DBDateTime,
     pub finished_at: Option<DBDateTime>,
-    pub size_bytes: Option<i32>,
+    pub size_bytes: Option<i64>,
     pub s3_location: String,
     pub error_message: Option<String>,
     pub metadata: Json,

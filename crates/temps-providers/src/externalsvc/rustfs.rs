@@ -24,7 +24,7 @@ use std::time::Duration;
 use temps_core::EncryptionService;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::utils::ensure_network_exists;
 
@@ -1214,7 +1214,7 @@ impl ExternalService for RustfsService {
     async fn backup_to_s3(
         &self,
         _s3_client: &aws_sdk_s3::Client,
-        _s3_credentials: &super::S3Credentials,
+        s3_credentials: &super::S3Credentials,
         backup: temps_entities::backups::Model,
         s3_source: &temps_entities::s3_sources::Model,
         _subpath: &str,
@@ -1222,7 +1222,7 @@ impl ExternalService for RustfsService {
         pool: &temps_database::DbConnection,
         external_service: &temps_entities::external_services::Model,
         service_config: ServiceConfig,
-    ) -> Result<String> {
+    ) -> Result<super::BackupOutcome> {
         use chrono::Utc;
         use sea_orm::*;
 
@@ -1390,16 +1390,39 @@ impl ExternalService for RustfsService {
             .await?;
 
         if success {
+            // Compute size by listing the destination prefix.
+            let dest_s3_client = s3_credentials.build_s3_client().await;
+            let size_bytes = match super::s3_util::list_total_size(
+                &dest_s3_client,
+                &s3_credentials.bucket_name,
+                &format!("{}/", subpath_root.trim_matches('/')),
+            )
+            .await
+            {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    warn!("RustFS mirror succeeded but failed to compute size: {}", e);
+                    None
+                }
+            };
+
             let mut backup_update: temps_entities::external_service_backups::ActiveModel =
                 backup_record.clone().into();
             backup_update.state = Set("completed".to_string());
             backup_update.finished_at = Set(Some(Utc::now()));
+            backup_update.size_bytes = Set(size_bytes);
             temps_entities::external_service_backups::Entity::update(backup_update)
                 .exec(pool)
                 .await?;
 
-            info!("RustFS backup completed successfully");
-            Ok(backup_prefix.to_string())
+            info!(
+                "RustFS backup completed successfully ({:?} bytes)",
+                size_bytes
+            );
+            Ok(super::BackupOutcome::new(
+                backup_prefix.to_string(),
+                size_bytes,
+            ))
         } else {
             let error_message = error_logs.join("\n");
 

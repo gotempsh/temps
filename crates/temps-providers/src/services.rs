@@ -2397,7 +2397,7 @@ impl ExternalServiceManager {
         s3_credentials: &crate::S3Credentials,
         subpath_root: &str,
         backup_id: i32,
-    ) -> Result<String, ExternalServiceError> {
+    ) -> Result<crate::externalsvc::BackupOutcome, ExternalServiceError> {
         info!(
             service_id = service.id,
             service_name = %service.name,
@@ -2567,11 +2567,33 @@ impl ExternalServiceManager {
             );
         }
 
-        // Success — mark the row completed with the prefix.
+        // Compute size by listing the WAL-G prefix in S3.
+        let s3_list_prefix = format!("{}/walg/", subpath_root.trim_matches('/'));
+        let s3_client = s3_credentials.build_s3_client().await;
+        let size_bytes = match crate::externalsvc::s3_util::list_total_size(
+            &s3_client,
+            &s3_credentials.bucket_name,
+            &s3_list_prefix,
+        )
+        .await
+        {
+            Ok(n) => Some(n),
+            Err(e) => {
+                warn!(
+                    service_id = service.id,
+                    error = %e,
+                    "Cluster backup succeeded but failed to compute size from S3"
+                );
+                None
+            }
+        };
+
+        // Success — mark the row completed with the prefix and size.
         let mut update: external_service_backups::ActiveModel = backup_record.into();
         update.state = Set("completed".to_string());
         update.s3_location = Set(walg_prefix.clone());
         update.finished_at = Set(Some(Utc::now()));
+        update.size_bytes = Set(size_bytes);
         if let Err(e) = update.update(self.db.as_ref()).await {
             warn!(
                 service_id = service.id,
@@ -2580,7 +2602,10 @@ impl ExternalServiceManager {
             );
         }
 
-        Ok(walg_prefix)
+        Ok(crate::externalsvc::BackupOutcome::new(
+            walg_prefix,
+            size_bytes,
+        ))
     }
 
     /// Write `/var/lib/postgresql/walg.env` to a single cluster member.

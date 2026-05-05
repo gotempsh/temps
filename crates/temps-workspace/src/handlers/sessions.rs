@@ -140,6 +140,21 @@ impl From<WorkspaceError> for Problem {
             WorkspaceError::WorkflowNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Workflow Not Found")
                 .with_detail(error.to_string()),
+            WorkspaceError::GitCredentialRepoMismatch { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Cross-Project Credential Request Denied")
+                    .with_detail(error.to_string())
+            }
+            WorkspaceError::GitCredentialNoConnection { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("No Git Provider Connection")
+                    .with_detail(error.to_string())
+            }
+            WorkspaceError::GitCredentialMintFailed { .. } => {
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("Credential Mint Failed")
+                    .with_detail(error.to_string())
+            }
             WorkspaceError::Database(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(error.to_string()),

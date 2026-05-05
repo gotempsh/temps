@@ -18,4 +18,5 @@ pub use plugin::GitPlugin;
 pub use services::git_provider_manager::GitProviderManager;
 pub use services::git_provider_manager_trait::{
     GitProviderManagerError, GitProviderManagerTrait, PullRequest, RepositoryInfo,
+    ScopedTokenGrant, ScopedTokenOp,
 };

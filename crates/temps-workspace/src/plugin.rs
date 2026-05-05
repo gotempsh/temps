@@ -15,6 +15,7 @@ use temps_providers::ExternalServiceManager;
 use tracing::{debug, info, warn};
 
 use crate::handlers::{configure_routes, WorkspaceAppState};
+use crate::services::git_credential_service::GitCredentialService;
 use crate::services::memory_service::WorkflowMemoryService;
 use crate::services::message_executor::MessageExecutor;
 use crate::services::session_manager::WorkspaceSessionManager;
@@ -62,6 +63,24 @@ impl TempsPlugin for WorkspacePlugin {
             // Create workspace service
             let workspace_service = Arc::new(WorkspaceService::new(db.clone()));
             context.register_service(workspace_service.clone());
+
+            // Create git credential service. Optional registration: only
+            // wire it up if the git plugin actually loaded its provider
+            // manager. Without that, the in-sandbox credential daemon's
+            // mint endpoint returns 503 — which is the correct UX for a
+            // server that doesn't have any git provider configured.
+            if let Some(git_provider_manager) = context.get_service::<dyn GitProviderManagerTrait>()
+            {
+                let git_credential_service =
+                    Arc::new(GitCredentialService::new(db.clone(), git_provider_manager));
+                context.register_service(git_credential_service);
+                info!("Workspace git credential service registered");
+            } else {
+                warn!(
+                    "Git provider manager not available — workspace credential mint endpoint will return 503. \
+                     Ensure the git plugin is loaded before the workspace plugin."
+                );
+            }
 
             // Create workflow memory service. We register it BOTH as the
             // concrete WorkflowMemoryService (for handlers in this crate)
@@ -332,6 +351,8 @@ impl TempsPlugin for WorkspacePlugin {
         // it, but the rest of the workspace routes work fine without Docker.
         let docker = context.get_service::<bollard::Docker>();
 
+        let git_credential_service = context.get_service::<GitCredentialService>();
+
         let app_state = Arc::new(WorkspaceAppState {
             db,
             workspace_service,
@@ -341,6 +362,7 @@ impl TempsPlugin for WorkspacePlugin {
             audit_service,
             platform_config_service,
             docker,
+            git_credential_service,
         });
 
         let routes = configure_routes().with_state(app_state);

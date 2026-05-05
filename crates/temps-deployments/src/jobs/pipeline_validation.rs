@@ -242,6 +242,21 @@ impl GitProviderManagerTrait for MockGitProviderManager {
             "Mock: not implemented".to_string(),
         ))
     }
+
+    async fn mint_scoped_repo_token(
+        &self,
+        _connection_id: i32,
+        _owner: &str,
+        _repo: &str,
+        _operation: temps_git::services::git_provider_manager_trait::ScopedTokenOp,
+    ) -> Result<
+        temps_git::services::git_provider_manager_trait::ScopedTokenGrant,
+        GitProviderManagerError,
+    > {
+        Err(GitProviderManagerError::Other(
+            "Mock: pipeline validation does not need scoped tokens".to_string(),
+        ))
+    }
 }
 
 /// Mock LogWriter for pipeline validation

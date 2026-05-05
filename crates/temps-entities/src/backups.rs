@@ -14,7 +14,7 @@ pub struct Model {
     pub state: String,
     pub started_at: DBDateTime,
     pub finished_at: Option<DBDateTime>,
-    pub size_bytes: Option<i32>,
+    pub size_bytes: Option<i64>,
     pub file_count: Option<i32>,
     pub s3_source_id: i32,
     pub s3_location: String,
@@ -25,6 +25,7 @@ pub struct Model {
     pub created_by: i32,
     pub expires_at: Option<DBDateTime>,
     pub tags: String,
+    pub last_heartbeat_at: Option<DBDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

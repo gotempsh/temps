@@ -2117,6 +2117,18 @@ mod tests {
                 "not implemented in test".into(),
             ))
         }
+
+        async fn mint_scoped_repo_token(
+            &self,
+            _connection_id: i32,
+            _owner: &str,
+            _repo: &str,
+            _operation: temps_git::ScopedTokenOp,
+        ) -> Result<temps_git::ScopedTokenGrant, temps_git::GitProviderManagerError> {
+            Err(temps_git::GitProviderManagerError::Other(
+                "not implemented in test".into(),
+            ))
+        }
     }
 
     struct MockStaticDeployer;

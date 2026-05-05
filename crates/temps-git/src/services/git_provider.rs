@@ -385,6 +385,39 @@ pub struct User {
     pub avatar_url: Option<String>,
 }
 
+/// Operation a per-op git credential will be used for. Drives permission
+/// narrowing on the minted token: `Fetch` → `contents:read`, `Push` →
+/// `contents:write`. Anything that needs more (issues, PRs, releases)
+/// uses a separate, fuller-scope flow — these are exclusively for the
+/// in-sandbox credential daemon serving git over HTTPS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopedTokenOp {
+    /// `git clone`, `git fetch`, `git ls-remote`. Read-only.
+    Fetch,
+    /// `git push`. Write to `contents` only — no other permissions.
+    Push,
+}
+
+/// A short-lived, narrowly-scoped credential issued by
+/// [`GitProviderService::mint_scoped_repo_token`].
+///
+/// Shape mirrors the git credential helper protocol so the daemon can
+/// pass `username`/`password` straight through: git uses HTTP Basic
+/// against `https://<username>:<password>@<host>/<repo>`.
+#[derive(Debug, Clone)]
+pub struct ScopedTokenGrant {
+    /// Username for HTTP Basic auth. `x-access-token` for GitHub App
+    /// installation tokens (the canonical username GitHub expects), or
+    /// the user's login name for PATs.
+    pub username: String,
+    /// The token itself. Treat as opaque, never log.
+    pub password: String,
+    /// Provider-reported expiry. `None` only if the provider doesn't
+    /// surface one — callers should treat that as "expires soon" and
+    /// re-mint on every operation.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Trait that all git providers must implement
 #[allow(clippy::too_many_arguments)]
 #[async_trait]
@@ -413,6 +446,35 @@ pub trait GitProviderService: Send + Sync {
         access_token: &str,
         refresh_token: Option<&str>,
     ) -> Result<(String, Option<String>), GitProviderError>;
+
+    /// Mint a per-operation, narrowly-scoped credential for a single
+    /// repository. The returned token MUST live only as long as one
+    /// `git clone`/`git push` operation needs and SHOULD be scoped to the
+    /// minimum permission necessary (`contents:read` for fetch,
+    /// `contents:write` for push). The credential daemon inside a workspace
+    /// container calls this for every git operation; the token never gets
+    /// reused across operations.
+    ///
+    /// Returns `(username, password, expires_at)` shaped for direct use as
+    /// HTTP Basic credentials in a `https://<username>:<password>@host/`
+    /// URL. For GitHub Apps the username is `x-access-token`. For PAT-style
+    /// providers the username is the human's login (or whatever the
+    /// provider expects).
+    ///
+    /// # Default
+    /// Returns [`GitProviderError::NotImplemented`]. Providers that don't
+    /// support per-op narrow tokens (e.g. plain PATs with no scope-down
+    /// API) inherit the default and the daemon should fall back to refusing
+    /// the request rather than handing out a long-lived token.
+    async fn mint_scoped_repo_token(
+        &self,
+        _installation_id: Option<&str>,
+        _owner: &str,
+        _repo: &str,
+        _operation: ScopedTokenOp,
+    ) -> Result<ScopedTokenGrant, GitProviderError> {
+        Err(GitProviderError::NotImplemented)
+    }
 
     /// List repositories for authenticated user/organization
     async fn list_repositories(

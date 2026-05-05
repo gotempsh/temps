@@ -284,6 +284,61 @@ impl WorkspaceSessionManager {
             })
     }
 
+    /// Execute a command as the sandbox container's root user.
+    ///
+    /// Used by setup-time tasks (credential daemon env file write) that
+    /// must touch files owned by uids other than the regular sandbox
+    /// user. See [`SandboxProvider::exec_as_root`] for the underlying
+    /// semantics; on local-fork providers this is a no-op alias for
+    /// `exec`.
+    pub async fn exec_as_root(
+        &self,
+        session_id: i32,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        on_output: Option<OnEventCallback>,
+    ) -> Result<SandboxExecResult, WorkspaceError> {
+        let sessions = self.sessions.read().await;
+        let live = sessions
+            .get(&session_id)
+            .ok_or(WorkspaceError::SandboxNotAvailable { session_id })?;
+
+        self.provider
+            .exec_as_root(&live.handle, cmd, env, on_output)
+            .await
+            .map_err(|e| WorkspaceError::AiCliFailed {
+                session_id,
+                reason: e.to_string(),
+            })
+    }
+
+    /// Execute a command inside the session's sandbox as a specific
+    /// user. `user` is `uid[:gid]` or `name[:group]` per Docker
+    /// conventions. Used to write the credential daemon's env file as
+    /// `temps-git` (uid 1001) directly — the only uid that can open
+    /// the 0600 file in the 0700-only-temps-git directory.
+    pub async fn exec_as_user(
+        &self,
+        session_id: i32,
+        user: &str,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        on_output: Option<OnEventCallback>,
+    ) -> Result<SandboxExecResult, WorkspaceError> {
+        let sessions = self.sessions.read().await;
+        let live = sessions
+            .get(&session_id)
+            .ok_or(WorkspaceError::SandboxNotAvailable { session_id })?;
+
+        self.provider
+            .exec_as_user(&live.handle, user, cmd, env, on_output)
+            .await
+            .map_err(|e| WorkspaceError::AiCliFailed {
+                session_id,
+                reason: e.to_string(),
+            })
+    }
+
     /// Write a file directly into the session's sandbox via the provider's
     /// native file-write API (tar streaming for Docker, fs::write for local).
     /// This avoids the bollard exec phantom-stream hang on silent processes

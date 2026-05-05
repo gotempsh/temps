@@ -1,0 +1,227 @@
+name: Sandbox Images (beta)
+
+# Publishes the sandbox image set + preview gateway to the BETA channel
+# every time `main` advances. Stable channel (canonical `:<version>`,
+# `:latest`, `:stable`) is owned by `release.yml` triggered on `v*.*.*`
+# tags — those two paths must never collide on the same tag.
+#
+# Why a separate workflow:
+#   - `release.yml` runs the full server build/release dance (linux+darwin
+#     binaries, GitHub release notes, Homebrew formula). 99% of `main`
+#     pushes don't need any of that — only the image jobs.
+#   - Path filters keep server-only changes from triggering 20 min of
+#     image rebuilds. The `paths` list below intentionally enumerates
+#     every file that affects image content; if you add a new bundle or
+#     change the install script, ADD IT HERE or builds will silently go
+#     stale (the same class of bug the channel split was designed to
+#     prevent).
+#
+# Channel discipline:
+#   - This workflow only ever pushes `:<ver>-beta`, `:beta`, and `:<sha>`.
+#   - It never touches the unsuffixed `:<ver>` or `:latest` refs — those
+#     are reserved for stable releases.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Sandbox image content lives in these paths. Keep this list in
+      # lock-step with what `print_dockerfile` + `print_bundle` actually
+      # depend on, otherwise main pushes that change image-affecting code
+      # won't republish and hosts will see stale images.
+      - 'crates/temps-agents/src/sandbox/**'
+      - 'crates/temps-agents/examples/print_dockerfile.rs'
+      - 'crates/temps-agents/examples/print_bundle.rs'
+      - 'crates/temps-pty-agent/**'
+      - 'crates/temps-git-credential/**'
+      - 'crates/temps-preview-gateway/**'
+      - 'scripts/build-sandbox-images.sh'
+      - '.github/workflows/sandbox-images-beta.yml'
+  # Manual fire for testing the workflow itself or rebuilding without a
+  # code change. Same dry-run knob as release.yml.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run: build but skip pushes"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push-sandbox-images:
+    name: Sandbox image (${{ matrix.runtime }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [node, bun, python, rust, go, full]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo deps
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: sandbox-image-builder
+
+      - name: Build sandbox-context helpers
+        # Same helpers the release workflow builds. They share a single
+        # `pty_agent_bundle::BUNDLE` source of truth with the runtime so
+        # CI can't drift from what `temps serve` ships to Docker at
+        # runtime.
+        run: |
+          cargo build \
+            --example print_dockerfile \
+            --example print_bundle \
+            -p temps-agents
+
+      - name: Extract sandbox image version
+        id: version
+        run: |
+          IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
+            crates/temps-agents/src/sandbox/docker.rs \
+            | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$IMAGE_VERSION" ]; then
+            echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker.rs"
+            exit 1
+          fi
+          echo "version=$IMAGE_VERSION" >> $GITHUB_OUTPUT
+          echo "Sandbox image version: $IMAGE_VERSION"
+
+      - name: Materialize Dockerfile for ${{ matrix.runtime }}
+        run: |
+          mkdir -p build-context
+          ./target/debug/examples/print_dockerfile ${{ matrix.runtime }} \
+            > build-context/Dockerfile
+
+      - name: Materialize bundles into build context
+        run: |
+          ./target/debug/examples/print_bundle build-context
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compose tag list (beta only)
+        id: tags
+        # Beta channel publishes only suffixed refs + sha. Never touches
+        # `:<ver>` or `:latest` — those are reserved for stable. Hard-coded
+        # here (vs. release.yml's branching) because this workflow only
+        # ever runs in beta mode.
+        run: |
+          REPO="ghcr.io/${{ github.repository_owner }}/temps-sandbox-${{ matrix.runtime }}"
+          VER="${{ steps.version.outputs.version }}"
+          SHA="${{ github.sha }}"
+          {
+            echo "list<<TAGS_EOF"
+            echo "$REPO:${VER}-beta"
+            echo "$REPO:beta"
+            echo "$REPO:$SHA"
+            echo "TAGS_EOF"
+          } >> $GITHUB_OUTPUT
+          echo "Will push:"
+          echo "  $REPO:${VER}-beta"
+          echo "  $REPO:beta"
+          echo "  $REPO:$SHA"
+
+      - name: Build and push sandbox image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./build-context
+          platforms: linux/amd64,linux/arm64
+          # workflow_dispatch with dry_run=true builds without pushing so
+          # we can verify the pipeline end-to-end without polluting the
+          # registry.
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+          tags: ${{ steps.tags.outputs.list }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.title=temps-sandbox-${{ matrix.runtime }}
+            org.opencontainers.image.description=Temps workspace sandbox image (${{ matrix.runtime }} runtime, beta channel)
+          cache-from: type=gha,scope=sandbox-${{ matrix.runtime }}
+          cache-to: type=gha,scope=sandbox-${{ matrix.runtime }},mode=max
+
+  build-and-push-preview-gateway:
+    name: Preview gateway image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract preview gateway version
+        id: version
+        run: |
+          GATEWAY_VERSION=$(grep -E '^version = ' \
+            crates/temps-preview-gateway/Cargo.standalone.toml \
+            | head -n 1 \
+            | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$GATEWAY_VERSION" ]; then
+            echo "::error::Failed to extract preview gateway version"
+            exit 1
+          fi
+          echo "version=$GATEWAY_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compose tag list (beta only)
+        id: tags
+        run: |
+          REPO="ghcr.io/${{ github.repository_owner }}/temps-preview-gateway"
+          VER="${{ steps.version.outputs.version }}"
+          SHA="${{ github.sha }}"
+          {
+            echo "list<<TAGS_EOF"
+            echo "$REPO:${VER}-beta"
+            echo "$REPO:beta"
+            echo "$REPO:$SHA"
+            echo "TAGS_EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Build and push preview gateway image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./crates/temps-preview-gateway
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+          tags: ${{ steps.tags.outputs.list }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.title=temps-preview-gateway
+            org.opencontainers.image.description=Temps preview gateway (beta channel)
+          cache-from: type=gha,scope=preview-gateway
+          cache-to: type=gha,scope=preview-gateway,mode=max
