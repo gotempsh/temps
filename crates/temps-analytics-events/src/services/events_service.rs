@@ -1505,239 +1505,195 @@ WHERE project_id = $1
     }
 }
 
-// AnalyticsEvents trait impl: delegates to the inherent methods above so
-// handlers can depend on `Arc<dyn AnalyticsEvents>` instead of the concrete
-// service. Kept as pure delegation so SQL stays in one place.
+// AnalyticsEvents trait impl: unpacks query value-types into the inherent
+// SQL methods above so handlers can depend on `Arc<dyn AnalyticsEvents>`.
+// The trait describes *what* to query (parameters); each backend chooses
+// *how* (SQL strings here, typed query builder for ClickHouse, etc.).
 #[async_trait::async_trait]
 impl crate::services::traits::AnalyticsEvents for AnalyticsEventsService {
-    async fn get_events_count(
+    async fn query_events_count(
         &self,
-        start_date: UtcDateTime,
-        end_date: UtcDateTime,
-        project_id: i32,
-        environment_id: Option<i32>,
-        limit: Option<i32>,
-        custom_events_only: Option<bool>,
-        aggregation_level: AggregationLevel,
+        q: crate::services::queries::EventsCountSpec,
     ) -> Result<Vec<crate::types::EventCount>, EventsError> {
         AnalyticsEventsService::get_events_count(
             self,
-            start_date,
-            end_date,
-            project_id,
-            environment_id,
-            limit,
-            custom_events_only,
-            aggregation_level,
+            q.range.start,
+            q.range.end,
+            q.scope.project_id,
+            q.scope.environment_id,
+            Some(q.limit),
+            Some(q.custom_events_only),
+            q.aggregation_level,
         )
         .await
     }
 
-    async fn get_session_events(
+    async fn query_session_events(
         &self,
-        session_id: String,
-        project_id: i32,
-        environment_id: Option<i32>,
+        q: crate::services::queries::SessionEventsSpec,
     ) -> Result<Option<crate::types::AnalyticsSessionEventsResponse>, EventsError> {
-        AnalyticsEventsService::get_session_events(self, session_id, project_id, environment_id)
-            .await
+        AnalyticsEventsService::get_session_events(
+            self,
+            q.session_id,
+            q.scope.project_id,
+            q.scope.environment_id,
+        )
+        .await
     }
 
-    async fn has_analytics_events(
+    async fn query_has_events(
         &self,
-        project_id: i32,
-        environment_id: Option<i32>,
+        q: crate::services::queries::HasEventsSpec,
     ) -> Result<bool, EventsError> {
-        AnalyticsEventsService::has_analytics_events(self, project_id, environment_id).await
+        AnalyticsEventsService::has_analytics_events(
+            self,
+            q.scope.project_id,
+            q.scope.environment_id,
+        )
+        .await
     }
 
-    async fn get_event_type_breakdown(
+    async fn query_event_type_breakdown(
         &self,
-        start_date: UtcDateTime,
-        end_date: UtcDateTime,
-        project_id: i32,
-        environment_id: Option<i32>,
-        aggregation_level: AggregationLevel,
+        q: crate::services::queries::EventTypeBreakdownSpec,
     ) -> Result<Vec<crate::types::EventTypeBreakdown>, EventsError> {
         AnalyticsEventsService::get_event_type_breakdown(
             self,
-            start_date,
-            end_date,
-            project_id,
-            environment_id,
-            aggregation_level,
+            q.range.start,
+            q.range.end,
+            q.scope.project_id,
+            q.scope.environment_id,
+            q.aggregation_level,
         )
         .await
     }
 
-    async fn get_events_timeline(
+    async fn query_events_timeline(
         &self,
-        start_date: UtcDateTime,
-        end_date: UtcDateTime,
-        project_id: i32,
-        environment_id: Option<i32>,
-        event_name: Option<String>,
-        bucket_size: Option<String>,
-        aggregation_level: AggregationLevel,
+        q: crate::services::queries::EventsTimelineSpec,
     ) -> Result<Vec<crate::types::EventTimeline>, EventsError> {
         AnalyticsEventsService::get_events_timeline(
             self,
-            start_date,
-            end_date,
-            project_id,
-            environment_id,
-            event_name,
-            bucket_size,
-            aggregation_level,
+            q.range.start,
+            q.range.end,
+            q.scope.project_id,
+            q.scope.environment_id,
+            q.event_name,
+            q.bucket_size,
+            q.aggregation_level,
         )
         .await
     }
 
-    async fn get_property_breakdown(
+    async fn query_property_breakdown(
         &self,
-        start_date: UtcDateTime,
-        end_date: UtcDateTime,
-        project_id: i32,
-        environment_id: Option<i32>,
-        deployment_id: Option<i32>,
-        event_name: Option<String>,
-        group_by_column: crate::types::PropertyColumn,
-        aggregation_level: &str,
-        limit: Option<i32>,
-        filters: Option<crate::types::PropertyBreakdownFilters>,
+        q: crate::services::queries::PropertyBreakdownSpec,
     ) -> Result<crate::types::PropertyBreakdownResponse, EventsError> {
         AnalyticsEventsService::get_property_breakdown(
             self,
-            start_date,
-            end_date,
-            project_id,
-            environment_id,
-            deployment_id,
-            event_name,
-            group_by_column,
-            aggregation_level,
-            limit,
-            filters,
+            q.range.start,
+            q.range.end,
+            q.scope.project_id,
+            q.scope.environment_id,
+            q.scope.deployment_id,
+            q.event_name,
+            q.group_by_column,
+            &q.aggregation_level,
+            Some(q.limit),
+            q.filters,
         )
         .await
     }
 
-    async fn get_property_timeline(
+    async fn query_property_timeline(
         &self,
-        start_date: UtcDateTime,
-        end_date: UtcDateTime,
-        project_id: i32,
-        environment_id: Option<i32>,
-        deployment_id: Option<i32>,
-        event_name: Option<String>,
-        group_by_column: crate::types::PropertyColumn,
-        aggregation_level: &str,
-        bucket_size: Option<String>,
+        q: crate::services::queries::PropertyTimelineSpec,
     ) -> Result<crate::types::PropertyTimelineResponse, EventsError> {
         AnalyticsEventsService::get_property_timeline(
             self,
-            start_date,
-            end_date,
-            project_id,
-            environment_id,
-            deployment_id,
-            event_name,
-            group_by_column,
-            aggregation_level,
-            bucket_size,
+            q.range.start,
+            q.range.end,
+            q.scope.project_id,
+            q.scope.environment_id,
+            q.scope.deployment_id,
+            q.event_name,
+            q.group_by_column,
+            &q.aggregation_level,
+            q.bucket_size,
         )
         .await
     }
 
-    async fn get_active_visitors_count(
+    async fn query_active_visitors(
         &self,
-        project_id: i32,
-        environment_id: Option<i32>,
-        deployment_id: Option<i32>,
+        q: crate::services::queries::ActiveVisitorsSpec,
     ) -> Result<i64, EventsError> {
         AnalyticsEventsService::get_active_visitors_count(
             self,
-            project_id,
-            environment_id,
-            deployment_id,
+            q.scope.project_id,
+            q.scope.environment_id,
+            q.scope.deployment_id,
         )
         .await
     }
 
-    async fn get_hourly_visits(
+    async fn query_hourly_visits(
         &self,
-        start_date: UtcDateTime,
-        end_date: UtcDateTime,
-        project_id: i32,
-        environment_id: Option<i32>,
-        aggregation_level: AggregationLevel,
+        q: crate::services::queries::HourlyVisitsSpec,
     ) -> Result<Vec<crate::types::EventTimeline>, EventsError> {
         AnalyticsEventsService::get_hourly_visits(
             self,
-            start_date,
-            end_date,
-            project_id,
-            environment_id,
-            aggregation_level,
+            q.range.start,
+            q.range.end,
+            q.scope.project_id,
+            q.scope.environment_id,
+            q.aggregation_level,
         )
         .await
     }
 
-    async fn get_unique_counts(
+    async fn query_unique_counts(
         &self,
-        start_date: UtcDateTime,
-        end_date: UtcDateTime,
-        project_id: i32,
-        environment_id: Option<i32>,
-        deployment_id: Option<i32>,
-        metric: String,
+        q: crate::services::queries::UniqueCountsSpec,
     ) -> Result<crate::types::UniqueCountsResponse, EventsError> {
         AnalyticsEventsService::get_unique_counts(
             self,
-            start_date,
-            end_date,
-            project_id,
-            environment_id,
-            deployment_id,
-            metric,
+            q.range.start,
+            q.range.end,
+            q.scope.project_id,
+            q.scope.environment_id,
+            q.scope.deployment_id,
+            q.metric,
         )
         .await
     }
 
-    async fn get_dashboard_projects_analytics(
+    async fn query_dashboard_projects(
         &self,
-        project_ids: &[i32],
-        start_date: UtcDateTime,
-        end_date: UtcDateTime,
+        q: crate::services::queries::DashboardProjectsSpec,
     ) -> Result<crate::types::DashboardProjectsAnalyticsResponse, EventsError> {
         AnalyticsEventsService::get_dashboard_projects_analytics(
             self,
-            project_ids,
-            start_date,
-            end_date,
+            &q.project_ids,
+            q.range.start,
+            q.range.end,
         )
         .await
     }
 
-    async fn get_aggregated_buckets(
+    async fn query_aggregated_buckets(
         &self,
-        start_date: UtcDateTime,
-        end_date: UtcDateTime,
-        project_id: i32,
-        environment_id: Option<i32>,
-        deployment_id: Option<i32>,
-        aggregation_level: AggregationLevel,
-        bucket_size: String,
+        q: crate::services::queries::AggregatedBucketsSpec,
     ) -> Result<crate::types::AggregatedBucketsResponse, EventsError> {
         AnalyticsEventsService::get_aggregated_buckets(
             self,
-            start_date,
-            end_date,
-            project_id,
-            environment_id,
-            deployment_id,
-            aggregation_level,
-            bucket_size,
+            q.range.start,
+            q.range.end,
+            q.scope.project_id,
+            q.scope.environment_id,
+            q.scope.deployment_id,
+            q.aggregation_level,
+            q.bucket_size,
         )
         .await
     }

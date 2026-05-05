@@ -1,4 +1,12 @@
-use crate::services::{AnalyticsEvents, AnalyticsEventsService};
+use crate::services::{
+    queries::{
+        ActiveVisitorsSpec, AggregatedBucketsSpec, AnalyticsScope, DashboardProjectsSpec,
+        EventTypeBreakdownSpec, EventsCountSpec, EventsTimelineSpec, HasEventsSpec,
+        HourlyVisitsSpec, PropertyBreakdownSpec, PropertyTimelineSpec, SessionEventsSpec,
+        TimeRange, UniqueCountsSpec,
+    },
+    AnalyticsEvents, AnalyticsEventsService,
+};
 use crate::types::{
     ActiveVisitorsQuery, ActiveVisitorsResponse, AggregatedBucketsResponse, AggregationLevel,
     AnalyticsSessionEventsResponse, ConsoleEventPayload, EventCount, EventMetricsPayload,
@@ -66,17 +74,19 @@ pub async fn get_events_count(
 ) -> Result<Json<Vec<EventCount>>, Problem> {
     permission_guard!(auth, AnalyticsRead);
 
+    let spec = EventsCountSpec::new(
+        TimeRange {
+            start: query.start_date.into(),
+            end: query.end_date.into(),
+        },
+        AnalyticsScope::project(project_id).with_environment(query.environment_id),
+        query.aggregation_level,
+        query.limit,
+        query.custom_events_only,
+    );
     let events = state
         .events_service
-        .get_events_count(
-            query.start_date.into(),
-            query.end_date.into(),
-            project_id,
-            query.environment_id,
-            query.limit,
-            query.custom_events_only,
-            query.aggregation_level,
-        )
+        .query_events_count(spec)
         .await
         .map_err(|e| {
             error!("Failed to get event counts: {}", e);
@@ -116,9 +126,13 @@ pub async fn get_session_events(
 ) -> Result<Json<AnalyticsSessionEventsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
 
+    let spec = SessionEventsSpec {
+        session_id: session_id.clone(),
+        scope: AnalyticsScope::project(query.project_id).with_environment(query.environment_id),
+    };
     let events_response = state
         .events_service
-        .get_session_events(session_id.clone(), query.project_id, query.environment_id)
+        .query_session_events(spec)
         .await
         .map_err(|e| {
             error!("Failed to get session events: {}", e);
@@ -161,9 +175,12 @@ pub async fn has_analytics_events(
 ) -> Result<Json<HasEventsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
 
+    let spec = HasEventsSpec {
+        scope: AnalyticsScope::project(project_id),
+    };
     let has_events = state
         .events_service
-        .has_analytics_events(project_id, None)
+        .query_has_events(spec)
         .await
         .map_err(|e| {
             error!("Failed to check for events: {}", e);
@@ -206,15 +223,17 @@ pub async fn get_event_type_breakdown(
 ) -> Result<Json<Vec<EventTypeBreakdown>>, Problem> {
     permission_guard!(auth, AnalyticsRead);
 
+    let spec = EventTypeBreakdownSpec {
+        range: TimeRange {
+            start: query.start_date.into(),
+            end: query.end_date.into(),
+        },
+        scope: AnalyticsScope::project(project_id).with_environment(query.environment_id),
+        aggregation_level: query.aggregation_level,
+    };
     let breakdown = state
         .events_service
-        .get_event_type_breakdown(
-            query.start_date.into(),
-            query.end_date.into(),
-            project_id,
-            query.environment_id,
-            query.aggregation_level,
-        )
+        .query_event_type_breakdown(spec)
         .await
         .map_err(|e| {
             error!("Failed to get event type breakdown: {}", e);
@@ -259,17 +278,19 @@ pub async fn get_events_timeline(
 ) -> Result<Json<Vec<EventTimeline>>, Problem> {
     permission_guard!(auth, AnalyticsRead);
 
+    let spec = EventsTimelineSpec {
+        range: TimeRange {
+            start: query.start_date.into(),
+            end: query.end_date.into(),
+        },
+        scope: AnalyticsScope::project(project_id).with_environment(query.environment_id),
+        aggregation_level: query.aggregation_level,
+        event_name: query.event_name,
+        bucket_size: query.bucket_size,
+    };
     let timeline = state
         .events_service
-        .get_events_timeline(
-            query.start_date.into(),
-            query.end_date.into(),
-            project_id,
-            query.environment_id,
-            query.event_name,
-            query.bucket_size,
-            query.aggregation_level,
-        )
+        .query_events_timeline(spec)
         .await
         .map_err(|e| {
             error!("Failed to get events timeline: {}", e);
@@ -309,9 +330,14 @@ pub async fn get_active_visitors(
 ) -> Result<Json<ActiveVisitorsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
 
+    let spec = ActiveVisitorsSpec {
+        scope: AnalyticsScope::project(project_id)
+            .with_environment(query.environment_id)
+            .with_deployment(query.deployment_id),
+    };
     let active_count = state
         .events_service
-        .get_active_visitors_count(project_id, query.environment_id, query.deployment_id)
+        .query_active_visitors(spec)
         .await
         .map_err(|e| {
             error!("Failed to get active visitors: {}", e);
@@ -357,15 +383,17 @@ pub async fn get_hourly_visits(
 ) -> Result<Json<Vec<EventTimeline>>, Problem> {
     permission_guard!(auth, AnalyticsRead);
 
+    let spec = HourlyVisitsSpec {
+        range: TimeRange {
+            start: query.start_date.into(),
+            end: query.end_date.into(),
+        },
+        scope: AnalyticsScope::project(project_id).with_environment(query.environment_id),
+        aggregation_level: query.aggregation_level,
+    };
     let hourly_data = state
         .events_service
-        .get_hourly_visits(
-            query.start_date.into(),
-            query.end_date.into(),
-            project_id,
-            query.environment_id,
-            query.aggregation_level,
-        )
+        .query_hourly_visits(spec)
         .await
         .map_err(|e| {
             error!("Failed to get hourly visits: {}", e);
@@ -429,20 +457,23 @@ pub async fn get_property_breakdown(
         referrer: query.filter_referrer,
     };
 
+    let spec = PropertyBreakdownSpec::new(
+        TimeRange {
+            start: query.start_date.into(),
+            end: query.end_date.into(),
+        },
+        AnalyticsScope::project(project_id)
+            .with_environment(query.environment_id)
+            .with_deployment(query.deployment_id),
+        query.event_name,
+        query.group_by.clone(),
+        aggregation_level,
+        query.limit,
+        Some(filters),
+    );
     let breakdown = state
         .events_service
-        .get_property_breakdown(
-            query.start_date.into(),
-            query.end_date.into(),
-            project_id,
-            query.environment_id,
-            query.deployment_id,
-            query.event_name,
-            query.group_by.clone(),
-            aggregation_level,
-            query.limit,
-            Some(filters),
-        )
+        .query_property_breakdown(spec)
         .await
         .map_err(|e| {
             error!("Failed to get property breakdown: {}", e);
@@ -491,19 +522,22 @@ pub async fn get_property_timeline(
 
     let aggregation_level = query.aggregation_level.as_str();
 
+    let spec = PropertyTimelineSpec {
+        range: TimeRange {
+            start: query.start_date.into(),
+            end: query.end_date.into(),
+        },
+        scope: AnalyticsScope::project(project_id)
+            .with_environment(query.environment_id)
+            .with_deployment(query.deployment_id),
+        event_name: query.event_name,
+        group_by_column: query.group_by.clone(),
+        aggregation_level: aggregation_level.to_string(),
+        bucket_size: query.bucket_size,
+    };
     let timeline = state
         .events_service
-        .get_property_timeline(
-            query.start_date.into(),
-            query.end_date.into(),
-            project_id,
-            query.environment_id,
-            query.deployment_id,
-            query.event_name,
-            query.group_by.clone(),
-            aggregation_level,
-            query.bucket_size,
-        )
+        .query_property_timeline(spec)
         .await
         .map_err(|e| {
             error!("Failed to get property timeline: {}", e);
@@ -547,16 +581,19 @@ pub async fn get_unique_counts(
 ) -> Result<Json<UniqueCountsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
 
+    let spec = UniqueCountsSpec {
+        range: TimeRange {
+            start: query.start_date.into(),
+            end: query.end_date.into(),
+        },
+        scope: AnalyticsScope::project(project_id)
+            .with_environment(query.environment_id)
+            .with_deployment(query.deployment_id),
+        metric: query.metric.to_lowercase(),
+    };
     let counts = state
         .events_service
-        .get_unique_counts(
-            query.start_date.into(),
-            query.end_date.into(),
-            project_id,
-            query.environment_id,
-            query.deployment_id,
-            query.metric.to_lowercase(),
-        )
+        .query_unique_counts(spec)
         .await
         .map_err(|e| {
             error!("Failed to get unique counts: {}", e);
@@ -895,17 +932,20 @@ pub async fn get_aggregated_buckets(
 ) -> Result<Json<crate::types::AggregatedBucketsResponse>, Problem> {
     permission_guard!(auth, AnalyticsRead);
 
+    let spec = AggregatedBucketsSpec {
+        range: TimeRange {
+            start: query.start_date.into(),
+            end: query.end_date.into(),
+        },
+        scope: AnalyticsScope::project(project_id)
+            .with_environment(query.environment_id)
+            .with_deployment(query.deployment_id),
+        aggregation_level: query.aggregation_level,
+        bucket_size: query.bucket_size,
+    };
     let result = state
         .events_service
-        .get_aggregated_buckets(
-            query.start_date.into(),
-            query.end_date.into(),
-            project_id,
-            query.environment_id,
-            query.deployment_id,
-            query.aggregation_level,
-            query.bucket_size,
-        )
+        .query_aggregated_buckets(spec)
         .await
         .map_err(|e| {
             error!("Failed to get aggregated buckets: {}", e);
@@ -968,13 +1008,16 @@ pub async fn get_dashboard_projects_analytics(
             .build());
     }
 
+    let spec = DashboardProjectsSpec {
+        project_ids: project_ids.clone(),
+        range: TimeRange {
+            start: query.start_date.into(),
+            end: query.end_date.into(),
+        },
+    };
     let result = state
         .events_service
-        .get_dashboard_projects_analytics(
-            &project_ids,
-            query.start_date.into(),
-            query.end_date.into(),
-        )
+        .query_dashboard_projects(spec)
         .await
         .map_err(|e| {
             error!("Failed to get dashboard projects analytics: {}", e);

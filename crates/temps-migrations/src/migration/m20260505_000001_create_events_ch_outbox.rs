@@ -5,9 +5,13 @@
 //! decouples the synchronous PG insert (returns to client immediately) from
 //! the asynchronous CH ingestion (batched by a background worker).
 //!
-//! - `event_id` is the FK to the events row in PG. ON DELETE CASCADE means
-//!   GDPR/project deletes propagate without an additional tombstone table —
-//!   self-hosted operators can lean on this directly.
+//! - `event_id` references the events row by value. We deliberately do NOT
+//!   create a Postgres FK because `events` is a TimescaleDB hypertable
+//!   partitioned by `(timestamp, id)`, and PG doesn't allow FKs to point
+//!   at a table whose unique constraint includes more than just `id`.
+//!   Orphaning is safe: the worker treats a missing event as "skip and
+//!   mark delivered" — the row just won't appear in CH, which is the
+//!   correct outcome when the source event has been retention-dropped.
 //! - `delivered_at NULL FIRST` index lets the worker scan only the
 //!   undelivered backlog cheaply.
 //!
@@ -52,13 +56,6 @@ impl MigrationTrait for Migration {
                             .default(0),
                     )
                     .col(ColumnDef::new(EventsChOutbox::LastError).text().null())
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_events_ch_outbox_event_id")
-                            .from(EventsChOutbox::Table, EventsChOutbox::EventId)
-                            .to(Events::Table, Events::Id)
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
                     .to_owned(),
             )
             .await?;
@@ -93,10 +90,4 @@ enum EventsChOutbox {
     DeliveredAt,
     Attempts,
     LastError,
-}
-
-#[derive(DeriveIden)]
-enum Events {
-    Table,
-    Id,
 }

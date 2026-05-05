@@ -272,7 +272,7 @@ pub struct PropertyBreakdownQuery {
 
 /// Optional filters for property breakdown drill-downs.
 /// These allow hierarchical navigation (e.g., country -> region -> city).
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PropertyBreakdownFilters {
     /// Filter by country name (for region/city drill-downs)
     pub country: Option<String>,
