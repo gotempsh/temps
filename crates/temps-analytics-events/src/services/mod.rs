@@ -1,5 +1,4 @@
 pub mod ch_fanout;
-#[cfg(feature = "clickhouse")]
 pub mod clickhouse_backend;
 pub mod events_service;
 pub mod queries;
@@ -7,7 +6,6 @@ pub mod traits;
 pub mod user_agent;
 
 pub use ch_fanout::{ChFanoutConfig, ChFanoutError, ChFanoutWorker};
-#[cfg(feature = "clickhouse")]
 pub use clickhouse_backend::ClickHouseEventsBackend;
 pub use events_service::*;
 pub use queries::{

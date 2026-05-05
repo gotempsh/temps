@@ -7,12 +7,6 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
-[features]
-default = []
-# Enables the optional ClickHouse analytics backend. Off by default so the
-# stock build stays a single binary against PostgreSQL/TimescaleDB only.
-clickhouse = ["temps-analytics-backend/clickhouse", "dep:clickhouse"]
-
 [dependencies]
 # Core dependencies
 temps-core = { path = "../temps-core" }
@@ -25,10 +19,10 @@ temps-analytics = { path = "../temps-analytics" }
 temps-analytics-backend = { path = "../temps-analytics-backend" }
 temps-config = { path = "../temps-config" }
 
-# Optional: ClickHouse Rust client. Only compiled when the `clickhouse`
-# feature on this crate is enabled (which also turns it on in
-# temps-analytics-backend).
-clickhouse = { version = "0.13", optional = true, features = ["uuid", "chrono"] }
+# ClickHouse Rust client. Always linked. The actual ClickHouse backend is
+# only constructed at runtime when ServerConfig::is_clickhouse_enabled()
+# returns true (i.e. operator set TEMPS_CLICKHOUSE_* env vars).
+clickhouse = { version = "0.13", features = ["uuid", "chrono"] }
 
 # Web framework
 axum = { workspace = true }

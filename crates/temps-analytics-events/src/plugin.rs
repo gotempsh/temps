@@ -11,8 +11,8 @@
 //!   are set, the read-side trait object becomes `ClickHouseEventsBackend`
 //!   instead of the PG-backed service. Writes still go to PG (system of
 //!   record); the `ChFanoutWorker` task continuously drains the outbox
-//!   into CH. Operators get the storage choice without changing any
-//!   handler or web SDK code.
+//!   into CH. Operators get the storage choice at runtime — no rebuild
+//!   with a feature flag is required.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -21,10 +21,7 @@ use std::sync::Arc;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-#[cfg(feature = "clickhouse")]
-use tracing::info;
-#[allow(unused_imports)]
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Analytics events tracking plugin
 pub struct EventsPlugin;
@@ -68,21 +65,8 @@ impl TempsPlugin for EventsPlugin {
         // Writes always continue against PG via `events_writer`.
         let events_backend: Arc<dyn crate::services::AnalyticsEvents> =
             if server_config.is_clickhouse_enabled() {
-                #[cfg(feature = "clickhouse")]
-                {
-                    let db = context.require_service::<sea_orm::DatabaseConnection>();
-                    build_clickhouse_backend(&server_config, db)
-                }
-                #[cfg(not(feature = "clickhouse"))]
-                {
-                    warn!(
-                        "TEMPS_CLICKHOUSE_* is set but this binary was built without the \
-                     `clickhouse` cargo feature. Falling back to PostgreSQL/TimescaleDB \
-                     for analytics reads. Rebuild with `--features clickhouse` to enable \
-                     the ClickHouse backend."
-                    );
-                    events_service.clone()
-                }
+                let db = context.require_service::<sea_orm::DatabaseConnection>();
+                build_clickhouse_backend(&server_config, db)
             } else {
                 debug!("ClickHouse analytics backend disabled (TEMPS_CLICKHOUSE_* unset)");
                 events_service.clone()
@@ -109,7 +93,6 @@ impl TempsPlugin for EventsPlugin {
 /// worker. Migrations are applied on a background task so plugin
 /// `configure_routes` returns promptly; if migrations fail, the backend
 /// will surface the error on the next query rather than blocking startup.
-#[cfg(feature = "clickhouse")]
 fn build_clickhouse_backend(
     server_config: &temps_config::ServerConfig,
     db: Arc<sea_orm::DatabaseConnection>,

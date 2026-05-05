@@ -1,9 +1,9 @@
 //! ClickHouse implementation of [`crate::services::traits::AnalyticsEvents`].
 //!
-//! Compiled only when the `clickhouse` feature is enabled. Operators activate
-//! it by setting `TEMPS_CLICKHOUSE_*` env vars; the plugin layer (in
-//! `plugin.rs`) then constructs this backend instead of the Timescale-backed
-//! `AnalyticsEventsService` for the read path.
+//! Always compiled. Operators activate it by setting `TEMPS_CLICKHOUSE_*`
+//! env vars; the plugin layer (in `plugin.rs`) then constructs this backend
+//! instead of the Timescale-backed `AnalyticsEventsService` for the read
+//! path. No rebuild with a feature flag is required.
 //!
 //! Design choices worth knowing:
 //!

@@ -5,6 +5,11 @@
 //! task so the synchronous PG insert path is never blocked on CH
 //! availability.
 //!
+//! The worker is always compiled in. The plugin layer only spawns it when
+//! `ServerConfig::is_clickhouse_enabled()` returns true (i.e. the operator
+//! set `TEMPS_CLICKHOUSE_*` env vars). Operators do not need to rebuild
+//! Temps with a feature flag to enable ClickHouse.
+//!
 //! Behavior:
 //! - **Fail open**: if CH is down, rows queue indefinitely. The worker
 //!   logs and retries on the next poll cycle. PG ingestion is unaffected.
@@ -12,17 +17,15 @@
 //!   keyed by `event_id`, so retries are safe.
 //! - **Skip orphans**: if an outbox row references an event that's been
 //!   retention-dropped, mark it delivered without sending.
-//! - **Bounded backlog visibility**: the worker logs `claimed`/`pushed`/
-//!   `lag` metrics; pair with `temps-monitoring` for alerting.
+//! - **Bounded backlog visibility**: the worker logs `claimed`/`pushed`
+//!   counts; pair with `temps-monitoring` for alerting.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use sea_orm::DatabaseConnection;
 use tokio::sync::Notify;
-#[cfg(feature = "clickhouse")]
-use tracing::debug;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Configuration for the fan-out worker.
 #[derive(Debug, Clone)]
@@ -50,14 +53,12 @@ impl Default for ChFanoutConfig {
 /// to stop gracefully (current batch finishes first).
 pub struct ChFanoutWorker {
     db: Arc<DatabaseConnection>,
-    #[cfg(feature = "clickhouse")]
     ch: Arc<::clickhouse::Client>,
     config: ChFanoutConfig,
     shutdown: Arc<Notify>,
 }
 
 impl ChFanoutWorker {
-    #[cfg(feature = "clickhouse")]
     pub fn new(
         db: Arc<DatabaseConnection>,
         ch: Arc<::clickhouse::Client>,
@@ -66,17 +67,6 @@ impl ChFanoutWorker {
         Self {
             db,
             ch,
-            config,
-            shutdown: Arc::new(Notify::new()),
-        }
-    }
-
-    /// Constructor for the non-CH build. Exists so feature-gated code can
-    /// keep the same shape; calling `run()` on it is a no-op.
-    #[cfg(not(feature = "clickhouse"))]
-    pub fn new(db: Arc<DatabaseConnection>, config: ChFanoutConfig) -> Self {
-        Self {
-            db,
             config,
             shutdown: Arc::new(Notify::new()),
         }
@@ -112,7 +102,6 @@ impl ChFanoutWorker {
         info!("ch_fanout worker stopped");
     }
 
-    #[cfg(feature = "clickhouse")]
     async fn process_one_batch(&self) -> Result<(), ChFanoutError> {
         use sea_orm::{DatabaseBackend, FromQueryResult, Statement};
 
@@ -225,19 +214,8 @@ impl ChFanoutWorker {
         Ok(())
     }
 
-    #[cfg(not(feature = "clickhouse"))]
-    async fn process_one_batch(&self) -> Result<(), ChFanoutError> {
-        // No-op when CH is disabled. The outbox is still populated by
-        // `record_event` so an operator who later enables CH gets full
-        // history (modulo retention).
-        let _ = &self.db;
-        let _ = &self.config;
-        Ok(())
-    }
-
     /// Mark a list of event_ids delivered. Called for both successful
     /// pushes and orphan-skips.
-    #[cfg(feature = "clickhouse")]
     async fn mark_delivered(&self, ids: &[i64]) -> Result<(), ChFanoutError> {
         if ids.is_empty() {
             return Ok(());
@@ -276,7 +254,6 @@ pub enum ChFanoutError {
 /// in `migrations/clickhouse/0001_events.sql` exactly. The `clickhouse`
 /// crate's `Row` derive does positional binary serialization, so this
 /// must stay in lockstep with the DDL.
-#[cfg(feature = "clickhouse")]
 #[derive(::clickhouse::Row, serde::Serialize)]
 struct ChEventRow {
     event_id: i64,
@@ -285,9 +262,7 @@ struct ChEventRow {
     deployment_id: Option<i32>,
     session_id: String,
     visitor_id: Option<i32>,
-    timestamp: i64, // Unix millis; CH `DateTime64(3)` accepts via fromUnixTimestamp64Milli, but the
-    // Rust client also serializes a naive `DateTime` directly. Using i64 millis is
-    // dialect-agnostic and avoids a chrono <-> ch type mismatch.
+    timestamp: i64,
     hostname: String,
     pathname: String,
     page_path: String,
@@ -337,7 +312,6 @@ struct ChEventRow {
 /// Map a Postgres `events::Model` into the `ChEventRow` shape. `Option<String>`
 /// becomes `""` because CH's `LowCardinality(String)` is non-null in our DDL
 /// — empty string is the canonical "no value" sentinel.
-#[cfg(feature = "clickhouse")]
 fn row_to_ch(m: &temps_entities::events::Model) -> ChEventRow {
     use temps_core::DBDateTime;
 

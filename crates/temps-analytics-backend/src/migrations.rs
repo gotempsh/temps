@@ -11,6 +11,10 @@
 //! *not* support stored statements that contain `;\n` inside a literal —
 //! none of our DDL has that today. If we ever need it, switch to a real
 //! parser; this is intentionally simple.
+//!
+//! The runner is invoked at startup by the analytics events plugin only
+//! when `ServerConfig::is_clickhouse_enabled()` is true. Operators do not
+//! need to rebuild Temps with a feature flag to enable ClickHouse.
 
 use crate::error::AnalyticsBackendError;
 
@@ -43,7 +47,6 @@ const MIGRATIONS: &[Migration] = &[
 /// SQL for the migration tracking table itself. Created on first run.
 /// Uses ReplacingMergeTree so re-running the runner doesn't error on
 /// duplicate inserts (we INSERT before checking, simpler than upsert).
-#[cfg(feature = "clickhouse")]
 const TRACKING_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS _temps_ch_migrations
 (
@@ -60,7 +63,6 @@ ORDER BY name;
 /// Idempotent: migrations already recorded in `_temps_ch_migrations` are
 /// skipped. Failures fail-fast — we don't try to roll back partially
 /// applied migrations because most CH DDL isn't transactional anyway.
-#[cfg(feature = "clickhouse")]
 pub async fn apply_migrations(
     client: &::clickhouse::Client,
 ) -> Result<MigrationReport, AnalyticsBackendError> {
@@ -125,19 +127,8 @@ pub async fn apply_migrations(
     Ok(report)
 }
 
-/// Fallback when the `clickhouse` feature isn't compiled in. Calling this
-/// is a logic error in plugin wiring, not a user-visible failure mode.
-#[cfg(not(feature = "clickhouse"))]
-pub async fn apply_migrations(_: &()) -> Result<MigrationReport, AnalyticsBackendError> {
-    Err(AnalyticsBackendError::BackendUnavailable {
-        backend: "clickhouse".to_string(),
-        reason: "binary built without the `clickhouse` cargo feature".to_string(),
-    })
-}
-
 /// Split a multi-statement SQL blob and execute each piece. ClickHouse
 /// HTTP endpoint accepts only one statement per request, so we iterate.
-#[cfg(feature = "clickhouse")]
 async fn execute_multi(
     client: &::clickhouse::Client,
     sql: &str,
@@ -163,7 +154,6 @@ async fn execute_multi(
     Ok(())
 }
 
-#[cfg(feature = "clickhouse")]
 fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_string()

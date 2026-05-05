@@ -7,12 +7,6 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
-[features]
-default = []
-# Enables the ClickHouse analytics backend. Off by default so a stock build
-# stays a single binary against PostgreSQL/TimescaleDB only.
-clickhouse = ["dep:clickhouse"]
-
 [dependencies]
 # Core
 temps-core = { path = "../temps-core" }
@@ -38,9 +32,9 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 
-# Optional: ClickHouse client. Pulled in only when the `clickhouse` feature
-# is enabled so default builds stay a single static binary against PG.
-clickhouse = { version = "0.13", optional = true, features = ["uuid", "chrono"] }
+# ClickHouse client. Always linked — operators flip CH on by setting
+# TEMPS_CLICKHOUSE_*; we don't make them rebuild with a feature flag for it.
+clickhouse = { version = "0.13", features = ["uuid", "chrono"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
