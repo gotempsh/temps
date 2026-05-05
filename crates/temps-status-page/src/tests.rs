@@ -1085,6 +1085,10 @@ mod integration_tests {
             postgres_acquire_timeout_secs: None,
             postgres_idle_timeout_secs: None,
             postgres_max_lifetime_secs: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
+            clickhouse_password: None,
         });
         let config_service = Arc::new(temps_config::ConfigService::new(server_config, db.clone()));
 

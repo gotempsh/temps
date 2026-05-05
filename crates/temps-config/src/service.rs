@@ -64,6 +64,14 @@ pub struct ServerConfig {
     pub postgres_acquire_timeout_secs: Option<u64>,
     pub postgres_idle_timeout_secs: Option<u64>,
     pub postgres_max_lifetime_secs: Option<u64>,
+
+    // ClickHouse analytics backend (optional, opt-in via env vars).
+    // When `clickhouse_url` is unset, Temps runs in PG-only mode and the
+    // CH fan-out worker is not started. See ADR-012.
+    pub clickhouse_url: Option<String>,
+    pub clickhouse_database: Option<String>,
+    pub clickhouse_user: Option<String>,
+    pub clickhouse_password: Option<String>,
 }
 
 impl ServerConfig {
@@ -146,7 +154,34 @@ impl ServerConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .or(Some(1800)),
+
+            // ClickHouse analytics backend. All four keys must be present
+            // for CH to be considered enabled — partial config is treated
+            // as off so a half-configured operator never silently loses
+            // analytics.
+            clickhouse_url: std::env::var("TEMPS_CLICKHOUSE_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            clickhouse_database: std::env::var("TEMPS_CLICKHOUSE_DATABASE")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            clickhouse_user: std::env::var("TEMPS_CLICKHOUSE_USER")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            clickhouse_password: std::env::var("TEMPS_CLICKHOUSE_PASSWORD")
+                .ok()
+                .filter(|s| !s.is_empty()),
         })
+    }
+
+    /// Returns true when all four ClickHouse env vars are populated and
+    /// the analytics fan-out path can be enabled. Partial config returns
+    /// false (fail closed).
+    pub fn is_clickhouse_enabled(&self) -> bool {
+        self.clickhouse_url.is_some()
+            && self.clickhouse_database.is_some()
+            && self.clickhouse_user.is_some()
+            && self.clickhouse_password.is_some()
     }
 
     /// Generate a 32-byte auth secret (64 hex characters)
