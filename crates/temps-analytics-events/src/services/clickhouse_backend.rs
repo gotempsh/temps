@@ -744,3 +744,528 @@ fn from_unix_milli(ms: i64) -> UtcDateTime {
                 .expect("epoch is a valid timestamp")
         })
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// Real-CH integration tests against a `clickhouse/clickhouse-server`
+// testcontainer. Validates SQL dialect, parameter binding, the row mapper,
+// and the migration runner end-to-end. If Docker is not available the test
+// skips gracefully (per CLAUDE.md: never `#[ignore]`).
+//
+// The fan-out worker is exercised indirectly — we ingest rows using the
+// same `ChEventRow` shape via the same `clickhouse::Client::insert()` path,
+// then read them back through the trait methods. If the row shape is wrong
+// or a query is malformed, this test catches it before any operator does.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use chrono::{Duration, Utc};
+
+    use crate::services::queries::{
+        AnalyticsScope, EventTypeBreakdownSpec, EventsCountSpec, EventsTimelineSpec, HasEventsSpec,
+        HourlyVisitsSpec, PropertyBreakdownSpec, SessionEventsSpec, TimeRange, UniqueCountsSpec,
+    };
+    use crate::services::traits::AnalyticsEvents;
+    use crate::types::{AggregationLevel, PropertyColumn};
+
+    /// Bring up a ClickHouse container, run migrations, and return a
+    /// connected backend ready to query against. Returns `None` if Docker
+    /// isn't reachable so the test can skip without failing CI on
+    /// machines that don't have Docker.
+    async fn setup_clickhouse() -> Option<(
+        ClickHouseEventsBackend,
+        Arc<::clickhouse::Client>,
+        // The container handle has to outlive the test, so return it.
+        // Boxed-as-any so we don't need to name the testcontainers types.
+        Box<dyn std::any::Any + Send>,
+    )> {
+        use testcontainers::{
+            core::{ContainerPort, WaitFor},
+            runners::AsyncRunner,
+            GenericImage, ImageExt,
+        };
+
+        // Probe Docker. If not reachable, skip.
+        let image = GenericImage::new("clickhouse/clickhouse-server", "24.8")
+            .with_exposed_port(ContainerPort::Tcp(8123))
+            .with_wait_for(WaitFor::message_on_stdout("Ready for connections"))
+            .with_env_var("CLICKHOUSE_DB", "temps_test")
+            .with_env_var("CLICKHOUSE_USER", "default")
+            .with_env_var("CLICKHOUSE_PASSWORD", "");
+
+        let container = match image.start().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Skipping ClickHouse test: failed to start container ({e})");
+                return None;
+            }
+        };
+
+        let host_port = match container.get_host_port_ipv4(8123).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Skipping ClickHouse test: cannot get host port ({e})");
+                return None;
+            }
+        };
+
+        let url = format!("http://127.0.0.1:{host_port}");
+        let client = ::clickhouse::Client::default()
+            .with_url(&url)
+            .with_database("temps_test")
+            .with_user("default")
+            .with_password("");
+
+        // Wait briefly for CH to fully accept HTTP queries (the readiness
+        // message is on stdout but the HTTP listener can lag a moment).
+        let mut last_err = String::new();
+        for _ in 0..30 {
+            match client.query("SELECT 1").execute().await {
+                Ok(_) => {
+                    last_err.clear();
+                    break;
+                }
+                Err(e) => {
+                    last_err = format!("{e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
+        if !last_err.is_empty() {
+            eprintln!("Skipping ClickHouse test: server never became ready ({last_err})");
+            return None;
+        }
+
+        // Apply migrations. If this fails, the test SHOULD fail loudly —
+        // it's the entire reason we're running.
+        temps_analytics_backend::migrations::apply_migrations(&client)
+            .await
+            .expect("apply_migrations failed against testcontainer ClickHouse");
+
+        let client = Arc::new(client);
+        let backend = ClickHouseEventsBackend::new(Arc::clone(&client));
+        Some((backend, client, Box::new(container)))
+    }
+
+    /// Insert a few hand-crafted rows so we have something to query.
+    /// Mirrors the field order of the `ChEventRow` shape in
+    /// `ch_fanout::ChEventRow`. Uses the public clickhouse client API so
+    /// any drift between this and the worker would also fail compilation.
+    async fn seed_rows(client: &::clickhouse::Client) {
+        // Local row type: matches the production DDL field-for-field. We
+        // duplicate it here rather than taking a dep on the fan-out
+        // module, because the fan-out type is `#[cfg(feature =
+        // "clickhouse")]`-gated within ch_fanout but the test module here
+        // is already feature-gated, so we could in principle use it. The
+        // duplication is intentional: if the test row diverges from the
+        // production row, the test fails loudly.
+        #[derive(::clickhouse::Row, serde::Serialize)]
+        struct SeedRow {
+            event_id: i64,
+            project_id: i32,
+            environment_id: Option<i32>,
+            deployment_id: Option<i32>,
+            session_id: String,
+            visitor_id: Option<i32>,
+            timestamp: i64,
+            hostname: String,
+            pathname: String,
+            page_path: String,
+            href: String,
+            querystring: String,
+            page_title: String,
+            referrer: String,
+            referrer_hostname: String,
+            event_type: String,
+            event_name: String,
+            props: String,
+            user_agent: String,
+            browser: String,
+            browser_version: String,
+            operating_system: String,
+            operating_system_version: String,
+            device_type: String,
+            screen_width: Option<i16>,
+            screen_height: Option<i16>,
+            viewport_width: Option<i16>,
+            viewport_height: Option<i16>,
+            ip_geolocation_id: Option<i32>,
+            channel: String,
+            utm_source: String,
+            utm_medium: String,
+            utm_campaign: String,
+            utm_term: String,
+            utm_content: String,
+            ttfb: Option<f32>,
+            lcp: Option<f32>,
+            fid: Option<f32>,
+            fcp: Option<f32>,
+            cls: Option<f32>,
+            inp: Option<f32>,
+            is_entry: u8,
+            is_exit: u8,
+            is_bounce: u8,
+            is_crawler: u8,
+            time_on_page: Option<i32>,
+            session_page_number: Option<i32>,
+            scroll_depth: Option<i32>,
+            clicks: Option<i32>,
+            language: String,
+            crawler_name: String,
+        }
+
+        fn make(
+            event_id: i64,
+            project_id: i32,
+            session_id: &str,
+            visitor_id: Option<i32>,
+            event_type: &str,
+            event_name: &str,
+            ts_ms: i64,
+        ) -> SeedRow {
+            SeedRow {
+                event_id,
+                project_id,
+                environment_id: Some(1),
+                deployment_id: None,
+                session_id: session_id.to_string(),
+                visitor_id,
+                timestamp: ts_ms,
+                hostname: "example.com".into(),
+                pathname: "/".into(),
+                page_path: "/".into(),
+                href: "https://example.com/".into(),
+                querystring: String::new(),
+                page_title: "Home".into(),
+                referrer: String::new(),
+                referrer_hostname: String::new(),
+                event_type: event_type.into(),
+                event_name: event_name.into(),
+                props: "{}".into(),
+                user_agent: "test-agent".into(),
+                browser: "Firefox".into(),
+                browser_version: "120".into(),
+                operating_system: "Linux".into(),
+                operating_system_version: "6".into(),
+                device_type: "desktop".into(),
+                screen_width: Some(1920),
+                screen_height: Some(1080),
+                viewport_width: Some(1920),
+                viewport_height: Some(1080),
+                ip_geolocation_id: None,
+                channel: "direct".into(),
+                utm_source: String::new(),
+                utm_medium: String::new(),
+                utm_campaign: String::new(),
+                utm_term: String::new(),
+                utm_content: String::new(),
+                ttfb: None,
+                lcp: None,
+                fid: None,
+                fcp: None,
+                cls: None,
+                inp: None,
+                is_entry: 0,
+                is_exit: 0,
+                is_bounce: 0,
+                is_crawler: 0,
+                time_on_page: None,
+                session_page_number: None,
+                scroll_depth: None,
+                clicks: None,
+                language: "en".into(),
+                crawler_name: String::new(),
+            }
+        }
+
+        let now = Utc::now();
+        let t = |mins_ago: i64| (now - Duration::minutes(mins_ago)).timestamp_millis();
+
+        // Project 7, session A, visitor 100: 2 page_views + 1 signup.
+        // Project 7, session B, visitor 101: 1 page_view, 1 click.
+        // Project 8, session C, visitor 102: 1 page_view (different project — must
+        // not leak into project 7 queries).
+        let rows = [
+            make(1, 7, "sess-a", Some(100), "page_view", "page_view", t(60)),
+            make(2, 7, "sess-a", Some(100), "page_view", "page_view", t(50)),
+            make(3, 7, "sess-a", Some(100), "signup", "signup", t(45)),
+            make(4, 7, "sess-b", Some(101), "page_view", "page_view", t(30)),
+            make(5, 7, "sess-b", Some(101), "click", "click", t(25)),
+            make(6, 8, "sess-c", Some(102), "page_view", "page_view", t(20)),
+        ];
+
+        let mut inserter = client.insert::<SeedRow>("events").expect("inserter setup");
+        for row in &rows {
+            inserter.write(row).await.expect("insert row");
+        }
+        inserter.end().await.expect("inserter end");
+
+        // ReplacingMergeTree merges happen in the background; OPTIMIZE FINAL
+        // forces them so FINAL reads return deterministic results in this
+        // test. Production queries use FINAL on the read side and tolerate
+        // some duplication during merges, but tests want determinism.
+        client
+            .query("OPTIMIZE TABLE events FINAL")
+            .execute()
+            .await
+            .expect("optimize");
+    }
+
+    fn project_scope(project_id: i32) -> AnalyticsScope {
+        AnalyticsScope::project(project_id).with_environment(Some(1))
+    }
+
+    fn full_range() -> TimeRange {
+        // 2 hours of slack on either side so all seeded events are inside.
+        let start = Utc::now() - Duration::hours(2);
+        let end = Utc::now() + Duration::hours(1);
+        TimeRange { start, end }
+    }
+
+    #[tokio::test]
+    async fn ch_backend_full_query_surface() {
+        let Some((backend, client, _container)) = setup_clickhouse().await else {
+            return; // Docker not available, skip.
+        };
+
+        seed_rows(&client).await;
+
+        // ---- query_has_events ----
+        assert!(
+            backend
+                .query_has_events(HasEventsSpec {
+                    scope: project_scope(7),
+                })
+                .await
+                .expect("query_has_events project 7"),
+            "project 7 has events"
+        );
+        assert!(
+            !backend
+                .query_has_events(HasEventsSpec {
+                    scope: project_scope(999),
+                })
+                .await
+                .expect("query_has_events project 999"),
+            "project 999 has no events"
+        );
+
+        // ---- query_events_count (events level, custom-only=true) ----
+        // Default custom_events_only=true filters out page_view, so we
+        // should see signup (1) and click (1) only — page_views excluded.
+        let counts = backend
+            .query_events_count(EventsCountSpec::new(
+                full_range(),
+                project_scope(7),
+                AggregationLevel::Events,
+                Some(50),
+                Some(true),
+            ))
+            .await
+            .expect("query_events_count");
+        let names: std::collections::HashSet<&str> =
+            counts.iter().map(|c| c.event_name.as_str()).collect();
+        assert!(
+            names.contains("signup") && names.contains("click"),
+            "expected signup+click, got {:?}",
+            names
+        );
+        assert!(
+            !names.contains("page_view"),
+            "page_view should be filtered when custom_events_only=true"
+        );
+
+        // ---- query_events_count (custom-only=false) ----
+        let counts_all = backend
+            .query_events_count(EventsCountSpec::new(
+                full_range(),
+                project_scope(7),
+                AggregationLevel::Events,
+                Some(50),
+                Some(false),
+            ))
+            .await
+            .expect("query_events_count all");
+        let total_events: i64 = counts_all.iter().map(|c| c.count).sum();
+        // 5 events on project 7. Project 8's row must not leak in.
+        assert_eq!(total_events, 5, "got {:?}", counts_all);
+
+        // ---- query_event_type_breakdown ----
+        let by_type = backend
+            .query_event_type_breakdown(EventTypeBreakdownSpec {
+                range: full_range(),
+                scope: project_scope(7),
+                aggregation_level: AggregationLevel::Events,
+            })
+            .await
+            .expect("query_event_type_breakdown");
+        // 3 page_view, 1 signup, 1 click on project 7.
+        let pv_count = by_type
+            .iter()
+            .find(|r| r.event_type == "page_view")
+            .map(|r| r.count)
+            .unwrap_or(0);
+        assert_eq!(pv_count, 3);
+
+        // ---- query_active_visitors ----
+        // The seeded events are 60-20 minutes ago, all outside the 5-min
+        // active window. So this should be 0.
+        let active = backend
+            .query_active_visitors(crate::services::queries::ActiveVisitorsSpec {
+                scope: project_scope(7).with_deployment(None),
+            })
+            .await
+            .expect("query_active_visitors");
+        assert_eq!(active, 0, "no events in last 5 min");
+
+        // ---- query_unique_counts: visitors ----
+        let visitors = backend
+            .query_unique_counts(UniqueCountsSpec {
+                range: full_range(),
+                scope: project_scope(7).with_deployment(None),
+                metric: "visitors".to_string(),
+            })
+            .await
+            .expect("query_unique_counts visitors");
+        // 2 distinct visitor_ids on project 7 (100, 101).
+        assert_eq!(visitors.count, 2);
+
+        // ---- query_unique_counts: page_views ----
+        let pvs = backend
+            .query_unique_counts(UniqueCountsSpec {
+                range: full_range(),
+                scope: project_scope(7).with_deployment(None),
+                metric: "page_views".to_string(),
+            })
+            .await
+            .expect("query_unique_counts page_views");
+        assert_eq!(pvs.count, 3);
+
+        // ---- query_unique_counts: bad metric ----
+        let bad = backend
+            .query_unique_counts(UniqueCountsSpec {
+                range: full_range(),
+                scope: project_scope(7),
+                metric: "nonsense".to_string(),
+            })
+            .await;
+        assert!(
+            matches!(bad, Err(EventsError::Validation(_))),
+            "bad metric must yield Validation error"
+        );
+
+        // ---- query_session_events ----
+        let session = backend
+            .query_session_events(SessionEventsSpec {
+                session_id: "sess-a".to_string(),
+                scope: project_scope(7),
+            })
+            .await
+            .expect("query_session_events");
+        let session = session.expect("session A exists");
+        assert_eq!(session.session_id, "sess-a");
+        assert_eq!(session.total_events, 3);
+        // Events ordered by timestamp ASC.
+        assert_eq!(session.events[0].event_type.as_deref(), Some("page_view"));
+
+        let none = backend
+            .query_session_events(SessionEventsSpec {
+                session_id: "does-not-exist".to_string(),
+                scope: project_scope(7),
+            })
+            .await
+            .expect("query_session_events none");
+        assert!(none.is_none(), "missing session must be None");
+
+        // ---- query_events_timeline ----
+        // Smoke-check: the WITH FILL clause is the trickiest piece of the
+        // CH SQL and a syntax error here would surface. We don't assert
+        // exact bucket counts because gap-fill semantics depend on the
+        // chosen interval, but we DO assert the call succeeds.
+        let timeline = backend
+            .query_events_timeline(EventsTimelineSpec {
+                range: full_range(),
+                scope: project_scope(7),
+                aggregation_level: AggregationLevel::Events,
+                event_name: None,
+                bucket_size: Some("hour".to_string()),
+            })
+            .await
+            .expect("query_events_timeline");
+        assert!(
+            !timeline.is_empty(),
+            "timeline must have at least one bucket"
+        );
+
+        // ---- query_hourly_visits ----
+        // Filters event_type='page_view' so only the 3 page_views count.
+        let hourly = backend
+            .query_hourly_visits(HourlyVisitsSpec {
+                range: full_range(),
+                scope: project_scope(7),
+                aggregation_level: AggregationLevel::Events,
+            })
+            .await
+            .expect("query_hourly_visits");
+        let hourly_total: i64 = hourly.iter().map(|p| p.count).sum();
+        assert_eq!(hourly_total, 3, "page_view count: {:?}", hourly);
+
+        // ---- query_aggregated_buckets ----
+        let aggr = backend
+            .query_aggregated_buckets(crate::services::queries::AggregatedBucketsSpec {
+                range: full_range(),
+                scope: project_scope(7).with_deployment(None),
+                aggregation_level: AggregationLevel::Events,
+                bucket_size: "hour".to_string(),
+            })
+            .await
+            .expect("query_aggregated_buckets");
+        assert_eq!(aggr.total, 5);
+
+        // ---- query_property_breakdown returns Validation (not implemented) ----
+        let pb = backend
+            .query_property_breakdown(PropertyBreakdownSpec::new(
+                full_range(),
+                project_scope(7),
+                None,
+                PropertyColumn::Channel,
+                "events",
+                Some(20),
+                None,
+            ))
+            .await;
+        assert!(
+            matches!(pb, Err(EventsError::Validation(_))),
+            "property_breakdown should report not-implemented as Validation"
+        );
+
+        // ---- query_dashboard_projects with empty input returns empty ----
+        let empty_dash = backend
+            .query_dashboard_projects(crate::services::queries::DashboardProjectsSpec {
+                project_ids: vec![],
+                range: full_range(),
+            })
+            .await
+            .expect("empty dashboard returns Ok");
+        assert!(
+            empty_dash.projects.is_empty(),
+            "empty input must yield empty response without hitting CH"
+        );
+
+        // ---- migration runner is idempotent ----
+        // Re-applying must skip everything, not error.
+        let report = temps_analytics_backend::migrations::apply_migrations(&client)
+            .await
+            .expect("re-apply migrations idempotent");
+        assert!(
+            report.applied.is_empty(),
+            "second migration run must apply nothing, got {:?}",
+            report.applied
+        );
+        assert_eq!(report.skipped.len(), 3, "all three migrations skipped");
+    }
+}
