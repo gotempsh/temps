@@ -83,6 +83,7 @@ mod m20260430_000002_add_deployment_container_runtime_info;
 mod m20260501_000001_add_gitlab_webhook_to_projects;
 mod m20260502_000001_add_observe_correlation;
 mod m20260504_000001_widen_backup_size_and_heartbeat;
+mod m20260505_000001_create_events_ch_outbox;
 
 pub struct Migrator;
 
@@ -169,6 +170,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260501_000001_add_gitlab_webhook_to_projects::Migration),
             Box::new(m20260502_000001_add_observe_correlation::Migration),
             Box::new(m20260504_000001_widen_backup_size_and_heartbeat::Migration),
+            Box::new(m20260505_000001_create_events_ch_outbox::Migration),
         ]
     }
 }

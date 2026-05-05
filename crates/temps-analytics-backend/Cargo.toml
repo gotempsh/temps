@@ -11,7 +11,7 @@ homepage.workspace = true
 default = []
 # Enables the ClickHouse analytics backend. Off by default so a stock build
 # stays a single binary against PostgreSQL/TimescaleDB only.
-clickhouse = []
+clickhouse = ["dep:clickhouse"]
 
 [dependencies]
 # Core
@@ -36,6 +36,11 @@ thiserror = { workspace = true }
 
 # Time
 chrono = { workspace = true }
+uuid = { workspace = true }
+
+# Optional: ClickHouse client. Pulled in only when the `clickhouse` feature
+# is enabled so default builds stay a single static binary against PG.
+clickhouse = { version = "0.13", optional = true, features = ["uuid", "chrono"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
