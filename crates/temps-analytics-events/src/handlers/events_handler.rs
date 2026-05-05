@@ -1,4 +1,4 @@
-use crate::services::AnalyticsEventsService;
+use crate::services::{AnalyticsEvents, AnalyticsEventsService};
 use crate::types::{
     ActiveVisitorsQuery, ActiveVisitorsResponse, AggregatedBucketsResponse, AggregationLevel,
     AnalyticsSessionEventsResponse, ConsoleEventPayload, EventCount, EventMetricsPayload,
@@ -23,7 +23,12 @@ use temps_proxy::CachedPeerTable;
 use tracing::error;
 
 pub struct AppState {
-    pub events_service: Arc<AnalyticsEventsService>,
+    /// Read-side: queries dispatched through the trait so the storage backend
+    /// can swap (TimescaleDB today, ClickHouse later) without handler edits.
+    pub events_service: Arc<dyn AnalyticsEvents>,
+    /// Write-side: stays a concrete service. Writes don't pick a backend at the
+    /// query level; they go to PG and fan out to CH via the outbox in Phase 2.
+    pub events_writer: Arc<AnalyticsEventsService>,
     pub route_table: Arc<CachedPeerTable>,
     pub ip_address_service: Arc<temps_geo::IpAddressService>,
     pub cookie_crypto: Arc<temps_core::CookieCrypto>,
@@ -693,7 +698,7 @@ pub async fn record_event_metrics(
     };
 
     match state
-        .events_service
+        .events_writer
         .record_event(
             project_id,
             environment_id,
@@ -811,7 +816,7 @@ pub async fn record_console_event(
         .or_else(|| Some(temps_core::uuid::Uuid::new_v4().to_string()));
 
     state
-        .events_service
+        .events_writer
         .record_event(
             project_id,
             Some(payload.environment_id),
@@ -1127,7 +1132,8 @@ mod tests {
     async fn setup_test_app(
         db: Arc<sea_orm::DatabaseConnection>,
     ) -> (axum::Router, Arc<AppState>, Arc<temps_core::CookieCrypto>) {
-        let events_service = Arc::new(crate::services::AnalyticsEventsService::new(db.clone()));
+        let events_writer = Arc::new(crate::services::AnalyticsEventsService::new(db.clone()));
+        let events_service: Arc<dyn crate::services::AnalyticsEvents> = events_writer.clone();
         let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
         let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
             temps_geo::MockGeoIpService::new(),
@@ -1139,6 +1145,7 @@ mod tests {
 
         let app_state = Arc::new(AppState {
             events_service,
+            events_writer,
             route_table,
             ip_address_service,
             cookie_crypto: cookie_crypto.clone(),
@@ -1523,7 +1530,8 @@ mod tests {
         let db = test_db.connection_arc();
         let project = insert_test_project(db.as_ref()).await;
 
-        let events_service = Arc::new(crate::services::AnalyticsEventsService::new(db.clone()));
+        let events_writer = Arc::new(crate::services::AnalyticsEventsService::new(db.clone()));
+        let events_service: Arc<dyn crate::services::AnalyticsEvents> = events_writer.clone();
         let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
         let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
             temps_geo::MockGeoIpService::new(),
@@ -1534,6 +1542,7 @@ mod tests {
             Arc::new(temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap());
         let app_state = Arc::new(AppState {
             events_service,
+            events_writer,
             route_table,
             ip_address_service,
             cookie_crypto,

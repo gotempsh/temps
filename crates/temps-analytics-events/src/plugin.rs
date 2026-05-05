@@ -41,9 +41,15 @@ impl TempsPlugin for EventsPlugin {
         let ip_address_service = context.require_service::<temps_geo::IpAddressService>();
         let cookie_crypto = context.require_service::<temps_core::CookieCrypto>();
 
+        // Erase the concrete service to its trait object for reads so handlers
+        // stay backend-agnostic (Phase 1 of hybrid PG+ClickHouse plan). Writes
+        // continue to go through the concrete service.
+        let events_backend: Arc<dyn crate::services::AnalyticsEvents> = events_service.clone();
+
         let routes =
             crate::handlers::configure_routes().with_state(Arc::new(crate::handlers::AppState {
-                events_service,
+                events_service: events_backend,
+                events_writer: events_service,
                 route_table,
                 ip_address_service,
                 cookie_crypto,
